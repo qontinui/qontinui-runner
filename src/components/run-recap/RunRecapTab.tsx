@@ -1,54 +1,34 @@
 /**
- * RunRecapTab (renamed from Recap to Summary)
+ * RunRecapTab (Summary Page)
  *
- * Session Summary page - the primary view for understanding what happened during a run.
- * Combines the former Dashboard stats with comprehensive run analysis.
+ * Redesigned layout:
+ *   1. Compact status strip (status + iterations + duration + sessions)
+ *   2. Two-column grid: AI Summary (left ~60%) + Run Details sidebar (right ~40%)
+ *   3. Failure section (if applicable, full width above grid)
+ *   4. Tabbed content (Timeline, Verification, Knowledge, Context, Canvas, Errors)
  *
- * Organized into tabs: Timeline, Verification, Knowledge, Tests, Context
- *
- * This is the main container component. Individual sections are extracted into separate files:
- * - StatusBanner: Overall status display
- * - FailureSection: Detailed failure information
- * - AISummarySection: AI-generated summary with goal achievement
- * - StagedTimeline: Steps grouped by workflow phases
- * - VerificationTab: Verification plan and results
- * - KnowledgeTab: Findings and knowledge entries
- * - TestsTab: Test results
- * - ContextTab: Variables and retry history
+ * Collapses to single-column below ~900px.
  */
 
 import { useState } from "react";
-import {
-  Activity,
-  AlertCircle,
-  XCircle,
-  Users,
-  FileText,
-  Play,
-  Loader2,
-  Target,
-  LayoutDashboard,
-} from "lucide-react";
+import { Activity, AlertCircle, XCircle, LayoutDashboard } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { useTaskRunRecap } from "../../hooks/useTaskRunRecap";
 import { useReopenTaskRun } from "../../hooks/useAiData";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "../ui/Tabs";
-import { StatusBanner } from "./StatusBanner";
+import { CompactStatusStrip } from "./CompactStatusStrip";
+import { RunDetailsSidebar } from "./RunDetailsSidebar";
 import { FailureSection } from "./FailureSection";
 import { AISummarySection } from "./AISummarySection";
 import { StagedTimeline } from "./StagedTimeline";
 import { StepsTimeline } from "./StepsTimeline";
 import { VerificationTab } from "./VerificationTab";
 import { KnowledgeTab } from "./KnowledgeTab";
-// AutomationTab hidden for production - visual automation feature
-// import { AutomationTab } from "./AutomationTab";
 import { ContextTab } from "./ContextTab";
 import { ErrorMonitorTab } from "../error-monitor/ErrorMonitorTab";
 import { CanvasRecapTab } from "./CanvasRecapTab";
-import { UsageSection } from "./UsageSection";
 import { useErrorBadge } from "../../hooks/useErrorMonitor";
-import { getAccentColors, getStatusColors } from "@/design-system";
 
 // ============================================================================
 // Main Component
@@ -67,7 +47,6 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
   const reopenMutation = useReopenTaskRun();
   const errorBadge = useErrorBadge(runSelection?.selectedRunId || undefined);
 
-  // Check if run is finished (can be continued)
   const isFinished =
     selectedRun?.status === "complete" ||
     selectedRun?.status === "failed" ||
@@ -115,143 +94,64 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
     );
   }
 
-  // Get summary data from selectedRun (which has AI-generated summaries)
-  // Fall back to data.summary which is extracted from output_log (## Summary section)
   const aiSummary = selectedRun?.summary || selectedRun?.ai_summary || data.summary || null;
   const goalAchieved = selectedRun?.goal_achieved ?? data.goal_achieved;
   const remainingWork = selectedRun?.remaining_work || null;
   const summaryGeneratedAt = selectedRun?.summary_generated_at || null;
-
   const taskRunId = selectedRun?.id || data.task_run_id;
 
   return (
     <div data-ui-id="recap-tab" className="h-full overflow-y-auto p-4 space-y-4">
-      {/* AI Summary Section - Most prominent at the top */}
-      <AISummarySection
-        aiSummary={aiSummary}
-        goalAchieved={goalAchieved}
-        remainingWork={remainingWork}
-        summaryGeneratedAt={summaryGeneratedAt}
-        taskRunId={taskRunId}
+      {/* 1. Compact Status Strip */}
+      <CompactStatusStrip
         status={data.status}
-        onSummaryGenerated={() => refetch()}
-      />
-
-      {/* Token Usage */}
-      <UsageSection taskRunId={taskRunId} />
-
-      {/* Status Banner */}
-      <StatusBanner
-        status={data.status}
-        goalAchieved={goalAchieved}
         duration={data.duration_ms}
-        startTime={data.created_at}
-        endTime={data.completed_at}
-        verificationPassed={selectedRun?.verification_passed}
         loopResult={selectedRun?.loop_result}
+        sessionsCount={selectedRun?.sessions_count}
+        maxSessions={selectedRun?.max_sessions}
+        outputLog={selectedRun?.output_log}
+        autoContinue={selectedRun?.auto_continue}
       />
 
-      {/* Session Stats Bar - Compact stats from former Dashboard */}
-      {selectedRun && (
-        <div className="flex items-center gap-4 p-3 rounded-lg border border-border bg-muted/30 text-sm">
-          <div className="flex items-center gap-2 text-muted-foreground">
-            <Users className="w-4 h-4" />
-            <span>
-              {selectedRun.sessions_count} session{selectedRun.sessions_count !== 1 ? "s" : ""}
-              {selectedRun.max_sessions ? ` / ${selectedRun.max_sessions} max` : ""}
-            </span>
-          </div>
-          <div className="w-px h-4 bg-border" />
-          <div className="flex items-center gap-2 text-muted-foreground">
-            <FileText className="w-4 h-4" />
-            <span>
-              {selectedRun.output_log
-                ? `${Math.round(selectedRun.output_log.length / 1024)}KB output`
-                : "No output"}
-            </span>
-          </div>
-          {selectedRun.auto_continue && (
-            <>
-              <div className="w-px h-4 bg-border" />
-              <span className="text-xs px-2 py-0.5 rounded bg-blue-500/10 text-blue-500">
-                Auto-continue enabled
-              </span>
-            </>
-          )}
-        </div>
-      )}
-
-      {/* Failure Section - Prominent when failed */}
+      {/* Failure Section - full width above the grid when present */}
       {data.failure_info && <FailureSection failure={data.failure_info} />}
 
-      {/* Continue Run Section - For finished runs */}
-      {isFinished && selectedRun && (
-        <div className="p-4 rounded-lg border border-border bg-card space-y-3">
-          <div className="flex items-center gap-2">
-            <Play className="w-4 h-4 text-muted-foreground" />
-            <h3 className="text-sm font-medium">Continue This Run</h3>
-            {selectedRun.goal_achieved === false && (
-              <span
-                className={`flex items-center gap-1.5 px-2 py-0.5 text-xs rounded ${getAccentColors("amber").bg} ${getAccentColors("amber").text}`}
-              >
-                <Target className="w-3 h-3" />
-                Goal Not Achieved
-              </span>
-            )}
-          </div>
-          <p className="text-sm text-muted-foreground">
-            Add more iterations to continue working toward the goal. New sessions will have access
-            to all previous output and context.
-          </p>
-          <div className="flex items-center gap-3 flex-wrap">
-            <div className="flex items-center gap-2">
-              <label htmlFor="additionalSessions" className="text-sm text-muted-foreground">
-                Additional sessions:
-              </label>
-              <input
-                id="additionalSessions"
-                type="number"
-                min={1}
-                max={20}
-                value={additionalSessions}
-                onChange={(e) =>
-                  setAdditionalSessions(Math.max(1, Math.min(20, parseInt(e.target.value) || 1)))
-                }
-                className="w-16 px-2 py-1 text-sm border border-border rounded bg-background text-foreground"
-              />
-            </div>
-            <button
-              onClick={handleContinueRun}
-              disabled={reopenMutation.isPending}
-              className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              {reopenMutation.isPending ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>Reopening...</span>
-                </>
-              ) : (
-                <>
-                  <Play className="w-4 h-4" />
-                  <span>Continue Run</span>
-                </>
-              )}
-            </button>
-          </div>
-          {reopenMutation.isError && (
-            <p className={`text-sm ${getStatusColors("error").text}`}>
-              Error: {reopenMutation.error?.message || "Failed to reopen run"}
-            </p>
-          )}
-          {reopenMutation.isSuccess && (
-            <p className={`text-sm ${getStatusColors("success").text}`}>
-              Run reopened successfully! It will continue automatically.
-            </p>
-          )}
-        </div>
-      )}
+      {/* 2. Two-column grid: AI Summary + Run Details sidebar */}
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-4">
+        {/* Left: AI Summary */}
+        <AISummarySection
+          aiSummary={aiSummary}
+          goalAchieved={goalAchieved}
+          remainingWork={remainingWork}
+          summaryGeneratedAt={summaryGeneratedAt}
+          taskRunId={taskRunId}
+          status={data.status}
+          onSummaryGenerated={() => refetch()}
+        />
 
-      {/* Tabbed Content */}
+        {/* Right: Run Details sidebar */}
+        {selectedRun && (
+          <RunDetailsSidebar
+            taskRunId={taskRunId}
+            startTime={data.created_at}
+            endTime={data.completed_at}
+            isFinished={isFinished}
+            goalAchieved={goalAchieved}
+            onContinueRun={handleContinueRun}
+            isContinuePending={reopenMutation.isPending}
+            continueError={
+              reopenMutation.isError
+                ? reopenMutation.error?.message || "Failed to reopen run"
+                : null
+            }
+            continueSuccess={reopenMutation.isSuccess}
+            additionalSessions={additionalSessions}
+            onAdditionalSessionsChange={setAdditionalSessions}
+          />
+        )}
+      </div>
+
+      {/* 3. Tabbed Content */}
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
         <TabsList data-ui-id="recap-tabs" className="w-full justify-start flex-wrap gap-1">
           <TabsTrigger data-ui-id="recap-tab-timeline" value="timeline">
@@ -297,7 +197,6 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
           </TabsTrigger>
         </TabsList>
 
-        {/* Timeline Tab */}
         <TabsContent value="timeline" className="space-y-3">
           {data.stages && data.stages.length > 0 ? (
             <StagedTimeline stages={data.stages} onAiStepClick={onNavigateToAiOutput} />
@@ -306,27 +205,22 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
           )}
         </TabsContent>
 
-        {/* Verification Tab */}
         <TabsContent value="verification">
           <VerificationTab taskRunId={taskRunId} />
         </TabsContent>
 
-        {/* Knowledge Tab */}
         <TabsContent value="knowledge">
           <KnowledgeTab taskRunId={taskRunId} />
         </TabsContent>
 
-        {/* Context Tab */}
         <TabsContent value="context">
           <ContextTab taskRunId={taskRunId} />
         </TabsContent>
 
-        {/* Canvas Tab */}
         <TabsContent value="canvas">
           <CanvasRecapTab taskRunId={taskRunId} />
         </TabsContent>
 
-        {/* Errors Tab */}
         <TabsContent value="errors" className="h-full">
           <ErrorMonitorTab
             taskRunId={runSelection?.selectedRunId || undefined}

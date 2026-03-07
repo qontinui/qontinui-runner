@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Run State Explorer page (dev-only) — displays UI state exploration results captured during verification phases. Users can browse exploration history, view detailed reports of state snapshots, and compare application state at different points in execution.",
+  "description": "Run State Explorer page (dev-only) — displays UI state exploration results captured during verification phases. Users can browse exploration history, view detailed reports of state snapshots, and compare application state at different points in execution.",
   "groups": [
     {
       "id": "state-explorer-history-browsing",
@@ -15,7 +15,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "exploration|history|state" },
+            "criteria": {
+              "textContent": "exploration|history|state"
+            },
             "label": "Exploration history list"
           },
           "assertionType": "exists",
@@ -30,7 +32,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Exploration selection control"
           },
           "assertionType": "exists",
@@ -45,7 +49,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No Run Selected|Select a run" },
+            "criteria": {
+              "textContent": "No Run Selected|Select a run"
+            },
             "label": "No run selected message"
           },
           "assertionType": "exists",
@@ -69,7 +75,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "report|state|exploration" },
+            "criteria": {
+              "textContent": "report|state|exploration"
+            },
             "label": "Exploration report"
           },
           "assertionType": "exists",
@@ -84,7 +92,10 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Back|History" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Back|History"
+            },
             "label": "Back to history navigation"
           },
           "assertionType": "exists",
@@ -99,7 +110,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "AI|prompt|analyze" },
+            "criteria": {
+              "textContent": "AI|prompt|analyze"
+            },
             "label": "AI prompt integration"
           },
           "assertionType": "exists",
@@ -123,7 +136,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "state|snapshot|capture" },
+            "criteria": {
+              "textContent": "state|snapshot|capture"
+            },
             "label": "State comparison data"
           },
           "assertionType": "exists",
@@ -138,7 +153,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "element|value|property" },
+            "criteria": {
+              "textContent": "element|value|property"
+            },
             "label": "Verification context data"
           },
           "assertionType": "exists",

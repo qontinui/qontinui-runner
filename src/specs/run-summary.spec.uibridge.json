@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Run Summary page — the primary post-run analysis view where users understand what happened during a workflow run. Combines AI-generated summaries, status banners, token usage, failure details, and tabbed deep-dive sections (Timeline, Verification, Knowledge, Context, Canvas, Errors).",
+  "description": "Run Summary page — the primary post-run analysis view where users understand what happened during a workflow run. Combines AI-generated summaries, status banners, token usage, failure details, and tabbed deep-dive sections (Timeline, Verification, Knowledge, Context, Canvas, Errors).",
   "groups": [
     {
       "id": "summary-run-outcome",
@@ -15,7 +15,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "complete|failed|stopped", "role": "status" },
+            "criteria": {
+              "textContent": "complete|failed|stopped",
+              "role": "status"
+            },
             "label": "Run status indicator"
           },
           "assertionType": "exists",
@@ -30,7 +33,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Summary" },
+            "criteria": {
+              "textContent": "Summary"
+            },
             "label": "AI summary section"
           },
           "assertionType": "exists",
@@ -45,7 +50,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Goal" },
+            "criteria": {
+              "textContent": "Goal"
+            },
             "label": "Goal achievement indicator"
           },
           "assertionType": "exists",
@@ -60,7 +67,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "session" },
+            "criteria": {
+              "textContent": "session"
+            },
             "label": "Session and timing stats"
           },
           "assertionType": "exists",
@@ -84,7 +93,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Failure|Error|failed" },
+            "criteria": {
+              "textContent": "Failure|Error|failed"
+            },
             "label": "Failure section"
           },
           "assertionType": "exists",
@@ -99,7 +110,10 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Continue" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Continue"
+            },
             "label": "Continue run button"
           },
           "assertionType": "exists",
@@ -114,7 +128,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "usage|token|cost" },
+            "criteria": {
+              "textContent": "usage|token|cost"
+            },
             "label": "Token usage section"
           },
           "assertionType": "exists",
@@ -138,7 +154,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Timeline" },
+            "criteria": {
+              "textContent": "Timeline"
+            },
             "label": "Timeline tab trigger"
           },
           "assertionType": "exists",
@@ -153,7 +171,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Verification" },
+            "criteria": {
+              "textContent": "Verification"
+            },
             "label": "Verification tab trigger"
           },
           "assertionType": "exists",
@@ -168,7 +188,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Knowledge" },
+            "criteria": {
+              "textContent": "Knowledge"
+            },
             "label": "Knowledge tab trigger"
           },
           "assertionType": "exists",
@@ -183,7 +205,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Context" },
+            "criteria": {
+              "textContent": "Context"
+            },
             "label": "Context tab trigger"
           },
           "assertionType": "exists",
@@ -198,7 +222,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Canvas" },
+            "criteria": {
+              "textContent": "Canvas"
+            },
             "label": "Canvas tab trigger"
           },
           "assertionType": "exists",
@@ -222,7 +248,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Loading" },
+            "criteria": {
+              "textContent": "Loading"
+            },
             "label": "Loading state indicator"
           },
           "assertionType": "exists",
@@ -237,7 +265,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Select a run" },
+            "criteria": {
+              "textContent": "Select a run"
+            },
             "label": "No data guidance message"
           },
           "assertionType": "exists",
@@ -252,7 +282,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Failed to load" },
+            "criteria": {
+              "textContent": "Failed to load"
+            },
             "label": "Error state message"
           },
           "assertionType": "exists",

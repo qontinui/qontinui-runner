@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Process Manager page — manages spawned child processes with lifecycle controls, log viewing, project scanning, and AI-assisted error diagnosis.",
+  "description": "Process Manager page — manages spawned child processes with lifecycle controls, log viewing, project scanning, and AI-assisted error diagnosis.",
   "groups": [
     {
       "id": "process-manager-overview",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Process Manager" },
+            "criteria": {
+              "textContent": "Process Manager"
+            },
             "label": "Process Manager heading"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "running" },
+            "criteria": {
+              "textContent": "running"
+            },
             "label": "Process list with status indicators"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No processes configured" },
+            "criteria": {
+              "textContent": "No processes configured"
+            },
             "label": "Empty state message"
           },
           "source": "manual",
@@ -70,7 +76,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Start process button"
           },
           "source": "manual",
@@ -85,7 +93,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Stop/restart process buttons"
           },
           "source": "manual",
@@ -100,7 +110,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Delete process button"
           },
           "source": "manual",
@@ -115,7 +127,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Add Process" },
+            "criteria": {
+              "textContent": "Add Process"
+            },
             "label": "Add process button"
           },
           "source": "manual",
@@ -139,7 +153,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Select a process to view its output" },
+            "criteria": {
+              "textContent": "Select a process to view its output"
+            },
             "label": "Output viewer placeholder"
           },
           "source": "manual",
@@ -154,7 +170,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Fix" },
+            "criteria": {
+              "textContent": "Fix"
+            },
             "label": "Fix with AI button"
           },
           "source": "manual",
@@ -169,7 +187,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Scan for Projects" },
+            "criteria": {
+              "textContent": "Scan for Projects"
+            },
             "label": "Scan for projects button"
           },
           "source": "manual",

@@ -11,6 +11,10 @@ export interface TerminalTab {
   createdAt?: number;
   /** True while the frontend is replaying the scrollback buffer from Rust. */
   isReconnecting?: boolean;
+  /** Claude Code session ID running in this tab (set on resume). */
+  claudeSessionId?: string;
+  /** Claude config dir for the session (set on resume). */
+  claudeConfigDir?: string;
 }
 
 interface TerminalInfo {
@@ -153,7 +157,15 @@ export function useTerminalManager() {
   }, []);
 
   const updateTab = useCallback(
-    (id: string, updates: Partial<Pick<TerminalTab, "isAlive" | "exitCode" | "workingDir">>) => {
+    (
+      id: string,
+      updates: Partial<
+        Pick<
+          TerminalTab,
+          "isAlive" | "exitCode" | "workingDir" | "claudeSessionId" | "claudeConfigDir"
+        >
+      >,
+    ) => {
       setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, ...updates } : t)));
     },
     [],

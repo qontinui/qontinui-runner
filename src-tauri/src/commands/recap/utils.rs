@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+use crate::str_utils::truncate_str;
 use serde::Deserialize;
 
 /// Map step type and name to a specific icon type for frontend rendering.
@@ -218,7 +219,7 @@ pub fn extract_session_summary(content: &str) -> Option<String> {
     let summary = lines.join(" ");
 
     if summary.len() > 100 {
-        Some(format!("{}...", &summary[..100]))
+        Some(format!("{}...", truncate_str(&summary, 100)))
     } else {
         Some(summary)
     }
@@ -263,7 +264,7 @@ pub fn extract_output_summary(output_log: &str) -> Option<String> {
     let summary: String = lines.into_iter().take(3).collect::<Vec<_>>().join(" ");
 
     let truncated = if summary.len() > 200 {
-        format!("{}...", &summary[..200])
+        format!("{}...", truncate_str(&summary, 200))
     } else {
         summary
     };

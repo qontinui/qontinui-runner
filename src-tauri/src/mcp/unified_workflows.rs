@@ -1248,6 +1248,9 @@ pub struct ExecuteInlineWorkflowRequest {
     /// Optional stages for multi-stage workflows
     #[serde(default)]
     stages: Vec<crate::unified_workflows::WorkflowStage>,
+    /// Category of the workflow (e.g. "plan-generated", "spec-generated", "error-fix")
+    #[serde(default)]
+    category: Option<String>,
 }
 
 pub fn default_max_iterations() -> u32 {
@@ -1754,7 +1757,10 @@ pub async fn execute_inline_workflow(
         id: format!("inline-{}", execution_id),
         name: request.name.clone(),
         description: request.description,
-        category: "error-fix".to_string(),
+        category: request
+            .category
+            .clone()
+            .unwrap_or_else(|| "error-fix".to_string()),
         tags: vec!["inline".to_string(), "quick-fix".to_string()],
         setup_steps: request.setup_steps,
         verification_steps: request.verification_steps,
@@ -1858,13 +1864,18 @@ pub async fn execute_inline_workflow(
 
     if has_prompt_steps {
         // AI-based execution with verification-agentic loop
+        let wf_type = if workflow.category == "plan-generated" {
+            "plan"
+        } else {
+            "unified"
+        };
         let input = crate::database::CreateTaskRunInput::new(&execution_id, &workflow.name)
             .with_prompt(&combined_prompt)
             .with_task_type("ai")
             .with_workflow_name(format!("[Inline] {}", workflow.name))
             .with_max_sessions(workflow.max_iterations)
             .with_auto_continue(true)
-            .with_workflow_type("unified");
+            .with_workflow_type(wf_type);
         if let Err(e) = state.app_state.checkpoint_db.create_task_run(&input) {
             warn!(
                 "Failed to create task_run for inline workflow {}: {}",

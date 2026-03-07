@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the Terminal page -- an integrated multi-tab PTY terminal with workflow generation, session transcript browsing, terminal output analysis, and findings tracking. Users execute shell commands in multiple concurrent terminal sessions, generate workflows from Claude Code session transcripts or command history, analyze terminal output with AI-powered analysis tools, and track findings (errors, warnings, issues) detected in real-time from terminal output. The terminal supports shell integration for structured command history and keyboard shortcuts for efficient tab management.",
+  "description": "Terminal page -- an integrated multi-tab PTY terminal with workflow generation, session transcript browsing, terminal output analysis, and findings tracking. Users execute shell commands in multiple concurrent terminal sessions, generate workflows from Claude Code session transcripts or command history, analyze terminal output with AI-powered analysis tools, and track findings (errors, warnings, issues) detected in real-time from terminal output. The terminal supports shell integration for structured command history and keyboard shortcuts for efficient tab management.",
   "groups": [
     {
       "id": "term-multi-tab",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "tablist" },
+            "criteria": {
+              "role": "tablist"
+            },
             "label": "Terminal tab bar"
           },
           "source": "manual",
@@ -31,7 +33,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "+" },
+            "criteria": {
+              "role": "button",
+              "textContent": "+"
+            },
             "label": "New terminal tab button"
           },
           "source": "manual",
@@ -46,7 +51,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No terminals open" },
+            "criteria": {
+              "textContent": "No terminals open"
+            },
             "label": "Empty terminal state message"
           },
           "source": "manual",
@@ -61,7 +68,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Ctrl+Shift+T" },
+            "criteria": {
+              "textContent": "Ctrl+Shift+T"
+            },
             "label": "Keyboard shortcut reference"
           },
           "source": "manual",
@@ -85,7 +94,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Sessions" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Sessions"
+            },
             "label": "Sessions sidebar toggle"
           },
           "source": "manual",
@@ -100,7 +112,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Generate" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Generate"
+            },
             "label": "Generate workflow from session button"
           },
           "source": "manual",
@@ -115,7 +130,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Analyze" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Analyze"
+            },
             "label": "Analysis menu trigger"
           },
           "source": "manual",
@@ -130,7 +148,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Findings" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Findings"
+            },
             "label": "Findings panel toggle"
           },
           "source": "manual",
@@ -154,7 +175,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Sessions" },
+            "criteria": {
+              "textContent": "Sessions"
+            },
             "label": "Session list in sidebar"
           },
           "source": "manual",
@@ -169,7 +192,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Transcript" },
+            "criteria": {
+              "textContent": "Transcript"
+            },
             "label": "Transcript content panel header"
           },
           "source": "manual",
@@ -184,7 +209,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Resume" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Resume"
+            },
             "label": "Resume session button"
           },
           "source": "manual",
@@ -199,7 +227,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Generate" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Generate"
+            },
             "label": "Generate workflow from transcript button"
           },
           "source": "manual",
@@ -223,7 +254,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Workflow" },
+            "criteria": {
+              "textContent": "Workflow"
+            },
             "label": "Workflow preview panel"
           },
           "source": "manual",
@@ -238,7 +271,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Execute" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Execute"
+            },
             "label": "Execute generated workflow button"
           },
           "source": "manual",
@@ -253,7 +289,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Save" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Save"
+            },
             "label": "Save workflow to library button"
           },
           "source": "manual",
@@ -268,7 +307,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Edit" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Edit"
+            },
             "label": "Edit in builder button"
           },
           "source": "manual",
@@ -292,7 +334,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Findings" },
+            "criteria": {
+              "textContent": "Findings"
+            },
             "label": "Findings panel header"
           },
           "source": "manual",
@@ -307,7 +351,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Fix" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Fix"
+            },
             "label": "Fix finding button"
           },
           "source": "manual",
@@ -322,7 +369,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Generate Workflow" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Generate Workflow"
+            },
             "label": "Generate workflow from findings button"
           },
           "source": "manual",
@@ -337,7 +387,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Respond" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Respond"
+            },
             "label": "Respond to finding button"
           },
           "source": "manual",
@@ -361,7 +414,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Analysis" },
+            "criteria": {
+              "textContent": "Analysis"
+            },
             "label": "Analysis results panel"
           },
           "source": "manual",
@@ -376,7 +431,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Summary" },
+            "criteria": {
+              "textContent": "Summary"
+            },
             "label": "Session summary analysis option"
           },
           "source": "manual",
@@ -391,7 +448,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Analyzing" },
+            "criteria": {
+              "textContent": "Analyzing"
+            },
             "label": "Analysis loading indicator"
           },
           "source": "manual",
@@ -419,6 +478,7 @@
       "analysis",
       "run-group",
       "tier-1"
-    ]
+    ],
+    "specType": "semantic"
   }
 }

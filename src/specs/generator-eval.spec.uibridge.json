@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Generator Evaluation page — a development tool for assessing workflow generation quality through pipeline inspection, edit analysis, benchmarks, example browsing, insights extraction, and training data export.",
+  "description": "Generator Evaluation page — a development tool for assessing workflow generation quality through pipeline inspection, edit analysis, benchmarks, example browsing, insights extraction, and training data export.",
   "groups": [
     {
       "id": "geneval-navigation",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Generator Evaluation" },
+            "criteria": {
+              "textContent": "Generator Evaluation"
+            },
             "label": "Generator Evaluation heading"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Dashboard" },
+            "criteria": {
+              "textContent": "Dashboard"
+            },
             "label": "Dashboard tab trigger"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Pipeline Inspector" },
+            "criteria": {
+              "textContent": "Pipeline Inspector"
+            },
             "label": "Pipeline Inspector tab trigger"
           },
           "source": "manual",
@@ -61,7 +67,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Edit Analysis" },
+            "criteria": {
+              "textContent": "Edit Analysis"
+            },
             "label": "Edit Analysis tab trigger"
           },
           "source": "manual",
@@ -85,7 +93,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Benchmarks" },
+            "criteria": {
+              "textContent": "Benchmarks"
+            },
             "label": "Benchmarks tab"
           },
           "source": "manual",
@@ -100,7 +110,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Example Library" },
+            "criteria": {
+              "textContent": "Example Library"
+            },
             "label": "Example Library tab"
           },
           "source": "manual",
@@ -115,7 +127,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Insights" },
+            "criteria": {
+              "textContent": "Insights"
+            },
             "label": "Insights tab"
           },
           "source": "manual",
@@ -139,7 +153,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Training Data" },
+            "criteria": {
+              "textContent": "Training Data"
+            },
             "label": "Training Data tab"
           },
           "source": "manual",
@@ -154,7 +170,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "dev" },
+            "criteria": {
+              "textContent": "dev"
+            },
             "label": "Dev badge"
           },
           "source": "manual",
@@ -169,7 +187,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Pipeline Inspector" },
+            "criteria": {
+              "textContent": "Pipeline Inspector"
+            },
             "label": "Pipeline Inspector tab for step-by-step tracing"
           },
           "source": "manual",

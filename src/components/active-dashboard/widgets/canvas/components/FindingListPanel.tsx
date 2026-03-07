@@ -19,32 +19,37 @@ interface Finding {
 
 const SEVERITY_CONFIG: Record<
   string,
-  { icon: typeof Info; classes: string; badgeClasses: string }
+  { icon: typeof Info; classes: string; badgeClasses: string; shape: string }
 > = {
   info: {
     icon: Info,
     classes: "text-blue-400",
     badgeClasses: "bg-blue-500/10 text-blue-400 border-blue-500/30",
+    shape: "circle",
   },
   low: {
     icon: CheckCircle,
     classes: "text-green-400",
     badgeClasses: "bg-green-500/10 text-green-400 border-green-500/30",
+    shape: "circle",
   },
   medium: {
     icon: AlertTriangle,
     classes: "text-yellow-400",
     badgeClasses: "bg-yellow-500/10 text-yellow-400 border-yellow-500/30",
+    shape: "triangle",
   },
   high: {
     icon: AlertCircle,
     classes: "text-orange-400",
     badgeClasses: "bg-orange-500/10 text-orange-400 border-orange-500/30",
+    shape: "diamond",
   },
   critical: {
     icon: AlertCircle,
     classes: "text-red-400",
     badgeClasses: "bg-red-500/10 text-red-400 border-red-500/30",
+    shape: "diamond",
   },
 };
 
@@ -97,7 +102,15 @@ export function FindingListPanel({ data, size }: CanvasPanelComponentProps) {
               isCompact && "p-1.5",
             )}
           >
-            <Icon className={cn("h-4 w-4 flex-shrink-0 mt-0.5", config.classes)} />
+            <div className="relative flex-shrink-0 mt-0.5">
+              <Icon className={cn("h-4 w-4", config.classes)} />
+              {config.shape === "diamond" && (
+                <div className="absolute -bottom-0.5 -right-0.5 w-1.5 h-1.5 bg-current rotate-45 opacity-60" />
+              )}
+              {config.shape === "triangle" && (
+                <div className="absolute -bottom-0.5 -right-0.5 w-0 h-0 border-l-[3px] border-r-[3px] border-b-[5px] border-l-transparent border-r-transparent border-b-current opacity-60" />
+              )}
+            </div>
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <span className={cn("font-medium", isCompact ? "text-xs" : "text-sm")}>

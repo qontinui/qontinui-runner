@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Run Traces page — displays an execution trace waterfall/timeline visualization showing parent-child span relationships, operation durations, phase groupings, and performance insights. Uses the TraceViewerWidget to render hierarchical execution spans.",
+  "description": "Run Traces page — displays an execution trace waterfall/timeline visualization showing parent-child span relationships, operation durations, phase groupings, and performance insights. Uses the TraceViewerWidget to render hierarchical execution spans.",
   "groups": [
     {
       "id": "traces-waterfall-visualization",
@@ -15,7 +15,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "trace|span|Trace" },
+            "criteria": {
+              "textContent": "trace|span|Trace"
+            },
             "label": "Trace waterfall chart"
           },
           "assertionType": "exists",
@@ -30,7 +32,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "row" },
+            "criteria": {
+              "role": "row"
+            },
             "label": "Span hierarchy rows"
           },
           "assertionType": "exists",
@@ -45,7 +49,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "ms|sec|duration" },
+            "criteria": {
+              "textContent": "ms|sec|duration"
+            },
             "label": "Span duration display"
           },
           "assertionType": "exists",
@@ -69,7 +75,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "role": "searchbox" },
+            "criteria": {
+              "role": "searchbox"
+            },
             "label": "Span name search input"
           },
           "assertionType": "exists",
@@ -84,7 +92,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "duration|Duration|min" },
+            "criteria": {
+              "textContent": "duration|Duration|min"
+            },
             "label": "Duration filter control"
           },
           "assertionType": "exists",
@@ -99,7 +109,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Phase|Status|phase|status" },
+            "criteria": {
+              "textContent": "Phase|Status|phase|status"
+            },
             "label": "Phase and status filters"
           },
           "assertionType": "exists",
@@ -123,7 +135,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "row" },
+            "criteria": {
+              "role": "row"
+            },
             "label": "Clickable span row"
           },
           "assertionType": "exists",
@@ -138,7 +152,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Detail|detail|span" },
+            "criteria": {
+              "textContent": "Detail|detail|span"
+            },
             "label": "Span detail panel"
           },
           "assertionType": "exists",
@@ -153,7 +169,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Insight|insight|Performance|critical" },
+            "criteria": {
+              "textContent": "Insight|insight|Performance|critical"
+            },
             "label": "Performance insights section"
           },
           "assertionType": "exists",
@@ -177,7 +195,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Select a task run" },
+            "criteria": {
+              "textContent": "Select a task run"
+            },
             "label": "No run selected message"
           },
           "assertionType": "exists",
@@ -192,7 +212,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Loading trace" },
+            "criteria": {
+              "textContent": "Loading trace"
+            },
             "label": "Loading state message"
           },
           "assertionType": "exists",
@@ -207,7 +229,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Failed to load" },
+            "criteria": {
+              "textContent": "Failed to load"
+            },
             "label": "Error state message"
           },
           "assertionType": "exists",

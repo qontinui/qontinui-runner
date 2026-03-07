@@ -25,6 +25,14 @@ function formatDate(iso: string): string {
   }
 }
 
+/** Extract just the last path segment for a compact project label. */
+function projectLabel(projectPath: string): string {
+  if (!projectPath) return "";
+  const normalized = projectPath.replace(/\\/g, "/").replace(/\/$/, "");
+  const last = normalized.split("/").pop() ?? "";
+  return last;
+}
+
 export function TranscriptSessionSidebar({
   sessions,
   loading,
@@ -76,6 +84,7 @@ export function TranscriptSessionSidebar({
                 <button
                   onClick={() => onSelectSession(session.session_id)}
                   className="w-full text-left px-3 py-2 pr-8"
+                  title={`Session ${session.session_id}`}
                 >
                   <div className="flex items-center gap-1.5 mb-0.5">
                     {session.has_plans && (
@@ -84,19 +93,14 @@ export function TranscriptSessionSidebar({
                         title="Contains plan content"
                       />
                     )}
-                    <span className="text-xs text-[#a9b1d6] truncate font-mono">
-                      {session.session_id.slice(0, 12)}...
-                    </span>
+                    <span className="text-xs text-[#a9b1d6] truncate">{session.display_name}</span>
                   </div>
-                  {session.first_message_preview && (
-                    <p className="text-[11px] text-[#565f89] truncate mb-0.5">
-                      &ldquo;{session.first_message_preview}&rdquo;
-                    </p>
-                  )}
                   <div className="flex items-center gap-1 text-[10px] text-[#414868]">
                     <span>{formatDate(session.last_modified)}</span>
                     <span>&middot;</span>
                     <span>{session.message_count} records</span>
+                    <span>&middot;</span>
+                    <span className="truncate">{projectLabel(session.project_path)}</span>
                   </div>
                 </button>
 

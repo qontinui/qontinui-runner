@@ -20,6 +20,7 @@ use crate::orchestrator::compression::{CompressionConfig, CompressionResult, Com
 use crate::orchestrator::types::{
     Confidence, CriterionOverride, Finding, OverrideCollection, WorkerSignal,
 };
+use crate::str_utils::truncate_str;
 
 // ============================================================================
 // Execution Span Types
@@ -1195,7 +1196,7 @@ pub fn build_iteration_context_with_compression(
                     let truncated = if raw_output.len() > 2000 {
                         format!(
                             "{}...\n[truncated, {} chars total]",
-                            &raw_output[..2000],
+                            truncate_str(raw_output, 2000),
                             raw_output.len()
                         )
                     } else {

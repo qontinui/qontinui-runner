@@ -2,6 +2,7 @@
 //!
 //! Provides CRUD operations for task_run_automation and config_statistics tables.
 
+use crate::str_utils::truncate_str;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{debug, info};
@@ -623,7 +624,7 @@ pub fn format_debugging_context_for_prompt(context: &DebuggingContext) -> String
             }
             if let Some(msg) = &failure.error_message {
                 let truncated = if msg.len() > 200 {
-                    format!("{}...", &msg[..200])
+                    format!("{}...", truncate_str(msg, 200))
                 } else {
                     msg.clone()
                 };

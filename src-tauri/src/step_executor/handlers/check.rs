@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use super::{HandlerContext, StepHandler, StepHandlerResult};
 use crate::step_executor::executor::ExecutionStepConfig;
+use crate::str_utils::truncate_str;
 
 /// Handler for check steps.
 pub struct CheckHandler;
@@ -124,7 +125,7 @@ impl StepHandler for CheckHandler {
 
         // Truncate command for display
         let command_display = if final_command.len() > 50 {
-            format!("{}...", &final_command[..50])
+            format!("{}...", truncate_str(&final_command, 50))
         } else {
             final_command.clone()
         };

@@ -7,6 +7,7 @@ export type {
   SpecConfig,
   SpecGroup,
   SpecAssertion,
+  SetupAction,
   SpecCategory,
   SpecSeverity,
   SpecSource,

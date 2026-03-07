@@ -30,11 +30,18 @@ import {
   KeyRound,
   Trash2,
   Plus,
+  MousePointer2,
+  Type,
+  Clock,
+  Navigation,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react";
 import type { LoadedSpec } from "./types";
 import type {
   SpecGroup,
   SpecAssertion,
+  SetupAction,
   ArchitectureConfig,
   TechStackEntry,
   ArchitectureConstraint,
@@ -101,6 +108,7 @@ const CATEGORY_TOOLTIPS: Record<string, string> = {
   "cross-page-consistency": "Consistency across multiple pages.",
   "modal-dialog": "Modal and dialog behavior.",
   design: "Visual design compliance.",
+  layout: "Layout and spatial relationships between elements.",
   custom: "Custom assertion category.",
 };
 
@@ -155,6 +163,8 @@ const ASSERTION_TYPE_TOOLTIPS: Record<string, string> = {
   cssPropertyInSet: "CSS property value is in an allowed set.",
   cssPropertyRange: "CSS property value is within a numeric range.",
   tokenCompliance: "CSS property matches a design token.",
+  noOverlap: "Two elements do not visually overlap (bounding box check).",
+  minSpacing: "Minimum pixel gap between two elements.",
 };
 
 const SOURCE_TOOLTIPS: Record<string, string> = {
@@ -240,6 +250,23 @@ function AssertionRow({
             </span>
           )}
 
+          {assertion.relatedTarget && (
+            <span className="text-[10px] text-cyan-400/70">
+              ↔{" "}
+              {assertion.relatedTarget.type === "search"
+                ? assertion.relatedTarget.criteria?.textContent ||
+                  assertion.relatedTarget.criteria?.role ||
+                  "related"
+                : assertion.relatedTarget.elementId || "related"}
+            </span>
+          )}
+
+          {assertion.minGap !== undefined && (
+            <span className="text-[10px] text-muted-foreground font-mono">
+              gap≥{assertion.minGap}px
+            </span>
+          )}
+
           {assertion.precondition && (
             <span
               className="text-[10px] text-muted-foreground italic truncate max-w-[200px]"
@@ -286,20 +313,43 @@ function AddAssertionForm({
 }) {
   const [description, setDescription] = useState("");
   const [severity, setSeverity] = useState<"critical" | "warning" | "info">("warning");
+  const [assertionType, setAssertionType] = useState("exists");
+  const [category, setCategory] = useState("custom");
+  const [targetText, setTargetText] = useState("");
+  const [relatedTargetText, setRelatedTargetText] = useState("");
+  const [minGap, setMinGap] = useState(0);
+
+  const isSpatial = assertionType === "noOverlap" || assertionType === "minSpacing";
 
   const handleSubmit = () => {
     if (!description.trim()) return;
-    onAdd({
+    const assertion: Record<string, unknown> = {
       id: crypto.randomUUID(),
       description: description.trim(),
       severity,
-      assertionType: "exists",
+      assertionType,
+      category,
       enabled: true,
       reviewed: false,
-      category: "custom",
-      target: { type: "search", criteria: { textContent: "" } },
-    } as SpecAssertion);
+      source: "manual",
+      target: {
+        type: "search",
+        criteria: targetText.trim() ? { textContent: targetText.trim() } : {},
+      },
+    };
+    if (isSpatial && relatedTargetText.trim()) {
+      assertion.relatedTarget = {
+        type: "search",
+        criteria: { textContent: relatedTargetText.trim() },
+      };
+    }
+    if (assertionType === "minSpacing") {
+      assertion.minGap = minGap;
+    }
+    onAdd(assertion as unknown as SpecAssertion);
     setDescription("");
+    setTargetText("");
+    setRelatedTargetText("");
   };
 
   return (
@@ -319,7 +369,46 @@ function AddAssertionForm({
           }
         }}
       />
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <select
+          value={assertionType}
+          onChange={(e) => setAssertionType(e.target.value)}
+          className="text-[10px] bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-foreground"
+        >
+          <optgroup label="Existence">
+            <option value="exists">exists</option>
+            <option value="notExists">notExists</option>
+            <option value="visible">visible</option>
+            <option value="hidden">hidden</option>
+          </optgroup>
+          <optgroup label="State">
+            <option value="enabled">enabled</option>
+            <option value="disabled">disabled</option>
+            <option value="focused">focused</option>
+            <option value="checked">checked</option>
+            <option value="unchecked">unchecked</option>
+          </optgroup>
+          <optgroup label="Content">
+            <option value="hasText">hasText</option>
+            <option value="containsText">containsText</option>
+            <option value="hasValue">hasValue</option>
+            <option value="count">count</option>
+          </optgroup>
+          <optgroup label="Style">
+            <option value="cssProperty">cssProperty</option>
+            <option value="cssPropertyInSet">cssPropertyInSet</option>
+            <option value="cssPropertyRange">cssPropertyRange</option>
+            <option value="tokenCompliance">tokenCompliance</option>
+          </optgroup>
+          <optgroup label="Layout">
+            <option value="noOverlap">noOverlap</option>
+            <option value="minSpacing">minSpacing</option>
+          </optgroup>
+          <optgroup label="Other">
+            <option value="attribute">attribute</option>
+            <option value="hasClass">hasClass</option>
+          </optgroup>
+        </select>
         <select
           value={severity}
           onChange={(e) => setSeverity(e.target.value as "critical" | "warning" | "info")}
@@ -329,6 +418,56 @@ function AddAssertionForm({
           <option value="warning">warning</option>
           <option value="info">info</option>
         </select>
+        <select
+          value={category}
+          onChange={(e) => setCategory(e.target.value)}
+          className="text-[10px] bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-foreground"
+        >
+          <option value="element-presence">element-presence</option>
+          <option value="layout">layout</option>
+          <option value="design">design</option>
+          <option value="accessibility">accessibility</option>
+          <option value="form-validation">form-validation</option>
+          <option value="state-consistency">state-consistency</option>
+          <option value="navigation">navigation</option>
+          <option value="semantic">semantic</option>
+          <option value="custom">custom</option>
+        </select>
+      </div>
+      <input
+        type="text"
+        value={targetText}
+        onChange={(e) => setTargetText(e.target.value)}
+        placeholder="Target element text..."
+        className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1
+          text-foreground placeholder:text-muted-foreground/40
+          focus:outline-none focus:border-green-500/50"
+      />
+      {isSpatial && (
+        <input
+          type="text"
+          value={relatedTargetText}
+          onChange={(e) => setRelatedTargetText(e.target.value)}
+          placeholder="Related target element text..."
+          className="w-full text-xs bg-transparent border border-cyan-500/20 rounded px-2 py-1
+            text-foreground placeholder:text-muted-foreground/40
+            focus:outline-none focus:border-cyan-500/50"
+        />
+      )}
+      {assertionType === "minSpacing" && (
+        <div className="flex items-center gap-2">
+          <label className="text-[10px] text-muted-foreground">Min gap (px):</label>
+          <input
+            type="number"
+            value={minGap}
+            onChange={(e) => setMinGap(Number(e.target.value))}
+            min={0}
+            className="w-20 text-xs bg-transparent border border-white/10 rounded px-2 py-0.5
+              text-foreground focus:outline-none focus:border-green-500/50"
+          />
+        </div>
+      )}
+      <div className="flex items-center gap-2">
         <div className="flex-1" />
         <button
           onClick={onCancel}
@@ -349,6 +488,237 @@ function AddAssertionForm({
   );
 }
 
+// ============================================================================
+// Setup Actions Editor
+// ============================================================================
+
+const SETUP_ACTION_LABELS: Record<
+  string,
+  { icon: typeof MousePointer2; label: string; color: string }
+> = {
+  click: { icon: MousePointer2, label: "Click", color: "text-blue-400" },
+  type: { icon: Type, label: "Type", color: "text-green-400" },
+  navigate: { icon: Navigation, label: "Navigate", color: "text-purple-400" },
+  waitForElement: { icon: Clock, label: "Wait for element", color: "text-amber-400" },
+  wait: { icon: Clock, label: "Wait", color: "text-muted-foreground" },
+};
+
+function SetupActionsEditor({
+  actions,
+  editMode,
+  onChange,
+}: {
+  actions: SetupAction[];
+  editMode?: boolean;
+  onChange?: (actions: SetupAction[]) => void;
+}) {
+  const [expanded, setExpanded] = useState(actions.length > 0);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [newType, setNewType] = useState<SetupAction["type"]>("click");
+  const [newTargetText, setNewTargetText] = useState("");
+  const [newValue, setNewValue] = useState("");
+  const [newUrl, setNewUrl] = useState("");
+  const [newMs, setNewMs] = useState(1000);
+
+  const handleAdd = () => {
+    let action: SetupAction;
+    switch (newType) {
+      case "click":
+        action = {
+          type: "click",
+          target: { type: "search", criteria: { textContent: newTargetText.trim() } },
+        };
+        break;
+      case "type":
+        action = {
+          type: "type",
+          target: { type: "search", criteria: { textContent: newTargetText.trim() } },
+          value: newValue,
+        };
+        break;
+      case "navigate":
+        action = { type: "navigate", url: newUrl };
+        break;
+      case "waitForElement":
+        action = {
+          type: "waitForElement",
+          target: { type: "search", criteria: { textContent: newTargetText.trim() } },
+          timeout: newMs,
+        };
+        break;
+      case "wait":
+        action = { type: "wait", ms: newMs };
+        break;
+    }
+    onChange?.([...actions, action]);
+    setNewTargetText("");
+    setNewValue("");
+    setNewUrl("");
+    setShowAddForm(false);
+  };
+
+  const handleRemove = (index: number) => {
+    onChange?.(actions.filter((_, i) => i !== index));
+  };
+
+  const needsTarget = newType === "click" || newType === "type" || newType === "waitForElement";
+
+  return (
+    <div className="space-y-1">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
+      >
+        {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+        Setup Actions
+        {actions.length > 0 && (
+          <span className="text-cyan-400/70 font-normal normal-case">({actions.length})</span>
+        )}
+      </button>
+
+      {expanded && (
+        <div className="space-y-1 ml-1">
+          {actions.map((action, i) => {
+            const config = SETUP_ACTION_LABELS[action.type] || SETUP_ACTION_LABELS.wait;
+            const Icon = config.icon;
+            const detail =
+              action.type === "navigate"
+                ? action.url
+                : action.type === "wait"
+                  ? `${action.ms}ms`
+                  : action.type === "type"
+                    ? `"${action.value}" → ${action.target.type === "search" ? action.target.criteria?.textContent || "?" : action.target.elementId}`
+                    : "target" in action && action.target.type === "search"
+                      ? action.target.criteria?.textContent || ""
+                      : "";
+
+            return (
+              <div
+                key={i}
+                className="flex items-center gap-2 px-2 py-1 rounded border border-white/5 bg-white/[0.02] text-xs"
+              >
+                <span className="text-[10px] text-muted-foreground/40 w-4 text-right">{i + 1}</span>
+                <Icon className={`w-3 h-3 shrink-0 ${config.color}`} />
+                <span className={`font-medium ${config.color}`}>{config.label}</span>
+                <span className="text-muted-foreground truncate flex-1">{detail}</span>
+                {editMode && (
+                  <button
+                    onClick={() => handleRemove(i)}
+                    className="text-red-400/50 hover:text-red-400 transition-colors shrink-0"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
+            );
+          })}
+
+          {editMode && !showAddForm && (
+            <button
+              onClick={() => setShowAddForm(true)}
+              className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-[10px] text-muted-foreground/60
+                rounded border border-dashed border-white/10 hover:border-cyan-500/30 hover:text-cyan-400
+                transition-colors"
+            >
+              <Plus className="w-2.5 h-2.5" />
+              Add Setup Action
+            </button>
+          )}
+
+          {editMode && showAddForm && (
+            <div className="px-2 py-2 rounded border border-dashed border-cyan-500/30 bg-cyan-500/5 space-y-2">
+              <select
+                value={newType}
+                onChange={(e) => setNewType(e.target.value as SetupAction["type"])}
+                className="text-[10px] bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-foreground w-full"
+              >
+                <option value="click">Click element</option>
+                <option value="type">Type text</option>
+                <option value="navigate">Navigate to URL</option>
+                <option value="waitForElement">Wait for element</option>
+                <option value="wait">Wait (delay)</option>
+              </select>
+
+              {needsTarget && (
+                <input
+                  type="text"
+                  value={newTargetText}
+                  onChange={(e) => setNewTargetText(e.target.value)}
+                  placeholder="Target element text..."
+                  className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1
+                    text-foreground placeholder:text-muted-foreground/40
+                    focus:outline-none focus:border-cyan-500/50"
+                />
+              )}
+
+              {newType === "type" && (
+                <input
+                  type="text"
+                  value={newValue}
+                  onChange={(e) => setNewValue(e.target.value)}
+                  placeholder="Text to type..."
+                  className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1
+                    text-foreground placeholder:text-muted-foreground/40
+                    focus:outline-none focus:border-green-500/50"
+                />
+              )}
+
+              {newType === "navigate" && (
+                <input
+                  type="text"
+                  value={newUrl}
+                  onChange={(e) => setNewUrl(e.target.value)}
+                  placeholder="http://localhost:3001/..."
+                  className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1
+                    text-foreground placeholder:text-muted-foreground/40
+                    focus:outline-none focus:border-purple-500/50"
+                />
+              )}
+
+              {(newType === "wait" || newType === "waitForElement") && (
+                <div className="flex items-center gap-2">
+                  <label className="text-[10px] text-muted-foreground">
+                    {newType === "wait" ? "Duration" : "Timeout"} (ms):
+                  </label>
+                  <input
+                    type="number"
+                    value={newMs}
+                    onChange={(e) => setNewMs(Number(e.target.value))}
+                    min={0}
+                    className="w-20 text-xs bg-transparent border border-white/10 rounded px-2 py-0.5
+                      text-foreground focus:outline-none focus:border-cyan-500/50"
+                  />
+                </div>
+              )}
+
+              <div className="flex items-center gap-2">
+                <div className="flex-1" />
+                <button
+                  onClick={() => setShowAddForm(false)}
+                  className="text-[10px] text-muted-foreground hover:text-foreground transition-colors px-2 py-0.5"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleAdd}
+                  className="text-[10px] px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20
+                    hover:bg-cyan-500/20 transition-colors"
+                >
+                  Add
+                </button>
+              </div>
+            </div>
+          )}
+
+          {actions.length === 0 && !showAddForm && !editMode && (
+            <p className="text-[10px] text-muted-foreground/40 italic px-2">No setup actions</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GroupDetail({
   group,
   specId, // eslint-disable-line @typescript-eslint/no-unused-vars
@@ -357,6 +727,7 @@ function GroupDetail({
   onRemoveAssertion,
   onAddAssertion,
   onRemoveGroup,
+  onUpdateSetupActions,
 }: {
   group: SpecGroup;
   specId?: string;
@@ -365,6 +736,7 @@ function GroupDetail({
   onRemoveAssertion?: (assertionId: string) => void;
   onAddAssertion?: (assertion: SpecAssertion) => void;
   onRemoveGroup?: () => void;
+  onUpdateSetupActions?: (actions: SetupAction[]) => void;
 }) {
   const [showAddForm, setShowAddForm] = useState(false);
   const enabled = group.assertions.filter((a) => a.enabled);
@@ -404,6 +776,12 @@ function GroupDetail({
           )}
         </div>
       </div>
+
+      <SetupActionsEditor
+        actions={group.setupActions || []}
+        editMode={editMode}
+        onChange={onUpdateSetupActions}
+      />
 
       <div className="space-y-1">
         {group.assertions.map((assertion) => (
@@ -536,6 +914,7 @@ function PageSpecOverview({
   config,
   specId,
   source,
+  appName,
   editMode,
   onAddGroup,
   onRemoveGroup,
@@ -543,6 +922,7 @@ function PageSpecOverview({
   config: import("ui-bridge").SpecConfig;
   specId: string;
   source: string;
+  appName?: string;
   editMode?: boolean;
   onAddGroup?: (group: SpecGroup) => void;
   onRemoveGroup?: (groupId: string) => void;
@@ -579,12 +959,35 @@ function PageSpecOverview({
         <div className="flex items-center gap-2">
           <Shield className="w-4 h-4 text-purple-400" />
           <h2 className="text-sm font-semibold text-foreground">{specId}</h2>
+          {appName && (
+            <span
+              className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20"
+              title={`Application: ${appName}`}
+            >
+              {appName}
+            </span>
+          )}
           <span
             className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground border border-white/10"
             title={SPEC_LOAD_SOURCE_TOOLTIPS[source] || `Source: ${source}`}
           >
             {source}
           </span>
+          {config.metadata?.specType && (
+            <span
+              className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                config.metadata.specType === "semantic"
+                  ? "bg-blue-500/10 text-blue-400 border-blue-500/20"
+                  : config.metadata.specType === "mixed"
+                    ? "bg-amber-500/10 text-amber-400 border-amber-500/20"
+                    : config.metadata.specType === "comprehensive"
+                      ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                      : "bg-white/5 text-muted-foreground border-white/10"
+              }`}
+            >
+              {config.metadata.specType as string}
+            </span>
+          )}
         </div>
         {config.description && (
           <p className="text-xs text-muted-foreground mt-1.5 leading-relaxed">
@@ -790,10 +1193,12 @@ function ArchitectureOverview({
   config,
   specId, // eslint-disable-line @typescript-eslint/no-unused-vars
   source,
+  appName,
 }: {
   config: ArchitectureConfig;
   specId: string;
   source: string;
+  appName?: string;
 }) {
   return (
     <div className="space-y-5">
@@ -805,6 +1210,14 @@ function ArchitectureOverview({
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 font-medium">
             architecture
           </span>
+          {appName && (
+            <span
+              className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20"
+              title={`Application: ${appName}`}
+            >
+              {appName}
+            </span>
+          )}
           <span
             className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground border border-white/10"
             title={SPEC_LOAD_SOURCE_TOOLTIPS[source] || `Source: ${source}`}
@@ -1120,10 +1533,12 @@ function ApiOverview({
   config,
   specId, // eslint-disable-line @typescript-eslint/no-unused-vars
   source,
+  appName,
 }: {
   config: ApiConfig;
   specId: string;
   source: string;
+  appName?: string;
 }) {
   const methodCounts = new Map<string, number>();
   for (const ep of config.endpoints) {
@@ -1142,6 +1557,14 @@ function ApiOverview({
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 font-medium">
             api
           </span>
+          {appName && (
+            <span
+              className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20"
+              title={`Application: ${appName}`}
+            >
+              {appName}
+            </span>
+          )}
           <span
             className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground border border-white/10"
             title={SPEC_LOAD_SOURCE_TOOLTIPS[source] || `Source: ${source}`}
@@ -1307,10 +1730,12 @@ function DataOverview({
   config,
   specId, // eslint-disable-line @typescript-eslint/no-unused-vars
   source,
+  appName,
 }: {
   config: DataConfig;
   specId: string;
   source: string;
+  appName?: string;
 }) {
   return (
     <div className="space-y-5">
@@ -1323,6 +1748,14 @@ function DataOverview({
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20 font-medium">
             data
           </span>
+          {appName && (
+            <span
+              className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20"
+              title={`Application: ${appName}`}
+            >
+              {appName}
+            </span>
+          )}
           <span
             className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground border border-white/10"
             title={SPEC_LOAD_SOURCE_TOOLTIPS[source] || `Source: ${source}`}
@@ -1506,10 +1939,12 @@ function DependencyOverview({
   config,
   specId, // eslint-disable-line @typescript-eslint/no-unused-vars
   source,
+  appName,
 }: {
   config: DependencyConfig;
   specId: string;
   source: string;
+  appName?: string;
 }) {
   // Group links by type
   const byType = new Map<string, number>();
@@ -1528,6 +1963,14 @@ function DependencyOverview({
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20 font-medium">
             dependencies
           </span>
+          {appName && (
+            <span
+              className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20"
+              title={`Application: ${appName}`}
+            >
+              {appName}
+            </span>
+          )}
           <span
             className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground border border-white/10"
             title={SPEC_LOAD_SOURCE_TOOLTIPS[source] || `Source: ${source}`}
@@ -1722,10 +2165,12 @@ function ConstraintOverview({
   config,
   specId, // eslint-disable-line @typescript-eslint/no-unused-vars
   source,
+  appName,
 }: {
   config: ConstraintConfig;
   specId: string;
   source: string;
+  appName?: string;
 }) {
   return (
     <div className="space-y-5">
@@ -1738,6 +2183,14 @@ function ConstraintOverview({
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20 font-medium">
             constraints
           </span>
+          {appName && (
+            <span
+              className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20"
+              title={`Application: ${appName}`}
+            >
+              {appName}
+            </span>
+          )}
           <span
             className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground border border-white/10"
             title={SPEC_LOAD_SOURCE_TOOLTIPS[source] || `Source: ${source}`}
@@ -1912,6 +2365,7 @@ interface SpecDetailPanelProps {
   onAddAssertion?: (specId: string, groupId: string, assertion: SpecAssertion) => void;
   onAddGroup?: (specId: string, group: SpecGroup) => void;
   onRemoveGroup?: (specId: string, groupId: string) => void;
+  onUpdateSetupActions?: (specId: string, groupId: string, actions: SetupAction[]) => void;
 }
 
 export function SpecDetailPanel({
@@ -1924,6 +2378,7 @@ export function SpecDetailPanel({
   onAddAssertion,
   onAddGroup,
   onRemoveGroup,
+  onUpdateSetupActions,
 }: SpecDetailPanelProps) {
   if (!selectedSpec) {
     return (
@@ -1958,6 +2413,11 @@ export function SpecDetailPanel({
           onRemoveGroup={
             onRemoveGroup ? () => onRemoveGroup(selectedSpec.specId, selectedGroup.id) : undefined
           }
+          onUpdateSetupActions={
+            onUpdateSetupActions
+              ? (actions) => onUpdateSetupActions(selectedSpec.specId, selectedGroup.id, actions)
+              : undefined
+          }
         />
       </div>
     );
@@ -1970,6 +2430,7 @@ export function SpecDetailPanel({
           config={selectedSpec.config}
           specId={selectedSpec.specId}
           source={selectedSpec.source}
+          appName={selectedSpec.appName}
           editMode={editMode}
           onAddGroup={onAddGroup ? (g) => onAddGroup(selectedSpec.specId, g) : undefined}
           onRemoveGroup={
@@ -1982,6 +2443,7 @@ export function SpecDetailPanel({
           config={selectedSpec.config}
           specId={selectedSpec.specId}
           source={selectedSpec.source}
+          appName={selectedSpec.appName}
         />
       )}
       {selectedSpec.kind === "api" && (
@@ -1989,6 +2451,7 @@ export function SpecDetailPanel({
           config={selectedSpec.config}
           specId={selectedSpec.specId}
           source={selectedSpec.source}
+          appName={selectedSpec.appName}
         />
       )}
       {selectedSpec.kind === "data" && (
@@ -1996,6 +2459,7 @@ export function SpecDetailPanel({
           config={selectedSpec.config}
           specId={selectedSpec.specId}
           source={selectedSpec.source}
+          appName={selectedSpec.appName}
         />
       )}
       {selectedSpec.kind === "dependency" && (
@@ -2003,6 +2467,7 @@ export function SpecDetailPanel({
           config={selectedSpec.config}
           specId={selectedSpec.specId}
           source={selectedSpec.source}
+          appName={selectedSpec.appName}
         />
       )}
       {selectedSpec.kind === "constraint" && (
@@ -2010,6 +2475,7 @@ export function SpecDetailPanel({
           config={selectedSpec.config}
           specId={selectedSpec.specId}
           source={selectedSpec.source}
+          appName={selectedSpec.appName}
         />
       )}
     </div>

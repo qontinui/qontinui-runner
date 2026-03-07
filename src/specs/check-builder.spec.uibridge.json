@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the Check Builder page -- a specialized editor for creating and managing reusable verification checks. Checks are individual validation rules that can detect code quality issues, run linters, formatters, type checkers, test runners, security scanners, and build tools. Each check defines a command, working directory, timeout, and behavioral flags like auto-fix and fail-on-warning. Checks serve as building blocks for check groups and can be used directly as verification steps in workflows.",
+  "description": "Check Builder page -- a specialized editor for creating and managing reusable verification checks. Checks are individual validation rules that can detect code quality issues, run linters, formatters, type checkers, test runners, security scanners, and build tools. Each check defines a command, working directory, timeout, and behavioral flags like auto-fix and fail-on-warning. Checks serve as building blocks for check groups and can be used directly as verification steps in workflows.",
   "groups": [
     {
       "id": "chk-list-management",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Checks" },
+            "criteria": {
+              "textContent": "Checks"
+            },
             "label": "Checks page title"
           },
           "source": "manual",
@@ -31,7 +33,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "New" },
+            "criteria": {
+              "role": "button",
+              "textContent": "New"
+            },
             "label": "New check button"
           },
           "source": "manual",
@@ -46,7 +51,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "searchbox" },
+            "criteria": {
+              "role": "searchbox"
+            },
             "label": "Check search input"
           },
           "source": "manual",
@@ -61,7 +68,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Checks" },
+            "criteria": {
+              "textContent": "Checks"
+            },
             "label": "Checks list with type badges"
           },
           "source": "manual",
@@ -85,7 +94,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Checks" },
+            "criteria": {
+              "textContent": "Checks"
+            },
             "label": "Check editor with type selection"
           },
           "source": "manual",
@@ -100,7 +111,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Checks" },
+            "criteria": {
+              "textContent": "Checks"
+            },
             "label": "Check editor with command field"
           },
           "source": "manual",
@@ -115,7 +128,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Checks" },
+            "criteria": {
+              "textContent": "Checks"
+            },
             "label": "Check editor with behavioral toggles"
           },
           "source": "manual",
@@ -130,7 +145,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Save" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Save"
+            },
             "label": "Save check button"
           },
           "source": "manual",
@@ -154,7 +172,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Checks" },
+            "criteria": {
+              "textContent": "Checks"
+            },
             "label": "Check editor with tag support"
           },
           "source": "manual",
@@ -169,7 +189,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Checks" },
+            "criteria": {
+              "textContent": "Checks"
+            },
             "label": "Check editor with working directory field"
           },
           "source": "manual",
@@ -184,7 +206,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Checks" },
+            "criteria": {
+              "textContent": "Checks"
+            },
             "label": "Check editor with timeout configuration"
           },
           "source": "manual",
@@ -199,7 +223,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Delete" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Delete"
+            },
             "label": "Delete check button"
           },
           "source": "manual",
@@ -217,6 +244,7 @@
     "updatedAt": "2026-03-05T00:00:00.000Z",
     "pageUrl": "/build/checks",
     "elementSource": "sdk",
-    "tags": ["checks", "verification", "builder", "library", "linter", "test-runner"]
+    "tags": ["checks", "verification", "builder", "library", "linter", "test-runner"],
+    "specType": "semantic"
   }
 }

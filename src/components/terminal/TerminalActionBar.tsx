@@ -1,4 +1,4 @@
-import { PanelLeft, FileText, RefreshCw, Wand2, MessageSquare } from "lucide-react";
+import { PanelLeft, FileText, RefreshCw, Wand2, MessageSquare, ListChecks } from "lucide-react";
 import type { AnalysisType } from "./TerminalAnalysisPanel";
 
 interface TerminalActionBarProps {
@@ -14,6 +14,8 @@ interface TerminalActionBarProps {
   isPlanLoading: boolean;
   /** Reload the plan file from disk. */
   onRefreshPlan: () => void;
+  /** Build workflow from the loaded plan file. */
+  onBuildPlanFromFile?: () => void;
   /** Toggle the findings decision panel. */
   onToggleFindings: () => void;
   /** Whether the findings panel is currently open. */
@@ -53,6 +55,7 @@ export function TerminalActionBar({
   planFileName,
   isPlanLoading,
   onRefreshPlan,
+  onBuildPlanFromFile,
   onToggleFindings,
   findingsActive,
   findingsCount,
@@ -137,12 +140,29 @@ export function TerminalActionBar({
             <div className="w-3 h-3 border border-[#565f89] border-t-transparent rounded-full animate-spin" />
           )}
           {planFileName && !isPlanLoading && (
-            <span
-              className="text-[10px] text-[#9ece6a] bg-[#9ece6a]/10 px-2 py-0.5 rounded-full font-mono truncate max-w-[180px]"
-              title={`Plan loaded: ${planFileName} — used by Architecture and Plan Progress analyses`}
-            >
-              {planFileName}
-            </span>
+            <>
+              <span
+                className="text-[10px] text-[#9ece6a] bg-[#9ece6a]/10 px-2 py-0.5 rounded-full font-mono truncate max-w-[180px]"
+                title={`Plan loaded: ${planFileName} — used by Architecture and Plan Progress analyses`}
+              >
+                {planFileName}
+              </span>
+              {onBuildPlanFromFile && (
+                <button
+                  onClick={onBuildPlanFromFile}
+                  disabled={busy}
+                  title="Build workflow from plan file with deterministic verification steps"
+                  data-ui-id="terminal-action-bar-build-plan-btn"
+                  className={`
+                    flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors
+                    ${busy ? "text-[#414868] cursor-not-allowed" : "text-[#e0af68] hover:bg-[#e0af68]/10 hover:text-[#e8b96e]"}
+                  `}
+                >
+                  <ListChecks className="w-3 h-3" />
+                  Build
+                </button>
+              )}
+            </>
           )}
           {!planFileName && !isPlanLoading && (
             <span

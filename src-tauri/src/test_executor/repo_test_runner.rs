@@ -7,6 +7,7 @@ use super::types::{
     CoverageReport, IndividualTestResult, ParseFormat, TestDefinition, TestError,
     TestExecutionResult, TestStatus, TestSuiteSummary, TestType,
 };
+use crate::str_utils::truncate_str;
 use std::fs;
 use tracing::info;
 
@@ -737,7 +738,7 @@ fn extract_error_message(full_error: &str) -> String {
         {
             // Truncate long messages
             if trimmed.len() > 200 {
-                return format!("{}...", &trimmed[..197]);
+                return format!("{}...", truncate_str(trimmed, 197));
             }
             return trimmed.to_string();
         }

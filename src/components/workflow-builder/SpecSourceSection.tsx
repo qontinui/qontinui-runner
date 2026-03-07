@@ -254,6 +254,9 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
       setSelectedPageUrls(pageUrls);
       if (allSpecs.length > 0) {
         setIsOpen(true);
+        // Start with all pages collapsed (spec groups hidden)
+        const allPageUrls = new Set(allSpecs.map(getSpecPageUrl));
+        setCollapsedPages(allPageUrls);
       }
       onSpecsChangedRef.current(buildState(allSpecs, selectedIds, pages, pageUrls));
     }

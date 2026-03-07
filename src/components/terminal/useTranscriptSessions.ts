@@ -9,6 +9,7 @@ export interface TranscriptSession {
   last_modified: string;
   first_message_preview: string | null;
   has_plans: boolean;
+  display_name: string;
 }
 
 export interface TranscriptMessage {

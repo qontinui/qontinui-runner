@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Run Actions page (dev-only) — a detailed log of every GUI automation action executed during a workflow run. Shows clicks, keystrokes, scrolls, and other low-level actions with their status, coordinates, and screenshots.",
+  "description": "Run Actions page (dev-only) — a detailed log of every GUI automation action executed during a workflow run. Shows clicks, keystrokes, scrolls, and other low-level actions with their status, coordinates, and screenshots.",
   "groups": [
     {
       "id": "actions-action-log-viewing",
@@ -15,7 +15,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "action" },
+            "criteria": {
+              "textContent": "action"
+            },
             "label": "Action log table"
           },
           "assertionType": "exists",
@@ -30,7 +32,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "role": "row" },
+            "criteria": {
+              "role": "row"
+            },
             "label": "Clickable action row"
           },
           "assertionType": "exists",
@@ -45,7 +49,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "actions|visible" },
+            "criteria": {
+              "textContent": "actions|visible"
+            },
             "label": "Action count display"
           },
           "assertionType": "exists",
@@ -69,7 +75,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Error|failed|failure" },
+            "criteria": {
+              "textContent": "Error|failed|failure"
+            },
             "label": "Failed action indicator"
           },
           "assertionType": "exists",
@@ -84,7 +92,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "error" },
+            "criteria": {
+              "textContent": "error"
+            },
             "label": "Error details"
           },
           "assertionType": "exists",
@@ -99,7 +109,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "role": "img" },
+            "criteria": {
+              "role": "img"
+            },
             "label": "Action screenshot"
           },
           "assertionType": "exists",
@@ -123,7 +135,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No actions" },
+            "criteria": {
+              "textContent": "No actions"
+            },
             "label": "Empty state message"
           },
           "assertionType": "exists",
@@ -138,7 +152,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Loading" },
+            "criteria": {
+              "textContent": "Loading"
+            },
             "label": "Loading indicator"
           },
           "assertionType": "exists",

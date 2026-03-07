@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use crate::error_monitor::curator::{CuratedError, DebugContext, DebugContextCurator};
 use crate::error_monitor::storage::ErrorEventStorage;
 use crate::error_monitor::types::{ErrorQuery, ErrorStatus};
+use crate::str_utils::truncate_str;
 use rusqlite::Connection;
 
 /// Configuration for generating an error fix workflow.
@@ -339,7 +340,7 @@ impl ErrorFixWorkflowGenerator {
 
         // Truncate very long messages
         let pattern = if first_line.len() > 200 {
-            &first_line[..200]
+            truncate_str(first_line, 200)
         } else {
             first_line
         };

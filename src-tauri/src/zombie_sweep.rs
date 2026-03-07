@@ -7,9 +7,13 @@
 //!
 //! This module runs a periodic sweep that detects orphaned tasks (tasks marked
 //! as running in the DB but with no active Claude CLI process) and notifies
-//! the user after a grace period. It does NOT automatically stop tasks, since
-//! false positives (e.g., inline sessions without SessionManager registration)
-//! would destroy legitimate in-progress work.
+//! the user after a grace period. It does NOT automatically stop most tasks,
+//! since false positives (e.g., inline sessions without SessionManager
+//! registration) would destroy legitimate in-progress work.
+//!
+//! **Exception**: Task runs with `sessions_count == 0` that have been orphaned
+//! for `ZERO_SESSION_AUTO_STOP` are automatically marked as failed. These tasks
+//! never started any AI work, so there is nothing to lose.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -33,6 +37,10 @@ const STARTUP_GRACE: Duration = Duration::from_secs(45);
 
 /// How long a task must be orphaned before we notify the user.
 const ORPHAN_GRACE: Duration = Duration::from_secs(90);
+
+/// How long a task with 0 sessions must be orphaned before auto-stop.
+/// These tasks never started AI work, so it's safe to clean them up.
+const ZERO_SESSION_AUTO_STOP: Duration = Duration::from_secs(300);
 
 /// Payload emitted to the frontend when a potentially stale task is detected.
 #[derive(Debug, Clone, Serialize)]
@@ -102,12 +110,12 @@ async fn sweep_once(
     // 1. Query DB for all running tasks (both workflows and chat sessions)
     let db_clone = db.clone();
     let running_tasks = tokio::task::spawn_blocking(move || {
-        let mut tasks = Vec::new();
+        let mut tasks: Vec<(String, String, u32)> = Vec::new();
 
         match db_clone.get_running_task_runs() {
             Ok(runs) => {
                 for run in runs {
-                    tasks.push((run.id, run.task_name));
+                    tasks.push((run.id, run.task_name, run.sessions_count));
                 }
             }
             Err(e) => warn!("Stale task sweep: failed to query running task runs: {}", e),
@@ -116,7 +124,7 @@ async fn sweep_once(
         match db_clone.get_running_ai_sessions() {
             Ok(sessions) => {
                 for session in sessions {
-                    tasks.push((session.id, session.task_name));
+                    tasks.push((session.id, session.task_name, session.sessions_count));
                 }
             }
             Err(e) => warn!(
@@ -144,9 +152,12 @@ async fn sweep_once(
         .collect();
 
     // 3. Check each running task
-    let running_ids: Vec<String> = running_tasks.iter().map(|(id, _)| id.clone()).collect();
+    let running_ids: Vec<String> = running_tasks.iter().map(|(id, _, _)| id.clone()).collect();
 
-    for (task_id, task_name) in &running_tasks {
+    // Collect tasks to auto-stop (avoid borrowing db while iterating)
+    let mut auto_stop_tasks: Vec<(String, String)> = Vec::new();
+
+    for (task_id, task_name, sessions_count) in &running_tasks {
         let has_live_session = session_map
             .get(task_id)
             .is_some_and(|(state, pid)| state.is_active() && is_process_alive(*pid));
@@ -159,6 +170,23 @@ async fn sweep_once(
 
         // No live session — track as potentially stale
         let orphan_duration = orphan_tracker.observe(task_id);
+
+        // Auto-stop tasks that never started any AI sessions.
+        // These are orphaned task_run records that were created but never executed.
+        if *sessions_count == 0
+            && orphan_duration >= ZERO_SESSION_AUTO_STOP
+            && !orphan_tracker.was_notified(task_id)
+        {
+            warn!(
+                "Stale task sweep: task '{}' (id={}) has 0 sessions after {:.0}s — auto-stopping",
+                task_name,
+                task_id,
+                orphan_duration.as_secs_f64()
+            );
+            auto_stop_tasks.push((task_id.clone(), task_name.clone()));
+            orphan_tracker.mark_notified(task_id);
+            continue;
+        }
 
         if orphan_duration >= ORPHAN_GRACE && !orphan_tracker.was_notified(task_id) {
             // Orphaned long enough and not yet notified — warn the user
@@ -183,10 +211,36 @@ async fn sweep_once(
         }
     }
 
-    // 4. Clean up closed sessions from the SessionManager
+    // 4. Auto-stop zero-session orphans
+    if !auto_stop_tasks.is_empty() {
+        let db_clone = db.clone();
+        let tasks_to_stop = auto_stop_tasks.clone();
+        tokio::task::spawn_blocking(move || {
+            for (task_id, task_name) in &tasks_to_stop {
+                if let Err(e) = db_clone.fail_task_run(
+                    task_id,
+                    "Auto-stopped: task had no AI sessions after 5 minutes",
+                ) {
+                    warn!(
+                        "Stale task sweep: failed to auto-stop task '{}' (id={}): {}",
+                        task_name, task_id, e
+                    );
+                } else {
+                    info!(
+                        "Stale task sweep: auto-stopped orphaned task '{}' (id={})",
+                        task_name, task_id
+                    );
+                }
+            }
+        })
+        .await
+        .ok();
+    }
+
+    // 5. Clean up closed sessions from the SessionManager
     session_manager.cleanup_closed();
 
-    // 5. Prune orphan tracker for tasks no longer running
+    // 6. Prune orphan tracker for tasks no longer running
     orphan_tracker.retain_known(&running_ids);
 }
 

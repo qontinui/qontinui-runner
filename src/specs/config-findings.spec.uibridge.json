@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Finding Categories configuration page — defines and manages categories used to organize AI-detected findings, with support for custom categories, colors, icons, action types, visibility control, and ordering.",
+  "description": "Finding Categories configuration page — defines and manages categories used to organize AI-detected findings, with support for custom categories, colors, icons, action types, visibility control, and ordering.",
   "groups": [
     {
       "id": "findings-category-management",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Finding Categories" },
+            "criteria": {
+              "textContent": "Finding Categories"
+            },
             "label": "Finding Categories heading"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Built-in" },
+            "criteria": {
+              "textContent": "Built-in"
+            },
             "label": "Built-in category indicator"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Category reorder controls"
           },
           "source": "manual",
@@ -70,7 +76,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "New Category" },
+            "criteria": {
+              "textContent": "New Category"
+            },
             "label": "New Category button"
           },
           "source": "manual",
@@ -85,7 +93,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Category Name" },
+            "criteria": {
+              "textContent": "Category Name"
+            },
             "label": "Category form preview placeholder"
           },
           "source": "manual",
@@ -100,7 +110,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Auto Fix" },
+            "criteria": {
+              "textContent": "Auto Fix"
+            },
             "label": "Action type selector"
           },
           "source": "manual",
@@ -115,7 +127,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Delete category button"
           },
           "source": "manual",
@@ -139,7 +153,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Hidden categories are not shown in reports" },
+            "criteria": {
+              "textContent": "Hidden categories are not shown in reports"
+            },
             "label": "Hidden category legend"
           },
           "source": "manual",
@@ -154,7 +170,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Reset" },
+            "criteria": {
+              "textContent": "Reset"
+            },
             "label": "Reset to defaults button"
           },
           "source": "manual",
@@ -169,7 +187,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Built-in categories cannot be edited or deleted" },
+            "criteria": {
+              "textContent": "Built-in categories cannot be edited or deleted"
+            },
             "label": "Built-in restriction legend"
           },
           "source": "manual",

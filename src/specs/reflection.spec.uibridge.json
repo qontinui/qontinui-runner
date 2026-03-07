@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Reflection Dashboard page — evaluates the effectiveness of AI self-healing fixes across workflow executions, providing aggregated metrics, run history, and individual fix analysis.",
+  "description": "Reflection Dashboard page — evaluates the effectiveness of AI self-healing fixes across workflow executions, providing aggregated metrics, run history, and individual fix analysis.",
   "groups": [
     {
       "id": "reflection-overview",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Reflection Effectiveness" },
+            "criteria": {
+              "textContent": "Reflection Effectiveness"
+            },
             "label": "Reflection dashboard heading"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Total Fixes" },
+            "criteria": {
+              "textContent": "Total Fixes"
+            },
             "label": "Total fixes metric card"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Effective" },
+            "criteria": {
+              "textContent": "Effective"
+            },
             "label": "Effective fixes metric card"
           },
           "source": "manual",
@@ -61,7 +67,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Effectiveness Rate" },
+            "criteria": {
+              "textContent": "Effectiveness Rate"
+            },
             "label": "Effectiveness rate metric card"
           },
           "source": "manual",
@@ -85,7 +93,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "combobox" },
+            "criteria": {
+              "role": "combobox"
+            },
             "label": "Workflow name selector"
           },
           "source": "manual",
@@ -100,7 +110,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No reflection fixes found" },
+            "criteria": {
+              "textContent": "No reflection fixes found"
+            },
             "label": "Empty state message"
           },
           "source": "manual",
@@ -115,7 +127,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Refresh button"
           },
           "source": "manual",
@@ -139,7 +153,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Recent Reflection Runs" },
+            "criteria": {
+              "textContent": "Recent Reflection Runs"
+            },
             "label": "Reflection run history section"
           },
           "source": "manual",
@@ -154,7 +170,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "complete" },
+            "criteria": {
+              "textContent": "complete"
+            },
             "label": "Run status badge"
           },
           "source": "manual",
@@ -178,7 +196,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "All Fixes" },
+            "criteria": {
+              "textContent": "All Fixes"
+            },
             "label": "Fix list section heading"
           },
           "source": "manual",
@@ -193,7 +213,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Old value" },
+            "criteria": {
+              "textContent": "Old value"
+            },
             "label": "Expanded fix detail with old/new values"
           },
           "source": "manual",
@@ -208,7 +230,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Knowledge Update" },
+            "criteria": {
+              "textContent": "Knowledge Update"
+            },
             "label": "Fix type label"
           },
           "source": "manual",

@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the Context Builder page — where users create reusable context configurations that provide background information and instructions to AI during workflow execution",
+  "description": "Context Builder page — where users create reusable context configurations that provide background information and instructions to AI during workflow execution",
   "groups": [
     {
       "id": "ctx-purpose",
@@ -15,7 +15,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Context" },
+            "criteria": {
+              "textContent": "Context"
+            },
             "label": "Context builder heading"
           },
           "assertionType": "exists",
@@ -30,7 +32,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Save" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Save"
+            },
             "label": "Save button"
           },
           "assertionType": "exists",
@@ -43,7 +48,13 @@
           "description": "Users can browse all saved contexts in a searchable list and select any context for editing or review",
           "category": "semantic",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "list" }, "label": "Context list" },
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "list"
+            },
+            "label": "Context list"
+          },
           "assertionType": "exists",
           "source": "manual",
           "reviewed": true,
@@ -65,7 +76,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "textbox" },
+            "criteria": {
+              "role": "textbox"
+            },
             "label": "Context name input"
           },
           "assertionType": "exists",
@@ -80,7 +93,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "textbox" },
+            "criteria": {
+              "role": "textbox"
+            },
             "label": "Context content editor"
           },
           "assertionType": "exists",
@@ -95,7 +110,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Delete" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Delete"
+            },
             "label": "Delete button"
           },
           "assertionType": "exists",
@@ -119,7 +137,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Context" },
+            "criteria": {
+              "textContent": "Context"
+            },
             "label": "Context reference"
           },
           "assertionType": "exists",
@@ -134,7 +154,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Context" },
+            "criteria": {
+              "textContent": "Context"
+            },
             "label": "Context consistency"
           },
           "assertionType": "exists",
@@ -152,6 +174,7 @@
     "createdAt": "2026-03-05T00:00:00.000Z",
     "updatedAt": "2026-03-05T00:00:00.000Z",
     "pageUrl": "/build/contexts",
-    "tags": ["context-builder", "contexts", "ai-configuration", "library-asset"]
+    "tags": ["context-builder", "contexts", "ai-configuration", "library-asset"],
+    "specType": "semantic"
   }
 }

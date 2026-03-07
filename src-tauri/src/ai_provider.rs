@@ -15,6 +15,7 @@ use crate::ai_router::{TaskContext, TaskRouter};
 use crate::config_facade::ai_keychain;
 use crate::doctor::{DoctorHandle, ProcessRegistration, ProcessType};
 use crate::settings::{self, AiProvider, CliExecutionMode};
+use crate::str_utils::truncate_str;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -848,7 +849,7 @@ fn process_cli_output(output: std::process::Output) -> AiResponse {
                 "Claude CLI exited successfully but stdout is empty. stderr ({} chars): {}",
                 stderr.len(),
                 if stderr.len() > 1000 {
-                    &stderr[..1000]
+                    truncate_str(&stderr, 1000)
                 } else {
                     &stderr
                 }
@@ -857,7 +858,7 @@ fn process_cli_output(output: std::process::Output) -> AiResponse {
             AiResponse::error(format!(
                 "Claude CLI produced no output. stderr: {}",
                 if stderr.len() > 500 {
-                    &stderr[..500]
+                    truncate_str(&stderr, 500)
                 } else {
                     &stderr
                 }

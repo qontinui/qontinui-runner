@@ -21,6 +21,7 @@ pub struct TranscriptSession {
     pub last_modified: String,                 // ISO 8601
     pub first_message_preview: Option<String>, // first ~80 chars of first user message
     pub has_plans: bool,                       // true if any message has planContent
+    pub display_name: String,                  // human-readable title derived from content
 }
 
 /// A single parsed message from a Claude Code transcript.
@@ -168,11 +169,17 @@ pub fn list_sessions(
 
                 let line_count = content.lines().count();
 
+                // Skip sessions with 0 messages
+                if line_count == 0 {
+                    continue;
+                }
+
                 // Substring check for plans (cheap — no JSON parse needed)
                 let has_plans = content.contains("\"planContent\"");
 
                 // Extract first user message preview (scan first ~20 lines)
                 let first_message_preview = extract_first_user_preview(&content);
+                let display_name = generate_display_name(&first_message_preview, &last_modified);
 
                 sessions.push(TranscriptSession {
                     session_id,
@@ -182,6 +189,7 @@ pub fn list_sessions(
                     last_modified,
                     first_message_preview,
                     has_plans,
+                    display_name,
                 });
             }
         }
@@ -424,6 +432,8 @@ pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<Tr
                     let line_count = content.lines().count();
                     let has_plans = content.contains("\"planContent\"");
                     let first_message_preview = extract_first_user_preview(&content);
+                    let display_name =
+                        generate_display_name(&first_message_preview, &last_modified);
 
                     return Some(TranscriptSession {
                         session_id: session_id.to_string(),
@@ -433,6 +443,7 @@ pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<Tr
                         last_modified,
                         first_message_preview,
                         has_plans,
+                        display_name,
                     });
                 }
             }
@@ -469,12 +480,121 @@ fn is_workflow_session(content: &str) -> bool {
     false
 }
 
-/// Extract a preview from the first user message in a JSONL transcript.
+/// Strip XML/HTML tags from text (simple regex-free approach).
+fn strip_xml_tags(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for ch in text.chars() {
+        if ch == '<' {
+            in_tag = true;
+        } else if ch == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// Check if a user message is system-generated or uninformative.
+fn is_system_or_noise(text: &str) -> bool {
+    let t = text.trim();
+    t.is_empty()
+        || t.starts_with("<local-command-caveat>")
+        || t.starts_with("<command-name>")
+        || t.starts_with("<command-message>")
+        || t.starts_with("<command-args>")
+        || t.starts_with("[Request interrupted")
+        || t.starts_with("<system-reminder>")
+        || t.starts_with("<available-deferred-tools>")
+        || t.starts_with("<task-notification>")
+}
+
+/// Common generic prefixes that should be stripped to reveal the actual content.
+const GENERIC_PREFIXES: &[&str] = &[
+    "Implement the following plan:",
+    "Implement this plan:",
+    "Please implement the following:",
+    "Please implement:",
+    "Execute the following plan:",
+    "Here is my plan:",
+];
+
+/// Generate a human-readable display name from the session's first user message.
 ///
-/// Scans the first 20 lines for a `"type":"user"` record and extracts
-/// the first ~80 characters of the user's text content.
+/// Strips XML/HTML tags, markdown heading markers, and generic prefixes, then
+/// truncates to ~50 chars at a word boundary. Falls back to a date-based name
+/// for short or uninformative messages (slash commands, "continue", etc.).
+fn generate_display_name(first_preview: &Option<String>, last_modified: &str) -> String {
+    if let Some(preview) = first_preview {
+        // Strip XML tags and clean up
+        let stripped = strip_xml_tags(preview);
+        let trimmed = stripped.trim();
+
+        // Skip short/uninformative messages
+        if trimmed.len() >= 8 && !trimmed.starts_with('/') {
+            // Strip generic prefixes
+            let after_prefix = strip_generic_prefix(trimmed);
+
+            // Strip markdown heading markers and find first meaningful line
+            let first_line = after_prefix
+                .lines()
+                .map(|l| l.trim().trim_start_matches('#').trim())
+                .find(|l| l.len() >= 5)
+                .unwrap_or(after_prefix);
+
+            // Strip "..." suffix from the preview if present
+            let clean = first_line.trim_end_matches("...");
+            if clean.len() <= 50 {
+                return first_line.to_string();
+            }
+            // Find a word boundary near 50 chars
+            let truncated = &clean[..clean.len().min(50)];
+            if let Some(last_space) = truncated.rfind(' ') {
+                if last_space > 20 {
+                    return format!("{}...", &clean[..last_space]);
+                }
+            }
+            // No good word boundary — truncate at char boundary
+            let mut end = 50.min(clean.len());
+            while end > 0 && !clean.is_char_boundary(end) {
+                end -= 1;
+            }
+            return format!("{}...", &clean[..end]);
+        }
+    }
+
+    // Fallback: date-based name
+    if !last_modified.is_empty() {
+        let iso = last_modified.trim_end_matches('Z');
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(iso, "%Y-%m-%dT%H:%M:%S") {
+            return format!("Session {}", dt.format("%b %-d, %H:%M"));
+        }
+    }
+
+    "Untitled session".to_string()
+}
+
+/// Strip known generic prefixes to get to the actual meaningful content.
+fn strip_generic_prefix(text: &str) -> &str {
+    let lower = text.to_lowercase();
+    for prefix in GENERIC_PREFIXES {
+        if lower.starts_with(&prefix.to_lowercase()) {
+            return text[prefix.len()..].trim();
+        }
+    }
+    text
+}
+
+/// Extract a preview from the first meaningful user message in a JSONL transcript.
+///
+/// Scans user records, skipping system-generated content (caveats, command
+/// markup, interruption notices) to find the actual user prompt. Returns
+/// up to ~80 characters of the first meaningful message.
 fn extract_first_user_preview(content: &str) -> Option<String> {
-    for line in content.lines().take(20) {
+    // Scan up to 50 lines to find a meaningful user message (system caveats
+    // and command records can consume the first 5-10 lines).
+    for line in content.lines().take(50) {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -485,7 +605,6 @@ fn extract_first_user_preview(content: &str) -> Option<String> {
         }
         if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
             if record.get("type").and_then(|t| t.as_str()) == Some("user") {
-                // Extract text from message.content
                 if let Some(content_val) = record.get("message").and_then(|m| m.get("content")) {
                     let text = if let Some(s) = content_val.as_str() {
                         s.to_string()
@@ -504,20 +623,28 @@ fn extract_first_user_preview(content: &str) -> Option<String> {
                         continue;
                     };
 
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        let preview = if trimmed.len() > 80 {
-                            // Find a valid char boundary at or before byte 80
-                            let mut end = 80;
-                            while end > 0 && !trimmed.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            format!("{}...", &trimmed[..end])
-                        } else {
-                            trimmed.to_string()
-                        };
-                        return Some(preview);
+                    // Skip system-generated and noise messages
+                    if is_system_or_noise(&text) {
+                        continue;
                     }
+
+                    // Strip XML tags that might be in the message
+                    let cleaned = strip_xml_tags(&text);
+                    let trimmed = cleaned.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    let preview = if trimmed.len() > 80 {
+                        let mut end = 80;
+                        while end > 0 && !trimmed.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}...", &trimmed[..end])
+                    } else {
+                        trimmed.to_string()
+                    };
+                    return Some(preview);
                 }
             }
         }
@@ -664,6 +791,44 @@ mod tests {
         let preview = extract_first_user_preview(&content).unwrap();
         assert!(preview.len() <= 84); // 80 chars + "..."
         assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn test_generate_display_name_from_message() {
+        let preview = Some("Fix the login bug so users can log in".to_string());
+        let name = generate_display_name(&preview, "2025-03-07T14:30:00Z");
+        assert_eq!(name, "Fix the login bug so users can log in");
+    }
+
+    #[test]
+    fn test_generate_display_name_truncates_long() {
+        let preview =
+            Some("Refactor the entire authentication system to use OAuth2 with PKCE flow and add refresh token rotation".to_string());
+        let name = generate_display_name(&preview, "2025-03-07T14:30:00Z");
+        assert!(name.len() <= 55); // ~50 chars + "..."
+        assert!(name.ends_with("..."));
+    }
+
+    #[test]
+    fn test_generate_display_name_fallback_to_date() {
+        let name = generate_display_name(&Some("/commit".to_string()), "2025-03-07T14:30:00Z");
+        assert!(name.starts_with("Session "));
+    }
+
+    #[test]
+    fn test_generate_display_name_fallback_no_message() {
+        let name = generate_display_name(&None, "2025-03-07T14:30:00Z");
+        assert!(name.starts_with("Session "));
+    }
+
+    #[test]
+    fn test_generate_display_name_strips_generic_prefix() {
+        let preview = Some(
+            "Implement the following plan:\n\n# UI Bridge Integration\n\nSome details..."
+                .to_string(),
+        );
+        let name = generate_display_name(&preview, "2025-03-07T14:30:00Z");
+        assert_eq!(name, "UI Bridge Integration");
     }
 
     #[test]

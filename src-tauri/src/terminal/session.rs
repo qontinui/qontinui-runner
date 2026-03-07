@@ -114,6 +114,14 @@ impl TerminalSession {
         // like Claude Code that check TERM for capability detection.
         cmd.env("TERM", "xterm-256color");
 
+        // Mark this terminal as running inside the Qontinui Runner so that tools
+        // (e.g. Claude Code via the shell integration wrapper) can detect the context.
+        cmd.env("QONTINUI_RUNNER_TERMINAL", "1");
+        cmd.env(
+            "QONTINUI_RUNNER_API_PORT",
+            crate::mcp::types::get_mcp_api_port().to_string(),
+        );
+
         // Spawn the child process
         let child = pair
             .slave

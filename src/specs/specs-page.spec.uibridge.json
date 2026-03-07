@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the Specs Viewer/Editor page -- a three-panel layout for viewing, editing, and managing project specifications of all types (page specs, architecture, API, data, dependency, constraint). The left panel shows a hierarchical spec tree grouped by application. The center panel shows spec details with inline editing capabilities. The right panel provides an AI chat for spec review, gap analysis, creation, and workflow building. Users can load bundled specs, discover specs from connected apps via UI Bridge, load/save spec files from disk, toggle edit mode for assertions/groups, and build verification workflows from specs.",
+  "description": "Specs Viewer/Editor page -- a three-panel layout for viewing, editing, and managing project specifications of all types (page specs, architecture, API, data, dependency, constraint). The left panel shows a hierarchical spec tree grouped by application. The center panel shows spec details with inline editing capabilities. The right panel provides an AI chat for spec review, gap analysis, creation, and workflow building. Users can load bundled specs, discover specs from connected apps via UI Bridge, load/save spec files from disk, toggle edit mode for assertions/groups, and build verification workflows from specs.",
   "groups": [
     {
       "id": "specs-page-layout",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specs" },
+            "criteria": {
+              "textContent": "Specs"
+            },
             "label": "Specs page heading"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "viewer" },
+            "criteria": {
+              "textContent": "viewer"
+            },
             "label": "Mode badge"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specifications" },
+            "criteria": {
+              "textContent": "Specifications"
+            },
             "label": "Left panel 'Specifications' heading"
           },
           "source": "manual",
@@ -61,7 +67,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "AI Chat" },
+            "criteria": {
+              "textContent": "AI Chat"
+            },
             "label": "AI Chat panel heading"
           },
           "source": "manual",
@@ -85,7 +93,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Bundled" },
+            "criteria": {
+              "textContent": "Bundled"
+            },
             "label": "Load bundled specs button"
           },
           "source": "manual",
@@ -100,7 +110,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "File" },
+            "criteria": {
+              "textContent": "File"
+            },
             "label": "Load from file button"
           },
           "source": "manual",
@@ -115,7 +127,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Discover" },
+            "criteria": {
+              "textContent": "Discover"
+            },
             "label": "Discover button"
           },
           "source": "manual",
@@ -130,7 +144,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "specs" },
+            "criteria": {
+              "textContent": "specs"
+            },
             "label": "Spec statistics"
           },
           "source": "manual",
@@ -145,7 +161,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Save" },
+            "criteria": {
+              "textContent": "Save"
+            },
             "label": "Save to file button"
           },
           "source": "manual",
@@ -160,7 +178,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Build Workflow" },
+            "criteria": {
+              "textContent": "Build Workflow"
+            },
             "label": "Build workflow button"
           },
           "source": "manual",
@@ -175,7 +195,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Edit" },
+            "criteria": {
+              "textContent": "Edit"
+            },
             "label": "Edit mode toggle button"
           },
           "source": "manual",
@@ -199,7 +221,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No specs loaded" },
+            "criteria": {
+              "textContent": "No specs loaded"
+            },
             "label": "Empty tree state message"
           },
           "source": "manual",
@@ -214,7 +238,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specifications" },
+            "criteria": {
+              "textContent": "Specifications"
+            },
             "label": "Spec tree with type icons"
           },
           "source": "manual",
@@ -229,7 +255,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specifications" },
+            "criteria": {
+              "textContent": "Specifications"
+            },
             "label": "Expandable spec tree"
           },
           "source": "manual",
@@ -244,7 +272,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specifications" },
+            "criteria": {
+              "textContent": "Specifications"
+            },
             "label": "Tree nodes with counts"
           },
           "source": "manual",
@@ -259,7 +289,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specifications" },
+            "criteria": {
+              "textContent": "Specifications"
+            },
             "label": "Selectable tree nodes"
           },
           "source": "manual",
@@ -283,7 +315,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "active-runs" },
+            "criteria": {
+              "textContent": "active-runs"
+            },
             "label": "Spec ID heading"
           },
           "source": "manual",
@@ -298,7 +332,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specs for the" },
+            "criteria": {
+              "textContent": "Specs for the"
+            },
             "label": "Spec description"
           },
           "source": "manual",
@@ -313,7 +349,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Categories" },
+            "criteria": {
+              "textContent": "Categories"
+            },
             "label": "Categories section"
           },
           "source": "manual",
@@ -328,7 +366,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Groups" },
+            "criteria": {
+              "textContent": "Groups"
+            },
             "label": "Groups list section"
           },
           "source": "manual",
@@ -343,7 +383,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Select a spec" },
+            "criteria": {
+              "textContent": "Select a spec"
+            },
             "label": "No selection placeholder"
           },
           "source": "manual",
@@ -367,7 +409,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Page Structure" },
+            "criteria": {
+              "textContent": "Page Structure"
+            },
             "label": "Group name heading"
           },
           "source": "manual",
@@ -382,7 +426,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "critical" },
+            "criteria": {
+              "textContent": "critical"
+            },
             "label": "Assertion severity badges"
           },
           "source": "manual",
@@ -397,7 +443,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "exists" },
+            "criteria": {
+              "textContent": "exists"
+            },
             "label": "Assertion with type badge"
           },
           "source": "manual",
@@ -421,7 +469,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Done" },
+            "criteria": {
+              "textContent": "Done"
+            },
             "label": "Edit mode with toggleable assertions"
           },
           "source": "manual",
@@ -436,7 +486,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Done" },
+            "criteria": {
+              "textContent": "Done"
+            },
             "label": "Edit mode with removable assertions"
           },
           "source": "manual",
@@ -451,7 +503,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Add assertion" },
+            "criteria": {
+              "textContent": "Add assertion"
+            },
             "label": "Add assertion form"
           },
           "source": "manual",
@@ -466,7 +520,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Add group" },
+            "criteria": {
+              "textContent": "Add group"
+            },
             "label": "Add group form"
           },
           "source": "manual",
@@ -481,7 +537,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Done" },
+            "criteria": {
+              "textContent": "Done"
+            },
             "label": "Edit mode with removable groups"
           },
           "source": "manual",
@@ -496,7 +554,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "editor" },
+            "criteria": {
+              "textContent": "editor"
+            },
             "label": "Editor mode badge"
           },
           "source": "manual",
@@ -520,7 +580,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Tech Stack" },
+            "criteria": {
+              "textContent": "Tech Stack"
+            },
             "label": "Architecture spec tech stack section"
           },
           "source": "manual",
@@ -535,7 +597,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Endpoints" },
+            "criteria": {
+              "textContent": "Endpoints"
+            },
             "label": "API spec endpoints section"
           },
           "source": "manual",
@@ -550,7 +614,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Entities" },
+            "criteria": {
+              "textContent": "Entities"
+            },
             "label": "Data spec entities section"
           },
           "source": "manual",
@@ -565,7 +631,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Modules" },
+            "criteria": {
+              "textContent": "Modules"
+            },
             "label": "Dependency spec modules section"
           },
           "source": "manual",
@@ -580,7 +648,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Performance Budgets" },
+            "criteria": {
+              "textContent": "Performance Budgets"
+            },
             "label": "Constraint spec performance section"
           },
           "source": "manual",
@@ -604,7 +674,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Review" },
+            "criteria": {
+              "textContent": "Review"
+            },
             "label": "Review mode toggle"
           },
           "source": "manual",
@@ -619,7 +691,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Create" },
+            "criteria": {
+              "textContent": "Create"
+            },
             "label": "Create mode toggle"
           },
           "source": "manual",
@@ -634,7 +708,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Review spec quality" },
+            "criteria": {
+              "textContent": "Review spec quality"
+            },
             "label": "Review spec quality quick action"
           },
           "source": "manual",
@@ -649,7 +725,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "AI Chat" },
+            "criteria": {
+              "textContent": "AI Chat"
+            },
             "label": "Chat input area"
           },
           "source": "manual",
@@ -664,7 +742,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "AI Chat" },
+            "criteria": {
+              "textContent": "AI Chat"
+            },
             "label": "Send/stop button"
           },
           "source": "manual",
@@ -679,7 +759,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "AI Chat" },
+            "criteria": {
+              "textContent": "AI Chat"
+            },
             "label": "AI message display"
           },
           "source": "manual",
@@ -694,7 +776,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Apply as" },
+            "criteria": {
+              "textContent": "Apply as"
+            },
             "label": "Apply spec JSON button"
           },
           "source": "manual",
@@ -709,7 +793,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Build verification workflow" },
+            "criteria": {
+              "textContent": "Build verification workflow"
+            },
             "label": "Build workflow from chat"
           },
           "source": "manual",
@@ -724,7 +810,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "New" },
+            "criteria": {
+              "textContent": "New"
+            },
             "label": "New session button"
           },
           "source": "manual",
@@ -748,7 +836,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "File" },
+            "criteria": {
+              "textContent": "File"
+            },
             "label": "File load with auto-detection"
           },
           "source": "manual",
@@ -763,7 +853,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Save" },
+            "criteria": {
+              "textContent": "Save"
+            },
             "label": "Save with correct extension"
           },
           "source": "manual",
@@ -778,7 +870,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specifications" },
+            "criteria": {
+              "textContent": "Specifications"
+            },
             "label": "Auto-select loaded spec"
           },
           "source": "manual",
@@ -802,7 +896,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Build Workflow" },
+            "criteria": {
+              "textContent": "Build Workflow"
+            },
             "label": "Page spec workflow generation"
           },
           "source": "manual",
@@ -817,7 +913,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Build Workflow" },
+            "criteria": {
+              "textContent": "Build Workflow"
+            },
             "label": "Non-page spec workflow generation"
           },
           "source": "manual",
@@ -832,7 +930,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Build Workflow" },
+            "criteria": {
+              "textContent": "Build Workflow"
+            },
             "label": "Auto-navigate to workflow builder"
           },
           "source": "manual",
@@ -856,7 +956,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "http://localhost:3001" },
+            "criteria": {
+              "textContent": "http://localhost:3001"
+            },
             "label": "URL input with default"
           },
           "source": "manual",
@@ -871,7 +973,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Discover" },
+            "criteria": {
+              "textContent": "Discover"
+            },
             "label": "Connection status indicators"
           },
           "source": "manual",
@@ -886,7 +990,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Discover" },
+            "criteria": {
+              "textContent": "Discover"
+            },
             "label": "Spec merge behavior"
           },
           "source": "manual",
@@ -901,7 +1007,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "http://localhost:3001" },
+            "criteria": {
+              "textContent": "http://localhost:3001"
+            },
             "label": "Enter key triggers discovery"
           },
           "source": "manual",
@@ -919,6 +1027,7 @@
     "updatedAt": "2026-03-06T00:00:00.000Z",
     "pageUrl": "/specs",
     "elementSource": "sdk",
-    "tags": ["specs", "viewer", "editor", "ai-chat", "workflow-builder", "spec-tree", "ui-bridge"]
+    "tags": ["specs", "viewer", "editor", "ai-chat", "workflow-builder", "spec-tree", "ui-bridge"],
+    "specType": "semantic"
   }
 }

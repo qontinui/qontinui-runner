@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Run Statistics page — displays execution performance metrics for a workflow configuration. Provides two views: Overview (config health, flaky items, run history, error patterns) and Performance (action timing, success trends, transition reliability). Shows config-level automation statistics rather than individual task run statistics.",
+  "description": "Run Statistics page — displays execution performance metrics for a workflow configuration. Provides two views: Overview (config health, flaky items, run history, error patterns) and Performance (action timing, success trends, transition reliability). Shows config-level automation statistics rather than individual task run statistics.",
   "groups": [
     {
       "id": "statistics-overview-dashboard",
@@ -15,7 +15,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Statistics|Health" },
+            "criteria": {
+              "textContent": "Statistics|Health"
+            },
             "label": "Config health panel"
           },
           "assertionType": "exists",
@@ -30,7 +32,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "flaky|Flaky|unreliable" },
+            "criteria": {
+              "textContent": "flaky|Flaky|unreliable"
+            },
             "label": "Flaky items list"
           },
           "assertionType": "exists",
@@ -45,7 +49,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "history|runs|recent" },
+            "criteria": {
+              "textContent": "history|runs|recent"
+            },
             "label": "Run history panel"
           },
           "assertionType": "exists",
@@ -60,7 +66,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "error|pattern" },
+            "criteria": {
+              "textContent": "error|pattern"
+            },
             "label": "Error patterns panel"
           },
           "assertionType": "exists",
@@ -84,7 +92,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Overview|Performance" },
+            "criteria": {
+              "textContent": "Overview|Performance"
+            },
             "label": "View mode toggle"
           },
           "assertionType": "exists",
@@ -99,7 +109,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Performance|timing|duration" },
+            "criteria": {
+              "textContent": "Performance|timing|duration"
+            },
             "label": "Performance metrics"
           },
           "assertionType": "exists",
@@ -114,7 +126,10 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Refresh|refresh" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Refresh|refresh"
+            },
             "label": "Refresh statistics button"
           },
           "assertionType": "exists",
@@ -138,7 +153,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Run detail interaction"
           },
           "assertionType": "exists",
@@ -153,7 +170,10 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Close" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Close"
+            },
             "label": "Close detail panel"
           },
           "assertionType": "exists",
@@ -177,7 +197,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Load a configuration|No Run Selected" },
+            "criteria": {
+              "textContent": "Load a configuration|No Run Selected"
+            },
             "label": "No config loaded message"
           },
           "assertionType": "exists",
@@ -192,7 +214,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No statistics|Run some workflows" },
+            "criteria": {
+              "textContent": "No statistics|Run some workflows"
+            },
             "label": "No data available message"
           },
           "assertionType": "exists",
@@ -207,7 +231,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "role": "status" },
+            "criteria": {
+              "role": "status"
+            },
             "label": "Loading spinner"
           },
           "assertionType": "exists",

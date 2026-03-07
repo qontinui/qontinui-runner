@@ -18,6 +18,11 @@ import { ProgressChartPanel } from "./ProgressChartPanel";
 import { FindingListPanel } from "./FindingListPanel";
 import { ChecklistPanel } from "./ChecklistPanel";
 import { ArchitectureGraphPanel } from "./ArchitectureGraphPanel";
+import { SummaryStatsPanel } from "./SummaryStatsPanel";
+import { StateTimelinePanel } from "./StateTimelinePanel";
+import { WaterfallPanel } from "./WaterfallPanel";
+import { SparklinePanel } from "./SparklinePanel";
+import { WaffleChartPanel } from "./WaffleChartPanel";
 
 /**
  * Props that all canvas panel components receive.
@@ -59,6 +64,11 @@ const COMPONENT_MAP: Record<string, ComponentType<CanvasPanelComponentProps>> = 
   FindingList: FindingListPanel,
   Checklist: ChecklistPanel,
   ArchitectureGraph: ArchitectureGraphPanel,
+  SummaryStats: SummaryStatsPanel,
+  StateTimeline: StateTimelinePanel,
+  Waterfall: WaterfallPanel,
+  Sparkline: SparklinePanel,
+  WaffleChart: WaffleChartPanel,
 };
 
 /**

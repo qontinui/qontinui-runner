@@ -64,6 +64,10 @@ struct SnapshotAssertion {
     #[serde(default)]
     criteria: serde_json::Map<String, serde_json::Value>,
     expected: Option<String>,
+    #[serde(default)]
+    related_criteria: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    min_gap: Option<f64>,
 }
 
 fn default_assertion_type() -> String {
@@ -176,6 +180,188 @@ fn evaluate_snapshot_assertion(
                 )
             }
         }
+        "noOverlap" => {
+            let related = match &assertion.related_criteria {
+                Some(rc) if !rc.is_empty() => rc,
+                _ => {
+                    return (
+                        false,
+                        "noOverlap assertion requires 'relatedCriteria' to identify the second element".to_string(),
+                    );
+                }
+            };
+
+            if matching.is_empty() {
+                return (
+                    false,
+                    format!(
+                        "No element found matching criteria {:?}",
+                        criteria_summary(&assertion.criteria)
+                    ),
+                );
+            }
+
+            let related_matching: Vec<&serde_json::Value> = elements
+                .iter()
+                .filter(|el| element_matches_criteria(el, related))
+                .collect();
+
+            if related_matching.is_empty() {
+                return (
+                    false,
+                    format!(
+                        "No element found matching relatedCriteria {:?}",
+                        criteria_summary(related)
+                    ),
+                );
+            }
+
+            let a = matching[0];
+            let b = related_matching[0];
+
+            let a_rect = match extract_rect(a) {
+                Some(r) => r,
+                None => {
+                    return (
+                        false,
+                        format!(
+                            "Could not extract rect from element matching {:?}",
+                            criteria_summary(&assertion.criteria)
+                        ),
+                    );
+                }
+            };
+            let b_rect = match extract_rect(b) {
+                Some(r) => r,
+                None => {
+                    return (
+                        false,
+                        format!(
+                            "Could not extract rect from element matching {:?}",
+                            criteria_summary(related)
+                        ),
+                    );
+                }
+            };
+
+            let (_a_x, _a_y, _a_w, _a_h, a_top, a_right, a_bottom, a_left) = a_rect;
+            let (_b_x, _b_y, _b_w, _b_h, b_top, b_right, b_bottom, b_left) = b_rect;
+
+            let overlaps =
+                a_right > b_left && a_left < b_right && a_bottom > b_top && a_top < b_bottom;
+
+            if overlaps {
+                (
+                    false,
+                    format!(
+                        "Elements overlap: A(left={}, top={}, right={}, bottom={}) B(left={}, top={}, right={}, bottom={})",
+                        a_left, a_top, a_right, a_bottom, b_left, b_top, b_right, b_bottom
+                    ),
+                )
+            } else {
+                (true, "Elements do not overlap".to_string())
+            }
+        }
+        "minSpacing" => {
+            let related = match &assertion.related_criteria {
+                Some(rc) if !rc.is_empty() => rc,
+                _ => {
+                    return (
+                        false,
+                        "minSpacing assertion requires 'relatedCriteria' to identify the second element".to_string(),
+                    );
+                }
+            };
+
+            if matching.is_empty() {
+                return (
+                    false,
+                    format!(
+                        "No element found matching criteria {:?}",
+                        criteria_summary(&assertion.criteria)
+                    ),
+                );
+            }
+
+            let related_matching: Vec<&serde_json::Value> = elements
+                .iter()
+                .filter(|el| element_matches_criteria(el, related))
+                .collect();
+
+            if related_matching.is_empty() {
+                return (
+                    false,
+                    format!(
+                        "No element found matching relatedCriteria {:?}",
+                        criteria_summary(related)
+                    ),
+                );
+            }
+
+            let a = matching[0];
+            let b = related_matching[0];
+
+            let a_rect = match extract_rect(a) {
+                Some(r) => r,
+                None => {
+                    return (
+                        false,
+                        format!(
+                            "Could not extract rect from element matching {:?}",
+                            criteria_summary(&assertion.criteria)
+                        ),
+                    );
+                }
+            };
+            let b_rect = match extract_rect(b) {
+                Some(r) => r,
+                None => {
+                    return (
+                        false,
+                        format!(
+                            "Could not extract rect from element matching {:?}",
+                            criteria_summary(related)
+                        ),
+                    );
+                }
+            };
+
+            let (_a_x, _a_y, _a_w, _a_h, a_top, a_right, a_bottom, a_left) = a_rect;
+            let (_b_x, _b_y, _b_w, _b_h, b_top, b_right, b_bottom, b_left) = b_rect;
+
+            let h_gap = f64::max(b_left - a_right, a_left - b_right);
+            let v_gap = f64::max(b_top - a_bottom, a_top - b_bottom);
+
+            let actual_gap = if h_gap > 0.0 && v_gap > 0.0 {
+                f64::min(h_gap, v_gap)
+            } else if h_gap > 0.0 {
+                h_gap
+            } else if v_gap > 0.0 {
+                v_gap
+            } else {
+                0.0
+            };
+
+            let required = assertion.min_gap.unwrap_or(0.0);
+
+            if actual_gap >= required {
+                (
+                    true,
+                    format!(
+                        "Spacing {:.1}px meets minimum {:.1}px",
+                        actual_gap, required
+                    ),
+                )
+            } else {
+                (
+                    false,
+                    format!(
+                        "Spacing {:.1}px is less than required {:.1}px (A: left={}, top={}, right={}, bottom={} | B: left={}, top={}, right={}, bottom={})",
+                        actual_gap, required, a_left, a_top, a_right, a_bottom, b_left, b_top, b_right, b_bottom
+                    ),
+                )
+            }
+        }
         other => (
             false,
             format!(
@@ -278,6 +464,21 @@ fn criteria_summary(criteria: &serde_json::Map<String, serde_json::Value>) -> St
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Extract bounding rect from an element's `state.rect` object.
+/// Returns (x, y, width, height, top, right, bottom, left) or None if missing.
+fn extract_rect(element: &serde_json::Value) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)> {
+    let rect = element.get("state")?.get("rect")?;
+    let x = rect.get("x")?.as_f64()?;
+    let y = rect.get("y")?.as_f64()?;
+    let width = rect.get("width")?.as_f64()?;
+    let height = rect.get("height")?.as_f64()?;
+    let top = rect.get("top")?.as_f64().unwrap_or(y);
+    let right = rect.get("right")?.as_f64().unwrap_or(x + width);
+    let bottom = rect.get("bottom")?.as_f64().unwrap_or(y + height);
+    let left = rect.get("left")?.as_f64().unwrap_or(x);
+    Some((x, y, width, height, top, right, bottom, left))
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +843,38 @@ impl StepHandler for UiBridgeHandler {
             return result;
         }
 
+        // Handle element_action: forward click/type/etc. to the SDK's action endpoint
+        if action == "element_action" {
+            let result = self
+                .execute_element_action(step, base_url, timeout_ms)
+                .await;
+            self.track_result(context, base_url, &result).await;
+            return result;
+        }
+
+        // Handle wait_for_element: poll snapshot until element appears
+        if action == "wait_for_element" {
+            let result = self
+                .execute_wait_for_element(step, base_url, timeout_ms)
+                .await;
+            self.track_result(context, base_url, &result).await;
+            return result;
+        }
+
+        // Handle wait: simple delay
+        if action == "wait" {
+            let ms: u64 = step
+                .ui_bridge_target
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000);
+            info!("UI Bridge wait: {}ms", ms);
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            return StepHandlerResult::success_with_data(
+                serde_json::json!({ "action": "wait", "duration_ms": ms }),
+            );
+        }
+
         // Handle snapshot_assert: fetch snapshot once, evaluate all assertions locally
         if action == "snapshot_assert" {
             let result = self
@@ -943,6 +1176,250 @@ impl UiBridgeHandler {
             Err(e) => {
                 warn!("AI diagnosis task panicked for {}: {}", base_url, e);
             }
+        }
+    }
+
+    /// Execute an "element_action" — find element by criteria and perform an action.
+    /// Target JSON: { "action": "click"|"type", "criteria": {...}, "params": {...} }
+    async fn execute_element_action(
+        &self,
+        step: &ExecutionStepConfig,
+        base_url: &str,
+        timeout_ms: u64,
+    ) -> StepHandlerResult {
+        let target_json = step.ui_bridge_target.as_deref().unwrap_or("{}");
+        let target: serde_json::Value = match serde_json::from_str(target_json) {
+            Ok(v) => v,
+            Err(e) => {
+                return StepHandlerResult::failure(format!(
+                    "Failed to parse element_action target: {}",
+                    e
+                ));
+            }
+        };
+
+        let action_name = target
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("click");
+        let criteria = target
+            .get("criteria")
+            .and_then(|c| c.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let params = target
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+
+        // Fetch snapshot to find element ID matching criteria
+        let snapshot_target = step
+            .ui_bridge_snapshot_target
+            .as_deref()
+            .unwrap_or("control");
+        let snapshot_endpoint = match snapshot_target {
+            "sdk" => format!("{}/sdk/snapshot", base_url.trim_end_matches('/')),
+            "control" => format!("{}/control/snapshot", base_url.trim_end_matches('/')),
+            t if t.starts_with("proxy:") => {
+                let port = &t["proxy:".len()..];
+                format!("http://127.0.0.1:{}/__ui-bridge/control/snapshot", port)
+            }
+            other => {
+                return StepHandlerResult::failure(format!("Unknown snapshot target: '{}'", other));
+            }
+        };
+
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(timeout_ms))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return StepHandlerResult::failure(format!("Failed to create HTTP client: {}", e));
+            }
+        };
+
+        // Get snapshot and find matching element
+        let snapshot_resp = match client.get(&snapshot_endpoint).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return StepHandlerResult::failure(format!("Failed to fetch snapshot: {}", e));
+            }
+        };
+
+        let snapshot: serde_json::Value = match snapshot_resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return StepHandlerResult::failure(format!("Failed to parse snapshot: {}", e));
+            }
+        };
+
+        let elements = snapshot
+            .get("data")
+            .and_then(|d| d.get("elements"))
+            .or_else(|| snapshot.get("elements"))
+            .and_then(|e| e.as_array());
+
+        let elements = match elements {
+            Some(e) => e,
+            None => {
+                return StepHandlerResult::failure("Snapshot does not contain elements array");
+            }
+        };
+
+        let matching: Vec<&serde_json::Value> = elements
+            .iter()
+            .filter(|el| element_matches_criteria(el, &criteria))
+            .collect();
+
+        if matching.is_empty() {
+            return StepHandlerResult::failure(format!(
+                "No element found matching criteria {:?} for {} action",
+                criteria_summary(&criteria),
+                action_name
+            ));
+        }
+
+        let element_id = matching[0]
+            .get("id")
+            .and_then(|id| id.as_str())
+            .unwrap_or("");
+
+        info!(
+            "element_action: {} on element '{}' (criteria: {:?})",
+            action_name,
+            element_id,
+            criteria_summary(&criteria)
+        );
+
+        // Execute action via the SDK's action endpoint
+        let action_endpoint = format!(
+            "{}/control/elements/{}/action",
+            base_url.trim_end_matches('/'),
+            element_id
+        );
+        let body = serde_json::json!({
+            "action": action_name,
+            "params": params,
+        });
+
+        match client.post(&action_endpoint).json(&body).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let resp_body: serde_json::Value =
+                    resp.json().await.unwrap_or(serde_json::json!({}));
+                if status.is_success() {
+                    StepHandlerResult::success_with_data(serde_json::json!({
+                        "action": "element_action",
+                        "elementAction": action_name,
+                        "elementId": element_id,
+                        "result": resp_body,
+                    }))
+                } else {
+                    StepHandlerResult::failure(format!(
+                        "Action {} failed on element '{}': {} - {}",
+                        action_name, element_id, status, resp_body
+                    ))
+                }
+            }
+            Err(e) => StepHandlerResult::failure(format!(
+                "Failed to execute action {}: {}",
+                action_name, e
+            )),
+        }
+    }
+
+    /// Execute a "wait_for_element" — poll snapshot until an element matching criteria appears.
+    /// Target JSON: { "criteria": {...}, "timeout": 5000 }
+    async fn execute_wait_for_element(
+        &self,
+        step: &ExecutionStepConfig,
+        base_url: &str,
+        _timeout_ms: u64,
+    ) -> StepHandlerResult {
+        let target_json = step.ui_bridge_target.as_deref().unwrap_or("{}");
+        let target: serde_json::Value = match serde_json::from_str(target_json) {
+            Ok(v) => v,
+            Err(e) => {
+                return StepHandlerResult::failure(format!(
+                    "Failed to parse wait_for_element target: {}",
+                    e
+                ));
+            }
+        };
+
+        let criteria = target
+            .get("criteria")
+            .and_then(|c| c.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let timeout_ms = target
+            .get("timeout")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(5000);
+
+        let snapshot_target = step
+            .ui_bridge_snapshot_target
+            .as_deref()
+            .unwrap_or("control");
+        let snapshot_endpoint = match snapshot_target {
+            "sdk" => format!("{}/sdk/snapshot", base_url.trim_end_matches('/')),
+            "control" => format!("{}/control/snapshot", base_url.trim_end_matches('/')),
+            t if t.starts_with("proxy:") => {
+                let port = &t["proxy:".len()..];
+                format!("http://127.0.0.1:{}/__ui-bridge/control/snapshot", port)
+            }
+            other => {
+                return StepHandlerResult::failure(format!("Unknown snapshot target: '{}'", other));
+            }
+        };
+
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return StepHandlerResult::failure(format!("Failed to create HTTP client: {}", e));
+            }
+        };
+
+        let start = std::time::Instant::now();
+        let poll_interval = std::time::Duration::from_millis(500);
+        let deadline = std::time::Duration::from_millis(timeout_ms);
+
+        loop {
+            if let Ok(resp) = client.get(&snapshot_endpoint).send().await {
+                if let Ok(snapshot) = resp.json::<serde_json::Value>().await {
+                    let elements = snapshot
+                        .get("data")
+                        .and_then(|d| d.get("elements"))
+                        .or_else(|| snapshot.get("elements"))
+                        .and_then(|e| e.as_array());
+
+                    if let Some(els) = elements {
+                        let found = els.iter().any(|el| element_matches_criteria(el, &criteria));
+                        if found {
+                            let elapsed = start.elapsed().as_millis();
+                            return StepHandlerResult::success_with_data(serde_json::json!({
+                                "action": "wait_for_element",
+                                "found": true,
+                                "elapsed_ms": elapsed,
+                            }));
+                        }
+                    }
+                }
+            }
+
+            if start.elapsed() >= deadline {
+                return StepHandlerResult::failure(format!(
+                    "Timed out after {}ms waiting for element matching {:?}",
+                    timeout_ms,
+                    criteria_summary(&criteria)
+                ));
+            }
+
+            tokio::time::sleep(poll_interval).await;
         }
     }
 

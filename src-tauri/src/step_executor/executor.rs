@@ -45,6 +45,7 @@ use crate::iteration_bundle::{
 use crate::orchestrator::context_propagation::{
     ExpressionEvaluator, RuntimeContext, SharedVariableStore,
 };
+use crate::str_utils::truncate_str;
 use crate::unified_workflow_executor::get_parent_task_id;
 
 // Handler system imports
@@ -995,7 +996,7 @@ fn extract_text_from_output_data(output_data: &Option<serde_json::Value>) -> Opt
     if json_str.len() > 4000 {
         Some(format!(
             "{}...\n[truncated, {} more chars]",
-            &json_str[..4000],
+            truncate_str(&json_str, 4000),
             json_str.len() - 4000
         ))
     } else {
@@ -1113,7 +1114,7 @@ impl VerificationPhaseResult {
                             let truncated = if stdout.len() > 2000 {
                                 format!(
                                     "{}...\n[truncated, {} more chars]",
-                                    &stdout[..2000],
+                                    truncate_str(stdout, 2000),
                                     stdout.len() - 2000
                                 )
                             } else {
@@ -1125,7 +1126,7 @@ impl VerificationPhaseResult {
                     if let Some(stderr) = &details.stderr {
                         if !stderr.is_empty() {
                             let truncated = if stderr.len() > 1000 {
-                                format!("{}...\n[truncated]", &stderr[..1000])
+                                format!("{}...\n[truncated]", truncate_str(stderr, 1000))
                             } else {
                                 stderr.clone()
                             };
@@ -1183,7 +1184,7 @@ impl VerificationPhaseResult {
                                         let truncated = if output.len() > 3000 {
                                             format!(
                                                 "{}...\n[truncated, {} more chars]",
-                                                &output[..3000],
+                                                truncate_str(output, 3000),
                                                 output.len() - 3000
                                             )
                                         } else {
@@ -2688,7 +2689,7 @@ impl StepExecutor {
                 let step_name = step.name.clone().unwrap_or_else(|| "AI Prompt".to_string());
                 let prompt_text = step.prompt_content.clone().unwrap_or_default();
                 let prompt_preview = if prompt_text.len() > 100 {
-                    format!("{}...", &prompt_text[..100])
+                    format!("{}...", truncate_str(&prompt_text, 100))
                 } else {
                     prompt_text.clone()
                 };
@@ -4012,7 +4013,7 @@ impl StepExecutor {
 
         // Truncate command for display (first 50 chars)
         let command_display = if command.len() > 50 {
-            format!("{}...", &command[..50])
+            format!("{}...", truncate_str(&command, 50))
         } else {
             command.clone()
         };
@@ -4194,12 +4195,12 @@ impl StepExecutor {
 
         // Truncate stdout/stderr for display
         let stdout_display = if stdout.len() > 200 {
-            format!("{}...", &stdout[..200])
+            format!("{}...", truncate_str(&stdout, 200))
         } else {
             stdout.clone()
         };
         let stderr_display = if stderr.len() > 200 {
-            format!("{}...", &stderr[..200])
+            format!("{}...", truncate_str(&stderr, 200))
         } else {
             stderr.clone()
         };
@@ -4614,7 +4615,7 @@ impl StepExecutor {
 
         // Truncate command for display
         let command_display = if final_command.len() > 50 {
-            format!("{}...", &final_command[..50])
+            format!("{}...", truncate_str(&final_command, 50))
         } else {
             final_command.clone()
         };

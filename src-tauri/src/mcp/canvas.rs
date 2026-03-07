@@ -38,6 +38,11 @@ const ALLOWED_COMPONENTS: &[&str] = &[
     "ProgressChart",
     "FindingList",
     "Checklist",
+    "SummaryStats",
+    "StateTimeline",
+    "Waterfall",
+    "Sparkline",
+    "WaffleChart",
 ];
 
 /// In-memory canvas state.
@@ -464,6 +469,11 @@ mod tests {
         assert!(ALLOWED_COMPONENTS.contains(&"Markdown"));
         assert!(ALLOWED_COMPONENTS.contains(&"Table"));
         assert!(ALLOWED_COMPONENTS.contains(&"CodeDiff"));
+        assert!(ALLOWED_COMPONENTS.contains(&"SummaryStats"));
+        assert!(ALLOWED_COMPONENTS.contains(&"StateTimeline"));
+        assert!(ALLOWED_COMPONENTS.contains(&"Waterfall"));
+        assert!(ALLOWED_COMPONENTS.contains(&"Sparkline"));
+        assert!(ALLOWED_COMPONENTS.contains(&"WaffleChart"));
         assert!(!ALLOWED_COMPONENTS.contains(&"arbitrary_html"));
     }
 

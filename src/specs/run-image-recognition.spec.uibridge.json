@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Run Image Recognition page (dev-only) — displays all image template matching attempts during a workflow run, including confidence scores, matched regions, and annotated screenshots showing detection results.",
+  "description": "Run Image Recognition page (dev-only) — displays all image template matching attempts during a workflow run, including confidence scores, matched regions, and annotated screenshots showing detection results.",
   "groups": [
     {
       "id": "image-recognition-results-browsing",
@@ -15,7 +15,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "image|recognition|match" },
+            "criteria": {
+              "textContent": "image|recognition|match"
+            },
             "label": "Image recognition results table"
           },
           "assertionType": "exists",
@@ -30,7 +32,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "role": "row" },
+            "criteria": {
+              "role": "row"
+            },
             "label": "Clickable image recognition row"
           },
           "assertionType": "exists",
@@ -45,7 +49,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "confidence|score|match" },
+            "criteria": {
+              "textContent": "confidence|score|match"
+            },
             "label": "Confidence score display"
           },
           "assertionType": "exists",
@@ -69,7 +75,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "img" },
+            "criteria": {
+              "role": "img"
+            },
             "label": "Annotated screenshot"
           },
           "assertionType": "exists",
@@ -84,7 +92,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "not found|failed|no match" },
+            "criteria": {
+              "textContent": "not found|failed|no match"
+            },
             "label": "Failed match indicator"
           },
           "assertionType": "exists",
@@ -99,7 +109,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "x|y|coordinate|region" },
+            "criteria": {
+              "textContent": "x|y|coordinate|region"
+            },
             "label": "Coordinate information"
           },
           "assertionType": "exists",
@@ -123,7 +135,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No image recognition" },
+            "criteria": {
+              "textContent": "No image recognition"
+            },
             "label": "Empty state message"
           },
           "assertionType": "exists",

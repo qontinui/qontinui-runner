@@ -167,8 +167,18 @@ export function SpecTree({ tree, expandedNodes, selection, onToggle, onSelect }:
     );
   }
 
+  // Show app name header when all specs are from the same app (no app grouping in tree)
+  const firstAppName = tree[0]?.appName;
+  const singleApp =
+    firstAppName && tree.every((n) => n.appName === firstAppName) ? firstAppName : null;
+
   return (
     <div className="py-1">
+      {singleApp && (
+        <div className="px-3 py-1 text-[10px] font-medium text-cyan-400/70 uppercase tracking-wider">
+          {singleApp}
+        </div>
+      )}
       {tree.map((node) => {
         const expanded = expandedNodes.has(node.id);
         const selected =

@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Run Tests page — displays Playwright test results and verification phase results for a workflow run. Shows pass/fail summaries, individual test cards with assertions, console output, failure screenshots, error messages, and iteration-grouped verification results.",
+  "description": "Run Tests page — displays Playwright test results and verification phase results for a workflow run. Shows pass/fail summaries, individual test cards with assertions, console output, failure screenshots, error messages, and iteration-grouped verification results.",
   "groups": [
     {
       "id": "tests-summary-overview",
@@ -15,7 +15,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "passed|failed|total" },
+            "criteria": {
+              "textContent": "passed|failed|total"
+            },
             "label": "Test results summary"
           },
           "assertionType": "exists",
@@ -30,7 +32,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Verification|iteration" },
+            "criteria": {
+              "textContent": "Verification|iteration"
+            },
             "label": "Loop result summary"
           },
           "assertionType": "exists",
@@ -45,7 +49,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Test Results" },
+            "criteria": {
+              "textContent": "Test Results"
+            },
             "label": "Test results heading"
           },
           "assertionType": "exists",
@@ -69,7 +75,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Iteration" },
+            "criteria": {
+              "textContent": "Iteration"
+            },
             "label": "Iteration group header"
           },
           "assertionType": "exists",
@@ -84,7 +92,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Verification Step|step" },
+            "criteria": {
+              "textContent": "Verification Step|step"
+            },
             "label": "Verification step card"
           },
           "assertionType": "exists",
@@ -99,7 +109,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Error|Console Output" },
+            "criteria": {
+              "textContent": "Error|Console Output"
+            },
             "label": "Error details section"
           },
           "assertionType": "exists",
@@ -114,7 +126,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "assertions" },
+            "criteria": {
+              "textContent": "assertions"
+            },
             "label": "Assertions count"
           },
           "assertionType": "exists",
@@ -138,7 +152,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Playwright" },
+            "criteria": {
+              "textContent": "Playwright"
+            },
             "label": "Playwright results section"
           },
           "assertionType": "exists",
@@ -153,7 +169,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Failure Screenshot" },
+            "criteria": {
+              "textContent": "Failure Screenshot"
+            },
             "label": "Failure screenshot section"
           },
           "assertionType": "exists",
@@ -168,7 +186,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Page Snapshot" },
+            "criteria": {
+              "textContent": "Page Snapshot"
+            },
             "label": "Page snapshot section"
           },
           "assertionType": "exists",
@@ -192,7 +212,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Select a run" },
+            "criteria": {
+              "textContent": "Select a run"
+            },
             "label": "No run selected message"
           },
           "assertionType": "exists",
@@ -207,7 +229,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "after the run completes" },
+            "criteria": {
+              "textContent": "after the run completes"
+            },
             "label": "Run in progress message"
           },
           "assertionType": "exists",
@@ -222,7 +246,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No test results" },
+            "criteria": {
+              "textContent": "No test results"
+            },
             "label": "No results message"
           },
           "assertionType": "exists",

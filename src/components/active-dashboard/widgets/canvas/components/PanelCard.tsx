@@ -93,6 +93,47 @@ function serializePanelData(panel: CanvasPanel): string {
       return segments.map((s) => `${s.label}: ${s.value}`).join("\n");
     }
 
+    case "SummaryStats": {
+      const total = (data.total as number) ?? 0;
+      const passed = (data.passed as number) ?? 0;
+      const failed = (data.failed as number) ?? 0;
+      const skipped = (data.skipped as number) ?? 0;
+      return `Passed: ${passed}, Failed: ${failed}, Skipped: ${skipped}, Total: ${total}`;
+    }
+
+    case "StateTimeline": {
+      const steps =
+        (data.steps as Array<{ name: string; iterations: Array<{ status: string }> }>) ?? [];
+      return steps
+        .map((s) => `${s.name}: ${s.iterations.map((i) => i.status).join(", ")}`)
+        .join("\n");
+    }
+
+    case "Waterfall": {
+      const entries =
+        (data.entries as Array<{ name: string; duration_ms: number; status?: string }>) ?? [];
+      return entries
+        .map((e) => `${e.name}: ${e.duration_ms}ms (${e.status ?? "unknown"})`)
+        .join("\n");
+    }
+
+    case "Sparkline": {
+      const series =
+        (data.series as Array<{ name: string; values: Array<{ outcome: string }> }>) ?? [];
+      return series.map((s) => `${s.name}: ${s.values.map((v) => v.outcome).join(",")}`).join("\n");
+    }
+
+    case "WaffleChart": {
+      const cells = (data.cells as Array<{ label: string; status: string }>) ?? [];
+      const counts: Record<string, number> = {};
+      cells.forEach((c) => {
+        counts[c.status] = (counts[c.status] ?? 0) + 1;
+      });
+      return Object.entries(counts)
+        .map(([k, v]) => `${k}: ${v}`)
+        .join(", ");
+    }
+
     default:
       return JSON.stringify(data, null, 2);
   }
@@ -140,7 +181,7 @@ export function PanelCard({ panel, isExpanded, onToggle, onMaximize, readOnly }:
   const roseColors = getAccentColors("rose");
 
   return (
-    <div className="border-b border-border/50 last:border-b-0">
+    <div className="border-b border-border/50 last:border-b-0 animate-panelEnter">
       {/* Panel header */}
       <button
         type="button"
@@ -198,7 +239,7 @@ export function PanelCard({ panel, isExpanded, onToggle, onMaximize, readOnly }:
       {isExpanded && (
         <div
           className={cn(
-            "border-l-2 border-primary bg-muted/20 px-4 py-3 animate-slideDown",
+            "border-l-2 border-primary bg-muted/20 px-4 py-3 animate-slideDown transition-all",
             panel.size === "compact"
               ? "max-h-[200px]"
               : panel.size === "large"

@@ -24,6 +24,8 @@ import type { Finding } from "@/types/findings";
 import { WorkflowPreviewPanel } from "@qontinui/workflow-ui";
 import type { UnifiedWorkflow, CanvasPanel } from "@qontinui/shared-types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { parsePlanMarkdown, summarizeParsedPlan } from "@/lib/workflow-builder/parsePlanMarkdown";
+import { buildPlanWorkflow } from "@/lib/workflow-builder/buildPlanWorkflow";
 
 interface CommandResponse {
   success: boolean;
@@ -247,6 +249,13 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
       const tabId = await createTerminal(tabTitle, session.project_path);
       if (!tabId) return;
 
+      // Track which Claude session is running in this tab so "Generate Workflow"
+      // can find the correct transcript instead of picking a random recent session.
+      updateTab(tabId, {
+        claudeSessionId: session.session_id,
+        claudeConfigDir: session.config_dir,
+      });
+
       // Close the transcript panel so the terminal is visible
       setRightPanelMode(null);
       setSelectedTranscriptSessionId(null);
@@ -275,7 +284,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
         ref?.current?.writeToTerminal(`${pending.resumeCmd}\r`);
       }, 1500);
     },
-    [createTerminal],
+    [createTerminal, updateTab],
   );
 
   // ── Session selection ──────────────────────────────────────────────────────
@@ -337,20 +346,32 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
     }
   }, []);
 
-  // ── Generate from latest session ──────────────────────────────────────────
+  // ── Generate from active or latest session ──────────────────────────────────
 
   const handleGenerateFromLatestSession = useCallback(async () => {
+    // Prefer the Claude session tracked on the active terminal tab (set on resume).
+    // Fall back to the most recent session for the tab's project directory.
+    const activeTab = tabs.find((t) => t.id === activeId);
+
+    if (activeTab?.claudeSessionId) {
+      setShowSidebar(true);
+      await handleSelectTranscriptSession(activeTab.claudeSessionId);
+      return;
+    }
+
     try {
-      const result = await invoke<CommandResponse>("transcript_get_latest", {});
+      // Pass the active tab's working directory so the backend scopes the
+      // search to sessions for that project instead of picking globally.
+      const result = await invoke<CommandResponse>("transcript_get_latest", {
+        projectPath: activeTab?.workingDir ?? null,
+      });
       if (result.success && result.data) {
         const session = result.data as { session_id: string };
-        // Open sidebar so the user can see the session list
         setShowSidebar(true);
-        // Load and display the session's messages
         await handleSelectTranscriptSession(session.session_id);
       } else {
         setNotification({
-          message: "No Claude Code sessions found",
+          message: "No Claude Code sessions found for this project",
           type: "error",
         });
       }
@@ -360,7 +381,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
         type: "error",
       });
     }
-  }, [handleSelectTranscriptSession]);
+  }, [activeId, tabs, handleSelectTranscriptSession]);
 
   // ── Generation entry points ────────────────────────────────────────────────
 
@@ -468,6 +489,41 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
     const { description, inlineContext } = lastGenerationParamsRef.current;
     await runGeneration(description, inlineContext);
   }, [runGeneration]);
+
+  // ── Build plan workflow from markdown text ─────────────────────────────────
+
+  const handleBuildPlanWorkflow = useCallback((planContent: string) => {
+    try {
+      const phases = parsePlanMarkdown(planContent);
+      if (phases.length === 0) {
+        setNotification({ message: "No plan structure found in content", type: "error" });
+        return;
+      }
+
+      const summary = summarizeParsedPlan(phases);
+      const workflow = buildPlanWorkflow({ phases });
+
+      setGeneratedWorkflow(workflow);
+      setWorkflowError(undefined);
+      setRightPanelMode("workflow");
+      setNotification({
+        message: `Plan workflow built: ${summary.phaseCount} phases, ${summary.verificationCount} checks (${summary.deterministicCount} deterministic, ${summary.aiCount} AI)`,
+        type: "success",
+      });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : "Failed to parse plan";
+      setWorkflowError(errMsg);
+      setNotification({ message: errMsg, type: "error" });
+    }
+  }, []);
+
+  const handleBuildPlanFromFile = useCallback(() => {
+    if (!latestPlanContent.trim()) {
+      setNotification({ message: "No plan file loaded", type: "error" });
+      return;
+    }
+    handleBuildPlanWorkflow(latestPlanContent);
+  }, [latestPlanContent, handleBuildPlanWorkflow]);
 
   // ── Analysis helper: read scrollback from a tab ───────────────────────────
 
@@ -704,6 +760,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
         planFileName={planFileName}
         isPlanLoading={isPlanLoading}
         onRefreshPlan={loadPlanContent}
+        onBuildPlanFromFile={handleBuildPlanFromFile}
         onToggleFindings={handleToggleFindings}
         findingsActive={rightPanelMode === "findings"}
         findingsCount={activeFindings.length}
@@ -766,6 +823,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
             loading={loadingMessages}
             onGenerate={handleGenerateFromTranscript}
             onGenerateAndRun={handleGenerateAndRunFromTranscript}
+            onBuildPlanWorkflow={handleBuildPlanWorkflow}
             onResume={handleResumeSession}
             onClose={() => {
               setRightPanelMode(null);

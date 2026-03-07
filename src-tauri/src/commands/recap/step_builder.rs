@@ -8,6 +8,7 @@ use super::utils::{
     get_icon_type, is_ai_step_type, parse_actions_summary,
 };
 use crate::database::{StoredVerificationResult, TaskRun, TaskRunAutomation, TaskRunEvent};
+use crate::str_utils::truncate_str;
 use crate::workflow_state::StepCheckpoint;
 use chrono::{DateTime, Duration};
 use std::collections::HashSet;
@@ -69,7 +70,7 @@ pub fn generate_automation_summary(
         "failed" => {
             if let Some(ref error) = automation.error_message {
                 if error.len() > 60 {
-                    format!("Failed: {}...", &error[..60])
+                    format!("Failed: {}...", truncate_str(error, 60))
                 } else {
                     format!("Failed: {}", error)
                 }
@@ -101,7 +102,7 @@ pub fn generate_verification_summary(result: &StoredVerificationResult) -> Strin
     } else if !result.issues.is_empty() {
         let first_issue = &result.issues[0];
         if first_issue.len() > 60 {
-            format!("{}...", &first_issue[..60])
+            format!("{}...", truncate_str(first_issue, 60))
         } else {
             first_issue.clone()
         }
@@ -115,7 +116,7 @@ pub fn generate_ai_session_summary(event_message: &str, session_num: u32, status
     let trimmed = event_message.trim();
     if !trimmed.is_empty() && trimmed.len() > 5 {
         if trimmed.len() > 80 {
-            return format!("{}...", &trimmed[..80]);
+            return format!("{}...", truncate_str(trimmed, 80));
         }
         return trimmed.to_string();
     }

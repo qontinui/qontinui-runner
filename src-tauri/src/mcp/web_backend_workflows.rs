@@ -5,6 +5,7 @@
 //! The runner maintains a local SQLite cache for offline execution.
 
 use crate::auth::AuthManager;
+use crate::str_utils::truncate_str;
 use crate::unified_workflows::UnifiedWorkflow;
 use serde::Deserialize;
 use tracing::{error, info, warn};
@@ -126,7 +127,7 @@ impl WebBackendWorkflowClient {
         let paginated: PaginatedResponse = serde_json::from_str(&body).map_err(|e| {
             // Log a truncated snippet of the body to help debug deserialization issues
             let snippet = if body.len() > 500 {
-                format!("{}...", &body[..500])
+                format!("{}...", truncate_str(&body, 500))
             } else {
                 body.clone()
             };

@@ -70,3 +70,34 @@ __qontinui_reset_command() {
 PROMPT_COMMAND="__qontinui_reset_command;${PROMPT_COMMAND}"
 
 trap '__qontinui_debug_trap' DEBUG
+
+# ── Claude Code runner context ─────────────────────────────────────────────
+# Wrap the `claude` command so sessions launched from this terminal
+# automatically know they are running inside the Qontinui Runner.
+if [ "${QONTINUI_RUNNER_TERMINAL}" = "1" ]; then
+    __qontinui_api_port="${QONTINUI_RUNNER_API_PORT:-9876}"
+    __qontinui_runner_context="You are running inside the Qontinui Runner desktop application terminal.
+The runner provides AI-driven development automation with structured workflows and verification feedback loops.
+
+Runner HTTP API at http://localhost:${__qontinui_api_port}.
+Key endpoints:
+- GET /task-runs/running - list running task runs
+- GET /task-runs/{id}/output?tail_chars=N - live AI conversation output
+- GET /task-runs/{id}/workflow-state - workflow execution state
+- POST /unified-workflows/execute-inline - execute a workflow inline
+- GET /unified-workflows - list saved workflows
+
+Runner SQLite DB (Windows): ~/AppData/Roaming/com.qontinui.runner/runner.db
+Key tables: task_runs, task_run_events, unified_workflows, workflow_verification_phase_results"
+
+    claude() {
+        case "${1:-}" in
+            mcp|config|update|doctor|api-key)
+                command claude "$@"
+                ;;
+            *)
+                command claude --append-system-prompt "$__qontinui_runner_context" "$@"
+                ;;
+        esac
+    }
+fi

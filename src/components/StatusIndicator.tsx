@@ -242,7 +242,7 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
                     <Icon className={`w-3.5 h-3.5 ${colorClass} animate-pulse`} />
                     <span
                       data-content-role="status"
-                      className="text-xs font-medium text-foreground"
+                      className="text-xs font-medium text-foreground truncate max-w-[200px]"
                     >
                       {activity.label}
                     </span>

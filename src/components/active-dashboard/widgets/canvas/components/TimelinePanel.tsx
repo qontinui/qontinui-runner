@@ -15,11 +15,14 @@ interface TimelineEvent {
   status?: "pending" | "running" | "success" | "failed";
 }
 
-const STATUS_CONFIG: Record<string, { icon: typeof Circle; classes: string }> = {
-  pending: { icon: Circle, classes: "text-muted-foreground" },
-  running: { icon: Loader2, classes: "text-blue-400 animate-spin" },
-  success: { icon: CheckCircle, classes: "text-green-500" },
-  failed: { icon: XCircle, classes: "text-red-500" },
+const STATUS_CONFIG: Record<
+  string,
+  { icon: typeof Circle; classes: string; shape: "circle" | "check-circle" | "spinner" | "diamond" }
+> = {
+  pending: { icon: Circle, classes: "text-muted-foreground", shape: "circle" },
+  running: { icon: Loader2, classes: "text-blue-400 animate-spin", shape: "spinner" },
+  success: { icon: CheckCircle, classes: "text-green-500", shape: "check-circle" },
+  failed: { icon: XCircle, classes: "text-red-500", shape: "diamond" },
 };
 
 export function TimelinePanel({ data, size }: CanvasPanelComponentProps) {
@@ -41,7 +44,12 @@ export function TimelinePanel({ data, size }: CanvasPanelComponentProps) {
           <div key={idx} className="flex gap-3">
             {/* Line + icon column */}
             <div className="flex flex-col items-center">
-              <Icon className={cn("h-4 w-4 flex-shrink-0", config.classes)} />
+              <div className="relative flex-shrink-0">
+                <Icon className={cn("h-4 w-4", config.classes)} />
+                {config.shape === "diamond" && (
+                  <div className="absolute -bottom-0.5 -right-0.5 w-1.5 h-1.5 bg-red-500 rotate-45" />
+                )}
+              </div>
               {!isLast && <div className="w-px flex-1 bg-border min-h-[16px]" />}
             </div>
 

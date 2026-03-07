@@ -8,30 +8,62 @@ use crate::terminal::transcript;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// List Claude Code transcript sessions for the current (or specified) project.
+/// List Claude Code transcript sessions.
+///
+/// When `all_projects` is true, scans the workspace root **and** all immediate
+/// child directories (the individual repos in the monorepo) so sessions started
+/// from subdirectories are visible too.
 #[tauri::command]
 pub async fn transcript_list_sessions(
     project_path: Option<String>,
+    all_projects: Option<bool>,
 ) -> Result<CommandResponse, String> {
-    let project = project_path.unwrap_or_else(|| {
-        crate::mcp::shared::get_workspace_paths_internal()
-            .map(|(root, _, _)| root.to_string_lossy().to_string())
-            .unwrap_or_default()
-    });
+    let workspace_root = crate::mcp::shared::get_workspace_paths_internal()
+        .map(|(root, _, _)| root.to_string_lossy().to_string())
+        .unwrap_or_default();
 
-    if project.is_empty() {
-        return Ok(CommandResponse {
-            success: false,
-            message: Some("No project path available".to_string()),
-            data: None,
-        });
-    }
+    // Build the list of project paths to scan
+    let project_paths: Vec<String> = if all_projects.unwrap_or(true) {
+        let mut paths = vec![workspace_root.clone()];
+        // Add immediate child directories (each repo in the monorepo)
+        if !workspace_root.is_empty() {
+            if let Ok(entries) = std::fs::read_dir(&workspace_root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let name = path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        // Skip hidden dirs and common non-project dirs
+                        if !name.starts_with('.') && name != "node_modules" {
+                            paths.push(path.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        paths
+    } else {
+        let project = project_path.unwrap_or(workspace_root);
+        if project.is_empty() {
+            return Ok(CommandResponse {
+                success: false,
+                message: Some("No project path available".to_string()),
+                data: None,
+            });
+        }
+        vec![project]
+    };
 
     let config_dirs = transcript::find_claude_config_dirs();
     info!(
-        "transcript_list_sessions: project='{}', config_dirs={:?}",
-        project, config_dirs
+        "transcript_list_sessions: scanning {} project paths across {} config dirs",
+        project_paths.len(),
+        config_dirs.len()
     );
+
     if config_dirs.is_empty() {
         return Ok(CommandResponse {
             success: true,
@@ -41,22 +73,31 @@ pub async fn transcript_list_sessions(
     }
 
     let mut all_sessions = Vec::new();
-    for dir in &config_dirs {
-        match transcript::list_sessions(dir, &project) {
-            Ok(sessions) => {
-                info!(
-                    "transcript_list_sessions: found {} sessions in {:?}",
-                    sessions.len(),
-                    dir
-                );
-                all_sessions.extend(sessions);
+    let mut seen_ids = std::collections::HashSet::new();
+
+    for project in &project_paths {
+        for dir in &config_dirs {
+            match transcript::list_sessions(dir, project) {
+                Ok(sessions) => {
+                    for session in sessions {
+                        // Deduplicate by session_id (same session won't appear twice)
+                        if seen_ids.insert(session.session_id.clone()) {
+                            all_sessions.push(session);
+                        }
+                    }
+                }
+                Err(e) => warn!("Failed to list sessions in {:?}: {}", dir, e),
             }
-            Err(e) => warn!("Failed to list sessions in {:?}: {}", dir, e),
         }
     }
 
     // Sort all sessions by last_modified descending
     all_sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+
+    info!(
+        "transcript_list_sessions: found {} total sessions",
+        all_sessions.len()
+    );
 
     Ok(CommandResponse {
         success: true,

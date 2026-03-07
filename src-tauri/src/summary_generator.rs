@@ -12,6 +12,7 @@ use crate::ai_router::TaskContext;
 use crate::database::CheckpointDb;
 use crate::doctor::DoctorHandle;
 use crate::findings::types::{Finding, FindingStatus};
+use crate::str_utils::truncate_str;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -296,7 +297,11 @@ fn build_workflow_metadata(
                     if !success {
                         // Always show failed steps with error details
                         let err = sr.get("error").and_then(|v| v.as_str()).unwrap_or("");
-                        let truncated = if err.len() > 150 { &err[..150] } else { err };
+                        let truncated = if err.len() > 150 {
+                            truncate_str(err, 150)
+                        } else {
+                            err
+                        };
                         parts.push(format!("  - FAILED: {} - {}", name, truncated));
                     } else if is_last {
                         // For the final iteration, also show passed steps (so summary

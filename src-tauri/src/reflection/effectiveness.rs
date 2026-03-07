@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use super::storage;
 use super::types::{FixEffectiveness, ReflectionFix};
+use crate::str_utils::truncate_str;
 
 /// Result of evaluating a single fix's effectiveness.
 #[derive(Debug)]
@@ -165,7 +166,7 @@ fn evaluate_by_finding_signature(
             effectiveness: FixEffectiveness::Ineffective,
             evidence: format!(
                 "Same finding (signature: {}) recurred in {}/{} subsequent runs",
-                &signature_hash[..8.min(signature_hash.len())],
+                truncate_str(&signature_hash, 8),
                 recurrence_count,
                 checked_runs
             ),

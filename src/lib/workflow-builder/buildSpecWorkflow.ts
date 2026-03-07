@@ -31,8 +31,29 @@ export interface SpecAssertion {
     criteria?: Record<string, unknown>;
     label?: string;
   };
+  relatedTarget?: {
+    type?: string;
+    criteria?: Record<string, unknown>;
+    label?: string;
+  };
   expected?: string;
+  minGap?: number;
   [key: string]: unknown;
+}
+
+export interface SetupAction {
+  type: "click" | "type" | "navigate" | "waitForElement" | "wait";
+  target?: {
+    type?: string;
+    criteria?: Record<string, unknown>;
+    elementId?: string;
+    label?: string;
+  };
+  value?: string;
+  clear?: boolean;
+  url?: string;
+  ms?: number;
+  timeout?: number;
 }
 
 export interface SpecGroup {
@@ -41,6 +62,7 @@ export interface SpecGroup {
   description: string;
   category: string;
   assertions: SpecAssertion[];
+  setupActions?: SetupAction[];
   [key: string]: unknown;
 }
 
@@ -75,9 +97,15 @@ export interface BuildSpecWorkflowInput {
 // Assertion types that can be evaluated deterministically against a UI snapshot
 const DETERMINISTIC_TYPES = new Set(["exists", "contains", "visible", "not_exists"]);
 
+// Spatial assertions need both target and relatedTarget to be deterministic
+const SPATIAL_TYPES = new Set(["noOverlap", "minSpacing"]);
+
 /** Check if an assertion can be evaluated deterministically (no AI needed). */
 function isDeterministic(assertion: SpecAssertion): boolean {
   const aType = assertion.assertionType || "exists";
+  if (SPATIAL_TYPES.has(aType)) {
+    return assertion.target?.criteria != null && assertion.relatedTarget?.criteria != null;
+  }
   return DETERMINISTIC_TYPES.has(aType) && assertion.target?.criteria != null;
 }
 
@@ -88,14 +116,23 @@ function buildSnapshotAssertStep(
   elementSource: string,
 ): VerificationStep {
   // Pack all assertions into a JSON array for the Rust handler to evaluate
-  const assertionSpecs = assertions.map((a) => ({
-    id: a.id,
-    description: a.description,
-    severity: a.severity,
-    assertionType: a.assertionType || "exists",
-    criteria: a.target?.criteria ?? {},
-    expected: a.expected,
-  }));
+  const assertionSpecs = assertions.map((a) => {
+    const spec: Record<string, unknown> = {
+      id: a.id,
+      description: a.description,
+      severity: a.severity,
+      assertionType: a.assertionType || "exists",
+      criteria: a.target?.criteria ?? {},
+      expected: a.expected,
+    };
+    if (a.relatedTarget?.criteria) {
+      spec.relatedCriteria = a.relatedTarget.criteria;
+    }
+    if (a.minGap !== undefined) {
+      spec.minGap = a.minGap;
+    }
+    return spec;
+  });
 
   // Use the ui_bridge_* prefixed field names that the Rust ExecutionStepConfig
   // deserializer expects (the bare "action"/"target" names aren't aliased)
@@ -131,6 +168,82 @@ function buildPromptStep(
   };
 }
 
+/** Build a UI Bridge setup step from a SetupAction. */
+function buildSetupActionStep(
+  groupName: string,
+  action: SetupAction,
+  elementSource: string,
+): VerificationStep {
+  const snapshotTarget = elementSource === "external" ? "sdk" : "control";
+
+  switch (action.type) {
+    case "navigate":
+      return {
+        id: crypto.randomUUID(),
+        type: "ui_bridge",
+        phase: "setup",
+        name: `${groupName}: Navigate to ${action.url}`,
+        ui_bridge_action: "navigate",
+        ui_bridge_url: action.url || "",
+        ui_bridge_snapshot_target: snapshotTarget,
+      } as unknown as VerificationStep;
+
+    case "click":
+      return {
+        id: crypto.randomUUID(),
+        type: "ui_bridge",
+        phase: "setup",
+        name: `${groupName}: Click element`,
+        ui_bridge_action: "element_action",
+        ui_bridge_target: JSON.stringify({
+          action: "click",
+          criteria: action.target?.criteria ?? {},
+        }),
+        ui_bridge_snapshot_target: snapshotTarget,
+      } as unknown as VerificationStep;
+
+    case "type":
+      return {
+        id: crypto.randomUUID(),
+        type: "ui_bridge",
+        phase: "setup",
+        name: `${groupName}: Type "${action.value}"`,
+        ui_bridge_action: "element_action",
+        ui_bridge_target: JSON.stringify({
+          action: "type",
+          criteria: action.target?.criteria ?? {},
+          params: { text: action.value, clear: action.clear },
+        }),
+        ui_bridge_snapshot_target: snapshotTarget,
+      } as unknown as VerificationStep;
+
+    case "waitForElement":
+      return {
+        id: crypto.randomUUID(),
+        type: "ui_bridge",
+        phase: "setup",
+        name: `${groupName}: Wait for element`,
+        ui_bridge_action: "wait_for_element",
+        ui_bridge_target: JSON.stringify({
+          criteria: action.target?.criteria ?? {},
+          timeout: action.timeout ?? 5000,
+        }),
+        ui_bridge_snapshot_target: snapshotTarget,
+      } as unknown as VerificationStep;
+
+    case "wait":
+      return {
+        id: crypto.randomUUID(),
+        type: "ui_bridge",
+        phase: "setup",
+        name: `${groupName}: Wait ${action.ms}ms`,
+        ui_bridge_action: "wait",
+        ui_bridge_target: String(action.ms ?? 1000),
+        ui_bridge_snapshot_target: snapshotTarget,
+      } as unknown as VerificationStep;
+  }
+}
+
 /**
  * Build a complete UnifiedWorkflow from a SpecConfig.
  *
@@ -158,8 +271,8 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
     ? specConfig.groups.filter((g) => selectedGroupIds.has(g.id))
     : specConfig.groups;
 
-  // Setup steps
-  const setupSteps: PromptStep[] = [];
+  // Setup steps — generated from group setupActions
+  const setupSteps: Array<PromptStep | VerificationStep> = [];
 
   const sourceExplanation =
     elementSource === "external"
@@ -170,6 +283,13 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
   const verificationSteps: VerificationStep[] = [];
 
   for (const group of selectedGroups) {
+    // Generate setup steps from group setupActions
+    if (group.setupActions && group.setupActions.length > 0) {
+      for (const action of group.setupActions) {
+        setupSteps.push(buildSetupActionStep(group.name, action, elementSource));
+      }
+    }
+
     const enabledAssertions = group.assertions.filter((a) => a.enabled);
     if (enabledAssertions.length === 0) continue;
 

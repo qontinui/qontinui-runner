@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::orchestrator::types::{Confidence, CriterionOverride, Finding, WorkerSignal};
+use crate::str_utils::truncate_str;
 
 // ============================================================================
 // Structured Worker Output
@@ -709,7 +710,7 @@ fn generate_summary_from_output(output: &str) -> String {
         .join(" ");
 
     if cleaned.len() > 200 {
-        format!("{}...", &cleaned[..197])
+        format!("{}...", truncate_str(&cleaned, 197))
     } else if cleaned.is_empty() {
         "Work performed (no summary provided)".to_string()
     } else {

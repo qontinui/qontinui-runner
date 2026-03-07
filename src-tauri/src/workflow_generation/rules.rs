@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::str_utils::truncate_str;
+
 /// A single generation rule stored in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerationRule {
@@ -451,7 +453,7 @@ pub fn truncate_to_title(description: &str) -> String {
     if first_sentence.len() <= 80 {
         first_sentence.to_string()
     } else {
-        format!("{}...", &first_sentence[..77])
+        format!("{}...", truncate_str(first_sentence, 77))
     }
 }
 

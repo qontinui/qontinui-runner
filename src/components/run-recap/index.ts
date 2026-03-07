@@ -5,6 +5,8 @@
  */
 
 export { RunRecapTab } from "./RunRecapTab";
+export { CompactStatusStrip } from "./CompactStatusStrip";
+export { RunDetailsSidebar } from "./RunDetailsSidebar";
 export { StatusBanner } from "./StatusBanner";
 export { FailureSection } from "./FailureSection";
 export { AISummarySection } from "./AISummarySection";

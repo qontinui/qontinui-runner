@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use super::IterationSnapshot;
 use crate::orchestrator::types::Finding;
+use crate::str_utils::truncate_str;
 use crate::unified_workflow_executor::types::LoopConfig;
 use crate::unified_workflow_executor::types::LoopResult;
 use std::collections::HashMap;
@@ -141,7 +142,7 @@ pub fn build_iteration_digest_verification(
         content.push_str("\n**Failures:**\n");
         for (name, error) in &snapshot.failed_step_errors {
             let truncated = if error.len() > 120 {
-                format!("{}…", &error[..120])
+                format!("{}…", truncate_str(error, 120))
             } else {
                 error.clone()
             };
@@ -183,7 +184,7 @@ pub fn build_iteration_digest_full(snapshot: &IterationSnapshot) -> Value {
     if !snapshot.failed_step_errors.is_empty() {
         for (name, error) in &snapshot.failed_step_errors {
             let truncated = if error.len() > 120 {
-                format!("{}…", &error[..120])
+                format!("{}…", truncate_str(error, 120))
             } else {
                 error.clone()
             };
@@ -334,6 +335,174 @@ pub fn build_outcome_alert(
         "severity": severity,
         "message": message,
         "details": details,
+    })
+}
+
+/// Build the Summary Stats panel (SummaryStats).
+/// Shows a compact pass/fail/skip ratio bar.
+pub fn build_summary_stats(snapshots: &[IterationSnapshot]) -> Value {
+    let latest = match snapshots.last() {
+        Some(s) => s,
+        None => {
+            return json!({
+                "total": 0,
+                "passed": 0,
+                "failed": 0,
+                "skipped": 0,
+                "label": "Verification Checks"
+            })
+        }
+    };
+
+    json!({
+        "total": latest.total,
+        "passed": latest.passed,
+        "failed": latest.failed,
+        "skipped": latest.skipped,
+        "label": "Verification Checks"
+    })
+}
+
+/// Build the State Timeline panel (StateTimeline).
+/// Shows per-step pass/fail across iterations as horizontal colored bars.
+pub fn build_state_timeline(verification_history: &HashMap<String, Vec<bool>>) -> Value {
+    let mut step_names: Vec<&String> = verification_history.keys().collect();
+    step_names.sort();
+
+    let steps: Vec<Value> = step_names
+        .iter()
+        .map(|name| {
+            let history = &verification_history[*name];
+            let iterations: Vec<Value> = history
+                .iter()
+                .enumerate()
+                .map(|(i, &passed)| {
+                    json!({
+                        "iteration": i + 1,
+                        "status": if passed { "pass" } else { "fail" }
+                    })
+                })
+                .collect();
+            json!({
+                "name": name,
+                "iterations": iterations
+            })
+        })
+        .collect();
+
+    json!({ "steps": steps })
+}
+
+/// Build the Waterfall panel (Waterfall).
+/// Shows time-based execution of steps as horizontal bars.
+pub fn build_waterfall(
+    step_timings: &[(String, u64, u64, &str, Option<&str>)], // (name, start_ms, duration_ms, status, phase)
+    total_duration_ms: u64,
+) -> Value {
+    let entries: Vec<Value> = step_timings
+        .iter()
+        .map(|(name, start_ms, duration_ms, status, phase)| {
+            let mut entry = json!({
+                "name": name,
+                "start_ms": start_ms,
+                "duration_ms": duration_ms,
+                "status": status,
+            });
+            if let Some(p) = phase {
+                entry["phase"] = json!(p);
+            }
+            entry
+        })
+        .collect();
+
+    json!({
+        "entries": entries,
+        "total_duration_ms": total_duration_ms
+    })
+}
+
+/// Build the Sparkline panel (Sparkline).
+/// Shows win-loss sparklines for each step across iterations.
+pub fn build_sparkline(verification_history: &HashMap<String, Vec<bool>>) -> Value {
+    let mut step_names: Vec<&String> = verification_history.keys().collect();
+    step_names.sort();
+
+    let series: Vec<Value> = step_names
+        .iter()
+        .map(|name| {
+            let history = &verification_history[*name];
+            let values: Vec<Value> = history
+                .iter()
+                .enumerate()
+                .map(|(i, &passed)| {
+                    json!({
+                        "iteration": i + 1,
+                        "outcome": if passed { "pass" } else { "fail" }
+                    })
+                })
+                .collect();
+            json!({
+                "name": name,
+                "values": values
+            })
+        })
+        .collect();
+
+    json!({ "series": series })
+}
+
+/// Build the Waffle Chart panel (WaffleChart).
+/// Shows a grid of colored cells representing check status.
+pub fn build_waffle_chart(snapshots: &[IterationSnapshot]) -> Value {
+    let latest = match snapshots.last() {
+        Some(s) => s,
+        None => {
+            return json!({
+                "cells": [],
+                "columns": 10
+            })
+        }
+    };
+
+    // Build cells from the latest snapshot
+    let mut cells: Vec<Value> = Vec::new();
+
+    // Add passed cells
+    for i in 0..latest.passed {
+        cells.push(json!({
+            "label": format!("Check {} (passed)", i + 1),
+            "status": "pass"
+        }));
+    }
+
+    // Add failed cells with actual step names
+    for name in &latest.failed_step_names {
+        cells.push(json!({
+            "label": format!("{} (failed)", name),
+            "status": "fail"
+        }));
+    }
+
+    // Add skipped cells
+    for i in 0..latest.skipped {
+        cells.push(json!({
+            "label": format!("Check {} (skipped)", i + 1),
+            "status": "skip"
+        }));
+    }
+
+    // Choose columns based on total count
+    let columns = if latest.total <= 10 {
+        latest.total.max(1)
+    } else if latest.total <= 25 {
+        5
+    } else {
+        10
+    };
+
+    json!({
+        "cells": cells,
+        "columns": columns
     })
 }
 

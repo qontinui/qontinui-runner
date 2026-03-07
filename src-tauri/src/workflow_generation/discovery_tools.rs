@@ -11,6 +11,7 @@
 use crate::check_generation::{
     recommended_tools_for_language, scan_workspace, ScanWorkspaceRequest,
 };
+use crate::str_utils::truncate_str;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -882,7 +883,7 @@ fn take_sdk_snapshot(
                 }
                 if !text.is_empty() {
                     let truncated_text = if text.len() > 50 {
-                        format!("{}...", &text[..47])
+                        format!("{}...", truncate_str(text, 47))
                     } else {
                         text.to_string()
                     };

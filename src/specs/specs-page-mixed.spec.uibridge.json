@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Mixed spec for Specs page — tests hybrid deterministic + AI verification. Contains both deterministic assertions (exists/contains with criteria) and AI-requiring assertions (behavior/semantic without criteria).",
+  "description": "Specs page — tests hybrid deterministic + AI verification. Contains both deterministic assertions (exists/contains with criteria) and AI-requiring assertions (behavior/semantic without criteria).",
   "groups": [
     {
       "id": "deterministic-elements",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specs" },
+            "criteria": {
+              "textContent": "Specs"
+            },
             "label": "Specs heading"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specifications" },
+            "criteria": {
+              "textContent": "Specifications"
+            },
             "label": "Specifications heading"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "AI Chat" },
+            "criteria": {
+              "textContent": "AI Chat"
+            },
             "label": "AI Chat heading"
           },
           "source": "manual",
@@ -61,7 +67,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Build Workflow" },
+            "criteria": {
+              "textContent": "Build Workflow"
+            },
             "label": "Build Workflow button"
           },
           "source": "manual",
@@ -112,7 +120,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Build verification workflow" },
+            "criteria": {
+              "textContent": "Build verification workflow"
+            },
             "label": "Build verification workflow button"
           },
           "source": "manual",
@@ -127,7 +137,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Review spec quality" },
+            "criteria": {
+              "textContent": "Review spec quality"
+            },
             "label": "Review spec quality button"
           },
           "source": "manual",
@@ -152,7 +164,9 @@
           "assertionType": "contains",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Specs" },
+            "criteria": {
+              "textContent": "Specs"
+            },
             "label": "Sidebar navigation"
           },
           "expected": "Specs",
@@ -164,6 +178,7 @@
     }
   ],
   "metadata": {
-    "elementSource": "control"
+    "elementSource": "control",
+    "specType": "mixed"
   }
 }

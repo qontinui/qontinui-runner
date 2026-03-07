@@ -229,6 +229,60 @@ impl CanvasPanelManager {
             .await;
         }
 
+        // Summary Stats Bar
+        let stats_data = builders::build_summary_stats(&self.iteration_snapshots);
+        self.emit_panel(
+            "summary-stats",
+            "SummaryStats",
+            "Check Status",
+            stats_data,
+            8,
+            "compact",
+            Some("Progress"),
+        )
+        .await;
+
+        // State Timeline (after 2+ iterations, more useful than convergence alone)
+        if self.iteration_snapshots.len() >= 2 {
+            let timeline_data = builders::build_state_timeline(verification_history);
+            self.emit_panel(
+                "state-timeline",
+                "StateTimeline",
+                "Step Convergence",
+                timeline_data,
+                12,
+                "normal",
+                Some("Progress"),
+            )
+            .await;
+
+            // Sparkline
+            let sparkline_data = builders::build_sparkline(verification_history);
+            self.emit_panel(
+                "sparkline",
+                "Sparkline",
+                "Step Trends",
+                sparkline_data,
+                13,
+                "compact",
+                Some("Progress"),
+            )
+            .await;
+        }
+
+        // Waffle Chart
+        let waffle_data = builders::build_waffle_chart(&self.iteration_snapshots);
+        self.emit_panel(
+            "waffle",
+            "WaffleChart",
+            "Check Coverage",
+            waffle_data,
+            9,
+            "compact",
+            Some("Progress"),
+        )
+        .await;
+
         // Iteration Digest
         let prev = if self.iteration_snapshots.len() >= 2 {
             Some(&self.iteration_snapshots[self.iteration_snapshots.len() - 2])
@@ -348,6 +402,56 @@ impl CanvasPanelManager {
             "Outcome",
             data,
             1,
+            "normal",
+            Some("Overview"),
+        )
+        .await;
+
+        // Waterfall timing panel
+        let mut step_timings: Vec<(String, u64, u64, &str, Option<&str>)> = Vec::new();
+        let mut offset_ms: u64 = 0;
+
+        // Add iteration timings
+        for snapshot in &self.iteration_snapshots {
+            let verify_status = if snapshot.failed == 0 {
+                "success"
+            } else {
+                "failed"
+            };
+            step_timings.push((
+                format!("Verify #{}", snapshot.iteration),
+                offset_ms,
+                snapshot.verify_duration_ms,
+                verify_status,
+                Some("verification"),
+            ));
+            offset_ms += snapshot.verify_duration_ms;
+
+            if let Some(agentic_ms) = snapshot.agentic_duration_ms {
+                let agentic_status = match snapshot.agentic_outcome.as_deref() {
+                    Some("Completed") => "success",
+                    Some("Failed") | Some("Error") => "failed",
+                    _ => "skipped",
+                };
+                step_timings.push((
+                    format!("AI #{}", snapshot.iteration),
+                    offset_ms,
+                    agentic_ms,
+                    agentic_status,
+                    Some("agentic"),
+                ));
+                offset_ms += agentic_ms;
+            }
+        }
+
+        let total_duration_ms = duration.as_millis() as u64;
+        let waterfall_data = builders::build_waterfall(&step_timings, total_duration_ms);
+        self.emit_panel(
+            "waterfall",
+            "Waterfall",
+            "Execution Timeline",
+            waterfall_data,
+            2,
             "normal",
             Some("Overview"),
         )

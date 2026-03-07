@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the Active Dashboard page -- the real-time monitoring hub for running workflows. Users observe live AI conversation output, verification results, iteration progress, phase transitions, and widget-based activity streams. The dashboard uses a dynamic widget layout where the active widget occupies 65% of screen space and summary widgets stack on the remaining 35%. It supports concurrent multi-run monitoring with a run switcher bar, keyboard shortcuts for fast navigation, and a completion summary overlay when workflows finish.",
+  "description": "Active Dashboard page -- the real-time monitoring hub for running workflows. Users observe live AI conversation output, verification results, iteration progress, phase transitions, and widget-based activity streams. The dashboard uses a dynamic widget layout where the active widget occupies 65% of screen space and summary widgets stack on the remaining 35%. It supports concurrent multi-run monitoring with a run switcher bar, keyboard shortcuts for fast navigation, and a completion summary overlay when workflows finish.",
   "groups": [
     {
       "id": "active-control-bar",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading" },
+            "criteria": {
+              "role": "heading"
+            },
             "label": "Task name heading in control bar"
           },
           "source": "manual",
@@ -31,7 +33,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Stop" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Stop"
+            },
             "label": "Stop execution button"
           },
           "source": "manual",
@@ -46,7 +51,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "agentic" },
+            "criteria": {
+              "textContent": "agentic"
+            },
             "label": "Phase badge showing current phase"
           },
           "source": "manual",
@@ -61,7 +68,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Play/pause toggle button"
           },
           "source": "manual",
@@ -85,7 +94,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "AI Conversation" },
+            "criteria": {
+              "textContent": "AI Conversation"
+            },
             "label": "AI Conversation widget"
           },
           "source": "manual",
@@ -100,7 +111,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Verification" },
+            "criteria": {
+              "textContent": "Verification"
+            },
             "label": "Verification widget"
           },
           "source": "manual",
@@ -115,7 +128,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "region" },
+            "criteria": {
+              "role": "region"
+            },
             "label": "Widget layout container"
           },
           "source": "manual",
@@ -130,7 +145,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "?" },
+            "criteria": {
+              "textContent": "?"
+            },
             "label": "Keyboard shortcut help indicator"
           },
           "source": "manual",
@@ -154,7 +171,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Running" },
+            "criteria": {
+              "textContent": "Running"
+            },
             "label": "Bottom bar running status"
           },
           "source": "manual",
@@ -169,7 +188,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "agent" },
+            "criteria": {
+              "textContent": "agent"
+            },
             "label": "Current orchestrator agent indicator"
           },
           "source": "manual",
@@ -184,7 +205,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Iteration" },
+            "criteria": {
+              "textContent": "Iteration"
+            },
             "label": "Iteration counter display"
           },
           "source": "manual",
@@ -208,7 +231,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Active Runs" },
+            "criteria": {
+              "textContent": "Active Runs"
+            },
             "label": "Active runs bar or heading"
           },
           "source": "manual",
@@ -223,7 +248,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "New Run" },
+            "criteria": {
+              "role": "button",
+              "textContent": "New Run"
+            },
             "label": "New Run button in active runs bar"
           },
           "source": "manual",
@@ -238,7 +266,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Individual run selector buttons"
           },
           "source": "manual",
@@ -262,7 +292,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Completed" },
+            "criteria": {
+              "textContent": "Completed"
+            },
             "label": "Completion status in summary overlay"
           },
           "source": "manual",
@@ -277,7 +309,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Success" },
+            "criteria": {
+              "textContent": "Success"
+            },
             "label": "Success rate or count in completion summary"
           },
           "source": "manual",
@@ -292,7 +326,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Dismiss" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Dismiss"
+            },
             "label": "Dismiss completion overlay button"
           },
           "source": "manual",
@@ -316,7 +353,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Approval" },
+            "criteria": {
+              "textContent": "Approval"
+            },
             "label": "Approval dialog overlay"
           },
           "source": "manual",
@@ -331,7 +370,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Approve" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Approve"
+            },
             "label": "Approve button in approval dialog"
           },
           "source": "manual",
@@ -346,7 +388,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "review" },
+            "criteria": {
+              "textContent": "review"
+            },
             "label": "Approval context description"
           },
           "source": "manual",
@@ -372,6 +416,7 @@
       "multi-run",
       "run-group",
       "tier-1"
-    ]
+    ],
+    "specType": "semantic"
   }
 }

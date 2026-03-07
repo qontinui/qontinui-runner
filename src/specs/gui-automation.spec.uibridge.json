@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the GUI Automation page -- a dev-only legacy execution interface for model-based GUI automation configs. Users load GUI automation configuration files that define visual states, transitions, and image recognition targets, then select workflows and monitors to execute. The page features a two-column layout with a workflow runner panel (2/3 width) and an automation toolkit sidebar (1/3 width) containing quick actions and macros. This page is hidden in production and serves as the original GUI automation executor before unified workflows were introduced.",
+  "description": "GUI Automation page -- a dev-only legacy execution interface for model-based GUI automation configs. Users load GUI automation configuration files that define visual states, transitions, and image recognition targets, then select workflows and monitors to execute. The page features a two-column layout with a workflow runner panel (2/3 width) and an automation toolkit sidebar (1/3 width) containing quick actions and macros. This page is hidden in production and serves as the original GUI automation executor before unified workflows were introduced.",
   "groups": [
     {
       "id": "gui-config-loading",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Config" },
+            "criteria": {
+              "textContent": "Config"
+            },
             "label": "Configuration status indicator in header"
           },
           "source": "manual",
@@ -31,7 +33,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Load" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Load"
+            },
             "label": "Load configuration button"
           },
           "source": "manual",
@@ -46,7 +51,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Last" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Last"
+            },
             "label": "Load last configuration button"
           },
           "source": "manual",
@@ -70,7 +78,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Workflow" },
+            "criteria": {
+              "textContent": "Workflow"
+            },
             "label": "Workflow selection area"
           },
           "source": "manual",
@@ -85,7 +95,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Monitor" },
+            "criteria": {
+              "textContent": "Monitor"
+            },
             "label": "Monitor selection controls"
           },
           "source": "manual",
@@ -100,7 +112,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Start" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Start"
+            },
             "label": "Start execution button"
           },
           "source": "manual",
@@ -115,7 +130,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "minimize" },
+            "criteria": {
+              "textContent": "minimize"
+            },
             "label": "Auto-minimize toggle"
           },
           "source": "manual",
@@ -130,7 +147,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Initial" },
+            "criteria": {
+              "textContent": "Initial"
+            },
             "label": "Initial states override section"
           },
           "source": "manual",
@@ -154,7 +173,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Macro" },
+            "criteria": {
+              "textContent": "Macro"
+            },
             "label": "Macros section in toolkit sidebar"
           },
           "source": "manual",
@@ -169,7 +190,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Quick" },
+            "criteria": {
+              "textContent": "Quick"
+            },
             "label": "Quick actions section"
           },
           "source": "manual",
@@ -184,7 +207,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Refresh" },
+            "criteria": {
+              "textContent": "Refresh"
+            },
             "label": "Refresh macros control"
           },
           "source": "manual",
@@ -208,7 +233,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "GUI Automation" },
+            "criteria": {
+              "textContent": "GUI Automation"
+            },
             "label": "GUI Automation header or title"
           },
           "source": "manual",
@@ -223,7 +250,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Tutorial menu trigger"
           },
           "source": "manual",
@@ -238,7 +267,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Toolkit" },
+            "criteria": {
+              "textContent": "Toolkit"
+            },
             "label": "Toolkit sidebar heading or label"
           },
           "source": "manual",
@@ -265,6 +296,7 @@
       "visual-automation",
       "run-group",
       "tier-2"
-    ]
+    ],
+    "specType": "semantic"
   }
 }

@@ -3,6 +3,7 @@
 //! Uses the existing `POST /api/embeddings/compute-text` endpoint which returns
 //! 384-dimensional MiniLM-L6-v2 embeddings.
 
+use crate::str_utils::truncate_str;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -72,7 +73,7 @@ impl EmbeddingClient {
     pub async fn compute_text_embedding(&self, text: &str) -> Result<Vec<f32>, String> {
         // Truncate very long texts to avoid API issues (MiniLM has 256 token limit)
         let truncated = if text.len() > 2000 {
-            &text[..2000]
+            truncate_str(text, 2000)
         } else {
             text
         };

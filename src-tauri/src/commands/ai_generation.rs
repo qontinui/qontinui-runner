@@ -9,6 +9,7 @@
 use crate::commands::{AppState, CommandResponse};
 use crate::config_facade::ai_keychain;
 use crate::executor::with_default_bridge;
+use crate::str_utils::truncate_str;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
@@ -793,7 +794,7 @@ Element:
         if text.len() <= 100 {
             prompt.push_str(&format!("- Text: {}\n", text));
         } else {
-            prompt.push_str(&format!("- Text: {}...\n", &text[..100]));
+            prompt.push_str(&format!("- Text: {}...\n", truncate_str(text, 100)));
         }
     }
 

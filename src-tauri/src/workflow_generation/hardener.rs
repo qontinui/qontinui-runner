@@ -721,6 +721,27 @@ pub fn sanitize_commands_in_steps(steps: &mut [Value]) -> usize {
             }
         }
 
+        // Fix incorrect health check assertions: d.get('status')=='ok' → d.get('success')==True
+        // The runner API returns {"success": true, "data": "ok"}, not {"status": "ok"}.
+        // AI models frequently generate the wrong assertion despite schema_context documentation.
+        let current_cmd_for_health = step.get(cmd_key).and_then(|v| v.as_str()).unwrap_or(&cmd);
+        if current_cmd_for_health.contains("/health")
+            && current_cmd_for_health.contains("python")
+            && current_cmd_for_health.contains("d.get('status')")
+        {
+            let fixed_health = current_cmd_for_health.replace(
+                "d.get('status')=='ok'",
+                "d.get('success')==True and d.get('data')=='ok'",
+            );
+            if fixed_health != current_cmd_for_health {
+                if let Some(obj) = step.as_object_mut() {
+                    obj.insert(cmd_key.to_string(), Value::String(fixed_health));
+                    count += 1;
+                    info!("Fixed incorrect health check assertion: status → success/data");
+                }
+            }
+        }
+
         // Quote URLs containing & in curl commands — unquoted & is misinterpreted
         // as a shell command separator by bash, e.g.:
         //   curl http://host/api?a=1&b=2 | grep x

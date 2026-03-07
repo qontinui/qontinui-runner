@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Lifecycle Hooks configuration page — manages webhooks and actions triggered by execution events, with CRUD operations, enable/disable toggles, and hook testing capabilities.",
+  "description": "Lifecycle Hooks configuration page — manages webhooks and actions triggered by execution events, with CRUD operations, enable/disable toggles, and hook testing capabilities.",
   "groups": [
     {
       "id": "hooks-management-overview",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Lifecycle Hooks" },
+            "criteria": {
+              "textContent": "Lifecycle Hooks"
+            },
             "label": "Lifecycle Hooks heading"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Configure actions to run at specific execution events" },
+            "criteria": {
+              "textContent": "Configure actions to run at specific execution events"
+            },
             "label": "Hooks description text"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No lifecycle hooks" },
+            "criteria": {
+              "textContent": "No lifecycle hooks"
+            },
             "label": "Empty state message"
           },
           "source": "manual",
@@ -70,7 +76,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "New Hook" },
+            "criteria": {
+              "textContent": "New Hook"
+            },
             "label": "New Hook button"
           },
           "source": "manual",
@@ -85,7 +93,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Edit hook action"
           },
           "source": "manual",
@@ -100,7 +110,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Delete Hook" },
+            "criteria": {
+              "textContent": "Delete Hook"
+            },
             "label": "Delete hook confirmation dialog"
           },
           "source": "manual",
@@ -124,7 +136,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Test" },
+            "criteria": {
+              "textContent": "Test"
+            },
             "label": "Test hook result display"
           },
           "source": "manual",
@@ -139,7 +153,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Hook enable/disable toggle"
           },
           "source": "manual",
@@ -154,7 +170,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "alert" },
+            "criteria": {
+              "role": "alert"
+            },
             "label": "Error banner"
           },
           "source": "manual",

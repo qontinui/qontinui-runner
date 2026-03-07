@@ -27,6 +27,7 @@ import {
   type SpecConfig as BuildSpecConfig,
 } from "@/lib/workflow-builder/buildSpecWorkflow";
 import { getApiBase } from "@/lib/runner-api";
+import { createSummaryStep } from "@/types/unified-workflow";
 import type { LoadedSpec } from "./types";
 
 interface SpecsPageProps {
@@ -75,6 +76,7 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
               agentic_steps: workflow.agentic_steps,
               completion_steps: workflow.completion_steps,
               max_iterations: workflow.max_iterations,
+              reflection_mode: true,
             }),
           });
 
@@ -123,8 +125,9 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
                 content: setupPrompt,
               },
             ],
-            completion_steps: [],
+            completion_steps: [createSummaryStep()],
             max_iterations: 3,
+            reflection_mode: true,
           };
 
           const response = await fetch(`${getApiBase()}/unified-workflows`, {
@@ -210,6 +213,7 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
             onAddAssertion={state.addAssertion}
             onAddGroup={state.addGroup}
             onRemoveGroup={state.removeGroup}
+            onUpdateSetupActions={state.updateSetupActions}
           />
         </div>
 

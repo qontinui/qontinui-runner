@@ -51,7 +51,7 @@
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
     "@qontinui/design-tokens": "^1.0.0",
-    "@qontinui/shared-types": "github:qontinui/qontinui-schemas",
+    "@qontinui/shared-types": "file:../qontinui-schemas/ts",
     "@qontinui/ui-bridge": "^0.3.1",
     "@qontinui/workflow-ui": "github:qontinui/qontinui-workflow-ui",
     "@qontinui/workflow-utils": "github:qontinui/qontinui-workflow-utils",
@@ -88,7 +88,7 @@
     "lucide-react": "^0.562.0",
     "postcss": "^8.5",
     "prism-react-renderer": "^2.4.1",
-    "qontinui-navigation": "github:qontinui/qontinui-navigation",
+    "qontinui-navigation": "file:../qontinui-navigation",
     "qrcode.react": "^4.2.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",

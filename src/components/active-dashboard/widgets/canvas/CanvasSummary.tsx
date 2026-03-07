@@ -19,6 +19,14 @@ export function CanvasSummary({ data }: CanvasSummaryProps) {
   const recentPanels = panels.slice(0, 3);
   const roseColors = getAccentColors("rose");
 
+  // Extract stats from SummaryStats or WaffleChart panels for mini visualization
+  const statsPanel = panels.find((p) => p.component === "SummaryStats");
+  const wafflePanel = panels.find((p) => p.component === "WaffleChart");
+  const summaryData = statsPanel?.data as
+    | { passed?: number; failed?: number; skipped?: number; total?: number }
+    | undefined;
+  const waffleCells = (wafflePanel?.data as { cells?: Array<{ status: string }> })?.cells;
+
   return (
     <div className="space-y-3">
       {/* Panel count */}
@@ -28,6 +36,66 @@ export function CanvasSummary({ data }: CanvasSummaryProps) {
           {panelCount} {panelCount === 1 ? "panel" : "panels"}
         </span>
       </div>
+
+      {/* Mini stats bar from SummaryStats panel */}
+      {summaryData && summaryData.total && summaryData.total > 0 && (
+        <div className="space-y-1">
+          <div className="flex h-2 rounded-full overflow-hidden bg-muted">
+            {summaryData.passed ? (
+              <div
+                className="bg-green-500 h-full"
+                style={{ width: `${(summaryData.passed / summaryData.total) * 100}%` }}
+              />
+            ) : null}
+            {summaryData.failed ? (
+              <div
+                className="bg-red-500 h-full"
+                style={{ width: `${(summaryData.failed / summaryData.total) * 100}%` }}
+              />
+            ) : null}
+            {summaryData.skipped ? (
+              <div
+                className="bg-gray-400 h-full"
+                style={{ width: `${((summaryData.skipped ?? 0) / summaryData.total) * 100}%` }}
+              />
+            ) : null}
+          </div>
+          <div className="flex gap-2 text-[10px]">
+            {summaryData.passed ? (
+              <span className="text-green-500">{summaryData.passed} pass</span>
+            ) : null}
+            {summaryData.failed ? (
+              <span className="text-red-500">{summaryData.failed} fail</span>
+            ) : null}
+          </div>
+        </div>
+      )}
+
+      {/* Mini waffle from WaffleChart panel */}
+      {!summaryData && waffleCells && waffleCells.length > 0 && (
+        <div className="flex flex-wrap gap-0.5">
+          {waffleCells.slice(0, 30).map((cell, i) => {
+            const statusColors: Record<string, string> = {
+              pass: "bg-green-500",
+              fail: "bg-red-500",
+              pending: "bg-gray-400",
+              running: "bg-blue-500 animate-pulse",
+              skip: "bg-gray-500",
+            };
+            return (
+              <div
+                key={i}
+                className={cn("w-2 h-2 rounded-sm", statusColors[cell.status] ?? "bg-gray-400")}
+              />
+            );
+          })}
+          {waffleCells.length > 30 && (
+            <span className="text-[9px] text-muted-foreground ml-1">
+              +{waffleCells.length - 30}
+            </span>
+          )}
+        </div>
+      )}
 
       {/* Recent panels */}
       {recentPanels.length > 0 ? (

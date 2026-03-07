@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the Library Dashboard page -- a unified cross-category asset browser that aggregates recently modified items from all automation library categories. Users can browse, search, and filter assets across tasks, prompt snippets, contexts, checks, check groups, shell commands, workflows, playwright tests, and more. Clicking any item navigates to the appropriate builder page for editing. The dashboard serves as the central hub for discovering and managing all reusable automation building blocks.",
+  "description": "Library Dashboard page -- a unified cross-category asset browser that aggregates recently modified items from all automation library categories. Users can browse, search, and filter assets across tasks, prompt snippets, contexts, checks, check groups, shell commands, workflows, playwright tests, and more. Clicking any item navigates to the appropriate builder page for editing. The dashboard serves as the central hub for discovering and managing all reusable automation building blocks.",
   "groups": [
     {
       "id": "lib-dashboard-overview",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Library Dashboard" },
+            "criteria": {
+              "textContent": "Library Dashboard"
+            },
             "label": "Library Dashboard heading"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "total items" },
+            "criteria": {
+              "textContent": "total items"
+            },
             "label": "Total items count"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Recently modified items across all categories" },
+            "criteria": {
+              "textContent": "Recently modified items across all categories"
+            },
             "label": "Recent items subtitle"
           },
           "source": "manual",
@@ -61,7 +67,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Library Dashboard" },
+            "criteria": {
+              "textContent": "Library Dashboard"
+            },
             "label": "Dashboard with navigable items"
           },
           "source": "manual",
@@ -85,7 +93,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Search across all categories" },
+            "criteria": {
+              "textContent": "Search across all categories"
+            },
             "label": "Cross-category search input placeholder"
           },
           "source": "manual",
@@ -100,7 +110,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "All" },
+            "criteria": {
+              "textContent": "All"
+            },
             "label": "All type filter pill"
           },
           "source": "manual",
@@ -115,7 +127,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Library Dashboard" },
+            "criteria": {
+              "textContent": "Library Dashboard"
+            },
             "label": "Dashboard with filter counts"
           },
           "source": "manual",
@@ -130,7 +144,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Library Dashboard" },
+            "criteria": {
+              "textContent": "Library Dashboard"
+            },
             "label": "Dashboard with empty state handling"
           },
           "source": "manual",
@@ -154,7 +170,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Library Dashboard" },
+            "criteria": {
+              "textContent": "Library Dashboard"
+            },
             "label": "Dashboard with typed items"
           },
           "source": "manual",
@@ -169,7 +187,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Library Dashboard" },
+            "criteria": {
+              "textContent": "Library Dashboard"
+            },
             "label": "Dashboard with timestamped items"
           },
           "source": "manual",
@@ -184,7 +204,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Library Dashboard" },
+            "criteria": {
+              "textContent": "Library Dashboard"
+            },
             "label": "Dashboard with item previews"
           },
           "source": "manual",
@@ -202,6 +224,7 @@
     "updatedAt": "2026-03-05T00:00:00.000Z",
     "pageUrl": "/library",
     "elementSource": "sdk",
-    "tags": ["library", "dashboard", "cross-category", "search", "asset-management"]
+    "tags": ["library", "dashboard", "cross-category", "search", "asset-management"],
+    "specType": "semantic"
   }
 }

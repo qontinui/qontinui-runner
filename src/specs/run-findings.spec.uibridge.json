@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Run Findings page — displays AI-detected issues and findings from a workflow run, organized by category with severity levels, filtering, auto-fix capabilities, and actionable recommendations.",
+  "description": "Run Findings page — displays AI-detected issues and findings from a workflow run, organized by category with severity levels, filtering, auto-fix capabilities, and actionable recommendations.",
   "groups": [
     {
       "id": "findings-overview-and-summary",
@@ -15,7 +15,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Total" },
+            "criteria": {
+              "textContent": "Total"
+            },
             "label": "Summary statistics"
           },
           "assertionType": "exists",
@@ -30,7 +32,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Execution Report|Report" },
+            "criteria": {
+              "textContent": "Execution Report|Report"
+            },
             "label": "Report title"
           },
           "assertionType": "exists",
@@ -45,7 +49,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Severity|critical|high" },
+            "criteria": {
+              "textContent": "Severity|critical|high"
+            },
             "label": "Severity indicators"
           },
           "assertionType": "exists",
@@ -69,7 +75,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "All Findings|Actionable" },
+            "criteria": {
+              "textContent": "All Findings|Actionable"
+            },
             "label": "Mode filter dropdown"
           },
           "assertionType": "exists",
@@ -84,7 +92,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Severity" },
+            "criteria": {
+              "textContent": "Severity"
+            },
             "label": "Severity filter dropdown"
           },
           "assertionType": "exists",
@@ -99,7 +109,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Category" },
+            "criteria": {
+              "textContent": "Category"
+            },
             "label": "Category filter dropdown"
           },
           "assertionType": "exists",
@@ -114,7 +126,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Clear" },
+            "criteria": {
+              "textContent": "Clear"
+            },
             "label": "Clear filters button"
           },
           "assertionType": "exists",
@@ -138,7 +152,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Auto-Fix" },
+            "criteria": {
+              "textContent": "Auto-Fix"
+            },
             "label": "Auto-fix toggle"
           },
           "assertionType": "exists",
@@ -153,7 +169,10 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Fix All" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Fix All"
+            },
             "label": "Fix all button"
           },
           "assertionType": "exists",
@@ -168,7 +187,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Clear" },
+            "criteria": {
+              "textContent": "Clear"
+            },
             "label": "Clear all findings button"
           },
           "assertionType": "exists",
@@ -192,7 +213,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "bug|security|test|documentation" },
+            "criteria": {
+              "textContent": "bug|security|test|documentation"
+            },
             "label": "Category section header"
           },
           "assertionType": "exists",
@@ -207,7 +230,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "finding|issue" },
+            "criteria": {
+              "textContent": "finding|issue"
+            },
             "label": "Individual finding"
           },
           "assertionType": "exists",
@@ -222,7 +247,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No Findings" },
+            "criteria": {
+              "textContent": "No Findings"
+            },
             "label": "Empty findings state"
           },
           "assertionType": "exists",

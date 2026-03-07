@@ -6,7 +6,7 @@ import { useState, useCallback, useMemo, useEffect } from "react";
 import { getAllSpecs } from "@/lib/spec-registry";
 import { useSpecFileLoader } from "./useSpecFileLoader";
 import type { LoadedSpec, SpecSelection, SpecTreeNode, ConnectionState } from "./types";
-import type { SpecConfig, SpecGroup, SpecAssertion } from "ui-bridge";
+import type { SpecConfig, SpecGroup, SpecAssertion, SetupAction } from "ui-bridge";
 
 function buildNodeFromSpec(spec: LoadedSpec): SpecTreeNode {
   if (spec.kind === "page-spec") {
@@ -23,11 +23,16 @@ function buildNodeFromSpec(spec: LoadedSpec): SpecTreeNode {
       (sum, g) => sum + g.assertions.filter((a) => a.enabled).length,
       0,
     );
+    // Extract page name from description: "Active Dashboard page -- details..." → "Active Dashboard"
+    const desc = spec.config.description || "";
+    const pageNameMatch = desc.match(/^(.+?)\s+page\b/i);
+    const label = pageNameMatch
+      ? pageNameMatch[1]
+      : desc.split(/\s*[—–-]{1,2}\s*/)[0] || spec.specId;
+
     return {
       id: spec.specId,
-      label: spec.config.description
-        ? spec.config.description.slice(0, 60) + (spec.config.description.length > 60 ? "..." : "")
-        : spec.specId,
+      label,
       type: "page-spec",
       specId: spec.specId,
       appName: spec.appName,
@@ -172,7 +177,7 @@ export function useSpecsState() {
     const discovered = getAllSpecs();
     const loaded: LoadedSpec[] = discovered.map((spec) => ({
       specId: spec.specId,
-      appName: spec.appName || "Bundled",
+      appName: spec.appName || "Unknown",
       kind: "page-spec" as const,
       config: spec.config as SpecConfig,
       source: "bundled" as const,
@@ -405,6 +410,31 @@ export function useSpecsState() {
     setExpandedNodes((prev) => new Set([...prev, specId]));
   }, []);
 
+  /** Update setup actions for a group (page-spec only) */
+  const updateSetupActions = useCallback(
+    (specId: string, groupId: string, setupActions: SetupAction[]) => {
+      setSpecs((prev) =>
+        prev.map((spec) => {
+          if (spec.specId !== specId || spec.kind !== "page-spec") return spec;
+          return {
+            ...spec,
+            config: {
+              ...spec.config,
+              groups: spec.config.groups.map((g) => {
+                if (g.id !== groupId) return g;
+                return {
+                  ...g,
+                  setupActions,
+                };
+              }),
+            },
+          };
+        }),
+      );
+    },
+    [],
+  );
+
   /** Remove a group from a page spec */
   const removeGroup = useCallback((specId: string, groupId: string) => {
     setSpecs((prev) =>
@@ -491,6 +521,7 @@ export function useSpecsState() {
     removeAssertion,
     addAssertion,
     addGroup,
+    updateSetupActions,
     removeGroup,
   };
 }

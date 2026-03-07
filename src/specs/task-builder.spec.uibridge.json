@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the Task Builder page -- a specialized editor for creating and managing task definitions (also known as prompts internally). Tasks define automation work units with a name, content body containing AI instructions or prompt text, category, and tags. They serve as reusable prompt building blocks that can be referenced from workflow agentic steps, providing consistent AI instructions across multiple workflows without duplication.",
+  "description": "Task Builder page -- a specialized editor for creating and managing task definitions (also known as prompts internally). Tasks define automation work units with a name, content body containing AI instructions or prompt text, category, and tags. They serve as reusable prompt building blocks that can be referenced from workflow agentic steps, providing consistent AI instructions across multiple workflows without duplication.",
   "groups": [
     {
       "id": "task-list-management",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Tasks" },
+            "criteria": {
+              "textContent": "Tasks"
+            },
             "label": "Tasks page title"
           },
           "source": "manual",
@@ -31,7 +33,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "New" },
+            "criteria": {
+              "role": "button",
+              "textContent": "New"
+            },
             "label": "New task button"
           },
           "source": "manual",
@@ -46,7 +51,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "searchbox" },
+            "criteria": {
+              "role": "searchbox"
+            },
             "label": "Task search input"
           },
           "source": "manual",
@@ -61,7 +68,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Tasks" },
+            "criteria": {
+              "textContent": "Tasks"
+            },
             "label": "Task list with content previews"
           },
           "source": "manual",
@@ -85,7 +94,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Tasks" },
+            "criteria": {
+              "textContent": "Tasks"
+            },
             "label": "Task editor with name field"
           },
           "source": "manual",
@@ -100,7 +111,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Tasks" },
+            "criteria": {
+              "textContent": "Tasks"
+            },
             "label": "Task editor with content textarea"
           },
           "source": "manual",
@@ -115,7 +128,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Save" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Save"
+            },
             "label": "Save task button"
           },
           "source": "manual",
@@ -130,7 +146,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Tasks" },
+            "criteria": {
+              "textContent": "Tasks"
+            },
             "label": "Task editor with category field"
           },
           "source": "manual",
@@ -154,7 +172,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Tasks" },
+            "criteria": {
+              "textContent": "Tasks"
+            },
             "label": "Task editor with tag management"
           },
           "source": "manual",
@@ -169,7 +189,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Delete" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Delete"
+            },
             "label": "Delete task button"
           },
           "source": "manual",
@@ -184,7 +207,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Tasks" },
+            "criteria": {
+              "textContent": "Tasks"
+            },
             "label": "Task list with tag counts"
           },
           "source": "manual",
@@ -202,6 +227,7 @@
     "updatedAt": "2026-03-05T00:00:00.000Z",
     "pageUrl": "/build/tasks",
     "elementSource": "sdk",
-    "tags": ["tasks", "prompts", "builder", "library", "ai-instructions"]
+    "tags": ["tasks", "prompts", "builder", "library", "ai-instructions"],
+    "specType": "semantic"
   }
 }

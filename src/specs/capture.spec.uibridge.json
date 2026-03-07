@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the Capture page -- a dev-only interaction recording tool available exclusively in the runner application. Users record mouse and keyboard interactions along with screen video to create data for State Machine construction from desktop and mixed-environment workflows. The tool captures input events as timestamped JSONL data synchronized with video frames, enabling analysis of complex multi-step user interactions including drag operations and cross-application workflows.",
+  "description": "Capture page -- a dev-only interaction recording tool available exclusively in the runner application. Users record mouse and keyboard interactions along with screen video to create data for State Machine construction from desktop and mixed-environment workflows. The tool captures input events as timestamped JSONL data synchronized with video frames, enabling analysis of complex multi-step user interactions including drag operations and cross-application workflows.",
   "groups": [
     {
       "id": "cap-recording-controls",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Start Recording" },
+            "criteria": {
+              "textContent": "Start Recording"
+            },
             "label": "Start Recording button"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Mouse" },
+            "criteria": {
+              "textContent": "Mouse"
+            },
             "label": "Mouse input type indicator"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Interaction Recording" },
+            "criteria": {
+              "textContent": "Interaction Recording"
+            },
             "label": "Interaction Recording header"
           },
           "source": "manual",
@@ -61,7 +67,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Record your interactions" },
+            "criteria": {
+              "textContent": "Record your interactions"
+            },
             "label": "Recording purpose text"
           },
           "source": "manual",
@@ -85,7 +93,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Interaction Recording" },
+            "criteria": {
+              "textContent": "Interaction Recording"
+            },
             "label": "Recording page with settings gear"
           },
           "source": "manual",
@@ -100,7 +110,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Video FPS" },
+            "criteria": {
+              "textContent": "Video FPS"
+            },
             "label": "Video FPS setting label"
           },
           "source": "manual",
@@ -115,7 +127,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "30 FPS is recommended" },
+            "criteria": {
+              "textContent": "30 FPS is recommended"
+            },
             "label": "FPS recommendation text"
           },
           "source": "manual",
@@ -139,7 +153,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Purpose" },
+            "criteria": {
+              "textContent": "Purpose"
+            },
             "label": "Purpose info section"
           },
           "source": "manual",
@@ -154,7 +170,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "JSONL" },
+            "criteria": {
+              "textContent": "JSONL"
+            },
             "label": "JSONL output format description"
           },
           "source": "manual",
@@ -169,7 +187,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Use cases" },
+            "criteria": {
+              "textContent": "Use cases"
+            },
             "label": "Use cases section"
           },
           "source": "manual",
@@ -187,6 +207,7 @@
     "updatedAt": "2026-03-05T00:00:00.000Z",
     "pageUrl": "/capture",
     "elementSource": "sdk",
-    "tags": ["capture", "recording", "interaction", "dev-only", "state-machine"]
+    "tags": ["capture", "recording", "interaction", "dev-only", "state-machine"],
+    "specType": "semantic"
   }
 }

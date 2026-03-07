@@ -15,3 +15,5 @@ export type {
   VerificationType,
   UiCheckAssertion,
 } from "./buildPlanWorkflow";
+
+export { parsePlanMarkdown, summarizeParsedPlan } from "./parsePlanMarkdown";

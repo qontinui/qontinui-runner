@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Error Monitor page — centralized error tracking and management across automation runs, providing filtering, status management, and fix workflow generation capabilities.",
+  "description": "Error Monitor page — centralized error tracking and management across automation runs, providing filtering, status management, and fix workflow generation capabilities.",
   "groups": [
     {
       "id": "error-monitor-visibility",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Error Monitor" },
+            "criteria": {
+              "textContent": "Error Monitor"
+            },
             "label": "Error Monitor heading"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "critical" },
+            "criteria": {
+              "textContent": "critical"
+            },
             "label": "Severity summary badges"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "unresolved" },
+            "criteria": {
+              "textContent": "unresolved"
+            },
             "label": "Unresolved error count badge"
           },
           "source": "manual",
@@ -61,7 +67,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Auto-refresh" },
+            "criteria": {
+              "textContent": "Auto-refresh"
+            },
             "label": "Auto-refresh indicator"
           },
           "source": "manual",
@@ -85,7 +93,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Search errors" },
+            "criteria": {
+              "textContent": "Search errors"
+            },
             "label": "Error search input"
           },
           "source": "manual",
@@ -100,7 +110,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Severity" },
+            "criteria": {
+              "textContent": "Severity"
+            },
             "label": "Severity filter section"
           },
           "source": "manual",
@@ -115,7 +127,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Status" },
+            "criteria": {
+              "textContent": "Status"
+            },
             "label": "Status filter section"
           },
           "source": "manual",
@@ -130,7 +144,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Filters" },
+            "criteria": {
+              "textContent": "Filters"
+            },
             "label": "Filter toggle button"
           },
           "source": "manual",
@@ -154,7 +170,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Full Message" },
+            "criteria": {
+              "textContent": "Full Message"
+            },
             "label": "Expanded error detail section"
           },
           "source": "manual",
@@ -169,7 +187,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Acknowledge" },
+            "criteria": {
+              "textContent": "Acknowledge"
+            },
             "label": "Acknowledge action button"
           },
           "source": "manual",
@@ -184,7 +204,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Mark Resolved" },
+            "criteria": {
+              "textContent": "Mark Resolved"
+            },
             "label": "Resolve action button"
           },
           "source": "manual",
@@ -199,7 +221,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Fix" },
+            "criteria": {
+              "textContent": "Fix"
+            },
             "label": "Fix errors button"
           },
           "source": "manual",
@@ -223,7 +247,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "error" },
+            "criteria": {
+              "role": "button",
+              "textContent": "error"
+            },
             "label": "Error item with log source metadata"
           },
           "source": "manual",
@@ -238,7 +265,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "error" },
+            "criteria": {
+              "textContent": "error"
+            },
             "label": "Error count footer"
           },
           "source": "manual",
@@ -253,7 +282,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No Errors" },
+            "criteria": {
+              "textContent": "No Errors"
+            },
             "label": "Empty state message"
           },
           "source": "manual",

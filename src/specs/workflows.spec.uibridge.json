@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the Workflow Builder page -- the core authoring environment where users create, edit, and manage multi-phase AI automation workflows. Users can generate complete workflows from natural language prompts using AI, manually build workflows step-by-step across four phases (setup, verification, agentic, completion), manage a sidebar library of saved workflows, configure individual steps, run workflows directly, and export/import workflows as JSON. The default landing state shows the AI Generate panel with a prompt textarea and spec source section; selecting a workflow reveals the full phase editor with Run, Save, and Export controls.",
+  "description": "Workflow Builder page -- the core authoring environment where users create, edit, and manage multi-phase AI automation workflows. Users can generate complete workflows from natural language prompts using AI, manually build workflows step-by-step across four phases (setup, verification, agentic, completion), manage a sidebar library of saved workflows, configure individual steps, run workflows directly, and export/import workflows as JSON. The default landing state shows the AI Generate panel with a prompt textarea and spec source section; selecting a workflow reveals the full phase editor with Run, Save, and Export controls.",
   "groups": [
     {
       "id": "wf-ai-generation",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Generate Workflow with AI" },
+            "criteria": {
+              "textContent": "Generate Workflow with AI"
+            },
             "label": "AI generation panel heading"
           },
           "source": "manual",
@@ -31,7 +33,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Generate" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Generate"
+            },
             "label": "Generate button"
           },
           "source": "manual",
@@ -46,7 +51,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Generate & Run" },
+            "criteria": {
+              "textContent": "Generate & Run"
+            },
             "label": "Generate & Run button"
           },
           "source": "manual",
@@ -61,7 +68,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Spec" },
+            "criteria": {
+              "textContent": "Spec"
+            },
             "label": "Spec source section"
           },
           "source": "manual",
@@ -76,7 +85,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Provider" },
+            "criteria": {
+              "textContent": "Provider"
+            },
             "label": "Provider selection area"
           },
           "source": "manual",
@@ -100,7 +111,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "searchbox" },
+            "criteria": {
+              "role": "searchbox"
+            },
             "label": "Workflow search input"
           },
           "source": "manual",
@@ -115,7 +128,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "New" },
+            "criteria": {
+              "role": "button",
+              "textContent": "New"
+            },
             "label": "New Workflow button"
           },
           "source": "manual",
@@ -130,7 +146,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Workflows" },
+            "criteria": {
+              "textContent": "Workflows"
+            },
             "label": "Workflows sidebar heading"
           },
           "source": "manual",
@@ -145,7 +163,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Sidebar toggle button"
           },
           "source": "manual",
@@ -169,7 +189,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Setup" },
+            "criteria": {
+              "textContent": "Setup"
+            },
             "label": "Setup phase heading"
           },
           "source": "manual",
@@ -184,7 +206,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Verification" },
+            "criteria": {
+              "textContent": "Verification"
+            },
             "label": "Verification phase heading"
           },
           "source": "manual",
@@ -199,7 +223,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Agentic" },
+            "criteria": {
+              "textContent": "Agentic"
+            },
             "label": "Agentic phase heading"
           },
           "source": "manual",
@@ -214,7 +240,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Completion" },
+            "criteria": {
+              "textContent": "Completion"
+            },
             "label": "Completion phase heading"
           },
           "source": "manual",
@@ -229,7 +257,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Add" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Add"
+            },
             "label": "Add step button"
           },
           "source": "manual",
@@ -253,7 +284,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Run" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Run"
+            },
             "label": "Run button"
           },
           "source": "manual",
@@ -268,7 +302,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Save" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Save"
+            },
             "label": "Save button"
           },
           "source": "manual",
@@ -283,7 +320,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Export" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Export"
+            },
             "label": "Export button"
           },
           "source": "manual",
@@ -307,7 +347,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Name" },
+            "criteria": {
+              "textContent": "Name"
+            },
             "label": "Workflow name field label"
           },
           "source": "manual",
@@ -322,7 +364,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Max Iterations" },
+            "criteria": {
+              "textContent": "Max Iterations"
+            },
             "label": "Max iterations setting"
           },
           "source": "manual",
@@ -337,7 +381,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Reflection" },
+            "criteria": {
+              "textContent": "Reflection"
+            },
             "label": "Reflection mode setting"
           },
           "source": "manual",
@@ -352,7 +398,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Settings gear button"
           },
           "source": "manual",
@@ -376,7 +424,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Setup" },
+            "criteria": {
+              "textContent": "Setup"
+            },
             "label": "Phase section with add step capability"
           },
           "source": "manual",
@@ -391,7 +441,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Workflows" },
+            "criteria": {
+              "textContent": "Workflows"
+            },
             "label": "Workflow builder with library integration"
           },
           "source": "manual",
@@ -406,7 +458,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Setup" },
+            "criteria": {
+              "textContent": "Setup"
+            },
             "label": "Phase section containing configurable steps"
           },
           "source": "manual",
@@ -424,6 +478,7 @@
     "updatedAt": "2026-03-05T00:00:00.000Z",
     "pageUrl": "/build/workflows",
     "elementSource": "sdk",
-    "tags": ["workflow-builder", "ai-generation", "multi-phase", "editor", "tier-1"]
+    "tags": ["workflow-builder", "ai-generation", "multi-phase", "editor", "tier-1"],
+    "specType": "semantic"
   }
 }

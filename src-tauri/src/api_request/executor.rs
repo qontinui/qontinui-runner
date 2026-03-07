@@ -8,6 +8,7 @@ use super::types::{
     CredentialValue, ExtractionResult, VariableExtraction,
 };
 use super::variable_resolver::VariableResolver;
+use crate::str_utils::truncate_str;
 use anyhow::{Context, Result};
 use jsonpath_rust::JsonPathFinder;
 use reqwest::Client;
@@ -485,7 +486,7 @@ impl ApiRequestExecutor {
                     assertion_type: "body_contains".to_string(),
                     expected,
                     actual: if actual.len() > 100 {
-                        format!("{}...", &actual[..100])
+                        format!("{}...", truncate_str(actual, 100))
                     } else {
                         actual.to_string()
                     },

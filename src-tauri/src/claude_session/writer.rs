@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::claude_protocol::codec::encode_message;
+use crate::str_utils::truncate_str;
 
 /// Thread-safe wrapper around Claude CLI's stdin pipe.
 pub struct StdinWriter {
@@ -40,7 +41,7 @@ impl StdinWriter {
                     .flush()
                     .map_err(|e| format!("Failed to flush stdin: {}", e))?;
                 let preview = if encoded.len() > 200 {
-                    &encoded[..200]
+                    truncate_str(&encoded, 200)
                 } else {
                     &encoded
                 };

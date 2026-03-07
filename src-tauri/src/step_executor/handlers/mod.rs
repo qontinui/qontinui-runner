@@ -62,6 +62,7 @@ use crate::action_service::UnifiedActionService;
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
 use crate::orchestrator::context_propagation::{RuntimeContext, SharedVariableStore};
+use crate::str_utils::truncate_str;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -453,7 +454,7 @@ impl StepHandler for PromptStepHandler {
         tracing::info!(
             "Evaluating verification prompt: {}",
             if prompt_content.len() > 80 {
-                format!("{}...", &prompt_content[..80])
+                format!("{}...", truncate_str(&prompt_content, 80))
             } else {
                 prompt_content.clone()
             }

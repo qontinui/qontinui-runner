@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the Check Group Builder page -- a specialized editor for creating and managing check groups that bundle multiple individual checks into reusable test suites. Check groups allow users to compose verification steps from existing checks, controlling execution order, parallelism, and failure behavior. When used in a workflow verification phase, a check group runs all its constituent checks as a single verification unit, simplifying workflow configuration and promoting consistent verification patterns.",
+  "description": "Check Group Builder page -- a specialized editor for creating and managing check groups that bundle multiple individual checks into reusable test suites. Check groups allow users to compose verification steps from existing checks, controlling execution order, parallelism, and failure behavior. When used in a workflow verification phase, a check group runs all its constituent checks as a single verification unit, simplifying workflow configuration and promoting consistent verification patterns.",
   "groups": [
     {
       "id": "cg-list-management",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Check Groups" },
+            "criteria": {
+              "textContent": "Check Groups"
+            },
             "label": "Check Groups page title"
           },
           "source": "manual",
@@ -31,7 +33,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "New" },
+            "criteria": {
+              "role": "button",
+              "textContent": "New"
+            },
             "label": "New check group button"
           },
           "source": "manual",
@@ -46,7 +51,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "searchbox" },
+            "criteria": {
+              "role": "searchbox"
+            },
             "label": "Check group search input"
           },
           "source": "manual",
@@ -70,7 +77,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Check Groups" },
+            "criteria": {
+              "textContent": "Check Groups"
+            },
             "label": "Check group editor with check selector"
           },
           "source": "manual",
@@ -85,7 +94,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Check Groups" },
+            "criteria": {
+              "textContent": "Check Groups"
+            },
             "label": "Check group editor with remove capability"
           },
           "source": "manual",
@@ -100,7 +111,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Check Groups" },
+            "criteria": {
+              "textContent": "Check Groups"
+            },
             "label": "Check selector with type info"
           },
           "source": "manual",
@@ -115,7 +128,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Save" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Save"
+            },
             "label": "Save check group button"
           },
           "source": "manual",
@@ -139,7 +155,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Check Groups" },
+            "criteria": {
+              "textContent": "Check Groups"
+            },
             "label": "Check group with execution mode"
           },
           "source": "manual",
@@ -154,7 +172,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Check Groups" },
+            "criteria": {
+              "textContent": "Check Groups"
+            },
             "label": "Check group with stop-on-failure toggle"
           },
           "source": "manual",
@@ -169,7 +189,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Check Groups" },
+            "criteria": {
+              "textContent": "Check Groups"
+            },
             "label": "Check group name and description fields"
           },
           "source": "manual",
@@ -184,7 +206,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Check Groups" },
+            "criteria": {
+              "textContent": "Check Groups"
+            },
             "label": "Check group with tag support"
           },
           "source": "manual",
@@ -202,6 +226,7 @@
     "updatedAt": "2026-03-05T00:00:00.000Z",
     "pageUrl": "/build/check-groups",
     "elementSource": "sdk",
-    "tags": ["check-groups", "verification", "builder", "library", "test-suites"]
+    "tags": ["check-groups", "verification", "builder", "library", "test-suites"],
+    "specType": "semantic"
   }
 }

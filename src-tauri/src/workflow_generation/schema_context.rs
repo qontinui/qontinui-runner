@@ -329,6 +329,16 @@ When the user mentions these terms, map them to the correct endpoints:
 - "supervisor" / "dev supervisor" → Qontinui Supervisor at http://localhost:9875 (health: GET /health, NOT /status)
 - Use health check API requests to verify services are running before testing. The supervisor uses GET /health (NOT /status).
 
+**IMPORTANT: Runner API Response Format**
+ALL runner API endpoints (port 9876) return responses in the standard `ApiResponse` format:
+```json
+{{"success": true, "data": <payload>}}    // on success
+{{"success": false, "error": "<message>"}} // on error
+```
+- Health check: `GET http://localhost:9876/health` returns `{{"success": true, "data": "ok"}}`
+- To verify health: `curl -s http://localhost:9876/health | python -c "import sys,json; d=json.load(sys.stdin); assert d.get('success')==True and d.get('data')=='ok', 'Runner not healthy: '+str(d)"`
+- NEVER check for `d.get('status')` — the field is `d.get('data')` for the payload and `d.get('success')` for success/failure.
+
 ## UI Bridge SDK (REQUIRED for Web App Verification)
 
 When a workflow targets a web application (localhost:3001, localhost:1420, or any React/Next.js app),

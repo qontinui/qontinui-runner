@@ -24,6 +24,7 @@ use crate::orchestrator::integration::StageTransition;
 use crate::orchestrator::knowledge::{parse_findings_from_output, AgentType, KnowledgeBase};
 use crate::step_executor::ExecutionStepConfig;
 use crate::step_registry::StepEventLogger;
+use crate::str_utils::truncate_str;
 use crate::summary_generator::generate_task_summary_async;
 use crate::workflow_state::{StateMachine, WorkflowState};
 use crate::AppState;
@@ -1745,7 +1746,7 @@ impl LoopController {
                     if !sr.success {
                         let err = sr.error.as_deref().unwrap_or("unknown error");
                         // Truncate long error messages
-                        let truncated = if err.len() > 200 { &err[..200] } else { err };
+                        let truncated = truncate_str(err, 200);
                         details
                             .push_str(&format!("  - {} [FAILED]: {}\n", sr.step_name, truncated));
                     }
@@ -2427,10 +2428,11 @@ impl LoopController {
                         if raw.is_empty() {
                             None
                         } else if raw.len() > 8000 {
+                            let t = truncate_str(&raw, 8000);
                             Some(format!(
                                 "{}...\n[truncated, {} more chars]",
-                                &raw[..8000],
-                                raw.len() - 8000
+                                t,
+                                raw.len() - t.len()
                             ))
                         } else {
                             Some(raw)
@@ -2643,10 +2645,11 @@ impl LoopController {
                                 Ok(d) if d.status.success() => {
                                     let raw = String::from_utf8_lossy(&d.stdout).to_string();
                                     if raw.len() > 8000 {
+                                        let t = truncate_str(&raw, 8000);
                                         format!(
                                             "{}...\n[truncated, {} more chars]",
-                                            &raw[..8000],
-                                            raw.len() - 8000
+                                            t,
+                                            raw.len() - t.len()
                                         )
                                     } else {
                                         raw
@@ -4118,18 +4121,18 @@ fn build_resume_agentic_context(
                 })
                 .collect();
 
-            if !failed.is_empty() {
-                let total = checkpoints.len();
-                let passed = checkpoints
-                    .iter()
-                    .filter(|cp| {
-                        matches!(
-                            cp.status,
-                            crate::workflow_state::StepCheckpointStatus::Success
-                        )
-                    })
-                    .count();
+            let total = checkpoints.len();
+            let passed = checkpoints
+                .iter()
+                .filter(|cp| {
+                    matches!(
+                        cp.status,
+                        crate::workflow_state::StepCheckpointStatus::Success
+                    )
+                })
+                .count();
 
+            if !failed.is_empty() {
                 let mut context = String::new();
                 context.push_str("## Verification Results (Resumed)\n\n");
                 context.push_str(&format!(
@@ -4161,10 +4164,11 @@ fn build_resume_agentic_context(
                             {
                                 if !output.is_empty() {
                                     let truncated = if output.len() > 2000 {
+                                        let t = truncate_str(output, 2000);
                                         format!(
                                             "{}...\n[truncated, {} more chars]",
-                                            &output[..2000],
-                                            output.len() - 2000
+                                            t,
+                                            output.len() - t.len()
                                         )
                                     } else {
                                         output.to_string()
@@ -4187,11 +4191,24 @@ fn build_resume_agentic_context(
                     failed.len()
                 );
                 return context;
+            } else {
+                // All verification steps passed — no failures to fix
+                info!(
+                    "RESUME: All {} verification steps passed, no failures to fix",
+                    total
+                );
+                return format!(
+                    "All {} verification steps passed. No failures to investigate. \
+                     Proceed with any analysis or improvements based on the workflow context provided.",
+                    total
+                );
             }
         }
     }
 
-    // Strategy 3: Fallback
+    // Strategy 3: Fallback — no verification data available at all
     info!("RESUME: No verification data found, using fallback context");
-    "Resuming from interrupted agentic phase. The previous verification found failures. Please investigate and fix the issues.".to_string()
+    "Resuming agentic phase. No verification data is available. \
+     Proceed with analysis based on the workflow context and instructions provided."
+        .to_string()
 }

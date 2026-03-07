@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
+use crate::str_utils::truncate_str;
+
 use crate::step_executor::{ExecutionResult, ExecutionStepConfig, LogSourceConfig};
 
 // ============================================================================
@@ -1017,7 +1019,7 @@ impl IterationBundle {
                 if let Some(ref command) = config.command {
                     // Truncate long commands
                     let cmd_display = if command.len() > 50 {
-                        format!("{}...", &command[..50])
+                        format!("{}...", truncate_str(command, 50))
                     } else {
                         command.clone()
                     };
@@ -1034,7 +1036,7 @@ impl IterationBundle {
                 }
                 if let Some(ref command) = config.command {
                     let cmd_display = if command.len() > 50 {
-                        format!("{}...", &command[..50])
+                        format!("{}...", truncate_str(command, 50))
                     } else {
                         command.clone()
                     };

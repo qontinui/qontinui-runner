@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the Workflow Queue (Execute) page -- the primary interface for composing and executing sequential workflow runs. Users browse a workflow library, build an ordered execution queue, configure execution options like stop-on-failure, and launch the entire queue as a composed workflow. The page persists queue state and options across sessions via localStorage, ensuring users can return to an in-progress queue without losing their selections.",
+  "description": "Workflow Queue (Execute) page -- the primary interface for composing and executing sequential workflow runs. Users browse a workflow library, build an ordered execution queue, configure execution options like stop-on-failure, and launch the entire queue as a composed workflow. The page persists queue state and options across sessions via localStorage, ensuring users can return to an in-progress queue without losing their selections.",
   "groups": [
     {
       "id": "exec-library-browsing",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "searchbox" },
+            "criteria": {
+              "role": "searchbox"
+            },
             "label": "Workflow library search input"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "all" },
+            "criteria": {
+              "textContent": "all"
+            },
             "label": "Category filter showing 'all' default"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Library" },
+            "criteria": {
+              "textContent": "Library"
+            },
             "label": "Library panel toggle or label"
           },
           "source": "manual",
@@ -61,7 +67,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Refresh" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Refresh"
+            },
             "label": "Refresh button"
           },
           "source": "manual",
@@ -85,7 +94,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "heading", "textContent": "Workflow Queue" },
+            "criteria": {
+              "role": "heading",
+              "textContent": "Workflow Queue"
+            },
             "label": "Workflow Queue page heading"
           },
           "source": "manual",
@@ -100,7 +112,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Queue:" },
+            "criteria": {
+              "textContent": "Queue:"
+            },
             "label": "Queue summary in bottom bar"
           },
           "source": "manual",
@@ -115,7 +129,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Clear" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Clear"
+            },
             "label": "Clear queue button"
           },
           "source": "manual",
@@ -139,7 +156,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Execution options" },
+            "criteria": {
+              "textContent": "Execution options"
+            },
             "label": "Execution options toggle button"
           },
           "source": "manual",
@@ -154,7 +173,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Stop on failure" },
+            "criteria": {
+              "textContent": "Stop on failure"
+            },
             "label": "Stop on failure option"
           },
           "source": "manual",
@@ -169,7 +190,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Stop the sequence if any workflow fails" },
+            "criteria": {
+              "textContent": "Stop the sequence if any workflow fails"
+            },
             "label": "Stop on failure description"
           },
           "source": "manual",
@@ -193,7 +216,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Run Queue" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Run Queue"
+            },
             "label": "Run Queue button"
           },
           "source": "manual",
@@ -208,7 +234,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Run Queue" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Run Queue"
+            },
             "label": "Run Queue button in disabled state"
           },
           "source": "manual",
@@ -223,7 +252,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Clear" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Clear"
+            },
             "label": "Clear button in disabled state"
           },
           "source": "manual",
@@ -247,7 +279,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Workflow Queue" },
+            "criteria": {
+              "textContent": "Workflow Queue"
+            },
             "label": "Page header with title"
           },
           "source": "manual",
@@ -262,7 +296,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Queue:" },
+            "criteria": {
+              "textContent": "Queue:"
+            },
             "label": "Bottom bar with queue count"
           },
           "source": "manual",
@@ -277,7 +313,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Library" },
+            "criteria": {
+              "textContent": "Library"
+            },
             "label": "Library panel indicator"
           },
           "source": "manual",
@@ -295,6 +333,7 @@
     "updatedAt": "2026-03-05T00:00:00.000Z",
     "pageUrl": "/execute",
     "elementSource": "sdk",
-    "tags": ["execute", "workflow-queue", "composed-workflow", "run-group", "tier-1"]
+    "tags": ["execute", "workflow-queue", "composed-workflow", "run-group", "tier-1"],
+    "specType": "semantic"
   }
 }

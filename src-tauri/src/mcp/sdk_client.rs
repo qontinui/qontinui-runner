@@ -1262,10 +1262,17 @@ async fn handle_discover_and_cache(
             }
         },
         Ok(resp) => {
+            let status = resp.status();
+            let hint = match status.as_u16() {
+                404 => " — the app may not have UI Bridge SDK integrated",
+                401 | 403 => " — authentication required",
+                500..=599 => " — the app's specs endpoint encountered an internal error",
+                _ => "",
+            };
             return Json(ApiResponse::error(format!(
-                "Specs endpoint returned HTTP {}",
-                resp.status()
-            )))
+                "Could not fetch specs from {}{}/control/specs (HTTP {}){}",
+                url, base_path, status, hint
+            )));
         }
         Err(e) => return Json(ApiResponse::error(format!("Failed to fetch specs: {}", e))),
     };

@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the Step Builders landing page -- a discovery hub that presents all available step builder types as a card grid. Users land here to understand what kinds of automation assets they can create and navigate to the specialized builder for each type. Each card represents a distinct builder (checks, check groups, shell commands, tasks, contexts, playwright tests) with a brief description and visual icon. Clicking a card navigates to the full builder interface for that asset type.",
+  "description": "Step Builders landing page -- a discovery hub that presents all available step builder types as a card grid. Users land here to understand what kinds of automation assets they can create and navigate to the specialized builder for each type. Each card represents a distinct builder (checks, check groups, shell commands, tasks, contexts, playwright tests) with a brief description and visual icon. Clicking a card navigates to the full builder interface for that asset type.",
   "groups": [
     {
       "id": "sb-page-purpose",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Step Builders" },
+            "criteria": {
+              "textContent": "Step Builders"
+            },
             "label": "Step Builders page heading"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Checks" },
+            "criteria": {
+              "textContent": "Checks"
+            },
             "label": "Checks builder card"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Shell Commands" },
+            "criteria": {
+              "textContent": "Shell Commands"
+            },
             "label": "Shell Commands builder card"
           },
           "source": "manual",
@@ -70,7 +76,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Verification checks for validating UI state" },
+            "criteria": {
+              "textContent": "Verification checks for validating UI state"
+            },
             "label": "Checks card description"
           },
           "source": "manual",
@@ -85,7 +93,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Check Groups" },
+            "criteria": {
+              "textContent": "Check Groups"
+            },
             "label": "Check Groups card title"
           },
           "source": "manual",
@@ -100,7 +110,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Tasks" },
+            "criteria": {
+              "textContent": "Tasks"
+            },
             "label": "Tasks card title"
           },
           "source": "manual",
@@ -115,7 +127,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Contexts" },
+            "criteria": {
+              "textContent": "Contexts"
+            },
             "label": "Contexts card title"
           },
           "source": "manual",
@@ -130,7 +144,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Playwright Tests" },
+            "criteria": {
+              "textContent": "Playwright Tests"
+            },
             "label": "Playwright Tests card title"
           },
           "source": "manual",
@@ -154,7 +170,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Step Builders" },
+            "criteria": {
+              "textContent": "Step Builders"
+            },
             "label": "Page with grid layout"
           },
           "source": "manual",
@@ -169,7 +187,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "System commands and shell scripts" },
+            "criteria": {
+              "textContent": "System commands and shell scripts"
+            },
             "label": "Shell Commands card description"
           },
           "source": "manual",
@@ -204,6 +224,7 @@
     "updatedAt": "2026-03-05T00:00:00.000Z",
     "pageUrl": "/build/templates",
     "elementSource": "sdk",
-    "tags": ["step-builders", "landing-page", "navigation", "asset-creation"]
+    "tags": ["step-builders", "landing-page", "navigation", "asset-creation"],
+    "specType": "semantic"
   }
 }

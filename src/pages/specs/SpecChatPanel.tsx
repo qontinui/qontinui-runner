@@ -24,6 +24,11 @@ import {
 } from "lucide-react";
 import { useAiSession } from "@/hooks/useAiSession";
 import { MarkdownViewer } from "@/components/MarkdownViewer";
+import {
+  SPEC_CREATION_INSTRUCTIONS,
+  buildDetailedSpecContext,
+  buildSpecReviewPrompt,
+} from "@/lib/spec-prompt-builder";
 import type { LoadedSpec, SpecKind } from "./types";
 
 // ============================================================================
@@ -99,21 +104,11 @@ function MessageBubble({
 
 function buildSpecContext(spec: LoadedSpec): string {
   if (spec.kind === "page-spec") {
-    const groups = spec.config.groups || [];
-    const groupSummary = groups
-      .map(
-        (g) =>
-          `  - ${g.name} (${g.category}): ${g.assertions.filter((a) => a.enabled).length} assertions`,
-      )
-      .join("\n");
-    return [
-      `# Selected Spec: ${spec.specId}`,
-      spec.config.description ? `Description: ${spec.config.description}` : "",
-      `Type: Page Spec`,
-      `Groups:\n${groupSummary}`,
-    ]
-      .filter(Boolean)
-      .join("\n");
+    return buildDetailedSpecContext({
+      specId: spec.specId,
+      config: spec.config,
+      appName: spec.appName,
+    });
   }
 
   if (spec.kind === "architecture") {
@@ -176,48 +171,37 @@ function buildSpecContext(spec: LoadedSpec): string {
 // Quick actions
 // ============================================================================
 
-const REVIEW_ACTIONS = [
-  {
-    label: "Review spec quality",
-    prompt:
-      "Review this spec for completeness, gaps, and potential improvements. Are there missing assertions or categories?",
-  },
-  {
-    label: "Find gaps",
-    prompt:
-      "Identify gaps in this specification. What scenarios, edge cases, or behaviors are not covered?",
-  },
-  {
-    label: "Suggest improvements",
-    prompt: "Suggest specific improvements to make this spec more comprehensive and maintainable.",
-  },
-  {
-    label: "Generate assertions",
-    prompt:
-      "Generate additional assertions that would strengthen this spec's coverage. Format each as a clear, testable statement.",
-  },
+type ReviewType = "quality" | "gaps" | "improvements" | "assertions";
+
+const REVIEW_ACTIONS: Array<{ label: string; reviewType: ReviewType }> = [
+  { label: "Review spec quality", reviewType: "quality" },
+  { label: "Find gaps", reviewType: "gaps" },
+  { label: "Suggest improvements", reviewType: "improvements" },
+  { label: "Generate assertions", reviewType: "assertions" },
 ];
 
-const CREATE_ACTIONS = [
+type CreateSpecType = "page-spec" | "architecture" | "api" | "data";
+
+const CREATE_ACTIONS: Array<{ label: string; specType: CreateSpecType; placeholder: string }> = [
   {
     label: "New Page Spec",
-    prompt:
-      "Help me create a new page specification. I'll describe the page, and you generate a complete SpecConfig JSON with groups and assertions. Ask me about the page first.",
+    specType: "page-spec",
+    placeholder: "Describe the page: name, URL, what it does, which project it belongs to...",
   },
   {
     label: "New Architecture Spec",
-    prompt:
-      "Help me create a new architecture specification. I'll describe the project, and you generate a complete ArchitectureConfig JSON. Ask me about the tech stack and patterns first.",
+    specType: "architecture",
+    placeholder: "Describe the project: name, tech stack, key patterns...",
   },
   {
     label: "New API Spec",
-    prompt:
-      "Help me create a new API specification. I'll describe the API, and you generate a complete ApiConfig JSON with endpoints and models. Ask me about the API first.",
+    specType: "api",
+    placeholder: "Describe the API: base path, endpoints, auth type...",
   },
   {
     label: "New Data Spec",
-    prompt:
-      "Help me create a new data specification. I'll describe the database schema, and you generate a complete DataConfig JSON. Ask me about the entities first.",
+    specType: "data",
+    placeholder: "Describe the schema: database type, entities, relations...",
   },
 ];
 
@@ -279,6 +263,7 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
   const session = useAiSession();
   const [input, setInput] = useState("");
   const [showCreateActions, setShowCreateActions] = useState(false);
+  const [pendingCreateType, setPendingCreateType] = useState<CreateSpecType | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -313,13 +298,20 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
         ? selectedSpec.kind === "page-spec"
           ? selectedSpec.config.description || selectedSpec.specId
           : selectedSpec.specId
-        : "Spec Review";
+        : pendingCreateType
+          ? "Spec Creation"
+          : "Spec Review";
       const specLabel = rawLabel.length > 60 ? rawLabel.slice(0, 57) + "..." : rawLabel;
       const id = await session.createSession(`Spec Chat: ${specLabel}`);
       if (!id) return;
 
-      // First message: include spec context
-      if (selectedSpec) {
+      // First message: include context
+      if (pendingCreateType === "page-spec") {
+        // Prepend creation instructions for page specs
+        const message = `${SPEC_CREATION_INSTRUCTIONS}\n\n---\n\nCreate a comprehensive page spec for the following page. Read the source code first, then generate a complete JSON spec.\n\n${text}`;
+        setPendingCreateType(null);
+        await session.sendMessage(message);
+      } else if (selectedSpec) {
         const context = buildSpecContext(selectedSpec);
         await session.sendMessage(`${context}\n\n---\n\n${text}`);
       } else {
@@ -329,12 +321,35 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
     }
 
     await session.sendMessage(text);
-  }, [input, session, selectedSpec]);
+  }, [input, session, selectedSpec, pendingCreateType]);
 
   const handleQuickAction = useCallback((prompt: string) => {
     setInput(prompt);
     textareaRef.current?.focus();
   }, []);
+
+  // Review actions send the full spec context + review instructions directly
+  const handleReviewAction = useCallback(
+    async (reviewType: ReviewType) => {
+      if (!selectedSpec || selectedSpec.kind !== "page-spec") return;
+
+      const reviewPrompt = buildSpecReviewPrompt(
+        { specId: selectedSpec.specId, config: selectedSpec.config, appName: selectedSpec.appName },
+        reviewType,
+      );
+
+      // Create session if needed
+      if (!session.taskRunId) {
+        const rawLabel = selectedSpec.config.description || selectedSpec.specId;
+        const specLabel = rawLabel.length > 60 ? rawLabel.slice(0, 57) + "..." : rawLabel;
+        const id = await session.createSession(`Spec Review: ${specLabel}`);
+        if (!id) return;
+      }
+
+      await session.sendMessage(reviewPrompt);
+    },
+    [selectedSpec, session],
+  );
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -354,7 +369,7 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
 
   const isProcessing = session.sessionState === "processing";
   const hasMessages = session.messages.length > 0;
-  const canSend = selectedSpec || session.taskRunId || showCreateActions;
+  const canSend = selectedSpec || session.taskRunId || pendingCreateType;
 
   return (
     <div className="h-full flex flex-col">
@@ -379,6 +394,7 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
                 session.close();
                 session.resetSession();
                 setShowCreateActions(false);
+                setPendingCreateType(null);
               }}
               className="text-[10px] text-muted-foreground/50 hover:text-muted-foreground transition-colors"
             >
@@ -421,7 +437,11 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
                 {REVIEW_ACTIONS.map((action) => (
                   <button
                     key={action.label}
-                    onClick={() => handleQuickAction(action.prompt)}
+                    onClick={() =>
+                      selectedSpec?.kind === "page-spec"
+                        ? handleReviewAction(action.reviewType)
+                        : handleQuickAction(`Review this spec: ${action.label}`)
+                    }
                     className="w-full text-left px-2 py-1.5 text-[10px] text-muted-foreground/70 rounded
                       bg-white/[0.02] border border-white/5 hover:bg-white/[0.05] hover:text-muted-foreground
                       transition-colors"
@@ -451,10 +471,17 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
                 {CREATE_ACTIONS.map((action) => (
                   <button
                     key={action.label}
-                    onClick={() => handleQuickAction(action.prompt)}
-                    className="w-full flex items-center gap-1.5 text-left px-2 py-1.5 text-[10px] text-muted-foreground/70 rounded
-                      bg-white/[0.02] border border-white/5 hover:bg-white/[0.05] hover:text-green-400
-                      transition-colors"
+                    onClick={() => {
+                      setPendingCreateType(action.specType);
+                      setInput("");
+                      textareaRef.current?.focus();
+                    }}
+                    className={`w-full flex items-center gap-1.5 text-left px-2 py-1.5 text-[10px] rounded
+                      bg-white/[0.02] border hover:bg-white/[0.05] transition-colors ${
+                        pendingCreateType === action.specType
+                          ? "text-green-400 border-green-500/30"
+                          : "text-muted-foreground/70 border-white/5 hover:text-green-400"
+                      }`}
                   >
                     <FilePlus className="w-3 h-3 shrink-0" />
                     {action.label}
@@ -519,9 +546,12 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
             placeholder={
               selectedSpec
                 ? "Ask about this spec..."
-                : showCreateActions
-                  ? "Describe the spec you want to create..."
-                  : "Select a spec first..."
+                : pendingCreateType
+                  ? CREATE_ACTIONS.find((a) => a.specType === pendingCreateType)?.placeholder ||
+                    "Describe the spec..."
+                  : showCreateActions
+                    ? "Select a spec type above..."
+                    : "Select a spec first..."
             }
             disabled={!canSend}
             rows={1}

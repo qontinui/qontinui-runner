@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the UI Bridge Integration page — manages discovery, connection, injection, monitoring, and exploration of UI Bridge-enabled applications across five specialized tabs.",
+  "description": "UI Bridge Integration page — manages discovery, connection, injection, monitoring, and exploration of UI Bridge-enabled applications across five specialized tabs.",
   "groups": [
     {
       "id": "uibridge-navigation",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "UI Bridge" },
+            "criteria": {
+              "textContent": "UI Bridge"
+            },
             "label": "UI Bridge heading"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Discovery" },
+            "criteria": {
+              "textContent": "Discovery"
+            },
             "label": "Discovery tab trigger"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Runtime Injection" },
+            "criteria": {
+              "textContent": "Runtime Injection"
+            },
             "label": "Runtime Injection tab trigger"
           },
           "source": "manual",
@@ -61,7 +67,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Source Integration" },
+            "criteria": {
+              "textContent": "Source Integration"
+            },
             "label": "Source Integration tab trigger"
           },
           "source": "manual",
@@ -85,7 +93,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Health Monitor" },
+            "criteria": {
+              "textContent": "Health Monitor"
+            },
             "label": "Health Monitor tab trigger"
           },
           "source": "manual",
@@ -100,7 +110,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "State Explorer" },
+            "criteria": {
+              "textContent": "State Explorer"
+            },
             "label": "State Explorer tab trigger"
           },
           "source": "manual",
@@ -115,7 +127,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "integration" },
+            "criteria": {
+              "textContent": "integration"
+            },
             "label": "Integration badge"
           },
           "source": "manual",
@@ -139,7 +153,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Discovery" },
+            "criteria": {
+              "textContent": "Discovery"
+            },
             "label": "First tab in the five-tab navigation"
           },
           "source": "manual",
@@ -154,7 +170,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "tablist" },
+            "criteria": {
+              "role": "tablist"
+            },
             "label": "Tab navigation list"
           },
           "source": "manual",
@@ -169,7 +187,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "tab" },
+            "criteria": {
+              "role": "tab"
+            },
             "label": "Active tab indicator"
           },
           "source": "manual",

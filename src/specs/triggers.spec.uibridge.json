@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Triggers page — configures event-driven workflow triggers that automatically execute workflows in response to schedules, webhooks, filesystem changes, and other events.",
+  "description": "Triggers page — configures event-driven workflow triggers that automatically execute workflows in response to schedules, webhooks, filesystem changes, and other events.",
   "groups": [
     {
       "id": "triggers-overview",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Triggers" },
+            "criteria": {
+              "textContent": "Triggers"
+            },
             "label": "Triggers page heading"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "enabled" },
+            "criteria": {
+              "textContent": "enabled"
+            },
             "label": "Trigger system status indicators"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "New Trigger" },
+            "criteria": {
+              "textContent": "New Trigger"
+            },
             "label": "New Trigger button"
           },
           "source": "manual",
@@ -70,7 +76,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "All Triggers" },
+            "criteria": {
+              "textContent": "All Triggers"
+            },
             "label": "All Triggers sub-tab"
           },
           "source": "manual",
@@ -85,7 +93,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Trigger enable/disable toggle"
           },
           "source": "manual",
@@ -100,7 +110,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Test Result" },
+            "criteria": {
+              "textContent": "Test Result"
+            },
             "label": "Test result modal"
           },
           "source": "manual",
@@ -115,7 +127,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Delete trigger action"
           },
           "source": "manual",
@@ -139,7 +153,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "History" },
+            "criteria": {
+              "textContent": "History"
+            },
             "label": "History sub-tab"
           },
           "source": "manual",
@@ -154,7 +170,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "View history action"
           },
           "source": "manual",
@@ -169,7 +187,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Refresh" },
+            "criteria": {
+              "textContent": "Refresh"
+            },
             "label": "Refresh button"
           },
           "source": "manual",

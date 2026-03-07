@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Run AI Output page — displays the full AI conversation transcript from a workflow run. Users can select between multiple AI sessions (setup, agentic, completion), read the complete conversation, view session statistics, manage auto-continue settings, and control live execution.",
+  "description": "Run AI Output page — displays the full AI conversation transcript from a workflow run. Users can select between multiple AI sessions (setup, agentic, completion), read the complete conversation, view session statistics, manage auto-continue settings, and control live execution.",
   "groups": [
     {
       "id": "ai-output-session-selection",
@@ -15,7 +15,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Session|All Sessions" },
+            "criteria": {
+              "textContent": "Session|All Sessions"
+            },
             "label": "Session selector"
           },
           "assertionType": "exists",
@@ -30,7 +32,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "duration|messages|session" },
+            "criteria": {
+              "textContent": "duration|messages|session"
+            },
             "label": "Session statistics"
           },
           "assertionType": "exists",
@@ -45,7 +49,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "All" },
+            "criteria": {
+              "textContent": "All"
+            },
             "label": "All sessions option"
           },
           "assertionType": "exists",
@@ -69,7 +75,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "output|conversation" },
+            "criteria": {
+              "textContent": "output|conversation"
+            },
             "label": "AI conversation transcript"
           },
           "assertionType": "exists",
@@ -84,7 +92,10 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Copy" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Copy"
+            },
             "label": "Copy output button"
           },
           "assertionType": "exists",
@@ -99,7 +110,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Loop|Iteration|iteration" },
+            "criteria": {
+              "textContent": "Loop|Iteration|iteration"
+            },
             "label": "Loop structure in output"
           },
           "assertionType": "exists",
@@ -123,7 +136,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Running|Complete|Failed|Stopped" },
+            "criteria": {
+              "textContent": "Running|Complete|Failed|Stopped"
+            },
             "label": "Session status banner"
           },
           "assertionType": "exists",
@@ -138,7 +153,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Auto" },
+            "criteria": {
+              "textContent": "Auto"
+            },
             "label": "Auto-continue toggle"
           },
           "assertionType": "exists",
@@ -153,7 +170,10 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Stop" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Stop"
+            },
             "label": "Stop session button"
           },
           "assertionType": "exists",
@@ -177,7 +197,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Select a run|No run" },
+            "criteria": {
+              "textContent": "Select a run|No run"
+            },
             "label": "No run selected message"
           },
           "assertionType": "exists",
@@ -192,7 +214,9 @@
           "severity": "minor",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No sessions|no output" },
+            "criteria": {
+              "textContent": "No sessions|no output"
+            },
             "label": "No sessions message"
           },
           "assertionType": "exists",
@@ -207,7 +231,9 @@
           "severity": "major",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Running|output" },
+            "criteria": {
+              "textContent": "Running|output"
+            },
             "label": "Live streaming indicator"
           },
           "assertionType": "exists",

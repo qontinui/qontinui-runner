@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Specs for the Scheduled Tasks page — manages recurring workflow execution through task scheduling with cron expressions, execution history, statistics, and settings configuration.",
+  "description": "Scheduled Tasks page — manages recurring workflow execution through task scheduling with cron expressions, execution history, statistics, and settings configuration.",
   "groups": [
     {
       "id": "scheduler-overview",
@@ -16,7 +16,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Scheduled Tasks" },
+            "criteria": {
+              "textContent": "Scheduled Tasks"
+            },
             "label": "Scheduled Tasks heading"
           },
           "source": "manual",
@@ -31,7 +33,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Running" },
+            "criteria": {
+              "textContent": "Running"
+            },
             "label": "Scheduler status indicator"
           },
           "source": "manual",
@@ -46,7 +50,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Scheduled" },
+            "criteria": {
+              "textContent": "Scheduled"
+            },
             "label": "Scheduled tasks sub-tab with count"
           },
           "source": "manual",
@@ -70,7 +76,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "New Task" },
+            "criteria": {
+              "textContent": "New Task"
+            },
             "label": "New Task button"
           },
           "source": "manual",
@@ -85,7 +93,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Scheduled" },
+            "criteria": {
+              "textContent": "Scheduled"
+            },
             "label": "Scheduled tasks tab content"
           },
           "source": "manual",
@@ -100,7 +110,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Task enable/disable toggle"
           },
           "source": "manual",
@@ -115,7 +127,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Auto-Fix" },
+            "criteria": {
+              "textContent": "Auto-Fix"
+            },
             "label": "Auto-Fix trigger button"
           },
           "source": "manual",
@@ -139,7 +153,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "History" },
+            "criteria": {
+              "textContent": "History"
+            },
             "label": "History sub-tab"
           },
           "source": "manual",
@@ -154,7 +170,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Settings" },
+            "criteria": {
+              "textContent": "Settings"
+            },
             "label": "Settings sub-tab"
           },
           "source": "manual",
@@ -169,7 +187,9 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": {
+              "role": "button"
+            },
             "label": "Refresh button"
           },
           "source": "manual",

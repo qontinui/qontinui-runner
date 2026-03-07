@@ -1,5 +1,5 @@
 import { useState, useCallback } from "react";
-import { X, Check, Wand2, Play, User, Bot, TerminalSquare } from "lucide-react";
+import { X, Check, Wand2, Play, User, Bot, TerminalSquare, ListChecks } from "lucide-react";
 import type { TranscriptMessage, TranscriptSession } from "./useTranscriptSessions";
 
 interface TranscriptContentPanelProps {
@@ -9,6 +9,7 @@ interface TranscriptContentPanelProps {
   loading: boolean;
   onGenerate: (description: string, inlineContext: string) => void;
   onGenerateAndRun?: (description: string, inlineContext: string) => void;
+  onBuildPlanWorkflow?: (planContent: string) => void;
   onResume: (session: TranscriptSession) => void;
   onClose: () => void;
 }
@@ -20,6 +21,7 @@ export function TranscriptContentPanel({
   loading,
   onGenerate,
   onGenerateAndRun,
+  onBuildPlanWorkflow,
   onResume,
   onClose,
 }: TranscriptContentPanelProps) {
@@ -90,6 +92,17 @@ export function TranscriptContentPanel({
     if (!ctx || !onGenerateAndRun) return;
     onGenerateAndRun(ctx.desc, ctx.inlineContext);
   }, [buildContext, onGenerateAndRun]);
+
+  const handleBuildPlan = useCallback(() => {
+    if (!onBuildPlanWorkflow) return;
+    // Extract plan content from selected messages
+    const selected = messages.filter((m) => selectedMessageIds.has(m.uuid));
+    const planParts = selected
+      .map((m) => m.plan_content || m.text)
+      .filter((t) => t.trim().length > 0);
+    if (planParts.length === 0) return;
+    onBuildPlanWorkflow(planParts.join("\n\n---\n\n"));
+  }, [messages, selectedMessageIds, onBuildPlanWorkflow]);
 
   const planCount = messages.filter((m) => m.plan_content).length;
 
@@ -274,6 +287,24 @@ export function TranscriptContentPanel({
             <Wand2 className="w-3 h-3" />
             Generate ({selectedMessageIds.size})
           </button>
+          {onBuildPlanWorkflow && (
+            <button
+              onClick={handleBuildPlan}
+              disabled={selectedMessageIds.size === 0}
+              className={`
+                flex items-center justify-center gap-1 px-2.5 py-1.5 rounded text-xs font-medium transition-colors
+                ${
+                  selectedMessageIds.size > 0
+                    ? "bg-[#e0af68] text-[#1a1b26] hover:bg-[#e8b96e]"
+                    : "bg-[#2a2d3d] text-[#414868] cursor-not-allowed"
+                }
+              `}
+              title="Build workflow from plan with deterministic verification steps"
+            >
+              <ListChecks className="w-3 h-3" />
+              Plan
+            </button>
+          )}
           {onGenerateAndRun && (
             <button
               onClick={handleGenerateAndRun}

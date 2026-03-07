@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Semantic specs for the Playwright Test Builder page — where users create, edit, and manage Playwright browser automation tests that serve as verification steps in workflows",
+  "description": "Playwright Test Builder page — where users create, edit, and manage Playwright browser automation tests that serve as verification steps in workflows",
   "groups": [
     {
       "id": "pw-purpose",
@@ -15,7 +15,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Playwright" },
+            "criteria": {
+              "textContent": "Playwright"
+            },
             "label": "Playwright test heading"
           },
           "assertionType": "exists",
@@ -30,7 +32,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Test" },
+            "criteria": {
+              "textContent": "Test"
+            },
             "label": "Test reference"
           },
           "assertionType": "exists",
@@ -43,7 +47,13 @@
           "description": "Users can browse all saved Playwright tests in a searchable list and select any test for editing, running, or review",
           "category": "semantic",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "list" }, "label": "Test list" },
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "list"
+            },
+            "label": "Test list"
+          },
           "assertionType": "exists",
           "source": "manual",
           "reviewed": true,
@@ -63,7 +73,13 @@
           "description": "Users can write and edit Playwright test code in a code editor with syntax highlighting for TypeScript/JavaScript",
           "category": "semantic",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "textbox" }, "label": "Code editor" },
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Code editor"
+          },
           "assertionType": "exists",
           "source": "manual",
           "reviewed": true,
@@ -76,7 +92,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "textbox" },
+            "criteria": {
+              "role": "textbox"
+            },
             "label": "Test name input"
           },
           "assertionType": "exists",
@@ -91,7 +109,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Save" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Save"
+            },
             "label": "Save button"
           },
           "assertionType": "exists",
@@ -115,7 +136,10 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Run" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Run"
+            },
             "label": "Run test button"
           },
           "assertionType": "exists",
@@ -130,7 +154,9 @@
           "severity": "critical",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Result" },
+            "criteria": {
+              "textContent": "Result"
+            },
             "label": "Test results area"
           },
           "assertionType": "exists",
@@ -154,7 +180,10 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "textContent": "Delete" },
+            "criteria": {
+              "role": "button",
+              "textContent": "Delete"
+            },
             "label": "Delete button"
           },
           "assertionType": "exists",
@@ -169,7 +198,9 @@
           "severity": "warning",
           "target": {
             "type": "search",
-            "criteria": { "role": "searchbox" },
+            "criteria": {
+              "role": "searchbox"
+            },
             "label": "Test search"
           },
           "assertionType": "exists",
@@ -187,6 +218,7 @@
     "createdAt": "2026-03-05T00:00:00.000Z",
     "updatedAt": "2026-03-05T00:00:00.000Z",
     "pageUrl": "/build/playwright-tests",
-    "tags": ["playwright", "test-builder", "verification", "browser-testing", "library-asset"]
+    "tags": ["playwright", "test-builder", "verification", "browser-testing", "library-asset"],
+    "specType": "semantic"
   }
 }

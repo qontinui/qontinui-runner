@@ -16,6 +16,7 @@ use crate::claude_protocol::types::OutgoingControlResponse;
 use crate::commands::ai_session::emit_session_state;
 use crate::findings::{FindingParser, ParsedFinding};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext};
+use crate::str_utils::truncate_str;
 use crate::workflow_state::{ParsedProgress, ProgressParser};
 
 use super::state::{SessionState, SessionStateTracker};
@@ -280,7 +281,7 @@ fn format_tool_activity(
         "Bash" | "bash" => {
             if let Some(cmd) = data.get("command").and_then(|v| v.as_str()) {
                 let short_cmd = if cmd.len() > 60 {
-                    format!("{}...", &cmd[..57])
+                    format!("{}...", truncate_str(cmd, 57))
                 } else {
                     cmd.to_string()
                 };
@@ -299,7 +300,7 @@ fn format_tool_activity(
         "Grep" | "grep" => {
             if let Some(pattern) = data.get("pattern").and_then(|v| v.as_str()) {
                 let short = if pattern.len() > 40 {
-                    format!("{}...", &pattern[..37])
+                    format!("{}...", truncate_str(pattern, 37))
                 } else {
                     pattern.to_string()
                 };
