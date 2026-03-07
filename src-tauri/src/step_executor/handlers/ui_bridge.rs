@@ -474,10 +474,16 @@ fn extract_rect(element: &serde_json::Value) -> Option<(f64, f64, f64, f64, f64,
     let y = rect.get("y")?.as_f64()?;
     let width = rect.get("width")?.as_f64()?;
     let height = rect.get("height")?.as_f64()?;
-    let top = rect.get("top")?.as_f64().unwrap_or(y);
-    let right = rect.get("right")?.as_f64().unwrap_or(x + width);
-    let bottom = rect.get("bottom")?.as_f64().unwrap_or(y + height);
-    let left = rect.get("left")?.as_f64().unwrap_or(x);
+    let top = rect.get("top").and_then(|v| v.as_f64()).unwrap_or(y);
+    let right = rect
+        .get("right")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(x + width);
+    let bottom = rect
+        .get("bottom")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(y + height);
+    let left = rect.get("left").and_then(|v| v.as_f64()).unwrap_or(x);
     Some((x, y, width, height, top, right, bottom, left))
 }
 
