@@ -526,6 +526,7 @@ function CompactZoneCard({
   assignments,
   sessionStates,
   onAssignTab,
+  tagColor,
 }: {
   tab: TerminalTab;
   state: SessionState;
@@ -550,6 +551,7 @@ function CompactZoneCard({
   assignments?: ZoneAssignments;
   sessionStates?: Record<string, SessionState>;
   onAssignTab?: (zoneIndex: number, tabId: string) => void;
+  tagColor?: string;
 }) {
   const needsInput = state === "needs-input";
   const [commandText, setCommandText] = useState("");
@@ -624,6 +626,11 @@ function CompactZoneCard({
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
     >
+      {/* Thin colored strip at top edge based on tag color */}
+      <div
+        className="h-[3px] w-full rounded-t shrink-0"
+        style={{ backgroundColor: tagColor ? `${tagColor}40` : "#2a2d3d20" }}
+      />
       {/* Copy output button — appears on hover, top-right corner */}
       {lastLines.length > 0 && (
         <button
@@ -1691,6 +1698,13 @@ export function ZoneGrid({
     }
   }, [resetRatiosKey, layout.columns, layout.rows]);
 
+  // Tick counter to force uptime re-render every 30s
+  const [, setUptimeTick] = useState(0);
+  useEffect(() => {
+    const interval = setInterval(() => setUptimeTick((t) => t + 1), 30000);
+    return () => clearInterval(interval);
+  }, []);
+
   const isMultiZone = layout.zones.length > 1;
   const showLabels = isMultiZone;
   // Auto-compact: when 4+ zones and viewMode is "auto", non-focused zones show compact
@@ -2010,6 +2024,7 @@ export function ZoneGrid({
                     assignments={assignments}
                     sessionStates={sessionStates}
                     onAssignTab={onAssignTab}
+                    tagColor={firstTagColor}
                   />
                   {/* Keep terminal instance alive but hidden */}
                   <div className="hidden">

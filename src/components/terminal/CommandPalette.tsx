@@ -1,7 +1,76 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import type { ReactNode } from "react";
 import { Search } from "lucide-react";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import type { TerminalTab } from "./useTerminalManager";
+
+/* ── Fuzzy match scoring ─────────────────────────────────────────────── */
+
+function fuzzyScore(text: string, query: string): { score: number; indices: number[] } | null {
+  const lower = text.toLowerCase();
+  const q = query.toLowerCase();
+
+  // Exact prefix match — highest score
+  if (lower.startsWith(q)) {
+    return {
+      score: 100 + q.length,
+      indices: Array.from({ length: q.length }, (_, i) => i),
+    };
+  }
+
+  // Word boundary match
+  const words = lower.split(/[\s\-_:]/);
+  let wordStart = 0;
+  const wordBoundaryIndices: number[] = [];
+  let qi = 0;
+  for (const word of words) {
+    if (qi < q.length && word.startsWith(q[qi])) {
+      for (let wi = 0; wi < word.length && qi < q.length; wi++) {
+        if (word[wi] === q[qi]) {
+          wordBoundaryIndices.push(wordStart + wi);
+          qi++;
+        }
+      }
+    }
+    wordStart += word.length + 1;
+  }
+  if (qi === q.length) {
+    return { score: 70 + q.length, indices: wordBoundaryIndices };
+  }
+
+  // Sequential character match (fuzzy)
+  const indices: number[] = [];
+  let si = 0;
+  for (let i = 0; i < lower.length && si < q.length; i++) {
+    if (lower[i] === q[si]) {
+      indices.push(i);
+      si++;
+    }
+  }
+  if (si === q.length) {
+    const spread = indices[indices.length - 1] - indices[0];
+    const compactness = Math.max(0, 50 - spread);
+    return { score: 30 + compactness, indices };
+  }
+
+  return null;
+}
+
+function renderHighlightedLabel(label: string, indices: number[]): ReactNode {
+  if (indices.length === 0) return label;
+  const indexSet = new Set(indices);
+  return label.split("").map((char, i) =>
+    indexSet.has(i) ? (
+      <span key={i} className="text-[#7aa2f7] font-medium">
+        {char}
+      </span>
+    ) : (
+      <span key={i}>{char}</span>
+    ),
+  );
+}
+
+/* ── Types ───────────────────────────────────────────────────────────── */
 
 interface PaletteAction {
   id: string;
@@ -344,7 +413,7 @@ export function CommandPalette({
     [onClose],
   );
 
-  // Filter by query
+  // Filter by query with fuzzy scoring
   const filtered = useMemo(() => {
     if (!query.trim()) {
       // Show recent commands first, then all actions
@@ -360,11 +429,44 @@ export function CommandPalette({
       const rest = actions.filter((a) => !recentIdSet.has(a.id));
       return [...recent, ...rest];
     }
-    const q = query.toLowerCase();
-    return actions.filter(
-      (a) => a.label.toLowerCase().includes(q) || a.category.toLowerCase().includes(q),
-    );
+
+    const q = query.toLowerCase().trim();
+    const scored: { action: PaletteAction; score: number; indices: number[] }[] = [];
+
+    for (const action of actions) {
+      const labelResult = fuzzyScore(action.label, q);
+      const catResult = fuzzyScore(action.category, q);
+      const best =
+        labelResult && catResult
+          ? labelResult.score >= catResult.score
+            ? labelResult
+            : null
+          : labelResult;
+
+      if (best) {
+        scored.push({ action, score: best.score, indices: best.indices });
+      } else if (catResult) {
+        scored.push({ action, score: catResult.score, indices: [] });
+      }
+    }
+
+    return scored.sort((a, b) => b.score - a.score).map((s) => s.action);
   }, [actions, query, recentIds]);
+
+  // Match indices map for highlighting (kept separate to avoid extending PaletteAction)
+  const matchIndicesMap = useMemo(() => {
+    const map = new Map<string, number[]>();
+    if (!query.trim()) return map;
+
+    const q = query.toLowerCase().trim();
+    for (const action of actions) {
+      const labelResult = fuzzyScore(action.label, q);
+      if (labelResult) {
+        map.set(action.id, labelResult.indices);
+      }
+    }
+    return map;
+  }, [actions, query]);
 
   // Clamp selected index
   useEffect(() => {
@@ -458,7 +560,9 @@ export function CommandPalette({
                     >
                       {action.category}
                     </span>
-                    <span className="text-[12px] truncate">{action.label}</span>
+                    <span className="text-[12px] truncate">
+                      {renderHighlightedLabel(action.label, matchIndicesMap.get(action.id) ?? [])}
+                    </span>
                   </div>
                   {action.shortcut && (
                     <kbd className="text-[9px] font-mono text-[#565f89] bg-[#2a2d3d] border border-[#3b3d57] rounded px-1 py-0.5 ml-3 shrink-0 whitespace-nowrap">

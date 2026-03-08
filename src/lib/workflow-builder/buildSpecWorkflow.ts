@@ -16,7 +16,12 @@
  * in Rust — no AI tokens, completes in seconds.
  */
 
-import type { UnifiedWorkflow, PromptStep, VerificationStep } from "../../types/unified-workflow";
+import type {
+  UnifiedWorkflow,
+  PromptStep,
+  VerificationStep,
+  WorkflowStage,
+} from "../../types/unified-workflow";
 import type { KnownIssue } from "@qontinui/shared-types";
 import { createSummaryStep } from "../../types/unified-workflow";
 
@@ -398,6 +403,220 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
     max_iterations: maxIterations,
     category: "spec-generated",
     tags: ["spec", "auto-generated", "live-page"],
+    created_at: now,
+    modified_at: now,
+  };
+}
+
+// =============================================================================
+// Multi-Stage Builder (one stage per page)
+// =============================================================================
+
+/** A page and its associated spec groups. */
+export interface PageSpecGroup {
+  pageUrl: string;
+  pageName: string;
+  groups: SpecGroup[];
+}
+
+export interface BuildMultiStageSpecWorkflowInput {
+  /** Specs grouped by page — each page becomes a workflow stage. */
+  pages: PageSpecGroup[];
+  /** Which group IDs to include (default: all groups in each page). */
+  selectedGroupIds?: Set<string>;
+  /** Custom agentic prompt for failure recovery (per-stage). */
+  agenticPrompt?: string;
+  /** Max verification/agentic iterations per stage (default: 3). */
+  maxIterations?: number;
+  /** Element source: "control" (runner UI) or "external" (browser tab). */
+  elementSource?: "control" | "external";
+  /** Workflow name override. */
+  workflowName?: string;
+  /** Force all assertions to use prompt steps (disables deterministic optimization). */
+  forcePromptOnly?: boolean;
+  /** Include regression checks for known issues. */
+  includeRegressionChecks?: boolean;
+  /** Known issues to include as regression verification steps. */
+  knownIssues?: KnownIssue[];
+}
+
+/**
+ * Build a multi-stage UnifiedWorkflow from page-grouped specs.
+ *
+ * Each page becomes a WorkflowStage with its own verification-agentic loop.
+ * If only one page is provided, creates a single-stage workflow (equivalent
+ * to the flat workflow from buildSpecWorkflow).
+ */
+export function buildMultiStageSpecWorkflow(
+  input: BuildMultiStageSpecWorkflowInput,
+): UnifiedWorkflow {
+  const {
+    pages,
+    selectedGroupIds,
+    agenticPrompt,
+    maxIterations = 3,
+    elementSource = "external",
+    workflowName,
+    forcePromptOnly = false,
+    includeRegressionChecks = false,
+    knownIssues = [],
+  } = input;
+
+  const now = new Date().toISOString();
+
+  const sourceExplanation =
+    elementSource === "external"
+      ? "Elements are fetched from an external SDK-connected app. The AI must fix the web application code so these assertions pass when checked against the live page."
+      : "Elements are fetched from the runner's own webview (control mode).";
+
+  const stages: WorkflowStage[] = pages.map((page) => {
+    // Filter groups by selection
+    const groups = selectedGroupIds
+      ? page.groups.filter((g) => selectedGroupIds.has(g.id))
+      : page.groups;
+
+    if (groups.length === 0) {
+      return {
+        id: crypto.randomUUID(),
+        name: page.pageName,
+        description: `No selected groups for ${page.pageUrl}`,
+        setup_steps: [],
+        verification_steps: [],
+        agentic_steps: [],
+        completion_steps: [],
+        max_iterations: maxIterations,
+      };
+    }
+
+    // Setup steps from group setupActions
+    const setupSteps: Array<PromptStep | VerificationStep> = [];
+    const verificationSteps: VerificationStep[] = [];
+
+    for (const group of groups) {
+      if (group.setupActions && group.setupActions.length > 0) {
+        for (const action of group.setupActions) {
+          setupSteps.push(buildSetupActionStep(group.name, action, elementSource));
+        }
+      }
+
+      const enabledAssertions = group.assertions.filter((a) => a.enabled);
+      if (enabledAssertions.length === 0) continue;
+
+      if (forcePromptOnly) {
+        verificationSteps.push(
+          buildPromptStep(
+            group.name,
+            group.description,
+            enabledAssertions,
+            elementSource,
+            sourceExplanation,
+          ),
+        );
+        continue;
+      }
+
+      const deterministic = enabledAssertions.filter(isDeterministic);
+      const aiRequired = enabledAssertions.filter((a) => !isDeterministic(a));
+
+      if (deterministic.length > 0) {
+        verificationSteps.push(buildSnapshotAssertStep(group.name, deterministic, elementSource));
+      }
+
+      if (aiRequired.length > 0) {
+        const name = deterministic.length > 0 ? `${group.name} (AI)` : group.name;
+        verificationSteps.push(
+          buildPromptStep(name, group.description, aiRequired, elementSource, sourceExplanation),
+        );
+      }
+    }
+
+    // Agentic step for this stage
+    const groupList = groups.map((g) => `- ${g.name}: ${g.description}`).join("\n");
+    const agenticContent =
+      agenticPrompt ??
+      `## Page: ${page.pageName}\n\nSome verification steps for this page failed. Analyze the failures and fix the issues.\n\nSpec groups on this page:\n${groupList}\n\nReview the failing assertions and make the necessary code changes to fix them.`;
+
+    return {
+      id: crypto.randomUUID(),
+      name: page.pageName,
+      description: `${page.pageUrl} — ${groups.length} groups`,
+      setup_steps: setupSteps,
+      verification_steps: verificationSteps,
+      agentic_steps: [
+        {
+          id: crypto.randomUUID(),
+          type: "prompt" as const,
+          phase: "agentic" as const,
+          name: `Fix: ${page.pageName}`,
+          content: agenticContent,
+        },
+      ],
+      completion_steps: [],
+      max_iterations: maxIterations,
+    };
+  });
+
+  // Filter out empty stages (no selected groups)
+  const activeStages = stages.filter(
+    (s) => s.verification_steps.length > 0 || s.agentic_steps.length > 0,
+  );
+
+  // Regression checks go into the last stage
+  if (includeRegressionChecks && knownIssues.length > 0 && activeStages.length > 0) {
+    const lastStage = activeStages[activeStages.length - 1];
+    for (const issue of knownIssues) {
+      if (issue.verification_step_template) {
+        const step = {
+          ...issue.verification_step_template,
+          id: `regression-${issue.id}`,
+          name: `[Regression] ${issue.title}`,
+          phase: "verification",
+          regression_issue_id: issue.id,
+        } as unknown as VerificationStep;
+        lastStage.verification_steps.push(step);
+      } else {
+        const hint = issue.verification_hint
+          ? `\nVerification hint: ${issue.verification_hint}`
+          : "";
+        lastStage.verification_steps.push({
+          id: `regression-${issue.id}`,
+          type: "prompt",
+          name: `[Regression] ${issue.title}`,
+          phase: "verification",
+          content: `Check for a known issue: ${issue.description}${hint}`,
+          response_mode: true,
+          regression_issue_id: issue.id,
+        } as unknown as VerificationStep);
+      }
+    }
+  }
+
+  const totalGroups = pages.reduce((sum, p) => {
+    const groups = selectedGroupIds ? p.groups.filter((g) => selectedGroupIds.has(g.id)) : p.groups;
+    return sum + groups.length;
+  }, 0);
+
+  const totalAssertions = pages.reduce((sum, p) => {
+    const groups = selectedGroupIds ? p.groups.filter((g) => selectedGroupIds.has(g.id)) : p.groups;
+    return sum + groups.reduce((s, g) => s + g.assertions.filter((a) => a.enabled).length, 0);
+  }, 0);
+
+  const pageNames = pages.map((p) => p.pageName).join(", ");
+  const name = workflowName ?? `Spec Verification — ${activeStages.length} pages (${pageNames})`;
+
+  return {
+    id: crypto.randomUUID(),
+    name,
+    description: `Auto-generated multi-stage spec workflow. ${activeStages.length} pages, ${totalGroups} groups, ${totalAssertions} assertions.`,
+    // Top-level steps are empty — all work is in stages
+    setup_steps: [],
+    verification_steps: [],
+    agentic_steps: [],
+    completion_steps: [createSummaryStep()],
+    max_iterations: maxIterations,
+    stages: activeStages,
+    category: "spec-generated",
+    tags: ["spec", "auto-generated", "live-page", "multi-stage"],
     created_at: now,
     modified_at: now,
   };

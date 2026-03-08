@@ -16,3 +16,6 @@ export { ZoneLayoutPicker } from "./ZoneLayoutPicker";
 export { ZoneStatusBar } from "./ZoneStatusBar";
 export { BatchOperationsBar } from "./BatchOperationsBar";
 export { KeyboardShortcutsOverlay } from "./KeyboardShortcutsOverlay";
+export { ZoneControlPanel } from "./ZoneControlPanel";
+export { useSessionPersistence } from "./useSessionPersistence";
+export type { SavedSessionConfig, SavedSessionLayout } from "./useSessionPersistence";

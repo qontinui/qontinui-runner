@@ -27,6 +27,8 @@ import { ZoneProfilePicker } from "./ZoneProfilePicker";
 import { CommandPalette } from "./CommandPalette";
 import { ZoneDiffOverlay } from "./ZoneDiffOverlay";
 import { ZoneTimeline } from "./ZoneTimeline";
+import { ZoneControlPanel } from "./ZoneControlPanel";
+import { useSessionPersistence } from "./useSessionPersistence";
 import { findingsTracker } from "@/services/FindingsTracker";
 import type { Finding } from "@/types/findings";
 import { WorkflowPreviewPanel } from "@qontinui/workflow-ui";
@@ -54,9 +56,14 @@ interface GenerateWorkflowResponse {
 interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
   onNavigateToActive?: () => void;
+  onSessionCountChange?: (count: number) => void;
 }
 
-export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: TerminalPageProps) {
+export function TerminalPage({
+  onNavigateToBuilder,
+  onNavigateToActive,
+  onSessionCountChange,
+}: TerminalPageProps) {
   const {
     tabs,
     activeId,
@@ -81,6 +88,11 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
       setActiveId(zoneLayout.focusedTabId);
     }
   }, [zoneLayout.focusedTabId, activeId, setActiveId]);
+
+  // Report session count changes to parent for sidebar auto-collapse
+  useEffect(() => {
+    onSessionCountChange?.(tabs.length);
+  }, [tabs.length, onSessionCountChange]);
 
   // ── Zone focus history (back/forward navigation) ───────────────────────────
   const focusHistoryRef = useRef<number[]>([]);
@@ -149,6 +161,10 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
   const [showShortcutsOverlay, setShowShortcutsOverlay] = useState(false);
   const [showCommandPalette, setShowCommandPalette] = useState(false);
   const [showTimeline, setShowTimeline] = useState(false);
+  const [showControlPanel, setShowControlPanel] = useState(
+    () => localStorage.getItem("zone-control-panel") === "true",
+  );
+  const [controlPanelCollapsed, setControlPanelCollapsed] = useState(false);
   const [diffZones, setDiffZones] = useState<[number, number] | null>(null);
   const outputSnapshotsRef = useRef<Record<string, string[]>>({});
   const [snapshotDiff, setSnapshotDiff] = useState<{
@@ -326,6 +342,16 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
     error: 0,
   });
 
+  // Session persistence — save/restore sessions across app restarts
+  const {
+    saveSessionLayout,
+    saveScrollbackBuffers,
+    updateScrollbackPaths,
+    getSavedLayout,
+    clearSavedLayout,
+    hasSavedLayout,
+  } = useSessionPersistence();
+
   // Persist auto-approve patterns
   useEffect(() => {
     localStorage.setItem("zone-auto-approve-patterns", JSON.stringify(autoApprovePatterns));
@@ -343,6 +369,79 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
   useEffect(() => {
     localStorage.setItem(`zone-pinned-${zoneLayout.layoutId}`, JSON.stringify([...pinnedZones]));
   }, [pinnedZones, zoneLayout.layoutId]);
+
+  // Auto-save session layout for persistence across app restarts
+  useEffect(() => {
+    if (tabs.length === 0) return;
+    saveSessionLayout({
+      layoutId: zoneLayout.layoutId,
+      tabs,
+      assignments: zoneLayout.assignments,
+      zoneLabels,
+      zoneNotes,
+      pinnedZones,
+      focusedZone: zoneLayout.focusedZone,
+    });
+  }, [
+    tabs,
+    zoneLayout.assignments,
+    zoneLayout.layoutId,
+    zoneLayout.focusedZone,
+    zoneLabels,
+    zoneNotes,
+    pinnedZones,
+    saveSessionLayout,
+  ]);
+
+  // Save scrollback buffers to disk when the window is about to close
+  // so terminal history can be restored on next launch
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
+  const zoneLayoutRef = useRef(zoneLayout);
+  zoneLayoutRef.current = zoneLayout;
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+
+    getCurrentWindow()
+      .onCloseRequested(async () => {
+        const currentTabs = tabsRef.current;
+        if (currentTabs.length === 0) return;
+
+        try {
+          // Save scrollback for all active tabs
+          const pathMap = await saveScrollbackBuffers(currentTabs);
+
+          // Build a mapping from tabId -> session index in the saved layout
+          const tabIdToSessionIndex: Record<string, number> = {};
+          const currentAssignments = zoneLayoutRef.current.assignments;
+          const assignedTabIds = new Set(Object.values(currentAssignments));
+          let idx = 0;
+          // Assigned sessions come first
+          for (const [, tabId] of Object.entries(currentAssignments)) {
+            if (currentTabs.some((t) => t.id === tabId)) {
+              tabIdToSessionIndex[tabId] = idx++;
+            }
+          }
+          // Then unassigned tabs
+          for (const tab of currentTabs) {
+            if (!assignedTabIds.has(tab.id)) {
+              tabIdToSessionIndex[tab.id] = idx++;
+            }
+          }
+
+          updateScrollbackPaths(pathMap, tabIdToSessionIndex);
+        } catch (err) {
+          console.warn("[TerminalPage] Failed to save scrollback on close:", err);
+        }
+      })
+      .then((fn) => {
+        unlisten = fn;
+      });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [saveScrollbackBuffers, updateScrollbackPaths]);
 
   // Reload labels/pins when layout changes, preserving pinned tabs across layouts
   const prevLayoutIdRef2 = useRef(zoneLayout.layoutId);
@@ -510,8 +609,19 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
     }
   }
 
-  // On mount: try to reconnect to existing Rust PTY sessions, else create a fresh terminal
+  // On mount: try to reconnect to existing Rust PTY sessions,
+  // then try to restore saved session layout, else create a fresh terminal
   const didInit = useRef(false);
+  // Track restored sessions that need scrollback replay or Claude resume
+  const pendingRestoresRef = useRef<
+    Array<{
+      tabId: string;
+      scrollbackPath?: string;
+      isClaudeSession?: boolean;
+      claudeSessionId?: string;
+      claudeConfigDir?: string;
+    }>
+  >([]);
   useEffect(() => {
     if (didInit.current) return;
     didInit.current = true;
@@ -519,11 +629,158 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
     (async () => {
       const reconnected = await reconnectToExistingSessions();
       if (!reconnected) {
-        await createTerminal();
+        // No live PTY sessions — check for saved session layout
+        const saved = hasSavedLayout() ? getSavedLayout() : null;
+        if (saved && saved.sessions.length > 0) {
+          // Restore layout preset
+          if (saved.layoutId !== zoneLayout.layoutId) {
+            const preset = LAYOUT_PRESETS.find((p) => p.id === saved.layoutId);
+            if (preset) zoneLayout.setLayoutId(preset.id);
+          }
+
+          // Recreate terminals with saved configs
+          const assignedSessions = saved.sessions.filter((s) => s.zoneIndex >= 0);
+          const unassignedSessions = saved.sessions.filter((s) => s.zoneIndex < 0);
+
+          for (const session of assignedSessions) {
+            const tabId = await createTerminal(session.title, session.workingDir);
+            if (tabId && session.zoneIndex >= 0) {
+              zoneLayout.assignTabToZone(session.zoneIndex, tabId);
+            }
+            // Restore labels and notes
+            if (session.label) {
+              setZoneLabels((prev) => ({ ...prev, [session.zoneIndex]: session.label! }));
+            }
+            if (session.notes) {
+              setZoneNotes((prev) => ({ ...prev, [session.zoneIndex]: session.notes! }));
+            }
+            if (session.pinned) {
+              setPinnedZones((prev) => new Set([...prev, session.zoneIndex]));
+            }
+            // Track sessions needing scrollback restore or Claude resume
+            if (tabId && (session.scrollbackPath || session.isClaudeSession)) {
+              pendingRestoresRef.current.push({
+                tabId,
+                scrollbackPath: session.scrollbackPath,
+                isClaudeSession: session.isClaudeSession,
+                claudeSessionId: session.claudeSessionId,
+                claudeConfigDir: session.claudeConfigDir,
+              });
+            }
+            // Propagate Claude session info to tab state
+            if (tabId && session.claudeSessionId) {
+              updateTab(tabId, {
+                claudeSessionId: session.claudeSessionId,
+                claudeConfigDir: session.claudeConfigDir,
+              });
+            }
+          }
+
+          // Recreate unassigned sessions
+          for (const session of unassignedSessions) {
+            const tabId = await createTerminal(session.title, session.workingDir);
+            if (tabId && (session.scrollbackPath || session.isClaudeSession)) {
+              pendingRestoresRef.current.push({
+                tabId,
+                scrollbackPath: session.scrollbackPath,
+                isClaudeSession: session.isClaudeSession,
+                claudeSessionId: session.claudeSessionId,
+                claudeConfigDir: session.claudeConfigDir,
+              });
+            }
+            if (tabId && session.claudeSessionId) {
+              updateTab(tabId, {
+                claudeSessionId: session.claudeSessionId,
+                claudeConfigDir: session.claudeConfigDir,
+              });
+            }
+          }
+
+          // Restore focused zone
+          if (saved.focusedZone >= 0) {
+            zoneLayout.setFocusedZone(saved.focusedZone);
+          }
+
+          // Replay scrollback buffers and resume Claude sessions after a short delay
+          // to allow TerminalInstance components to mount and obtain refs
+          if (pendingRestoresRef.current.length > 0) {
+            setTimeout(async () => {
+              for (const restore of pendingRestoresRef.current) {
+                const ref = terminalRefs.current.get(restore.tabId);
+                const handle = ref?.current;
+
+                // Replay saved scrollback buffer directly to the display
+                // (writeToDisplay writes to xterm without sending to PTY stdin)
+                if (restore.scrollbackPath && handle) {
+                  try {
+                    const result = await invoke<CommandResponse>("terminal_get_saved_scrollback", {
+                      filePath: restore.scrollbackPath,
+                    });
+                    if (result.success && result.data) {
+                      const encoded = (result.data as { data: string }).data;
+                      if (encoded) {
+                        const raw = atob(encoded);
+                        const decoded = new TextDecoder().decode(
+                          Uint8Array.from(raw, (c) => c.charCodeAt(0)),
+                        );
+                        handle.writeToDisplay(decoded);
+                      }
+                    }
+                  } catch (err) {
+                    console.warn(
+                      `[TerminalPage] Failed to restore scrollback for ${restore.tabId}:`,
+                      err,
+                    );
+                  }
+                }
+
+                // Resume Claude Code session by writing the resume command to PTY stdin
+                if (restore.isClaudeSession && restore.claudeSessionId && handle) {
+                  try {
+                    const resumeCmd = `claude --resume ${restore.claudeSessionId}\r`;
+                    // Small delay to let the shell initialize before sending the command
+                    await new Promise((r) => setTimeout(r, 500));
+                    handle.writeToTerminal(resumeCmd);
+                  } catch (err) {
+                    console.warn(
+                      `[TerminalPage] Failed to resume Claude session for ${restore.tabId}:`,
+                      err,
+                    );
+                  }
+                }
+              }
+
+              // Clean up scrollback files from disk
+              try {
+                await invoke("terminal_cleanup_scrollback");
+              } catch (err) {
+                console.warn("[TerminalPage] Failed to cleanup scrollback files:", err);
+              }
+
+              pendingRestoresRef.current = [];
+            }, 1500);
+          }
+
+          clearSavedLayout();
+        } else {
+          await createTerminal();
+        }
       }
       setInitialized(true);
     })();
-  }, [reconnectToExistingSessions, createTerminal, setInitialized]);
+  }, [
+    reconnectToExistingSessions,
+    createTerminal,
+    setInitialized,
+    getSavedLayout,
+    hasSavedLayout,
+    clearSavedLayout,
+    zoneLayout,
+    setZoneLabels,
+    setZoneNotes,
+    setPinnedZones,
+    updateTab,
+  ]);
 
   // Load plan content once on mount (best-effort)
   useEffect(() => {
@@ -1758,8 +2015,8 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
         });
         return;
       }
-      // Ctrl+Shift+P — toggle pin on focused zone
-      if (e.ctrlKey && e.shiftKey && e.key === "P") {
+      // Ctrl+Shift+O — toggle pin on focused zone
+      if (e.ctrlKey && e.shiftKey && e.key === "O") {
         e.preventDefault();
         setPinnedZones((prev) => {
           const next = new Set(prev);
@@ -1803,6 +2060,16 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
       if (e.ctrlKey && e.shiftKey && e.key === "I") {
         e.preventDefault();
         setShowTimeline((prev) => !prev);
+        return;
+      }
+      // Ctrl+Shift+P — toggle control panel
+      if (e.ctrlKey && e.shiftKey && e.key === "P") {
+        e.preventDefault();
+        setShowControlPanel((prev) => {
+          const next = !prev;
+          localStorage.setItem("zone-control-panel", String(next));
+          return next;
+        });
         return;
       }
       // Ctrl+Shift+G — cycle through tag filters
@@ -2359,6 +2626,91 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
             />
           )}
         </div>
+
+        {/* Zone control panel */}
+        {showControlPanel && zoneLayout.isMultiZone && (
+          <ZoneControlPanel
+            tabs={tabs}
+            assignments={zoneLayout.assignments}
+            sessionStates={sessionStates}
+            zoneLabels={zoneLabels}
+            zoneNotes={zoneNotes}
+            labelColorMap={labelColorMap}
+            focusedZone={zoneLayout.focusedZone}
+            zoneCount={zoneLayout.layout.zones.length}
+            lastOutputLines={lastOutputLines}
+            onFocusZone={zoneLayout.setFocusedZone}
+            onSetZoneLabel={(zoneIdx, label) => {
+              setZoneLabels((prev) => {
+                if (!label) {
+                  const next = { ...prev };
+                  delete next[zoneIdx];
+                  return next;
+                }
+                return { ...prev, [zoneIdx]: label };
+              });
+            }}
+            onSetZoneNotes={(zoneIdx, note) => {
+              setZoneNotes((prev) => {
+                if (!note) {
+                  const next = { ...prev };
+                  delete next[zoneIdx];
+                  return next;
+                }
+                return { ...prev, [zoneIdx]: note };
+              });
+            }}
+            onClose={() => {
+              setShowControlPanel(false);
+              localStorage.setItem("zone-control-panel", "false");
+            }}
+            collapsed={controlPanelCollapsed}
+            onToggleCollapsed={() => setControlPanelCollapsed((v) => !v)}
+            onCreateTerminal={() => createAndAssignTerminal()}
+            pinnedZones={pinnedZones}
+            onTogglePin={(zoneIdx) => {
+              setPinnedZones((prev) => {
+                const next = new Set(prev);
+                if (next.has(zoneIdx)) next.delete(zoneIdx);
+                else next.add(zoneIdx);
+                return next;
+              });
+            }}
+            onSwapZones={(src, dst) => {
+              const srcTabId = zoneLayout.assignments[src];
+              const dstTabId = zoneLayout.assignments[dst];
+              if (srcTabId) zoneLayout.assignTabToZone(dst, srcTabId);
+              if (dstTabId) zoneLayout.assignTabToZone(src, dstTabId);
+            }}
+            onLoadWorkspace={async (workspace) => {
+              // Switch layout if needed
+              if (workspace.layoutId !== zoneLayout.layoutId) {
+                zoneLayout.setLayoutId(workspace.layoutId);
+              }
+              // Create terminals for each session in the workspace
+              for (const session of workspace.sessions) {
+                if (session.zoneIndex < 0) {
+                  await createTerminal(session.title, session.workingDir);
+                  continue;
+                }
+                const tabId = await createTerminal(session.title, session.workingDir);
+                if (tabId) {
+                  zoneLayout.assignTabToZone(session.zoneIndex, tabId);
+                }
+                if (session.label) {
+                  setZoneLabels((prev) => ({ ...prev, [session.zoneIndex]: session.label! }));
+                }
+                if (session.notes) {
+                  setZoneNotes((prev) => ({ ...prev, [session.zoneIndex]: session.notes! }));
+                }
+                if (session.pinned) {
+                  setPinnedZones((prev) => new Set([...prev, session.zoneIndex]));
+                }
+              }
+            }}
+            layoutId={zoneLayout.layoutId}
+          />
+        )}
 
         {/* Right panel — transcript content OR workflow preview */}
         {rightPanelMode === "transcript" && selectedTranscriptSessionId && (

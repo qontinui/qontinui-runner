@@ -12,6 +12,11 @@ export interface TerminalInstanceHandle {
   getSelection: () => string;
   hasSelection: () => boolean;
   writeToTerminal: (text: string) => void;
+  /**
+   * Write raw output data directly to the xterm display without sending to the PTY.
+   * Used for replaying saved scrollback buffers on session restore.
+   */
+  writeToDisplay: (data: string) => void;
   /** Read up to `maxLines` lines from the terminal scrollback buffer. */
   getScrollback: (maxLines?: number) => string;
   /** Scroll the terminal viewport to the very bottom. */
@@ -120,6 +125,9 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       writeToTerminal: (text: string) => {
         const bytes = encoder.encode(text);
         invoke("terminal_write", { terminalId, data: uint8ToBase64(bytes) }).catch(() => {});
+      },
+      writeToDisplay: (data: string) => {
+        termRef.current?.write(data);
       },
       getScrollback: (maxLines = 500) => {
         const term = termRef.current;

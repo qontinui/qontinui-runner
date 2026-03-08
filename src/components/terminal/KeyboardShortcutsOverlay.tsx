@@ -44,7 +44,8 @@ const SHORTCUT_GROUPS: { title: string; shortcuts: ShortcutDef[] }[] = [
     shortcuts: [
       { keys: "Ctrl+Shift+F", description: "Maximize / restore focused zone" },
       { keys: "Ctrl+Shift+M", description: "Cycle view mode (auto / full / compact)" },
-      { keys: "Ctrl+Shift+P", description: "Pin / unpin focused zone" },
+      { keys: "Ctrl+Shift+O", description: "Pin / unpin focused zone" },
+      { keys: "Ctrl+Shift+P", description: "Toggle control panel" },
       { keys: "Ctrl+Shift+X", description: "Swap zones (press twice: source → target)" },
       { keys: "Ctrl+Shift+L", description: "Cycle through layout presets" },
       { keys: "Ctrl+Shift+A", description: "Toggle auto-focus on needs-input" },

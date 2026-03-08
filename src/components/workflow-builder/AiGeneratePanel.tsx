@@ -33,6 +33,7 @@ import {
   Save,
   AlertCircle,
   CheckCircle2,
+  ShieldCheck,
   type LucideIcon,
 } from "lucide-react";
 import { getAccentColors } from "@/design-system";
@@ -42,7 +43,13 @@ import {
   MODEL_OVERRIDE_PHASES,
 } from "@qontinui/workflow-utils";
 import { SpecSourceSection, type SpecSourceState } from "./SpecSourceSection";
-import { buildSpecPrompt } from "@/lib/spec-prompt-builder";
+import { buildSpecPrompt, type DiscoveredSpec } from "@/lib/spec-prompt-builder";
+import {
+  buildMultiStageSpecWorkflow,
+  buildSpecWorkflow,
+  type PageSpecGroup,
+  type SpecGroup as BuildSpecGroup,
+} from "@/lib/workflow-builder";
 import {
   GENERATION_TEMPLATES,
   type WorkflowGenerationTemplate,
@@ -109,6 +116,8 @@ interface SavedPrompt {
 export interface AiGeneratePanelProps {
   onCreateManually: () => void;
   onNavigateToActiveRuns: () => void;
+  /** Load a pre-built workflow into the builder (for deterministic spec workflows). */
+  onLoadWorkflow?: (workflow: import("../../types/unified-workflow").UnifiedWorkflow) => void;
 }
 
 // =============================================================================
@@ -151,6 +160,7 @@ async function autoSaveGenerationPrompt(promptText: string): Promise<void> {
 export function AiGeneratePanel({
   onCreateManually,
   onNavigateToActiveRuns,
+  onLoadWorkflow,
 }: AiGeneratePanelProps) {
   const accentColors = getAccentColors("blue");
 
@@ -402,10 +412,6 @@ export function AiGeneratePanel({
     }
   };
 
-  // Batch mode: multiple pages selected
-  const isBatchMode = specState.selectedPageUrls.size > 1;
-  const batchPageCount = specState.selectedPageUrls.size;
-
   /** Build the base request (everything except description). */
   const buildBaseRequest = useCallback(() => {
     const tags = tagsInput
@@ -473,45 +479,6 @@ export function AiGeneratePanel({
     return { ...base, description: fullDescription };
   }, [buildBaseRequest, description, specState]);
 
-  /** Build one request per selected page (batch mode). */
-  const buildBatchRequests = useCallback(() => {
-    const base = buildBaseRequest();
-    const requests: Record<string, unknown>[] = [];
-
-    for (const pageUrl of specState.selectedPageUrls) {
-      // Filter specs belonging to this page
-      const pageSpecs = specState.discoveredSpecs.filter(
-        (s) => (s.config.metadata?.pageUrl || s.specId) === pageUrl,
-      );
-      if (pageSpecs.length === 0) continue;
-
-      // Filter selectedGroupIds to only groups in this page's specs
-      const pageGroupIds = new Set<string>();
-      for (const spec of pageSpecs) {
-        for (const group of spec.config.groups) {
-          if (specState.selectedGroupIds.has(group.id)) {
-            pageGroupIds.add(group.id);
-          }
-        }
-      }
-      if (pageGroupIds.size === 0) continue;
-
-      const specResult = buildSpecPrompt({
-        discoveredSpecs: pageSpecs,
-        selectedGroupIds: pageGroupIds,
-      });
-
-      let fullDescription = specResult.prompt;
-      if (description.trim()) {
-        fullDescription += `\n\n## Additional Instructions\n${description.trim()}`;
-      }
-
-      requests.push({ ...base, description: fullDescription });
-    }
-
-    return requests;
-  }, [buildBaseRequest, description, specState]);
-
   const canGenerate = description.trim() || hasSpecs;
 
   /** Fire a single generate-async request and return the task_run_id. */
@@ -534,14 +501,8 @@ export function AiGeneratePanel({
     setSubmittingAction("generate");
     setError(null);
     try {
-      if (isBatchMode) {
-        const requests = buildBatchRequests();
-        const results = await Promise.all(requests.map(fireGenerateRequest));
-        console.log(`[AiGeneratePanel] Batch generation started: ${results.length} pages`);
-      } else {
-        const taskRunId = await fireGenerateRequest(buildGenerateRequest());
-        console.log("[AiGeneratePanel] Generation started:", taskRunId);
-      }
+      const taskRunId = await fireGenerateRequest(buildGenerateRequest());
+      console.log("[AiGeneratePanel] Generation started:", taskRunId);
       if (description.trim()) {
         autoSaveGenerationPrompt(description); // fire-and-forget
       }
@@ -567,17 +528,9 @@ export function AiGeneratePanel({
     setSubmittingAction("generate-and-run");
     setError(null);
     try {
-      if (isBatchMode) {
-        const requests = buildBatchRequests().map((r, i) =>
-          i === 0 ? { ...r, auto_run: true } : r,
-        );
-        const results = await Promise.all(requests.map(fireGenerateRequest));
-        console.log(`[AiGeneratePanel] Batch Generate & Run started: ${results.length} pages`);
-      } else {
-        const request = { ...buildGenerateRequest(), auto_run: true };
-        const taskRunId = await fireGenerateRequest(request);
-        console.log("[AiGeneratePanel] Generate & Run started:", taskRunId);
-      }
+      const request = { ...buildGenerateRequest(), auto_run: true };
+      const taskRunId = await fireGenerateRequest(request);
+      console.log("[AiGeneratePanel] Generate & Run started:", taskRunId);
       if (description.trim()) {
         autoSaveGenerationPrompt(description); // fire-and-forget
       }
@@ -597,6 +550,55 @@ export function AiGeneratePanel({
       setSubmittingAction(null);
     }
   };
+
+  /** Build a deterministic multi-stage spec workflow and load it into the builder. */
+  const handleBuildFromSpecs = useCallback(() => {
+    if (!onLoadWorkflow || !hasSpecs) return;
+
+    // Group discovered specs by page URL
+    const pageMap = new Map<string, { pageName: string; specs: DiscoveredSpec[] }>();
+    for (const spec of specState.discoveredSpecs) {
+      const pageUrl = spec.config?.metadata?.pageUrl || spec.specId;
+      const pageName =
+        (spec.config?.metadata?.component as string) ||
+        (spec.appName ? `${spec.appName}` : pageUrl);
+      if (!pageMap.has(pageUrl)) {
+        pageMap.set(pageUrl, { pageName, specs: [] });
+      }
+      pageMap.get(pageUrl)!.specs.push(spec);
+    }
+
+    // Build PageSpecGroup array
+    const pages: PageSpecGroup[] = [];
+    for (const [pageUrl, { pageName, specs }] of pageMap) {
+      // Only include pages that have selected groups
+      const groups = specs.flatMap((s) => s.config?.groups ?? []) as unknown as BuildSpecGroup[];
+      const hasSelectedGroups = groups.some((g) => specState.selectedGroupIds.has(g.id));
+      if (!hasSelectedGroups) continue;
+      pages.push({ pageUrl, pageName, groups });
+    }
+
+    if (pages.length === 0) return;
+
+    // Single page → flat workflow; multiple pages → multi-stage
+    if (pages.length === 1) {
+      const workflow = buildSpecWorkflow({
+        specConfig: { version: "1.0", groups: pages[0].groups },
+        selectedGroupIds: specState.selectedGroupIds,
+        elementSource: "external",
+        pageUrl: pages[0].pageUrl,
+        workflowName: `Spec Verification — ${pages[0].pageName}`,
+      });
+      onLoadWorkflow(workflow);
+    } else {
+      const workflow = buildMultiStageSpecWorkflow({
+        pages,
+        selectedGroupIds: specState.selectedGroupIds,
+        elementSource: "external",
+      });
+      onLoadWorkflow(workflow);
+    }
+  }, [onLoadWorkflow, hasSpecs, specState]);
 
   // Group contexts by scope
   const contextsByScope = savedContexts.reduce(
@@ -1234,11 +1236,7 @@ export function AiGeneratePanel({
             ) : (
               <Sparkles className="w-4 h-4" />
             )}
-            {submittingAction === "generate"
-              ? "Starting..."
-              : isBatchMode
-                ? `Generate (${batchPageCount} pages)`
-                : "Generate"}
+            {submittingAction === "generate" ? "Starting..." : "Generate"}
           </button>
           <button
             onClick={handleGenerateAndRun}
@@ -1250,12 +1248,19 @@ export function AiGeneratePanel({
             ) : (
               <Play className="w-4 h-4" />
             )}
-            {submittingAction === "generate-and-run"
-              ? "Starting..."
-              : isBatchMode
-                ? `Generate & Run (${batchPageCount} pages)`
-                : "Generate & Run"}
+            {submittingAction === "generate-and-run" ? "Starting..." : "Generate & Run"}
           </button>
+          {onLoadWorkflow && hasSpecs && (
+            <button
+              onClick={handleBuildFromSpecs}
+              disabled={submittingAction !== null}
+              title="Build a deterministic spec workflow directly — one stage per page, hybrid verification (no AI generation needed)"
+              className="flex items-center gap-2 px-6 py-2 rounded-md font-medium border border-emerald-700 bg-emerald-900/30 text-emerald-300 hover:bg-emerald-900/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <ShieldCheck className="w-4 h-4" />
+              Build from Specs
+            </button>
+          )}
         </div>
       </div>
     </div>

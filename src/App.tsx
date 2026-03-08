@@ -696,6 +696,30 @@ function AppContent() {
     return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
   });
 
+  // Auto-collapse sidebar when multiple terminal sessions are open
+  const [terminalSessionCount, setTerminalSessionCount] = useState(0);
+  const autoCollapsedRef = useRef(false);
+
+  const handleSidebarCollapsedChange = useCallback((value: boolean) => {
+    // Manual toggle clears auto-collapse tracking
+    autoCollapsedRef.current = false;
+    setSidebarCollapsed(value);
+    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, JSON.stringify(value));
+  }, []);
+
+  useEffect(() => {
+    const shouldAutoCollapse = activeTab === "terminal" && terminalSessionCount > 1;
+
+    if (shouldAutoCollapse && !sidebarCollapsed) {
+      autoCollapsedRef.current = true;
+      setSidebarCollapsed(true);
+    } else if (!shouldAutoCollapse && autoCollapsedRef.current) {
+      // Restore expanded state when auto-collapse conditions end
+      autoCollapsedRef.current = false;
+      setSidebarCollapsed(false);
+    }
+  }, [activeTab, terminalSessionCount, sidebarCollapsed]);
+
   // Log sub-tab state
   const [activeLogSubTab, setActiveLogSubTab] = useState<LogSubTab>("general");
 
@@ -1562,7 +1586,7 @@ function AppContent() {
             activeTab={activeTab}
             onTabChange={(tab) => setActiveTab(tab as MainTabId)}
             collapsed={sidebarCollapsed}
-            onCollapsedChange={setSidebarCollapsed}
+            onCollapsedChange={handleSidebarCollapsedChange}
           />
 
           {/* Content Area */}
@@ -1573,6 +1597,7 @@ function AppContent() {
               <TerminalPage
                 onNavigateToBuilder={() => setActiveTab("unified-workflow-builder")}
                 onNavigateToActive={() => setActiveTab("active")}
+                onSessionCountChange={setTerminalSessionCount}
               />
             </div>
           </main>
