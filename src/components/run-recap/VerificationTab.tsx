@@ -73,13 +73,13 @@ function isSnapshotAssertOutput(data: Record<string, unknown> | null | undefined
  */
 function SnapshotAssertResults({
   data,
-  dataUiPrefix,
+  dataUiPrefix: _dataUiPrefix,
 }: {
   data: SnapshotAssertOutputData;
   dataUiPrefix: string;
 }) {
   return (
-    <div data-ui-id={`${dataUiPrefix}-snapshot-assertions`}>
+    <div>
       <h4 className="text-sm font-medium mb-2 flex items-center gap-1.5">
         <Globe className="w-3.5 h-3.5" />
         Snapshot Assertions ({data.passed}/{data.total} passed)
@@ -128,13 +128,13 @@ function SnapshotAssertResults({
 
 function ConsoleErrorsList({
   errors,
-  dataUiPrefix,
+  dataUiPrefix: _dataUiPrefix,
 }: {
   errors: ConsoleError[];
   dataUiPrefix: string;
 }) {
   return (
-    <div data-ui-id={`${dataUiPrefix}-console-errors`}>
+    <div>
       <h4 className="text-sm font-medium mb-1 text-red-400 flex items-center gap-1.5">
         <AlertTriangle className="w-3.5 h-3.5" />
         Console Errors ({errors.length})
@@ -190,10 +190,7 @@ function StepResultCard({
     step.verification_details?.assertions_total ?? snapshotAssertData?.total ?? undefined;
 
   return (
-    <div
-      data-ui-id={`verification-step-${step.step_index}`}
-      className="border border-border rounded-lg overflow-hidden"
-    >
+    <div className="border border-border rounded-lg overflow-hidden">
       <button
         onClick={onToggle}
         disabled={!hasDetails}
@@ -203,7 +200,7 @@ function StepResultCard({
       >
         <div className="flex items-center gap-3">
           {/* Status indicator */}
-          <div data-ui-id={`verification-step-${step.step_index}-status`}>
+          <div>
             {step.success ? (
               <CheckCircle2 className="w-5 h-5 text-green-500" />
             ) : (
@@ -213,7 +210,6 @@ function StepResultCard({
 
           {/* Type indicator */}
           <div
-            data-ui-id={`verification-step-${step.step_index}-type`}
             className={`p-1.5 rounded ${
               step.success ? "bg-green-500/10 text-green-500" : "bg-red-500/10 text-red-500"
             }`}
@@ -262,7 +258,7 @@ function StepResultCard({
 
           {/* Error message */}
           {step.error && (
-            <div data-ui-id={`verification-step-${step.step_index}-error`}>
+            <div>
               <h4 className="text-sm font-medium mb-1 text-red-400">Error</h4>
               <pre className="text-xs text-red-400/80 bg-red-500/10 p-2 rounded overflow-x-auto whitespace-pre-wrap">
                 {step.error}
@@ -272,7 +268,7 @@ function StepResultCard({
 
           {/* Stdout (skip for snapshot_assert since we show per-assertion results) */}
           {step.verification_details?.stdout && !snapshotAssertData && (
-            <div data-ui-id={`verification-step-${step.step_index}-stdout`}>
+            <div>
               <h4 className="text-sm font-medium mb-1">Output</h4>
               <pre className="text-xs text-muted-foreground bg-muted p-2 rounded overflow-x-auto whitespace-pre-wrap max-h-48 overflow-y-auto">
                 {step.verification_details.stdout}
@@ -282,7 +278,7 @@ function StepResultCard({
 
           {/* Stderr */}
           {step.verification_details?.stderr && (
-            <div data-ui-id={`verification-step-${step.step_index}-stderr`}>
+            <div>
               <h4 className="text-sm font-medium mb-1 text-amber-400">Stderr</h4>
               <pre className="text-xs text-amber-400/80 bg-amber-500/10 p-2 rounded overflow-x-auto whitespace-pre-wrap max-h-48 overflow-y-auto">
                 {step.verification_details.stderr}
@@ -292,7 +288,7 @@ function StepResultCard({
 
           {/* Console output (for browser tests) */}
           {step.verification_details?.console_output && (
-            <div data-ui-id={`verification-step-${step.step_index}-console`}>
+            <div>
               <h4 className="text-sm font-medium mb-1">Console Output</h4>
               <pre className="text-xs text-muted-foreground bg-muted p-2 rounded overflow-x-auto whitespace-pre-wrap max-h-48 overflow-y-auto">
                 {step.verification_details.console_output}
@@ -336,7 +332,7 @@ function IterationCard({
   };
 
   return (
-    <div data-ui-id={`verification-iteration-${result.iteration}`} className="card overflow-hidden">
+    <div className="card overflow-hidden">
       <button
         onClick={() => setIsExpanded(!isExpanded)}
         className="w-full px-4 py-3 flex items-center justify-between hover:bg-muted/50 transition-colors"
@@ -448,7 +444,7 @@ export function VerificationTab({ taskRunId }: VerificationTabProps) {
   if (!data || data.results.length === 0) {
     return (
       <div className="space-y-4">
-        <div data-ui-id="verification-empty-state" className="card p-6 text-center">
+        <div className="card p-6 text-center">
           <FlaskConical className="w-12 h-12 mx-auto mb-4 text-muted-foreground opacity-50" />
           <h3 className="font-medium text-lg mb-2">No Verification Results</h3>
           <p className="text-sm text-muted-foreground max-w-md mx-auto">
@@ -464,7 +460,6 @@ export function VerificationTab({ taskRunId }: VerificationTabProps) {
     <div className="space-y-4">
       {/* Summary Banner */}
       <div
-        data-ui-id="verification-summary"
         className={`rounded-lg p-4 ${
           data.failed_iterations === 0
             ? "bg-green-500/10 text-green-500"
@@ -505,7 +500,7 @@ export function VerificationTab({ taskRunId }: VerificationTabProps) {
       </div>
 
       {/* Iteration Results */}
-      <div data-ui-id="verification-iterations" className="space-y-3">
+      <div className="space-y-3">
         {data.results.map((result, index) => (
           <IterationCard
             key={result.iteration}

@@ -103,10 +103,7 @@ export function ShellCommandLibraryPicker({
       <div className="absolute inset-0 bg-black/50" onClick={onClose} />
 
       {/* Dialog */}
-      <div
-        data-ui-id="dialog-shell-command-library-picker"
-        className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] flex flex-col overflow-hidden"
-      >
+      <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] flex flex-col overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-border">
           <div className="flex items-center gap-2">
@@ -116,7 +113,6 @@ export function ShellCommandLibraryPicker({
           <button
             onClick={onClose}
             className="p-1 text-muted-foreground hover:text-foreground transition-colors"
-            data-ui-id="workflow-builder-shell-picker-close-btn"
           >
             <X className="w-5 h-5" />
           </button>
@@ -133,7 +129,6 @@ export function ShellCommandLibraryPicker({
               placeholder="Search by name or command..."
               className="w-full pl-10 pr-4 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
               autoFocus
-              data-ui-id="workflow-builder-shell-picker-search-input"
             />
           </div>
           {categories.length > 0 && (
@@ -141,7 +136,6 @@ export function ShellCommandLibraryPicker({
               value={categoryFilter}
               onChange={(e) => setCategoryFilter(e.target.value)}
               className="px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
-              data-ui-id="workflow-builder-shell-picker-category-select"
             >
               <option value="">All Categories</option>
               {categories.map((cat) => (
@@ -186,7 +180,6 @@ export function ShellCommandLibraryPicker({
                       ? "border-primary bg-primary/5"
                       : "border-border hover:border-muted-foreground hover:bg-muted/50"
                   }`}
-                  data-ui-id={`workflow-builder-shell-picker-item-${cmd.id}`}
                 >
                   <div className="flex items-start gap-3">
                     <Terminal
@@ -234,7 +227,6 @@ export function ShellCommandLibraryPicker({
           <button
             onClick={onClose}
             className="flex-1 px-4 py-2 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
-            data-ui-id="workflow-builder-shell-picker-cancel-btn"
           >
             Cancel
           </button>
@@ -242,7 +234,6 @@ export function ShellCommandLibraryPicker({
             onClick={handleSelect}
             disabled={!selectedId}
             className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 ${getAccentColors("violet").bgSolid} text-white rounded-md font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors`}
-            data-ui-id="workflow-builder-shell-picker-select-btn"
           >
             <Check className="w-4 h-4" />
             Select

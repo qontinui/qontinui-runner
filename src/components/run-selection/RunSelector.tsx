@@ -144,7 +144,6 @@ function RunItem({
   return (
     <button
       onClick={onClick}
-      data-ui-id={`run-selector-item-${run.id}`}
       data-run-id={run.id}
       data-run-status={run.status}
       data-run-name={run.task_name || "Unknown Task"}
@@ -245,7 +244,6 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
   if (isLoadingRuns && recentRuns.length === 0) {
     return (
       <div
-        data-ui-id="run-selector-loading"
         className={`flex items-center gap-2 px-3 py-2 bg-muted/30 rounded-lg text-muted-foreground ${className}`}
       >
         <Loader2 className="w-4 h-4 animate-spin" />
@@ -258,7 +256,6 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
   if (recentRuns.length === 0) {
     return (
       <div
-        data-ui-id="run-selector-empty"
         className={`flex items-center gap-2 px-3 py-2 bg-muted/30 rounded-lg text-muted-foreground ${className}`}
       >
         <Clock className="w-4 h-4" />
@@ -278,7 +275,6 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
   return (
     <div
       ref={dropdownRef}
-      data-ui-id="run-selector"
       data-selected-run-id={selectedRunId || ""}
       data-is-open={isOpen}
       className={`relative ${className}`}
@@ -286,7 +282,6 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
       {/* Dropdown Trigger */}
       <button
         onClick={() => setIsOpen(!isOpen)}
-        data-ui-id="run-selector-trigger"
         className={`
           w-full flex items-center gap-3 px-3 py-2 bg-card border border-border rounded-lg
           hover:bg-muted/30 transition-colors
@@ -332,7 +327,6 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
       {/* Dropdown Menu */}
       {isOpen && (
         <div
-          data-ui-id="run-selector-dropdown"
           data-run-count={recentRuns.length}
           className="absolute z-50 mt-1 w-full bg-popover border border-border rounded-lg shadow-lg overflow-hidden"
         >
@@ -347,7 +341,6 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
                   }
                   setIsOpen(false);
                 }}
-                data-ui-id="run-selector-current-run"
                 className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-muted/50 border-b border-border"
               >
                 <div className={`p-1 rounded ${getStatusColors("running").bg}`}>
@@ -361,7 +354,7 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
           )}
 
           {/* Run List */}
-          <div data-ui-id="run-selector-list" className="max-h-64 overflow-y-auto">
+          <div className="max-h-64 overflow-y-auto">
             {recentRuns.map((run) => (
               <RunItem
                 key={run.id}
@@ -382,7 +375,6 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
                 clearSelection();
                 setIsOpen(false);
               }}
-              data-ui-id="run-selector-clear"
               className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-muted/50 border-t border-border text-muted-foreground"
             >
               <Trash2 className="w-4 h-4" />

@@ -138,10 +138,7 @@ export function PlaywrightScriptLibraryPicker({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-      <div
-        data-ui-id="dialog-playwright-script-library-picker"
-        className="bg-card border border-border rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
-      >
+      <div className="bg-card border border-border rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-border">
           <div>
@@ -153,7 +150,6 @@ export function PlaywrightScriptLibraryPicker({
           <button
             onClick={onClose}
             className="p-1.5 hover:bg-muted/80 rounded-md transition-colors"
-            data-ui-id="workflow-builder-script-picker-close-btn"
           >
             <X className="w-5 h-5" />
           </button>
@@ -171,7 +167,6 @@ export function PlaywrightScriptLibraryPicker({
               className="w-full pl-9 pr-3 py-2 text-sm bg-muted border border-border rounded-md
                        focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
               autoFocus
-              data-ui-id="workflow-builder-script-picker-search-input"
             />
           </div>
           {categories.length > 0 && (
@@ -180,7 +175,6 @@ export function PlaywrightScriptLibraryPicker({
               onChange={(e) => setFilterCategory(e.target.value || null)}
               className="px-3 py-2 text-sm bg-muted border border-border rounded-md
                        focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
-              data-ui-id="workflow-builder-script-picker-category-select"
             >
               <option value="">All Categories</option>
               {categories.map((cat) => (
@@ -220,7 +214,6 @@ export function PlaywrightScriptLibraryPicker({
                           : "bg-muted/50 border-2 border-transparent hover:bg-muted hover:border-border"
                       }
                     `}
-                    data-ui-id={`workflow-builder-script-picker-item-${script.id}`}
                   >
                     {isSelected && (
                       <div className="absolute top-2 right-2">
@@ -316,7 +309,6 @@ export function PlaywrightScriptLibraryPicker({
             <button
               onClick={onClose}
               className="px-4 py-2 text-sm rounded-md hover:bg-muted/80 transition-colors"
-              data-ui-id="workflow-builder-script-picker-cancel-btn"
             >
               Cancel
             </button>
@@ -325,7 +317,6 @@ export function PlaywrightScriptLibraryPicker({
               disabled={!selectedId}
               className="px-4 py-2 text-sm bg-cyan-600 hover:bg-cyan-700 text-white rounded-md
                        transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              data-ui-id="workflow-builder-script-picker-add-btn"
             >
               Add to Workflow
             </button>

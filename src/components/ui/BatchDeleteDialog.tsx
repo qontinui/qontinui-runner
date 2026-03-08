@@ -44,10 +44,7 @@ export function BatchDeleteDialog({
       <div className="absolute inset-0 bg-black/50" onClick={isDeleting ? undefined : onClose} />
 
       {/* Dialog */}
-      <div
-        data-ui-id="dialog-batch-delete"
-        className="relative bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden"
-      >
+      <div className="relative bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-700 bg-red-500/10">
           <div className="flex items-center gap-2">
@@ -55,7 +52,6 @@ export function BatchDeleteDialog({
             <h3 className="text-lg font-semibold text-red-400">{title}</h3>
           </div>
           <button
-            data-ui-id="dialog-batch-delete-close-btn"
             onClick={onClose}
             disabled={isDeleting}
             className="p-1 text-zinc-400 hover:text-zinc-200 transition-colors disabled:opacity-50"
@@ -88,7 +84,6 @@ export function BatchDeleteDialog({
         {/* Footer */}
         <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-zinc-700 bg-zinc-800/50">
           <button
-            data-ui-id="dialog-batch-delete-cancel-btn"
             onClick={onClose}
             disabled={isDeleting}
             className="px-4 py-2 text-sm font-medium text-zinc-300 hover:text-zinc-100 transition-colors disabled:opacity-50"
@@ -96,7 +91,6 @@ export function BatchDeleteDialog({
             Cancel
           </button>
           <button
-            data-ui-id="dialog-batch-delete-confirm-btn"
             onClick={onConfirm}
             disabled={isDeleting}
             className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-red-600 hover:bg-red-500 text-white rounded-md transition-colors disabled:opacity-50"

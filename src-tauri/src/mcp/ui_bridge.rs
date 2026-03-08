@@ -495,6 +495,22 @@ pub struct PageNavigateRequest {
     url: String,
 }
 
+/// Request for CSS selector query
+#[derive(Debug, Deserialize)]
+pub struct QuerySelectorRequest {
+    pub selector: String,
+    /// Optional action to perform on matched element(s): "click"
+    pub action: Option<String>,
+    /// Index of the matched element to perform the action on (default: 0)
+    pub index: Option<u32>,
+}
+
+/// Request for page evaluation
+#[derive(Debug, Deserialize)]
+pub struct PageEvaluateRequest {
+    pub expression: String,
+}
+
 /// Refresh the page.
 pub async fn ui_bridge_page_refresh_handler(
     State(state): State<Arc<ApiState>>,
@@ -550,6 +566,51 @@ pub async fn ui_bridge_page_go_forward_handler(
     info!("UI Bridge API: Page go forward");
 
     match ui_bridge_request_sync(&state, "page_go_forward", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Query elements by CSS selector, optionally performing an action.
+pub async fn ui_bridge_query_selector_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<QuerySelectorRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Query selector '{}'", request.selector);
+
+    let payload = serde_json::json!({
+        "selector": request.selector,
+        "index": request.index,
+        "params": {
+            "action": request.action,
+        },
+    });
+
+    match ui_bridge_request_sync(&state, "query_selector", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Evaluate a JavaScript expression in the webview.
+pub async fn ui_bridge_page_evaluate_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<PageEvaluateRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "UI Bridge API: Page evaluate ({}...)",
+        &request.expression[..request.expression.len().min(80)]
+    );
+
+    let payload = serde_json::json!({ "expression": request.expression });
+
+    match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
         Ok(data) => Ok(Json(ApiResponse::success(data))),
         Err(e) => {
             error!("UI Bridge API: {}", e);
@@ -1178,6 +1239,14 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/page/forward",
             post(ui_bridge_page_go_forward_handler),
+        )
+        .route(
+            "/ui-bridge/control/query-selector",
+            post(ui_bridge_query_selector_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/evaluate",
+            post(ui_bridge_page_evaluate_handler),
         )
         // Design Review
         .route(

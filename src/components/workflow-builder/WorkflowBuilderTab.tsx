@@ -140,7 +140,7 @@ interface SettingsPanelProps {
 function ToggleSwitch({
   checked,
   onChange,
-  dataUiId,
+  dataUiId: _dataUiId,
 }: {
   checked: boolean;
   onChange: (value: boolean) => void;
@@ -157,7 +157,6 @@ function ToggleSwitch({
         transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
         ${checked ? "bg-blue-600" : "bg-zinc-600"}
       `}
-      data-ui-id={dataUiId}
     >
       <span
         className={`
@@ -259,7 +258,6 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
                 updateWorkflow({ timeout_seconds: e.target.checked ? 300 : null });
               }}
               className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-blue-500 focus:ring-blue-500/50"
-              data-ui-id="workflow-builder-timeout-checkbox"
             />
             <label htmlFor="timeout-enabled" className="text-sm text-zinc-400">
               Enable timeout
@@ -277,7 +275,6 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
                   min={def.min}
                   max={def.max}
                   className="w-24 px-2 py-1 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
-                  data-ui-id="workflow-builder-timeout-input"
                 />
                 <span className="text-sm text-zinc-500">seconds</span>
               </>
@@ -304,7 +301,6 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
           min={def.min}
           max={def.max}
           className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id={`workflow-builder-${def.key.replace(/_/g, "-")}-input`}
         />
         {def.description && <p className="text-xs text-zinc-500 mt-1">{def.description}</p>}
       </div>
@@ -324,7 +320,6 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
               onChange={(e) => updateWorkflow({ name: e.target.value })}
               placeholder="Workflow name..."
               className={inputClass}
-              data-ui-id="workflow-builder-name-input"
             />
           </div>
         );
@@ -339,7 +334,6 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
               placeholder="What does this workflow do?"
               rows={2}
               className={`${inputClass} resize-none`}
-              data-ui-id="workflow-builder-description-input"
             />
           </div>
         );
@@ -363,7 +357,6 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
                 updateWorkflow({ log_source_selection: parsed ?? "default" });
               }}
               className={selectClass}
-              data-ui-id="workflow-builder-log-sources-select"
             >
               <option value="default">Default (use global setting)</option>
               <option value="ai">AI-based selection</option>
@@ -457,7 +450,6 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
               onChange={(e) => updateWorkflow({ category: e.target.value })}
               placeholder="general"
               className={inputClass}
-              data-ui-id="workflow-builder-category-input"
             />
           </div>
         );
@@ -479,7 +471,6 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
               }
               placeholder="tag1, tag2"
               className={inputClass}
-              data-ui-id="workflow-builder-tags-input"
             />
           </div>
         );
@@ -502,7 +493,6 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
             })
           }
           className={selectClass}
-          data-ui-id={`workflow-builder-${def.key.replace(/_/g, "-")}-select`}
         >
           {def.options.map((opt) => (
             <option key={opt.value} value={opt.value}>
@@ -589,7 +579,6 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
                     updateWorkflow({ provider: e.target.value || undefined, model: undefined })
                   }
                   className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50"
-                  data-ui-id="workflow-builder-provider-select"
                 >
                   {PROVIDER_OPTIONS.map((opt) => (
                     <option key={opt.value} value={opt.value}>
@@ -602,7 +591,6 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
                     value={workflow.model ?? ""}
                     onChange={(e) => updateWorkflow({ model: e.target.value || undefined })}
                     className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50"
-                    data-ui-id="workflow-builder-model-select"
                   >
                     {MODELS_BY_PROVIDER[workflow.provider]!.map((opt) => (
                       <option key={opt.value} value={opt.value}>
@@ -782,7 +770,6 @@ function PerPhaseModelSelect() {
               value={currentPreset}
               onChange={(e) => applyPreset(e.target.value)}
               className="flex-1 px-2 py-1.5 bg-zinc-700 border border-zinc-600 rounded text-zinc-200 text-xs focus:outline-none focus:ring-2 focus:ring-purple-500/50"
-              data-ui-id="workflow-builder-model-preset"
             >
               <option value="custom">Custom</option>
               {MODEL_PRESETS.map((preset) => (
@@ -838,7 +825,6 @@ function PerPhaseModelSelect() {
                     }
                   }}
                   className={selectClass}
-                  data-ui-id={`workflow-builder-phase-${phase.key}-provider`}
                 >
                   <option value="">Inherit</option>
                   {PROVIDER_OPTIONS.filter((p) => p.value !== "").map((opt) => (
@@ -852,7 +838,6 @@ function PerPhaseModelSelect() {
                     value={model}
                     onChange={(e) => updatePhaseOverride(phase.key, "model", e.target.value)}
                     className={selectClass}
-                    data-ui-id={`workflow-builder-phase-${phase.key}-model`}
                   >
                     {MODELS_BY_PROVIDER[provider]!.map((opt) => (
                       <option key={opt.value} value={opt.value}>
@@ -2013,10 +1998,7 @@ function WorkflowBuilderContent({
           <div className="p-4 border-b border-border">
             {/* Title row with dropdown and actions */}
             <div className="flex items-center justify-between mb-3">
-              <h2
-                className="text-lg font-semibold flex items-center gap-2"
-                data-ui-id="workflow-builder-title"
-              >
+              <h2 className="text-lg font-semibold flex items-center gap-2">
                 <Sparkles className="w-5 h-5" style={{ color: accentColors.bgSolid }} />
                 Workflows
               </h2>
@@ -2027,7 +2009,6 @@ function WorkflowBuilderContent({
                     <button
                       className="flex items-center justify-center w-7 h-7 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
                       title="Add or import workflow"
-                      data-ui-id="workflow-builder-add-menu-btn"
                     >
                       <Plus className="w-4 h-4" />
                     </button>
@@ -2040,7 +2021,6 @@ function WorkflowBuilderContent({
                     >
                       <DropdownMenu.Item
                         className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
-                        data-ui-id="workflow-builder-new-workflow-item"
                         onSelect={handleNewWorkflow}
                       >
                         <Plus className="w-3.5 h-3.5 text-muted-foreground" />
@@ -2048,7 +2028,6 @@ function WorkflowBuilderContent({
                       </DropdownMenu.Item>
                       <DropdownMenu.Item
                         className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors disabled:opacity-50"
-                        data-ui-id="workflow-builder-import-workflow-item"
                         disabled={workflowsLoading}
                         onSelect={() => workflowFileInputRef.current?.click()}
                       >
@@ -2120,7 +2099,6 @@ function WorkflowBuilderContent({
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 className="w-full pl-9 pr-3 py-2 bg-muted border border-border rounded-lg text-sm focus:outline-none focus:border-border"
-                data-ui-id="workflow-builder-search-input"
               />
             </div>
           </div>
@@ -2166,7 +2144,6 @@ function WorkflowBuilderContent({
                   <button
                     key={workflow.id}
                     aria-label={`${isWorkflowSelectionMode ? "Select" : "Open"} workflow: ${workflow.name}`}
-                    data-ui-id={`workflow-builder-list-item-${workflow.id}`}
                     onClick={() => {
                       if (isWorkflowSelectionMode) {
                         toggleWorkflowSelection(workflow.id);
@@ -2232,7 +2209,6 @@ function WorkflowBuilderContent({
         <div className="flex items-center justify-between p-4 border-b border-zinc-700">
           <div className="flex items-center gap-3">
             <button
-              data-ui-id="workflow-builder-library-toggle-btn"
               onClick={toggleLibrary}
               className={`p-1.5 rounded-md transition-colors ${
                 showLibrary
@@ -2245,7 +2221,6 @@ function WorkflowBuilderContent({
             </button>
             <button
               data-tutorial-id="workflow-settings"
-              data-ui-id="workflow-builder-settings-btn"
               onClick={() => setShowSettings(!showSettings)}
               className={`p-1.5 rounded-md transition-colors ${
                 showSettings
@@ -2265,7 +2240,6 @@ function WorkflowBuilderContent({
           <div className="flex items-center gap-2">
             <button
               data-tutorial-id="save-workflow-button"
-              data-ui-id="workflow-builder-save-btn"
               onClick={handleSave}
               disabled={state.isSaving || (!hasUnsavedChanges && !!state.originalWorkflow)}
               className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -2285,7 +2259,6 @@ function WorkflowBuilderContent({
                 <button
                   className="flex items-center justify-center p-1.5 rounded-md text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors"
                   title="More actions"
-                  data-ui-id="workflow-builder-more-menu-btn"
                 >
                   <MoreHorizontal className="w-4 h-4" />
                 </button>
@@ -2298,7 +2271,6 @@ function WorkflowBuilderContent({
                 >
                   <DropdownMenu.Item
                     className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors disabled:opacity-50"
-                    data-ui-id="workflow-builder-export-btn"
                     disabled={!state.workflow.id || isExportingWorkflow}
                     onSelect={handleExportWorkflow}
                   >
@@ -2308,7 +2280,6 @@ function WorkflowBuilderContent({
                   <DropdownMenu.Separator className="h-px bg-border/50 my-1" />
                   <DropdownMenu.Item
                     className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors disabled:opacity-50"
-                    data-ui-id="workflow-builder-export-skills-btn"
                     disabled={isExportingSkills}
                     onSelect={handleOpenExportDialog}
                   >
@@ -2317,7 +2288,6 @@ function WorkflowBuilderContent({
                   </DropdownMenu.Item>
                   <DropdownMenu.Item
                     className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors disabled:opacity-50"
-                    data-ui-id="workflow-builder-import-skills-btn"
                     disabled={isImportingSkills}
                     onSelect={() => skillFileInputRef.current?.click()}
                   >
@@ -2327,7 +2297,6 @@ function WorkflowBuilderContent({
                   <DropdownMenu.Separator className="h-px bg-border/50 my-1" />
                   <DropdownMenu.Item
                     className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
-                    data-ui-id="workflow-builder-create-composition-btn"
                     onSelect={() => setShowCompositionBuilder(true)}
                   >
                     <Layers className="w-3.5 h-3.5 text-muted-foreground" />
@@ -2349,7 +2318,6 @@ function WorkflowBuilderContent({
                 onClick={handleStop}
                 className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-white transition-colors"
                 title="Stop execution"
-                data-ui-id="workflow-builder-stop-btn"
               >
                 <Square className="w-4 h-4" />
                 <span className="text-sm">Stop</span>
@@ -2360,7 +2328,6 @@ function WorkflowBuilderContent({
                 disabled={isEmpty}
                 className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-blue-600 hover:bg-blue-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 title={isEmpty ? "Add steps to run this workflow" : "Run workflow"}
-                data-ui-id="workflow-builder-run-btn"
               >
                 <Play className="w-4 h-4" />
                 <span className="text-sm">Run</span>

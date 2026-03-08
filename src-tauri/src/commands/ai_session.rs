@@ -1183,7 +1183,7 @@ that implements this plan, including creating or updating semantic page specs.
 When the plan describes creating NEW pages:
 - Generate a `.spec.uibridge.json` file for each new page as part of the agentic steps
 - Use the plan's description to define semantic spec groups (what the page SHOULD do)
-- Wire individual UI elements with element-presence assertions using data-ui-id attributes
+- Wire individual UI elements with element-presence assertions using the SDK's auto-generated semantic IDs
 - Include form-validation, state-consistency, and accessibility assertions
 - Set `source: "ai-generated"` on all assertion groups
 
@@ -1253,13 +1253,13 @@ Each `.spec.uibridge.json` file follows this structure:
 {{ "type": "search", "criteria": {{ "role": "button", "textContent": "Save" }} }}
 ```
 
-**Element ID target** (use when data-ui-id is set):
+**Element ID target** (use when element ID is known):
 ```json
 {{ "type": "elementId", "elementId": "settings-dark-mode-toggle" }}
 ```
 
 ### Implementation Guidelines
-- Add `data-ui-id` attributes to key interactive elements in generated markup
+- The SDK's AutoRegisterProvider automatically assigns stable semantic IDs to interactive elements
 - Create verification steps that load and run the generated specs
 - Group assertions semantically (e.g., "form-elements", "navigation", "state-management")
 

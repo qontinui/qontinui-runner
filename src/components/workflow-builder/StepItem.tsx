@@ -101,7 +101,6 @@ export function StepItem({
             : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700"
         }`}
         title="Move up"
-        data-ui-id={`workflow-builder-step-${step.id}-move-up-btn`}
       >
         <ChevronUp className="w-3.5 h-3.5" />
       </button>
@@ -117,7 +116,6 @@ export function StepItem({
             : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700"
         }`}
         title="Move down"
-        data-ui-id={`workflow-builder-step-${step.id}-move-down-btn`}
       >
         <ChevronDown className="w-3.5 h-3.5" />
       </button>
@@ -133,7 +131,6 @@ export function StepItem({
         e.stopPropagation();
         onToggleSelect?.();
       }}
-      data-ui-id={`workflow-builder-step-${step.id}-select-checkbox`}
     >
       {isSelectedForDelete && <Check className="w-3 h-3 text-white" />}
     </div>

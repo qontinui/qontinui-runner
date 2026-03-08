@@ -86,10 +86,7 @@ export function SkillLibraryPicker({
         onSkillUsed={onSkillUsed}
       >
         {(props) => (
-          <div
-            data-ui-id="dialog-skill-library-picker"
-            className="bg-zinc-900 border border-zinc-700 rounded-lg shadow-2xl w-[640px] max-w-[90vw] max-h-[80vh] flex flex-col"
-          >
+          <div className="bg-zinc-900 border border-zinc-700 rounded-lg shadow-2xl w-[640px] max-w-[90vw] max-h-[80vh] flex flex-col">
             {/* Header */}
             <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-700">
               <div>
@@ -105,7 +102,6 @@ export function SkillLibraryPicker({
               <button
                 onClick={onClose}
                 className="p-1.5 hover:bg-zinc-800 rounded-md transition-colors text-zinc-400 hover:text-zinc-200"
-                data-ui-id="skill-picker-close-btn"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -180,7 +176,6 @@ function BrowseView({
             placeholder="Search skills..."
             className="w-full bg-zinc-800 border border-zinc-700 rounded-md pl-9 pr-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-500"
             autoFocus
-            data-ui-id="skill-picker-search-input"
           />
         </div>
 
@@ -328,7 +323,6 @@ function ConfigureView({
           className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-500 text-white rounded-md disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           onClick={onConfirm}
           disabled={validationErrors.length > 0}
-          data-ui-id="skill-picker-add-btn"
         >
           Add to Phase
         </button>
@@ -383,7 +377,6 @@ function SkillRow({
     <button
       className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-zinc-800 transition-colors text-left group"
       onClick={onClick}
-      data-ui-id={`skill-picker-item-${skill.slug}`}
     >
       <div className={`shrink-0 p-1.5 rounded ${iconData.bgClass}`}>
         <Icon className={`w-4 h-4 ${iconData.textClass}`} />

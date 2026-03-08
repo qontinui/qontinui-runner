@@ -51,7 +51,7 @@ export function StatusPanel({ executionState }: StatusPanelProps) {
   ];
 
   return (
-    <div data-ui-id="dashboard-status-panel" className="w-[30%] bg-card">
+    <div className="w-[30%] bg-card">
       <ScrollArea className="h-full">
         <div className="flex flex-col gap-4 p-4">
           {/* Execution Summary Card */}
@@ -129,7 +129,6 @@ export function StatusPanel({ executionState }: StatusPanelProps) {
                   </div>
                   {totalScreenshots > 6 && (
                     <button
-                      data-ui-id="dashboard-view-all-screenshots-btn"
                       className={`mt-3 text-sm ${getAccentColors("blue").text} hover:opacity-80 transition-colors`}
                     >
                       View All ({totalScreenshots})
@@ -221,7 +220,6 @@ export function StatusPanel({ executionState }: StatusPanelProps) {
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/80 z-50" />
           <Dialog.Content
-            data-ui-id="dialog-screenshot-preview"
             className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-w-4xl w-full"
             aria-describedby="screenshot-preview-description"
           >
@@ -235,7 +233,6 @@ export function StatusPanel({ executionState }: StatusPanelProps) {
               </div>
               <Dialog.Close asChild>
                 <button
-                  data-ui-id="dialog-screenshot-preview-close-btn"
                   className="absolute top-4 right-4 p-2 bg-black/50 hover:bg-black/70 text-white rounded-full transition-colors"
                   aria-label="Close"
                 >

@@ -192,7 +192,6 @@ function ParameterField({ param, value, onChange }: ParameterFieldProps) {
           value={(value as string) ?? ""}
           onChange={(e) => onChange(e.target.value)}
           placeholder={param.placeholder}
-          data-ui-id={`skill-param-${param.name}`}
         />
       )}
 
@@ -206,7 +205,6 @@ function ParameterField({ param, value, onChange }: ParameterFieldProps) {
             onChange(num);
           }}
           placeholder={param.placeholder}
-          data-ui-id={`skill-param-${param.name}`}
         />
       )}
 
@@ -221,7 +219,6 @@ function ParameterField({ param, value, onChange }: ParameterFieldProps) {
             ${value ? "bg-blue-500" : "bg-zinc-700"}
           `}
           onClick={() => onChange(!value)}
-          data-ui-id={`skill-param-${param.name}`}
         >
           <span
             className={`
@@ -238,7 +235,6 @@ function ParameterField({ param, value, onChange }: ParameterFieldProps) {
           className={inputClasses}
           value={(value as string) ?? ""}
           onChange={(e) => onChange(e.target.value)}
-          data-ui-id={`skill-param-${param.name}`}
         >
           <option value="">Select...</option>
           {param.options.map((opt) => (

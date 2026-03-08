@@ -443,7 +443,7 @@ Produce 3–8 structured criteria. Each criterion must have:
 - `description`: one-sentence description of the success condition
 - `method`: how to verify it — one of "command", "ui_bridge", "test", "manual"
 - `priority`: one of "critical", "important", "optional"
-- `verification_hint`: a concrete suggestion for how to check it (e.g., "Run `npx tsc --noEmit`", "Assert element with data-ui-id='save-btn' is visible")
+- `verification_hint`: a concrete suggestion for how to check it (e.g., "Run `npx tsc --noEmit`", "Assert element with id 'button-save' is visible via UI Bridge")
 - `category`: grouping label (e.g., "compilation", "ui-content", "behavior", "data-integrity", "style")
 
 Also provide:

@@ -86,10 +86,7 @@ export function GuiAutomationHeader({
                 {/* Change button - dropdown menu */}
                 <DropdownMenu.Root open={loadMenuOpen} onOpenChange={setLoadMenuOpen}>
                   <DropdownMenu.Trigger asChild>
-                    <button
-                      className="px-3 py-1.5 text-sm rounded-md border border-border bg-secondary/50 hover:bg-secondary transition-colors"
-                      data-ui-id="header-change-config-btn"
-                    >
+                    <button className="px-3 py-1.5 text-sm rounded-md border border-border bg-secondary/50 hover:bg-secondary transition-colors">
                       Change
                     </button>
                   </DropdownMenu.Trigger>
@@ -102,7 +99,6 @@ export function GuiAutomationHeader({
                     >
                       <DropdownMenu.Item
                         className="flex items-center gap-2 px-3 py-2 text-sm rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
-                        data-ui-id="header-load-file-item"
                         onSelect={() => {
                           setLoadMenuOpen(false);
                           onLoadConfiguration();
@@ -113,7 +109,6 @@ export function GuiAutomationHeader({
                       </DropdownMenu.Item>
                       <DropdownMenu.Item
                         className="flex items-center gap-2 px-3 py-2 text-sm rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
-                        data-ui-id="header-load-last-item"
                         onSelect={() => {
                           setLoadMenuOpen(false);
                           handleLoadLastConfig();
@@ -127,7 +122,6 @@ export function GuiAutomationHeader({
                       <DropdownMenu.Separator className="h-px bg-border/50 my-1" />
                       <DropdownMenu.Item
                         className="flex items-center gap-2 px-3 py-2 text-sm rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
-                        data-ui-id="header-load-rag-item"
                         onSelect={() => {
                           setLoadMenuOpen(false);
                           setShowRAGModal(true);
@@ -145,7 +139,6 @@ export function GuiAutomationHeader({
                   <button
                     onClick={onUnloadConfig}
                     className="px-3 py-1.5 text-sm rounded-md border border-destructive/50 text-destructive hover:bg-destructive/10 transition-colors"
-                    data-ui-id="header-unload-config-btn"
                   >
                     <X className="w-4 h-4" />
                   </button>
@@ -167,7 +160,6 @@ export function GuiAutomationHeader({
                     <button
                       className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
                       data-tutorial-id="load-config-button"
-                      data-ui-id="header-load-config-btn"
                     >
                       <FileText className="w-4 h-4" />
                       Load Configuration
@@ -182,7 +174,6 @@ export function GuiAutomationHeader({
                     >
                       <DropdownMenu.Item
                         className="flex items-center gap-2 px-3 py-2 text-sm rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
-                        data-ui-id="header-load-file-item"
                         onSelect={() => {
                           setLoadMenuOpen(false);
                           onLoadConfiguration();
@@ -193,7 +184,6 @@ export function GuiAutomationHeader({
                       </DropdownMenu.Item>
                       <DropdownMenu.Item
                         className="flex items-center gap-2 px-3 py-2 text-sm rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
-                        data-ui-id="header-load-last-item"
                         onSelect={() => {
                           setLoadMenuOpen(false);
                           handleLoadLastConfig();
@@ -207,7 +197,6 @@ export function GuiAutomationHeader({
                       <DropdownMenu.Separator className="h-px bg-border/50 my-1" />
                       <DropdownMenu.Item
                         className="flex items-center gap-2 px-3 py-2 text-sm rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
-                        data-ui-id="header-load-rag-item"
                         onSelect={() => {
                           setLoadMenuOpen(false);
                           setShowRAGModal(true);

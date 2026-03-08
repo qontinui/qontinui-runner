@@ -348,10 +348,7 @@ export function ControlBar({
   } = useAutoContinue();
 
   return (
-    <div
-      data-ui-id="dashboard-control-bar"
-      className="flex h-14 items-center justify-between border-b border-border bg-card px-4"
-    >
+    <div className="flex h-14 items-center justify-between border-b border-border bg-card px-4">
       {/* Left: Task Name */}
       <div className="flex items-center gap-3 min-w-0 flex-1">
         {taskName && (
@@ -439,7 +436,6 @@ export function ControlBar({
         {/* Playback Controls */}
         <div className="flex items-center gap-2">
           <Button
-            data-ui-id="dashboard-play-pause-btn"
             size="sm"
             variant="outline"
             onClick={onPlayPause}
@@ -450,7 +446,6 @@ export function ControlBar({
           </Button>
 
           <Button
-            data-ui-id="dashboard-stop-btn"
             size="sm"
             variant="outline"
             onClick={onStop}
@@ -462,7 +457,6 @@ export function ControlBar({
 
           {/* Auto-Continue Toggle */}
           <button
-            data-ui-id="dashboard-auto-continue-toggle"
             onClick={toggleAutoContinue}
             disabled={autoContinueLoading}
             className={`flex items-center gap-1.5 px-2 py-1 rounded text-xs transition-colors ml-2 ${

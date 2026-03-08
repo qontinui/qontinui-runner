@@ -99,7 +99,6 @@ export function AiProviderStep({ onComplete, onBack }: AiProviderStepProps) {
                 isSelected ? "border-primary/60 bg-primary/5" : "hover:border-zinc-600"
               }`}
               onClick={() => setSelectedProvider(isSelected ? null : provider.id)}
-              data-ui-id={`setup-provider-${provider.id}`}
             >
               <div className="flex items-start gap-3">
                 <div
@@ -129,7 +128,7 @@ export function AiProviderStep({ onComplete, onBack }: AiProviderStepProps) {
           Back
         </button>
         <div className="flex gap-2">
-          <button className="btn-secondary" onClick={handleSkip} data-ui-id="setup-wizard-skip-ai">
+          <button className="btn-secondary" onClick={handleSkip}>
             Skip
           </button>
           {selectedProvider && (
@@ -137,7 +136,6 @@ export function AiProviderStep({ onComplete, onBack }: AiProviderStepProps) {
               className="btn-primary flex items-center gap-2"
               onClick={handleSave}
               disabled={saving}
-              data-ui-id="setup-wizard-next-ai"
             >
               {saving && <Loader2 className="w-4 h-4 animate-spin" />}
               Next

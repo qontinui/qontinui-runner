@@ -115,17 +115,14 @@ function SummaryContent({ text }: { text: string }) {
   // If no user messages found, render as plain text (same as before)
   if (segments.length === 1 && segments[0].type === "text") {
     return (
-      <p
-        data-ui-id="recap-ai-summary-text"
-        className="text-foreground/90 leading-relaxed whitespace-pre-wrap"
-      >
+      <p className="text-foreground/90 leading-relaxed whitespace-pre-wrap">
         {segments[0].content}
       </p>
     );
   }
 
   return (
-    <div data-ui-id="recap-ai-summary-text" className="space-y-3">
+    <div className="space-y-3">
       {segments.map((segment, index) =>
         segment.type === "user_message" ? (
           <UserMessageBubble key={index} content={segment.content} />
@@ -223,10 +220,7 @@ export function AISummarySection({
   // If we have a summary, display it prominently
   if (aiSummary) {
     return (
-      <div
-        data-ui-id="recap-ai-summary-section"
-        className="rounded-xl border-2 border-primary/30 bg-gradient-to-br from-primary/5 to-primary/10 p-5 space-y-4"
-      >
+      <div className="rounded-xl border-2 border-primary/30 bg-gradient-to-br from-primary/5 to-primary/10 p-5 space-y-4">
         {/* Header */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -237,7 +231,6 @@ export function AISummarySection({
               <h2 className="font-semibold text-lg text-foreground">AI Summary</h2>
               {summaryGeneratedAt && (
                 <p
-                  data-ui-id="recap-summary-timestamp"
                   data-content-role="metric"
                   data-content-label="summary generation time"
                   className="text-xs text-muted-foreground"
@@ -250,7 +243,6 @@ export function AISummarySection({
           {/* Goal Achievement Badge */}
           {goalAchieved !== undefined && goalAchieved !== null && (
             <span
-              data-ui-id="recap-goal-badge"
               data-content-role="badge"
               data-content-label="goal achievement"
               className={`flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded-full ${
@@ -291,7 +283,6 @@ export function AISummarySection({
         {/* Remaining Work (if goal not achieved) */}
         {remainingWork && !goalAchieved && (
           <div
-            data-ui-id="recap-remaining-work"
             className={`p-4 rounded-lg ${getAccentColors("amber").bg} border ${getAccentColors("amber").border}`}
           >
             <div className="flex items-center gap-2 mb-2">
@@ -328,20 +319,13 @@ export function AISummarySection({
 
   if (isTerminal) {
     return (
-      <div
-        data-ui-id="recap-ai-summary-section"
-        data-has-summary="false"
-        className="rounded-xl border border-border bg-muted/20 p-5"
-      >
+      <div data-has-summary="false" className="rounded-xl border border-border bg-muted/20 p-5">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3 text-muted-foreground">
             <FileText className="w-5 h-5 opacity-50" />
-            <span data-ui-id="recap-ai-summary-text" data-content-role="status">
-              No AI summary available for this run.
-            </span>
+            <span data-content-role="status">No AI summary available for this run.</span>
           </div>
           <button
-            data-ui-id="recap-generate-summary-btn"
             onClick={handleGenerateSummary}
             className="flex items-center gap-2 px-4 py-2 text-sm bg-primary/10 hover:bg-primary/20 text-primary rounded-lg transition-colors"
           >
@@ -356,20 +340,14 @@ export function AISummarySection({
 
   // Run is still in progress
   return (
-    <div
-      data-ui-id="recap-ai-summary-section"
-      data-has-summary="false"
-      className="rounded-xl border border-border bg-muted/20 p-5"
-    >
+    <div data-has-summary="false" className="rounded-xl border border-border bg-muted/20 p-5">
       <div className="flex items-center gap-3 text-muted-foreground">
         <FileText className="w-5 h-5 opacity-50" />
-        <span data-ui-id="recap-ai-summary-text" data-content-role="status">
+        <span data-content-role="status">
           Run in progress. Summary will be available after completion.
         </span>
       </div>
-      <p data-ui-id="recap-summary-timestamp" className="text-xs text-muted-foreground mt-2">
-        Waiting for run to complete...
-      </p>
+      <p className="text-xs text-muted-foreground mt-2">Waiting for run to complete...</p>
     </div>
   );
 }

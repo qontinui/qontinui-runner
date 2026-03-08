@@ -157,6 +157,10 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         const fitAddon = fitAddonRef.current;
         const term = termRef.current;
         if (!fitAddon || !term || !containerRef.current) return;
+        // Skip resize when container is hidden (e.g., compact mode) to avoid
+        // resizing the PTY to zero columns which garbles output wrapping.
+        const { clientWidth, clientHeight } = containerRef.current;
+        if (clientWidth === 0 || clientHeight === 0) return;
         try {
           fitAddon.fit();
           invoke("terminal_resize", {

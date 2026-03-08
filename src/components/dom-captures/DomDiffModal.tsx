@@ -101,10 +101,7 @@ export function DomDiffModal({
     <Dialog.Root open={isOpen} onOpenChange={(open) => !open && onClose()}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/70 z-50" />
-        <Dialog.Content
-          data-ui-id="dialog-dom-diff"
-          className="fixed inset-4 bg-card rounded-lg shadow-2xl z-50 flex flex-col overflow-hidden"
-        >
+        <Dialog.Content className="fixed inset-4 bg-card rounded-lg shadow-2xl z-50 flex flex-col overflow-hidden">
           {/* Header */}
           <div className="flex items-center justify-between p-4 border-b border-border">
             <div className="flex items-center gap-4">
@@ -173,7 +170,6 @@ export function DomDiffModal({
               </button>
               <Dialog.Close asChild>
                 <button
-                  data-ui-id="dialog-dom-diff-close-btn"
                   className="p-2 text-muted-foreground hover:text-white hover:bg-muted/80 rounded"
                   title="Close"
                 >

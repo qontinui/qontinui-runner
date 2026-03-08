@@ -59,7 +59,7 @@ export function ContextTab({ taskRunId }: ContextTabProps) {
   return (
     <div className="space-y-4">
       {/* Variables Table */}
-      <div data-ui-id="recap-variables-table" className="card overflow-hidden">
+      <div className="card overflow-hidden">
         <div className="px-4 py-3 border-b border-border flex items-center gap-2">
           <Variable className="w-5 h-5 text-primary" />
           <h3 className="font-medium">Context Variables</h3>
@@ -78,15 +78,9 @@ export function ContextTab({ taskRunId }: ContextTabProps) {
             <table className="w-full text-sm">
               <thead>
                 <tr className="bg-muted/50">
-                  <th data-ui-id="recap-var-name" className="text-left px-4 py-2 font-medium">
-                    Name
-                  </th>
-                  <th data-ui-id="recap-var-value" className="text-left px-4 py-2 font-medium">
-                    Value
-                  </th>
-                  <th data-ui-id="recap-var-source" className="text-left px-4 py-2 font-medium">
-                    Source
-                  </th>
+                  <th className="text-left px-4 py-2 font-medium">Name</th>
+                  <th className="text-left px-4 py-2 font-medium">Value</th>
+                  <th className="text-left px-4 py-2 font-medium">Source</th>
                   <th className="text-left px-4 py-2 font-medium">Source Step</th>
                 </tr>
               </thead>
@@ -129,9 +123,9 @@ export function ContextTab({ taskRunId }: ContextTabProps) {
               No context variables recorded for this run.
             </p>
             {/* Hidden elements for test compatibility */}
-            <span data-ui-id="recap-var-name" className="hidden" />
-            <span data-ui-id="recap-var-value" className="hidden" />
-            <span data-ui-id="recap-var-source" className="hidden" />
+            <span className="hidden" />
+            <span className="hidden" />
+            <span className="hidden" />
           </div>
         )}
       </div>

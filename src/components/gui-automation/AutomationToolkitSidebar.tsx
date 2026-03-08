@@ -261,13 +261,9 @@ export function AutomationToolkitSidebar({
       </CardHeader>
       <CardContent>
         <Tabs defaultValue="quick-actions" className="w-full">
-          <TabsList className="grid w-full grid-cols-2" data-ui-id="toolkit-tabs">
-            <TabsTrigger value="quick-actions" data-ui-id="toolkit-tab-actions">
-              Quick Actions
-            </TabsTrigger>
-            <TabsTrigger value="macros" data-ui-id="toolkit-tab-macros">
-              Macros
-            </TabsTrigger>
+          <TabsList className="grid w-full grid-cols-2">
+            <TabsTrigger value="quick-actions">Quick Actions</TabsTrigger>
+            <TabsTrigger value="macros">Macros</TabsTrigger>
           </TabsList>
 
           {/* Quick Actions Tab */}

@@ -189,24 +189,33 @@ export function useZoneLayout(tabIds: string[]) {
   // Auto-assign tabs to empty zones when tabs change
   useEffect(() => {
     setAssignments((prev) => {
+      // Check if any removals or additions are needed before cloning
+      const hasDeadAssignments = Object.values(prev).some((tabId) => !tabIds.includes(tabId));
+      const assignedTabIds = new Set(Object.values(prev));
+      const hasUnassigned = tabIds.some((id) => !assignedTabIds.has(id));
+
+      if (!hasDeadAssignments && !hasUnassigned) return prev;
+
       const next = { ...prev };
 
       // Remove assignments for tabs that no longer exist
-      for (const [zoneIdx, tabId] of Object.entries(next)) {
-        if (!tabIds.includes(tabId)) {
-          delete next[Number(zoneIdx)];
+      if (hasDeadAssignments) {
+        for (const [zoneIdx, tabId] of Object.entries(next)) {
+          if (!tabIds.includes(tabId)) {
+            delete next[Number(zoneIdx)];
+          }
         }
       }
 
-      // Find unassigned tabs
-      const assignedTabIds = new Set(Object.values(next));
-      const unassigned = tabIds.filter((id) => !assignedTabIds.has(id));
-
-      // Fill empty zone slots with unassigned tabs
-      const maxZones = layout.zones.length;
-      for (let z = 0; z < maxZones && unassigned.length > 0; z++) {
-        if (!(z in next) || !next[z]) {
-          next[z] = unassigned.shift()!;
+      // Find unassigned tabs and fill empty zone slots
+      if (hasUnassigned) {
+        const nowAssigned = new Set(Object.values(next));
+        const unassigned = tabIds.filter((id) => !nowAssigned.has(id));
+        const maxZones = layout.zones.length;
+        for (let z = 0; z < maxZones && unassigned.length > 0; z++) {
+          if (!(z in next) || !next[z]) {
+            next[z] = unassigned.shift()!;
+          }
         }
       }
 

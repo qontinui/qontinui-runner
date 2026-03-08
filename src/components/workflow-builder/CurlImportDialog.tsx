@@ -114,10 +114,7 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
       <div className="absolute inset-0 bg-black/50" onClick={handleClose} />
 
       {/* Dialog */}
-      <div
-        data-ui-id="dialog-curl-import"
-        className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] flex flex-col overflow-hidden"
-      >
+      <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] flex flex-col overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-border">
           <div className="flex items-center gap-2">
@@ -127,7 +124,6 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
           <button
             onClick={handleClose}
             className="p-1 text-muted-foreground hover:text-foreground transition-colors"
-            data-ui-id="workflow-builder-curl-import-close-btn"
           >
             <X className="w-5 h-5" />
           </button>
@@ -151,7 +147,6 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
   --data-raw '{"key": "value"}'`}
               className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm font-mono resize-none h-40 focus:outline-none focus:ring-2 focus:ring-primary"
               autoFocus
-              data-ui-id="workflow-builder-curl-import-input"
             />
             <p className="text-xs text-muted-foreground mt-1">
               Paste a cURL command copied from browser DevTools or other sources
@@ -174,7 +169,6 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
               onClick={handleParse}
               disabled={isLoading || !curlCommand.trim()}
               className={`w-full flex items-center justify-center gap-2 px-4 py-2 ${getAccentColors("cyan").bgSolid} text-white rounded-md font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors`}
-              data-ui-id="workflow-builder-curl-import-parse-btn"
             >
               {isLoading ? (
                 <>
@@ -290,7 +284,6 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
           <button
             onClick={handleClose}
             className="flex-1 px-4 py-2 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
-            data-ui-id="workflow-builder-curl-import-cancel-btn"
           >
             Cancel
           </button>
@@ -298,7 +291,6 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
             <button
               onClick={handleImport}
               className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 ${getAccentColors("cyan").bgSolid} text-white rounded-md font-medium hover:opacity-90 transition-colors`}
-              data-ui-id="workflow-builder-curl-import-confirm-btn"
             >
               <Check className="w-4 h-4" />
               Import

@@ -24,7 +24,6 @@ export function ConfigurationLoadMenu({ onLoadFromFile, onLoadRAG }: Configurati
       <DropdownMenu.Trigger asChild>
         <button
           data-tutorial-id="load-config-button"
-          data-ui-id="config-load-btn"
           className={`w-full flex items-center justify-center gap-2 px-3 py-2 text-xs rounded-lg ${getAccentColors("blue").bg} ${getAccentColors("blue").text} hover:opacity-80 transition-colors`}
         >
           <FileText className="w-3.5 h-3.5" />
@@ -42,7 +41,6 @@ export function ConfigurationLoadMenu({ onLoadFromFile, onLoadRAG }: Configurati
           {/* Load from File */}
           <DropdownMenu.Item
             className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
-            data-ui-id="config-load-file-item"
             onSelect={() => {
               setOpen(false);
               onLoadFromFile();
@@ -58,7 +56,6 @@ export function ConfigurationLoadMenu({ onLoadFromFile, onLoadRAG }: Configurati
           {/* Load RAG */}
           <DropdownMenu.Item
             className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
-            data-ui-id="config-load-rag-item"
             onSelect={() => {
               setOpen(false);
               onLoadRAG();

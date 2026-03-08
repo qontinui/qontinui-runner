@@ -98,7 +98,7 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
       />
 
       {/* Current Version Card */}
-      <div className="rounded-lg bg-card/50 p-4" data-ui-id="settings-update-version-section">
+      <div className="rounded-lg bg-card/50 p-4">
         <h4 className="font-medium text-sm mb-3">Current Version</h4>
 
         <div className="flex items-center justify-between">
@@ -131,7 +131,6 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
                   : "bg-secondary text-secondary-foreground hover:bg-secondary/80"
               }
             `}
-            data-ui-id="settings-update-check-btn"
           >
             <RefreshCw className={`w-4 h-4 ${status === "checking" ? "animate-spin" : ""}`} />
             {status === "checking" ? "Checking..." : "Check for Updates"}
@@ -141,7 +140,7 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
 
       {/* Update Status Card */}
       {updateInfo && (
-        <div className="rounded-lg bg-card/50 p-4" data-ui-id="settings-update-status-section">
+        <div className="rounded-lg bg-card/50 p-4">
           <h4 className="font-medium text-sm mb-3">Update Status</h4>
 
           {updateInfo.development ? (
@@ -215,7 +214,6 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
                       : "bg-primary text-primary-foreground hover:bg-primary/90"
                   }
                 `}
-                data-ui-id="settings-update-install-btn"
               >
                 {status === "installing" ? (
                   <>

@@ -320,7 +320,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
   return (
     <div className="space-y-4">
       {/* Findings Panel */}
-      <div data-ui-id="recap-findings-panel" className="card p-4">
+      <div className="card p-4">
         <div className="flex items-center justify-between mb-4">
           <h3 className="font-medium flex items-center gap-2">
             <AlertTriangle className="w-5 h-5 text-amber-500" />
@@ -336,11 +336,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
           const colors = SEVERITY_COLORS[severity];
 
           return (
-            <div
-              key={severity}
-              data-ui-id={`recap-findings-${severity}`}
-              className={`mb-3 rounded-lg border ${colors.border} ${colors.bg}`}
-            >
+            <div key={severity} className={`mb-3 rounded-lg border ${colors.border} ${colors.bg}`}>
               <div
                 data-content-role="heading"
                 data-content-label={`${severity} findings`}
@@ -354,18 +350,13 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                   const isExpanded = expandedFindings.has(finding.id);
 
                   return (
-                    <div
-                      key={finding.id}
-                      data-ui-id={`recap-finding-${finding.id}`}
-                      className="px-3 py-2"
-                    >
+                    <div key={finding.id} className="px-3 py-2">
                       <button
                         onClick={() => toggleFinding(finding.id)}
                         className="w-full flex items-center gap-2 text-left"
                       >
                         <Icon className={`w-4 h-4 ${colors.text}`} />
                         <span
-                          data-ui-id={`recap-finding-${finding.id}-category`}
                           className={`text-xs px-1.5 py-0.5 rounded ${colors.bg} ${colors.text}`}
                         >
                           {finding.categoryId}
@@ -400,7 +391,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
         })}
 
         {findings.length === 0 && (
-          <div data-ui-id="recap-finding-placeholder" className="px-3 py-4 text-center">
+          <div className="px-3 py-4 text-center">
             <p className="text-sm text-muted-foreground">No findings recorded for this run.</p>
           </div>
         )}
@@ -408,7 +399,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
 
       {/* Reflection Fixes Panel */}
       {(reflectionFixes.length > 0 || !reflectionLoading) && (
-        <div data-ui-id="recap-reflection-fixes-panel" className="card p-4">
+        <div className="card p-4">
           <div className="flex items-center justify-between mb-4">
             <h3 className="font-medium flex items-center gap-2">
               <RotateCcw className="w-5 h-5 text-purple-400" />
@@ -419,7 +410,6 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
               onClick={triggerReflection}
               disabled={triggeringReflection}
               className="px-3 py-1.5 text-xs font-medium bg-purple-500/10 text-purple-400 hover:bg-purple-500/20 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
-              data-ui-id="recap-trigger-reflection-btn"
             >
               {triggeringReflection ? (
                 <>
@@ -458,11 +448,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                 const isExpanded = expandedFixes.has(fix.id);
 
                 return (
-                  <div
-                    key={fix.id}
-                    data-ui-id={`recap-reflection-fix-${fix.id}`}
-                    className="rounded-lg border border-border bg-muted/20"
-                  >
+                  <div key={fix.id} className="rounded-lg border border-border bg-muted/20">
                     <button
                       onClick={() => toggleFix(fix.id)}
                       className="w-full px-3 py-2 flex items-center gap-2 text-left hover:bg-muted/40 transition-colors rounded-lg"
@@ -567,7 +553,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
       )}
 
       {/* Knowledge Timeline */}
-      <div data-ui-id="recap-knowledge-timeline" className="card p-4">
+      <div className="card p-4">
         <div className="flex items-center justify-between mb-4">
           <h3 className="font-medium flex items-center gap-2">
             <Clock className="w-5 h-5 text-primary" />
@@ -576,7 +562,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
 
           {/* Filters */}
           <div className="flex items-center gap-2">
-            <div data-ui-id="recap-knowledge-filter-category" className="flex items-center gap-1">
+            <div className="flex items-center gap-1">
               <Filter className="w-4 h-4 text-muted-foreground" />
               <select
                 value={categoryFilter}
@@ -593,7 +579,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
               </select>
             </div>
 
-            <div data-ui-id="recap-knowledge-filter-agent" className="flex items-center gap-1">
+            <div className="flex items-center gap-1">
               <select
                 value={agentFilter}
                 onChange={(e) => setAgentFilter(e.target.value)}
@@ -634,11 +620,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                       const isExpanded = expandedKnowledge.has(entry.id);
 
                       return (
-                        <div
-                          key={entry.id}
-                          data-ui-id={`recap-knowledge-entry-${entry.id}`}
-                          className="rounded-lg border border-border bg-muted/20"
-                        >
+                        <div key={entry.id} className="rounded-lg border border-border bg-muted/20">
                           <button
                             onClick={() => toggleKnowledge(entry.id)}
                             className="w-full px-3 py-2 flex items-center gap-2 text-left hover:bg-muted/40 transition-colors rounded-lg"
@@ -726,10 +708,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
           </div>
         ) : (
           <div className="space-y-2">
-            <p
-              data-ui-id="recap-knowledge-entry-placeholder"
-              className="text-sm text-muted-foreground text-center py-4"
-            >
+            <p className="text-sm text-muted-foreground text-center py-4">
               No knowledge entries recorded for this run.
             </p>
           </div>

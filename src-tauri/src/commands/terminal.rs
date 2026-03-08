@@ -76,12 +76,17 @@ pub fn terminal_resize(
 }
 
 /// Close a terminal session and kill its process.
+/// Uses spawn_blocking to avoid blocking the IPC thread during thread joins.
 #[tauri::command]
-pub fn terminal_close(
+pub async fn terminal_close(
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     terminal_id: String,
 ) -> Result<CommandResponse, String> {
-    terminal_manager.close(&terminal_id)?;
+    let manager = terminal_manager.inner().clone();
+    let id = terminal_id.clone();
+    tokio::task::spawn_blocking(move || manager.close(&id))
+        .await
+        .map_err(|e| format!("Join error: {}", e))??;
 
     Ok(CommandResponse {
         success: true,

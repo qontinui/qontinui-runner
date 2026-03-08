@@ -125,15 +125,11 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
       <div className="absolute inset-0 bg-black/50" onClick={isLoading ? undefined : onClose} />
 
       {/* Dialog */}
-      <div
-        data-ui-id="dialog-new-run"
-        className="relative bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden"
-      >
+      <div className="relative bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-700 bg-zinc-800/50">
           <h3 className="text-lg font-semibold text-zinc-100">New Run</h3>
           <button
-            data-ui-id="dialog-new-run-close-btn"
             onClick={onClose}
             disabled={isLoading}
             className="p-1 text-zinc-400 hover:text-zinc-200 transition-colors disabled:opacity-50"
@@ -297,16 +293,10 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
 
         {/* Footer */}
         <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-zinc-700 bg-zinc-800/50">
-          <Button
-            data-ui-id="dialog-new-run-cancel-btn"
-            variant="ghost"
-            onClick={onClose}
-            disabled={isLoading}
-          >
+          <Button variant="ghost" onClick={onClose} disabled={isLoading}>
             Cancel
           </Button>
           <Button
-            data-ui-id="dialog-new-run-create-btn"
             variant="primary"
             onClick={handleCreate}
             disabled={isLoading || (guiLockConflict && !forceGuiLock)}

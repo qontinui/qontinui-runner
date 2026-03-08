@@ -156,7 +156,6 @@ export function ActiveRunsBar({ onNewRun, onRunCreated }: ActiveRunsBarProps) {
   return (
     <div
       ref={containerRef}
-      data-ui-id="active-runs-bar"
       role="listbox"
       aria-label="Active workflow runs"
       aria-activedescendant={
@@ -293,7 +292,6 @@ export function ActiveRunsBar({ onNewRun, onRunCreated }: ActiveRunsBarProps) {
 
       {/* New Run button */}
       <Button
-        data-ui-id="new-run-btn"
         size="sm"
         variant="outline"
         onClick={() => setIsNewRunDialogOpen(true)}

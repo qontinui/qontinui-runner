@@ -351,7 +351,6 @@ function NavItem({
   const button = (
     <button
       data-nav-item={dataNavItem}
-      data-ui-id={`sidebar-nav-item-${dataNavItem}`}
       onClick={onClick}
       onKeyDown={onKeyDown}
       tabIndex={tabIndex}
@@ -409,7 +408,6 @@ function FlyoutItem({ item, isActive, onClick, index }: FlyoutItemProps) {
   return (
     <button
       onClick={onClick}
-      data-ui-id={`sidebar-flyout-item-${item.id}`}
       className={`
         w-full p-3 rounded-lg flex items-start gap-3 transition-all duration-200 text-left group
         animate-in fade-in slide-in-from-left-2
@@ -516,10 +514,9 @@ function NavGroup({
   }
 
   return (
-    <div className="space-y-1" data-ui-id={`sidebar-nav-group-${group.id}`}>
+    <div className="space-y-1">
       <button
         onClick={onToggle}
-        data-ui-id={`sidebar-nav-group-${group.id}-toggle`}
         className="w-full flex items-center justify-between px-2 py-1.5 text-xs
                    font-semibold text-muted-foreground/70 hover:text-muted-foreground
                    transition-colors uppercase tracking-wider outline-none
@@ -631,7 +628,6 @@ function FlyoutSidebar({
         </div>
         <button
           onClick={onClose}
-          data-ui-id="sidebar-flyout-close-btn"
           className="p-1.5 rounded-md text-muted-foreground hover:text-foreground
                      hover:bg-muted/50 transition-colors"
           aria-label="Close flyout"
@@ -889,7 +885,6 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
       {/* Main Sidebar */}
       <nav
         data-tutorial-id="sidebar"
-        data-ui-id="sidebar-nav"
         className={`
           h-full flex flex-col bg-card border-r border-border/50
           transition-all duration-300 ease-in-out flex-shrink-0
@@ -923,7 +918,6 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
           >
             <button
               onClick={() => onCollapsedChange(!collapsed)}
-              data-ui-id="sidebar-collapse-btn"
               className={`
                 w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm
                 text-muted-foreground hover:text-foreground hover:bg-muted/30

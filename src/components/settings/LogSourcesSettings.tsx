@@ -289,7 +289,6 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
         <button
           onClick={migrateFromProjects}
           className="flex items-center gap-2 px-3 py-1.5 text-xs bg-muted/50 hover:bg-muted rounded-md transition-colors"
-          data-ui-id="settings-logsources-import-btn"
         >
           <Copy className="w-3.5 h-3.5" />
           Import from Projects
@@ -298,7 +297,6 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
           onClick={saveSettings}
           disabled={saving}
           className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-md hover:bg-primary/90 disabled:opacity-50 transition-colors"
-          data-ui-id="settings-logsources-save-btn"
         >
           {saving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
           Save Changes
@@ -306,14 +304,10 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
       </div>
 
       {/* AI Selection Mode */}
-      <div
-        className="rounded-lg bg-card/50 p-4"
-        data-ui-id="settings-logsources-ai-selection-section"
-      >
+      <div className="rounded-lg bg-card/50 p-4">
         <button
           onClick={() => toggleSection("aiSettings")}
           className="flex items-center gap-2 w-full text-left"
-          data-ui-id="settings-logsources-ai-selection-toggle-btn"
         >
           {expandedSections.aiSettings ? (
             <ChevronDown className="w-4 h-4" />
@@ -367,7 +361,6 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
                     checked={settings.ai_selection_mode === mode.value}
                     onChange={() => setAiSelectionMode(mode.value)}
                     className="w-4 h-4"
-                    data-ui-id={`settings-logsources-ai-mode-${mode.value}-radio`}
                   />
                   <div>
                     <div className="text-sm font-medium">{mode.label}</div>
@@ -381,12 +374,11 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
       </div>
 
       {/* Sources Section */}
-      <div className="rounded-lg bg-card/50 p-4" data-ui-id="settings-logsources-sources-section">
+      <div className="rounded-lg bg-card/50 p-4">
         <div className="flex items-center justify-between">
           <button
             onClick={() => toggleSection("sources")}
             className="flex items-center gap-2 text-left"
-            data-ui-id="settings-logsources-sources-toggle-btn"
           >
             {expandedSections.sources ? (
               <ChevronDown className="w-4 h-4" />
@@ -404,7 +396,6 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
           <button
             onClick={() => setShowAddSource(true)}
             className="flex items-center gap-1 px-2 py-1 text-xs bg-primary/10 hover:bg-primary/20 text-primary rounded transition-colors"
-            data-ui-id="settings-logsources-add-source-btn"
           >
             <Plus className="w-3.5 h-3.5" />
             Add Source
@@ -434,12 +425,11 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
       </div>
 
       {/* Profiles Section */}
-      <div className="rounded-lg bg-card/50 p-4" data-ui-id="settings-logsources-profiles-section">
+      <div className="rounded-lg bg-card/50 p-4">
         <div className="flex items-center justify-between">
           <button
             onClick={() => toggleSection("profiles")}
             className="flex items-center gap-2 text-left"
-            data-ui-id="settings-logsources-profiles-toggle-btn"
           >
             {expandedSections.profiles ? (
               <ChevronDown className="w-4 h-4" />
@@ -457,7 +447,6 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
           <button
             onClick={() => setShowAddProfile(true)}
             className="flex items-center gap-1 px-2 py-1 text-xs bg-primary/10 hover:bg-primary/20 text-primary rounded transition-colors"
-            data-ui-id="settings-logsources-add-profile-btn"
           >
             <Plus className="w-3.5 h-3.5" />
             Add Profile
@@ -773,7 +762,6 @@ function SourceEditor({
               onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
               placeholder="Backend Logs"
               className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-              data-ui-id="settings-logsources-source-name-input"
             />
           </div>
 
@@ -785,7 +773,6 @@ function SourceEditor({
               onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
               placeholder="FastAPI backend server logs"
               className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-              data-ui-id="settings-logsources-source-description-input"
             />
           </div>
 
@@ -796,7 +783,6 @@ function SourceEditor({
                 value={form.category}
                 onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))}
                 className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-                data-ui-id="settings-logsources-source-category-select"
               >
                 {CATEGORIES.map((cat) => (
                   <option key={cat.value} value={cat.value}>
@@ -811,7 +797,6 @@ function SourceEditor({
                 value={form.type}
                 onChange={(e) => setForm((f) => ({ ...f, type: e.target.value }))}
                 className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-                data-ui-id="settings-logsources-source-type-select"
               >
                 <option value="file">File</option>
                 <option value="directory">Directory</option>
@@ -828,12 +813,8 @@ function SourceEditor({
                 onChange={(e) => setForm((f) => ({ ...f, path: e.target.value }))}
                 placeholder="/path/to/logs/app.log"
                 className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-                data-ui-id="settings-logsources-source-path-input"
               />
-              <button
-                className="p-2 bg-muted/50 hover:bg-muted rounded-md"
-                data-ui-id="settings-logsources-source-path-browse-btn"
-              >
+              <button className="p-2 bg-muted/50 hover:bg-muted rounded-md">
                 <FolderOpen className="w-4 h-4" />
               </button>
             </div>
@@ -848,7 +829,6 @@ function SourceEditor({
                 onChange={(e) => setForm((f) => ({ ...f, pattern: e.target.value }))}
                 placeholder="*.log"
                 className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-                data-ui-id="settings-logsources-source-pattern-input"
               />
             </div>
           )}
@@ -865,7 +845,6 @@ function SourceEditor({
                 min={10}
                 max={10000}
                 className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-                data-ui-id="settings-logsources-source-tail-lines-input"
               />
             </div>
             <div>
@@ -876,7 +855,6 @@ function SourceEditor({
                 onChange={(e) => setForm((f) => ({ ...f, color: e.target.value }))}
                 placeholder="#22c55e"
                 className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-                data-ui-id="settings-logsources-source-color-input"
               />
             </div>
           </div>
@@ -889,7 +867,6 @@ function SourceEditor({
               onChange={(e) => setForm((f) => ({ ...f, keywords: e.target.value }))}
               placeholder="python, fastapi, http, api"
               className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-              data-ui-id="settings-logsources-source-keywords-input"
             />
             <p className="text-[10px] text-muted-foreground mt-1">
               Keywords help AI identify when this source is relevant
@@ -902,7 +879,6 @@ function SourceEditor({
               type="button"
               onClick={() => setShowErrorMonitoring(!showErrorMonitoring)}
               className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground"
-              data-ui-id="settings-logsources-source-error-monitoring-toggle"
             >
               {showErrorMonitoring ? (
                 <ChevronDown className="w-3 h-3" />
@@ -921,7 +897,6 @@ function SourceEditor({
                       value={form.format}
                       onChange={(e) => setForm((f) => ({ ...f, format: e.target.value }))}
                       className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-                      data-ui-id="settings-logsources-source-format-select"
                     >
                       <option value="plaintext">Plaintext</option>
                       <option value="json">JSON</option>
@@ -934,7 +909,6 @@ function SourceEditor({
                       value={form.parser}
                       onChange={(e) => setForm((f) => ({ ...f, parser: e.target.value }))}
                       className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-                      data-ui-id="settings-logsources-source-parser-select"
                     >
                       <option value="generic">Generic</option>
                       <option value="python">Python</option>
@@ -952,7 +926,6 @@ function SourceEditor({
                     onChange={(e) => setForm((f) => ({ ...f, timestamp_pattern: e.target.value }))}
                     placeholder="e.g. ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
                     className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-                    data-ui-id="settings-logsources-source-timestamp-pattern-input"
                   />
                 </div>
 
@@ -965,7 +938,6 @@ function SourceEditor({
                       onChange={(e) => setForm((f) => ({ ...f, timezone: e.target.value }))}
                       placeholder="local"
                       className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-                      data-ui-id="settings-logsources-source-timezone-input"
                     />
                   </div>
                   <div>
@@ -982,7 +954,6 @@ function SourceEditor({
                       min={500}
                       max={60000}
                       className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-                      data-ui-id="settings-logsources-source-poll-interval-input"
                     />
                   </div>
                 </div>
@@ -995,7 +966,6 @@ function SourceEditor({
                     placeholder="Custom regex patterns to identify errors"
                     rows={3}
                     className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
-                    data-ui-id="settings-logsources-source-error-patterns-textarea"
                   />
                 </div>
 
@@ -1007,7 +977,6 @@ function SourceEditor({
                     placeholder="Custom regex patterns to identify warnings"
                     rows={2}
                     className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
-                    data-ui-id="settings-logsources-source-warning-patterns-textarea"
                   />
                 </div>
 
@@ -1019,7 +988,6 @@ function SourceEditor({
                     placeholder="Patterns to suppress false positives"
                     rows={2}
                     className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
-                    data-ui-id="settings-logsources-source-ignore-patterns-textarea"
                   />
                 </div>
               </div>
@@ -1028,18 +996,13 @@ function SourceEditor({
         </div>
 
         <div className="flex justify-end gap-2 pt-2">
-          <button
-            onClick={onCancel}
-            className="px-3 py-1.5 text-sm hover:bg-muted rounded-md"
-            data-ui-id="settings-logsources-source-cancel-btn"
-          >
+          <button onClick={onCancel} className="px-3 py-1.5 text-sm hover:bg-muted rounded-md">
             Cancel
           </button>
           <button
             onClick={handleSubmit}
             disabled={!form.name || !form.path}
             className="px-3 py-1.5 text-sm bg-primary text-primary-foreground rounded-md hover:bg-primary/90 disabled:opacity-50"
-            data-ui-id="settings-logsources-source-submit-btn"
           >
             {source ? "Update" : "Add"}
           </button>
@@ -1120,7 +1083,6 @@ function ProfileEditor({
               onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
               placeholder="Web Development"
               className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-              data-ui-id="settings-logsources-profile-name-input"
             />
           </div>
 
@@ -1132,7 +1094,6 @@ function ProfileEditor({
               onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
               placeholder="Sources for web frontend and backend development"
               className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-              data-ui-id="settings-logsources-profile-description-input"
             />
           </div>
 
@@ -1174,18 +1135,13 @@ function ProfileEditor({
         </div>
 
         <div className="flex justify-end gap-2 pt-2">
-          <button
-            onClick={onCancel}
-            className="px-3 py-1.5 text-sm hover:bg-muted rounded-md"
-            data-ui-id="settings-logsources-profile-cancel-btn"
-          >
+          <button onClick={onCancel} className="px-3 py-1.5 text-sm hover:bg-muted rounded-md">
             Cancel
           </button>
           <button
             onClick={handleSubmit}
             disabled={!form.name}
             className="px-3 py-1.5 text-sm bg-primary text-primary-foreground rounded-md hover:bg-primary/90 disabled:opacity-50"
-            data-ui-id="settings-logsources-profile-submit-btn"
           >
             {profile ? "Update" : "Add"}
           </button>

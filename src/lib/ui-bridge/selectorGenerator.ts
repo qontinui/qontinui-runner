@@ -27,7 +27,7 @@ export interface SelectorResult {
  * Generate a CSS selector from element data
  *
  * Priority:
- * 1. data-testid or data-ui-id (most reliable for testing)
+ * 1. data-testid or data-test-id (most reliable for automation)
  * 2. ID attribute
  * 3. Unique class combination
  * 4. Tag + attributes
@@ -35,17 +35,10 @@ export interface SelectorResult {
  */
 export function generateCssSelector(element: ExternalElement): SelectorResult {
   // Check for test IDs first (most reliable)
-  const testId =
-    element.dataAttributes?.["testid"] ||
-    element.dataAttributes?.["test-id"] ||
-    element.dataAttributes?.["ui-id"];
+  const testId = element.dataAttributes?.["testid"] || element.dataAttributes?.["test-id"];
 
   if (testId) {
-    const attr = element.dataAttributes?.["testid"]
-      ? "data-testid"
-      : element.dataAttributes?.["test-id"]
-        ? "data-test-id"
-        : "data-ui-id";
+    const attr = element.dataAttributes?.["testid"] ? "data-testid" : "data-test-id";
     return {
       selector: `[${attr}="${testId}"]`,
       type: "css",
@@ -227,7 +220,7 @@ export function generateXPath(element: ExternalElement): SelectorResult {
  * Looks for common test ID data attributes
  */
 export function generateTestIdSelector(element: ExternalElement): SelectorResult | null {
-  const testIdAttrs = ["testid", "test-id", "ui-id", "cy", "pw"];
+  const testIdAttrs = ["testid", "test-id", "cy", "pw"];
 
   for (const attr of testIdAttrs) {
     const value = element.dataAttributes?.[attr];

@@ -61,7 +61,6 @@ function ImageViewer({ imagePath, imageData, title, isOpen, onClose }: ImageView
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/80 z-50" />
         <Dialog.Content
-          data-ui-id="dialog-image-viewer"
           className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-h-[90vh] max-w-[90vw]"
           aria-describedby="image-description"
         >
@@ -77,7 +76,6 @@ function ImageViewer({ imagePath, imageData, title, isOpen, onClose }: ImageView
             />
             <Dialog.Close asChild>
               <button
-                data-ui-id="dialog-image-viewer-close-btn"
                 className="absolute top-4 right-4 p-2 bg-black/50 hover:bg-black/70 text-white rounded-full transition-colors"
                 aria-label="Close"
               >
@@ -107,7 +105,6 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/50 backdrop-blur-sm z-40" />
           <Dialog.Content
-            data-ui-id="dialog-image-detail"
             className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-card border border-border rounded-xl shadow-2xl z-40 max-h-[90vh] w-[90vw] max-w-4xl overflow-hidden flex flex-col"
             aria-describedby="image-detail-description"
           >
@@ -137,7 +134,6 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
               </div>
               <Dialog.Close asChild>
                 <button
-                  data-ui-id="dialog-image-detail-close-btn"
                   className="p-2 hover:bg-accent rounded-lg transition-colors"
                   aria-label="Close"
                 >
@@ -428,9 +424,7 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
             {/* Footer */}
             <div className="border-t border-border p-4 flex justify-end">
               <Dialog.Close asChild>
-                <button data-ui-id="dialog-image-detail-confirm-btn" className="btn-secondary">
-                  Close
-                </button>
+                <button className="btn-secondary">Close</button>
               </Dialog.Close>
             </div>
           </Dialog.Content>

@@ -95,10 +95,7 @@ export function RunDetailsSidebar({
   const primaryModel = usage?.phases?.[0]?.model_used ?? null;
 
   return (
-    <div
-      data-ui-id="recap-details-sidebar"
-      className="rounded-lg border border-border bg-card space-y-0 divide-y divide-border"
-    >
+    <div className="rounded-lg border border-border bg-card space-y-0 divide-y divide-border">
       {/* Key-value metrics */}
       <div className="p-3 space-y-2">
         <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider">

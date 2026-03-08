@@ -107,10 +107,7 @@ export function TaskListWidget({
   }
 
   return (
-    <div
-      data-ui-id="widget-task-list"
-      className="bg-card border border-border rounded-lg shadow-sm min-w-[180px] max-w-[240px]"
-    >
+    <div className="bg-card border border-border rounded-lg shadow-sm min-w-[180px] max-w-[240px]">
       {/* Header */}
       <div className="px-3 py-1.5 border-b border-border/50 bg-muted/30">
         <div className="flex items-center justify-between">
@@ -131,7 +128,7 @@ export function TaskListWidget({
       </div>
 
       {/* Stage List */}
-      <div data-ui-id="widget-task-stages-list" className="px-2 py-1.5 space-y-0.5">
+      <div className="px-2 py-1.5 space-y-0.5">
         {WORKFLOW_STAGES.map((stage) => {
           const config = WORKFLOW_STAGE_CONFIG[stage];
           const status = getStageStatus(stage, currentStage, isComplete, isFailed, isPaused);

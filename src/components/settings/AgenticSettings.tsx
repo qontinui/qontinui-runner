@@ -262,10 +262,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
       )}
 
       {/* Memory Compression Section */}
-      <div
-        className="rounded-lg bg-card/50 overflow-hidden"
-        data-ui-id="settings-agentic-compression-section"
-      >
+      <div className="rounded-lg bg-card/50 overflow-hidden">
         <button
           onClick={() => setCompressionExpanded(!compressionExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
@@ -320,7 +317,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                   }
                   disabled={!settings.compression.enabled}
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-                  data-ui-id="settings-agentic-compression-threshold-input"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Compress when context exceeds this token count
@@ -346,7 +342,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                   }
                   disabled={!settings.compression.enabled}
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-                  data-ui-id="settings-agentic-compression-target-input"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Target token count after compression
@@ -371,7 +366,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                   }
                   disabled={!settings.compression.enabled}
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-                  data-ui-id="settings-agentic-compression-recent-items-input"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Recent items preserved (never compressed)
@@ -399,7 +393,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                   }
                   disabled={!settings.compression.enabled}
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-                  data-ui-id="settings-agentic-compression-batch-size-input"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Items summarized together per batch
@@ -419,10 +412,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
       </div>
 
       {/* Retry with Feedback Section */}
-      <div
-        className="rounded-lg bg-card/50 overflow-hidden"
-        data-ui-id="settings-agentic-retry-section"
-      >
+      <div className="rounded-lg bg-card/50 overflow-hidden">
         <button
           onClick={() => setRetryExpanded(!retryExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
@@ -476,7 +466,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                   }
                   disabled={!settings.retry.enabled}
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-                  data-ui-id="settings-agentic-retry-max-retries-input"
                 />
                 <p className="text-[10px] text-muted-foreground">Maximum retry attempts</p>
               </div>
@@ -500,7 +489,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                   }
                   disabled={!settings.retry.enabled}
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-                  data-ui-id="settings-agentic-retry-base-delay-input"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Initial delay before first retry
@@ -526,7 +514,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                   }
                   disabled={!settings.retry.enabled}
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-                  data-ui-id="settings-agentic-retry-max-delay-input"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Maximum delay cap for exponential backoff
@@ -555,7 +542,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                   }
                   disabled={!settings.retry.enabled}
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-                  data-ui-id="settings-agentic-retry-exponential-base-input"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Delay multiplier: base_delay * base^attempt
@@ -615,10 +601,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
       </div>
 
       {/* Task Routing Section */}
-      <div
-        className="rounded-lg bg-card/50 overflow-hidden"
-        data-ui-id="settings-agentic-routing-section"
-      >
+      <div className="rounded-lg bg-card/50 overflow-hidden">
         <button
           onClick={() => setRoutingExpanded(!routingExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
@@ -669,7 +652,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                   }
                   disabled={!settings.routing.enabled}
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-                  data-ui-id="settings-agentic-routing-simple-model-select"
                 >
                   {MODEL_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -697,7 +679,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                   }
                   disabled={!settings.routing.enabled}
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-                  data-ui-id="settings-agentic-routing-medium-model-select"
                 >
                   {MODEL_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -725,7 +706,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                   }
                   disabled={!settings.routing.enabled}
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-                  data-ui-id="settings-agentic-routing-complex-model-select"
                 >
                   {MODEL_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -760,7 +740,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                     }
                     disabled={!settings.routing.enabled}
                     className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-                    data-ui-id="settings-agentic-routing-simple-threshold-input"
                   />
                   <p className="text-[10px] text-muted-foreground">Max files for simple tasks</p>
                 </div>
@@ -786,7 +765,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                     }
                     disabled={!settings.routing.enabled}
                     className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
-                    data-ui-id="settings-agentic-routing-medium-threshold-input"
                   />
                   <p className="text-[10px] text-muted-foreground">
                     Max files for medium (above = complex)
@@ -807,10 +785,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
       </div>
 
       {/* Post-Run Reflection Section */}
-      <div
-        className="rounded-lg bg-card/50 overflow-hidden"
-        data-ui-id="settings-agentic-reflection-section"
-      >
+      <div className="rounded-lg bg-card/50 overflow-hidden">
         <button
           onClick={() => setReflectionExpanded(!reflectionExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
@@ -864,7 +839,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
         <button
           onClick={resetToDefaults}
           className="px-4 py-2 bg-muted hover:bg-muted/80 text-foreground rounded-md font-medium transition-colors text-sm"
-          data-ui-id="settings-agentic-reset-defaults-btn"
         >
           Reset to Defaults
         </button>
@@ -873,7 +847,6 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
           onClick={saveSettings}
           disabled={saving}
           className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-sm"
-          data-ui-id="settings-agentic-save-btn"
         >
           {saving ? (
             <>

@@ -1463,7 +1463,6 @@ export function StateDiscoveryPanel({
                 size="sm"
                 onClick={() => (compareMode ? exitCompareMode() : setCompareMode(true))}
                 title={compareMode ? "Exit compare mode" : "Compare two states side-by-side"}
-                data-ui-id="state-discovery-compare-toggle"
               >
                 <GitCompare className="w-4 h-4 mr-1.5" />
                 {compareMode ? "Exit Compare" : "Compare"}
@@ -1472,12 +1471,7 @@ export function StateDiscoveryPanel({
 
           {/* Compare selected button - visible when exactly 2 states selected */}
           {compareMode && selectedStates.length === 2 && (
-            <Button
-              variant="success"
-              size="sm"
-              onClick={openComparisonView}
-              data-ui-id="state-discovery-compare-selected"
-            >
+            <Button variant="success" size="sm" onClick={openComparisonView}>
               Compare Selected ({selectedStates.length})
             </Button>
           )}

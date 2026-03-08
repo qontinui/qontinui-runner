@@ -92,10 +92,7 @@ export function ConfirmDialog({
       <div className="absolute inset-0 bg-black/50" onClick={isLoading ? undefined : onClose} />
 
       {/* Dialog */}
-      <div
-        data-ui-id="dialog-confirm"
-        className="relative bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden"
-      >
+      <div className="relative bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden">
         {/* Header */}
         <div
           className={`flex items-center justify-between px-6 py-4 border-b border-zinc-700 ${styles.headerBg}`}
@@ -105,7 +102,6 @@ export function ConfirmDialog({
             <h3 className={`text-lg font-semibold ${styles.titleColor}`}>{title}</h3>
           </div>
           <button
-            data-ui-id="dialog-confirm-close-btn"
             onClick={onClose}
             disabled={isLoading}
             className="p-1 text-zinc-400 hover:text-zinc-200 transition-colors disabled:opacity-50"
@@ -123,7 +119,6 @@ export function ConfirmDialog({
         {/* Footer */}
         <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-zinc-700 bg-zinc-800/50">
           <button
-            data-ui-id="dialog-confirm-cancel-btn"
             onClick={onClose}
             disabled={isLoading}
             className="px-4 py-2 text-sm font-medium text-zinc-300 hover:text-zinc-100 transition-colors disabled:opacity-50"
@@ -131,7 +126,6 @@ export function ConfirmDialog({
             {cancelText}
           </button>
           <button
-            data-ui-id="dialog-confirm-action-btn"
             onClick={onConfirm}
             disabled={isLoading}
             className={`flex items-center gap-2 px-4 py-2 text-sm font-medium ${styles.buttonBg} ${styles.buttonHover} text-white rounded-md transition-colors disabled:opacity-50`}

@@ -264,12 +264,12 @@ def _extract_valid_selectors(elements: list[dict] | None) -> list[str]:
     for el in elements:
         el_id = el.get("id", "")
         if el_id:
-            selectors.append(f'[data-ui-id="{el_id}"]')
+            selectors.append(f'[data-testid="{el_id}"]')
     return selectors
 
 
 def _extract_valid_ids(elements: list[dict] | None) -> set[str]:
-    """Extract all valid data-ui-id values from elements list."""
+    """Extract all valid element IDs from elements list."""
     if not elements:
         return set()
     ids = set()
@@ -281,17 +281,17 @@ def _extract_valid_ids(elements: list[dict] | None) -> set[str]:
 
 
 def _validate_test_selectors(test_code: str, valid_ids: set[str]) -> tuple[bool, list[str]]:
-    """Validate that test code only uses valid data-ui-id selectors.
+    """Validate that test code only uses valid element ID selectors.
 
     Returns:
         tuple: (is_valid, list of invalid selectors found)
     """
-    # Find all data-ui-id selectors in the test code
-    # Pattern matches [data-ui-id="..."] with various quote styles
-    pattern = r'\[data-ui-id=["\']([^"\']+)["\']\]'
+    # Find all data-testid selectors in the test code
+    # Pattern matches [data-testid="..."] with various quote styles
+    pattern = r'\[data-testid=["\']([^"\']+)["\']\]'
     found_ids = re.findall(pattern, test_code)
 
-    logger.info(f"[SELECTOR VALIDATION] Found {len(found_ids)} data-ui-id selectors in test code")
+    logger.info(f"[SELECTOR VALIDATION] Found {len(found_ids)} data-testid selectors in test code")
     logger.info(f"[SELECTOR VALIDATION] All found IDs: {found_ids}")
 
     invalid_ids = []
@@ -308,8 +308,8 @@ def _validate_test_selectors(test_code: str, valid_ids: set[str]) -> tuple[bool,
 def _format_elements_list(elements: list[dict] | None) -> str:
     """Format a list of elements into a readable string for AI prompt.
 
-    Elements from UI Bridge have data-ui-id attributes, not native id attributes.
-    The selector should be [data-ui-id="..."] not #id.
+    Elements from UI Bridge have registered IDs from the bridge registry.
+    The selector should be [data-testid="..."] or use element ID directly.
     """
     if not elements:
         return "(no elements)"
@@ -327,13 +327,13 @@ def _format_elements_list(elements: list[dict] | None) -> str:
         parts = []
         if el_id:
             # Make the Playwright selector very obvious - this is what the AI MUST use
-            parts.append(f'  - **USE THIS SELECTOR**: `[data-ui-id="{el_id}"]`')
+            parts.append(f'  - **USE THIS SELECTOR**: `[data-testid="{el_id}"]`')
             parts.append(f'    `<{tag_name}>` type="{el_type}"')
             if el_text:
                 parts.append(f'    text="{el_text[:100]}"')
             parts.append(f"    ({visible}, {enabled})")
         else:
-            parts.append(f"  - `<{tag_name}>` (no data-ui-id)")
+            parts.append(f"  - `<{tag_name}>` (no element ID)")
             if el_type:
                 parts.append(f'type="{el_type}"')
             if el_text:
@@ -468,7 +468,7 @@ Create a Python script that uses the UI Bridge HTTP API to automate the browser.
 
 **The script must:**
 - Use the UI Bridge HTTP API on http://localhost:9876 to interact with browser elements
-- Use data-ui-id selectors to identify elements (these are the element IDs in UI Bridge)
+- Use element IDs from the UI Bridge registry to identify elements
 - Use `assertion()` calls instead of Python `assert` statements
 - Include appropriate waits for dynamic content
 - Use descriptive variable names
@@ -482,7 +482,7 @@ The extension must be connected to the runner and have a tab selected for automa
 - POST /extension/command - Send commands to the extension
 
 **Extension Commands:**
-- `{{"action": "getElements", "params": {{}}}}` - Get all elements with data-ui-id
+- `{{"action": "getElements", "params": {{}}}}` - Get all registered elements
 - `{{"action": "executeAction", "params": {{"elementId": "...", "action": "click", "params": {{}}}}}}` - Click element
 - `{{"action": "selectTab", "params": {{"tabId": ...}}}}` - Select a browser tab
 - `{{"action": "listTabs", "params": {{}}}}` - List available browser tabs
@@ -659,7 +659,7 @@ Return a JSON object with exactly these fields:
 - DO NOT use pytest-style function definitions
 - DO use `import requests` and call UI Bridge HTTP API on localhost:9876
 - DO use `assertion(name, passed, message)` instead of Python `assert` statements
-- DO use element IDs from the data-ui-id attributes (these are the UI Bridge element IDs)
+- DO use element IDs from the UI Bridge registry (these are the registered element IDs)
 - The test runs as a standalone script, not under pytest
 
 **Remember:**

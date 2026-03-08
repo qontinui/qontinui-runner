@@ -112,7 +112,6 @@ export function GuiWorkflowPicker({
         type="button"
         onClick={() => setIsOpen(!isOpen)}
         className="w-full flex items-center justify-between px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 hover:border-zinc-600 focus:outline-none focus:ring-2 focus:ring-purple-500/50 transition-colors"
-        data-ui-id="workflow-builder-gui-workflow-picker-toggle-btn"
       >
         <span className={selectedWorkflow ? "text-zinc-200" : "text-zinc-500"}>
           {selectedWorkflow ? selectedWorkflow.name : placeholder}
@@ -147,7 +146,6 @@ export function GuiWorkflowPicker({
                   placeholder="Search workflows..."
                   className="w-full pl-8 pr-3 py-1.5 bg-zinc-700 border border-zinc-600 rounded text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-purple-500/50"
                   autoFocus
-                  data-ui-id="workflow-builder-gui-workflow-picker-search-input"
                 />
               </div>
             </div>
@@ -180,7 +178,6 @@ export function GuiWorkflowPicker({
                           ? "bg-purple-500/10 text-purple-400"
                           : "text-zinc-300"
                       }`}
-                      data-ui-id={`workflow-builder-gui-workflow-picker-item-${workflow.id}`}
                     >
                       <span className="truncate">{workflow.name}</span>
                       {workflow.id === selectedWorkflowId && (

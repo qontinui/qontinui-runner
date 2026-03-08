@@ -101,7 +101,7 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
   const taskRunId = selectedRun?.id || data.task_run_id;
 
   return (
-    <div data-ui-id="recap-tab" className="h-full overflow-y-auto p-4 space-y-4">
+    <div className="h-full overflow-y-auto p-4 space-y-4">
       {/* 1. Compact Status Strip */}
       <CompactStatusStrip
         status={data.status}
@@ -153,32 +153,16 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
 
       {/* 3. Tabbed Content */}
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-        <TabsList data-ui-id="recap-tabs" className="w-full justify-start flex-wrap gap-1">
-          <TabsTrigger data-ui-id="recap-tab-timeline" value="timeline">
-            Timeline
-          </TabsTrigger>
-          <TabsTrigger data-ui-id="recap-tab-verification" value="verification">
-            Verification
-          </TabsTrigger>
-          <TabsTrigger data-ui-id="recap-tab-knowledge" value="knowledge">
-            Knowledge
-          </TabsTrigger>
-          <TabsTrigger data-ui-id="recap-tab-context" value="context">
-            Context
-          </TabsTrigger>
-          <TabsTrigger
-            data-ui-id="recap-tab-canvas"
-            value="canvas"
-            className="flex items-center gap-1.5"
-          >
+        <TabsList className="w-full justify-start flex-wrap gap-1">
+          <TabsTrigger value="timeline">Timeline</TabsTrigger>
+          <TabsTrigger value="verification">Verification</TabsTrigger>
+          <TabsTrigger value="knowledge">Knowledge</TabsTrigger>
+          <TabsTrigger value="context">Context</TabsTrigger>
+          <TabsTrigger value="canvas" className="flex items-center gap-1.5">
             <LayoutDashboard className="w-3.5 h-3.5" />
             Canvas
           </TabsTrigger>
-          <TabsTrigger
-            data-ui-id="recap-tab-errors"
-            value="errors"
-            className="flex items-center gap-1.5"
-          >
+          <TabsTrigger value="errors" className="flex items-center gap-1.5">
             <AlertCircle className="w-3.5 h-3.5" />
             Errors
             {errorBadge.count > 0 && (

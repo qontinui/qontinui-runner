@@ -129,13 +129,9 @@ export function useTerminalManager() {
     [],
   );
 
-  const closeTerminal = useCallback(async (id: string) => {
-    try {
-      await invoke<CommandResponse>("terminal_close", { terminalId: id });
-    } catch {
-      // Terminal may already be gone
-    }
-
+  const closeTerminal = useCallback((id: string) => {
+    // Update React state immediately so the UI is responsive.
+    // The Rust-side close (process kill + thread join) runs in the background.
     setTabs((prev) => {
       const next = prev.filter((t) => t.id !== id);
       setActiveId((currentActive) => {
@@ -144,6 +140,11 @@ export function useTerminalManager() {
         return next[Math.min(closedIndex, next.length - 1)]?.id ?? null;
       });
       return next;
+    });
+
+    // Fire-and-forget: let Rust clean up the PTY in the background
+    invoke<CommandResponse>("terminal_close", { terminalId: id }).catch(() => {
+      // Terminal may already be gone
     });
   }, []);
 

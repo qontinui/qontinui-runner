@@ -161,7 +161,6 @@ export function ProcessStep({
                   isSelected ? "border-primary/50" : ""
                 }`}
                 onClick={() => toggleConfig(config)}
-                data-ui-id={`setup-process-${config.id}`}
               >
                 {isSelected ? (
                   <CheckSquare className="w-4 h-4 text-primary shrink-0" />
@@ -199,12 +198,7 @@ export function ProcessStep({
         <button className="btn-secondary" onClick={onBack}>
           Back
         </button>
-        <button
-          className="btn-primary"
-          onClick={onNext}
-          disabled={loading}
-          data-ui-id="setup-wizard-processes-next"
-        >
+        <button className="btn-primary" onClick={onNext} disabled={loading}>
           {selectedConfigs.length > 0
             ? `Continue with ${selectedConfigs.length} process${selectedConfigs.length !== 1 ? "es" : ""}`
             : "Skip"}

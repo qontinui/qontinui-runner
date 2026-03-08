@@ -223,10 +223,7 @@ export function StateComparisonView({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div
-        data-ui-id="dialog-state-comparison"
-        className="bg-card border border-border rounded-lg shadow-xl w-full max-w-4xl mx-4 max-h-[90vh] flex flex-col"
-      >
+      <div className="bg-card border border-border rounded-lg shadow-xl w-full max-w-4xl mx-4 max-h-[90vh] flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-border flex-shrink-0">
           <div className="flex items-center gap-3">
@@ -240,11 +237,7 @@ export function StateComparisonView({
               </span>
             </Badge>
           </div>
-          <button
-            onClick={onClose}
-            className="p-1 hover:bg-muted rounded-md transition-colors"
-            data-ui-id="state-comparison-close-btn"
-          >
+          <button onClick={onClose} className="p-1 hover:bg-muted rounded-md transition-colors">
             <X className="w-5 h-5" />
           </button>
         </div>
@@ -398,7 +391,7 @@ export function StateComparisonView({
 
         {/* Footer */}
         <div className="flex items-center justify-end gap-2 p-4 border-t border-border flex-shrink-0">
-          <Button variant="outline" size="sm" onClick={onClose} data-ui-id="state-comparison-close">
+          <Button variant="outline" size="sm" onClick={onClose}>
             Close
           </Button>
         </div>

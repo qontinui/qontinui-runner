@@ -115,21 +115,14 @@ export function ExportConfigDialog({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div
-        data-ui-id="dialog-export-config"
-        className="bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[90vh] flex flex-col"
-      >
+      <div className="bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[90vh] flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-border flex-shrink-0">
           <div className="flex items-center gap-2">
             <Download className="w-5 h-5 text-primary" />
             <h2 className="text-lg font-semibold">Export to Automation Config</h2>
           </div>
-          <button
-            onClick={onClose}
-            className="p-1 hover:bg-muted rounded-md transition-colors"
-            data-ui-id="export-config-close-btn"
-          >
+          <button onClick={onClose} className="p-1 hover:bg-muted rounded-md transition-colors">
             <X className="w-5 h-5" />
           </button>
         </div>
@@ -158,7 +151,6 @@ export function ExportConfigDialog({
               className="w-full px-3 py-2 bg-muted/30 border border-border rounded-md text-sm
                        focus:outline-none focus:ring-2 focus:ring-primary/50"
               placeholder="Enter a name for this config..."
-              data-ui-id="export-config-name-input"
             />
           </div>
 
@@ -172,7 +164,6 @@ export function ExportConfigDialog({
                 checked={options.includeGlobalStates}
                 onChange={(e) => updateOption("includeGlobalStates", e.target.checked)}
                 className="w-4 h-4 rounded"
-                data-ui-id="export-config-include-global"
               />
               <span className="text-sm">Include global states (header/footer)</span>
               <Badge variant="info" size="sm">
@@ -186,7 +177,6 @@ export function ExportConfigDialog({
                 checked={options.includeModalStates}
                 onChange={(e) => updateOption("includeModalStates", e.target.checked)}
                 className="w-4 h-4 rounded"
-                data-ui-id="export-config-include-modal"
               />
               <span className="text-sm">Include modal states</span>
               <Badge variant="warning" size="sm">
@@ -200,7 +190,6 @@ export function ExportConfigDialog({
                 checked={options.includeElementDetails}
                 onChange={(e) => updateOption("includeElementDetails", e.target.checked)}
                 className="w-4 h-4 rounded"
-                data-ui-id="export-config-include-elements"
               />
               <span className="text-sm">Include element details (fingerprints)</span>
             </label>
@@ -215,18 +204,13 @@ export function ExportConfigDialog({
                 selected)
               </label>
               <div className="flex gap-2">
-                <button
-                  onClick={selectAllStates}
-                  className="text-xs text-primary hover:underline"
-                  data-ui-id="export-config-select-all"
-                >
+                <button onClick={selectAllStates} className="text-xs text-primary hover:underline">
                   Select All
                 </button>
                 <span className="text-muted-foreground">|</span>
                 <button
                   onClick={deselectAllStates}
                   className="text-xs text-primary hover:underline"
-                  data-ui-id="export-config-select-none"
                 >
                   Select None
                 </button>
@@ -285,7 +269,6 @@ export function ExportConfigDialog({
             <button
               onClick={() => setShowPreview(!showPreview)}
               className="w-full flex items-center gap-2 p-3 hover:bg-muted/30 transition-colors text-left"
-              data-ui-id="export-config-toggle-preview"
             >
               {showPreview ? (
                 <ChevronDown className="w-4 h-4 text-muted-foreground" />
@@ -345,12 +328,7 @@ export function ExportConfigDialog({
             Export format: Qontinui Automation Config v1.0
           </div>
           <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={onClose}
-              data-ui-id="export-config-cancel-btn"
-            >
+            <Button variant="outline" size="sm" onClick={onClose}>
               Cancel
             </Button>
             <Button
@@ -358,7 +336,6 @@ export function ExportConfigDialog({
               size="sm"
               onClick={handleCopy}
               disabled={exportConfig.states.length === 0}
-              data-ui-id="export-config-copy-btn"
             >
               {copied ? (
                 <>
@@ -377,7 +354,6 @@ export function ExportConfigDialog({
               size="sm"
               onClick={handleDownload}
               disabled={exportConfig.states.length === 0}
-              data-ui-id="export-config-download-btn"
             >
               <Download className="w-4 h-4 mr-1.5" />
               Download

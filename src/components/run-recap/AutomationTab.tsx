@@ -50,38 +50,33 @@ export function AutomationTab({ taskRunId: _taskRunId, stats }: AutomationTabPro
   return (
     <div className="space-y-4">
       {/* Actions Summary */}
-      <div data-ui-id="recap-actions-summary" className="card p-4">
+      <div className="card p-4">
         <div className="flex items-center justify-between mb-4">
           <h3 className="font-medium flex items-center gap-2">
             <Activity className="w-5 h-5 text-primary" />
             Actions Summary
           </h3>
-          <span data-ui-id="recap-actions-total" className="text-sm text-muted-foreground">
-            {total} total actions
-          </span>
+          <span className="text-sm text-muted-foreground">{total} total actions</span>
         </div>
 
         {/* Stats row */}
         <div className="flex items-center gap-4 mb-4">
-          <div data-ui-id="recap-actions-success" className="flex items-center gap-2">
+          <div className="flex items-center gap-2">
             <CheckCircle2 className="w-4 h-4 text-green-500" />
             <span className="text-sm">{successful} success</span>
           </div>
-          <div data-ui-id="recap-actions-failed" className="flex items-center gap-2">
+          <div className="flex items-center gap-2">
             <XCircle className="w-4 h-4 text-red-500" />
             <span className="text-sm">{failed} failed</span>
           </div>
-          <div data-ui-id="recap-actions-skipped" className="flex items-center gap-2">
+          <div className="flex items-center gap-2">
             <SkipForward className="w-4 h-4 text-muted-foreground" />
             <span className="text-sm">{skipped} skipped</span>
           </div>
         </div>
 
         {/* Visual Bar Chart */}
-        <div
-          data-ui-id="recap-actions-chart"
-          className="h-4 bg-muted rounded-full overflow-hidden flex"
-        >
+        <div className="h-4 bg-muted rounded-full overflow-hidden flex">
           {total > 0 ? (
             <>
               <div
@@ -108,7 +103,7 @@ export function AutomationTab({ taskRunId: _taskRunId, stats }: AutomationTabPro
       {/* States & Transitions Row */}
       <div className="grid grid-cols-2 gap-4">
         {/* States Visited */}
-        <div data-ui-id="recap-states-visited" className="card p-4">
+        <div className="card p-4">
           <h3 className="font-medium flex items-center gap-2 mb-3">
             <Layers className="w-5 h-5 text-blue-500" />
             States Visited
@@ -119,7 +114,7 @@ export function AutomationTab({ taskRunId: _taskRunId, stats }: AutomationTabPro
         </div>
 
         {/* Transitions */}
-        <div data-ui-id="recap-transitions" className="card p-4">
+        <div className="card p-4">
           <h3 className="font-medium flex items-center gap-2 mb-3">
             <ArrowRight className="w-5 h-5 text-purple-500" />
             Transitions
@@ -131,7 +126,7 @@ export function AutomationTab({ taskRunId: _taskRunId, stats }: AutomationTabPro
       </div>
 
       {/* Template Matching */}
-      <div data-ui-id="recap-template-matches" className="card p-4">
+      <div className="card p-4">
         <h3 className="font-medium flex items-center gap-2 mb-3">
           <Eye className="w-5 h-5 text-amber-500" />
           Template Matching
@@ -142,7 +137,7 @@ export function AutomationTab({ taskRunId: _taskRunId, stats }: AutomationTabPro
       </div>
 
       {/* Screenshots Gallery */}
-      <div data-ui-id="recap-screenshots-gallery" className="card p-4">
+      <div className="card p-4">
         <h3 className="font-medium flex items-center gap-2 mb-3">
           <Image className="w-5 h-5 text-teal-500" />
           Annotated Screenshots

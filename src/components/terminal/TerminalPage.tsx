@@ -1,9 +1,9 @@
-import { useEffect, useCallback, useRef, useState, createRef } from "react";
+import { useEffect, useCallback, useRef, useState, useMemo, createRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { type TerminalInstanceHandle } from "./TerminalInstance";
 import { TerminalTabBar } from "./TerminalTabBar";
-import { TerminalActionBar } from "./TerminalActionBar";
+
 import { TerminalNotification } from "./TerminalNotification";
 import { TranscriptSessionSidebar } from "./TranscriptSessionSidebar";
 import { TranscriptContentPanel } from "./TranscriptContentPanel";
@@ -74,15 +74,23 @@ export function TerminalPage({
   } = useTerminalManager();
 
   // ── Zone layout ─────────────────────────────────────────────────────────────
-  const tabIds = tabs.map((t) => t.id);
+  // Memoize tabIds to prevent useZoneLayout's auto-assign effect from running
+  // every render (tabs.map creates a new array reference each time).
+  const tabIds = useMemo(() => tabs.map((t) => t.id), [tabs]);
   const zoneLayout = useZoneLayout(tabIds);
 
-  // Sync zone focus → activeId so existing handlers (analysis, findings) work
+  // Sync zone focus → activeId so existing handlers (analysis, findings) work.
+  // Guard: only set activeId to a tab that actually exists in tabs (prevents
+  // setting activeId to a dead tab during the close cascade).
   useEffect(() => {
-    if (zoneLayout.focusedTabId && zoneLayout.focusedTabId !== activeId) {
+    if (
+      zoneLayout.focusedTabId &&
+      zoneLayout.focusedTabId !== activeId &&
+      tabs.some((t) => t.id === zoneLayout.focusedTabId)
+    ) {
       setActiveId(zoneLayout.focusedTabId);
     }
-  }, [zoneLayout.focusedTabId, activeId, setActiveId]);
+  }, [zoneLayout.focusedTabId, activeId, setActiveId, tabs]);
 
   // Report session count changes to parent for sidebar auto-collapse
   useEffect(() => {
@@ -111,10 +119,19 @@ export function TerminalPage({
   const stateTracking = useSessionStateTracking({
     tabs,
     processOutput: (tabId, text) => processOutputRef.current?.(tabId, text),
+    getBufferLines: (tabId, maxLines) => {
+      const ref = terminalRefs.current.get(tabId);
+      const scrollback = ref?.current?.getScrollback?.(maxLines) ?? "";
+      if (!scrollback) return [];
+      return scrollback
+        .split("\n")
+        .filter((l) => l.trim().length > 0)
+        .slice(-maxLines);
+    },
   });
 
   // ── Unread tracking ───────────────────────────────────────────────────────
-  const { unreadZones } = useUnreadTracking(
+  const { unreadZones: _unreadZones } = useUnreadTracking(
     zoneLayout.focusedZone,
     zoneLayout.assignments,
     stateTracking.lastOutputLines,
@@ -279,7 +296,7 @@ export function TerminalPage({
   const needsInputCount = Object.values(stateTracking.sessionStates).filter(
     (s) => s === "needs-input",
   ).length;
-  const workingCount = Object.values(stateTracking.sessionStates).filter(
+  const _workingCount = Object.values(stateTracking.sessionStates).filter(
     (s) => s === "working",
   ).length;
   const errorCount = Object.values(stateTracking.sessionStates).filter((s) => s === "error").length;
@@ -291,7 +308,7 @@ export function TerminalPage({
   // ══════════════════════════════════════════════════════════════════════════════
 
   const [viewMode, setViewMode] = useState<ViewMode>("auto");
-  const [statusBarCollapsed, setStatusBarCollapsed] = useState(false);
+
   const [showShortcutsOverlay, setShowShortcutsOverlay] = useState(false);
   const [showCommandPalette, setShowCommandPalette] = useState(false);
   const [showTimeline, setShowTimeline] = useState(false);
@@ -623,7 +640,12 @@ export function TerminalPage({
     [zoneLayout.isMultiZone, zoneLayout.toggleMaximize],
   );
 
-  // Create terminal and auto-assign to first empty zone
+  // Create terminal and auto-assign to first empty zone.
+  // When all zones are full, upgrade the layout to one with more zones
+  // (regardless of the autoLayout toggle — otherwise the tab is invisible).
+  // The auto-assign effect in useZoneLayout handles placing unassigned tabs
+  // into empty zones after the layout change, so we don't need
+  // requestAnimationFrame with stale closure values.
   const createAndAssignTerminal = useCallback(
     async (title?: string, workingDir?: string) => {
       incrementMetric("sessionsCreated");
@@ -631,38 +653,36 @@ export function TerminalPage({
       if (!tabId) return tabId;
 
       const totalTabs = tabs.length + 1;
-      if (autoLayout && zoneLayout.layoutId === "single" && totalTabs >= 2) {
-        let targetLayout = "split";
+      const currentZoneCount = zoneLayout.layout.zones.length;
+
+      // Check if there's a free zone in the current layout
+      const hasEmptyZone = zoneLayout.layout.zones.some((_, idx) => !zoneLayout.assignments[idx]);
+
+      // Upgrade layout if no room for the new tab
+      if (totalTabs > currentZoneCount || (!hasEmptyZone && totalTabs > 1)) {
+        let targetLayout: string;
         if (totalTabs >= 7) targetLayout = "full-grid";
         else if (totalTabs >= 5) targetLayout = "six-pack";
         else if (totalTabs >= 3) targetLayout = "quad";
-        zoneLayout.setLayoutId(targetLayout);
+        else targetLayout = "split";
+        // Only upgrade, never downgrade
+        if (targetLayout !== zoneLayout.layoutId) {
+          zoneLayout.setLayoutId(targetLayout);
+        }
       }
 
-      if (zoneLayout.isMultiZone || (autoLayout && totalTabs >= 2)) {
-        requestAnimationFrame(() => {
-          const emptyZone = zoneLayout.layout.zones.findIndex(
-            (_, idx) => !zoneLayout.assignments[idx],
-          );
-          if (emptyZone >= 0) {
-            zoneLayout.assignTabToZone(emptyZone, tabId);
-            zoneLayout.setFocusedZone(emptyZone);
-          }
-        });
-      }
+      // The auto-assign effect in useZoneLayout will place the new tab
+      // into an empty zone when it detects an unassigned tab.
       return tabId;
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- granular deps on specific properties
     [
       createTerminal,
       zoneLayout.layoutId,
-      zoneLayout.isMultiZone,
       zoneLayout.setLayoutId,
       zoneLayout.layout,
-      zoneLayout.assignTabToZone,
-      zoneLayout.setFocusedZone,
+      zoneLayout.assignments,
       tabs.length,
-      autoLayout,
       incrementMetric,
     ],
   );
@@ -1169,16 +1189,14 @@ export function TerminalPage({
             />
           </div>
         }
-        statusSummary={
-          zoneLayout.isMultiZone
-            ? {
-                needsInput: needsInputCount,
-                working: workingCount,
-                errors: errorCount,
-                unseen: transitionEffects.unseenNeedsInput.size,
-              }
-            : undefined
-        }
+        assignments={zoneLayout.isMultiZone ? zoneLayout.assignments : undefined}
+        activityData={stateTracking.activityData}
+        stateDurations={stateTracking.stateDurations}
+        lastOutputLines={stateTracking.lastOutputLines}
+        unreadTabs={transitionEffects.unseenNeedsInput}
+        staleTabs={stateTracking.staleTabs}
+        zoneLabels={labelsAndTags.zoneLabels}
+        labelColorMap={labelsAndTags.labelColorMap}
         onQuickLaunch={async (count, autoCommand) => {
           const layoutMap: Record<number, string> = {
             2: "split",
@@ -1202,7 +1220,65 @@ export function TerminalPage({
           }
         }}
       />
-      <TerminalActionBar
+      <ZoneStatusBar
+        tabs={tabs}
+        assignments={zoneLayout.assignments}
+        sessionStates={stateTracking.sessionStates}
+        onJumpToNeedsInput={() => zoneLayout.focusNextNeedsInput(stateTracking.sessionStates)}
+        onShowShortcuts={() => setShowShortcutsOverlay(true)}
+        autoFocus={transitionEffects.autoFocusNeedsInput}
+        onToggleAutoFocus={transitionEffects.toggleAutoFocus}
+        soundEnabled={transitionEffects.soundEnabled}
+        onToggleSound={transitionEffects.toggleSound}
+        desktopNotify={transitionEffects.desktopNotify}
+        onToggleDesktopNotify={() => {
+          transitionEffects.setDesktopNotify((prev) => {
+            const next = !prev;
+            localStorage.setItem("zone-desktop-notify", String(next));
+            return next;
+          });
+        }}
+        stateDurations={stateTracking.stateDurations}
+        onSelectByState={(state) => {
+          const zones = new Set<number>();
+          for (const [zoneStr, tabId] of Object.entries(zoneLayout.assignments)) {
+            if ((stateTracking.sessionStates[tabId] ?? "idle") === state) {
+              zones.add(Number(zoneStr));
+            }
+          }
+          setSelectedZones(zones);
+        }}
+        metrics={metrics.current}
+        zoneLabels={labelsAndTags.zoneLabels}
+        onExport={handleExportOutput}
+        onSortZones={handleSortZones}
+        eventHistory={eventHistory}
+        labelColorMap={labelsAndTags.labelColorMap}
+        focusMode={focusMode}
+        autoApprovePatterns={transitionEffects.autoApprovePatterns}
+        onSetAutoApprovePatterns={transitionEffects.setAutoApprovePatterns}
+        autoApproveCount={transitionEffects.autoApproveCount}
+        stateTimeAccum={stateTracking.stateTimeAccum.current}
+        autoRestart={transitionEffects.autoRestart}
+        onToggleAutoRestart={() => {
+          transitionEffects.setAutoRestart((prev) => {
+            const next = !prev;
+            localStorage.setItem("zone-auto-restart", String(next));
+            return next;
+          });
+        }}
+        autoRestartCount={transitionEffects.autoRestartCount}
+        onToggleFocusMode={() => {
+          setFocusMode((prev) => {
+            const next = !prev;
+            localStorage.setItem("zone-focus-mode", String(next));
+            return next;
+          });
+        }}
+        activeTagFilters={labelsAndTags.activeTagFilters}
+        onSetActiveTagFilters={labelsAndTags.setActiveTagFilters}
+        allTags={labelsAndTags.allTags}
+        lastOutputLines={stateTracking.lastOutputLines}
         showSidebar={workflowGen.showSidebar}
         onToggleSidebar={() => workflowGen.setShowSidebar((v) => !v)}
         isGenerating={workflowGen.isGenerating}
@@ -1222,84 +1298,6 @@ export function TerminalPage({
         type={workflowGen.notification?.type ?? "success"}
         onDismiss={() => workflowGen.setNotification(null)}
       />
-
-      {/* Status bar (multi-zone only) */}
-      {zoneLayout.isMultiZone && (
-        <ZoneStatusBar
-          tabs={tabs}
-          assignments={zoneLayout.assignments}
-          sessionStates={stateTracking.sessionStates}
-          focusedZone={zoneLayout.focusedZone}
-          collapsed={statusBarCollapsed}
-          onToggleCollapsed={() => setStatusBarCollapsed((v) => !v)}
-          onJumpToNeedsInput={() => zoneLayout.focusNextNeedsInput(stateTracking.sessionStates)}
-          onFocusZone={zoneLayout.setFocusedZone}
-          onShowShortcuts={() => setShowShortcutsOverlay(true)}
-          autoFocus={transitionEffects.autoFocusNeedsInput}
-          onToggleAutoFocus={transitionEffects.toggleAutoFocus}
-          soundEnabled={transitionEffects.soundEnabled}
-          onToggleSound={transitionEffects.toggleSound}
-          desktopNotify={transitionEffects.desktopNotify}
-          onToggleDesktopNotify={() => {
-            transitionEffects.setDesktopNotify((prev) => {
-              const next = !prev;
-              localStorage.setItem("zone-desktop-notify", String(next));
-              return next;
-            });
-          }}
-          stateDurations={stateTracking.stateDurations}
-          onSelectByState={(state) => {
-            const zones = new Set<number>();
-            for (const [zoneStr, tabId] of Object.entries(zoneLayout.assignments)) {
-              if ((stateTracking.sessionStates[tabId] ?? "idle") === state) {
-                zones.add(Number(zoneStr));
-              }
-            }
-            setSelectedZones(zones);
-          }}
-          pinnedZones={labelsAndTags.pinnedZones}
-          staleTabs={stateTracking.staleTabs}
-          metrics={metrics.current}
-          zoneLabels={labelsAndTags.zoneLabels}
-          onSetZoneLabel={(z, label) => labelsAndTags.setZoneLabel(z, label)}
-          flashingTabs={transitionEffects.flashingTabs}
-          onExport={handleExportOutput}
-          onSortZones={handleSortZones}
-          eventHistory={eventHistory}
-          labelColorMap={labelsAndTags.labelColorMap}
-          focusMode={focusMode}
-          autoApprovePatterns={transitionEffects.autoApprovePatterns}
-          onSetAutoApprovePatterns={transitionEffects.setAutoApprovePatterns}
-          autoApproveCount={transitionEffects.autoApproveCount}
-          stateTimeAccum={stateTracking.stateTimeAccum.current}
-          autoRestart={transitionEffects.autoRestart}
-          onToggleAutoRestart={() => {
-            transitionEffects.setAutoRestart((prev) => {
-              const next = !prev;
-              localStorage.setItem("zone-auto-restart", String(next));
-              return next;
-            });
-          }}
-          autoRestartCount={transitionEffects.autoRestartCount}
-          onToggleFocusMode={() => {
-            setFocusMode((prev) => {
-              const next = !prev;
-              localStorage.setItem("zone-focus-mode", String(next));
-              return next;
-            });
-          }}
-          activeTagFilters={labelsAndTags.activeTagFilters}
-          onSetActiveTagFilters={labelsAndTags.setActiveTagFilters}
-          allTags={labelsAndTags.allTags}
-          activityData={stateTracking.activityData}
-          sessionStartTimes={stateTracking.stateEntryTimeRef.current}
-          lastOutputLines={stateTracking.lastOutputLines}
-          unreadTabs={unreadZones}
-          onApproveTab={approveTab}
-          onRestartZone={handleRestartInZone}
-          onTogglePin={labelsAndTags.togglePin}
-        />
-      )}
 
       {/* Zone timeline (multi-zone only) */}
       {showTimeline && zoneLayout.isMultiZone && (

@@ -293,12 +293,8 @@ You do NOT implement anything. You only define what "done" looks like.
             let severity = issue.severity.as_str();
             let hint = issue.verification_hint.as_deref().unwrap_or("(no hint)");
             prompt.push_str(&format!(
-                "- **{}** [{}]: {}\n  Detection: {}\n  Hint: {}\n\n",
-                issue.title,
-                severity,
-                issue.description,
-                issue.detection_method.as_str(),
-                hint,
+                "- **{}** [{}]: {}\n  Hint: {}\n\n",
+                issue.title, severity, issue.description, hint,
             ));
         }
     }
@@ -319,7 +315,7 @@ Produce 3–8 structured criteria. Each criterion must have:
 - `description`: one-sentence description of the success condition
 - `method`: how to verify it — one of "command", "ui_bridge", "test", "manual"
 - `priority`: one of "critical", "important", "optional"
-- `verification_hint`: a concrete suggestion for how to check it (e.g., "Run `npx tsc --noEmit`", "Assert element with data-ui-id='save-btn' is visible")
+- `verification_hint`: a concrete suggestion for how to check it (e.g., "Run `npx tsc --noEmit`", "Assert element with id 'button-save' is visible via UI Bridge")
 - `category`: grouping label (e.g., "compilation", "ui-content", "behavior", "data-integrity", "style")
 
 Also provide:
@@ -496,9 +492,8 @@ mod tests {
                     description: "Dark mode toggle button is visible on settings page".to_string(),
                     method: VerificationMethod::UiBridge,
                     priority: CriterionPriority::Critical,
-                    verification_hint:
-                        "Assert element with data-ui-id='settings-dark-mode-toggle' exists"
-                            .to_string(),
+                    verification_hint: "Assert element 'toggle-dark-mode' exists via UI Bridge"
+                        .to_string(),
                     category: "ui-content".to_string(),
                 },
                 AcceptanceCriterion {

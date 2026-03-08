@@ -97,10 +97,7 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
       />
 
       {/* Authentication Credentials */}
-      <div
-        className="space-y-4 rounded-lg bg-card/50 p-4"
-        data-ui-id="settings-playwright-auth-section"
-      >
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
         <h4 className="font-medium text-sm">Test Authentication</h4>
         <p className="text-xs text-muted-foreground">
           These credentials are passed to Playwright tests as environment variables
@@ -121,7 +118,6 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
               onChange={(e) => updateSetting("test_username", e.target.value || null)}
               placeholder="user@example.com"
               className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
-              data-ui-id="settings-playwright-username-input"
             />
           </div>
 
@@ -138,13 +134,11 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
                 onChange={(e) => updateSetting("test_password", e.target.value || null)}
                 placeholder="Enter password"
                 className="w-full px-2.5 py-1.5 pr-10 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
-                data-ui-id="settings-playwright-password-input"
               />
               <button
                 type="button"
                 onClick={() => setShowPassword(!showPassword)}
                 className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground"
-                data-ui-id="settings-playwright-toggle-password-btn"
               >
                 {showPassword ? (
                   <EyeOff className="w-3.5 h-3.5" />
@@ -158,10 +152,7 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
       </div>
 
       {/* Environment Configuration */}
-      <div
-        className="space-y-4 rounded-lg bg-card/50 p-4"
-        data-ui-id="settings-playwright-environment-section"
-      >
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
         <h4 className="font-medium text-sm">Environment</h4>
 
         {/* Base URL */}
@@ -176,7 +167,6 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
             onChange={(e) => updateSetting("base_url", e.target.value || null)}
             placeholder="http://localhost:3001"
             className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
-            data-ui-id="settings-playwright-base-url-input"
           />
           <p className="text-[10px] text-muted-foreground">
             Passed as PLAYWRIGHT_BASE_URL. Leave empty to use the default from playwright.config.ts
@@ -197,7 +187,6 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
               className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
                 settings.skip_web_server ? "bg-primary" : "bg-muted"
               }`}
-              data-ui-id="settings-playwright-skip-webserver-toggle"
             >
               <span
                 className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
@@ -219,7 +208,6 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
               ? "bg-primary text-primary-foreground hover:bg-primary/90"
               : "bg-muted text-muted-foreground cursor-not-allowed"
           }`}
-          data-ui-id="settings-playwright-save-btn"
         >
           {isSaving ? "Saving..." : "Save Settings"}
         </button>

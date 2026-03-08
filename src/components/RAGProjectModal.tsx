@@ -43,7 +43,6 @@ export function RAGProjectModal({ isOpen, onClose, onLog }: RAGProjectModalProps
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/50 backdrop-blur-sm z-40" />
         <Dialog.Content
-          data-ui-id="dialog-rag-project"
           className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-card border border-border rounded-xl shadow-2xl z-40 max-h-[70vh] w-[90vw] max-w-2xl overflow-hidden flex flex-col"
           aria-describedby="rag-modal-description"
         >
@@ -62,7 +61,6 @@ export function RAGProjectModal({ isOpen, onClose, onLog }: RAGProjectModalProps
             </div>
             <Dialog.Close asChild>
               <button
-                data-ui-id="dialog-rag-project-close-btn"
                 className="p-2 hover:bg-accent/20 rounded-lg transition-colors"
                 aria-label="Close"
                 disabled={loading}
@@ -80,11 +78,7 @@ export function RAGProjectModal({ isOpen, onClose, onLog }: RAGProjectModalProps
           {/* Footer */}
           <div className="border-t border-border p-4 flex justify-end gap-3">
             <Dialog.Close asChild>
-              <button
-                data-ui-id="dialog-rag-project-cancel-btn"
-                className="btn-secondary"
-                disabled={loading}
-              >
+              <button className="btn-secondary" disabled={loading}>
                 Cancel
               </button>
             </Dialog.Close>

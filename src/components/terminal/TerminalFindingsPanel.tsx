@@ -77,10 +77,7 @@ export function TerminalFindingsPanel({
   }, [selected, responseText, onRespond]);
 
   return (
-    <div
-      className="w-[460px] h-full shrink-0 flex flex-col bg-[#13141f] border-l border-[#2a2d3d]"
-      data-ui-id="terminal-findings-panel"
-    >
+    <div className="w-[460px] h-full shrink-0 flex flex-col bg-[#13141f] border-l border-[#2a2d3d]">
       {/* Header */}
       <div className="flex items-center gap-2 px-3 py-2.5 border-b border-[#2a2d3d] bg-[#0d0e1a] shrink-0">
         <AlertCircle className="w-4 h-4 text-[#bb9af7]" />

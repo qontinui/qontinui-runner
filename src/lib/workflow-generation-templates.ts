@@ -396,7 +396,7 @@ Pick one (or describe your own):
 4. Ensure all original content and functionality is preserved if redesigning
 5. Run sdk_design_evaluate to verify design quality scores
 6. Iterate on any metrics scoring below 70
-7. Add data-ui-id attributes and UI Bridge instrumentation to new elements`,
+7. Verify UI Bridge auto-registration discovers new interactive elements`,
     advancedDefaults: {
       discoveryMode: "enabled",
       category: "design",
@@ -409,7 +409,7 @@ Pick one (or describe your own):
     name: "Add UI Bridge SDK",
     icon: "Plug",
     description:
-      "Instrument a React project with UI Bridge SDK — provider, hooks, data-ui-id attributes, and spec files",
+      "Instrument a React project with UI Bridge SDK — provider, AutoRegisterProvider, and spec files",
     content: `Instrument an existing React project with the UI Bridge SDK so it can be discovered, inspected, and verified by Qontinui workflows.
 
 ## Project
@@ -424,20 +424,19 @@ Pick one (or describe your own):
 ## Instructions
 1. Install the UI Bridge SDK package: \`npm install @anthropic/ui-bridge\` (or check if already installed)
 2. Wrap the root layout with \`<UIBridgeProvider>\` — find the top-level layout file and add the provider
-3. For each page/route listed above:
-   a. Add \`data-ui-id\` attributes to all interactive and semantically meaningful elements following the naming convention: \`{feature}-{component}-{element}\` with suffixes like \`-btn\`, \`-input\`, \`-link\`
-   b. Register key interactive elements (buttons, inputs, links, toggles) with the \`useUIElement\` hook
-   c. Register component-level actions with \`useUIComponent\` for forms and complex components
-   d. Register important UI states (loading, error, empty) with \`useUIState\`
-   e. Create a \`.spec.uibridge.json\` file alongside the page with grouped assertions:
+3. Wrap the app with \`<AutoRegisterProvider>\` inside the UIBridgeProvider — this automatically discovers and registers all interactive elements with stable semantic IDs
+4. For each page/route listed above:
+   a. Register component-level actions with \`useUIComponent\` for forms and complex components (optional, for advanced actions)
+   b. Register important UI states (loading, error, empty) with \`useUIState\` (optional)
+   c. Create a \`.spec.uibridge.json\` file alongside the page with grouped assertions:
       - An \`element-presence\` group verifying core layout elements exist
       - A \`state-consistency\` group verifying interactive element states (enabled/disabled, initial values)
       - A \`semantic\` group describing the page's purpose and key capabilities
       - Use diverse assertion types: exists, enabled, disabled, hasText, containsText, hasValue — not just exists
       - Use conditions for state-dependent assertions
       - Use graduated severity: critical for core, warning for important, info for nice-to-have
-4. Verify the instrumented app starts without errors and the UI Bridge endpoints respond
-5. Connect via UI Bridge and confirm elements are discoverable
+5. Verify the instrumented app starts without errors and the UI Bridge endpoints respond
+6. Connect via UI Bridge and confirm elements are discoverable
 
 ## Spec File Format
 Each spec file should follow this structure:

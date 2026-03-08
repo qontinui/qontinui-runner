@@ -489,7 +489,7 @@ function HighlightedText({ text, query }: { text: string; query?: string }) {
 }
 
 /** Check if a line looks like an error/failure message */
-function isErrorLine(line: string): boolean {
+function _isErrorLine(line: string): boolean {
   const lower = line.toLowerCase();
   return /\b(error|failed|failure|exception|panic|fatal|critical|traceback|segfault)\b/.test(lower);
 }
@@ -1151,25 +1151,6 @@ function CompactZoneCard({
         </div>
       )}
 
-      {/* Output tail preview — last 2 lines */}
-      {lastLines.length > 0 && (
-        <div className="px-2 pb-1 mt-auto">
-          {lastLines.slice(-2).map((line, i) => {
-            const errorLine = line ? isErrorLine(line) : false;
-            return (
-              <div
-                key={i}
-                className={`text-[9px] font-mono truncate leading-tight ${
-                  errorLine ? "text-[#f7768e]" : "text-[#565f89]"
-                }`}
-              >
-                {line ? <HighlightedText text={line} query={searchQuery} /> : "\u00A0"}
-              </div>
-            );
-          })}
-        </div>
-      )}
-
       {/* Activity progress bar for working sessions */}
       {state === "working" &&
         (() => {
@@ -1707,8 +1688,9 @@ export function ZoneGrid({
 
   const isMultiZone = layout.zones.length > 1;
   const showLabels = isMultiZone;
-  // Auto-compact: when 4+ zones and viewMode is "auto", non-focused zones show compact
-  const autoCompact = viewMode === "auto" && layout.zones.length >= 4;
+  // Auto-compact disabled: all zones show full xterm terminals in "auto" mode.
+  // Users can opt into compact mode with Ctrl+Shift+M (viewMode → "compact").
+  const autoCompact = false;
   const forceCompact = viewMode === "compact";
 
   // In single layout or maximized mode, render just one zone full-size
@@ -1984,9 +1966,9 @@ export function ZoneGrid({
             )}
 
             {tab ? (
-              useCompact ? (
-                <>
-                  {/* Compact card view */}
+              <>
+                {/* Compact card overlay - shown when in compact mode */}
+                {useCompact && (
                   <CompactZoneCard
                     tab={tab}
                     state={state}
@@ -2026,147 +2008,133 @@ export function ZoneGrid({
                     onAssignTab={onAssignTab}
                     tagColor={firstTagColor}
                   />
-                  {/* Keep terminal instance alive but hidden */}
-                  <div className="hidden">
-                    <TerminalInstance
-                      ref={terminalRefs.get(tab.id)}
-                      terminalId={tab.id}
-                      visible={false}
-                      isReconnecting={tab.isReconnecting}
-                      onReconnected={() => onReconnected(tab.id)}
-                      onExit={(code) => onExit(tab.id, code)}
-                      onFirstInput={(input) => onFirstInput(tab.id, input)}
-                      onShellIntegration={(event) => onShellIntegration(tab.id, event)}
-                      onOutput={(text) => onOutput(tab.id, text)}
-                    />
-                  </div>
-                </>
-              ) : (
-                <>
-                  {/* Full terminal view */}
-                  {showLabels && (
-                    <ZoneLabel
-                      tab={tab}
-                      state={state}
-                      zoneIndex={zoneIdx}
-                      allTabs={tabs}
-                      assignments={assignments}
-                      sessionStates={sessionStates}
-                      onAssignTab={onAssignTab}
-                      isPinned={isPinned}
-                      onTogglePin={onTogglePin ? () => onTogglePin(zoneIdx) : undefined}
-                      zoneLabel={zoneLabels?.[zoneIdx]}
-                      onSetZoneLabel={
-                        onSetZoneLabel ? (label) => onSetZoneLabel(zoneIdx, label) : undefined
-                      }
-                      onScrollToBottom={() => {
-                        const ref = terminalRefs.get(tab.id);
-                        ref?.current?.scrollToBottom();
-                      }}
-                      outputLineCount={(lastOutputLines[tab.id] ?? []).length}
-                      outputByteSize={(lastOutputLines[tab.id] ?? []).reduce(
-                        (sum, l) => sum + l.length,
-                        0,
-                      )}
-                      onToggleFilter={() =>
-                        setShowFilterInput((prev) => (prev === zoneIdx ? null : zoneIdx))
-                      }
-                      filterActive={!!zoneFilters[zoneIdx]}
-                    />
-                  )}
-                  {/* Per-zone filter input bar */}
-                  {showFilterInput === zoneIdx && (
-                    <div
-                      className="absolute left-0 right-0 flex items-center gap-2 px-2 py-1 bg-[#1a1b26] border-b border-[#2a2d3d] z-10"
-                      style={{ top: showLabels ? "20px" : "0px" }}
-                    >
-                      <Filter className="w-3 h-3 text-[#565f89]" />
-                      <input
-                        autoFocus
-                        value={zoneFilters[zoneIdx] ?? ""}
-                        onChange={(e) =>
-                          setZoneFilters((prev) => ({ ...prev, [zoneIdx]: e.target.value }))
-                        }
-                        onKeyDown={(e) => {
-                          e.stopPropagation();
-                          if (e.key === "Escape") {
-                            setShowFilterInput(null);
-                          }
-                        }}
-                        onMouseDown={(e) => e.stopPropagation()}
-                        onClick={(e) => e.stopPropagation()}
-                        placeholder="Filter output..."
-                        className="flex-1 bg-transparent text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-none font-mono"
-                      />
-                      {zoneFilters[zoneIdx] && (
-                        <>
-                          <span className="text-[9px] text-[#e0af68] font-mono">
-                            {countMatches(lastOutputLines[tab.id] ?? [], zoneFilters[zoneIdx])}{" "}
-                            matches
-                          </span>
-                          <button
-                            onClick={() =>
-                              setZoneFilters((prev) => {
-                                const n = { ...prev };
-                                delete n[zoneIdx];
-                                return n;
-                              })
-                            }
-                            onMouseDown={(e) => e.stopPropagation()}
-                            className="text-[9px] text-[#565f89] hover:text-[#f7768e] px-1"
-                          >
-                            Clear
-                          </button>
-                        </>
-                      )}
-                    </div>
-                  )}
-                  {isMultiZone && (
-                    <ZoneQuickActions
-                      zoneIndex={zoneIdx}
-                      isPinned={isPinned}
-                      onTogglePin={onTogglePin ? () => onTogglePin(zoneIdx) : undefined}
-                      onMaximize={() => onZoneDoubleClick(zoneIdx)}
-                      onCopyOutput={() => {
-                        const lines = lastOutputLines[tab.id] ?? [];
-                        navigator.clipboard.writeText(lines.join("\n"));
-                      }}
-                      onScrollToBottom={() => {
-                        const ref = terminalRefs.get(tab.id);
-                        ref?.current?.scrollToBottom();
-                      }}
-                      lastLines={lastOutputLines[tab.id] ?? []}
-                      state={state}
-                      onRestart={onRestartInZone ? () => onRestartInZone(zoneIdx) : undefined}
-                      onExportZone={onExportZone ? (fmt) => onExportZone(zoneIdx, fmt) : undefined}
-                    />
-                  )}
+                )}
+                {/* Full terminal view elements - shown when not compact */}
+                {!useCompact && showLabels && (
+                  <ZoneLabel
+                    tab={tab}
+                    state={state}
+                    zoneIndex={zoneIdx}
+                    allTabs={tabs}
+                    assignments={assignments}
+                    sessionStates={sessionStates}
+                    onAssignTab={onAssignTab}
+                    isPinned={isPinned}
+                    onTogglePin={onTogglePin ? () => onTogglePin(zoneIdx) : undefined}
+                    zoneLabel={zoneLabels?.[zoneIdx]}
+                    onSetZoneLabel={
+                      onSetZoneLabel ? (label) => onSetZoneLabel(zoneIdx, label) : undefined
+                    }
+                    onScrollToBottom={() => {
+                      const ref = terminalRefs.get(tab.id);
+                      ref?.current?.scrollToBottom();
+                    }}
+                    outputLineCount={(lastOutputLines[tab.id] ?? []).length}
+                    outputByteSize={(lastOutputLines[tab.id] ?? []).reduce(
+                      (sum, l) => sum + l.length,
+                      0,
+                    )}
+                    onToggleFilter={() =>
+                      setShowFilterInput((prev) => (prev === zoneIdx ? null : zoneIdx))
+                    }
+                    filterActive={!!zoneFilters[zoneIdx]}
+                  />
+                )}
+                {/* Per-zone filter input bar */}
+                {!useCompact && showFilterInput === zoneIdx && (
                   <div
-                    className="h-full w-full"
-                    style={{
-                      paddingTop: showLabels
+                    className="absolute left-0 right-0 flex items-center gap-2 px-2 py-1 bg-[#1a1b26] border-b border-[#2a2d3d] z-10"
+                    style={{ top: showLabels ? "20px" : "0px" }}
+                  >
+                    <Filter className="w-3 h-3 text-[#565f89]" />
+                    <input
+                      autoFocus
+                      value={zoneFilters[zoneIdx] ?? ""}
+                      onChange={(e) =>
+                        setZoneFilters((prev) => ({ ...prev, [zoneIdx]: e.target.value }))
+                      }
+                      onKeyDown={(e) => {
+                        e.stopPropagation();
+                        if (e.key === "Escape") {
+                          setShowFilterInput(null);
+                        }
+                      }}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={(e) => e.stopPropagation()}
+                      placeholder="Filter output..."
+                      className="flex-1 bg-transparent text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-none font-mono"
+                    />
+                    {zoneFilters[zoneIdx] && (
+                      <>
+                        <span className="text-[9px] text-[#e0af68] font-mono">
+                          {countMatches(lastOutputLines[tab.id] ?? [], zoneFilters[zoneIdx])}{" "}
+                          matches
+                        </span>
+                        <button
+                          onClick={() =>
+                            setZoneFilters((prev) => {
+                              const n = { ...prev };
+                              delete n[zoneIdx];
+                              return n;
+                            })
+                          }
+                          onMouseDown={(e) => e.stopPropagation()}
+                          className="text-[9px] text-[#565f89] hover:text-[#f7768e] px-1"
+                        >
+                          Clear
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
+                {!useCompact && isMultiZone && (
+                  <ZoneQuickActions
+                    zoneIndex={zoneIdx}
+                    isPinned={isPinned}
+                    onTogglePin={onTogglePin ? () => onTogglePin(zoneIdx) : undefined}
+                    onMaximize={() => onZoneDoubleClick(zoneIdx)}
+                    onCopyOutput={() => {
+                      const lines = lastOutputLines[tab.id] ?? [];
+                      navigator.clipboard.writeText(lines.join("\n"));
+                    }}
+                    onScrollToBottom={() => {
+                      const ref = terminalRefs.get(tab.id);
+                      ref?.current?.scrollToBottom();
+                    }}
+                    lastLines={lastOutputLines[tab.id] ?? []}
+                    state={state}
+                    onRestart={onRestartInZone ? () => onRestartInZone(zoneIdx) : undefined}
+                    onExportZone={onExportZone ? (fmt) => onExportZone(zoneIdx, fmt) : undefined}
+                  />
+                )}
+                {/* Terminal instance - always mounted at same tree position to preserve xterm state */}
+                <div
+                  className={`h-full w-full ${useCompact ? "hidden" : ""}`}
+                  style={{
+                    paddingTop: useCompact
+                      ? undefined
+                      : showLabels
                         ? showFilterInput === zoneIdx
                           ? "46px"
                           : "20px"
                         : showFilterInput === zoneIdx
                           ? "26px"
                           : undefined,
-                    }}
-                  >
-                    <TerminalInstance
-                      ref={terminalRefs.get(tab.id)}
-                      terminalId={tab.id}
-                      visible={true}
-                      isReconnecting={tab.isReconnecting}
-                      onReconnected={() => onReconnected(tab.id)}
-                      onExit={(code) => onExit(tab.id, code)}
-                      onFirstInput={(input) => onFirstInput(tab.id, input)}
-                      onShellIntegration={(event) => onShellIntegration(tab.id, event)}
-                      onOutput={(text) => onOutput(tab.id, text)}
-                    />
-                  </div>
-                </>
-              )
+                  }}
+                >
+                  <TerminalInstance
+                    ref={terminalRefs.get(tab.id)}
+                    terminalId={tab.id}
+                    visible={!useCompact}
+                    isReconnecting={tab.isReconnecting}
+                    onReconnected={() => onReconnected(tab.id)}
+                    onExit={(code) => onExit(tab.id, code)}
+                    onFirstInput={(input) => onFirstInput(tab.id, input)}
+                    onShellIntegration={(event) => onShellIntegration(tab.id, event)}
+                    onOutput={(text) => onOutput(tab.id, text)}
+                  />
+                </div>
+              </>
             ) : (
               <div
                 className={`h-full w-full flex flex-col items-center justify-center text-xs gap-2 transition-colors ${

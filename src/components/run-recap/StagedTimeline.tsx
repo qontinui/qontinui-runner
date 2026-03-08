@@ -78,7 +78,6 @@ function StepItem({ step, onClick }: StepItemProps) {
 
   return (
     <div
-      data-ui-id={`recap-staged-step-${step.step_type}`}
       className={`flex items-center gap-3 px-3 py-2 rounded-lg transition-colors ${
         isClickable ? "hover:bg-muted/50 cursor-pointer" : "hover:bg-muted/30"
       }`}
@@ -163,9 +162,8 @@ function StageSection({ stage, onAiStepClick }: StageSectionProps) {
   const colorClasses = COLOR_CLASSES[config?.color] || COLOR_CLASSES.blue;
 
   return (
-    <div data-ui-id={`recap-stage-section-${stage.stage}`} className="card overflow-hidden">
+    <div className="card overflow-hidden">
       <button
-        data-ui-id="recap-stage-toggle-btn"
         onClick={() => setExpanded(!expanded)}
         className="w-full px-4 py-3 flex items-center justify-between hover:bg-muted/50 transition-colors"
       >
@@ -181,7 +179,6 @@ function StageSection({ stage, onAiStepClick }: StageSectionProps) {
           {(stage.stage === "verification" || stage.stage === "agentic") &&
             stage.iteration !== undefined && (
               <span
-                data-ui-id={`recap-iteration-${stage.stage}-${stage.iteration}`}
                 data-content-role="badge"
                 data-content-label={`${stage.display_name} iteration`}
                 className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded"
@@ -287,11 +284,7 @@ export function StagedTimeline({ stages, onAiStepClick }: StagedTimelineProps) {
   }
 
   return (
-    <section
-      data-ui-id="recap-staged-timeline"
-      aria-label="Workflow timeline"
-      className="space-y-3"
-    >
+    <section aria-label="Workflow timeline" className="space-y-3">
       {allStages.map((stage, index) => (
         <StageSection
           key={`${stage.stage}-${stage.iteration ?? index}`}

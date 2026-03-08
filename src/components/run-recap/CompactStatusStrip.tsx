@@ -94,14 +94,11 @@ export function CompactStatusStrip({
   const outputSize = outputLog ? `${Math.round(outputLog.length / 1024)}KB` : null;
 
   return (
-    <div
-      data-ui-id="recap-status-strip"
-      className={`flex items-center gap-2 px-3 py-2 rounded-lg ${statusBg} flex-wrap`}
-    >
+    <div className={`flex items-center gap-2 px-3 py-2 rounded-lg ${statusBg} flex-wrap`}>
       {/* Status */}
       <div className={`flex items-center gap-1.5 text-sm font-medium ${statusText}`}>
         <StatusIcon className={`w-4 h-4 ${isRunning ? "animate-pulse" : ""}`} />
-        <span data-ui-id="recap-status-label">{label}</span>
+        <span>{label}</span>
       </div>
 
       <Separator />

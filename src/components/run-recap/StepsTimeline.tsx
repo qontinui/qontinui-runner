@@ -57,7 +57,7 @@ export function StepsTimeline({ steps, onAiStepClick }: StepsTimelineProps) {
   }
 
   return (
-    <div data-ui-id="recap-steps-timeline" className="card">
+    <div className="card">
       <div className="px-4 py-3 border-b border-border">
         <h3 className="text-sm font-medium">
           Steps ({steps.length}){useVirtualScroll && " - virtualized"}
@@ -76,7 +76,7 @@ export function StepsTimeline({ steps, onAiStepClick }: StepsTimelineProps) {
         </div>
       ) : (
         /* Regular scrolling for small lists */
-        <div data-ui-id="recap-steps-list" className="p-2 space-y-1 max-h-[400px] overflow-y-auto">
+        <div className="p-2 space-y-1 max-h-[400px] overflow-y-auto">
           {steps.map((step, index) => (
             <StepItem
               key={`${step.name}-${index}`}

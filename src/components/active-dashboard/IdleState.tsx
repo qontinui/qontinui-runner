@@ -40,7 +40,6 @@ export function IdleState({
               onClick={onRunLastWorkflow}
               disabled={isRunningLastWorkflow}
               className="bg-green-600 hover:bg-green-700 text-white"
-              data-ui-id="button-run-last-workflow"
             >
               {isRunningLastWorkflow ? (
                 <Loader2 className="mr-2 h-5 w-5 animate-spin" />

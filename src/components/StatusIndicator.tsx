@@ -14,7 +14,6 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import type { BackgroundActivity, ActivityType } from "../hooks/useBackgroundActivities";
 import { getSeverityColors, getAccentColors } from "@/design-system";
-import { ErrorBadge } from "./error-monitor";
 import { DoctorHealthBadge } from "./doctor";
 
 const RUNNER_NAME_STORAGE_KEY = "qontinui-runner-name";
@@ -196,13 +195,6 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
             </span>
           </div>
         )}
-
-        {/* Error Badge - Navigate to Error Monitor on click */}
-        <ErrorBadge
-          onClick={() => {
-            window.dispatchEvent(new CustomEvent("navigate-to-error-monitor"));
-          }}
-        />
 
         {/* Doctor Health Badge - Shows when AI processes appear stuck */}
         <DoctorHealthBadge />

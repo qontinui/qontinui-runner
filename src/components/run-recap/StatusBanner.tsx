@@ -106,19 +106,15 @@ export function StatusBanner({
   const formattedEndTime = formatTime(endTime);
 
   return (
-    <div
-      data-ui-id="recap-status-banner"
-      className={`${bgColor} ${textColor} rounded-lg p-4 space-y-3`}
-    >
+    <div className={`${bgColor} ${textColor} rounded-lg p-4 space-y-3`}>
       {/* Main status row */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           {icon}
-          <span data-ui-id="recap-status-label" data-content-role="status" className="font-medium">
+          <span data-content-role="status" className="font-medium">
             {label}
           </span>
           <span
-            data-ui-id="recap-goal-indicator"
             data-content-role="status"
             data-content-label="goal status"
             className={`text-xs px-2 py-0.5 rounded-full ${
@@ -134,7 +130,6 @@ export function StatusBanner({
           {/* Loop iteration badge */}
           {loopResult && loopResult.iterations_run > 0 && (
             <span
-              data-ui-id="recap-iterations-badge"
               data-content-role="badge"
               className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400"
             >
@@ -144,7 +139,6 @@ export function StatusBanner({
           )}
         </div>
         <div
-          data-ui-id="recap-duration"
           data-content-role="metric"
           data-content-label="run duration"
           className="flex items-center gap-2 text-sm"
@@ -158,24 +152,16 @@ export function StatusBanner({
 
       {/* Loop summary row */}
       {loopResult && loopResult.summary && (
-        <div
-          data-ui-id="recap-loop-summary"
-          data-content-role="body-text"
-          className="text-sm opacity-90"
-        >
+        <div data-content-role="body-text" className="text-sm opacity-90">
           {loopResult.summary}
         </div>
       )}
 
       {/* Timestamps row */}
       {(formattedStartTime || formattedEndTime) && (
-        <div
-          data-ui-id="recap-timestamps"
-          className="flex flex-wrap items-center gap-4 text-sm opacity-80"
-        >
+        <div className="flex flex-wrap items-center gap-4 text-sm opacity-80">
           {formattedStartTime && (
             <div
-              data-ui-id="recap-start-time"
               data-content-role="metric"
               data-content-label="start time"
               className="flex items-center gap-2"
@@ -186,7 +172,6 @@ export function StatusBanner({
           )}
           {formattedEndTime && (
             <div
-              data-ui-id="recap-end-time"
               data-content-role="metric"
               data-content-label="end time"
               className="flex items-center gap-2"

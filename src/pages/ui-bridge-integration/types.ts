@@ -76,7 +76,9 @@ export interface FileModification {
 
 export interface IntegrationOptions {
   install_deps: boolean;
-  auto_instrument: boolean;
+  /** @deprecated Auto-instrumentation is no longer needed. The SDK's AutoRegisterProvider
+   * generates stable semantic IDs at runtime, eliminating the need for build-time Babel plugins. */
+  auto_instrument?: boolean;
   sdk_version?: string;
 }
 

@@ -584,7 +584,7 @@ describe('"#,
             match priority.as_str() {
                 "ui_id" => {
                     if let Some(ui_id) = &target.ui_id {
-                        return format!("[data-ui-id=\"{}\"]", ui_id);
+                        return format!("[data-testid=\"{}\"]", ui_id);
                     }
                 }
                 "css" => {
@@ -623,7 +623,7 @@ describe('"#,
             match priority.as_str() {
                 "ui_id" => {
                     if let Some(ui_id) = &target.ui_id {
-                        return format!("[data-ui-id='{}']", ui_id);
+                        return format!("[data-testid='{}']", ui_id);
                     }
                 }
                 "css" => {

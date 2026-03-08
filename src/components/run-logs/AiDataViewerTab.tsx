@@ -267,10 +267,7 @@ function SidebarNav({
   ];
 
   return (
-    <div
-      data-ui-id="logs-ai-data-sidebar"
-      className="w-56 flex-shrink-0 border-r border-border bg-muted/30 overflow-y-auto"
-    >
+    <div className="w-56 flex-shrink-0 border-r border-border bg-muted/30 overflow-y-auto">
       <div className="p-2 space-y-1">
         {navGroups.map((group) => {
           const isExpanded = expandedGroups.has(group.id);
@@ -280,7 +277,6 @@ function SidebarNav({
             <div key={group.id}>
               {/* Group header */}
               <button
-                data-ui-id={`logs-sidebar-group-${group.id}-btn`}
                 onClick={() => toggleGroup(group.id)}
                 className={`w-full flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-md transition-colors ${
                   hasActiveItem ? "text-foreground" : "text-muted-foreground hover:text-foreground"
@@ -304,7 +300,6 @@ function SidebarNav({
                     return (
                       <button
                         key={item.id}
-                        data-ui-id={`logs-sidebar-item-${item.id}-btn`}
                         onClick={() => onCategoryChange(item.id)}
                         className={`w-full flex items-center gap-2 px-3 py-1.5 text-sm rounded-md transition-colors ${
                           isActive
@@ -3895,13 +3890,12 @@ export function AiDataViewerTab() {
   const needsFlexLayout = ["ai-prompt", "loaded-config"].includes(activeCategory);
 
   return (
-    <div data-ui-id="logs-ai-data-viewer-tab" className="h-full flex overflow-hidden">
+    <div className="h-full flex overflow-hidden">
       {/* Sidebar navigation */}
       <SidebarNav activeCategory={activeCategory} onCategoryChange={setActiveCategory} />
 
       {/* Content area */}
       <div
-        data-ui-id={`logs-ai-data-content-${activeCategory}`}
         className={`flex-1 min-h-0 p-4 ${
           needsFlexLayout ? "overflow-hidden flex flex-col" : "overflow-auto"
         }`}

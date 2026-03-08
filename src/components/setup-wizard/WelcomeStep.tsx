@@ -32,11 +32,7 @@ export function WelcomeStep({ onNext }: WelcomeStepProps) {
         </div>
       </div>
 
-      <button
-        className="btn-primary px-8 py-2.5 text-base"
-        onClick={onNext}
-        data-ui-id="setup-wizard-get-started"
-      >
+      <button className="btn-primary px-8 py-2.5 text-base" onClick={onNext}>
         Get Started
       </button>
     </div>

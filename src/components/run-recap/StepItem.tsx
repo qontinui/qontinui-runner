@@ -68,12 +68,8 @@ export function StepItem({ step, depth = 0, onAiStepClick }: StepItemProps) {
   };
 
   return (
-    <div
-      data-ui-id={`recap-step-item-${step.step_type}`}
-      className={depth > 0 ? "ml-6 border-l border-border pl-4" : ""}
-    >
+    <div className={depth > 0 ? "ml-6 border-l border-border pl-4" : ""}>
       <button
-        data-ui-id="recap-step-toggle-btn"
         onClick={handleClick}
         className={`
           w-full flex items-center gap-3 p-3 rounded-lg text-left transition-colors

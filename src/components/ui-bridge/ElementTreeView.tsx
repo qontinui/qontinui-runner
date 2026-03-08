@@ -369,7 +369,9 @@ export function ElementTreeView({
       <div className="flex flex-col items-center justify-center h-full text-muted-foreground text-sm gap-2">
         <Box className="w-8 h-8 opacity-50" />
         <p>No UI Bridge elements found</p>
-        <p className="text-xs">Make sure the page uses UI Bridge with data-ui-id attributes</p>
+        <p className="text-xs">
+          The AutoRegisterProvider automatically discovers interactive elements
+        </p>
       </div>
     );
   }

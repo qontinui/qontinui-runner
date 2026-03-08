@@ -478,7 +478,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
           onChange={(e) => setFormData((f) => ({ ...f, name: e.target.value }))}
           placeholder="My MCP Server"
           className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
-          data-ui-id="settings-mcp-server-name-input"
         />
       </div>
 
@@ -491,7 +490,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
           onChange={(e) => setFormData((f) => ({ ...f, description: e.target.value }))}
           placeholder="What this server provides"
           className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
-          data-ui-id="settings-mcp-server-description-input"
         />
       </div>
 
@@ -513,7 +511,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               checked={formData.transport === "stdio"}
               onChange={() => setFormData((f) => ({ ...f, transport: "stdio" }))}
               className="accent-primary"
-              data-ui-id="settings-mcp-transport-stdio-radio"
             />
             <Terminal className="w-4 h-4" />
             <div>
@@ -535,7 +532,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               checked={formData.transport === "http"}
               onChange={() => setFormData((f) => ({ ...f, transport: "http" }))}
               className="accent-primary"
-              data-ui-id="settings-mcp-transport-http-radio"
             />
             <Globe className="w-4 h-4" />
             <div>
@@ -557,7 +553,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               onChange={(e) => setFormData((f) => ({ ...f, command: e.target.value }))}
               placeholder="npx @modelcontextprotocol/server-filesystem"
               className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50 font-mono"
-              data-ui-id="settings-mcp-stdio-command-input"
             />
           </div>
           <div className="space-y-1.5">
@@ -568,7 +563,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               placeholder="--path&#10;/home/user"
               rows={3}
               className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50 font-mono resize-none"
-              data-ui-id="settings-mcp-stdio-args-input"
             />
           </div>
           <div className="space-y-1.5">
@@ -579,7 +573,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               onChange={(e) => setFormData((f) => ({ ...f, cwd: e.target.value }))}
               placeholder="/home/user/project"
               className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50 font-mono"
-              data-ui-id="settings-mcp-stdio-cwd-input"
             />
           </div>
           <div className="p-2 bg-amber-500/10 rounded text-xs text-amber-600 dark:text-amber-400">
@@ -599,7 +592,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               onChange={(e) => setFormData((f) => ({ ...f, url: e.target.value }))}
               placeholder="http://localhost:3000"
               className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50 font-mono"
-              data-ui-id="settings-mcp-http-url-input"
             />
           </div>
           <div className="space-y-1.5">
@@ -610,7 +602,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               placeholder='Authorization: Bearer token&#10;Or: {"Authorization": "Bearer token"}'
               rows={3}
               className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50 font-mono resize-none"
-              data-ui-id="settings-mcp-http-headers-input"
             />
           </div>
         </div>
@@ -629,7 +620,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
             min={1}
             max={300}
             className="w-24 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-            data-ui-id="settings-mcp-timeout-input"
           />
         </div>
 
@@ -639,7 +629,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
             checked={formData.enabled}
             onChange={(e) => setFormData((f) => ({ ...f, enabled: e.target.checked }))}
             className="accent-primary"
-            data-ui-id="settings-mcp-enabled-checkbox"
           />
           <div>
             <div className="text-sm font-medium">Enabled</div>
@@ -653,7 +642,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
             checked={formData.autoStart}
             onChange={(e) => setFormData((f) => ({ ...f, autoStart: e.target.checked }))}
             className="accent-primary"
-            data-ui-id="settings-mcp-autostart-checkbox"
           />
           <div>
             <div className="text-sm font-medium">Auto-start</div>
@@ -669,7 +657,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
         <button
           onClick={cancelForm}
           className="px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground"
-          data-ui-id="settings-mcp-form-cancel-btn"
         >
           Cancel
         </button>
@@ -681,7 +668,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               ? "bg-primary text-primary-foreground hover:bg-primary/90"
               : "bg-muted text-muted-foreground cursor-not-allowed"
           }`}
-          data-ui-id="settings-mcp-form-submit-btn"
         >
           {saving ? "Saving..." : editingServer ? "Update" : "Create"}
         </button>
@@ -702,14 +688,12 @@ export function McpSettings({ onLog }: McpSettingsProps) {
             <button
               onClick={() => setDeleteConfirm(null)}
               className="px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground"
-              data-ui-id="settings-mcp-delete-cancel-btn"
             >
               Cancel
             </button>
             <button
               onClick={() => handleDelete(deleteConfirm)}
               className="px-4 py-1.5 rounded-md text-sm font-medium bg-red-500 text-white hover:bg-red-600"
-              data-ui-id="settings-mcp-delete-confirm-btn"
             >
               Delete
             </button>
@@ -738,7 +722,6 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               setShowAddForm(true);
             }}
             className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-primary text-primary-foreground rounded-md hover:bg-primary/90"
-            data-ui-id="settings-mcp-add-server-btn"
           >
             <Plus className="w-4 h-4" />
             Add Server

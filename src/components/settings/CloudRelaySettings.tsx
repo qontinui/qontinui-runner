@@ -171,10 +171,7 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
       />
 
       {/* Enable/Disable */}
-      <div
-        className="space-y-4 rounded-lg bg-card/50 p-4"
-        data-ui-id="settings-cloud-relay-enable-section"
-      >
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
         <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
           <div className="space-y-1">
             <div className="text-sm font-medium">Enable Cloud Relay</div>
@@ -187,7 +184,6 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
             className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
               settings.enabled ? "bg-primary" : "bg-muted"
             }`}
-            data-ui-id="settings-cloud-relay-enable-toggle"
           >
             <span
               className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
@@ -199,10 +195,7 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
       </div>
 
       {/* Backend URL */}
-      <div
-        className="space-y-4 rounded-lg bg-card/50 p-4"
-        data-ui-id="settings-cloud-relay-url-section"
-      >
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
         <h4 className="font-medium text-sm">Backend URL</h4>
 
         <div className="space-y-1.5">
@@ -216,7 +209,6 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
             onChange={(e) => updateSetting("backend_url", e.target.value)}
             placeholder="https://qontinui.io"
             className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
-            data-ui-id="settings-cloud-relay-url-input"
           />
           <p className="text-[10px] text-muted-foreground">
             The backend server URL for relay connections
@@ -225,10 +217,7 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
       </div>
 
       {/* Auto-Connect */}
-      <div
-        className="space-y-4 rounded-lg bg-card/50 p-4"
-        data-ui-id="settings-cloud-relay-auto-connect-section"
-      >
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
         <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
           <div className="space-y-1">
             <div className="text-sm font-medium">Auto-Connect on Startup</div>
@@ -241,7 +230,6 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
             className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
               settings.auto_connect ? "bg-primary" : "bg-muted"
             }`}
-            data-ui-id="settings-cloud-relay-auto-connect-toggle"
           >
             <span
               className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
@@ -253,10 +241,7 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
       </div>
 
       {/* Connection Status */}
-      <div
-        className="space-y-4 rounded-lg bg-card/50 p-4"
-        data-ui-id="settings-cloud-relay-status-section"
-      >
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
         <h4 className="font-medium text-sm">Connection Status</h4>
 
         <div className="flex items-center justify-between p-3 rounded-lg bg-muted/30">
@@ -275,7 +260,6 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
                 onClick={handleConnect}
                 disabled={isConnecting}
                 className="px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                data-ui-id="settings-cloud-relay-connect-btn"
               >
                 {isConnecting ? "Connecting..." : "Connect"}
               </button>
@@ -283,7 +267,6 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
               <button
                 onClick={handleDisconnect}
                 className="px-3 py-1.5 text-xs font-medium rounded-md bg-destructive text-destructive-foreground hover:bg-destructive/90 transition-colors"
-                data-ui-id="settings-cloud-relay-disconnect-btn"
               >
                 Disconnect
               </button>
@@ -308,7 +291,6 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
               ? "bg-primary text-primary-foreground hover:bg-primary/90"
               : "bg-muted text-muted-foreground cursor-not-allowed"
           }`}
-          data-ui-id="settings-cloud-relay-save-btn"
         >
           {isSaving ? "Saving..." : "Save Settings"}
         </button>

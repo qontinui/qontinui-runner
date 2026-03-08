@@ -161,18 +161,13 @@ export function ClaudeConfigStep({ onComplete, onBack }: ClaudeConfigStepProps) 
           Back
         </button>
         <div className="flex gap-2">
-          <button
-            className="btn-secondary"
-            onClick={handleSkip}
-            data-ui-id="setup-wizard-skip-claude-config"
-          >
+          <button className="btn-secondary" onClick={handleSkip}>
             Skip
           </button>
           <button
             className="btn-primary flex items-center gap-2"
             onClick={handleFinish}
             disabled={saving}
-            data-ui-id="setup-wizard-finish"
           >
             {saving && <Loader2 className="w-4 h-4 animate-spin" />}
             Finish Setup

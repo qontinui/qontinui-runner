@@ -74,7 +74,9 @@ type UIBridgeRequestType =
   | "design_get_style_guide"
   | "design_clear_style_guide"
   | "design_get_element_styles"
-  | "design_get_state_styles";
+  | "design_get_state_styles"
+  | "query_selector"
+  | "page_evaluate";
 
 /**
  * Payload structure for UI Bridge requests from Rust
@@ -99,6 +101,12 @@ interface UIBridgeRequestPayload {
   specId?: string;
   url?: string;
   params?: Record<string, unknown>;
+  /** CSS selector for query_selector requests */
+  selector?: string;
+  /** JavaScript expression for page_evaluate requests */
+  expression?: string;
+  /** Element index for query_selector action targeting */
+  index?: number;
   guide?: StyleGuideConfig;
   elementIds?: string[];
   includePseudoElements?: boolean;
@@ -592,6 +600,107 @@ export function useUIBridgeEventHandler(): void {
             break;
           }
 
+          case "query_selector": {
+            const { selector, index: selectorIndex } = payload;
+            // action field is typed as object for execute_action, but for
+            // query_selector the Rust side sends it as a plain string in params
+            const selectorAction = (payload.params?.action as string) ?? undefined;
+            if (!selector) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: "selector is required",
+                timestamp: Date.now(),
+              });
+              return;
+            }
+            try {
+              const elements = document.querySelectorAll(selector);
+              const results = Array.from(elements).map((el, i) => {
+                const htmlEl = el as HTMLElement;
+                const rect = htmlEl.getBoundingClientRect();
+                return {
+                  index: i,
+                  tagName: htmlEl.tagName.toLowerCase(),
+                  textContent: (htmlEl.textContent ?? "").slice(0, 200),
+                  id: htmlEl.id || undefined,
+                  className: htmlEl.className || undefined,
+                  visible: rect.width > 0 && rect.height > 0,
+                  rect: {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                  },
+                };
+              });
+
+              // Optionally perform an action on a matched element
+              if (selectorAction === "click") {
+                const targetIdx = typeof selectorIndex === "number" ? selectorIndex : 0;
+                const target = elements[targetIdx] as HTMLElement | undefined;
+                if (target) {
+                  target.click();
+                }
+              }
+
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: { count: results.length, elements: results },
+                timestamp: Date.now(),
+              });
+            } catch (err) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: String(err),
+                timestamp: Date.now(),
+              });
+            }
+            break;
+          }
+
+          case "page_evaluate": {
+            const { expression } = payload;
+            if (!expression) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: "expression is required",
+                timestamp: Date.now(),
+              });
+              return;
+            }
+            try {
+              const result = eval(expression);
+              const resolvedResult = await Promise.resolve(result);
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: {
+                  result:
+                    typeof resolvedResult === "object" ? resolvedResult : { value: resolvedResult },
+                },
+                timestamp: Date.now(),
+              });
+            } catch (err) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: String(err),
+                timestamp: Date.now(),
+              });
+            }
+            break;
+          }
+
           case "design_get_snapshot": {
             const allElements = currentBridge.elements;
             const targetIds = payload.elementIds as string[] | undefined;
@@ -625,18 +734,10 @@ export function useUIBridgeEventHandler(): void {
                 }
               }
             } else {
-              // Fallback: scan DOM for all data-ui-id elements
-              const domElements = document.querySelectorAll<HTMLElement>("[data-ui-id]");
-              for (const domEl of domElements) {
-                const uiId = domEl.getAttribute("data-ui-id") ?? "";
-                if (targetIds && !targetIds.includes(uiId)) continue;
-                designData.push(
-                  getElementDesignData(domEl, {
-                    elementId: uiId,
-                    includePseudoElements: payload.includePseudoElements,
-                  }),
-                );
-              }
+              // No registered elements available — nothing to report
+              console.log(
+                "[UIBridgeEventHandler] design_get_snapshot: no registered elements in bridge",
+              );
             }
 
             await sendResponse({
@@ -675,8 +776,8 @@ export function useUIBridgeEventHandler(): void {
               }
             }
             if (!styleDomEl) {
-              // Try direct selector query as last resort
-              styleDomEl = document.querySelector<HTMLElement>(`[data-ui-id="${styleElementId}"]`);
+              // Try finding element by data-testid as last resort
+              styleDomEl = document.querySelector<HTMLElement>(`[data-testid="${styleElementId}"]`);
             }
 
             if (!styleDomEl) {
@@ -733,7 +834,7 @@ export function useUIBridgeEventHandler(): void {
               }
             }
             if (!stateDomEl) {
-              stateDomEl = document.querySelector<HTMLElement>(`[data-ui-id="${stateElementId}"]`);
+              stateDomEl = document.querySelector<HTMLElement>(`[data-testid="${stateElementId}"]`);
             }
 
             if (!stateDomEl) {
@@ -818,12 +919,10 @@ export function useUIBridgeEventHandler(): void {
                 }
               }
             } else {
-              const domElements = document.querySelectorAll<HTMLElement>("[data-ui-id]");
-              for (const domEl of domElements) {
-                const uiId = domEl.getAttribute("data-ui-id") ?? "";
-                if (auditTargetIds && !auditTargetIds.includes(uiId)) continue;
-                auditDesignData.push(getElementDesignData(domEl, { elementId: uiId }));
-              }
+              // No registered elements available — nothing to audit
+              console.log(
+                "[UIBridgeEventHandler] design_run_audit: no registered elements in bridge",
+              );
             }
 
             const guide =

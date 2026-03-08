@@ -161,7 +161,7 @@ pub struct BrowserInfo {
 /// Target element information for an action
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionTarget {
-    /// UI Bridge element ID (data-ui-id attribute)
+    /// UI Bridge element ID (from bridge registry or data-testid attribute)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_id: Option<String>,
     /// HTML tag name

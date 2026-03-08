@@ -34,10 +34,10 @@ import type {
   IssuePatternTemplate,
   IssueCategory,
   KnownIssueSeverity,
-  DetectionMethod,
   ListKnownIssuesQuery,
 } from "@qontinui/shared-types";
-import { ISSUE_CATEGORIES, ISSUE_SEVERITIES, DETECTION_METHODS } from "@qontinui/shared-types";
+import { ISSUE_CATEGORIES, ISSUE_SEVERITIES } from "@qontinui/shared-types";
+import { getAllSpecs } from "@/lib/spec-registry";
 
 // ============================================================================
 // Style constants
@@ -184,10 +184,6 @@ function IssueCard({
         <Badge text={issue.severity} style={SEVERITY_STYLES[issue.severity]} />
         <Badge text={issue.category.replace(/_/g, " ")} style={CATEGORY_STYLES[issue.category]} />
         <Badge text={issue.status} style={STATUS_STYLES[issue.status]} />
-        <Badge
-          text={issue.detection_method.replace(/_/g, " ")}
-          style="bg-gray-500/15 text-gray-400 border-gray-500/30"
-        />
         {issue.scope_type !== "global" && (
           <Badge
             text={`${issue.scope_type}: ${issue.scope_value || "?"}`}
@@ -272,58 +268,38 @@ function IssueCard({
 function CreateIssueForm({
   onSubmit,
   onCancel,
-  initialDetectionMethod,
-  initialDetectionConfig,
   initialCategory,
 }: {
   onSubmit: (req: CreateKnownIssueRequest) => Promise<void>;
   onCancel: () => void;
-  initialDetectionMethod?: DetectionMethod;
-  initialDetectionConfig?: Record<string, unknown>;
   initialCategory?: IssueCategory;
 }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [category, setCategory] = useState<IssueCategory>(initialCategory || "other");
   const [severity, setSeverity] = useState<KnownIssueSeverity>("medium");
-  const [detectionMethod, setDetectionMethod] = useState<DetectionMethod>(
-    initialDetectionMethod || "ai_judgment",
-  );
   const [scopeType, setScopeType] = useState<"global" | "spec" | "url" | "component" | "feature">(
-    "global",
+    "spec",
   );
   const [scopeValue, setScopeValue] = useState("");
   const [verificationHint, setVerificationHint] = useState("");
   const [reproductionContext, setReproductionContext] = useState("");
-  const [detectionConfigStr, setDetectionConfigStr] = useState(
-    initialDetectionConfig ? JSON.stringify(initialDetectionConfig, null, 2) : "",
-  );
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const handleSubmit = async () => {
     if (!title.trim() || !description.trim()) return;
     setIsSubmitting(true);
     try {
-      let detectionConfig: Record<string, unknown> | undefined;
-      if (detectionConfigStr.trim()) {
-        try {
-          detectionConfig = JSON.parse(detectionConfigStr.trim());
-        } catch {
-          // ignore parse error, submit without config
-        }
-      }
-
       await onSubmit({
         title: title.trim(),
         description: description.trim(),
         category,
         severity,
-        detection_method: detectionMethod,
+        detection_method: "ai_judgment",
         scope_type: scopeType,
         scope_value: scopeType !== "global" ? scopeValue.trim() || undefined : undefined,
         verification_hint: verificationHint.trim() || undefined,
         reproduction_context: reproductionContext.trim() || undefined,
-        detection_config: detectionConfig,
       });
     } finally {
       setIsSubmitting(false);
@@ -416,7 +392,20 @@ function CreateIssueForm({
       </div>
 
       {/* Scope value (only when not global) */}
-      {scopeType !== "global" && (
+      {scopeType !== "global" && scopeType === "spec" ? (
+        <select
+          value={scopeValue}
+          onChange={(e) => setScopeValue(e.target.value)}
+          className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
+        >
+          <option value="">Select a page spec...</option>
+          {getAllSpecs().map((s) => (
+            <option key={s.specId} value={s.specId}>
+              {s.specId} ({s.appName})
+            </option>
+          ))}
+        </select>
+      ) : scopeType !== "global" ? (
         <input
           type="text"
           placeholder={`${scopeType} identifier`}
@@ -424,25 +413,7 @@ function CreateIssueForm({
           onChange={(e) => setScopeValue(e.target.value)}
           className="w-full px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
         />
-      )}
-
-      {/* Detection method */}
-      <div>
-        <label className="text-[10px] text-muted-foreground uppercase tracking-wider">
-          Detection Method
-        </label>
-        <select
-          value={detectionMethod}
-          onChange={(e) => setDetectionMethod(e.target.value as DetectionMethod)}
-          className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
-        >
-          {DETECTION_METHODS.map((d) => (
-            <option key={d.value} value={d.value}>
-              {d.label}
-            </option>
-          ))}
-        </select>
-      </div>
+      ) : null}
 
       {/* Verification hint */}
       <div>
@@ -471,21 +442,6 @@ function CreateIssueForm({
           className="w-full mt-0.5 px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
         />
       </div>
-
-      {/* Detection config JSON */}
-      {detectionConfigStr && (
-        <div>
-          <label className="text-[10px] text-muted-foreground uppercase tracking-wider">
-            Detection Config (JSON)
-          </label>
-          <textarea
-            value={detectionConfigStr}
-            onChange={(e) => setDetectionConfigStr(e.target.value)}
-            className="w-full mt-0.5 px-3 py-2 text-xs font-mono bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50 min-h-[60px] resize-y"
-            rows={3}
-          />
-        </div>
-      )}
 
       {/* Actions */}
       <div className="flex justify-end gap-2 pt-1">
@@ -1032,12 +988,6 @@ export function KnownIssuesPage() {
   const [showForm, setShowForm] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [showTemplates, setShowTemplates] = useState(false);
-  const [formInitialDetectionMethod, setFormInitialDetectionMethod] = useState<
-    DetectionMethod | undefined
-  >();
-  const [formInitialDetectionConfig, setFormInitialDetectionConfig] = useState<
-    Record<string, unknown> | undefined
-  >();
   const [formInitialCategory, setFormInitialCategory] = useState<IssueCategory | undefined>();
   const [showTemplateForm, setShowTemplateForm] = useState(false);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -1138,8 +1088,6 @@ export function KnownIssuesPage() {
       try {
         await invoke("create_known_issue", { request: req });
         setShowForm(false);
-        setFormInitialDetectionMethod(undefined);
-        setFormInitialDetectionConfig(undefined);
         setFormInitialCategory(undefined);
         await loadIssues();
       } catch (err) {
@@ -1221,8 +1169,6 @@ export function KnownIssuesPage() {
   }, []);
 
   const handleUseTemplate = useCallback((template: IssuePatternTemplate) => {
-    setFormInitialDetectionMethod(template.detection_type as DetectionMethod);
-    setFormInitialDetectionConfig(template.step_template || undefined);
     setFormInitialCategory(
       (ISSUE_CATEGORIES.find((c) => c.value === template.category)
         ? template.category
@@ -1370,8 +1316,6 @@ export function KnownIssuesPage() {
             {!showForm && (
               <button
                 onClick={() => {
-                  setFormInitialDetectionMethod(undefined);
-                  setFormInitialDetectionConfig(undefined);
                   setFormInitialCategory(undefined);
                   setShowForm(true);
                 }}
@@ -1517,12 +1461,8 @@ export function KnownIssuesPage() {
             onSubmit={handleCreate}
             onCancel={() => {
               setShowForm(false);
-              setFormInitialDetectionMethod(undefined);
-              setFormInitialDetectionConfig(undefined);
               setFormInitialCategory(undefined);
             }}
-            initialDetectionMethod={formInitialDetectionMethod}
-            initialDetectionConfig={formInitialDetectionConfig}
             initialCategory={formInitialCategory}
           />
         )}

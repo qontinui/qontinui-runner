@@ -57,7 +57,7 @@ export function SourceIntegrationPanel() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           project_path: projectPath.trim(),
-          options: { install_deps: true, auto_instrument: true },
+          options: { install_deps: true },
         }),
       });
       const data: ApiResponse<FileModification[]> = await resp.json();
@@ -79,7 +79,7 @@ export function SourceIntegrationPanel() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           project_path: projectPath.trim(),
-          options: { install_deps: true, auto_instrument: true },
+          options: { install_deps: true },
         }),
       });
       const data: ApiResponse<IntegrationResult> = await resp.json();
@@ -130,8 +130,9 @@ export function SourceIntegrationPanel() {
       <div className="p-4 rounded-lg border border-border bg-card/50">
         <h3 className="text-sm font-medium mb-1">Project Directory</h3>
         <p className="text-xs text-muted-foreground mb-3">
-          Enter the path to a web application project to analyze and automatically integrate the UI
-          Bridge SDK.
+          Enter the path to a web application project to analyze and integrate the UI Bridge SDK.
+          The SDK automatically discovers and registers interactive elements with stable semantic
+          IDs at runtime via the bridge registry.
         </p>
         <div className="flex gap-2">
           <div className="flex-1 relative">

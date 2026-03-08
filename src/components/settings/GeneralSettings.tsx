@@ -197,10 +197,7 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
         icon={<SettingsIcon className="w-6 h-6" />}
       />
 
-      <div
-        className="space-y-4 rounded-lg bg-card/50 p-4"
-        data-ui-id="settings-general-application-section"
-      >
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
         <h4 className="font-medium text-sm">Application</h4>
 
         <div className="space-y-2">
@@ -217,7 +214,6 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
               className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
                 appSettings.auto_load_last_config ? "bg-primary" : "bg-muted"
               }`}
-              data-ui-id="settings-general-auto-load-toggle"
             >
               <span
                 className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
@@ -238,10 +234,7 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
       </div>
 
       {/* Workflow Builder Settings */}
-      <div
-        className="space-y-4 rounded-lg bg-card/50 p-4"
-        data-ui-id="settings-general-workflow-builder-section"
-      >
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
         <h4 className="font-medium text-sm flex items-center gap-2">
           <FileText className="w-4 h-4" />
           Workflow Builder
@@ -260,7 +253,6 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
               className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
                 includeSummaryStep ? "bg-primary" : "bg-muted"
               }`}
-              data-ui-id="settings-general-include-summary-toggle"
             >
               <span
                 className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
@@ -281,10 +273,7 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
       </div>
 
       {/* Claude Code Sessions */}
-      <div
-        className="space-y-4 rounded-lg bg-card/50 p-4"
-        data-ui-id="settings-general-claude-sessions-section"
-      >
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
         <h4 className="font-medium text-sm flex items-center gap-2">
           <FolderSearch className="w-4 h-4" />
           Claude Code Sessions

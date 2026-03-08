@@ -197,7 +197,6 @@ export function WorkflowRunnerPanel({
           <button
             onClick={() => setShowWorkflowDropdown(!showWorkflowDropdown)}
             disabled={!configLoaded || workflows.length === 0}
-            data-ui-id="execution-workflow-select"
             className={cn(
               "w-full h-14 flex items-center justify-between px-4",
               "text-sm rounded-lg transition-all",
@@ -253,7 +252,6 @@ export function WorkflowRunnerPanel({
                         <div key={category}>
                           <button
                             onClick={() => setExpandedCategory(isExpanded ? null : category)}
-                            data-ui-id={`execution-category-${category}`}
                             className="w-full flex items-center justify-between px-4 py-2.5 text-sm text-left hover:bg-muted/50 transition-colors font-medium"
                           >
                             <span>{displayName}</span>
@@ -275,7 +273,6 @@ export function WorkflowRunnerPanel({
                                 <button
                                   key={workflow.id}
                                   onClick={() => handleWorkflowSelect(workflow.id)}
-                                  data-ui-id={`execution-workflow-${workflow.id}`}
                                   className={cn(
                                     "w-full px-6 py-2 text-sm text-left hover:bg-muted/50 transition-colors",
                                     selectedWorkflow === workflow.id &&
@@ -300,7 +297,6 @@ export function WorkflowRunnerPanel({
                       <button
                         key={workflow.id}
                         onClick={() => handleWorkflowSelect(workflow.id)}
-                        data-ui-id={`execution-workflow-${workflow.id}`}
                         className={cn(
                           "w-full px-4 py-2.5 text-sm text-left hover:bg-muted/50 transition-colors",
                           selectedWorkflow === workflow.id && "bg-primary/10 text-primary",
@@ -355,7 +351,6 @@ export function WorkflowRunnerPanel({
           <button
             onClick={() => setAdvancedSettingsOpen(!advancedSettingsOpen)}
             className="w-full flex items-center justify-between px-4 py-3 text-sm font-medium hover:bg-muted/50 transition-colors"
-            data-ui-id="advanced-settings-toggle"
           >
             <div className="flex items-center gap-2">
               <Settings2 className="w-4 h-4 text-muted-foreground" />
@@ -401,7 +396,6 @@ export function WorkflowRunnerPanel({
                   type="checkbox"
                   checked={autoMinimize}
                   onChange={(e) => onAutoMinimizeChange(e.target.checked)}
-                  data-ui-id="execution-auto-minimize-checkbox"
                   className="rounded w-4 h-4"
                 />
                 <span className="text-sm">Auto-minimize window on start</span>
@@ -414,7 +408,6 @@ export function WorkflowRunnerPanel({
         <div className="flex gap-3 pt-2">
           <button
             data-tutorial-id="start-execution-button"
-            data-ui-id="execution-start-btn"
             onClick={() => {
               onStartExecution();
               onNavigateToActive?.();
@@ -434,7 +427,6 @@ export function WorkflowRunnerPanel({
           <button
             onClick={onStopExecution}
             disabled={!executionActive}
-            data-ui-id="execution-stop-btn"
             className={cn(
               "flex-1 h-16 flex items-center justify-center gap-3",
               "text-lg font-semibold rounded-lg transition-all",

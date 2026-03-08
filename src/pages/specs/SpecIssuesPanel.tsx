@@ -22,9 +22,8 @@ import type {
   CreateKnownIssueRequest,
   IssueCategory,
   KnownIssueSeverity,
-  DetectionMethod,
 } from "@qontinui/shared-types";
-import { ISSUE_CATEGORIES, ISSUE_SEVERITIES, DETECTION_METHODS } from "@qontinui/shared-types";
+import { ISSUE_CATEGORIES, ISSUE_SEVERITIES } from "@qontinui/shared-types";
 
 // ============================================================================
 // Sub-components
@@ -143,7 +142,6 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
   const [description, setDescription] = useState("");
   const [category, setCategory] = useState<IssueCategory>("other");
   const [severity, setSeverity] = useState<KnownIssueSeverity>("medium");
-  const [detectionMethod, setDetectionMethod] = useState<DetectionMethod>("ai_judgment");
   const [verificationHint, setVerificationHint] = useState("");
   const [reproductionContext, setReproductionContext] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -157,7 +155,7 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
         description: description.trim(),
         category,
         severity,
-        detection_method: detectionMethod,
+        detection_method: "ai_judgment",
         scope_type: "spec",
         scope_value: specId,
         verification_hint: verificationHint.trim() || undefined,
@@ -230,24 +228,6 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
             ))}
           </select>
         </div>
-      </div>
-
-      {/* Detection method */}
-      <div>
-        <label className="text-[10px] text-muted-foreground uppercase tracking-wider">
-          Detection Method
-        </label>
-        <select
-          value={detectionMethod}
-          onChange={(e) => setDetectionMethod(e.target.value as DetectionMethod)}
-          className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-purple-500/50"
-        >
-          {DETECTION_METHODS.map((d) => (
-            <option key={d.value} value={d.value}>
-              {d.label}
-            </option>
-          ))}
-        </select>
       </div>
 
       {/* Verification hint */}

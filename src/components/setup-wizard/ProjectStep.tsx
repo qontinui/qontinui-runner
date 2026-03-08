@@ -124,11 +124,7 @@ export function ProjectStep({
 
       {/* Folder picker */}
       <div className="flex gap-2 items-center max-w-xl mx-auto w-full">
-        <button
-          className="btn-secondary flex items-center gap-2 shrink-0"
-          onClick={pickFolder}
-          data-ui-id="setup-wizard-pick-folder"
-        >
+        <button className="btn-secondary flex items-center gap-2 shrink-0" onClick={pickFolder}>
           <FolderOpen className="w-4 h-4" />
           Browse
         </button>
@@ -139,7 +135,6 @@ export function ProjectStep({
           className="btn-primary flex items-center gap-2 shrink-0"
           onClick={scanWorkspace}
           disabled={!scanPath || scanning}
-          data-ui-id="setup-wizard-scan"
         >
           {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
           Scan
@@ -189,7 +184,6 @@ export function ProjectStep({
                         isSelected ? "border-primary/50" : ""
                       }`}
                       onClick={() => toggleProject(project)}
-                      data-ui-id={`setup-project-${project.name}`}
                     >
                       {isSelected ? (
                         <CheckSquare className="w-4 h-4 text-primary shrink-0" />
@@ -219,12 +213,7 @@ export function ProjectStep({
         <button className="btn-secondary" onClick={onBack}>
           Back
         </button>
-        <button
-          className="btn-primary"
-          onClick={onNext}
-          disabled={!scanned}
-          data-ui-id="setup-wizard-projects-next"
-        >
+        <button className="btn-primary" onClick={onNext} disabled={!scanned}>
           {selectedProjects.length > 0
             ? `Continue with ${selectedProjects.length} project${selectedProjects.length !== 1 ? "s" : ""}`
             : "Skip"}

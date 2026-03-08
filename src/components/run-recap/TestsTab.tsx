@@ -205,7 +205,6 @@ export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
       {/* Loop Result Summary (if available) */}
       {loopResult && (
         <div
-          data-ui-id="recap-loop-result-summary"
           className={`rounded-lg p-4 ${
             loopResult.verification_passed
               ? "bg-green-500/10 text-green-500"
@@ -376,20 +375,18 @@ export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
       {/* No Results */}
       {!hasVerificationResults && !hasPlaywrightResults && (
         <div className="card p-8 text-center">
-          <p data-ui-id="recap-test-name" className="text-muted-foreground">
-            No test results available for this run.
-          </p>
-          <p data-ui-id="recap-test-status" className="text-sm text-muted-foreground mt-1">
+          <p className="text-muted-foreground">No test results available for this run.</p>
+          <p className="text-sm text-muted-foreground mt-1">
             Tests will appear here when a workflow includes verification or test execution steps.
           </p>
           {/* Placeholder elements for UI test compatibility - invisible but discoverable */}
           <div className="opacity-0 h-0 overflow-hidden pointer-events-none">
-            <span data-ui-id="recap-test-duration">-</span>
-            <span data-ui-id="recap-test-assertions">-</span>
-            <span data-ui-id="recap-test-console">-</span>
-            <span data-ui-id="recap-test-snapshot">-</span>
-            <span data-ui-id="recap-test-screenshots">-</span>
-            <span data-ui-id="recap-test-error">-</span>
+            <span>-</span>
+            <span>-</span>
+            <span>-</span>
+            <span>-</span>
+            <span>-</span>
+            <span>-</span>
           </div>
         </div>
       )}
@@ -411,12 +408,11 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
     <>
       <button
         onClick={onToggle}
-        data-ui-id={`recap-test-result-${test.id}`}
         className="w-full px-4 py-3 flex items-center justify-between hover:bg-muted/50 transition-colors"
       >
         <div className="flex items-center gap-3">
           {/* Status */}
-          <div data-ui-id="recap-test-status">
+          <div>
             {isPassed ? (
               <CheckCircle2 className="w-5 h-5 text-green-500" />
             ) : isSkipped ? (
@@ -427,9 +423,7 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
           </div>
 
           {/* Name */}
-          <span data-ui-id="recap-test-name" className="font-medium">
-            {test.name}
-          </span>
+          <span className="font-medium">{test.name}</span>
 
           {/* Test Type Badge */}
           {test.test_type && (
@@ -440,7 +434,7 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
 
           {/* Assertions */}
           {test.assertions_total !== undefined && test.assertions_total > 0 && (
-            <span data-ui-id="recap-test-assertions" className="text-xs text-muted-foreground">
+            <span className="text-xs text-muted-foreground">
               ({test.assertions_passed || 0}/{test.assertions_total} assertions)
             </span>
           )}
@@ -449,10 +443,7 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
         <div className="flex items-center gap-3">
           {/* Duration */}
           {test.duration_ms !== undefined && (
-            <span
-              data-ui-id="recap-test-duration"
-              className="text-sm text-muted-foreground flex items-center gap-1"
-            >
+            <span className="text-sm text-muted-foreground flex items-center gap-1">
               <Clock className="w-3 h-3" />
               {formatDuration(test.duration_ms)}
             </span>
@@ -470,7 +461,7 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
         <div className="border-t border-border p-4 space-y-4">
           {/* Snapshot Assert Results (for ui_bridge steps with snapshot_assert) */}
           {test.snapshot_assert_results && (
-            <div data-ui-id="recap-test-snapshot-assert-results">
+            <div>
               <h4 className="text-sm font-medium mb-3 flex items-center gap-2">
                 <Globe className="w-4 h-4" />
                 Snapshot Assertions ({test.snapshot_assert_results.passed}/
@@ -521,7 +512,7 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
 
           {/* Individual Check Results (for command steps with check groups) */}
           {test.check_results && test.check_results.length > 0 && (
-            <div data-ui-id="recap-test-check-results">
+            <div>
               <h4 className="text-sm font-medium mb-3 flex items-center gap-2">
                 <FlaskConical className="w-4 h-4" />
                 Individual Checks ({test.check_results.filter((c) => c.status === "passed").length}/
@@ -537,7 +528,7 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
 
           {/* Console Output */}
           {test.console_output && (
-            <div data-ui-id="recap-test-console">
+            <div>
               <h4 className="text-sm font-medium mb-2 flex items-center gap-2">
                 <Terminal className="w-4 h-4" />
                 Console Output
@@ -550,7 +541,7 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
 
           {/* Page Snapshot */}
           {test.page_snapshot && (
-            <div data-ui-id="recap-test-snapshot">
+            <div>
               <h4 className="text-sm font-medium mb-2 flex items-center gap-2">
                 <FileCode className="w-4 h-4" />
                 Page Snapshot
@@ -563,7 +554,7 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
 
           {/* Error/Stack Trace */}
           {(test.error_message || test.stack_trace) && (
-            <div data-ui-id="recap-test-error">
+            <div>
               <h4 className="text-sm font-medium mb-2 flex items-center gap-2 text-red-400">
                 <AlertCircle className="w-4 h-4" />
                 Error Details
@@ -583,7 +574,7 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
 
           {/* Failure Screenshots */}
           {test.screenshot_path && (
-            <div data-ui-id="recap-test-screenshots">
+            <div>
               <h4 className="text-sm font-medium mb-2 flex items-center gap-2">
                 <Camera className="w-4 h-4" />
                 Failure Screenshot

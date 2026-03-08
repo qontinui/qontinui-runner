@@ -5,6 +5,8 @@ import { detectSessionState } from "./sessionStateDetector";
 export interface UseSessionStateTrackingParams {
   tabs: Array<{ id: string; isAlive: boolean; exitCode: number | null }>;
   processOutput?: (tabId: string, text: string) => void;
+  /** Read rendered lines from the xterm buffer (handles cursor movements correctly). */
+  getBufferLines?: (tabId: string, maxLines: number) => string[];
 }
 
 export interface UseSessionStateTrackingReturn {
@@ -24,7 +26,9 @@ export interface UseSessionStateTrackingReturn {
 export function useSessionStateTracking(
   params: UseSessionStateTrackingParams,
 ): UseSessionStateTrackingReturn {
-  const { tabs, processOutput } = params;
+  const { tabs, processOutput, getBufferLines } = params;
+  const getBufferLinesRef = useRef(getBufferLines);
+  getBufferLinesRef.current = getBufferLines;
 
   // ── State ─────────────────────────────────────────────────────────────────
 
@@ -52,13 +56,20 @@ export function useSessionStateTracking(
 
   // ── Idle / stale detection interval (2s) ──────────────────────────────────
 
+  // Use a ref for tabs so the interval doesn't need to be recreated on every
+  // tab change. The interval reads the latest value via the ref.
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
+
   useEffect(() => {
     const interval = setInterval(() => {
       const now = Date.now();
+      const currentTabs = tabsRef.current;
+
       setSessionStates((prev) => {
         const next = { ...prev };
         let changed = false;
-        for (const tab of tabs) {
+        for (const tab of currentTabs) {
           const lastOutput = lastOutputTimeRef.current[tab.id] ?? 0;
           const current = next[tab.id] ?? "idle";
           if (!tab.isAlive && current !== "completed" && current !== "error") {
@@ -73,23 +84,61 @@ export function useSessionStateTracking(
       });
 
       // Detect stale "working" sessions (no output for 60s)
-      const newStale = new Set<string>();
-      for (const tab of tabs) {
-        const lastOutput = lastOutputTimeRef.current[tab.id] ?? 0;
-        const state = sessionStates[tab.id] ?? "idle";
-        if (state === "working" && lastOutput > 0 && now - lastOutput > 60000) {
-          newStale.add(tab.id);
+      // Read sessionStates via the updater to get the latest value
+      setStaleTabs((prevStale) => {
+        const newStale = new Set<string>();
+        // Use a sync read of sessionStates via a separate ref
+        // We only need the "working" check, so read from setSessionStates updater isn't needed
+        for (const tab of currentTabs) {
+          const lastOutput = lastOutputTimeRef.current[tab.id] ?? 0;
+          if (lastOutput > 0 && now - lastOutput > 60000) {
+            newStale.add(tab.id);
+          }
         }
-      }
-      setStaleTabs((prev) => {
-        if (prev.size !== newStale.size || [...newStale].some((id) => !prev.has(id))) {
+        if (prevStale.size !== newStale.size || [...newStale].some((id) => !prevStale.has(id))) {
           return newStale;
         }
-        return prev;
+        return prevStale;
       });
     }, 2000);
     return () => clearInterval(interval);
-  }, [tabs, sessionStates]);
+  }, []); // Stable interval — reads tabs via ref
+
+  // ── Clean up state for removed tabs ──────────────────────────────────────
+
+  useEffect(() => {
+    const tabIdSet = new Set(tabs.map((t) => t.id));
+
+    setSessionStates((prev) => {
+      const deadKeys = Object.keys(prev).filter((id) => !tabIdSet.has(id));
+      if (deadKeys.length === 0) return prev;
+      const next = { ...prev };
+      for (const key of deadKeys) delete next[key];
+      return next;
+    });
+
+    setLastOutputLines((prev) => {
+      const deadKeys = Object.keys(prev).filter((id) => !tabIdSet.has(id));
+      if (deadKeys.length === 0) return prev;
+      const next = { ...prev };
+      for (const key of deadKeys) delete next[key];
+      return next;
+    });
+
+    // Clean up refs too
+    for (const id of Object.keys(lastOutputTimeRef.current)) {
+      if (!tabIdSet.has(id)) delete lastOutputTimeRef.current[id];
+    }
+    for (const id of Object.keys(stateEntryTimeRef.current)) {
+      if (!tabIdSet.has(id)) delete stateEntryTimeRef.current[id];
+    }
+    for (const id of Object.keys(prevSessionStatesRef.current)) {
+      if (!tabIdSet.has(id)) delete prevSessionStatesRef.current[id];
+    }
+    for (const id of Object.keys(activityBuffersRef.current)) {
+      if (!tabIdSet.has(id)) delete activityBuffersRef.current[id];
+    }
+  }, [tabs]);
 
   // ── Duration formatting interval (10s) ────────────────────────────────────
 
@@ -116,7 +165,7 @@ export function useSessionStateTracking(
     update();
     const interval = setInterval(update, 10000);
     return () => clearInterval(interval);
-  }, [sessionStates]); // Re-start interval when states change for immediate update
+  }, []); // Stable interval — duration updates independently of state changes
 
   // ── Activity sparkline tick interval (2s) ─────────────────────────────────
 
@@ -163,18 +212,44 @@ export function useSessionStateTracking(
         return prev;
       });
 
-      // Track last output lines for compact view (keep last 20 non-empty lines)
-      // Normal display shows 6; hover preview shows up to 20
-      // Strip ANSI escape sequences for cleaner display
-      // eslint-disable-next-line no-control-regex
-      const stripped = text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").replace(/\r/g, "");
-      const newLines = stripped.split("\n").filter((l) => l.trim().length > 0);
-      if (newLines.length > 0) {
-        setLastOutputLines((prev) => {
-          const existing = prev[tabId] ?? [];
-          const combined = [...existing, ...newLines].slice(-20);
-          return { ...prev, [tabId]: combined };
-        });
+      // Track last output lines for compact view (keep last 20 non-empty lines).
+      // Read from the xterm buffer which correctly handles cursor movements,
+      // line rewrites, and all escape sequences. Falls back to ANSI-stripping
+      // the raw output if the buffer isn't available yet.
+      const bufferReader = getBufferLinesRef.current;
+      if (bufferReader) {
+        const lines = bufferReader(tabId, 20);
+        if (lines.length > 0) {
+          setLastOutputLines((prev) => ({ ...prev, [tabId]: lines }));
+        }
+      } else {
+        // Fallback: strip ANSI and accumulate from raw output
+        const stripped = text
+          // eslint-disable-next-line no-control-regex
+          .replace(/\x1b\[[0-9;:?>=! ]*[a-zA-Z@`]/g, "") // CSI sequences
+          // eslint-disable-next-line no-control-regex
+          .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "") // OSC sequences
+          // eslint-disable-next-line no-control-regex
+          .replace(/\x1b[()#%*+\-./][0-9A-Za-z]/g, "") // Character set designations
+          // eslint-disable-next-line no-control-regex
+          .replace(/\x1b[NODMEHc789>=<]/g, "") // Simple escape sequences
+          // eslint-disable-next-line no-control-regex
+          .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "") // Stray control chars
+          .replace(/\r/g, "");
+        const newLines = stripped.split("\n").filter((l) => l.trim().length > 0);
+        if (newLines.length > 0) {
+          setLastOutputLines((prev) => {
+            const existing = prev[tabId] ?? [];
+            const combined = [...existing, ...newLines];
+            const deduped: string[] = [];
+            for (const line of combined) {
+              if (deduped.length === 0 || line !== deduped[deduped.length - 1]) {
+                deduped.push(line);
+              }
+            }
+            return { ...prev, [tabId]: deduped.slice(-20) };
+          });
+        }
       }
 
       processOutput?.(tabId, text);

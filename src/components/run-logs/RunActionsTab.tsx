@@ -33,9 +33,9 @@ export function RunActionsTab({
   onActionRowClick,
 }: RunActionsTabProps) {
   return (
-    <div data-ui-id="logs-actions-tab" className="h-full flex flex-col overflow-hidden">
+    <div className="h-full flex flex-col overflow-hidden">
       {/* Content */}
-      <div data-ui-id="logs-actions-list" className="flex-1 min-h-0 overflow-auto">
+      <div className="flex-1 min-h-0 overflow-auto">
         {actionLogLoading && (
           <div className="flex items-center justify-center py-8 text-muted-foreground">
             <Loader2 className="w-5 h-5 animate-spin mr-2" />

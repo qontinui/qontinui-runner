@@ -693,7 +693,6 @@ function TestFieldsConfig({
           value={step.test_type}
           onChange={(e) => onUpdate({ test_type: e.target.value as TestType })}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-test-type-select"
         >
           <option value="playwright">Playwright (Browser)</option>
           <option value="qontinui_vision">Qontinui Vision</option>
@@ -721,7 +720,6 @@ function TestFieldsConfig({
                   : "command to run"
             }
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-test-command-input"
           />
         </div>
       )}
@@ -737,7 +735,6 @@ function TestFieldsConfig({
                 onUpdate({ execution_mode: e.target.value as PlaywrightExecutionMode })
               }
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-              data-ui-id="workflow-builder-step-config-test-execution-mode-select"
             >
               <option value="independent">Independent (fresh session)</option>
               <option value="chained">Chained (continue after previous)</option>
@@ -757,7 +754,6 @@ function TestFieldsConfig({
               onChange={(e) => onUpdate({ fused_script_id: e.target.value || undefined })}
               placeholder="script-uuid"
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-              data-ui-id="workflow-builder-step-config-test-fused-script-id-input"
             />
             <p className="text-xs text-zinc-500 mt-1">
               If set, this test will run after the specified setup script
@@ -799,7 +795,6 @@ function CheckFieldsConfig({
             onUpdate({ check_type: newType, tool: undefined, command: undefined });
           }}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-check-type-select"
         >
           <option value="lint">Lint (code quality)</option>
           <option value="format">Format (code style)</option>
@@ -822,7 +817,6 @@ function CheckFieldsConfig({
               onChange={(e) => onUpdate({ repository: e.target.value || undefined })}
               placeholder="owner/repo"
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
-              data-ui-id="workflow-builder-step-config-check-cicd-repo-input"
             />
             <p className="text-xs text-zinc-500 mt-1">
               GitHub repository (e.g., jspindev/qontinui-runner). Leave blank to auto-detect from
@@ -842,7 +836,6 @@ function CheckFieldsConfig({
                 onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
                 placeholder="Path to git repo root"
                 className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                data-ui-id="workflow-builder-step-config-check-cicd-workdir-input"
               />
               <p className="text-xs text-zinc-500 mt-1">
                 Git repo directory to auto-detect the GitHub repository from.
@@ -861,7 +854,6 @@ function CheckFieldsConfig({
               onChange={(e) => onUpdate({ workflow_name: e.target.value || undefined })}
               placeholder="CI"
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-              data-ui-id="workflow-builder-step-config-check-cicd-workflow-input"
             />
             <p className="text-xs text-zinc-500 mt-1">GitHub Actions workflow name to filter by.</p>
           </div>
@@ -877,7 +869,6 @@ function CheckFieldsConfig({
               onChange={(e) => onUpdate({ branch: e.target.value || undefined })}
               placeholder="main"
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-              data-ui-id="workflow-builder-step-config-check-cicd-branch-input"
             />
           </div>
 
@@ -889,7 +880,6 @@ function CheckFieldsConfig({
               checked={step.wait_for_completion ?? false}
               onChange={(e) => onUpdate({ wait_for_completion: e.target.checked })}
               className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-              data-ui-id="workflow-builder-step-config-check-cicd-wait-checkbox"
             />
             <label htmlFor="wait_for_completion" className="text-sm text-zinc-300">
               Wait for in-progress runs
@@ -911,7 +901,6 @@ function CheckFieldsConfig({
               min={15}
               max={600}
               className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-              data-ui-id="workflow-builder-step-config-check-cicd-timeout-input"
             />
           </div>
         </>
@@ -931,7 +920,6 @@ function CheckFieldsConfig({
                   });
                 }}
                 className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                data-ui-id="workflow-builder-step-config-check-tool-select"
               >
                 <option value="">Select a tool...</option>
                 {availableTools.map((tool) => (
@@ -960,7 +948,6 @@ function CheckFieldsConfig({
               onChange={(e) => onUpdate({ command: e.target.value || undefined })}
               placeholder={selectedTool?.default_command || "Enter command..."}
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
-              data-ui-id="workflow-builder-step-config-check-command-input"
             />
             {selectedTool?.default_command && !step.command && (
               <p className="text-xs text-zinc-500 mt-1">
@@ -981,7 +968,6 @@ function CheckFieldsConfig({
               onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
               placeholder="Leave empty for project root"
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-              data-ui-id="workflow-builder-step-config-check-working-dir-input"
             />
           </div>
 
@@ -994,7 +980,6 @@ function CheckFieldsConfig({
                 checked={step.auto_fix ?? false}
                 onChange={(e) => onUpdate({ auto_fix: e.target.checked })}
                 className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-                data-ui-id="workflow-builder-step-config-check-auto-fix-checkbox"
               />
               <label htmlFor="auto_fix" className="text-sm text-zinc-300">
                 Auto-fix issues (when supported)
@@ -1014,7 +999,6 @@ function CheckFieldsConfig({
               min={5}
               max={600}
               className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-              data-ui-id="workflow-builder-step-config-check-timeout-input"
             />
           </div>
         </>
@@ -1063,7 +1047,6 @@ function CommandConfig({
         value={effectiveMode}
         onChange={(e) => handleModeChange(e.target.value)}
         className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-        data-ui-id="workflow-builder-step-config-command-mode-select"
       >
         <option value="shell">Shell Command</option>
         <option value="check">Check (lint, typecheck, etc.)</option>
@@ -1086,7 +1069,6 @@ function CommandConfig({
             onChange={(e) => onUpdate({ check_group_id: e.target.value })}
             placeholder="check-group-uuid"
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-check-group-id-input"
           />
           <p className="text-xs text-zinc-500 mt-1">
             The ID of a saved check group from the Check Builder
@@ -1135,7 +1117,6 @@ function CommandConfig({
           placeholder="git branch backup-$(date +%Y%m%d)"
           rows={3}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
-          data-ui-id="workflow-builder-step-config-shell-command-input"
         />
         <p className="text-xs text-zinc-500 mt-1">
           Shell command to execute (bash on Unix, PowerShell on Windows)
@@ -1153,7 +1134,6 @@ function CommandConfig({
           onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
           placeholder="Leave empty for project root"
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-shell-working-dir-input"
         />
       </div>
 
@@ -1167,7 +1147,6 @@ function CommandConfig({
           min={5}
           max={600}
           className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-shell-timeout-input"
         />
       </div>
 
@@ -1179,7 +1158,6 @@ function CommandConfig({
           checked={step.fail_on_error ?? true}
           onChange={(e) => onUpdate({ fail_on_error: e.target.checked })}
           className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-shell-fail-on-error-checkbox"
         />
         <label htmlFor="fail_on_error" className="text-sm text-zinc-300">
           Fail workflow on non-zero exit code
@@ -1234,7 +1212,6 @@ function PromptConfig({
           placeholder="Enter the prompt for the AI agent..."
           rows={24}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 resize-y font-mono text-sm"
-          data-ui-id="workflow-builder-step-config-prompt-content-input"
         />
         <p className="text-xs text-zinc-500 mt-1">
           This prompt will be sent to the AI agent during the agentic phase
@@ -1250,7 +1227,6 @@ function PromptConfig({
             value={step.provider ?? ""}
             onChange={(e) => onUpdate({ provider: e.target.value || undefined })}
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-prompt-provider-select"
           >
             <option value="">Default</option>
             <option value="claude_cli">Claude CLI</option>
@@ -1263,7 +1239,6 @@ function PromptConfig({
             value={step.model ?? ""}
             onChange={(e) => onUpdate({ model: e.target.value || undefined })}
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-prompt-model-select"
           >
             <option value="">Default</option>
             <option value="claude-sonnet-4">Claude Sonnet 4</option>
@@ -1304,7 +1279,6 @@ function UiBridgeConfig({
             })
           }
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
-          data-ui-id="workflow-builder-step-config-ui-bridge-action-select"
         >
           <option value="navigate">Navigate</option>
           <option value="execute">Execute Instruction</option>
@@ -1324,7 +1298,6 @@ function UiBridgeConfig({
             onChange={(e) => onUpdate({ url: e.target.value })}
             placeholder="https://example.com"
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
-            data-ui-id="workflow-builder-step-config-ui-bridge-url-input"
           />
           <p className="text-xs text-zinc-500 mt-1">The URL to navigate to</p>
         </div>
@@ -1340,7 +1313,6 @@ function UiBridgeConfig({
             placeholder="Click the submit button, fill in the form..."
             rows={4}
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 resize-y"
-            data-ui-id="workflow-builder-step-config-ui-bridge-instruction-input"
           />
           <p className="text-xs text-zinc-500 mt-1">
             Natural language instruction for the UI Bridge to execute
@@ -1357,13 +1329,10 @@ function UiBridgeConfig({
               type="text"
               value={step.target || ""}
               onChange={(e) => onUpdate({ target: e.target.value })}
-              placeholder='[data-ui-id="submit-btn"], .header-title, etc.'
+              placeholder='[data-testid="submit-btn"], .header-title, etc.'
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 font-mono text-sm"
-              data-ui-id="workflow-builder-step-config-ui-bridge-target-input"
             />
-            <p className="text-xs text-zinc-500 mt-1">
-              CSS selector or data-ui-id of the target element
-            </p>
+            <p className="text-xs text-zinc-500 mt-1">CSS selector of the target element</p>
           </div>
 
           <div>
@@ -1381,7 +1350,6 @@ function UiBridgeConfig({
                 })
               }
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
-              data-ui-id="workflow-builder-step-config-ui-bridge-assert-type-select"
             >
               <option value="exists">Exists</option>
               <option value="text_equals">Text Equals</option>
@@ -1399,7 +1367,6 @@ function UiBridgeConfig({
               onChange={(e) => onUpdate({ expected: e.target.value })}
               placeholder="Expected text or value"
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
-              data-ui-id="workflow-builder-step-config-ui-bridge-expected-input"
             />
             <p className="text-xs text-zinc-500 mt-1">
               Expected value for text_equals and contains assertions
@@ -1421,7 +1388,6 @@ function UiBridgeConfig({
               placeholder={`[\n  {\n    "id": "check-1",\n    "description": "Header exists",\n    "severity": "critical",\n    "assertionType": "exists",\n    "criteria": { "textContent": "Header" }\n  }\n]`}
               rows={8}
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 resize-y font-mono text-xs"
-              data-ui-id="workflow-builder-step-config-ui-bridge-snapshot-assert-json"
             />
             <p className="text-xs text-zinc-500 mt-1">
               JSON array of assertions. Each needs: id, description, severity, assertionType
@@ -1436,7 +1402,6 @@ function UiBridgeConfig({
               value={step.ui_bridge_snapshot_target || "control"}
               onChange={(e) => onUpdate({ ui_bridge_snapshot_target: e.target.value })}
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
-              data-ui-id="workflow-builder-step-config-ui-bridge-snapshot-target-select"
             >
               <option value="control">Control (Runner UI)</option>
               <option value="sdk">SDK (Connected App)</option>
@@ -1456,7 +1421,6 @@ function UiBridgeConfig({
           max={60000}
           step={1000}
           className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
-          data-ui-id="workflow-builder-step-config-ui-bridge-timeout-input"
         />
       </div>
     </div>
@@ -1495,7 +1459,6 @@ function WorkflowConfig({
         <button
           onClick={onChangeWorkflow}
           className="w-full px-3 py-2 text-sm bg-zinc-700 hover:bg-zinc-600 rounded-md text-zinc-200 transition-colors"
-          data-ui-id="workflow-builder-step-config-change-workflow-btn"
         >
           Change Workflow
         </button>
@@ -1590,7 +1553,6 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
           <button
             onClick={onClose}
             className="p-1 hover:bg-zinc-700 rounded transition-colors text-zinc-400 hover:text-zinc-200"
-            data-ui-id="workflow-builder-step-config-close-btn"
           >
             <X className="w-4 h-4" />
           </button>
@@ -1629,7 +1591,6 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
             onChange={(e) => handleUpdate({ name: e.target.value })}
             placeholder="Step name"
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-name-input"
           />
         </div>
 
@@ -1666,7 +1627,6 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
                   handleUpdate({ fail_on_console_errors: e.target.checked } as Partial<UnifiedStep>)
                 }
                 className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-                data-ui-id="workflow-builder-step-config-fail-on-console-errors-checkbox"
               />
               <label htmlFor="fail_on_console_errors" className="text-sm text-zinc-300">
                 Fail on console errors

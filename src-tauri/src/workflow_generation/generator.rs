@@ -603,6 +603,10 @@ pub fn generate_workflow(
         }
 
         if spec_result.success && !spec_result.criteria.criteria.is_empty() {
+            // Write back verification_step_template to matched known issues
+            if let Some(c) = conn {
+                write_back_verification_templates(c, &relevant_issues, &spec_result.criteria);
+            }
             Some(spec_result.criteria)
         } else {
             None // Graceful fallback — builder runs without criteria
@@ -1261,16 +1265,13 @@ const UI_BRIDGE_INSTRUCTIONS: &str = r#"## UI Bridge SDK Integration
 
 When the workflow's agentic prompts instruct AI to create or modify React frontend code, include these UI Bridge SDK integration instructions in the agentic prompt content so the AI agent adds proper SDK instrumentation to the code it writes.
 
-### data-ui-id Attributes
-Add `data-ui-id` attributes to all interactive and semantically meaningful elements.
-Naming convention: `{feature}-{component}-{element}` (e.g., `settings-form-save-btn`, `dashboard-metrics-revenue`, `nav-sidebar-home-link`).
-- Buttons: `feature-component-action-btn`
-- Inputs: `feature-component-field-input`
-- Links: `feature-component-target-link`
-- Display elements: `feature-component-content-name`
+### AutoRegisterProvider (Automatic Element Discovery)
+The SDK's AutoRegisterProvider automatically discovers interactive elements and assigns stable semantic IDs at runtime.
+No manual data attributes are needed — the AutoRegisterProvider discovers and registers elements in the bridge registry automatically.
+IDs follow the pattern: `{type}-{label-slug}[-{context}][-{index}]` (e.g., `button-save`, `input-email-settings-form`).
 
 ### useUIElement Hook
-Register interactive elements (buttons, inputs, links, toggles) with useUIElement for programmatic discovery and control:
+Register interactive elements (buttons, inputs, links, toggles) with useUIElement for custom programmatic actions and state:
 ```tsx
 import { useUIElement } from '@/hooks/useUIBridge';
 
@@ -1279,7 +1280,7 @@ const { ref } = useUIElement({
   type: 'button', // 'button' | 'input' | 'link' | 'toggle' | 'select' | 'display'
   label: 'Human-Readable Label',
 });
-// Attach ref to the element: <button ref={ref} data-ui-id="feature-component-element">...</button>
+// Attach ref to the element: <button ref={ref}>...</button>
 ```
 
 ### useUIComponent Hook
@@ -1747,6 +1748,124 @@ pub fn extract_json_from_response(response: &str) -> String {
     }
 
     trimmed.to_string()
+}
+
+// ============================================================================
+// Known-Issue Verification Template Write-Back
+// ============================================================================
+
+/// Normalize a string to kebab-case for matching (lowercase, non-alphanumeric → hyphens,
+/// collapse consecutive hyphens, trim leading/trailing hyphens).
+fn to_kebab_case(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut prev_hyphen = true; // start true to skip leading hyphens
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            result.push(ch.to_ascii_lowercase());
+            prev_hyphen = false;
+        } else if !prev_hyphen {
+            result.push('-');
+            prev_hyphen = true;
+        }
+    }
+    // trim trailing hyphen
+    if result.ends_with('-') {
+        result.pop();
+    }
+    result
+}
+
+/// After the specification agent produces acceptance criteria, write back a
+/// `verification_step_template` to each known issue that:
+///   (a) doesn't already have one, and
+///   (b) can be matched to a generated criterion.
+fn write_back_verification_templates(
+    conn: &Connection,
+    issues: &[crate::known_issues::KnownIssue],
+    criteria: &specification::AcceptanceCriteria,
+) {
+    use crate::known_issues::{storage::update_known_issue, UpdateKnownIssueRequest};
+
+    for issue in issues {
+        // Skip issues that already have a template
+        if issue.verification_step_template.is_some() {
+            continue;
+        }
+
+        let title_kebab = to_kebab_case(&issue.title);
+        let title_lower = issue.title.to_lowercase();
+
+        // Find a matching criterion
+        let matched = criteria.criteria.iter().find(|c| {
+            // criterion ID contains the kebab-cased title
+            if !title_kebab.is_empty() && c.id.contains(&title_kebab) {
+                return true;
+            }
+            // criterion description or hint contains the original title (case-insensitive)
+            let desc_lower = c.description.to_lowercase();
+            let hint_lower = c.verification_hint.to_lowercase();
+            if !title_lower.is_empty()
+                && (desc_lower.contains(&title_lower) || hint_lower.contains(&title_lower))
+            {
+                return true;
+            }
+            false
+        });
+
+        let criterion = match matched {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Build the verification_step_template based on the criterion's method
+        let template = match criterion.method {
+            specification::VerificationMethod::UiBridge => serde_json::json!({
+                "type": "ui_bridge",
+                "ui_bridge_action": "snapshot_assert",
+                "ui_bridge_target": criterion.verification_hint,
+            }),
+            specification::VerificationMethod::Command => serde_json::json!({
+                "type": "command",
+                "command": criterion.verification_hint,
+            }),
+            specification::VerificationMethod::Test => serde_json::json!({
+                "type": "command",
+                "command": criterion.verification_hint,
+                "test_type": true,
+            }),
+            specification::VerificationMethod::Manual => continue,
+        };
+
+        let req = UpdateKnownIssueRequest {
+            title: None,
+            description: None,
+            category: None,
+            scope_type: None,
+            scope_value: None,
+            scope_tags: None,
+            detection_method: None,
+            detection_config: None,
+            pattern_template_id: None,
+            reproduction_context: None,
+            trigger_conditions: None,
+            severity: None,
+            status: None,
+            confidence: None,
+            verification_hint: None,
+            verification_step_template: Some(template),
+        };
+
+        match update_known_issue(conn, &issue.id, &req) {
+            Ok(_) => info!(
+                "Wrote verification_step_template to known issue '{}' ({})",
+                issue.title, issue.id
+            ),
+            Err(e) => warn!(
+                "Failed to write verification_step_template to issue '{}': {}",
+                issue.id, e
+            ),
+        }
+    }
 }
 
 // ============================================================================

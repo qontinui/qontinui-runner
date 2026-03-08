@@ -242,14 +242,10 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
       )}
 
       {/* Authentication Section */}
-      <div
-        className="rounded-lg bg-card/50 overflow-hidden"
-        data-ui-id="settings-executionvariables-auth-section"
-      >
+      <div className="rounded-lg bg-card/50 overflow-hidden">
         <button
           onClick={() => setAuthExpanded(!authExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
-          data-ui-id="settings-executionvariables-auth-toggle-btn"
         >
           <div className="flex items-center gap-3">
             <Key className="w-5 h-5 text-primary" />
@@ -318,7 +314,6 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                   }
                   placeholder="Authorization"
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-                  data-ui-id="settings-executionvariables-auth-header-name-input"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   HTTP header name to use for the auth token (e.g., Authorization, X-API-Key)
@@ -340,7 +335,6 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                     }
                     placeholder="Bearer eyJhbGciOiJIUzI1NiIs..."
                     className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
-                    data-ui-id="settings-executionvariables-auth-token-input"
                   />
                   <p className="text-[10px] text-muted-foreground">
                     Include the full header value (e.g., "Bearer token123")
@@ -364,12 +358,10 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                       }
                       placeholder="API_AUTH_TOKEN"
                       className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
-                      data-ui-id="settings-executionvariables-auth-envvar-input"
                     />
                     <button
                       onClick={() => testEnvVar(settings.authEnvVar)}
                       className="px-3 py-1.5 text-xs bg-muted hover:bg-muted/80 rounded-md transition-colors"
-                      data-ui-id="settings-executionvariables-auth-envvar-test-btn"
                     >
                       Test
                     </button>
@@ -407,14 +399,10 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
       </div>
 
       {/* Custom Variables Section */}
-      <div
-        className="rounded-lg bg-card/50 overflow-hidden"
-        data-ui-id="settings-executionvariables-custom-section"
-      >
+      <div className="rounded-lg bg-card/50 overflow-hidden">
         <button
           onClick={() => setVariablesExpanded(!variablesExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
-          data-ui-id="settings-executionvariables-custom-toggle-btn"
         >
           <div className="flex items-center gap-3">
             <Variable className="w-5 h-5 text-primary" />
@@ -549,7 +537,6 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
               <button
                 onClick={addCustomVariable}
                 className="w-full p-2 flex items-center justify-center gap-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/30 rounded-lg border border-dashed border-border/50 transition-colors"
-                data-ui-id="settings-executionvariables-add-variable-btn"
               >
                 <Plus className="w-4 h-4" />
                 Add Custom Variable
@@ -573,7 +560,6 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
         <button
           onClick={resetToDefaults}
           className="px-4 py-2 bg-muted hover:bg-muted/80 text-foreground rounded-md font-medium transition-colors text-sm"
-          data-ui-id="settings-executionvariables-reset-defaults-btn"
         >
           Reset to Defaults
         </button>
@@ -582,7 +568,6 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
           onClick={saveSettings}
           disabled={saving}
           className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-sm"
-          data-ui-id="settings-executionvariables-save-btn"
         >
           {saving ? (
             <>
