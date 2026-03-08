@@ -5,7 +5,7 @@
  * Organizes steps into three phases: Setup, Verification, Agentic.
  */
 
-import React, { useState, useCallback, useEffect, useRef } from "react";
+import React, { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import {
   Plus,
   Save,
@@ -1201,7 +1201,7 @@ function WorkflowBuilderContent({
     }
   }, []);
 
-  const hasFavorites = savedWorkflows.some((w) => w.is_favorite);
+  const hasFavorites = useMemo(() => savedWorkflows.some((w) => w.is_favorite), [savedWorkflows]);
 
   // Toggle workflow selection for batch delete
   const toggleWorkflowSelection = useCallback((workflowId: string) => {

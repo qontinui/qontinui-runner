@@ -6012,7 +6012,7 @@ impl CheckpointDb {
             );
         }
 
-        if (1..92).contains(&current_version) {
+        if current_version < 92 {
             info!("Migrating database to version 92 (workflow favorites)");
 
             conn.execute_batch(
