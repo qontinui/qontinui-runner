@@ -1182,8 +1182,11 @@ function WorkflowBuilderContent({
     }
   }, [state.isSaving, state.workflow.id, fetchWorkflows]);
 
-  // Toggle favorite on a workflow
+  // Toggle favorite on a workflow (optimistic update with rollback)
   const toggleFavorite = useCallback(async (workflowId: string) => {
+    setSavedWorkflows((prev) =>
+      prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: !w.is_favorite } : w)),
+    );
     try {
       const response = await tracedFetch(
         `${getApiBase()}/unified-workflows/${workflowId}/favorite`,
@@ -1195,9 +1198,16 @@ function WorkflowBuilderContent({
         setSavedWorkflows((prev) =>
           prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: newState } : w)),
         );
+      } else {
+        setSavedWorkflows((prev) =>
+          prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: !w.is_favorite } : w)),
+        );
       }
     } catch (error) {
       console.error("Failed to toggle favorite:", error);
+      setSavedWorkflows((prev) =>
+        prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: !w.is_favorite } : w)),
+      );
     }
   }, []);
 

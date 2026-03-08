@@ -98,7 +98,7 @@ src-tauri/binaries/qontinui-executor-*
 
 # Playwright user scripts (generated at runtime)
 playwright-user-scripts/
-test-results/
+/test-results/
 test.spec.ts
 
 # Debug/test screenshots

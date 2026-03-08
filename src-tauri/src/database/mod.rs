@@ -13160,15 +13160,20 @@ impl CheckpointDb {
     }
 
     /// Toggle the is_favorite flag on a unified workflow.
-    /// Returns the new favorite state.
+    /// Returns the new favorite state, or an error if the workflow doesn't exist.
     pub fn toggle_unified_workflow_favorite(&self, id: &str) -> Result<bool, String> {
         let conn = self.get_conn()?;
 
-        conn.execute(
-            "UPDATE unified_workflows SET is_favorite = CASE WHEN is_favorite = 1 THEN 0 ELSE 1 END WHERE id = ?1",
-            params![id],
-        )
-        .map_err(|e| format!("Failed to toggle favorite: {}", e))?;
+        let rows_affected = conn
+            .execute(
+                "UPDATE unified_workflows SET is_favorite = CASE WHEN is_favorite = 1 THEN 0 ELSE 1 END WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|e| format!("Failed to toggle favorite: {}", e))?;
+
+        if rows_affected == 0 {
+            return Err(format!("Workflow not found: {}", id));
+        }
 
         let new_state: bool = conn
             .query_row(

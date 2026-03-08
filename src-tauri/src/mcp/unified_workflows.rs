@@ -2424,10 +2424,12 @@ async fn toggle_favorite_handler(
         .checkpoint_db
         .toggle_unified_workflow_favorite(&id)
         .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to toggle favorite: {}", e))),
-            )
+            let status = if e.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(api_error(e)))
         })?;
 
     Ok(Json(ApiResponse::success(serde_json::json!({

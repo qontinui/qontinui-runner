@@ -374,8 +374,14 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
     fetchAllItems();
   }, [fetchAllItems]);
 
-  // Toggle favorite on a workflow
+  // Toggle favorite on a workflow (optimistic update with rollback)
   const toggleFavorite = useCallback(async (itemId: string) => {
+    // Optimistic toggle
+    setItems((prev) =>
+      prev.map((item) =>
+        item.id === itemId ? { ...item, isFavorite: !item.isFavorite } : item,
+      ),
+    );
     try {
       const response = await tracedFetch(
         `${getApiBase()}/unified-workflows/${itemId}/favorite`,
@@ -383,15 +389,29 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       );
       const result = await response.json();
       if (result.success) {
+        // Sync with server state in case of mismatch
         const newState = result.data.is_favorite;
         setItems((prev) =>
           prev.map((item) =>
             item.id === itemId ? { ...item, isFavorite: newState } : item,
           ),
         );
+      } else {
+        // Revert on failure
+        setItems((prev) =>
+          prev.map((item) =>
+            item.id === itemId ? { ...item, isFavorite: !item.isFavorite } : item,
+          ),
+        );
       }
     } catch (error) {
       console.error("Failed to toggle favorite:", error);
+      // Revert optimistic update
+      setItems((prev) =>
+        prev.map((item) =>
+          item.id === itemId ? { ...item, isFavorite: !item.isFavorite } : item,
+        ),
+      );
     }
   }, []);
 
