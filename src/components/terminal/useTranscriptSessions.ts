@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { CommandResponse } from "./types";
 
 export interface TranscriptSession {
   session_id: string;
@@ -20,12 +21,6 @@ export interface TranscriptMessage {
   plan_content: string | null;
   model: string | null;
   has_tool_use: boolean;
-}
-
-interface CommandResponse {
-  success: boolean;
-  message: string | null;
-  data: unknown;
 }
 
 export interface UseTranscriptSessionsResult {

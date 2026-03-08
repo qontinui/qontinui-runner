@@ -33,7 +33,6 @@ import {
   Save,
   AlertCircle,
   CheckCircle2,
-  ShieldCheck,
   type LucideIcon,
 } from "lucide-react";
 import { getAccentColors } from "@/design-system";
@@ -1288,17 +1287,6 @@ export function AiGeneratePanel({
             )}
             {submittingAction === "generate-and-run" ? "Starting..." : "Generate & Run"}
           </button>
-          {onLoadWorkflow && hasSpecs && (
-            <button
-              onClick={handleBuildFromSpecs}
-              disabled={submittingAction !== null}
-              title="Build a deterministic spec workflow directly — one stage per page, hybrid verification (no AI generation needed)"
-              className="flex items-center gap-2 px-6 py-2 rounded-md font-medium border border-emerald-700 bg-emerald-900/30 text-emerald-300 hover:bg-emerald-900/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <ShieldCheck className="w-4 h-4" />
-              Build from Specs
-            </button>
-          )}
         </div>
       </div>
     </div>

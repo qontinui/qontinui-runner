@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { CommandResponse } from "./types";
 
 export interface TerminalTab {
   id: string;
@@ -28,12 +29,6 @@ interface TerminalInfo {
   exit_code: number | null;
   created_at: number;
   total_bytes_produced: number;
-}
-
-interface CommandResponse {
-  success: boolean;
-  message: string | null;
-  data: Record<string, unknown> | null;
 }
 
 export function useTerminalManager() {

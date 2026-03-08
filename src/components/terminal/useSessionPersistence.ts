@@ -1,15 +1,10 @@
 import { useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { CommandResponse } from "./types";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-interface CommandResponse {
-  success: boolean;
-  message: string | null;
-  data: Record<string, unknown> | null;
-}
 
 export interface SavedSessionConfig {
   /** Original tab title */
