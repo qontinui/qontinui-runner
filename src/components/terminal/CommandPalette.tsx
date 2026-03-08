@@ -142,6 +142,7 @@ export function CommandPalette({
 }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const [prevQuery, setPrevQuery] = useState("");
   const [recentIds, setRecentIds] = useState<string[]>(() => {
     try {
       const stored = localStorage.getItem("zone-recent-commands");
@@ -468,10 +469,11 @@ export function CommandPalette({
     return map;
   }, [actions, query]);
 
-  // Clamp selected index
-  useEffect(() => {
+  // Reset selected index when query changes (derived state computed during render)
+  if (query !== prevQuery) {
+    setPrevQuery(query);
     setSelectedIndex(0);
-  }, [query]);
+  }
 
   // Keyboard navigation
   useEffect(() => {

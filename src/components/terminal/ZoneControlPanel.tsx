@@ -231,11 +231,14 @@ function EditableLabel({
 
 function InlineNotesEditor({ notes, onSave }: { notes: string; onSave: (notes: string) => void }) {
   const [draft, setDraft] = useState(notes);
+  const [prevNotes, setPrevNotes] = useState(notes);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  useEffect(() => {
+  // Reset draft when notes prop changes (derived state computed during render)
+  if (notes !== prevNotes) {
+    setPrevNotes(notes);
     setDraft(notes);
-  }, [notes]);
+  }
 
   useEffect(() => {
     requestAnimationFrame(() => textareaRef.current?.focus());

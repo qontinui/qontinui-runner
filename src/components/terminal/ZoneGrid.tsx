@@ -1174,6 +1174,36 @@ function CompactZoneCard({
   );
 }
 
+/** Reusable menu item for ZoneContextMenu */
+function ZoneMenuItem({
+  label,
+  onClick,
+  onClose,
+  danger,
+  disabled,
+}: {
+  label: string;
+  onClick: () => void;
+  onClose: () => void;
+  danger?: boolean;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      onClick={() => {
+        onClick();
+        onClose();
+      }}
+      disabled={disabled}
+      className={`w-full text-left px-3 py-1.5 text-[11px] transition-colors disabled:opacity-30 ${
+        danger ? "text-[#f7768e] hover:bg-[#f7768e]/10" : "text-[#c0caf5] hover:bg-[#7aa2f7]/10"
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
 /** Context menu for zone right-click actions */
 function ZoneContextMenu({
   x,
@@ -1228,31 +1258,6 @@ function ZoneContextMenu({
 
   const needsInput = state === "needs-input";
 
-  const MenuItem = ({
-    label,
-    onClick,
-    danger,
-    disabled,
-  }: {
-    label: string;
-    onClick: () => void;
-    danger?: boolean;
-    disabled?: boolean;
-  }) => (
-    <button
-      onClick={() => {
-        onClick();
-        onClose();
-      }}
-      disabled={disabled}
-      className={`w-full text-left px-3 py-1.5 text-[11px] transition-colors disabled:opacity-30 ${
-        danger ? "text-[#f7768e] hover:bg-[#f7768e]/10" : "text-[#c0caf5] hover:bg-[#7aa2f7]/10"
-      }`}
-    >
-      {label}
-    </button>
-  );
-
   return (
     <div
       ref={menuRef}
@@ -1267,21 +1272,21 @@ function ZoneContextMenu({
         {tab ? ` — ${tab.title}` : ""}
       </div>
 
-      <MenuItem label="Focus" onClick={onFocus} />
-      <MenuItem label="Maximize" onClick={onMaximize} disabled={!tab} />
+      <ZoneMenuItem label="Focus" onClick={onFocus} onClose={onClose} />
+      <ZoneMenuItem label="Maximize" onClick={onMaximize} onClose={onClose} disabled={!tab} />
 
       {needsInput && (
         <>
           <div className="h-px bg-[#2a2d3d] my-1" />
-          <MenuItem label="Approve (y)" onClick={onApprove} />
-          <MenuItem label="Reject (n)" onClick={onReject} />
+          <ZoneMenuItem label="Approve (y)" onClick={onApprove} onClose={onClose} />
+          <ZoneMenuItem label="Reject (n)" onClick={onReject} onClose={onClose} />
         </>
       )}
 
       {(state === "completed" || state === "error") && onRestart && (
         <>
           <div className="h-px bg-[#2a2d3d] my-1" />
-          <MenuItem label="Restart session" onClick={onRestart} />
+          <ZoneMenuItem label="Restart session" onClick={onRestart} onClose={onClose} />
         </>
       )}
 
@@ -1321,7 +1326,7 @@ function ZoneContextMenu({
       {tab && (
         <>
           <div className="h-px bg-[#2a2d3d] my-1" />
-          <MenuItem label="Unassign from zone" onClick={onUnassign} danger />
+          <ZoneMenuItem label="Unassign from zone" onClick={onUnassign} onClose={onClose} danger />
         </>
       )}
     </div>
