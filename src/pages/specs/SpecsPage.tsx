@@ -239,6 +239,7 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
             onAddGroup={state.addGroup}
             onRemoveGroup={state.removeGroup}
             onUpdateSetupActions={state.updateSetupActions}
+            onClearSelection={() => state.setSelection({ type: "none" })}
           />
         </div>
 

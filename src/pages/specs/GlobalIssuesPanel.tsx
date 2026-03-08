@@ -1,9 +1,9 @@
 /**
- * KnownIssuesPage -- Full-page issue management view.
+ * GlobalIssuesPanel — Global issue management embedded in the Specs page.
  *
- * Provides listing, filtering, creation, resolution, and deletion of
- * known issues across all scopes.  Also includes a collapsible pattern
- * template browser at the bottom.
+ * Shows when no spec is selected in the center panel. Provides filtering,
+ * search, creation, resolution, deletion, bulk operations, and export/import
+ * of known issues across all scopes.
  */
 
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
@@ -20,9 +20,6 @@ import {
   Clock,
   AlertTriangle,
   X,
-  FileCode,
-  Layers,
-  BarChart2,
   Download,
   Upload,
   Sparkles,
@@ -30,51 +27,18 @@ import {
 import type {
   KnownIssue,
   CreateKnownIssueRequest,
-  CreatePatternTemplateRequest,
-  IssuePatternTemplate,
   IssueCategory,
   KnownIssueSeverity,
   ListKnownIssuesQuery,
 } from "@qontinui/shared-types";
 import { ISSUE_CATEGORIES, ISSUE_SEVERITIES } from "@qontinui/shared-types";
 import { getAllSpecs } from "@/lib/spec-registry";
-
-// ============================================================================
-// Style constants
-// ============================================================================
-
-const SEVERITY_STYLES: Record<string, string> = {
-  critical: "bg-red-500/15 text-red-400 border-red-500/30",
-  high: "bg-orange-500/15 text-orange-400 border-orange-500/30",
-  medium: "bg-amber-500/15 text-amber-400 border-amber-500/30",
-  low: "bg-blue-500/15 text-blue-400 border-blue-500/30",
-};
-
-const CATEGORY_STYLES: Record<string, string> = {
-  duplication: "bg-purple-500/15 text-purple-400 border-purple-500/30",
-  rendering: "bg-cyan-500/15 text-cyan-400 border-cyan-500/30",
-  data_integrity: "bg-green-500/15 text-green-400 border-green-500/30",
-  timing: "bg-yellow-500/15 text-yellow-400 border-yellow-500/30",
-  state: "bg-indigo-500/15 text-indigo-400 border-indigo-500/30",
-  layout: "bg-pink-500/15 text-pink-400 border-pink-500/30",
-  performance: "bg-orange-500/15 text-orange-400 border-orange-500/30",
-  encoding: "bg-teal-500/15 text-teal-400 border-teal-500/30",
-  navigation: "bg-sky-500/15 text-sky-400 border-sky-500/30",
-  authentication: "bg-red-500/15 text-red-400 border-red-500/30",
-  other: "bg-gray-500/15 text-gray-400 border-gray-500/30",
-};
-
-const STATUS_STYLES: Record<string, string> = {
-  active: "bg-amber-500/15 text-amber-400 border-amber-500/30",
-  resolved: "bg-green-500/15 text-green-400 border-green-500/30",
-  monitoring: "bg-blue-500/15 text-blue-400 border-blue-500/30",
-  wont_fix: "bg-gray-500/15 text-gray-400 border-gray-500/30",
-};
+import { SEVERITY_STYLES, CATEGORY_STYLES, STATUS_STYLES } from "./issue-styles";
 
 type StatusFilter = "all" | "active" | "resolved" | "monitoring";
 
 // ============================================================================
-// Badge
+// Badge & ConfidenceBar
 // ============================================================================
 
 function Badge({ text, style }: { text: string; style?: string }) {
@@ -86,10 +50,6 @@ function Badge({ text, style }: { text: string; style?: string }) {
     </span>
   );
 }
-
-// ============================================================================
-// Confidence bar
-// ============================================================================
 
 function ConfidenceBar({ value }: { value: number }) {
   const pct = Math.round(value * 100);
@@ -268,15 +228,13 @@ function IssueCard({
 function CreateIssueForm({
   onSubmit,
   onCancel,
-  initialCategory,
 }: {
   onSubmit: (req: CreateKnownIssueRequest) => Promise<void>;
   onCancel: () => void;
-  initialCategory?: IssueCategory;
 }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [category, setCategory] = useState<IssueCategory>(initialCategory || "other");
+  const [category, setCategory] = useState<IssueCategory>("other");
   const [severity, setSeverity] = useState<KnownIssueSeverity>("medium");
   const [scopeType, setScopeType] = useState<"global" | "spec" | "url" | "component" | "feature">(
     "spec",
@@ -318,7 +276,6 @@ function CreateIssueForm({
         </button>
       </div>
 
-      {/* Title */}
       <input
         type="text"
         placeholder="Issue title"
@@ -328,7 +285,6 @@ function CreateIssueForm({
         autoFocus
       />
 
-      {/* Description */}
       <textarea
         placeholder="Describe the issue -- what you observed, what is wrong"
         value={description}
@@ -337,7 +293,6 @@ function CreateIssueForm({
         rows={3}
       />
 
-      {/* Row: Category + Severity + Scope */}
       <div className="grid grid-cols-3 gap-3">
         <div>
           <label className="text-[10px] text-muted-foreground uppercase tracking-wider">
@@ -391,7 +346,6 @@ function CreateIssueForm({
         </div>
       </div>
 
-      {/* Scope value (only when not global) */}
       {scopeType !== "global" && scopeType === "spec" ? (
         <select
           value={scopeValue}
@@ -415,7 +369,6 @@ function CreateIssueForm({
         />
       ) : null}
 
-      {/* Verification hint */}
       <div>
         <label className="text-[10px] text-muted-foreground uppercase tracking-wider">
           Verification Hint (optional)
@@ -429,7 +382,6 @@ function CreateIssueForm({
         />
       </div>
 
-      {/* Reproduction context */}
       <div>
         <label className="text-[10px] text-muted-foreground uppercase tracking-wider">
           Reproduction Context (optional)
@@ -443,7 +395,6 @@ function CreateIssueForm({
         />
       </div>
 
-      {/* Actions */}
       <div className="flex justify-end gap-2 pt-1">
         <button
           onClick={onCancel}
@@ -464,532 +415,21 @@ function CreateIssueForm({
 }
 
 // ============================================================================
-// Template card
+// Main panel
 // ============================================================================
 
-function TemplateCard({
-  template,
-  onUse,
-}: {
-  template: IssuePatternTemplate;
-  onUse: (t: IssuePatternTemplate) => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-
-  return (
-    <div className="border border-border rounded-lg p-3 space-y-2 hover:border-border/80 transition-colors">
-      <div className="flex items-start justify-between gap-2">
-        <div className="flex-1 min-w-0">
-          <button
-            onClick={() => setExpanded(!expanded)}
-            className="flex items-center gap-1.5 text-left group"
-          >
-            {expanded ? (
-              <ChevronDown className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
-            ) : (
-              <ChevronRight className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
-            )}
-            <FileCode className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-            <span className="text-sm font-medium group-hover:text-primary transition-colors">
-              {template.name}
-            </span>
-          </button>
-          <p className="text-xs text-muted-foreground line-clamp-2 ml-[52px] mt-0.5">
-            {template.description}
-          </p>
-        </div>
-        <button
-          onClick={() => onUse(template)}
-          className="px-2 py-1 text-xs rounded-md border border-border hover:bg-primary/10 hover:text-primary hover:border-primary/30 transition-colors shrink-0"
-        >
-          Use Template
-        </button>
-      </div>
-
-      <div className="flex items-center gap-1.5 ml-[52px]">
-        <Badge
-          text={template.category.replace(/_/g, " ")}
-          style={
-            CATEGORY_STYLES[template.category] || "bg-gray-500/15 text-gray-400 border-gray-500/30"
-          }
-        />
-        <Badge
-          text={template.detection_type.replace(/_/g, " ")}
-          style="bg-gray-500/15 text-gray-400 border-gray-500/30"
-        />
-        {template.built_in && (
-          <Badge text="built-in" style="bg-blue-500/15 text-blue-400 border-blue-500/30" />
-        )}
-      </div>
-
-      {expanded && (
-        <div className="ml-[52px] mt-1 space-y-2 border-t border-border pt-2 text-xs">
-          {template.parameters.length > 0 && (
-            <div>
-              <span className="text-muted-foreground font-medium">Parameters:</span>
-              <div className="mt-1 space-y-1">
-                {template.parameters.map((p) => (
-                  <div key={p.name} className="flex items-baseline gap-2">
-                    <code className="text-[11px] bg-white/5 px-1 rounded">{p.name}</code>
-                    <span className="text-muted-foreground">({p.type})</span>
-                    <span className="text-foreground">{p.description}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-          {template.ai_prompt_template && (
-            <div>
-              <span className="text-muted-foreground font-medium">AI Prompt Template:</span>
-              <pre className="mt-0.5 bg-white/5 p-2 rounded text-[11px] overflow-x-auto whitespace-pre-wrap">
-                {template.ai_prompt_template}
-              </pre>
-            </div>
-          )}
-          {template.step_template && Object.keys(template.step_template).length > 0 && (
-            <div>
-              <span className="text-muted-foreground font-medium">Step Template:</span>
-              <pre className="mt-0.5 bg-white/5 p-2 rounded text-[11px] overflow-x-auto">
-                {JSON.stringify(template.step_template, null, 2)}
-              </pre>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ============================================================================
-// Create Template Form
-// ============================================================================
-
-const TEMPLATE_CATEGORIES = [
-  { value: "duplication", label: "Duplication" },
-  { value: "rendering", label: "Rendering" },
-  { value: "data_integrity", label: "Data Integrity" },
-  { value: "timing", label: "Timing" },
-  { value: "layout", label: "Layout" },
-  { value: "state", label: "State" },
-  { value: "performance", label: "Performance" },
-  { value: "encoding", label: "Encoding" },
-  { value: "navigation", label: "Navigation" },
-  { value: "authentication", label: "Authentication" },
-  { value: "other", label: "Other" },
-];
-
-const TEMPLATE_DETECTION_TYPES = [
-  { value: "algorithmic", label: "Algorithmic" },
-  { value: "ai_judgment", label: "AI Judgment" },
-  { value: "visual", label: "Visual" },
-  { value: "command", label: "Command" },
-  { value: "ui_bridge", label: "UI Bridge" },
-];
-
-function CreateTemplateForm({
-  onSubmit,
-  onCancel,
-}: {
-  onSubmit: (req: CreatePatternTemplateRequest) => Promise<void>;
-  onCancel: () => void;
-}) {
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [category, setCategory] = useState("other");
-  const [detectionType, setDetectionType] = useState("ai_judgment");
-  const [aiPromptTemplate, setAiPromptTemplate] = useState("");
-  const [parametersStr, setParametersStr] = useState("");
-  const [isSubmitting, setIsSubmitting] = useState(false);
-
-  const handleSubmit = async () => {
-    if (!name.trim() || !description.trim()) return;
-    setIsSubmitting(true);
-    try {
-      // Validate parameters JSON if provided
-      if (parametersStr.trim()) {
-        try {
-          JSON.parse(parametersStr.trim());
-        } catch {
-          // ignore parse error, submit without parameters
-        }
-      }
-
-      await onSubmit({
-        name: name.trim(),
-        description: description.trim(),
-        category,
-        detection_type: detectionType,
-        ai_prompt_template: aiPromptTemplate.trim() || undefined,
-        parameters: parametersStr.trim() || undefined,
-      });
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  return (
-    <div className="border border-primary/30 rounded-lg p-4 space-y-3 bg-card">
-      <div className="flex items-center justify-between">
-        <span className="text-sm font-medium flex items-center gap-2">
-          <Plus className="w-4 h-4 text-primary" />
-          New Pattern Template
-        </span>
-        <button onClick={onCancel} className="p-1 rounded hover:bg-muted text-muted-foreground">
-          <X className="w-4 h-4" />
-        </button>
-      </div>
-
-      {/* Name */}
-      <input
-        type="text"
-        placeholder="Template name"
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        className="w-full px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
-        autoFocus
-      />
-
-      {/* Description */}
-      <textarea
-        placeholder="Describe what this template detects"
-        value={description}
-        onChange={(e) => setDescription(e.target.value)}
-        className="w-full px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50 min-h-[80px] resize-y"
-        rows={3}
-      />
-
-      {/* Row: Category + Detection Type */}
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <label className="text-[10px] text-muted-foreground uppercase tracking-wider">
-            Category
-          </label>
-          <select
-            value={category}
-            onChange={(e) => setCategory(e.target.value)}
-            className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
-          >
-            {TEMPLATE_CATEGORIES.map((c) => (
-              <option key={c.value} value={c.value}>
-                {c.label}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div>
-          <label className="text-[10px] text-muted-foreground uppercase tracking-wider">
-            Detection Type
-          </label>
-          <select
-            value={detectionType}
-            onChange={(e) => setDetectionType(e.target.value)}
-            className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
-          >
-            {TEMPLATE_DETECTION_TYPES.map((d) => (
-              <option key={d.value} value={d.value}>
-                {d.label}
-              </option>
-            ))}
-          </select>
-        </div>
-      </div>
-
-      {/* AI Prompt Template */}
-      <div>
-        <label className="text-[10px] text-muted-foreground uppercase tracking-wider">
-          AI Prompt Template (optional)
-        </label>
-        <textarea
-          placeholder="The prompt the AI uses to detect this pattern..."
-          value={aiPromptTemplate}
-          onChange={(e) => setAiPromptTemplate(e.target.value)}
-          className="w-full mt-0.5 px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50 min-h-[80px] resize-y"
-          rows={3}
-        />
-      </div>
-
-      {/* Parameters JSON */}
-      <div>
-        <label className="text-[10px] text-muted-foreground uppercase tracking-wider">
-          Parameters (optional, JSON array)
-        </label>
-        <textarea
-          placeholder={
-            '[\n  { "name": "threshold", "type": "number", "description": "Detection threshold" }\n]'
-          }
-          value={parametersStr}
-          onChange={(e) => setParametersStr(e.target.value)}
-          className="w-full mt-0.5 px-3 py-2 text-xs font-mono bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50 min-h-[60px] resize-y"
-          rows={3}
-        />
-      </div>
-
-      {/* Actions */}
-      <div className="flex justify-end gap-2 pt-1">
-        <button
-          onClick={onCancel}
-          className="px-3 py-1.5 text-xs rounded-md border border-border hover:bg-muted transition-colors"
-        >
-          Cancel
-        </button>
-        <button
-          onClick={handleSubmit}
-          disabled={!name.trim() || !description.trim() || isSubmitting}
-          className="px-3 py-1.5 text-xs rounded-md bg-primary hover:bg-primary/90 text-primary-foreground disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-        >
-          {isSubmitting ? "Creating..." : "Create Template"}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// ============================================================================
-// Horizontal bar helper
-// ============================================================================
-
-function HorizontalBar({
-  label,
-  count,
-  total,
-  color,
-}: {
-  label: string;
-  count: number;
-  total: number;
-  color: string;
-}) {
-  const pct = total > 0 ? (count / total) * 100 : 0;
-  return (
-    <div className="flex items-center gap-2">
-      <span className="text-[11px] text-muted-foreground w-20 shrink-0 text-right">{label}</span>
-      <div className="flex-1 h-4 rounded bg-white/5 overflow-hidden">
-        {pct > 0 && (
-          <div
-            className={`h-full rounded ${color} transition-all duration-300`}
-            style={{ width: `${Math.max(pct, 2)}%` }}
-          />
-        )}
-      </div>
-      <span className="text-[11px] text-muted-foreground w-8 shrink-0">{count}</span>
-    </div>
-  );
-}
-
-// ============================================================================
-// Analytics section
-// ============================================================================
-
-function AnalyticsSection({ issues }: { issues: KnownIssue[] }) {
-  const [expanded, setExpanded] = useState(false);
-
-  const analytics = useMemo(() => {
-    const total = issues.length;
-    const now = Date.now();
-    const ONE_DAY = 24 * 60 * 60 * 1000;
-
-    // Detection frequency buckets
-    const detectionBuckets = { once: 0, few: 0, several: 0, many: 0 };
-    for (const issue of issues) {
-      const td = issue.times_detected;
-      if (td <= 1) detectionBuckets.once++;
-      else if (td <= 3) detectionBuckets.few++;
-      else if (td <= 9) detectionBuckets.several++;
-      else detectionBuckets.many++;
-    }
-
-    // Confidence distribution
-    const confidenceBuckets = { low: 0, moderate: 0, high: 0, veryHigh: 0 };
-    for (const issue of issues) {
-      const c = issue.confidence;
-      if (c < 0.25) confidenceBuckets.low++;
-      else if (c < 0.5) confidenceBuckets.moderate++;
-      else if (c < 0.75) confidenceBuckets.high++;
-      else confidenceBuckets.veryHigh++;
-    }
-
-    // Age breakdown
-    const ageBuckets = { day: 0, week: 0, month: 0, older: 0 };
-    for (const issue of issues) {
-      const age = now - new Date(issue.created_at).getTime();
-      if (age <= ONE_DAY) ageBuckets.day++;
-      else if (age <= 7 * ONE_DAY) ageBuckets.week++;
-      else if (age <= 30 * ONE_DAY) ageBuckets.month++;
-      else ageBuckets.older++;
-    }
-
-    // Provenance breakdown
-    const provenanceCounts: Record<string, number> = {};
-    for (const issue of issues) {
-      const p = issue.provenance || "unknown";
-      provenanceCounts[p] = (provenanceCounts[p] || 0) + 1;
-    }
-
-    return { total, detectionBuckets, confidenceBuckets, ageBuckets, provenanceCounts };
-  }, [issues]);
-
-  if (issues.length === 0) return null;
-
-  return (
-    <div className="border-b border-border px-6 py-3">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
-      >
-        {expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-        <BarChart2 className="w-4 h-4" />
-        Analytics
-      </button>
-
-      {expanded && (
-        <div className="mt-3 grid grid-cols-2 gap-6">
-          {/* Detection trends */}
-          <div className="space-y-1.5">
-            <h3 className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium mb-2">
-              Detection Frequency
-            </h3>
-            <HorizontalBar
-              label="1 time"
-              count={analytics.detectionBuckets.once}
-              total={analytics.total}
-              color="bg-blue-500"
-            />
-            <HorizontalBar
-              label="2-3 times"
-              count={analytics.detectionBuckets.few}
-              total={analytics.total}
-              color="bg-amber-500"
-            />
-            <HorizontalBar
-              label="4-9 times"
-              count={analytics.detectionBuckets.several}
-              total={analytics.total}
-              color="bg-orange-500"
-            />
-            <HorizontalBar
-              label="10+ times"
-              count={analytics.detectionBuckets.many}
-              total={analytics.total}
-              color="bg-red-500"
-            />
-          </div>
-
-          {/* Confidence distribution */}
-          <div className="space-y-1.5">
-            <h3 className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium mb-2">
-              Confidence Distribution
-            </h3>
-            <HorizontalBar
-              label="Low"
-              count={analytics.confidenceBuckets.low}
-              total={analytics.total}
-              color="bg-red-500"
-            />
-            <HorizontalBar
-              label="Moderate"
-              count={analytics.confidenceBuckets.moderate}
-              total={analytics.total}
-              color="bg-amber-500"
-            />
-            <HorizontalBar
-              label="High"
-              count={analytics.confidenceBuckets.high}
-              total={analytics.total}
-              color="bg-blue-500"
-            />
-            <HorizontalBar
-              label="Very High"
-              count={analytics.confidenceBuckets.veryHigh}
-              total={analytics.total}
-              color="bg-green-500"
-            />
-          </div>
-
-          {/* Age breakdown */}
-          <div className="space-y-1.5">
-            <h3 className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium mb-2">
-              Age Breakdown
-            </h3>
-            <HorizontalBar
-              label="Last 24h"
-              count={analytics.ageBuckets.day}
-              total={analytics.total}
-              color="bg-green-500"
-            />
-            <HorizontalBar
-              label="Last 7d"
-              count={analytics.ageBuckets.week}
-              total={analytics.total}
-              color="bg-blue-500"
-            />
-            <HorizontalBar
-              label="Last 30d"
-              count={analytics.ageBuckets.month}
-              total={analytics.total}
-              color="bg-amber-500"
-            />
-            <HorizontalBar
-              label="Older"
-              count={analytics.ageBuckets.older}
-              total={analytics.total}
-              color="bg-gray-500"
-            />
-          </div>
-
-          {/* Provenance breakdown */}
-          <div className="space-y-1.5">
-            <h3 className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium mb-2">
-              Provenance
-            </h3>
-            {Object.entries(analytics.provenanceCounts)
-              .sort(([, a], [, b]) => b - a)
-              .map(([provenance, count]) => {
-                const colorMap: Record<string, string> = {
-                  manual: "bg-blue-500",
-                  auto_detected: "bg-amber-500",
-                  reflection: "bg-purple-500",
-                  imported: "bg-cyan-500",
-                };
-                return (
-                  <HorizontalBar
-                    key={provenance}
-                    label={provenance.replace(/_/g, " ")}
-                    count={count}
-                    total={analytics.total}
-                    color={colorMap[provenance] || "bg-gray-500"}
-                  />
-                );
-              })}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ============================================================================
-// Main page
-// ============================================================================
-
-export function KnownIssuesPage() {
-  // Data
+export function GlobalIssuesPanel() {
   const [issues, setIssues] = useState<KnownIssue[]>([]);
-  const [templates, setTemplates] = useState<IssuePatternTemplate[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Filters
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("active");
   const [categoryFilter, setCategoryFilter] = useState<string>("all");
   const [severityFilter, setSeverityFilter] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState("");
 
-  // UI state
   const [showForm, setShowForm] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [showTemplates, setShowTemplates] = useState(false);
-  const [formInitialCategory, setFormInitialCategory] = useState<IssueCategory | undefined>();
-  const [showTemplateForm, setShowTemplateForm] = useState(false);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [autoDetectedToast, setAutoDetectedToast] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1014,26 +454,11 @@ export function KnownIssuesPage() {
     }
   }, [statusFilter, categoryFilter, severityFilter]);
 
-  const loadTemplates = useCallback(async () => {
-    try {
-      const result = await invoke<IssuePatternTemplate[]>("list_pattern_templates");
-      setTemplates(result);
-    } catch {
-      // non-critical
-    }
-  }, []);
-
   useEffect(() => {
     loadIssues();
   }, [loadIssues]);
 
-  useEffect(() => {
-    if (showTemplates && templates.length === 0) {
-      loadTemplates();
-    }
-  }, [showTemplates, templates.length, loadTemplates]);
-
-  // Listen for auto-detected known issues from the loop controller
+  // Listen for auto-detected known issues
   useEffect(() => {
     const unlisten = listen<{ count: number; issue_ids: string[] }>(
       "known-issues-auto-detected",
@@ -1044,9 +469,7 @@ export function KnownIssuesPage() {
             ? "1 new known issue auto-detected from recurring findings"
             : `${count} new known issues auto-detected from recurring findings`;
         setAutoDetectedToast(msg);
-        // Auto-dismiss after 8 seconds
         setTimeout(() => setAutoDetectedToast(null), 8000);
-        // Refresh the issues list
         loadIssues();
       },
     );
@@ -1071,13 +494,12 @@ export function KnownIssuesPage() {
   // ------ Stats ------
 
   const stats = useMemo(() => {
-    const all = issues;
     return {
-      total: all.length,
-      critical: all.filter((i) => i.severity === "critical" && i.status === "active").length,
-      high: all.filter((i) => i.severity === "high" && i.status === "active").length,
-      medium: all.filter((i) => i.severity === "medium" && i.status === "active").length,
-      low: all.filter((i) => i.severity === "low" && i.status === "active").length,
+      total: issues.length,
+      critical: issues.filter((i) => i.severity === "critical" && i.status === "active").length,
+      high: issues.filter((i) => i.severity === "high" && i.status === "active").length,
+      medium: issues.filter((i) => i.severity === "medium" && i.status === "active").length,
+      low: issues.filter((i) => i.severity === "low" && i.status === "active").length,
     };
   }, [issues]);
 
@@ -1088,7 +510,6 @@ export function KnownIssuesPage() {
       try {
         await invoke("create_known_issue", { request: req });
         setShowForm(false);
-        setFormInitialCategory(undefined);
         await loadIssues();
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
@@ -1100,10 +521,7 @@ export function KnownIssuesPage() {
   const handleResolve = useCallback(
     async (id: string) => {
       try {
-        await invoke("resolve_known_issue", {
-          id,
-          resolution: "Resolved from Known Issues page",
-        });
+        await invoke("resolve_known_issue", { id, resolution: "Resolved from Specs page" });
         await loadIssues();
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
@@ -1132,10 +550,7 @@ export function KnownIssuesPage() {
   const handleBulkResolve = useCallback(async () => {
     for (const id of selectedIds) {
       try {
-        await invoke("resolve_known_issue", {
-          id,
-          resolution: "Bulk resolved from Known Issues page",
-        });
+        await invoke("resolve_known_issue", { id, resolution: "Bulk resolved from Specs page" });
       } catch {
         // continue with others
       }
@@ -1167,30 +582,6 @@ export function KnownIssuesPage() {
       return next;
     });
   }, []);
-
-  const handleUseTemplate = useCallback((template: IssuePatternTemplate) => {
-    setFormInitialCategory(
-      (ISSUE_CATEGORIES.find((c) => c.value === template.category)
-        ? template.category
-        : "other") as IssueCategory,
-    );
-    setShowForm(true);
-    // Scroll to top
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  }, []);
-
-  const handleCreateTemplate = useCallback(
-    async (req: CreatePatternTemplateRequest) => {
-      try {
-        await invoke("create_pattern_template", { request: req });
-        setShowTemplateForm(false);
-        await loadTemplates();
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-      }
-    },
-    [loadTemplates],
-  );
 
   // ------ Export / Import ------
 
@@ -1233,7 +624,6 @@ export function KnownIssuesPage() {
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       } finally {
-        // Reset file input so the same file can be re-selected
         if (fileInputRef.current) {
           fileInputRef.current.value = "";
         }
@@ -1242,7 +632,7 @@ export function KnownIssuesPage() {
     [loadIssues],
   );
 
-  // ------ Pill button helper ------
+  // ------ Pill helper ------
 
   const pillClass = (active: boolean) =>
     `px-3 py-1 text-xs rounded-full font-medium transition-colors ${
@@ -1258,53 +648,41 @@ export function KnownIssuesPage() {
   return (
     <div className="h-full flex flex-col overflow-hidden">
       {/* Header */}
-      <div className="shrink-0 border-b border-border px-6 py-4">
+      <div className="shrink-0 border-b border-border px-4 py-3">
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <Bug className="w-5 h-5 text-amber-400" />
-            <h1 className="text-lg font-semibold">Known Issues</h1>
-            <div className="flex items-center gap-2 ml-2">
-              <span className="text-xs px-2 py-0.5 rounded-full bg-white/10 text-muted-foreground">
-                {stats.total} total
+          <div className="flex items-center gap-2">
+            <Bug className="w-4 h-4 text-amber-400" />
+            <span className="text-sm font-semibold">All Issues</span>
+            <div className="flex items-center gap-1.5 ml-1">
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/10 text-muted-foreground">
+                {stats.total}
               </span>
               {stats.critical > 0 && (
-                <span className="text-xs px-2 py-0.5 rounded-full bg-red-500/15 text-red-400">
-                  {stats.critical} critical
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-500/15 text-red-400">
+                  {stats.critical} crit
                 </span>
               )}
               {stats.high > 0 && (
-                <span className="text-xs px-2 py-0.5 rounded-full bg-orange-500/15 text-orange-400">
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-orange-500/15 text-orange-400">
                   {stats.high} high
-                </span>
-              )}
-              {stats.medium > 0 && (
-                <span className="text-xs px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400">
-                  {stats.medium} medium
-                </span>
-              )}
-              {stats.low > 0 && (
-                <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/15 text-blue-400">
-                  {stats.low} low
                 </span>
               )}
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
             <button
               onClick={handleExport}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-border hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+              className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
               title="Export issues as JSON"
             >
-              <Download className="w-4 h-4" />
-              Export
+              <Download className="w-3.5 h-3.5" />
             </button>
             <button
               onClick={() => fileInputRef.current?.click()}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-border hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+              className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
               title="Import issues from JSON"
             >
-              <Upload className="w-4 h-4" />
-              Import
+              <Upload className="w-3.5 h-3.5" />
             </button>
             <input
               ref={fileInputRef}
@@ -1315,26 +693,20 @@ export function KnownIssuesPage() {
             />
             {!showForm && (
               <button
-                onClick={() => {
-                  setFormInitialCategory(undefined);
-                  setShowForm(true);
-                }}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+                onClick={() => setShowForm(true)}
+                className="flex items-center gap-1 px-2 py-1 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
               >
-                <Plus className="w-4 h-4" />
-                New Issue
+                <Plus className="w-3 h-3" />
+                New
               </button>
             )}
           </div>
         </div>
       </div>
 
-      {/* Analytics */}
-      <AnalyticsSection issues={issues} />
-
       {/* Filters bar */}
-      <div className="shrink-0 border-b border-border px-6 py-3">
-        <div className="flex items-center gap-4 flex-wrap">
+      <div className="shrink-0 border-b border-border px-4 py-2">
+        <div className="flex items-center gap-3 flex-wrap">
           {/* Status pills */}
           <div className="flex items-center gap-1">
             {(["all", "active", "resolved", "monitoring"] as StatusFilter[]).map((s) => (
@@ -1348,7 +720,6 @@ export function KnownIssuesPage() {
             ))}
           </div>
 
-          {/* Category select */}
           <select
             value={categoryFilter}
             onChange={(e) => setCategoryFilter(e.target.value)}
@@ -1362,7 +733,6 @@ export function KnownIssuesPage() {
             ))}
           </select>
 
-          {/* Severity select */}
           <select
             value={severityFilter}
             onChange={(e) => setSeverityFilter(e.target.value)}
@@ -1376,12 +746,11 @@ export function KnownIssuesPage() {
             ))}
           </select>
 
-          {/* Search */}
-          <div className="flex items-center gap-1 flex-1 min-w-[180px] max-w-[320px]">
+          <div className="flex items-center gap-1 flex-1 min-w-[140px] max-w-[240px]">
             <Search className="w-3.5 h-3.5 text-muted-foreground" />
             <input
               type="text"
-              placeholder="Search issues..."
+              placeholder="Search..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="flex-1 px-2 py-1 text-xs bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
@@ -1390,21 +759,21 @@ export function KnownIssuesPage() {
 
           {/* Bulk actions */}
           {selectedIds.size > 0 && (
-            <div className="flex items-center gap-2 ml-auto">
-              <span className="text-xs text-muted-foreground">{selectedIds.size} selected</span>
+            <div className="flex items-center gap-1.5 ml-auto">
+              <span className="text-[10px] text-muted-foreground">{selectedIds.size} sel.</span>
               <button
                 onClick={handleBulkResolve}
                 className="flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-green-500/30 text-green-400 hover:bg-green-500/10 transition-colors"
               >
                 <CheckCircle2 className="w-3 h-3" />
-                Resolve Selected
+                Resolve
               </button>
               <button
                 onClick={handleBulkDelete}
                 className="flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-red-500/30 text-red-400 hover:bg-red-500/10 transition-colors"
               >
                 <Trash2 className="w-3 h-3" />
-                Delete Selected
+                Delete
               </button>
             </div>
           )}
@@ -1412,7 +781,7 @@ export function KnownIssuesPage() {
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+      <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
         {/* Error */}
         {error && (
           <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
@@ -1441,7 +810,7 @@ export function KnownIssuesPage() {
           </div>
         )}
 
-        {/* Auto-detected known issues toast */}
+        {/* Auto-detected toast */}
         {autoDetectedToast && (
           <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-400 text-sm">
             <Sparkles className="w-4 h-4 shrink-0" />
@@ -1459,11 +828,7 @@ export function KnownIssuesPage() {
         {showForm && (
           <CreateIssueForm
             onSubmit={handleCreate}
-            onCancel={() => {
-              setShowForm(false);
-              setFormInitialCategory(undefined);
-            }}
-            initialCategory={formInitialCategory}
+            onCancel={() => setShowForm(false)}
           />
         )}
 
@@ -1502,57 +867,6 @@ export function KnownIssuesPage() {
               onDelete={() => handleDelete(issue.id)}
             />
           ))}
-        </div>
-
-        {/* Pattern Templates section */}
-        <div className="border-t border-border pt-4 mt-6">
-          <div className="flex items-center justify-between">
-            <button
-              onClick={() => setShowTemplates(!showTemplates)}
-              className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
-            >
-              {showTemplates ? (
-                <ChevronDown className="w-4 h-4" />
-              ) : (
-                <ChevronRight className="w-4 h-4" />
-              )}
-              <Layers className="w-4 h-4" />
-              Pattern Templates
-              {templates.length > 0 && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/10">
-                  {templates.length}
-                </span>
-              )}
-            </button>
-            {showTemplates && !showTemplateForm && (
-              <button
-                onClick={() => setShowTemplateForm(true)}
-                className="flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md border border-border hover:bg-primary/10 hover:text-primary hover:border-primary/30 transition-colors"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                Create Template
-              </button>
-            )}
-          </div>
-
-          {showTemplates && (
-            <div className="mt-3 space-y-2">
-              {showTemplateForm && (
-                <CreateTemplateForm
-                  onSubmit={handleCreateTemplate}
-                  onCancel={() => setShowTemplateForm(false)}
-                />
-              )}
-              {templates.length === 0 && !showTemplateForm && (
-                <p className="text-xs text-muted-foreground py-4 text-center">
-                  No pattern templates available.
-                </p>
-              )}
-              {templates.map((t) => (
-                <TemplateCard key={t.id} template={t} onUse={handleUseTemplate} />
-              ))}
-            </div>
-          )}
         </div>
       </div>
     </div>

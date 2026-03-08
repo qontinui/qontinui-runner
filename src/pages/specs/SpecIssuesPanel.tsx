@@ -24,31 +24,7 @@ import type {
   KnownIssueSeverity,
 } from "@qontinui/shared-types";
 import { ISSUE_CATEGORIES, ISSUE_SEVERITIES } from "@qontinui/shared-types";
-
-// ============================================================================
-// Sub-components
-// ============================================================================
-
-const SEVERITY_STYLES: Record<string, string> = {
-  critical: "bg-red-500/15 text-red-400 border-red-500/30",
-  high: "bg-orange-500/15 text-orange-400 border-orange-500/30",
-  medium: "bg-amber-500/15 text-amber-400 border-amber-500/30",
-  low: "bg-blue-500/15 text-blue-400 border-blue-500/30",
-};
-
-const CATEGORY_STYLES: Record<string, string> = {
-  duplication: "bg-purple-500/15 text-purple-400 border-purple-500/30",
-  rendering: "bg-cyan-500/15 text-cyan-400 border-cyan-500/30",
-  data_integrity: "bg-green-500/15 text-green-400 border-green-500/30",
-  timing: "bg-yellow-500/15 text-yellow-400 border-yellow-500/30",
-  state: "bg-indigo-500/15 text-indigo-400 border-indigo-500/30",
-  layout: "bg-pink-500/15 text-pink-400 border-pink-500/30",
-  performance: "bg-orange-500/15 text-orange-400 border-orange-500/30",
-  encoding: "bg-teal-500/15 text-teal-400 border-teal-500/30",
-  navigation: "bg-sky-500/15 text-sky-400 border-sky-500/30",
-  authentication: "bg-red-500/15 text-red-400 border-red-500/30",
-  other: "bg-gray-500/15 text-gray-400 border-gray-500/30",
-};
+import { SEVERITY_STYLES, CATEGORY_STYLES } from "./issue-styles";
 
 function Badge({ text, style }: { text: string; style?: string }) {
   return (
@@ -285,9 +261,10 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
 interface SpecIssuesPanelProps {
   specId: string;
   pageUrl?: string;
+  onViewAllIssues?: () => void;
 }
 
-export function SpecIssuesPanel({ specId, pageUrl }: SpecIssuesPanelProps) {
+export function SpecIssuesPanel({ specId, pageUrl, onViewAllIssues }: SpecIssuesPanelProps) {
   const { issues, isLoading, error, loadIssuesForSpec, createIssue, resolveIssue, deleteIssue } =
     useKnownIssues();
   const [showForm, setShowForm] = useState(false);
@@ -380,6 +357,18 @@ export function SpecIssuesPanel({ specId, pageUrl }: SpecIssuesPanelProps) {
 
       {/* Resolved issues (collapsed) */}
       {resolvedIssues.length > 0 && <ResolvedSection issues={resolvedIssues} />}
+
+      {/* Link to global view */}
+      {onViewAllIssues && (
+        <div className="border-t border-border pt-2 mt-2">
+          <button
+            onClick={onViewAllIssues}
+            className="text-xs text-muted-foreground hover:text-primary transition-colors"
+          >
+            View all issues across specs
+          </button>
+        </div>
+      )}
     </div>
   );
 }

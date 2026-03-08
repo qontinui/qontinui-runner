@@ -40,6 +40,7 @@ import {
 } from "lucide-react";
 import type { LoadedSpec } from "./types";
 import { SpecIssuesPanel } from "./SpecIssuesPanel";
+import { GlobalIssuesPanel } from "./GlobalIssuesPanel";
 import type {
   SpecGroup,
   SpecAssertion,
@@ -2368,6 +2369,7 @@ interface SpecDetailPanelProps {
   onAddGroup?: (specId: string, group: SpecGroup) => void;
   onRemoveGroup?: (specId: string, groupId: string) => void;
   onUpdateSetupActions?: (specId: string, groupId: string, actions: SetupAction[]) => void;
+  onClearSelection?: () => void;
 }
 
 export function SpecDetailPanel({
@@ -2381,15 +2383,12 @@ export function SpecDetailPanel({
   onAddGroup,
   onRemoveGroup,
   onUpdateSetupActions,
+  onClearSelection,
 }: SpecDetailPanelProps) {
   const [activeTab, setActiveTab] = useState<"assertions" | "issues">("assertions");
 
   if (!selectedSpec) {
-    return (
-      <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
-        Select a spec or group from the sidebar
-      </div>
-    );
+    return <GlobalIssuesPanel />;
   }
 
   if (selectionType === "group" && selectedGroup && selectedSpec.kind === "page-spec") {
@@ -2475,7 +2474,7 @@ export function SpecDetailPanel({
             />
           )}
           {activeTab === "issues" && (
-            <SpecIssuesPanel specId={selectedSpec.specId} pageUrl={pageUrl} />
+            <SpecIssuesPanel specId={selectedSpec.specId} pageUrl={pageUrl} onViewAllIssues={onClearSelection} />
           )}
         </div>
       </div>
