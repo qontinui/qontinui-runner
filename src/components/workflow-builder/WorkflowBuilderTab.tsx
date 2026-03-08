@@ -40,6 +40,7 @@ import {
   MoreHorizontal,
   ExternalLink,
   PanelLeft,
+  Star,
 } from "lucide-react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import type {
@@ -1113,6 +1114,9 @@ function WorkflowBuilderContent({
   const [workflowsLoading, setWorkflowsLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
 
+  // Favorites filter
+  const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
+
   // Workflow selection mode state (for batch delete)
   const [isWorkflowSelectionMode, setIsWorkflowSelectionMode] = useState(false);
   const [selectedWorkflowIds, setSelectedWorkflowIds] = useState<Set<string>>(new Set());
@@ -1177,6 +1181,27 @@ function WorkflowBuilderContent({
       fetchWorkflows();
     }
   }, [state.isSaving, state.workflow.id, fetchWorkflows]);
+
+  // Toggle favorite on a workflow
+  const toggleFavorite = useCallback(async (workflowId: string) => {
+    try {
+      const response = await tracedFetch(
+        `${getApiBase()}/unified-workflows/${workflowId}/favorite`,
+        { method: "POST" },
+      );
+      const result = await response.json();
+      if (result.success) {
+        const newState = result.data.is_favorite;
+        setSavedWorkflows((prev) =>
+          prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: newState } : w)),
+        );
+      }
+    } catch (error) {
+      console.error("Failed to toggle favorite:", error);
+    }
+  }, []);
+
+  const hasFavorites = savedWorkflows.some((w) => w.is_favorite);
 
   // Toggle workflow selection for batch delete
   const toggleWorkflowSelection = useCallback((workflowId: string) => {
@@ -1507,15 +1532,22 @@ function WorkflowBuilderContent({
   }, []);
 
   // Filter workflows
-  const filteredWorkflows = savedWorkflows.filter((w) => {
-    if (!searchQuery) return true;
-    const query = searchQuery.toLowerCase();
-    return (
-      w.name.toLowerCase().includes(query) ||
-      w.description?.toLowerCase().includes(query) ||
-      w.category?.toLowerCase().includes(query)
-    );
-  });
+  const filteredWorkflows = savedWorkflows
+    .filter((w) => {
+      if (showFavoritesOnly && !w.is_favorite) return false;
+      if (!searchQuery) return true;
+      const query = searchQuery.toLowerCase();
+      return (
+        w.name.toLowerCase().includes(query) ||
+        w.description?.toLowerCase().includes(query) ||
+        w.category?.toLowerCase().includes(query)
+      );
+    })
+    .sort((a, b) => {
+      const favA = a.is_favorite ? 1 : 0;
+      const favB = b.is_favorite ? 1 : 0;
+      return favB - favA;
+    });
 
   // Select a workflow for editing
   const selectWorkflow = async (workflow: UnifiedWorkflow) => {
@@ -2101,6 +2133,20 @@ function WorkflowBuilderContent({
                 className="w-full pl-9 pr-3 py-2 bg-muted border border-border rounded-lg text-sm focus:outline-none focus:border-border"
               />
             </div>
+            {/* Favorites filter */}
+            {hasFavorites && (
+              <button
+                onClick={() => setShowFavoritesOnly((prev) => !prev)}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+                  showFavoritesOnly
+                    ? "bg-amber-500/20 text-amber-400 border border-amber-500/50"
+                    : "bg-white/5 text-muted-foreground border border-transparent hover:bg-white/10"
+                }`}
+              >
+                <Star className={`w-3 h-3 ${showFavoritesOnly ? "fill-amber-400" : ""}`} />
+                Favorites
+              </button>
+            )}
           </div>
 
           {/* Selection Mode Header */}
@@ -2178,7 +2224,20 @@ function WorkflowBuilderContent({
                       </div>
                     )}
                     <div className="flex-1 min-w-0">
-                      <div className="font-medium text-sm truncate">{workflow.name}</div>
+                      <div className="flex items-center gap-1.5">
+                        {!isWorkflowSelectionMode && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); toggleFavorite(workflow.id); }}
+                            className="flex-shrink-0 p-0.5 rounded transition-colors hover:bg-white/10"
+                            title={workflow.is_favorite ? "Remove from favorites" : "Add to favorites"}
+                          >
+                            <Star
+                              className={`w-3.5 h-3.5 ${workflow.is_favorite ? "text-amber-400 fill-amber-400" : "text-muted-foreground"}`}
+                            />
+                          </button>
+                        )}
+                        <div className="font-medium text-sm truncate">{workflow.name}</div>
+                      </div>
                       {workflow.description && (
                         <div className="text-xs text-muted-foreground truncate mt-0.5">
                           {workflow.description}

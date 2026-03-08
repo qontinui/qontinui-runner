@@ -1789,6 +1789,7 @@ pub async fn execute_inline_workflow(
         approval_gate: false,
         reflection_mode: false,
         completion_prompts_first: false,
+        is_favorite: false,
         model_overrides: std::collections::HashMap::new(),
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -2411,6 +2412,31 @@ pub async fn run_composed_workflow(
 }
 
 // ============================================================================
+// Favorite Toggle API
+// ============================================================================
+
+async fn toggle_favorite_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let new_state = state
+        .app_state
+        .checkpoint_db
+        .toggle_unified_workflow_favorite(&id)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to toggle favorite: {}", e))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "id": id,
+        "is_favorite": new_state,
+    }))))
+}
+
+// ============================================================================
 // Example Status API
 // ============================================================================
 
@@ -2514,5 +2540,9 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/unified-workflows/:id/example-status",
             axum::routing::put(update_example_status_handler),
+        )
+        .route(
+            "/unified-workflows/:id/favorite",
+            axum::routing::post(toggle_favorite_handler),
         )
 }

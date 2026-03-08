@@ -6,7 +6,7 @@
  * and execute the entire sequence.
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { Play, RefreshCw, Trash2, Loader2, Settings2, ChevronRight } from "lucide-react";
 import { WorkflowLibraryPanel } from "./WorkflowLibraryPanel";
 import { WorkflowQueuePanel } from "./WorkflowQueuePanel";
@@ -71,6 +71,9 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
       return next;
     });
   }, []);
+
+  // Favorites filter
+  const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
 
   // Execution state
   const [isExecuting, setIsExecuting] = useState(false);
@@ -157,6 +160,35 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
     fetchWorkflows();
   }, [fetchWorkflows]);
 
+  // Toggle favorite on a workflow
+  const toggleFavorite = useCallback(async (workflowId: string) => {
+    try {
+      const response = await tracedFetch(
+        `${getApiBase()}/unified-workflows/${workflowId}/favorite`,
+        { method: "POST" },
+      );
+      const result = await response.json();
+      if (result.success) {
+        const newState = result.data.is_favorite;
+        setWorkflows((prev) =>
+          prev.map((w) => (w.id === workflowId ? { ...w, is_favorite: newState } : w)),
+        );
+      }
+    } catch (error) {
+      console.error("Failed to toggle favorite:", error);
+    }
+  }, []);
+
+  // Check if any workflows are favorited
+  const hasFavorites = useMemo(() => workflows.some((w) => w.is_favorite), [workflows]);
+
+  // Auto-enable favorites filter when favorites exist on first load
+  useEffect(() => {
+    if (hasFavorites && workflows.length > 0 && !loading) {
+      setShowFavoritesOnly(true);
+    }
+  }, [hasFavorites, workflows.length, loading]);
+
   // Queue operations
   const addToQueue = useCallback((workflow: WorkflowWithStats) => {
     setQueue((prev) => [
@@ -226,7 +258,8 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
       w.name.toLowerCase().includes(search.toLowerCase()) ||
       w.description.toLowerCase().includes(search.toLowerCase());
     const matchesCategory = category === "all" || w.category === category;
-    return matchesSearch && matchesCategory;
+    const matchesFavorites = !showFavoritesOnly || w.is_favorite;
+    return matchesSearch && matchesCategory && matchesFavorites;
   });
 
   // Get unique categories
@@ -269,6 +302,10 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
               onAddToQueue={addToQueue}
               queuedIds={queuedIds}
               onCollapse={toggleLibrary}
+              showFavoritesOnly={showFavoritesOnly}
+              onToggleFavoritesFilter={() => setShowFavoritesOnly((prev) => !prev)}
+              onToggleFavorite={toggleFavorite}
+              hasFavorites={hasFavorites}
             />
           </div>
         ) : (

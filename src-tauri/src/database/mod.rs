@@ -4579,10 +4579,27 @@ impl CheckpointDb {
         // Version 59: Reflection deduplication, auto-apply support, and stale fix archival
         if current_version < 59 {
             info!("Migrating database to version 59 (reflection dedup & auto-apply)");
+
+            // Check if content_hash column already exists (idempotent migration)
+            let column_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('reflection_fixes') WHERE name = 'content_hash'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|count| count > 0)
+                .unwrap_or(false);
+
+            if !column_exists {
+                conn.execute(
+                    "ALTER TABLE reflection_fixes ADD COLUMN content_hash TEXT",
+                    [],
+                )
+                .map_err(|e| format!("Failed to add content_hash column: {}", e))?;
+            }
+
             conn.execute_batch(
                 r#"
-                -- Add content_hash column for deduplication
-                ALTER TABLE reflection_fixes ADD COLUMN content_hash TEXT;
                 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_content_hash ON reflection_fixes(content_hash);
 
                 -- Archive stale template variable resolution fixes (resolved by code fix)
@@ -4597,21 +4614,6 @@ impl CheckpointDb {
                 -- Archive duplicate finding dedup instruction fixes (issue resolved)
                 UPDATE reflection_fixes SET status = 'superseded'
                 WHERE fix_description LIKE '%duplicate%FINDING%' AND status = 'applied';
-
-                -- Best practice knowledge entry: verification plans must include feature-specific checks
-                INSERT OR IGNORE INTO task_knowledge (id, task_run_id, category, agent_type, iteration, content, confidence, related_files, is_resolved, created_at)
-                VALUES (
-                    'best-practice-verification-plans',
-                    'e2a404ce-9fbb-467d-8d86-789340069ff5',
-                    'recurring_pattern',
-                    'reflection',
-                    1,
-                    'Verification plans for feature-implementation workflows MUST include feature-specific checks (element presence, tab visibility, component rendering) in addition to compilation/lint gates. Compilation-only verification causes premature completion when the AI fixes pre-existing errors without implementing features.',
-                    'high',
-                    '[]',
-                    0,
-                    datetime('now')
-                );
 
                 INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (59, datetime('now'));
                 "#,
@@ -6008,6 +6010,23 @@ impl CheckpointDb {
             info!(
                 "Successfully migrated to version 91 (known issues registry + pattern templates)"
             );
+        }
+
+        if (1..92).contains(&current_version) {
+            info!("Migrating database to version 92 (workflow favorites)");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN is_favorite INTEGER DEFAULT 0;
+
+                CREATE INDEX IF NOT EXISTS idx_unified_workflows_is_favorite ON unified_workflows(is_favorite);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (92, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 92: {}", e))?;
+
+            info!("Successfully migrated to version 92 (workflow favorites)");
         }
 
         Ok(())
@@ -12240,9 +12259,9 @@ impl CheckpointDb {
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                        stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
-                       completion_prompts_first
+                       completion_prompts_first, is_favorite
                 FROM unified_workflows
-                ORDER BY updated_at DESC
+                ORDER BY is_favorite DESC, updated_at DESC
                 "#,
             )
             .map_err(|e| format!("Failed to prepare statement: {}", e))?;
@@ -12321,6 +12340,7 @@ impl CheckpointDb {
                     },
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
+                    is_favorite: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -12348,7 +12368,7 @@ impl CheckpointDb {
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
-                   completion_prompts_first
+                   completion_prompts_first, is_favorite
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -12424,6 +12444,7 @@ impl CheckpointDb {
                     },
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
+                    is_favorite: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -12453,7 +12474,7 @@ impl CheckpointDb {
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
-                   completion_prompts_first
+                   completion_prompts_first, is_favorite
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -12531,6 +12552,7 @@ impl CheckpointDb {
                     },
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
+                    is_favorite: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -12968,7 +12990,7 @@ impl CheckpointDb {
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
-                   completion_prompts_first
+                   completion_prompts_first, is_favorite
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -12993,7 +13015,7 @@ impl CheckpointDb {
             params_vec.push(format!("%\"{}%", tag));
         }
 
-        sql.push_str(" ORDER BY updated_at DESC");
+        sql.push_str(" ORDER BY is_favorite DESC, updated_at DESC");
 
         let mut stmt = conn
             .prepare(&sql)
@@ -13078,6 +13100,7 @@ impl CheckpointDb {
                     },
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
+                    is_favorite: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -13136,6 +13159,28 @@ impl CheckpointDb {
         self.create_unified_workflow(&create_request)
     }
 
+    /// Toggle the is_favorite flag on a unified workflow.
+    /// Returns the new favorite state.
+    pub fn toggle_unified_workflow_favorite(&self, id: &str) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+
+        conn.execute(
+            "UPDATE unified_workflows SET is_favorite = CASE WHEN is_favorite = 1 THEN 0 ELSE 1 END WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| format!("Failed to toggle favorite: {}", e))?;
+
+        let new_state: bool = conn
+            .query_row(
+                "SELECT is_favorite FROM unified_workflows WHERE id = ?1",
+                params![id],
+                |row| Ok(row.get::<_, i32>(0)? != 0),
+            )
+            .map_err(|e| format!("Failed to read favorite state: {}", e))?;
+
+        Ok(new_state)
+    }
+
     // ========================================================================
     // Workflow Sync Helpers
     // ========================================================================
@@ -13156,7 +13201,7 @@ impl CheckpointDb {
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep,
                        max_sweep_iterations, stages, stop_on_failure, reflection_mode, model_overrides,
-                       approval_gate, completion_prompts_first
+                       approval_gate, completion_prompts_first, is_favorite
                 FROM unified_workflows
                 WHERE sync_pending = 1
                 "#,
@@ -13237,6 +13282,7 @@ impl CheckpointDb {
                     },
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
+                    is_favorite: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
                     targeted_error_ids: vec![],
                 })
             })
@@ -15843,7 +15889,7 @@ impl CheckpointDb {
                        disabled_context_ids, auto_include_contexts, prompt_template,
                        generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                        stages, stop_on_failure, reflection_mode, sync_pending, example_status,
-                       model_overrides, approval_gate, completion_prompts_first
+                       model_overrides, approval_gate, completion_prompts_first, is_favorite
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -15933,6 +15979,7 @@ impl CheckpointDb {
                     "model_overrides": model_overrides,
                     "approval_gate": row.get::<_, Option<i64>>(34)?,
                     "completion_prompts_first": row.get::<_, Option<i64>>(35)?,
+                    "is_favorite": row.get::<_, Option<i64>>(36)?,
                 }))
             })
             .map_err(|e| format!("Failed to export unified workflows: {}", e))?
@@ -16436,6 +16483,7 @@ impl CheckpointDb {
             let reflection_mode = workflow["reflection_mode"].as_i64().unwrap_or(1);
             let completion_prompts_first =
                 workflow["completion_prompts_first"].as_i64().unwrap_or(0);
+            let is_favorite = workflow["is_favorite"].as_i64().unwrap_or(0);
             let sync_pending = workflow["sync_pending"].as_i64().unwrap_or(0);
             let example_status = workflow["example_status"].as_str().unwrap_or("pending");
 
@@ -16450,12 +16498,12 @@ impl CheckpointDb {
                     disabled_context_ids, auto_include_contexts, prompt_template,
                     generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                     stages, stop_on_failure, approval_gate, reflection_mode, completion_prompts_first,
-                    sync_pending, example_status
+                    is_favorite, sync_pending, example_status
                 )
                 VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                    ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
+                    ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36
                 )
                 "#,
                 params![
@@ -16492,6 +16540,7 @@ impl CheckpointDb {
                     approval_gate,
                     reflection_mode,
                     completion_prompts_first,
+                    is_favorite,
                     sync_pending,
                     example_status
                 ],

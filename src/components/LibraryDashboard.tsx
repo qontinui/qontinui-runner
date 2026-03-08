@@ -22,6 +22,7 @@ import {
   ChevronRight,
   Filter,
   CheckCircle,
+  Star,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { isDevelopmentMode } from "qontinui-navigation";
@@ -49,6 +50,7 @@ interface DashboardItem {
   tags?: string[];
   modifiedAt: string;
   createdAt: string;
+  isFavorite?: boolean;
 }
 
 // Raw API response item (flexible shape from various endpoints)
@@ -70,6 +72,7 @@ interface ApiResponseItem {
   enabled?: boolean;
   check_type?: string;
   tool?: string;
+  is_favorite?: boolean;
 }
 
 // Normalize tags from API response (can be JSON string or array)
@@ -160,6 +163,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<ItemType | "all">("all");
+  const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
 
   // Fetch all items from all categories
   const fetchAllItems = useCallback(async () => {
@@ -311,6 +315,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
             tags: normalizeTags(item.tags),
             modifiedAt: item.modified_at || item.updated_at || item.created_at,
             createdAt: item.created_at,
+            isFavorite: item.is_favorite,
           });
         });
       }
@@ -369,9 +374,40 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
     fetchAllItems();
   }, [fetchAllItems]);
 
+  // Toggle favorite on a workflow
+  const toggleFavorite = useCallback(async (itemId: string) => {
+    try {
+      const response = await tracedFetch(
+        `${getApiBase()}/unified-workflows/${itemId}/favorite`,
+        { method: "POST" },
+      );
+      const result = await response.json();
+      if (result.success) {
+        const newState = result.data.is_favorite;
+        setItems((prev) =>
+          prev.map((item) =>
+            item.id === itemId ? { ...item, isFavorite: newState } : item,
+          ),
+        );
+      }
+    } catch (error) {
+      console.error("Failed to toggle favorite:", error);
+    }
+  }, []);
+
+  const hasFavorites = useMemo(
+    () => items.some((item) => item.type === "unified-workflow" && item.isFavorite),
+    [items],
+  );
+
   // Filter and sort items
   const filteredItems = useMemo(() => {
     let result = [...items];
+
+    // Filter by favorites
+    if (showFavoritesOnly) {
+      result = result.filter((item) => item.type === "unified-workflow" && item.isFavorite);
+    }
 
     // Filter by type
     if (typeFilter !== "all") {
@@ -390,15 +426,18 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       );
     }
 
-    // Sort by modified date (most recent first)
+    // Sort favorites first, then by modified date
     result.sort((a, b) => {
+      const favA = a.isFavorite ? 1 : 0;
+      const favB = b.isFavorite ? 1 : 0;
+      if (favA !== favB) return favB - favA;
       const dateA = new Date(a.modifiedAt || a.createdAt).getTime();
       const dateB = new Date(b.modifiedAt || b.createdAt).getTime();
       return dateB - dateA;
     });
 
     return result;
-  }, [items, typeFilter, searchQuery]);
+  }, [items, typeFilter, searchQuery, showFavoritesOnly]);
 
   // Group items by type for the type filter counts
   const typeCounts = useMemo(() => {
@@ -484,6 +523,19 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
         {/* Type filters */}
         <div className="flex items-center gap-2 overflow-x-auto pb-1">
           <Filter className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+          {hasFavorites && (
+            <button
+              onClick={() => setShowFavoritesOnly((prev) => !prev)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-colors whitespace-nowrap ${
+                showFavoritesOnly
+                  ? "bg-amber-500/20 text-amber-400 border border-amber-500/50"
+                  : "bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground border border-transparent"
+              }`}
+            >
+              <Star className={`w-3.5 h-3.5 ${showFavoritesOnly ? "fill-amber-400" : ""}`} />
+              Favorites
+            </button>
+          )}
           {availableTypes.map((type) => {
             const isAll = type === "all";
             const config = isAll ? null : CATEGORY_CONFIG[type];
@@ -575,6 +627,19 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
                         </span>
                       </div>
                     </div>
+
+                    {/* Star toggle for workflows */}
+                    {item.type === "unified-workflow" && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); toggleFavorite(item.id); }}
+                        className="flex-shrink-0 p-1 rounded transition-colors hover:bg-white/10 mt-0.5"
+                        title={item.isFavorite ? "Remove from favorites" : "Add to favorites"}
+                      >
+                        <Star
+                          className={`w-4 h-4 ${item.isFavorite ? "text-amber-400 fill-amber-400" : "text-border group-hover:text-muted-foreground"}`}
+                        />
+                      </button>
+                    )}
 
                     {/* Arrow */}
                     <ChevronRight className="w-4 h-4 text-border group-hover:text-muted-foreground transition-colors flex-shrink-0 mt-1" />

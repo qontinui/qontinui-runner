@@ -371,6 +371,10 @@ pub struct UnifiedWorkflow {
     #[serde(default)]
     pub completion_prompts_first: bool,
 
+    /// Whether this workflow is marked as a favorite for quick access.
+    #[serde(default)]
+    pub is_favorite: bool,
+
     /// ISO 8601 timestamp of creation
     #[serde(default)]
     pub created_at: String,

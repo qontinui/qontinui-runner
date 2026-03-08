@@ -422,7 +422,8 @@ mod tests {
                 "agentic_steps": [
                     {"id": "a1", "name": "Fix issues", "step_type": "prompt", "phase": "agentic", "content": "Fix the lint errors found in verification"}
                 ],
-                "completion_steps": []
+                "completion_steps": [],
+                "is_favorite": false
             }"#,
         )
         .unwrap()

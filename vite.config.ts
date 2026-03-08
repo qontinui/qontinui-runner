@@ -31,9 +31,14 @@ export default defineConfig({
     sourcemap: !!process.env.TAURI_DEBUG,
   },
   resolve: {
-    alias: {
-      "@": path.resolve(__dirname, "./src"),
-      "@qontinui/schemas": path.resolve(__dirname, "../qontinui-schemas/generated/typescript"),
-    },
+    alias: [
+      { find: "@", replacement: path.resolve(__dirname, "./src") },
+      { find: "@qontinui/schemas", replacement: path.resolve(__dirname, "../qontinui-schemas/generated/typescript") },
+      // Explicit subpath aliases for symlinked packages (Vite can't resolve
+      // exports maps from within file:-linked sibling packages)
+      { find: /^@qontinui\/shared-types\/(.+)$/, replacement: path.resolve(__dirname, "../qontinui-schemas/ts/dist/$1.js") },
+      { find: "@qontinui/shared-types", replacement: path.resolve(__dirname, "../qontinui-schemas/ts/dist/index.js") },
+      { find: "@qontinui/workflow-utils", replacement: path.resolve(__dirname, "../qontinui-workflow-utils/dist/index.js") },
+    ],
   },
 });

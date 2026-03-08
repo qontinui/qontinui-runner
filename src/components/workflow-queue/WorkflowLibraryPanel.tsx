@@ -5,7 +5,7 @@
  * Includes search, category filtering, and add-to-queue functionality.
  */
 
-import { Search, Loader2, Inbox, ChevronLeft } from "lucide-react";
+import { Search, Loader2, Inbox, ChevronLeft, Star } from "lucide-react";
 import type { WorkflowWithStats } from "./types";
 import { WorkflowLibraryCard } from "./WorkflowLibraryCard";
 
@@ -20,6 +20,10 @@ interface WorkflowLibraryPanelProps {
   onAddToQueue: (workflow: WorkflowWithStats) => void;
   queuedIds: Set<string>;
   onCollapse: () => void;
+  showFavoritesOnly?: boolean;
+  onToggleFavoritesFilter?: () => void;
+  onToggleFavorite?: (workflowId: string) => void;
+  hasFavorites?: boolean;
 }
 
 export function WorkflowLibraryPanel({
@@ -33,6 +37,10 @@ export function WorkflowLibraryPanel({
   onAddToQueue,
   queuedIds,
   onCollapse,
+  showFavoritesOnly,
+  onToggleFavoritesFilter,
+  onToggleFavorite,
+  hasFavorites,
 }: WorkflowLibraryPanelProps) {
   return (
     <div className="w-full border-r border-white/10 flex flex-col">
@@ -63,6 +71,19 @@ export function WorkflowLibraryPanel({
 
         {/* Category filter */}
         <div className="flex flex-wrap gap-2">
+          {hasFavorites && onToggleFavoritesFilter && (
+            <button
+              onClick={onToggleFavoritesFilter}
+              className={`px-3 py-1 rounded-full text-label-sm transition-colors flex items-center gap-1.5 ${
+                showFavoritesOnly
+                  ? "bg-amber-500/20 text-amber-400 border border-amber-500/50"
+                  : "bg-white/5 text-muted-foreground border border-transparent hover:bg-white/10"
+              }`}
+            >
+              <Star className={`w-3 h-3 ${showFavoritesOnly ? "fill-amber-400" : ""}`} />
+              Favorites
+            </button>
+          )}
           {categories.map((cat) => (
             <button
               key={cat}
@@ -102,6 +123,7 @@ export function WorkflowLibraryPanel({
                 workflow={workflow}
                 onAdd={() => onAddToQueue(workflow)}
                 isQueued={queuedIds.has(workflow.id)}
+                onToggleFavorite={onToggleFavorite}
               />
             ))}
           </div>
