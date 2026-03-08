@@ -163,7 +163,17 @@ export function TerminalPage({
         }
       }
     },
-    [zoneLayout, tabs, stateTracking.sessionStates, labelsAndTags, createTerminal],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- granular deps avoid re-creation on unrelated property changes
+    [
+      zoneLayout.assignments,
+      zoneLayout.assignTabToZone,
+      zoneLayout.setFocusedZone,
+      tabs,
+      stateTracking.sessionStates,
+      labelsAndTags.zoneLabels,
+      labelsAndTags.setZoneLabel,
+      createTerminal,
+    ],
   );
   handleRestartInZoneRef.current = handleRestartInZone;
 
@@ -568,7 +578,8 @@ export function TerminalPage({
       updateTab(terminalId, { isAlive: false, exitCode });
       stateTracking.handleExit(terminalId, exitCode);
     },
-    [updateTab, stateTracking],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- granular dep on .handleExit only
+    [updateTab, stateTracking.handleExit],
   );
 
   // ══════════════════════════════════════════════════════════════════════════════
@@ -598,7 +609,8 @@ export function TerminalPage({
         }
       }
     },
-    [zoneLayout, transitionEffects],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- granular deps on specific properties
+    [zoneLayout.setFocusedZone, zoneLayout.assignments, transitionEffects.setUnseenNeedsInput],
   );
 
   const handleZoneDoubleClick = useCallback(
@@ -607,7 +619,8 @@ export function TerminalPage({
         zoneLayout.toggleMaximize(zoneIndex);
       }
     },
-    [zoneLayout],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- granular deps on specific properties
+    [zoneLayout.isMultiZone, zoneLayout.toggleMaximize],
   );
 
   // Create terminal and auto-assign to first empty zone
@@ -639,7 +652,19 @@ export function TerminalPage({
       }
       return tabId;
     },
-    [createTerminal, zoneLayout, tabs.length, autoLayout, incrementMetric],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- granular deps on specific properties
+    [
+      createTerminal,
+      zoneLayout.layoutId,
+      zoneLayout.isMultiZone,
+      zoneLayout.setLayoutId,
+      zoneLayout.layout,
+      zoneLayout.assignTabToZone,
+      zoneLayout.setFocusedZone,
+      tabs.length,
+      autoLayout,
+      incrementMetric,
+    ],
   );
 
   // Sort zones by session state priority
@@ -663,7 +688,8 @@ export function TerminalPage({
     for (let i = 0; i < sortedTabIds.length; i++) {
       zoneLayout.assignTabToZone(i, sortedTabIds[i]);
     }
-  }, [zoneLayout, stateTracking.sessionStates]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- granular deps on specific properties
+  }, [zoneLayout.assignments, zoneLayout.assignTabToZone, stateTracking.sessionStates]);
 
   // Export all session output to a text file
   const handleExportOutput = useCallback(async () => {
@@ -716,7 +742,15 @@ export function TerminalPage({
         type: "error",
       });
     }
-  }, [tabs, zoneLayout, stateTracking, workflowGen]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- granular deps on specific properties
+  }, [
+    tabs,
+    zoneLayout.layoutId,
+    zoneLayout.assignments,
+    stateTracking.sessionStates,
+    stateTracking.lastOutputLines,
+    workflowGen.setNotification,
+  ]);
 
   // Export a single zone's output in the chosen format
   const handleExportZone = useCallback(
@@ -777,7 +811,13 @@ export function TerminalPage({
         console.error("Export failed:", err);
       }
     },
-    [tabs, stateTracking, labelsAndTags, zoneLayout.assignments],
+    [
+      tabs,
+      stateTracking.lastOutputLines,
+      stateTracking.sessionStates,
+      labelsAndTags.zoneLabels,
+      zoneLayout.assignments,
+    ],
   );
 
   // Helper: approve a single tab

@@ -7,7 +7,7 @@
  * advanced options, and Generate/Generate & Run actions.
  */
 
-import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import {
   Sparkles,
   Loader2,
@@ -54,6 +54,9 @@ import {
   type WorkflowGenerationTemplate,
 } from "@/lib/workflow-generation-templates";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { useGenerateData, type SavedPrompt } from "./useGenerateData";
+import { useAdvancedOptions, PROVIDERS } from "./useAdvancedOptions";
+import { useTemplatePopover } from "./useTemplatePopover";
 
 // Icon lookup map for template icons
 const TEMPLATE_ICONS: Record<string, LucideIcon> = {
@@ -69,48 +72,9 @@ const TEMPLATE_ICONS: Record<string, LucideIcon> = {
   Paintbrush,
 };
 
-// Provider and model constants
-const PROVIDERS = [
-  { value: "claude_cli", label: "Claude CLI" },
-  { value: "claude_api", label: "Claude API" },
-  { value: "gemini_cli", label: "Gemini CLI" },
-  { value: "gemini_api", label: "Gemini API" },
-] as const;
-
-const CLAUDE_MODELS = [
-  { value: "claude-sonnet-4", label: "Claude Sonnet 4" },
-  { value: "claude-opus-4", label: "Claude Opus 4" },
-  { value: "claude-3-5-sonnet", label: "Claude 3.5 Sonnet" },
-  { value: "claude-3-opus", label: "Claude 3 Opus" },
-];
-
-const GEMINI_MODELS = [
-  { value: "gemini-3-flash", label: "Gemini 3 Flash" },
-  { value: "gemini-3-pro", label: "Gemini 3 Pro" },
-  { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
-  { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-  { value: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
-];
-
 // =============================================================================
 // Types
 // =============================================================================
-
-interface SavedContext {
-  id: string;
-  name: string;
-  scope: string;
-  category?: string;
-  content?: string;
-}
-
-interface SavedPrompt {
-  id: string;
-  name: string;
-  content: string;
-  category?: string;
-  tags?: string[];
-}
 
 export interface AiGeneratePanelProps {
   onCreateManually: () => void;
@@ -163,7 +127,58 @@ export function AiGeneratePanel({
 }: AiGeneratePanelProps) {
   const accentColors = getAccentColors("blue");
 
-  // Form state — description is persisted to localStorage
+  // --- Custom hooks ---
+  const {
+    savedContexts,
+    aiSettings,
+    generationPrompts,
+    contextsByScope,
+    handleSaveAsTemplate,
+    handleDeleteSavedTemplate,
+    refreshContexts,
+  } = useGenerateData();
+
+  const advanced = useAdvancedOptions(aiSettings);
+  const {
+    showAdvanced,
+    setShowAdvanced,
+    category,
+    setCategory,
+    tagsInput,
+    setTagsInput,
+    maxIterations,
+    setMaxIterations,
+    provider,
+    setProvider,
+    model,
+    setModel,
+    maxFixIterations,
+    setMaxFixIterations,
+    autoIncludeContexts,
+    setAutoIncludeContexts,
+    investigateCodebase,
+    setInvestigateCodebase,
+    includeDesignGuidance,
+    setIncludeDesignGuidance,
+    verificationDepth,
+    setVerificationDepth,
+    discoveryMode,
+    setDiscoveryMode,
+    generationModelOverrides,
+    setGenerationModelOverrides,
+    modelsForProvider,
+    buildBaseRequest,
+  } = advanced;
+
+  const {
+    showTemplates,
+    setShowTemplates,
+    isSavingTemplate,
+    setIsSavingTemplate,
+    templatePopoverRef,
+  } = useTemplatePopover();
+
+  // --- Remaining local state ---
   const [description, setDescription] = useState("");
   const [selectedContextIds, setSelectedContextIds] = useState<string[]>([]);
   const [inlineContext, setInlineContext] = useState("");
@@ -177,6 +192,15 @@ export function AiGeneratePanel({
     type: "success" | "error";
     message: string;
   } | null>(null);
+  const [showContext, setShowContext] = useState(false);
+  const [contextTab, setContextTab] = useState<"saved" | "custom" | "file">("saved");
+  const [specState, setSpecState] = useState<SpecSourceState>({
+    discoveredSpecs: [],
+    selectedGroupIds: new Set(),
+    discoveredPages: [],
+    selectedPageUrls: new Set(),
+  });
+  const hasSpecs = specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0;
 
   // Hydrate description from localStorage after mount
   useEffect(() => {
@@ -189,197 +213,35 @@ export function AiGeneratePanel({
     localStorage.setItem("generate-workflow-prompt", description);
   }, [description]);
 
-  // Advanced options
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const [category, setCategory] = useState("");
-  const [tagsInput, setTagsInput] = useState("");
-  const [maxIterations, setMaxIterations] = useState("");
-  const [provider, setProvider] = useState("");
-  const [model, setModel] = useState("");
-  const [maxFixIterations, setMaxFixIterations] = useState("");
-  const [autoIncludeContexts, setAutoIncludeContexts] = useState(true);
-  const [investigateCodebase, setInvestigateCodebase] = useState(true);
-  const [includeDesignGuidance, setIncludeDesignGuidance] = useState(false);
-  const [verificationDepth, setVerificationDepth] = useState<
-    "smoke" | "standard" | "thorough" | "regression"
-  >("standard");
-  const [discoveryMode, setDiscoveryMode] = useState<"auto" | "enabled" | "disabled">("auto");
-  const [generationModelOverrides, setGenerationModelOverrides] = useState<
-    Record<string, { provider?: string; model?: string }> | undefined
-  >(undefined);
-
-  // Context section
-  const [showContext, setShowContext] = useState(false);
-  const [contextTab, setContextTab] = useState<"saved" | "custom" | "file">("saved");
-
-  // Page Specs section
-  const [specState, setSpecState] = useState<SpecSourceState>({
-    discoveredSpecs: [],
-    selectedGroupIds: new Set(),
-    discoveredPages: [],
-    selectedPageUrls: new Set(),
-  });
-  const hasSpecs = specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0;
-
-  // Template picker
-  const [showTemplates, setShowTemplates] = useState(false);
-  const [isSavingTemplate, setIsSavingTemplate] = useState(false);
-  const templatePopoverRef = useRef<HTMLDivElement>(null);
-
-  // Click-away listener for template popover
-  useEffect(() => {
-    if (!showTemplates) return;
-    const handleClickOutside = (e: MouseEvent) => {
-      if (templatePopoverRef.current && !templatePopoverRef.current.contains(e.target as Node)) {
-        setShowTemplates(false);
-      }
-    };
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [showTemplates]);
-
-  // Saved prompts (generation category)
-  const [savedPrompts, setSavedPrompts] = useState<SavedPrompt[]>([]);
-  const generationPrompts = useMemo(
-    () => savedPrompts.filter((p) => p.category === "Generation"),
-    [savedPrompts],
-  );
-
-  // Saved contexts
-  const [savedContexts, setSavedContexts] = useState<SavedContext[]>([]);
-
-  // Fetch prompts and contexts on mount
-  useEffect(() => {
-    const controller = new AbortController();
-    let cancelled = false;
-
-    (async () => {
-      try {
-        const resp = await tracedFetch(`${getApiBase()}/prompts`, { signal: controller.signal });
-        const json = await resp.json();
-        if (!cancelled) setSavedPrompts(json.data ?? []);
-      } catch {
-        // Runner may not be running or request was aborted
-      }
-    })();
-    (async () => {
-      try {
-        const resp = await tracedFetch(`${getApiBase()}/contexts`, { signal: controller.signal });
-        const json = await resp.json();
-        if (!cancelled) setSavedContexts(json.data ?? []);
-      } catch {
-        // Runner may not be running or request was aborted
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      controller.abort();
-    };
-  }, []);
-
-  // AI settings (for provider/model defaults)
-  const [aiSettings, setAiSettings] = useState<Record<string, unknown> | null>(null);
-  useEffect(() => {
-    const controller = new AbortController();
-    let cancelled = false;
-
-    (async () => {
-      try {
-        const resp = await tracedFetch(`${getApiBase()}/settings/ai`, {
-          signal: controller.signal,
-        });
-        const json = await resp.json();
-        if (!cancelled) setAiSettings(json.data ?? null);
-      } catch {
-        // Runner may not be running or request was aborted
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      controller.abort();
-    };
-  }, []);
-
-  // Initialize provider/model from settings when loaded
-  useEffect(() => {
-    if (!aiSettings) return;
-    const settings = aiSettings as Record<string, unknown>;
-    if (!provider && typeof settings.provider === "string") {
-      setProvider(settings.provider);
-    }
-    if (!model) {
-      const p = provider || (settings.provider as string) || "";
-      const sub = settings[p] as Record<string, unknown> | undefined;
-      if (sub && typeof sub.model === "string") {
-        setModel(sub.model);
-      }
-    }
-  }, [aiSettings, provider, model]);
-
-  // Models list changes based on selected provider
-  const modelsForProvider = useMemo(() => {
-    if (provider.startsWith("gemini")) return GEMINI_MODELS;
-    return CLAUDE_MODELS;
-  }, [provider]);
-
   const handleContextToggle = useCallback((contextId: string) => {
     setSelectedContextIds((prev) =>
       prev.includes(contextId) ? prev.filter((id) => id !== contextId) : [...prev, contextId],
     );
   }, []);
 
-  const handleApplyTemplate = useCallback((template: WorkflowGenerationTemplate) => {
-    setDescription(template.content);
-    if (template.advancedDefaults) {
-      const d = template.advancedDefaults;
-      if (d.discoveryMode) setDiscoveryMode(d.discoveryMode);
-      if (d.category) setCategory(d.category);
-      if (d.tags) setTagsInput(d.tags);
-      if (d.includeDesignGuidance !== undefined) setIncludeDesignGuidance(d.includeDesignGuidance);
-      setShowAdvanced(true);
-    }
-    setShowTemplates(false);
-  }, []);
-
-  const handleSaveAsTemplate = useCallback(async () => {
-    const trimmed = description.trim();
-    if (!trimmed) return;
-    setIsSavingTemplate(true);
-    try {
-      const name = trimmed.length > 60 ? trimmed.substring(0, 57) + "..." : trimmed;
-      await tracedFetch(`${getApiBase()}/prompts`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name,
-          content: trimmed,
-          category: "Generation",
-          description: "",
-          tags: ["user-template"],
-        }),
-      });
-      // Refresh prompts
-      const resp = await tracedFetch(`${getApiBase()}/prompts`);
-      const json = await resp.json();
-      setSavedPrompts(json.data ?? []);
-    } catch {
-      // Failed to save
-    } finally {
-      setIsSavingTemplate(false);
-    }
-  }, [description]);
-
-  const handleDeleteSavedTemplate = useCallback(async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    try {
-      await tracedFetch(`${getApiBase()}/prompts/${id}`, { method: "DELETE" });
-      setSavedPrompts((prev) => prev.filter((p) => p.id !== id));
-    } catch {
-      // Failed to delete
-    }
-  }, []);
+  const handleApplyTemplate = useCallback(
+    (template: WorkflowGenerationTemplate) => {
+      setDescription(template.content);
+      if (template.advancedDefaults) {
+        const d = template.advancedDefaults;
+        if (d.discoveryMode) setDiscoveryMode(d.discoveryMode);
+        if (d.category) setCategory(d.category);
+        if (d.tags) setTagsInput(d.tags);
+        if (d.includeDesignGuidance !== undefined)
+          setIncludeDesignGuidance(d.includeDesignGuidance);
+        setShowAdvanced(true);
+      }
+      setShowTemplates(false);
+    },
+    [
+      setDiscoveryMode,
+      setCategory,
+      setTagsInput,
+      setIncludeDesignGuidance,
+      setShowAdvanced,
+      setShowTemplates,
+    ],
+  );
 
   const handleImportFile = async () => {
     if (!filePath.trim()) return;
@@ -397,10 +259,8 @@ export function AiGeneratePanel({
       }
       setFilePath("");
       setImportFeedback({ type: "success", message: "Context imported successfully" });
-      // Refresh contexts
-      const resp = await tracedFetch(`${getApiBase()}/contexts`);
-      const json = await resp.json();
-      setSavedContexts(json.data ?? []);
+      // Refresh contexts list
+      refreshContexts();
       // Auto-dismiss success after 3s
       setTimeout(() => setImportFeedback(null), 3000);
     } catch (err) {
@@ -411,55 +271,9 @@ export function AiGeneratePanel({
     }
   };
 
-  /** Build the base request (everything except description). */
-  const buildBaseRequest = useCallback(() => {
-    const tags = tagsInput
-      .split(",")
-      .map((t) => t.trim())
-      .filter(Boolean);
-
-    if (hasSpecs && !tags.includes("spec-generated")) {
-      tags.push("spec-generated");
-    }
-
-    const request: Record<string, unknown> = {};
-    if (category.trim()) request.category = category.trim();
-    if (tags.length > 0) request.tags = tags;
-    if (selectedContextIds.length > 0) request.context_ids = selectedContextIds;
-    if (inlineContext.trim()) request.inline_context = inlineContext.trim();
-    if (maxIterations) request.max_iterations = parseInt(maxIterations, 10);
-    if (provider.trim()) request.provider = provider.trim();
-    if (model.trim()) request.model = model.trim();
-    if (maxFixIterations) request.max_fix_iterations = parseInt(maxFixIterations, 10);
-    request.auto_include_contexts = autoIncludeContexts;
-    request.investigate_codebase = investigateCodebase;
-    if (includeDesignGuidance) request.include_design_guidance = true;
-    if (verificationDepth !== "standard") request.verification_depth = verificationDepth;
-    if (discoveryMode !== "auto") request.discovery_mode = discoveryMode;
-    if (generationModelOverrides) request.model_overrides = generationModelOverrides;
-
-    return request;
-  }, [
-    tagsInput,
-    category,
-    selectedContextIds,
-    inlineContext,
-    maxIterations,
-    provider,
-    model,
-    maxFixIterations,
-    autoIncludeContexts,
-    investigateCodebase,
-    includeDesignGuidance,
-    verificationDepth,
-    discoveryMode,
-    hasSpecs,
-    generationModelOverrides,
-  ]);
-
   /** Build a single request (non-batch or fallback). */
   const buildGenerateRequest = useCallback(() => {
-    const base = buildBaseRequest();
+    const base = buildBaseRequest({ selectedContextIds, inlineContext, hasSpecs });
 
     let fullDescription = "";
     if (specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0) {
@@ -476,7 +290,7 @@ export function AiGeneratePanel({
     }
 
     return { ...base, description: fullDescription };
-  }, [buildBaseRequest, description, specState]);
+  }, [buildBaseRequest, description, specState, selectedContextIds, inlineContext, hasSpecs]);
 
   const canGenerate = description.trim() || hasSpecs;
 
@@ -637,17 +451,6 @@ export function AiGeneratePanel({
     }
   }, [specState, description]);
 
-  // Group contexts by scope
-  const contextsByScope = savedContexts.reduce(
-    (acc, ctx) => {
-      const scope = ctx.scope || "user";
-      if (!acc[scope]) acc[scope] = [];
-      acc[scope].push(ctx);
-      return acc;
-    },
-    {} as Record<string, SavedContext[]>,
-  );
-
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
@@ -672,7 +475,9 @@ export function AiGeneratePanel({
           {/* Left column - Prompt */}
           <div className="flex-1 flex flex-col min-w-0 space-y-2">
             <div className="flex items-center justify-between">
-              <label className="text-sm text-zinc-300">What should the workflow do?</label>
+              <label htmlFor="generate-description" className="text-sm text-zinc-300">
+                What should the workflow do?
+              </label>
               {/* Template Picker */}
               <div className="relative" ref={templatePopoverRef}>
                 <button
@@ -749,7 +554,14 @@ export function AiGeneratePanel({
                         <button
                           className="w-full text-left px-3 py-2 text-xs hover:bg-zinc-700/50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5 text-zinc-400 hover:text-zinc-200"
                           disabled={!description.trim() || isSavingTemplate}
-                          onClick={handleSaveAsTemplate}
+                          onClick={async () => {
+                            setIsSavingTemplate(true);
+                            try {
+                              await handleSaveAsTemplate(description);
+                            } finally {
+                              setIsSavingTemplate(false);
+                            }
+                          }}
                         >
                           {isSavingTemplate ? (
                             <Loader2 className="w-3 h-3 animate-spin shrink-0" />
@@ -765,6 +577,7 @@ export function AiGeneratePanel({
               </div>
             </div>
             <textarea
+              id="generate-description"
               className="w-full flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 text-sm min-h-[200px] resize-none focus:outline-none focus:ring-2 focus:ring-blue-500/50"
               placeholder={
                 hasSpecs
@@ -943,8 +756,11 @@ export function AiGeneratePanel({
                 <div className="mt-3 space-y-3 pl-1">
                   <div className="grid grid-cols-2 gap-3">
                     <div className="space-y-1">
-                      <label className="text-xs text-zinc-400">Category</label>
+                      <label htmlFor="generate-category" className="text-xs text-zinc-400">
+                        Category
+                      </label>
                       <input
+                        id="generate-category"
                         className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50"
                         placeholder="e.g., testing, deployment"
                         value={category}
@@ -952,8 +768,11 @@ export function AiGeneratePanel({
                       />
                     </div>
                     <div className="space-y-1">
-                      <label className="text-xs text-zinc-400">Tags (comma-separated)</label>
+                      <label htmlFor="generate-tags" className="text-xs text-zinc-400">
+                        Tags (comma-separated)
+                      </label>
                       <input
+                        id="generate-tags"
                         className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50"
                         placeholder="e.g., python, lint"
                         value={tagsInput}
@@ -961,8 +780,11 @@ export function AiGeneratePanel({
                       />
                     </div>
                     <div className="space-y-1">
-                      <label className="text-xs text-zinc-400">Max Iterations</label>
+                      <label htmlFor="generate-max-iterations" className="text-xs text-zinc-400">
+                        Max Iterations
+                      </label>
                       <input
+                        id="generate-max-iterations"
                         type="number"
                         className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50"
                         placeholder="10"
@@ -971,8 +793,11 @@ export function AiGeneratePanel({
                       />
                     </div>
                     <div className="space-y-1">
-                      <label className="text-xs text-zinc-400">AI Provider</label>
+                      <label htmlFor="generate-provider" className="text-xs text-zinc-400">
+                        AI Provider
+                      </label>
                       <select
+                        id="generate-provider"
                         value={provider}
                         onChange={(e) => {
                           setProvider(e.target.value);
@@ -989,8 +814,11 @@ export function AiGeneratePanel({
                       </select>
                     </div>
                     <div className="space-y-1">
-                      <label className="text-xs text-zinc-400">Model</label>
+                      <label htmlFor="generate-model" className="text-xs text-zinc-400">
+                        Model
+                      </label>
                       <select
+                        id="generate-model"
                         value={model}
                         onChange={(e) => setModel(e.target.value)}
                         className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50"
@@ -1004,7 +832,10 @@ export function AiGeneratePanel({
                       </select>
                     </div>
                     <div className="space-y-1">
-                      <label className="text-xs text-zinc-400 flex items-center gap-1">
+                      <label
+                        htmlFor="generate-max-fix-iterations"
+                        className="text-xs text-zinc-400 flex items-center gap-1"
+                      >
                         Verification Rounds
                         <span className="relative group">
                           <Info className="w-3 h-3 text-zinc-500 cursor-help" />
@@ -1015,6 +846,7 @@ export function AiGeneratePanel({
                         </span>
                       </label>
                       <input
+                        id="generate-max-fix-iterations"
                         type="number"
                         className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50"
                         placeholder="3"
@@ -1023,7 +855,10 @@ export function AiGeneratePanel({
                       />
                     </div>
                     <div className="space-y-1">
-                      <label className="text-xs text-zinc-400 flex items-center gap-1">
+                      <label
+                        htmlFor="generate-discovery-mode"
+                        className="text-xs text-zinc-400 flex items-center gap-1"
+                      >
                         Discovery
                         <span className="relative group">
                           <Info className="w-3 h-3 text-zinc-500 cursor-help" />
@@ -1034,6 +869,7 @@ export function AiGeneratePanel({
                         </span>
                       </label>
                       <select
+                        id="generate-discovery-mode"
                         value={discoveryMode}
                         onChange={(e) =>
                           setDiscoveryMode(e.target.value as "auto" | "enabled" | "disabled")
@@ -1105,7 +941,10 @@ export function AiGeneratePanel({
                       </label>
                     </div>
                     <div>
-                      <label className="text-sm text-zinc-300">
+                      <label
+                        htmlFor="generate-verification-depth"
+                        className="text-sm text-zinc-300"
+                      >
                         Verification depth
                         <span className="relative group ml-1">
                           <Info className="w-3 h-3 text-zinc-500 cursor-help inline" />
@@ -1116,6 +955,7 @@ export function AiGeneratePanel({
                         </span>
                       </label>
                       <select
+                        id="generate-verification-depth"
                         value={verificationDepth}
                         onChange={(e) =>
                           setVerificationDepth(e.target.value as typeof verificationDepth)
