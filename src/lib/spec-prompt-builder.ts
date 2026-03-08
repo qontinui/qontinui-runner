@@ -316,23 +316,38 @@ A spec file has this top-level structure:
 }
 \`\`\`
 
-## Assertion Types
+## Assertion Types — Choosing the Right Type
 
-### Deterministic (automatable without AI)
-- **exists** / **notExists** — element presence/absence
-- **visible** / **hidden** — visibility state
-- **enabled** / **disabled** — interactive state
-- **hasText** / **containsText** — text content match
-- **count** — number of matching elements (set \`expected\` to a number)
-- **hasValue** — form input value
-- **attribute** — attribute value match
-- **hasClass** — CSS class presence
+**This is critical.** The assertionType determines whether a workflow step runs as a fast deterministic check or requires AI evaluation. Using the wrong type produces broken workflows.
 
-### AI-Requiring (semantic)
-- **behavior** — describes expected interaction behavior (click results, state transitions)
-- **semantic** — describes expected meaning, data relationships, or complex flows
+### Deterministic types (fast, no AI needed)
+Use these ONLY for assertions that can be verified by inspecting a single UI snapshot — checking whether an element exists, what text it shows, or what state it's in:
+- **exists** — "A button labeled 'Save' is present on the page"
+- **notExists** — "No error banner is shown on successful load"
+- **visible** / **hidden** — "The settings panel is visible when the Settings tab is selected"
+- **enabled** / **disabled** — "The Submit button is disabled until the form is valid"
+- **hasText** / **containsText** — "The heading shows 'Active Runs'"
+- **count** — "There are exactly 6 tabs" (set \`expected\` to a number)
+- **hasValue** — "The search input contains the user's query"
+- **attribute** — "The button has aria-pressed='true'"
+- **hasClass** — "The selected tab has the 'active' CSS class"
 
-Semantic assertions are the most valuable part of a spec. They describe behavior that only an AI can verify by understanding the page. Write them as detailed narratives of what should happen, grounded in what you observed in the source code.
+### Semantic types (require AI evaluation)
+Use these for ANYTHING that describes interaction results, multi-step flows, data relationships, or outcomes that can't be verified from a static snapshot:
+- **behavior** — user interaction produces expected results. Use when the description mentions clicking, submitting, creating, deleting, navigating, or any action that changes state.
+- **semantic** — data model correctness, algorithm outputs, content meaning, cross-system relationships. Use when the description discusses data structures, expected API responses, or how systems connect.
+
+### Decision rule
+Ask: "Can this be verified by looking at a single UI snapshot without performing any action?"
+- **Yes** → use a deterministic type (\`exists\`, \`visible\`, \`hasText\`, etc.)
+- **No** → use \`behavior\` (for interactions) or \`semantic\` (for data/logic)
+
+### Common mistakes — DO NOT do these:
+- **WRONG:** \`assertionType: "exists"\` with description "Clicking Save should persist the data and show a success toast" — this is a behavior, not an existence check
+- **WRONG:** \`assertionType: "exists"\` with description "The discovery workflow creates states grouped by element co-occurrence" — this is semantic, not an existence check
+- **CORRECT:** \`assertionType: "exists"\` with description "A 'Save' button is present in the toolbar"
+- **CORRECT:** \`assertionType: "behavior"\` with description "Clicking Save should persist the data and show a success toast"
+- **CORRECT:** \`assertionType: "semantic"\` with description "The discovery workflow creates states grouped by element co-occurrence"
 
 ## Quality Standards
 
@@ -350,19 +365,21 @@ Semantic assertions are the most valuable part of a spec. They describe behavior
 - Target criteria should use the most stable identifiers: \`role\`, \`data-content-label\`, \`textContent\`
 - Use actual text strings, data attributes, and ARIA roles you found in the source code — not guesses
 
-### Semantic Assertion Writing
-For behavior and semantic assertions, write descriptions detailed enough for an AI to:
+### Writing behavior and semantic assertions
+For \`assertionType: "behavior"\` and \`assertionType: "semantic"\`, write descriptions detailed enough for an AI to:
 1. Understand the expected outcome
 2. Know what "correct" looks like
 3. Fix the feature if it's broken
 
-Ground semantic assertions in the actual code behavior:
+These assertions MUST use \`assertionType: "behavior"\` or \`assertionType: "semantic"\` — NEVER \`"exists"\`.
 
-**Bad:** "State creation works"
-**Good:** "Creating a new state machine config via the 'New Config' button should open a creation dialog, accept a name, and after saving, the new config should appear in the config selector dropdown and be automatically selected. The API call POST /api/state-machines should return the new config with an auto-generated ID."
+Ground them in the actual code behavior:
 
-**Bad:** "Form validates input"
-**Good:** "The workflow name field requires at least 1 character. Submitting with an empty name should show an inline error message 'Name is required' below the input. The Save button should remain enabled but the form should not submit until the error is resolved."
+**Bad:** assertionType "exists" + description "State creation works" — wrong type AND vague
+**Good:** assertionType **"behavior"** + description "Creating a new state machine config via the 'New Config' button should open a creation dialog, accept a name, and after saving, the new config should appear in the config selector dropdown and be automatically selected. The API call POST /api/state-machines should return the new config with an auto-generated ID."
+
+**Bad:** assertionType "exists" + description "Form validates input" — wrong type AND vague
+**Good:** assertionType **"behavior"** + description "The workflow name field requires at least 1 character. Submitting with an empty name should show an inline error message 'Name is required' below the input. The Save button should remain enabled but the form should not submit until the error is resolved."
 
 ### Severity Guidelines
 - **critical** — core page purpose, primary navigation, data integrity. Page is broken without this.
@@ -376,24 +393,24 @@ Use preconditions liberally. They tell the automation system what state the page
 - "A workflow is currently running"
 - "The creation dialog is open"
 
-## Example (Partial)
+## Example Group (showing all three assertion types)
 
 \`\`\`json
 {
-  "id": "page-tab-navigation",
-  "name": "Tab Navigation",
-  "description": "The page has 4 tabs: Overview, Details, Settings, History. Each tab shows different content.",
-  "category": "navigation",
+  "id": "settings-form",
+  "name": "Settings Form",
+  "description": "The Settings tab contains a form for editing configuration values, with save and reset actions.",
+  "category": "interaction",
   "assertions": [
     {
-      "id": "tab-overview",
-      "description": "Overview tab is present and selected by default on page load",
-      "category": "navigation",
+      "id": "settings-save-button-exists",
+      "description": "A 'Save' button is present in the settings form",
+      "category": "element-presence",
       "severity": "critical",
       "target": {
         "type": "search",
-        "criteria": { "role": "tab", "textContent": "Overview" },
-        "label": "Overview tab"
+        "criteria": { "role": "button", "textContent": "Save" },
+        "label": "Save button"
       },
       "assertionType": "exists",
       "source": "manual",
@@ -401,17 +418,32 @@ Use preconditions liberally. They tell the automation system what state the page
       "enabled": true
     },
     {
-      "id": "tab-switch-behavior",
-      "description": "Clicking a tab switches the visible content panel. The selected tab should have an active/highlighted visual state. Previously selected tab content should be hidden. The URL hash should update to reflect the selected tab.",
+      "id": "settings-save-persists",
+      "description": "Clicking Save submits the form via PUT /api/settings, shows a success toast 'Settings saved', and the form retains the new values. If the API returns a validation error, the form shows inline error messages under the invalid fields.",
       "category": "behavior",
       "severity": "critical",
       "target": {
         "type": "search",
-        "criteria": { "role": "tab" },
-        "label": "Any tab"
+        "criteria": { "role": "button", "textContent": "Save" },
+        "label": "Save button"
       },
       "assertionType": "behavior",
-      "precondition": "Page has loaded with default Overview tab selected",
+      "precondition": "Settings tab is selected and at least one field has been modified",
+      "source": "manual",
+      "reviewed": true,
+      "enabled": true
+    },
+    {
+      "id": "settings-data-model",
+      "description": "Settings are stored as key-value pairs where keys follow the pattern 'section.property' (e.g., 'ai.model', 'runner.timeout'). The API returns all settings as a flat JSON object. Boolean settings render as toggle switches, string settings as text inputs, and numeric settings as number inputs with min/max constraints from the schema.",
+      "category": "semantic",
+      "severity": "warning",
+      "target": {
+        "type": "search",
+        "criteria": { "role": "form" },
+        "label": "Settings form"
+      },
+      "assertionType": "semantic",
       "source": "manual",
       "reviewed": true,
       "enabled": true
@@ -421,16 +453,19 @@ Use preconditions liberally. They tell the automation system what state the page
 }
 \`\`\`
 
+Notice: the Save button gets TWO assertions — \`exists\` (is it there?) and \`behavior\` (what happens when you click it?). This is the correct pattern. Do NOT put behavioral descriptions on \`exists\` assertions.
+
 ## Instructions
 
 1. **Read the source code first** — explore components, hooks, API calls, and data models before writing any assertions
 2. Always output a complete, valid JSON spec (not partial)
-3. Include both deterministic AND semantic/behavior assertions — aim for roughly 40-60% semantic
-4. Cover the full page lifecycle: loading, empty states, populated states, interactions, error states
-5. Use consistent ID prefixes per page (e.g., "sm-" for state machine, "ar-" for active runs)
-6. Include metadata with component name, page URL, and relevant tags
-7. Write the top-level description as a comprehensive summary of what the page does
-8. Ground all assertions in what you actually found in the code — use real text content, real data attributes, real component names
+3. **Choose assertionType based on what is being verified, not the element being targeted.** If the description mentions an interaction result, state change, or multi-step flow, it MUST be \`behavior\` or \`semantic\`, never \`exists\`. Review every assertion before finalizing: does the description match the type?
+4. Every group should contain a mix of types — typically 2-3 deterministic (\`exists\`, \`visible\`, \`hasText\`) plus 1-2 semantic (\`behavior\`, \`semantic\`). A spec with only \`exists\` assertions is incomplete.
+5. Cover the full page lifecycle: loading, empty states, populated states, interactions, error states
+6. Use consistent ID prefixes per page (e.g., "sm-" for state machine, "ar-" for active runs)
+7. Include metadata with component name, page URL, and relevant tags
+8. Write the top-level description as a comprehensive summary of what the page does
+9. Ground all assertions in what you actually found in the code — use real text content, real data attributes, real component names
 `.trim();
 
 /**

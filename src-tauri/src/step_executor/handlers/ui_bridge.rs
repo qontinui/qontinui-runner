@@ -362,6 +362,24 @@ fn evaluate_snapshot_assertion(
                 )
             }
         }
+        // behavior/semantic assertions describe page behaviors and data model
+        // semantics — treat as existence checks for snapshot verification.
+        "behavior" | "semantic" => {
+            if matching.is_empty() {
+                (
+                    false,
+                    format!(
+                        "No element found matching criteria {:?}",
+                        criteria_summary(&assertion.criteria)
+                    ),
+                )
+            } else {
+                (
+                    true,
+                    format!("Found {} element(s) matching criteria", matching.len()),
+                )
+            }
+        }
         other => (
             false,
             format!(
@@ -430,6 +448,18 @@ fn element_matches_criteria(
             "type" => {
                 let el_type = element.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 el_type == expected
+            }
+            "role" => {
+                // Check element.type first (AutoRegister maps role/tag to type),
+                // then fall back to state.role for elements that set it explicitly.
+                let el_type = element.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                let state_role = element
+                    .get("state")
+                    .and_then(|s| s.get("role"))
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("");
+                el_type.to_lowercase().contains(&expected.to_lowercase())
+                    || state_role.to_lowercase().contains(&expected.to_lowercase())
             }
             "label" => {
                 let label = element.get("label").and_then(|l| l.as_str()).unwrap_or("");

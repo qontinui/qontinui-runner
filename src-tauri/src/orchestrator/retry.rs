@@ -436,7 +436,11 @@ fn truncate_error(error: &str, max_len: usize) -> String {
     if error.len() <= max_len {
         error.to_string()
     } else {
-        format!("{}...", &error[..max_len])
+        let mut end = max_len;
+        while end > 0 && !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &error[..end])
     }
 }
 

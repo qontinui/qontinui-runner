@@ -72,6 +72,7 @@ pub mod hooks;
 pub mod instances; // Runner instance management (dev feature)
 pub mod interaction;
 pub mod issues;
+pub mod known_issues; // Known issues registry CRUD
 pub mod learning; // Learning insights dashboard commands
 pub mod library_sync; // Sync library items (checks, macros, etc.) to web backend
 pub mod logging;

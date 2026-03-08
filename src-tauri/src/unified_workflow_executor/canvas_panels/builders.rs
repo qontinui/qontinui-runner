@@ -506,6 +506,199 @@ pub fn build_waffle_chart(snapshots: &[IterationSnapshot]) -> Value {
     })
 }
 
+/// Build the Phase Timeline panel (PhaseTimeline).
+/// Shows a horizontal segmented bar of workflow phase progression.
+pub fn build_phase_timeline(
+    snapshots: &[IterationSnapshot],
+    setup_duration_ms: u64,
+    setup_steps: usize,
+    total_elapsed: std::time::Duration,
+) -> Value {
+    let total_ms = total_elapsed.as_millis() as u64;
+    let mut phases: Vec<Value> = Vec::new();
+
+    // Setup phase
+    phases.push(json!({
+        "name": "Setup",
+        "duration_ms": setup_duration_ms,
+        "status": "completed",
+        "step_count": setup_steps,
+    }));
+
+    // Aggregate verification + agentic durations
+    let mut verify_total_ms: u64 = 0;
+    let mut verify_steps: usize = 0;
+    let mut agentic_total_ms: u64 = 0;
+    let mut agentic_count: usize = 0;
+    let mut last_verify_failed = false;
+    let mut last_agentic_failed = false;
+
+    for snapshot in snapshots {
+        verify_total_ms += snapshot.verify_duration_ms;
+        verify_steps += snapshot.total;
+        last_verify_failed = snapshot.failed > 0;
+
+        if let Some(agentic_ms) = snapshot.agentic_duration_ms {
+            agentic_total_ms += agentic_ms;
+            agentic_count += 1;
+            last_agentic_failed = snapshot.agentic_outcome.as_deref() == Some("Failed")
+                || snapshot.agentic_outcome.as_deref() == Some("Error");
+        }
+    }
+
+    // Verification phase
+    let verify_status = if last_verify_failed {
+        "failed"
+    } else {
+        "completed"
+    };
+    phases.push(json!({
+        "name": "Verification",
+        "duration_ms": verify_total_ms,
+        "status": verify_status,
+        "step_count": verify_steps,
+    }));
+
+    // Agentic phase
+    if agentic_count > 0 {
+        let agentic_status = if last_agentic_failed {
+            "failed"
+        } else {
+            "completed"
+        };
+        phases.push(json!({
+            "name": "Agentic",
+            "duration_ms": agentic_total_ms,
+            "status": agentic_status,
+            "step_count": agentic_count,
+        }));
+    }
+
+    json!({
+        "phases": phases,
+        "total_duration_ms": total_ms
+    })
+}
+
+/// Build the Iteration Comparison panel (IterationComparison).
+/// Shows pass/fail counts per iteration as grouped bars.
+pub fn build_iteration_comparison(snapshots: &[IterationSnapshot]) -> Value {
+    let iterations: Vec<Value> = snapshots
+        .iter()
+        .map(|s| {
+            json!({
+                "iteration": s.iteration,
+                "passed": s.passed,
+                "failed": s.failed,
+                "total": s.total,
+            })
+        })
+        .collect();
+
+    json!({ "iterations": iterations })
+}
+
+/// Build the Step Duration Chart panel (StepDurationChart).
+/// Shows the longest-running steps sorted by duration.
+pub fn build_step_duration_chart(
+    step_timings: &[(String, u64, &str, Option<&str>)], // (name, duration_ms, status, phase)
+    max_steps: usize,
+) -> Value {
+    // Sort by duration descending, take top N
+    let mut sorted = step_timings.to_vec();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.truncate(max_steps);
+
+    let max_duration = sorted.first().map(|s| s.1).unwrap_or(0);
+
+    let steps: Vec<Value> = sorted
+        .iter()
+        .map(|(name, duration_ms, status, phase)| {
+            let mut entry = json!({
+                "name": name,
+                "duration_ms": duration_ms,
+                "status": status,
+            });
+            if let Some(p) = phase {
+                entry["phase"] = json!(p);
+            }
+            entry
+        })
+        .collect();
+
+    json!({
+        "steps": steps,
+        "max_duration_ms": max_duration
+    })
+}
+
+/// Build the Phase Distribution panel (PhaseDistribution).
+/// Shows a donut chart of time allocation across phases.
+pub fn build_phase_distribution(
+    snapshots: &[IterationSnapshot],
+    setup_duration_ms: u64,
+    total_elapsed: std::time::Duration,
+) -> Value {
+    let total_ms = total_elapsed.as_millis() as u64;
+    if total_ms == 0 {
+        return json!({
+            "segments": [],
+            "total_duration_ms": 0
+        });
+    }
+
+    let mut segments: Vec<Value> = Vec::new();
+
+    // Setup
+    if setup_duration_ms > 0 {
+        segments.push(json!({
+            "phase": "Setup",
+            "duration_ms": setup_duration_ms,
+            "percentage": (setup_duration_ms as f64 / total_ms as f64) * 100.0,
+            "color": "#60a5fa"
+        }));
+    }
+
+    // Verification aggregate
+    let verify_total: u64 = snapshots.iter().map(|s| s.verify_duration_ms).sum();
+    if verify_total > 0 {
+        segments.push(json!({
+            "phase": "Verification",
+            "duration_ms": verify_total,
+            "percentage": (verify_total as f64 / total_ms as f64) * 100.0,
+            "color": "#a78bfa"
+        }));
+    }
+
+    // Agentic aggregate
+    let agentic_total: u64 = snapshots.iter().filter_map(|s| s.agentic_duration_ms).sum();
+    if agentic_total > 0 {
+        segments.push(json!({
+            "phase": "Agentic",
+            "duration_ms": agentic_total,
+            "percentage": (agentic_total as f64 / total_ms as f64) * 100.0,
+            "color": "#4ade80"
+        }));
+    }
+
+    // Overhead (unaccounted time)
+    let accounted = setup_duration_ms + verify_total + agentic_total;
+    if accounted < total_ms {
+        let overhead = total_ms - accounted;
+        segments.push(json!({
+            "phase": "Overhead",
+            "duration_ms": overhead,
+            "percentage": (overhead as f64 / total_ms as f64) * 100.0,
+            "color": "#6b7280"
+        }));
+    }
+
+    json!({
+        "segments": segments,
+        "total_duration_ms": total_ms
+    })
+}
+
 // ─── Helpers ───
 
 fn format_duration_ms(ms: u64) -> String {

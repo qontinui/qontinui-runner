@@ -19,13 +19,11 @@ import { NavigationGraphPreview } from "./NavigationGraphPreview";
 import { AgenticPromptEditor } from "./AgenticPromptEditor";
 import { WorkflowPreview } from "./WorkflowPreview";
 import type { SpecConfig, GeneratorSpecMetadata } from "./types";
-import type {
-  UnifiedWorkflow,
-  SetupStep,
-  VerificationStep,
-  PromptStep,
-} from "../../types/unified-workflow";
-import { createSummaryStep } from "../../types/unified-workflow";
+import type { UnifiedWorkflow } from "../../types/unified-workflow";
+import {
+  buildSpecWorkflow,
+  type SpecConfig as BuildSpecConfig,
+} from "../../lib/workflow-builder/buildSpecWorkflow";
 
 type Step = "load" | "select" | "configure" | "preview";
 
@@ -92,89 +90,34 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
     setSelectedSpecIds(new Set());
   }, []);
 
-  // Build the full UnifiedWorkflow
+  // Build the full UnifiedWorkflow using the shared hybrid builder
   const workflow: UnifiedWorkflow | null = useMemo(() => {
     if (!loadedData) return null;
 
-    const now = new Date().toISOString();
     const isNavigation = generatorType === "navigation";
-    const workflowName = isNavigation ? "Navigation Verification" : "Snapshot Verification";
+    const explorationMeta = genMeta?.explorationMetadata as { targetUrl?: string } | undefined;
+    const pageUrl = isNavigation
+      ? explorationMeta?.targetUrl || states[0]?.pageUrl || undefined
+      : undefined;
 
-    // Setup steps
-    const setupSteps: SetupStep[] = [];
-    if (isNavigation && transitions.length > 0) {
-      const explorationMeta = genMeta?.explorationMetadata as { targetUrl?: string } | undefined;
-      const pageUrl = explorationMeta?.targetUrl || states[0]?.pageUrl || "";
-      if (pageUrl) {
-        setupSteps.push({
-          id: crypto.randomUUID(),
-          type: "command",
-          phase: "setup",
-          name: `Navigate to ${pageUrl}`,
-          mode: "shell",
-          command: `playwright test --headed -g 'navigate' -- --base-url='${pageUrl}'`,
-        } satisfies SetupStep);
-      }
-    }
-
-    // Verification steps: each selected group becomes a prompt-based verification step
-    const selectedGroups = loadedData.groups.filter((g) => selectedSpecIds.has(g.id));
-    const verificationSteps: VerificationStep[] = selectedGroups.map((group) => {
-      const enabledAssertions = group.assertions.filter((a) => a.enabled);
-      const assertionDescriptions = enabledAssertions
-        .map((a) => `- ${a.description} [${a.severity}]`)
-        .join("\n");
-
-      return {
-        id: crypto.randomUUID(),
-        type: "prompt",
-        phase: "verification",
-        name: group.name,
-        content: `${group.description}\n\nAssertions:\n${assertionDescriptions}`,
-      } satisfies VerificationStep;
+    return buildSpecWorkflow({
+      specConfig: loadedData as unknown as BuildSpecConfig,
+      selectedGroupIds: selectedSpecIds,
+      agenticPrompt: agenticPrompt || undefined,
+      maxIterations,
+      elementSource,
+      pageUrl,
+      workflowName: isNavigation ? "Navigation Verification" : "Snapshot Verification",
     });
-
-    // Agentic steps
-    const agenticSteps: PromptStep[] = [];
-    if (agenticPrompt || selectedGroups.length > 0) {
-      const defaultPrompt =
-        agenticPrompt ||
-        `Some verification steps failed. Analyze the failures and fix the issues. The test specifications describe what the application should look like and how it should behave.`;
-      agenticSteps.push({
-        id: crypto.randomUUID(),
-        type: "prompt",
-        phase: "agentic",
-        name: "Fix Verification Failures",
-        content: defaultPrompt,
-      });
-    }
-
-    // Completion steps
-    const completionSteps = [createSummaryStep()];
-
-    return {
-      id: crypto.randomUUID(),
-      name: workflowName,
-      description: `Auto-generated from ${generatorType || "spec"} specifications. ${selectedGroups.length} groups selected with ${selectedGroups.reduce((sum, g) => sum + g.assertions.filter((a) => a.enabled).length, 0)} total assertions.`,
-      setup_steps: setupSteps,
-      verification_steps: verificationSteps,
-      agentic_steps: agenticSteps,
-      completion_steps: completionSteps,
-      max_iterations: maxIterations,
-      category: "spec-generated",
-      tags: [generatorType || "spec", "auto-generated"].filter(Boolean) as string[],
-      created_at: now,
-      modified_at: now,
-    };
   }, [
     loadedData,
     selectedSpecIds,
     agenticPrompt,
     maxIterations,
+    elementSource,
     generatorType,
     genMeta,
     states,
-    transitions,
   ]);
 
   const steps: { id: Step; label: string; icon: React.ReactNode }[] = [

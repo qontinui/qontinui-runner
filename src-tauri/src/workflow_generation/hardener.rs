@@ -455,7 +455,78 @@ pub fn run_hardener_agent(
 
     // Post-hardener SDK URL fix: the AI may also re-introduce /control/ URLs
     // or drop the SDK connect step
-    let hardened = fix_sdk_urls(&hardened);
+    let mut hardened = fix_sdk_urls(&hardened);
+
+    // Re-inject any regression steps that the AI may have dropped.
+    // This is a safety net: the prompt tells the AI to preserve them, and
+    // validate_hardened_output checks for them, but if a regression step was
+    // removed AND the validation was somehow bypassed (e.g., future changes),
+    // this ensures they are always present in the final output.
+    let original_regression_steps: Vec<&Value> = workflow
+        .verification_steps
+        .iter()
+        .filter(|s| s.get("regression_issue_id").is_some())
+        .collect();
+
+    if !original_regression_steps.is_empty() {
+        let hardened_regression_ids: std::collections::HashSet<String> = hardened
+            .verification_steps
+            .iter()
+            .filter_map(|s| {
+                s.get("regression_issue_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .collect();
+
+        for step in original_regression_steps {
+            if let Some(issue_id) = step.get("regression_issue_id").and_then(|v| v.as_str()) {
+                if !hardened_regression_ids.contains(issue_id) {
+                    hardened.verification_steps.push(step.clone());
+                    info!(
+                        "Re-injected regression step for issue '{}' after hardening",
+                        issue_id
+                    );
+                }
+            }
+        }
+    }
+
+    // Re-inject regression steps in stages
+    for (idx, orig_stage) in workflow.stages.iter().enumerate() {
+        let stage_regression_steps: Vec<&Value> = orig_stage
+            .verification_steps
+            .iter()
+            .filter(|s| s.get("regression_issue_id").is_some())
+            .collect();
+
+        if !stage_regression_steps.is_empty() {
+            if let Some(hard_stage) = hardened.stages.get_mut(idx) {
+                let hard_stage_regression_ids: std::collections::HashSet<String> = hard_stage
+                    .verification_steps
+                    .iter()
+                    .filter_map(|s| {
+                        s.get("regression_issue_id")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    })
+                    .collect();
+
+                for step in stage_regression_steps {
+                    if let Some(issue_id) = step.get("regression_issue_id").and_then(|v| v.as_str())
+                    {
+                        if !hard_stage_regression_ids.contains(issue_id) {
+                            hard_stage.verification_steps.push(step.clone());
+                            info!(
+                                "Re-injected regression step for issue '{}' in stages[{}] after hardening",
+                                issue_id, idx
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Build summary by comparing original and hardened verification steps
     let summary = build_summary(&workflow, &hardened);
@@ -1331,7 +1402,8 @@ verify that the tab has spatial visualization content. Add content-specific chec
 10. **Do not convert existing command+check_type steps**: Do NOT convert `command` steps that already have `check_type` set (lint, typecheck, etc.) — they are already deterministic
 11. **SDK verification uses command+curl**: Use `command` steps with `mode: "shell"` and curl piped to grep for SDK-based verification, not `api_request`
 12. **Always set mode on command steps**: Every `command` step must include a `mode` field (`shell`, `check`, `check_group`, or `test`) matching the fields present
-13. **No bash negation prefix**: NEVER use `!` as a command prefix to invert exit codes (e.g., `! grep -qE 'pattern' file`). The `!` operator is bash-specific and may not be detected by the shell router on Windows. Instead, use: `grep -qE 'pattern' file && exit 1 || exit 0`"#);
+13. **No bash negation prefix**: NEVER use `!` as a command prefix to invert exit codes (e.g., `! grep -qE 'pattern' file`). The `!` operator is bash-specific and may not be detected by the shell router on Windows. Instead, use: `grep -qE 'pattern' file && exit 1 || exit 0`
+14. **Regression steps**: Steps with a `regression_issue_id` field or IDs starting with `regression-` must be preserved EXACTLY as-is. Do not modify, remove, or attempt to harden these steps. They are deterministic regression checks tied to specific issues and must remain unchanged."#);
     }
 
     // Include skill catalog context so the hardener can match steps to known skills
@@ -1472,6 +1544,57 @@ fn validate_hardened_output(
         }
         if orig_stage.completion_steps != hard_stage.completion_steps {
             return Some(format!("stages[{}].completion_steps were modified", idx));
+        }
+    }
+
+    // Check that all regression steps are preserved (top-level)
+    let original_regression_ids: Vec<&str> = original
+        .verification_steps
+        .iter()
+        .filter_map(|s| s.get("regression_issue_id").and_then(|v| v.as_str()))
+        .collect();
+
+    let hardened_regression_ids: Vec<&str> = hardened
+        .verification_steps
+        .iter()
+        .filter_map(|s| s.get("regression_issue_id").and_then(|v| v.as_str()))
+        .collect();
+
+    for id in &original_regression_ids {
+        if !hardened_regression_ids.contains(id) {
+            return Some(format!(
+                "Regression step for issue '{}' was removed by hardener",
+                id
+            ));
+        }
+    }
+
+    // Check that all regression steps are preserved (per-stage)
+    for (idx, (orig_stage, hard_stage)) in original
+        .stages
+        .iter()
+        .zip(hardened.stages.iter())
+        .enumerate()
+    {
+        let orig_stage_regression_ids: Vec<&str> = orig_stage
+            .verification_steps
+            .iter()
+            .filter_map(|s| s.get("regression_issue_id").and_then(|v| v.as_str()))
+            .collect();
+
+        let hard_stage_regression_ids: Vec<&str> = hard_stage
+            .verification_steps
+            .iter()
+            .filter_map(|s| s.get("regression_issue_id").and_then(|v| v.as_str()))
+            .collect();
+
+        for id in &orig_stage_regression_ids {
+            if !hard_stage_regression_ids.contains(id) {
+                return Some(format!(
+                    "stages[{}]: regression step for issue '{}' was removed by hardener",
+                    idx, id
+                ));
+            }
         }
     }
 

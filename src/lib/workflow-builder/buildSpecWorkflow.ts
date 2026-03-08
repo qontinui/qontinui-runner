@@ -17,6 +17,7 @@
  */
 
 import type { UnifiedWorkflow, PromptStep, VerificationStep } from "../../types/unified-workflow";
+import type { KnownIssue } from "@qontinui/shared-types";
 import { createSummaryStep } from "../../types/unified-workflow";
 
 // Re-export SpecConfig type shape for consumers that don't import ui-bridge directly
@@ -92,6 +93,10 @@ export interface BuildSpecWorkflowInput {
   workflowName?: string;
   /** Force all assertions to use prompt steps (disables deterministic optimization) */
   forcePromptOnly?: boolean;
+  /** Include regression checks for known issues scoped to this spec */
+  includeRegressionChecks?: boolean;
+  /** Known issues to include as regression verification steps */
+  knownIssues?: KnownIssue[];
 }
 
 // Assertion types that can be evaluated deterministically against a UI snapshot
@@ -258,6 +263,8 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
     pageUrl,
     workflowName,
     forcePromptOnly = false,
+    includeRegressionChecks = false,
+    knownIssues = [],
   } = input;
 
   // Resolve element source: explicit param > spec metadata > "control"
@@ -319,6 +326,37 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
       verificationSteps.push(
         buildPromptStep(name, group.description, aiRequired, elementSource, sourceExplanation),
       );
+    }
+  }
+
+  // ── Regression checks from known issues ─────────────────────────────
+  if (includeRegressionChecks && knownIssues.length > 0) {
+    for (const issue of knownIssues) {
+      if (issue.verification_step_template) {
+        // Deterministic step from template
+        const step = {
+          ...issue.verification_step_template,
+          id: `regression-${issue.id}`,
+          name: `[Regression] ${issue.title}`,
+          phase: "verification",
+          regression_issue_id: issue.id,
+        } as unknown as VerificationStep;
+        verificationSteps.push(step);
+      } else {
+        // AI judgment step from description + hint
+        const hint = issue.verification_hint
+          ? `\nVerification hint: ${issue.verification_hint}`
+          : "";
+        verificationSteps.push({
+          id: `regression-${issue.id}`,
+          type: "prompt",
+          name: `[Regression] ${issue.title}`,
+          phase: "verification",
+          content: `Check for a known issue: ${issue.description}${hint}`,
+          response_mode: true,
+          regression_issue_id: issue.id,
+        } as unknown as VerificationStep);
+      }
     }
   }
 

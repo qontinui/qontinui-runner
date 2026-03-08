@@ -789,6 +789,7 @@ async fn handle_relay_command(
                 auto_run: None,
                 model_overrides: None,
                 generate_specification: Some(true),
+                verification_depth: None,
             };
 
             let doctor_handle = api_state.doctor_handle.clone();

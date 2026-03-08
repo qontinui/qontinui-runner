@@ -919,4 +919,26 @@
   .animate-phase-border {
     animation: phase-border-glow 2s ease-in-out infinite;
   }
+
+  /* ============================================
+   * Zone Flash Animation
+   * Brief amber flash when a zone needs input
+   * ============================================ */
+  @keyframes zone-flash-border {
+    0% {
+      border-color: #e0af68;
+      box-shadow:
+        0 0 16px rgba(224, 175, 104, 0.7),
+        inset 0 0 12px rgba(224, 175, 104, 0.2);
+    }
+    50% {
+      border-color: #e0af68;
+      box-shadow:
+        0 0 8px rgba(224, 175, 104, 0.4),
+        inset 0 0 4px rgba(224, 175, 104, 0.1);
+    }
+    100% {
+      box-shadow: none;
+    }
+  }
 }

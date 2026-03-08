@@ -14,6 +14,8 @@ export interface TerminalInstanceHandle {
   writeToTerminal: (text: string) => void;
   /** Read up to `maxLines` lines from the terminal scrollback buffer. */
   getScrollback: (maxLines?: number) => string;
+  /** Scroll the terminal viewport to the very bottom. */
+  scrollToBottom: () => void;
 }
 
 export type ShellIntegrationEvent =
@@ -133,6 +135,9 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           }
         }
         return lines.join("\n");
+      },
+      scrollToBottom: () => {
+        termRef.current?.scrollToBottom();
       },
     }));
 

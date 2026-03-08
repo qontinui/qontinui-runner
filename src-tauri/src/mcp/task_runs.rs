@@ -3174,6 +3174,7 @@ pub async fn generate_workflow_from_session(
         auto_run: None,
         model_overrides: None,
         generate_specification: Some(true),
+        verification_depth: None,
     };
 
     let doctor_handle = state.doctor_handle.clone();

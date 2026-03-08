@@ -28,6 +28,7 @@ import {
 } from "@/lib/workflow-builder/buildSpecWorkflow";
 import { getApiBase } from "@/lib/runner-api";
 import { createSummaryStep } from "@/types/unified-workflow";
+import { useKnownIssues } from "@/hooks/useKnownIssues";
 import type { LoadedSpec } from "./types";
 
 interface SpecsPageProps {
@@ -38,6 +39,8 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
   const state = useSpecsState();
   const [isSavingWorkflow, setIsSavingWorkflow] = useState(false);
   const [forcePromptOnly, setForcePromptOnly] = useState(false);
+  const [includeRegressionChecks, setIncludeRegressionChecks] = useState(false);
+  const { issues: knownIssues, loadIssuesForSpec } = useKnownIssues();
 
   // Auto-load bundled specs on first mount only (skip if restored from cache)
   useEffect(() => {
@@ -47,6 +50,15 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Load known issues when a spec is selected (for regression checks)
+  useEffect(() => {
+    if (state.selectedSpec?.kind === "page-spec") {
+      const pageUrl = (state.selectedSpec.config as { metadata?: { pageUrl?: string } })?.metadata
+        ?.pageUrl;
+      loadIssuesForSpec(state.selectedSpec.specId, pageUrl);
+    }
+  }, [state.selectedSpec, loadIssuesForSpec]);
+
   // Build workflow from any spec type, save via API, navigate to builder
   const handleBuildWorkflow = useCallback(
     async (spec?: LoadedSpec) => {
@@ -54,10 +66,13 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
       if (!target || isSavingWorkflow) return;
 
       if (target.kind === "page-spec") {
+        const activeIssues = knownIssues.filter((i) => i.status === "active");
         const workflow = buildSpecWorkflow({
           specConfig: target.config as unknown as BuildSpecConfig,
           workflowName: `Spec: ${target.config.description || target.specId}`,
           forcePromptOnly,
+          includeRegressionChecks: includeRegressionChecks && activeIssues.length > 0,
+          knownIssues: includeRegressionChecks ? activeIssues : [],
         });
 
         // Save to backend and navigate to builder
@@ -151,7 +166,14 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
         }
       }
     },
-    [state.selectedSpec, isSavingWorkflow, onNavigateToWorkflowBuilder, forcePromptOnly],
+    [
+      state.selectedSpec,
+      isSavingWorkflow,
+      onNavigateToWorkflowBuilder,
+      forcePromptOnly,
+      includeRegressionChecks,
+      knownIssues,
+    ],
   );
 
   return (
@@ -179,6 +201,9 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
         onSaveToFile={state.saveToFile}
         forcePromptOnly={forcePromptOnly}
         onToggleForcePromptOnly={() => setForcePromptOnly(!forcePromptOnly)}
+        includeRegressionChecks={includeRegressionChecks}
+        onToggleRegressionChecks={() => setIncludeRegressionChecks(!includeRegressionChecks)}
+        regressionIssueCount={knownIssues.filter((i) => i.status === "active").length}
         onBuildWorkflow={() => handleBuildWorkflow()}
         onToggleEditMode={() => state.setEditMode(!state.editMode)}
       />

@@ -632,6 +632,7 @@ pub async fn generate_workflow_from_session(
         auto_run: None,
         model_overrides: None,
         generate_specification: Some(true),
+        verification_depth: None,
     };
 
     // Emit a UI-only note that generation is starting (not sent to AI session --

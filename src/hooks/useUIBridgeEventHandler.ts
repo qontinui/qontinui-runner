@@ -32,6 +32,7 @@ import {
   getGlobalSpecStore,
   getElementDesignData,
   captureResponsiveSnapshots,
+  captureStateVariations,
   runStyleAudit,
 } from "ui-bridge";
 import type {
@@ -43,6 +44,7 @@ import type {
   ElementDesignData,
   StyleGuideConfig,
   DesignRegistryLike,
+  InteractionStateName,
 } from "ui-bridge";
 
 /**
@@ -70,7 +72,9 @@ type UIBridgeRequestType =
   | "design_run_audit"
   | "design_load_style_guide"
   | "design_get_style_guide"
-  | "design_clear_style_guide";
+  | "design_clear_style_guide"
+  | "design_get_element_styles"
+  | "design_get_state_styles";
 
 /**
  * Payload structure for UI Bridge requests from Rust
@@ -590,27 +594,171 @@ export function useUIBridgeEventHandler(): void {
 
           case "design_get_snapshot": {
             const allElements = currentBridge.elements;
-            const targetIds = payload.elementIds;
-            const filtered = targetIds
-              ? allElements.filter((el) => targetIds.includes(el.id))
-              : allElements;
+            const targetIds = payload.elementIds as string[] | undefined;
 
-            const designData: ElementDesignData[] = filtered
-              .filter((el) => el.element instanceof HTMLElement)
-              .map((el) =>
-                getElementDesignData(el.element as HTMLElement, {
-                  elementId: el.id,
-                  label: el.label,
-                  type: el.type,
-                  includePseudoElements: payload.includePseudoElements,
-                }),
-              );
+            const designData: ElementDesignData[] = [];
+
+            if (allElements.length > 0) {
+              // Use registered elements from bridge
+              const filtered = targetIds
+                ? allElements.filter((el) => targetIds.includes(el.id))
+                : allElements;
+
+              for (const el of filtered) {
+                let domEl: HTMLElement | null =
+                  el.element instanceof HTMLElement ? el.element : null;
+                if (!domEl) {
+                  const selector = el.getIdentifier?.()?.selector;
+                  if (selector) {
+                    domEl = document.querySelector<HTMLElement>(selector);
+                  }
+                }
+                if (domEl) {
+                  designData.push(
+                    getElementDesignData(domEl, {
+                      elementId: el.id,
+                      label: el.label,
+                      type: el.type,
+                      includePseudoElements: payload.includePseudoElements,
+                    }),
+                  );
+                }
+              }
+            } else {
+              // Fallback: scan DOM for all data-ui-id elements
+              const domElements = document.querySelectorAll<HTMLElement>("[data-ui-id]");
+              for (const domEl of domElements) {
+                const uiId = domEl.getAttribute("data-ui-id") ?? "";
+                if (targetIds && !targetIds.includes(uiId)) continue;
+                designData.push(
+                  getElementDesignData(domEl, {
+                    elementId: uiId,
+                    includePseudoElements: payload.includePseudoElements,
+                  }),
+                );
+              }
+            }
 
             await sendResponse({
               requestId,
               type,
               success: true,
               data: { elements: designData, timestamp: Date.now() },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "design_get_element_styles": {
+            const { elementId: styleElementId } = payload;
+            if (!styleElementId) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: "elementId is required",
+                timestamp: Date.now(),
+              });
+              return;
+            }
+
+            const styleElement = currentBridge.getElement(styleElementId);
+            let styleDomEl: HTMLElement | null = null;
+            if (styleElement) {
+              styleDomEl =
+                styleElement.element instanceof HTMLElement ? styleElement.element : null;
+              if (!styleDomEl) {
+                const sel = styleElement.getIdentifier?.()?.selector;
+                if (sel) {
+                  styleDomEl = document.querySelector<HTMLElement>(sel);
+                }
+              }
+            }
+            if (!styleDomEl) {
+              // Try direct selector query as last resort
+              styleDomEl = document.querySelector<HTMLElement>(`[data-ui-id="${styleElementId}"]`);
+            }
+
+            if (!styleDomEl) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: `Element not found in DOM: ${styleElementId}`,
+                timestamp: Date.now(),
+              });
+              return;
+            }
+
+            const elementDesignData = getElementDesignData(styleDomEl, {
+              elementId: styleElementId,
+              label: styleElement?.label,
+              type: styleElement?.type,
+              includePseudoElements: true,
+            });
+
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: elementDesignData,
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "design_get_state_styles": {
+            const { elementId: stateElementId } = payload;
+            if (!stateElementId) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: "elementId is required",
+                timestamp: Date.now(),
+              });
+              return;
+            }
+
+            const stateElement = currentBridge.getElement(stateElementId);
+            let stateDomEl: HTMLElement | null = null;
+            if (stateElement) {
+              stateDomEl =
+                stateElement.element instanceof HTMLElement ? stateElement.element : null;
+              if (!stateDomEl) {
+                const sel = stateElement.getIdentifier?.()?.selector;
+                if (sel) {
+                  stateDomEl = document.querySelector<HTMLElement>(sel);
+                }
+              }
+            }
+            if (!stateDomEl) {
+              stateDomEl = document.querySelector<HTMLElement>(`[data-ui-id="${stateElementId}"]`);
+            }
+
+            if (!stateDomEl) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: `Element not found in DOM: ${stateElementId}`,
+                timestamp: Date.now(),
+              });
+              return;
+            }
+
+            const states =
+              (payload.params?.states as InteractionStateName[] | undefined) ?? undefined;
+            const stateVariations = await captureStateVariations(stateDomEl, states);
+
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: {
+                elementId: stateElementId,
+                states: stateVariations,
+              },
               timestamp: Date.now(),
             });
             break;
@@ -644,19 +792,39 @@ export function useUIBridgeEventHandler(): void {
             const auditElements = currentBridge.elements;
             const auditTargetIds =
               payload.elementIds ?? (payload.params?.elementIds as string[] | undefined);
-            const auditFiltered = auditTargetIds
-              ? auditElements.filter((el) => auditTargetIds.includes(el.id))
-              : auditElements;
 
-            const auditDesignData: ElementDesignData[] = auditFiltered
-              .filter((el) => el.element instanceof HTMLElement)
-              .map((el) =>
-                getElementDesignData(el.element as HTMLElement, {
-                  elementId: el.id,
-                  label: el.label,
-                  type: el.type,
-                }),
-              );
+            const auditDesignData: ElementDesignData[] = [];
+            if (auditElements.length > 0) {
+              const auditFiltered = auditTargetIds
+                ? auditElements.filter((el) => auditTargetIds.includes(el.id))
+                : auditElements;
+              for (const el of auditFiltered) {
+                let domEl: HTMLElement | null =
+                  el.element instanceof HTMLElement ? el.element : null;
+                if (!domEl) {
+                  const sel = el.getIdentifier?.()?.selector;
+                  if (sel) {
+                    domEl = document.querySelector<HTMLElement>(sel);
+                  }
+                }
+                if (domEl) {
+                  auditDesignData.push(
+                    getElementDesignData(domEl, {
+                      elementId: el.id,
+                      label: el.label,
+                      type: el.type,
+                    }),
+                  );
+                }
+              }
+            } else {
+              const domElements = document.querySelectorAll<HTMLElement>("[data-ui-id]");
+              for (const domEl of domElements) {
+                const uiId = domEl.getAttribute("data-ui-id") ?? "";
+                if (auditTargetIds && !auditTargetIds.includes(uiId)) continue;
+                auditDesignData.push(getElementDesignData(domEl, { elementId: uiId }));
+              }
+            }
 
             const guide =
               payload.guide ??

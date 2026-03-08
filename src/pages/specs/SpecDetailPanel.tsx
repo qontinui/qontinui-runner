@@ -36,8 +36,10 @@ import {
   Navigation,
   ChevronDown,
   ChevronRight,
+  Bug,
 } from "lucide-react";
 import type { LoadedSpec } from "./types";
+import { SpecIssuesPanel } from "./SpecIssuesPanel";
 import type {
   SpecGroup,
   SpecAssertion,
@@ -2380,6 +2382,8 @@ export function SpecDetailPanel({
   onRemoveGroup,
   onUpdateSetupActions,
 }: SpecDetailPanelProps) {
+  const [activeTab, setActiveTab] = useState<"assertions" | "issues">("assertions");
+
   if (!selectedSpec) {
     return (
       <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
@@ -2423,21 +2427,63 @@ export function SpecDetailPanel({
     );
   }
 
+  // Page spec view with tabs for Assertions and Issues
+  if (selectedSpec.kind === "page-spec") {
+    const pageUrl = (selectedSpec.config as { metadata?: { pageUrl?: string } })?.metadata?.pageUrl;
+
+    return (
+      <div className="h-full flex flex-col">
+        {/* Tab bar */}
+        <div className="flex border-b border-border px-4 pt-2 gap-1 shrink-0">
+          <button
+            onClick={() => setActiveTab("assertions")}
+            className={`px-3 py-1.5 text-xs font-medium rounded-t border border-b-0 transition-colors ${
+              activeTab === "assertions"
+                ? "bg-background text-foreground border-border"
+                : "text-muted-foreground border-transparent hover:text-foreground"
+            }`}
+          >
+            <Shield className="w-3 h-3 inline-block mr-1 -mt-0.5" />
+            Assertions
+          </button>
+          <button
+            onClick={() => setActiveTab("issues")}
+            className={`px-3 py-1.5 text-xs font-medium rounded-t border border-b-0 transition-colors ${
+              activeTab === "issues"
+                ? "bg-background text-foreground border-border"
+                : "text-muted-foreground border-transparent hover:text-foreground"
+            }`}
+          >
+            <Bug className="w-3 h-3 inline-block mr-1 -mt-0.5" />
+            Issues
+          </button>
+        </div>
+
+        {/* Tab content */}
+        <div className="flex-1 overflow-y-auto p-4">
+          {activeTab === "assertions" && (
+            <PageSpecOverview
+              config={selectedSpec.config}
+              specId={selectedSpec.specId}
+              source={selectedSpec.source}
+              appName={selectedSpec.appName}
+              editMode={editMode}
+              onAddGroup={onAddGroup ? (g) => onAddGroup(selectedSpec.specId, g) : undefined}
+              onRemoveGroup={
+                onRemoveGroup ? (gid) => onRemoveGroup(selectedSpec.specId, gid) : undefined
+              }
+            />
+          )}
+          {activeTab === "issues" && (
+            <SpecIssuesPanel specId={selectedSpec.specId} pageUrl={pageUrl} />
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="h-full overflow-y-auto p-4">
-      {selectedSpec.kind === "page-spec" && (
-        <PageSpecOverview
-          config={selectedSpec.config}
-          specId={selectedSpec.specId}
-          source={selectedSpec.source}
-          appName={selectedSpec.appName}
-          editMode={editMode}
-          onAddGroup={onAddGroup ? (g) => onAddGroup(selectedSpec.specId, g) : undefined}
-          onRemoveGroup={
-            onRemoveGroup ? (gid) => onRemoveGroup(selectedSpec.specId, gid) : undefined
-          }
-        />
-      )}
       {selectedSpec.kind === "architecture" && (
         <ArchitectureOverview
           config={selectedSpec.config}

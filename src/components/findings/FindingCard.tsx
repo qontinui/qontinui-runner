@@ -5,7 +5,7 @@
  * severity, status, and action buttons.
  */
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   Bug,
   CheckSquare,
@@ -30,9 +30,42 @@ import {
   Loader2,
   ExternalLink,
 } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import type { Finding } from "../../types/findings";
+import type {
+  CreateKnownIssueRequest,
+  IssueCategory,
+  KnownIssueSeverity,
+  KnownIssue,
+} from "@qontinui/shared-types";
 import { getCategoryById, getCategoryColorClasses } from "../../services/FindingCategories";
 import { getSeverityColors, getStatusColors, getAccentColors } from "@/design-system";
+
+// Map finding category IDs to known issue categories
+const FINDING_TO_ISSUE_CATEGORY: Record<string, IssueCategory> = {
+  code_bug: "other",
+  security: "other",
+  performance: "performance",
+  runtime_issue: "state",
+  todo: "other",
+  enhancement: "other",
+  config_issue: "other",
+  test_issue: "other",
+  documentation: "other",
+  warning: "other",
+  data_migration: "other",
+  already_fixed: "other",
+  expected_behavior: "other",
+};
+
+// Map finding severity to known issue severity
+const FINDING_TO_ISSUE_SEVERITY: Record<string, KnownIssueSeverity> = {
+  critical: "critical",
+  high: "high",
+  medium: "medium",
+  low: "low",
+  info: "low",
+};
 
 // Map icon names to Lucide components
 const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -91,6 +124,54 @@ export function FindingCard({
   const [isExpanded, setIsExpanded] = useState(false);
   const [inputValue, setInputValue] = useState("");
   const [showInputForm, setShowInputForm] = useState(false);
+  const [knownIssueState, setKnownIssueState] = useState<"idle" | "creating" | "created" | "error">(
+    "idle",
+  );
+  const [existingIssueId, setExistingIssueId] = useState<string | null>(null);
+
+  // Check if a known issue already exists for this finding
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const issues = await invoke<KnownIssue[]>("list_known_issues", { query: {} });
+        if (cancelled) return;
+        const match = issues.find(
+          (issue) => issue.source_finding_ids.includes(finding.id) || issue.title === finding.title,
+        );
+        setExistingIssueId(match?.id ?? null);
+      } catch {
+        // Non-critical -- leave as null (show create button)
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [finding.id, finding.title]);
+
+  const handleCreateKnownIssue = async () => {
+    setKnownIssueState("creating");
+    try {
+      const request: CreateKnownIssueRequest = {
+        title: finding.title,
+        description: finding.description,
+        category: FINDING_TO_ISSUE_CATEGORY[finding.categoryId] || "other",
+        severity: FINDING_TO_ISSUE_SEVERITY[finding.severity] || "medium",
+        detection_method: "ai_judgment",
+        scope_type: "global",
+        scope_value: null,
+        provenance: "manual",
+        source_finding_ids: [finding.id],
+        verification_hint: finding.description.slice(0, 200),
+      };
+      await invoke("create_known_issue", { request });
+      setKnownIssueState("created");
+    } catch {
+      setKnownIssueState("error");
+      // Reset to idle after a brief delay so the user can retry
+      setTimeout(() => setKnownIssueState("idle"), 3000);
+    }
+  };
 
   const category = getCategoryById(finding.categoryId);
   const categoryColors = getCategoryColorClasses(category?.color || "slate");
@@ -205,6 +286,47 @@ export function FindingCard({
                 Respond
               </button>
             )}
+
+            {/* Known Issue Button: shows linked state if issue exists, otherwise create */}
+            {finding.status !== "resolved" &&
+              finding.status !== "wont_fix" &&
+              (existingIssueId ? (
+                <span
+                  data-ui-id="findings-known-issue-linked"
+                  className="p-1.5 rounded text-amber-400 bg-amber-500/10 cursor-default"
+                  title="Known issue exists for this finding"
+                >
+                  <Bug className="w-4 h-4" />
+                </span>
+              ) : (
+                <button
+                  data-ui-id="findings-create-known-issue-btn"
+                  onClick={handleCreateKnownIssue}
+                  disabled={knownIssueState === "creating" || knownIssueState === "created"}
+                  className={`p-1.5 rounded transition-colors ${
+                    knownIssueState === "created"
+                      ? "text-green-400 bg-green-500/10"
+                      : knownIssueState === "error"
+                        ? "text-red-400 bg-red-500/10"
+                        : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                  } disabled:opacity-70`}
+                  title={
+                    knownIssueState === "created"
+                      ? "Known issue created"
+                      : knownIssueState === "error"
+                        ? "Failed to create known issue"
+                        : "Create Known Issue"
+                  }
+                >
+                  {knownIssueState === "creating" ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : knownIssueState === "created" ? (
+                    <Check className="w-4 h-4" />
+                  ) : (
+                    <Bug className="w-4 h-4" />
+                  )}
+                </button>
+              ))}
 
             {/* Dismiss Button */}
             {finding.status !== "resolved" && onDismiss && (

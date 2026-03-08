@@ -241,3 +241,5 @@ export type {
 export { useSharedElapsedTime } from "./useSharedElapsedTime";
 
 export { useRunnerConnectionStatus } from "./useRunnerConnectionStatus";
+
+export { useKnownIssues } from "./useKnownIssues";

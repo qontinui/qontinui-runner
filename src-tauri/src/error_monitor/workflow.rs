@@ -313,7 +313,7 @@ impl ErrorFixWorkflowGenerator {
             format!("[{}] {} resolved", severity.to_uppercase(), error_type)
         } else {
             let short_msg = if error.message.len() > 40 {
-                format!("{}...", &error.message[..40])
+                format!("{}...", truncate_str(&error.message, 40))
             } else {
                 error.message.clone()
             };

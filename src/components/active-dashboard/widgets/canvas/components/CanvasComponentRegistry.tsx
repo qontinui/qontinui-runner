@@ -23,6 +23,10 @@ import { StateTimelinePanel } from "./StateTimelinePanel";
 import { WaterfallPanel } from "./WaterfallPanel";
 import { SparklinePanel } from "./SparklinePanel";
 import { WaffleChartPanel } from "./WaffleChartPanel";
+import { PhaseTimelinePanel } from "./PhaseTimelinePanel";
+import { IterationComparisonPanel } from "./IterationComparisonPanel";
+import { StepDurationChartPanel } from "./StepDurationChartPanel";
+import { PhaseDistributionPanel } from "./PhaseDistributionPanel";
 
 /**
  * Props that all canvas panel components receive.
@@ -69,6 +73,10 @@ const COMPONENT_MAP: Record<string, ComponentType<CanvasPanelComponentProps>> = 
   Waterfall: WaterfallPanel,
   Sparkline: SparklinePanel,
   WaffleChart: WaffleChartPanel,
+  PhaseTimeline: PhaseTimelinePanel,
+  IterationComparison: IterationComparisonPanel,
+  StepDurationChart: StepDurationChartPanel,
+  PhaseDistribution: PhaseDistributionPanel,
 };
 
 /**

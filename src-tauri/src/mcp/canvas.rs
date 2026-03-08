@@ -43,6 +43,10 @@ const ALLOWED_COMPONENTS: &[&str] = &[
     "Waterfall",
     "Sparkline",
     "WaffleChart",
+    "PhaseTimeline",
+    "IterationComparison",
+    "StepDurationChart",
+    "PhaseDistribution",
 ];
 
 /// In-memory canvas state.

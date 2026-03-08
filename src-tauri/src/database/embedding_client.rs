@@ -128,7 +128,7 @@ impl EmbeddingClient {
             .iter()
             .map(|t| {
                 if t.len() > 2000 {
-                    t[..2000].to_string()
+                    truncate_str(t, 2000).to_string()
                 } else {
                     t.clone()
                 }

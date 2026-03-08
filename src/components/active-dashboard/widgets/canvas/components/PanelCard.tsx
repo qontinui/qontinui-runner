@@ -134,6 +134,34 @@ function serializePanelData(panel: CanvasPanel): string {
         .join(", ");
     }
 
+    case "PhaseTimeline": {
+      const phases =
+        (data.phases as Array<{ name: string; duration_ms: number; status: string }>) ?? [];
+      return phases.map((p) => `${p.name}: ${p.duration_ms}ms (${p.status})`).join("\n");
+    }
+
+    case "IterationComparison": {
+      const iterations =
+        (data.iterations as Array<{ iteration: number; passed: number; failed: number }>) ?? [];
+      return iterations
+        .map((i) => `Iter ${i.iteration}: ${i.passed} passed, ${i.failed} failed`)
+        .join("\n");
+    }
+
+    case "StepDurationChart": {
+      const steps =
+        (data.steps as Array<{ name: string; duration_ms: number; status: string }>) ?? [];
+      return steps.map((s) => `${s.name}: ${s.duration_ms}ms (${s.status})`).join("\n");
+    }
+
+    case "PhaseDistribution": {
+      const segments =
+        (data.segments as Array<{ phase: string; duration_ms: number; percentage: number }>) ?? [];
+      return segments
+        .map((s) => `${s.phase}: ${s.percentage.toFixed(1)}% (${s.duration_ms}ms)`)
+        .join("\n");
+    }
+
     default:
       return JSON.stringify(data, null, 2);
   }

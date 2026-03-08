@@ -106,6 +106,8 @@ pub fn run_specification_agent(
     model_override: Option<&str>,
     provider_override: Option<&str>,
     insights_section: Option<&str>,
+    verification_depth: &str,
+    relevant_issues: &[crate::known_issues::KnownIssue],
 ) -> SpecificationResult {
     let start = Instant::now();
 
@@ -114,6 +116,8 @@ pub fn run_specification_agent(
         discovery_context,
         resolved_contexts,
         insights_section,
+        verification_depth,
+        relevant_issues,
     );
     let task_context = TaskContext::from_prompt(&prompt);
     let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
@@ -222,6 +226,8 @@ fn build_specification_prompt(
     discovery_context: &str,
     resolved_contexts: &str,
     insights_section: Option<&str>,
+    verification_depth: &str,
+    relevant_issues: &[crate::known_issues::KnownIssue],
 ) -> String {
     let mut prompt = format!(
         r#"You are a specification agent for an automation platform. Your job is to define **acceptance criteria** — concrete, observable conditions that prove a task was completed successfully.
@@ -255,6 +261,45 @@ You do NOT implement anything. You only define what "done" looks like.
         if !insights.is_empty() {
             prompt.push('\n');
             prompt.push_str(insights);
+        }
+    }
+
+    // Inject verification depth instructions
+    match verification_depth {
+        "smoke" => {
+            prompt.push_str("\n## Verification Scope: SMOKE\n\n");
+            prompt.push_str(
+                "Generate only 1-3 minimal criteria: the app builds, starts, and doesn't crash.\n",
+            );
+            prompt.push_str("Do NOT generate detailed behavioral or content criteria.\n");
+        }
+        "thorough" => {
+            prompt.push_str("\n## Verification Scope: THOROUGH\n\n");
+            prompt.push_str("In addition to standard criteria, add 1-2 exploratory criteria that ask the AI to look for anomalies, unexpected behavior, or visual defects in the UI.\n");
+        }
+        "regression" => {
+            prompt.push_str("\n## Verification Scope: REGRESSION\n\n");
+            prompt.push_str("Include standard criteria plus regression checks for all known issues listed below.\n");
+            prompt.push_str("Each known issue should produce at least one dedicated criterion.\n");
+        }
+        _ => {} // "standard" — no extra instructions
+    }
+
+    // Inject known issues as additional criteria hints
+    if !relevant_issues.is_empty() {
+        prompt.push_str("\n## Known Issues (Generate Regression Criteria)\n\n");
+        prompt.push_str("The following issues have been previously observed. Generate a criterion for each to verify it does not recur:\n\n");
+        for issue in relevant_issues {
+            let severity = issue.severity.as_str();
+            let hint = issue.verification_hint.as_deref().unwrap_or("(no hint)");
+            prompt.push_str(&format!(
+                "- **{}** [{}]: {}\n  Detection: {}\n  Hint: {}\n\n",
+                issue.title,
+                severity,
+                issue.description,
+                issue.detection_method.as_str(),
+                hint,
+            ));
         }
     }
 

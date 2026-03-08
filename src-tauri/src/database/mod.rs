@@ -5936,6 +5936,80 @@ impl CheckpointDb {
             info!("Successfully migrated to version 90 (completion_prompts_first)");
         }
 
+        // Version 91: Known Issues Registry + Issue Pattern Templates
+        if current_version < 91 {
+            info!("Migrating to version 91 (known issues registry + pattern templates)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS issue_pattern_templates (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    detection_type TEXT NOT NULL,
+                    step_template TEXT,
+                    ai_prompt_template TEXT,
+                    parameters TEXT NOT NULL DEFAULT '[]',
+                    built_in BOOLEAN NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ipt_category ON issue_pattern_templates(category);
+                CREATE INDEX IF NOT EXISTS idx_ipt_status ON issue_pattern_templates(status);
+
+                CREATE TABLE IF NOT EXISTS known_issues (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'other',
+                    scope_type TEXT NOT NULL DEFAULT 'global',
+                    scope_value TEXT,
+                    scope_tags TEXT DEFAULT '[]',
+                    detection_method TEXT NOT NULL DEFAULT 'ai_judgment',
+                    detection_config TEXT DEFAULT '{}',
+                    pattern_template_id TEXT,
+                    reproduction_context TEXT,
+                    trigger_conditions TEXT DEFAULT '[]',
+                    severity TEXT NOT NULL DEFAULT 'medium',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    provenance TEXT NOT NULL DEFAULT 'manual',
+                    source_finding_ids TEXT DEFAULT '[]',
+                    source_task_run_id TEXT,
+                    verification_hint TEXT,
+                    verification_step_template TEXT,
+                    times_detected INTEGER DEFAULT 1,
+                    times_checked INTEGER DEFAULT 0,
+                    last_detected_at TEXT,
+                    last_checked_at TEXT,
+                    resolved_at TEXT,
+                    description_embedding BLOB,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (pattern_template_id) REFERENCES issue_pattern_templates(id) ON DELETE SET NULL,
+                    FOREIGN KEY (source_task_run_id) REFERENCES task_runs(id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_known_issues_category ON known_issues(category);
+                CREATE INDEX IF NOT EXISTS idx_known_issues_scope_type ON known_issues(scope_type);
+                CREATE INDEX IF NOT EXISTS idx_known_issues_status ON known_issues(status);
+                CREATE INDEX IF NOT EXISTS idx_known_issues_severity ON known_issues(severity);
+                CREATE INDEX IF NOT EXISTS idx_known_issues_scope_value ON known_issues(scope_value);
+                CREATE INDEX IF NOT EXISTS idx_known_issues_scope_compound ON known_issues(scope_type, scope_value, status);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (91, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 91: {}", e))?;
+
+            info!(
+                "Successfully migrated to version 91 (known issues registry + pattern templates)"
+            );
+        }
+
         Ok(())
     }
 

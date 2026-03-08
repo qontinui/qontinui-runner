@@ -53,6 +53,8 @@ pub struct CanvasPanelManager {
     workflow_start_time: Instant,
     max_iterations: u32,
     max_sessions: Option<u32>,
+    setup_duration_ms: u64,
+    setup_step_count: usize,
 }
 
 impl CanvasPanelManager {
@@ -77,6 +79,8 @@ impl CanvasPanelManager {
             workflow_start_time: Instant::now(),
             max_iterations: 5,
             max_sessions: None,
+            setup_duration_ms: 0,
+            setup_step_count: 0,
         }
     }
 
@@ -142,6 +146,8 @@ impl CanvasPanelManager {
     /// Called after setup phase completes.
     pub async fn on_setup_complete(&mut self, success: bool, results: &[StepExecutionResult]) {
         let duration_ms: u64 = results.iter().map(|r| r.duration_ms).sum();
+        self.setup_duration_ms = duration_ms;
+        self.setup_step_count = results.len();
         let data = builders::build_setup_report(success, results, duration_ms);
         self.emit_panel(
             "setup",
@@ -307,6 +313,56 @@ impl CanvasPanelManager {
         )
         .await;
 
+        // Iteration Comparison (after 2+ iterations)
+        if self.iteration_snapshots.len() >= 2 {
+            let comparison_data = builders::build_iteration_comparison(&self.iteration_snapshots);
+            self.emit_panel(
+                "iter-comparison",
+                "IterationComparison",
+                "Iteration Comparison",
+                comparison_data,
+                14,
+                "compact",
+                Some("Progress"),
+            )
+            .await;
+        }
+
+        // Phase Timeline
+        let phase_timeline_data = builders::build_phase_timeline(
+            &self.iteration_snapshots,
+            self.setup_duration_ms,
+            self.setup_step_count,
+            self.workflow_start_time.elapsed(),
+        );
+        self.emit_panel(
+            "phase-timeline",
+            "PhaseTimeline",
+            "Phase Timeline",
+            phase_timeline_data,
+            7,
+            "compact",
+            Some("Overview"),
+        )
+        .await;
+
+        // Phase Distribution
+        let distribution_data = builders::build_phase_distribution(
+            &self.iteration_snapshots,
+            self.setup_duration_ms,
+            self.workflow_start_time.elapsed(),
+        );
+        self.emit_panel(
+            "phase-distribution",
+            "PhaseDistribution",
+            "Time Distribution",
+            distribution_data,
+            15,
+            "compact",
+            Some("Progress"),
+        )
+        .await;
+
         // Resource Dashboard
         let sessions_count = self.get_sessions_count().await;
         let resource_data = builders::build_resource_dashboard(
@@ -445,6 +501,24 @@ impl CanvasPanelManager {
         }
 
         let total_duration_ms = duration.as_millis() as u64;
+
+        // Step Duration Chart (top 10 longest steps)
+        let duration_chart_data: Vec<(String, u64, &str, Option<&str>)> = step_timings
+            .iter()
+            .map(|(name, _start, dur, status, phase)| (name.clone(), *dur, *status, *phase))
+            .collect();
+        let step_duration_data = builders::build_step_duration_chart(&duration_chart_data, 10);
+        self.emit_panel(
+            "step-durations",
+            "StepDurationChart",
+            "Slowest Steps",
+            step_duration_data,
+            3,
+            "compact",
+            Some("Overview"),
+        )
+        .await;
+
         let waterfall_data = builders::build_waterfall(&step_timings, total_duration_ms);
         self.emit_panel(
             "waterfall",
@@ -454,6 +528,41 @@ impl CanvasPanelManager {
             2,
             "normal",
             Some("Overview"),
+        )
+        .await;
+
+        // Final Phase Timeline (with accurate total duration)
+        let final_phase_timeline = builders::build_phase_timeline(
+            &self.iteration_snapshots,
+            self.setup_duration_ms,
+            self.setup_step_count,
+            duration,
+        );
+        self.emit_panel(
+            "phase-timeline",
+            "PhaseTimeline",
+            "Phase Timeline",
+            final_phase_timeline,
+            7,
+            "compact",
+            Some("Overview"),
+        )
+        .await;
+
+        // Final Phase Distribution (with accurate total duration)
+        let final_distribution = builders::build_phase_distribution(
+            &self.iteration_snapshots,
+            self.setup_duration_ms,
+            duration,
+        );
+        self.emit_panel(
+            "phase-distribution",
+            "PhaseDistribution",
+            "Time Distribution",
+            final_distribution,
+            15,
+            "compact",
+            Some("Progress"),
         )
         .await;
     }

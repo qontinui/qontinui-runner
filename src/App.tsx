@@ -166,6 +166,7 @@ import { GeneratorEvalPage } from "./pages/GeneratorEvalPage";
 import { SpecsPage } from "./pages/specs/SpecsPage";
 import { UIBridgeIntegrationPage } from "./pages/ui-bridge-integration/UIBridgeIntegrationPage";
 import { TerminalPage } from "./components/terminal";
+import { KnownIssuesPage } from "./pages/known-issues/KnownIssuesPage";
 
 // Development tools
 import { PerformanceOverlay } from "./components/dev";
@@ -185,6 +186,7 @@ type MainTabId =
   | "runs"
   | "history"
   | "error-monitor"
+  | "known-issues"
   | "processes"
   | "reflection"
   | "generator-eval"
@@ -254,6 +256,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "runs",
   "history",
   "error-monitor",
+  "known-issues",
   "processes",
   "reflection",
   "generator-eval",
@@ -972,6 +975,13 @@ function AppContent() {
         return (
           <div className="h-full overflow-hidden">
             <ErrorMonitorTab />
+          </div>
+        );
+
+      case "known-issues":
+        return (
+          <div className="h-full overflow-hidden">
+            <KnownIssuesPage />
           </div>
         );
 

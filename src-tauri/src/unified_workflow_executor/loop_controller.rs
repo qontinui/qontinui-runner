@@ -13,7 +13,7 @@
 //! 6. The loop respects external stop requests (via stop_ai_analysis endpoint)
 
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
@@ -1479,7 +1479,7 @@ impl LoopController {
             );
         }
 
-        loop {
+        let loop_result = loop {
             iteration += 1;
 
             // Update routing context for conditional model routing
@@ -1499,7 +1499,7 @@ impl LoopController {
             // Check if the task has been stopped externally (e.g., user clicked Stop button)
             if self.is_task_stopped(&config.execution_id) {
                 warn!("Task was stopped externally - exiting loop");
-                return LoopResult {
+                break LoopResult {
                     iterations_run: iteration - 1,
                     verification_passed: false,
                     max_iterations_reached: false,
@@ -1520,7 +1520,7 @@ impl LoopController {
                             "Global max_sessions ({}) reached (sessions_count={}) - exiting loop",
                             max, task_run.sessions_count
                         );
-                        return LoopResult {
+                        break LoopResult {
                             iterations_run: iteration - 1,
                             verification_passed: false,
                             max_iterations_reached: true,
@@ -1557,7 +1557,7 @@ impl LoopController {
                     "Max iterations ({}) exceeded - exiting loop",
                     config.max_iterations
                 );
-                return LoopResult {
+                break LoopResult {
                     iterations_run: iteration - 1, // Don't count this iteration
                     verification_passed: false,
                     max_iterations_reached: true,
@@ -1688,6 +1688,45 @@ impl LoopController {
             for name in &skipped_consistent_pass {
                 let entry = config.verification_history.entry(name.clone()).or_default();
                 entry.push(true);
+            }
+
+            // Track regression issue step results
+            {
+                let db = &self.checkpoint_db;
+                for step_result in &verification_result.step_results {
+                    if let Some(ref step_id) = step_result.step_id {
+                        if let Some(issue_id) = step_id.strip_prefix("regression-") {
+                            let issue_id = issue_id.to_string();
+                            let success = step_result.success;
+                            if let Err(e) = db.with_conn(|conn| {
+                                crate::known_issues::storage::increment_checked(conn, &issue_id)?;
+                                if !success {
+                                    crate::known_issues::storage::increment_detected(
+                                        conn, &issue_id,
+                                    )?;
+                                } else {
+                                    // Decay confidence when regression check passes
+                                    if let Err(e) =
+                                        crate::known_issues::storage::decay_confidence_on_pass(
+                                            conn, &issue_id,
+                                        )
+                                    {
+                                        debug!(
+                                            "Failed to decay confidence for {}: {}",
+                                            issue_id, e
+                                        );
+                                    }
+                                }
+                                Ok::<(), String>(())
+                            }) {
+                                debug!(
+                                    "Failed to update known issue tracking for {}: {}",
+                                    issue_id, e
+                                );
+                            }
+                        }
+                    }
+                }
             }
 
             // Improvement D: Flaky test detection
@@ -1911,7 +1950,7 @@ impl LoopController {
                 };
                 iteration_results.push(iter_result);
 
-                return LoopResult {
+                break LoopResult {
                     iterations_run: iteration,
                     verification_passed: true,
                     max_iterations_reached: false,
@@ -1941,7 +1980,7 @@ impl LoopController {
                 };
                 iteration_results.push(iter_result);
 
-                return LoopResult {
+                break LoopResult {
                     iterations_run: iteration,
                     verification_passed: false,
                     max_iterations_reached: false,
@@ -2359,7 +2398,7 @@ impl LoopController {
                     false,
                 );
 
-                return LoopResult {
+                break LoopResult {
                     iterations_run: iteration,
                     verification_passed: false,
                     max_iterations_reached: false,
@@ -2373,7 +2412,7 @@ impl LoopController {
             // Check if the task was stopped during the agentic phase
             if self.is_task_stopped(&config.execution_id) {
                 warn!("Task was stopped during agentic phase - exiting loop");
-                return LoopResult {
+                break LoopResult {
                     iterations_run: iteration,
                     verification_passed: false,
                     max_iterations_reached: false,
@@ -2598,7 +2637,7 @@ impl LoopController {
                         "Workflow aborted via approval gate on iteration {}",
                         iteration
                     );
-                    return LoopResult {
+                    break LoopResult {
                         iterations_run: iteration,
                         verification_passed: false,
                         max_iterations_reached: false,
@@ -2693,7 +2732,45 @@ impl LoopController {
             );
             // The loop continues here naturally - no return statement
             // Control flows back to the top of the loop for the next iteration
+        };
+
+        // Auto-detect recurring findings → known issues
+        let auto_detected_ids: Vec<String> = self
+            .checkpoint_db
+            .with_conn(|conn| {
+                match crate::known_issues::auto_detect::check_and_promote_recurring_findings(
+                    conn,
+                    &config.execution_id,
+                ) {
+                    Ok(new_ids) => {
+                        if !new_ids.is_empty() {
+                            info!(
+                                "Auto-detected {} new known issue(s) from recurring findings",
+                                new_ids.len()
+                            );
+                        }
+                        Ok(new_ids)
+                    }
+                    Err(e) => {
+                        warn!("Failed to check for recurring findings: {}", e);
+                        Ok(vec![])
+                    }
+                }
+            })
+            .unwrap_or_default();
+
+        // Notify frontend about auto-detected known issues
+        if !auto_detected_ids.is_empty() {
+            let _ = self.app_handle.emit(
+                "known-issues-auto-detected",
+                serde_json::json!({
+                    "count": auto_detected_ids.len(),
+                    "issue_ids": auto_detected_ids,
+                }),
+            );
         }
+
+        loop_result
     }
 
     async fn mark_task_completed(&self, execution_id: &str, workflow_id: Option<&str>) {

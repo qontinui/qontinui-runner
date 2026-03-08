@@ -167,10 +167,19 @@ pub fn list_sessions(
                     continue;
                 }
 
-                let line_count = content.lines().count();
+                // Count actual user/assistant messages (cheap substring check)
+                let message_count = content
+                    .lines()
+                    .filter(|l| {
+                        l.contains("\"type\":\"user\"")
+                            || l.contains("\"type\": \"user\"")
+                            || l.contains("\"type\":\"assistant\"")
+                            || l.contains("\"type\": \"assistant\"")
+                    })
+                    .count();
 
-                // Skip sessions with 0 messages
-                if line_count == 0 {
+                // Skip sessions with no real messages
+                if message_count == 0 {
                     continue;
                 }
 
@@ -185,7 +194,7 @@ pub fn list_sessions(
                     session_id,
                     project_path: project_path.to_string(),
                     config_dir: config_dir.to_string_lossy().to_string(),
-                    message_count: line_count,
+                    message_count,
                     last_modified,
                     first_message_preview,
                     has_plans,
@@ -429,7 +438,15 @@ pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<Tr
                         .unwrap_or_default();
 
                     let content = fs::read_to_string(&session_file).unwrap_or_default();
-                    let line_count = content.lines().count();
+                    let message_count = content
+                        .lines()
+                        .filter(|l| {
+                            l.contains("\"type\":\"user\"")
+                                || l.contains("\"type\": \"user\"")
+                                || l.contains("\"type\":\"assistant\"")
+                                || l.contains("\"type\": \"assistant\"")
+                        })
+                        .count();
                     let has_plans = content.contains("\"planContent\"");
                     let first_message_preview = extract_first_user_preview(&content);
                     let display_name =
@@ -439,7 +456,7 @@ pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<Tr
                         session_id: session_id.to_string(),
                         project_path: project_path.to_string(),
                         config_dir: config_dir.to_string_lossy().to_string(),
-                        message_count: line_count,
+                        message_count,
                         last_modified,
                         first_message_preview,
                         has_plans,

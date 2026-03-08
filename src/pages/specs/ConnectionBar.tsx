@@ -15,6 +15,7 @@ import {
   Pencil,
   PencilOff,
   Brain,
+  Bug,
 } from "lucide-react";
 import type { ConnectionState } from "./types";
 
@@ -27,6 +28,9 @@ interface ConnectionBarProps {
   selectedSpecKind: string | null;
   forcePromptOnly: boolean;
   onToggleForcePromptOnly: () => void;
+  includeRegressionChecks: boolean;
+  onToggleRegressionChecks: () => void;
+  regressionIssueCount: number;
   onLoadBundled: () => void;
   onDiscover: (url: string) => void;
   onLoadFromFile: () => void;
@@ -44,6 +48,9 @@ export function ConnectionBar({
   selectedSpecKind,
   forcePromptOnly,
   onToggleForcePromptOnly,
+  includeRegressionChecks,
+  onToggleRegressionChecks,
+  regressionIssueCount,
   onLoadBundled,
   onDiscover,
   onLoadFromFile,
@@ -156,6 +163,21 @@ export function ConnectionBar({
           >
             <Brain className="w-3.5 h-3.5" />
             AI Eval
+          </button>
+        )}
+        {hasSelectedSpec && selectedSpecKind === "page-spec" && regressionIssueCount > 0 && (
+          <button
+            onClick={onToggleRegressionChecks}
+            className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
+            border transition-colors shrink-0 ${
+              includeRegressionChecks
+                ? "bg-purple-500/15 text-purple-400 border-purple-500/30"
+                : "bg-white/5 text-muted-foreground border-white/10 hover:bg-white/10"
+            }`}
+            title="Include regression checks for known issues in the generated workflow"
+          >
+            <Bug className="w-3.5 h-3.5" />
+            Regression ({regressionIssueCount})
           </button>
         )}
         {hasSelectedSpec && (

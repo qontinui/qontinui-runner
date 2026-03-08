@@ -144,7 +144,7 @@ export function TranscriptSessionSidebar({
                       <div className="flex items-center gap-1 text-[10px] text-[#414868]">
                         <span>{formatTime(session.last_modified)}</span>
                         <span>&middot;</span>
-                        <span>{session.message_count} records</span>
+                        <span>{session.message_count} msgs</span>
                         <span>&middot;</span>
                         <span className="truncate">{projectLabel(session.project_path)}</span>
                       </div>

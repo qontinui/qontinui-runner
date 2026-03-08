@@ -1,10 +1,7 @@
-import { useEffect, useCallback, useRef, useState, createRef } from "react";
+import { useEffect, useCallback, useRef, useState, createRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import {
-  TerminalInstance,
-  type TerminalInstanceHandle,
-  type ShellIntegrationEvent,
-} from "./TerminalInstance";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { type TerminalInstanceHandle, type ShellIntegrationEvent } from "./TerminalInstance";
 import { TerminalTabBar } from "./TerminalTabBar";
 import { TerminalActionBar } from "./TerminalActionBar";
 import { TerminalNotification } from "./TerminalNotification";
@@ -19,6 +16,17 @@ import { TerminalAnalysisPanel, type AnalysisType } from "./TerminalAnalysisPane
 import { TerminalFindingsPanel } from "./TerminalFindingsPanel";
 import { useTerminalManager } from "./useTerminalManager";
 import { useTerminalFindings } from "./useTerminalFindings";
+import { useZoneLayout, LAYOUT_PRESETS, type SessionState } from "./useZoneLayout";
+import { ZoneGrid, type ViewMode } from "./ZoneGrid";
+import { ZoneLayoutPicker } from "./ZoneLayoutPicker";
+import { ZoneStatusBar } from "./ZoneStatusBar";
+import { BatchOperationsBar } from "./BatchOperationsBar";
+import { KeyboardShortcutsOverlay } from "./KeyboardShortcutsOverlay";
+import { ZoneMinimap } from "./ZoneMinimap";
+import { ZoneProfilePicker } from "./ZoneProfilePicker";
+import { CommandPalette } from "./CommandPalette";
+import { ZoneDiffOverlay } from "./ZoneDiffOverlay";
+import { ZoneTimeline } from "./ZoneTimeline";
 import { findingsTracker } from "@/services/FindingsTracker";
 import type { Finding } from "@/types/findings";
 import { WorkflowPreviewPanel } from "@qontinui/workflow-ui";
@@ -26,6 +34,10 @@ import type { UnifiedWorkflow, CanvasPanel } from "@qontinui/shared-types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { parsePlanMarkdown, summarizeParsedPlan } from "@/lib/workflow-builder/parsePlanMarkdown";
 import { buildPlanWorkflow } from "@/lib/workflow-builder/buildPlanWorkflow";
+import { detectSessionState } from "./sessionStateDetector";
+import { playNeedsInputChime, playCompletionChime, playErrorAlert } from "./notificationSound";
+import { save } from "@tauri-apps/plugin-dialog";
+import { writeTextFile } from "@tauri-apps/plugin-fs";
 
 interface CommandResponse {
   success: boolean;
@@ -58,6 +70,329 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
     reconnectToExistingSessions,
     markReconnected,
   } = useTerminalManager();
+
+  // ── Zone layout ─────────────────────────────────────────────────────────────
+  const tabIds = tabs.map((t) => t.id);
+  const zoneLayout = useZoneLayout(tabIds);
+
+  // Sync zone focus → activeId so existing handlers (analysis, findings) work
+  useEffect(() => {
+    if (zoneLayout.focusedTabId && zoneLayout.focusedTabId !== activeId) {
+      setActiveId(zoneLayout.focusedTabId);
+    }
+  }, [zoneLayout.focusedTabId, activeId, setActiveId]);
+
+  // ── Zone focus history (back/forward navigation) ───────────────────────────
+  const focusHistoryRef = useRef<number[]>([]);
+  const focusHistoryIndexRef = useRef(-1);
+  const isNavigatingHistoryRef = useRef(false);
+
+  useEffect(() => {
+    if (isNavigatingHistoryRef.current) {
+      isNavigatingHistoryRef.current = false;
+      return;
+    }
+    const history = focusHistoryRef.current;
+    // Don't push if same as current position in history
+    if (history[focusHistoryIndexRef.current] === zoneLayout.focusedZone) return;
+
+    // Truncate forward history
+    focusHistoryRef.current = history.slice(0, focusHistoryIndexRef.current + 1);
+    focusHistoryRef.current.push(zoneLayout.focusedZone);
+
+    // Cap at 20 entries
+    if (focusHistoryRef.current.length > 20) {
+      focusHistoryRef.current = focusHistoryRef.current.slice(-20);
+    }
+    focusHistoryIndexRef.current = focusHistoryRef.current.length - 1;
+  }, [zoneLayout.focusedZone]);
+
+  // Session state tracking (for status borders)
+  const [sessionStates, setSessionStates] = useState<Record<string, SessionState>>({});
+  const lastOutputTimeRef = useRef<Record<string, number>>({});
+
+  // Last output lines per tab (for compact view)
+  const [lastOutputLines, setLastOutputLines] = useState<Record<string, string[]>>({});
+
+  // Track last-seen line count per tab for unread indicators
+  const lastSeenLineCountRef = useRef<Record<string, number>>({});
+
+  // Update last-seen line count when zone gains focus (clears unread indicator)
+  useEffect(() => {
+    const tabId = zoneLayout.assignments[zoneLayout.focusedZone];
+    if (tabId) {
+      lastSeenLineCountRef.current[tabId] = (lastOutputLines[tabId] ?? []).length;
+    }
+  }, [zoneLayout.focusedZone, zoneLayout.assignments, lastOutputLines]);
+
+  // Compute which zones have unread output
+  const unreadZones = useMemo(() => {
+    const unread = new Set<string>();
+    for (const [zoneStr, tabId] of Object.entries(zoneLayout.assignments)) {
+      const currentCount = (lastOutputLines[tabId] ?? []).length;
+      const lastSeen = lastSeenLineCountRef.current[tabId] ?? 0;
+      if (currentCount > lastSeen && Number(zoneStr) !== zoneLayout.focusedZone) {
+        unread.add(tabId);
+      }
+    }
+    return unread;
+  }, [lastOutputLines, zoneLayout.assignments, zoneLayout.focusedZone]);
+
+  // Zone view mode: "auto" (focused=full, others=compact when 4+ zones), "full", "compact"
+  const [viewMode, setViewMode] = useState<ViewMode>("auto");
+
+  // Status bar collapsed state
+  const [statusBarCollapsed, setStatusBarCollapsed] = useState(false);
+
+  // Batch operations bar dismissed state (resets when needs-input count changes)
+  const [batchBarDismissed, setBatchBarDismissed] = useState(false);
+  const [showShortcutsOverlay, setShowShortcutsOverlay] = useState(false);
+  const [showCommandPalette, setShowCommandPalette] = useState(false);
+  const [showTimeline, setShowTimeline] = useState(false);
+  const [diffZones, setDiffZones] = useState<[number, number] | null>(null);
+  const outputSnapshotsRef = useRef<Record<string, string[]>>({});
+  const [snapshotDiff, setSnapshotDiff] = useState<{
+    tabId: string;
+    snapshot: string[];
+    current: string[];
+  } | null>(null);
+  const [snapshotCounter, setSnapshotCounter] = useState(0);
+  const [flashingTabs, setFlashingTabs] = useState<Set<string>>(new Set());
+  const stateEntryTimeRef = useRef<Record<string, number>>({});
+  const [stateDurations, setStateDurations] = useState<Record<string, string>>({});
+  const [selectedZones, setSelectedZones] = useState<Set<number>>(new Set());
+  const [staleTabs, setStaleTabs] = useState<Set<string>>(new Set());
+  const [pinnedZones, setPinnedZones] = useState<Set<number>>(() => {
+    try {
+      const stored = localStorage.getItem(`zone-pinned-${zoneLayout.layoutId}`);
+      if (stored) return new Set(JSON.parse(stored) as number[]);
+    } catch {
+      // intentionally empty
+    }
+    return new Set();
+  });
+  const [outputSearch, setOutputSearch] = useState("");
+  const [showOutputSearch, setShowOutputSearch] = useState(false);
+  const [swapSource, setSwapSource] = useState<number | null>(null);
+  const [resetRatiosKey, setResetRatiosKey] = useState(0);
+  const [autoLayout, setAutoLayout] = useState(
+    () => localStorage.getItem("zone-auto-layout") !== "false",
+  );
+  const [focusMode, setFocusMode] = useState(
+    () => localStorage.getItem("zone-focus-mode") === "true",
+  );
+  const [autoRestart, setAutoRestart] = useState(
+    () => localStorage.getItem("zone-auto-restart") === "true",
+  );
+  const autoRestartCountRef = useRef(0);
+  const handleRestartInZoneRef = useRef<(zoneIdx: number) => void>(() => {});
+  const [pendingRestarts, setPendingRestarts] = useState<Record<number, number>>({});
+  const pendingRestartTimersRef = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
+  const metricsRef = useRef({
+    totalApprovals: 0,
+    totalRejections: 0,
+    totalBroadcasts: 0,
+    sessionsCreated: 0,
+  });
+  const [zoneLabels, setZoneLabels] = useState<Record<number, string>>(() => {
+    try {
+      const stored = localStorage.getItem(`zone-labels-${zoneLayout.layoutId}`);
+      if (stored) return JSON.parse(stored) as Record<number, string>;
+    } catch {
+      // intentionally empty
+    }
+    return {};
+  });
+  const [activeTagFilters, setActiveTagFilters] = useState<Set<string>>(new Set());
+  const [unseenNeedsInput, setUnseenNeedsInput] = useState<Set<string>>(new Set());
+  const [zoneNotes, setZoneNotes] = useState<Record<number, string>>(() => {
+    try {
+      const stored = localStorage.getItem(`zone-notes-${zoneLayout.layoutId}`);
+      if (stored) return JSON.parse(stored) as Record<number, string>;
+    } catch {
+      // intentionally empty
+    }
+    return {};
+  });
+
+  // Auto-approve rules: regex patterns that auto-send "y\r" when needs-input output matches
+  const [autoApprovePatterns, setAutoApprovePatterns] = useState<string[]>(() => {
+    try {
+      const stored = localStorage.getItem("zone-auto-approve-patterns");
+      if (stored) return JSON.parse(stored) as string[];
+    } catch {
+      // intentionally empty
+    }
+    return [];
+  });
+  const autoApproveCountRef = useRef(0);
+
+  // Notification history log
+  type HistoryEntry = { time: number; type: string; session: string; zone?: number; color: string };
+  const [eventHistory, setEventHistory] = useState<HistoryEntry[]>([]);
+  const addHistoryEvent = useCallback(
+    (type: string, session: string, zone?: number, color = "#a9b1d6") => {
+      setEventHistory((prev) => [
+        ...prev.slice(-99),
+        { time: Date.now(), type, session, zone, color },
+      ]);
+    },
+    [],
+  );
+  const cancelPendingRestart = useCallback((zoneIndex: number) => {
+    const timer = pendingRestartTimersRef.current[zoneIndex];
+    if (timer) {
+      clearTimeout(timer);
+      delete pendingRestartTimersRef.current[zoneIndex];
+    }
+    setPendingRestarts((prev) => {
+      const next = { ...prev };
+      delete next[zoneIndex];
+      return next;
+    });
+  }, []);
+
+  // Group label → color mapping (auto-assigned from preset palette)
+  const labelColorMap = useMemo(() => {
+    const GROUP_COLORS = ["#bb9af7", "#7aa2f7", "#9ece6a", "#e0af68", "#f7768e", "#7dcfff"];
+    const map: Record<string, string> = {};
+    const tagSet = new Set<string>();
+    for (const label of Object.values(zoneLabels)) {
+      if (!label) continue;
+      for (const tag of label
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean)) {
+        tagSet.add(tag);
+      }
+    }
+    const uniqueTags = [...tagSet].sort();
+    for (let i = 0; i < uniqueTags.length; i++) {
+      map[uniqueTags[i]] = GROUP_COLORS[i % GROUP_COLORS.length];
+    }
+    return map;
+  }, [zoneLabels]);
+
+  // All unique tags across zones (sorted) — used by keyboard shortcut to cycle
+  const allTags = useMemo(() => {
+    const tagSet = new Set<string>();
+    for (const label of Object.values(zoneLabels)) {
+      if (!label) continue;
+      for (const tag of label
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean)) {
+        tagSet.add(tag);
+      }
+    }
+    return [...tagSet].sort();
+  }, [zoneLabels]);
+
+  // Set of tab IDs that have output snapshots stored
+  const snapshotZones = useMemo(
+    () => new Set(Object.keys(outputSnapshotsRef.current)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [snapshotCounter],
+  );
+
+  // Activity sparkline: ring buffer of output byte counts per 2s interval per tab
+  const activityBuffersRef = useRef<Record<string, number[]>>({});
+  const [autoFocusNeedsInput, setAutoFocusNeedsInput] = useState(
+    () => localStorage.getItem("zone-auto-focus") === "true",
+  );
+  const [soundEnabled, setSoundEnabled] = useState(
+    () => localStorage.getItem("zone-sound-notify") === "true",
+  );
+  const [desktopNotify, setDesktopNotify] = useState(
+    () => localStorage.getItem("zone-desktop-notify") === "true",
+  );
+
+  // Request notification permission when desktop notifications are enabled
+  useEffect(() => {
+    if (desktopNotify && "Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+  }, [desktopNotify]);
+
+  const prevNeedsInputCountRef = useRef(0);
+  const prevSessionStatesRef = useRef<Record<string, SessionState>>({});
+
+  // Cumulative time tracking per state (in ms)
+  const stateTimeAccum = useRef<Record<SessionState, number>>({
+    idle: 0,
+    working: 0,
+    "needs-input": 0,
+    completed: 0,
+    error: 0,
+  });
+
+  // Persist auto-approve patterns
+  useEffect(() => {
+    localStorage.setItem("zone-auto-approve-patterns", JSON.stringify(autoApprovePatterns));
+  }, [autoApprovePatterns]);
+
+  // Persist zone labels, notes, and pinned zones to localStorage
+  useEffect(() => {
+    localStorage.setItem(`zone-labels-${zoneLayout.layoutId}`, JSON.stringify(zoneLabels));
+  }, [zoneLabels, zoneLayout.layoutId]);
+
+  useEffect(() => {
+    localStorage.setItem(`zone-notes-${zoneLayout.layoutId}`, JSON.stringify(zoneNotes));
+  }, [zoneNotes, zoneLayout.layoutId]);
+
+  useEffect(() => {
+    localStorage.setItem(`zone-pinned-${zoneLayout.layoutId}`, JSON.stringify([...pinnedZones]));
+  }, [pinnedZones, zoneLayout.layoutId]);
+
+  // Reload labels/pins when layout changes, preserving pinned tabs across layouts
+  const prevLayoutIdRef2 = useRef(zoneLayout.layoutId);
+  const prevAssignmentsRef = useRef<Record<number, string>>(zoneLayout.assignments);
+  useEffect(() => {
+    if (prevLayoutIdRef2.current !== zoneLayout.layoutId) {
+      // Capture which TAB IDs were pinned using the previous layout's assignments
+      const pinnedTabIds = new Set<string>();
+      for (const zoneIdx of pinnedZones) {
+        const tabId = prevAssignmentsRef.current[zoneIdx];
+        if (tabId) pinnedTabIds.add(tabId);
+      }
+
+      prevLayoutIdRef2.current = zoneLayout.layoutId;
+      prevAssignmentsRef.current = zoneLayout.assignments;
+
+      try {
+        const storedLabels = localStorage.getItem(`zone-labels-${zoneLayout.layoutId}`);
+        setZoneLabels(storedLabels ? JSON.parse(storedLabels) : {});
+      } catch {
+        setZoneLabels({});
+      }
+
+      // Restore pins: merge stored pins with migrated tab-based pins
+      let newPins = new Set<number>();
+      try {
+        const storedPins = localStorage.getItem(`zone-pinned-${zoneLayout.layoutId}`);
+        if (storedPins) newPins = new Set(JSON.parse(storedPins) as number[]);
+      } catch {
+        // intentionally empty
+      }
+      // Add pins for tabs that were pinned in the previous layout
+      for (const [zoneStr, tabId] of Object.entries(zoneLayout.assignments)) {
+        if (pinnedTabIds.has(tabId)) {
+          newPins.add(Number(zoneStr));
+        }
+      }
+      setPinnedZones(newPins);
+
+      try {
+        const storedNotes = localStorage.getItem(`zone-notes-${zoneLayout.layoutId}`);
+        setZoneNotes(storedNotes ? JSON.parse(storedNotes) : {});
+      } catch {
+        setZoneNotes({});
+      }
+    } else {
+      // Keep assignments ref in sync for non-layout-change updates (e.g., tab swaps)
+      prevAssignmentsRef.current = zoneLayout.assignments;
+    }
+  }, [zoneLayout.layoutId, zoneLayout.assignments]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Shell integration: structured command history per tab
   const [commandHistories, setCommandHistories] = useState<
@@ -195,9 +530,263 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
     loadPlanContent();
   }, [loadPlanContent]);
 
+  // ── Session state detection ──────────────────────────────────────────────────
+
+  // Periodically check for idle sessions (no output for 10s while at shell prompt)
+  // and stale sessions (working but no output for 60s — may be stuck)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = Date.now();
+      setSessionStates((prev) => {
+        const next = { ...prev };
+        let changed = false;
+        for (const tab of tabs) {
+          const lastOutput = lastOutputTimeRef.current[tab.id] ?? 0;
+          const current = next[tab.id] ?? "idle";
+          if (!tab.isAlive && current !== "completed" && current !== "error") {
+            next[tab.id] = tab.exitCode === 0 || tab.exitCode === null ? "completed" : "error";
+            changed = true;
+          } else if (current === "working" && now - lastOutput > 10000) {
+            next[tab.id] = "idle";
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+
+      // Detect stale "working" sessions (no output for 60s)
+      const newStale = new Set<string>();
+      for (const tab of tabs) {
+        const lastOutput = lastOutputTimeRef.current[tab.id] ?? 0;
+        const state = sessionStates[tab.id] ?? "idle";
+        if (state === "working" && lastOutput > 0 && now - lastOutput > 60000) {
+          newStale.add(tab.id);
+        }
+      }
+      setStaleTabs((prev) => {
+        if (prev.size !== newStale.size || [...newStale].some((id) => !prev.has(id))) {
+          return newStale;
+        }
+        return prev;
+      });
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [tabs, sessionStates]);
+
+  // Detect transitions to needs-input and trigger flash animation + auto-focus
+  useEffect(() => {
+    const prev = prevSessionStatesRef.current;
+    const now = Date.now();
+    const newFlashing: string[] = [];
+    const newErrors: string[] = [];
+    const newCompleted: string[] = [];
+    for (const [tabId, state] of Object.entries(sessionStates)) {
+      // Track entry time for any state change
+      if (prev[tabId] !== state) {
+        // Accumulate time in previous state
+        const prevState = prev[tabId];
+        if (prevState && stateEntryTimeRef.current[tabId]) {
+          const elapsed = now - stateEntryTimeRef.current[tabId];
+          stateTimeAccum.current[prevState] += elapsed;
+        }
+        stateEntryTimeRef.current[tabId] = now;
+        // Log state transitions to history
+        const tab = tabs.find((t) => t.id === tabId);
+        const zone = Object.entries(zoneLayout.assignments).find(([, id]) => id === tabId);
+        const zoneNum = zone ? Number(zone[0]) : undefined;
+        if (state === "needs-input") {
+          addHistoryEvent("Needs input", tab?.title ?? tabId, zoneNum, "#e0af68");
+        } else if (state === "error" && prev[tabId] !== "error") {
+          addHistoryEvent("Error", tab?.title ?? tabId, zoneNum, "#f7768e");
+        } else if (state === "completed" && prev[tabId] !== "completed") {
+          addHistoryEvent("Completed", tab?.title ?? tabId, zoneNum, "#9ece6a");
+          // Auto-restart: schedule restart for completed sessions (exit 0) after 2s
+          if (autoRestart && zoneNum !== undefined) {
+            const completedTab = tabs.find((t) => t.id === tabId);
+            if (completedTab && (completedTab.exitCode === 0 || completedTab.exitCode === null)) {
+              const capturedZoneNum = zoneNum;
+              const capturedTitle = completedTab.title ?? tabId;
+              const restartAt = Date.now() + 2000;
+              setPendingRestarts((prev) => ({ ...prev, [capturedZoneNum]: restartAt }));
+
+              const timer = setTimeout(() => {
+                handleRestartInZoneRef.current(capturedZoneNum);
+                autoRestartCountRef.current++;
+                addHistoryEvent("Auto-restarted", capturedTitle, capturedZoneNum, "#7dcfff");
+                setPendingRestarts((prev) => {
+                  const next = { ...prev };
+                  delete next[capturedZoneNum];
+                  return next;
+                });
+                delete pendingRestartTimersRef.current[capturedZoneNum];
+              }, 2000);
+
+              pendingRestartTimersRef.current[capturedZoneNum] = timer;
+            }
+          }
+        }
+      }
+      if (state === "needs-input" && prev[tabId] !== "needs-input") {
+        newFlashing.push(tabId);
+      }
+      if (state === "error" && prev[tabId] !== "error") {
+        newErrors.push(tabId);
+      }
+      if (state === "completed" && prev[tabId] !== "completed") {
+        newCompleted.push(tabId);
+      }
+    }
+    prevSessionStatesRef.current = sessionStates;
+    // Track unseen needs-input
+    if (newFlashing.length > 0) {
+      setUnseenNeedsInput((old) => {
+        const next = new Set(old);
+        for (const id of newFlashing) next.add(id);
+        return next;
+      });
+    }
+    // Auto-approve: check last output lines against patterns
+    if (newFlashing.length > 0 && autoApprovePatterns.length > 0) {
+      for (const tabId of newFlashing) {
+        const lines = lastOutputLines[tabId] ?? [];
+        const lastFew = lines.slice(-5).join("\n");
+        const matched = autoApprovePatterns.some((pattern) => {
+          try {
+            return new RegExp(pattern, "i").test(lastFew);
+          } catch {
+            return false;
+          }
+        });
+        if (matched) {
+          const ref = terminalRefs.current.get(tabId);
+          ref?.current?.writeToTerminal("y\r");
+          autoApproveCountRef.current++;
+          const tab = tabs.find((t) => t.id === tabId);
+          addHistoryEvent("Auto-approved", tab?.title ?? tabId, undefined, "#9ece6a");
+        }
+      }
+    }
+    if (newFlashing.length > 0) {
+      setFlashingTabs((old) => {
+        const next = new Set(old);
+        for (const id of newFlashing) next.add(id);
+        return next;
+      });
+      // Auto-focus: jump to the first newly-needs-input zone
+      if (autoFocusNeedsInput) {
+        const firstFlashing = newFlashing[0];
+        const zoneIdx = Object.entries(zoneLayout.assignments).find(
+          ([, tabId]) => tabId === firstFlashing,
+        );
+        if (zoneIdx) {
+          zoneLayout.setFocusedZone(Number(zoneIdx[0]));
+        }
+      }
+      // Play notification sound
+      if (soundEnabled) {
+        playNeedsInputChime();
+      }
+      // Desktop notifications for needs-input transitions
+      if (
+        desktopNotify &&
+        document.hidden &&
+        "Notification" in window &&
+        Notification.permission === "granted"
+      ) {
+        for (const tabId of newFlashing) {
+          const tab = tabs.find((t) => t.id === tabId);
+          const zoneNum = Object.entries(zoneLayout.assignments).find(
+            ([, tid]) => tid === tabId,
+          )?.[0];
+          new Notification("Session needs input", {
+            body: `Zone ${zoneNum ? Number(zoneNum) + 1 : "?"}: ${tab?.title ?? tabId}`,
+            tag: `zone-input-${tabId}`,
+          });
+        }
+      }
+      // Clear flash after animation duration (1s)
+      const timer = setTimeout(() => {
+        setFlashingTabs((old) => {
+          const next = new Set(old);
+          for (const id of newFlashing) next.delete(id);
+          return next;
+        });
+      }, 1000);
+      return () => clearTimeout(timer);
+    }
+    // Desktop notifications for error transitions
+    if (
+      newErrors.length > 0 &&
+      desktopNotify &&
+      document.hidden &&
+      "Notification" in window &&
+      Notification.permission === "granted"
+    ) {
+      for (const tabId of newErrors) {
+        const tab = tabs.find((t) => t.id === tabId);
+        const zoneNum = Object.entries(zoneLayout.assignments).find(
+          ([, tid]) => tid === tabId,
+        )?.[0];
+        new Notification("Session error", {
+          body: `Zone ${zoneNum ? Number(zoneNum) + 1 : "?"}: ${tab?.title ?? tabId}`,
+          tag: `zone-error-${tabId}`,
+        });
+      }
+    }
+    // Play completion chime for completed transitions
+    if (soundEnabled && newCompleted.length > 0) {
+      playCompletionChime();
+    }
+    // Play error alert for error transitions
+    if (soundEnabled && newErrors.length > 0) {
+      playErrorAlert();
+    }
+  }, [
+    sessionStates,
+    autoFocusNeedsInput,
+    soundEnabled,
+    desktopNotify,
+    zoneLayout,
+    autoApprovePatterns,
+    lastOutputLines,
+    tabs,
+    addHistoryEvent,
+    autoRestart,
+  ]);
+
+  // Update formatted durations every 10 seconds
+  useEffect(() => {
+    const formatDuration = (ms: number): string => {
+      const seconds = Math.floor(ms / 1000);
+      if (seconds < 60) return `${seconds}s`;
+      const minutes = Math.floor(seconds / 60);
+      if (minutes < 60) return `${minutes}m`;
+      const hours = Math.floor(minutes / 60);
+      const remainMin = minutes % 60;
+      return `${hours}h${remainMin > 0 ? `${remainMin}m` : ""}`;
+    };
+
+    const update = () => {
+      const now = Date.now();
+      const durations: Record<string, string> = {};
+      for (const [tabId, entryTime] of Object.entries(stateEntryTimeRef.current)) {
+        durations[tabId] = formatDuration(now - entryTime);
+      }
+      setStateDurations(durations);
+    };
+
+    update();
+    const interval = setInterval(update, 10000);
+    return () => clearInterval(interval);
+  }, [sessionStates]); // Re-start interval when states change for immediate update
+
   const handleExit = useCallback(
     (terminalId: string, exitCode: number | null) => {
       updateTab(terminalId, { isAlive: false, exitCode });
+      setSessionStates((prev) => ({
+        ...prev,
+        [terminalId]: exitCode === 0 || exitCode === null ? "completed" : "error",
+      }));
     },
     [updateTab],
   );
@@ -215,9 +804,30 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
             ref?.current?.writeToTerminal(`${pending.resumeCmd}\r`);
           }, 50);
         }
+        // Shell prompt → could be idle or needs-input
+        // If a Claude Code session is running, prompt_start typically means
+        // it's waiting for user input. For a bare shell, it's idle.
+        setSessionStates((prev) => {
+          const tab = tabs.find((t) => t.id === tabId);
+          if (tab?.claudeSessionId) {
+            return { ...prev, [tabId]: "needs-input" };
+          }
+          return { ...prev, [tabId]: "idle" };
+        });
+      }
+      if (event.type === "command_execute") {
+        setSessionStates((prev) => ({ ...prev, [tabId]: "working" }));
       }
       if (event.type === "cwd") {
         updateTab(tabId, { workingDir: event.path });
+        // Auto-name tab from project directory if still using default name
+        const tab = tabs.find((t) => t.id === tabId);
+        if (tab && /^Terminal \d+$/.test(tab.title)) {
+          const dirName = event.path.split(/[/\\]/).pop();
+          if (dirName) {
+            renameTab(tabId, dirName);
+          }
+        }
       } else if (event.type === "command_line") {
         pendingCommandRef.current[tabId] = event.command;
       } else if (event.type === "command_done") {
@@ -234,7 +844,62 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
         }
       }
     },
-    [updateTab],
+    [updateTab, renameTab, tabs],
+  );
+
+  // ── Terminal output handler with session state tracking ────────────────────
+
+  // Tick activity sparkline buffers every 2 seconds
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const buffers = activityBuffersRef.current;
+      for (const tabId of Object.keys(buffers)) {
+        // Push current accumulator and reset; keep last 30 points
+        buffers[tabId] = [...(buffers[tabId] ?? []), 0].slice(-30);
+      }
+    }, 2000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleOutput = useCallback(
+    (tabId: string, text: string) => {
+      lastOutputTimeRef.current[tabId] = Date.now();
+
+      // Accumulate bytes for sparkline
+      if (!activityBuffersRef.current[tabId]) {
+        activityBuffersRef.current[tabId] = [];
+      }
+      const buf = activityBuffersRef.current[tabId];
+      if (buf.length === 0) buf.push(0);
+      buf[buf.length - 1] += text.length;
+
+      // Use the session state detector for pattern matching
+      setSessionStates((prev) => {
+        const current = prev[tabId] ?? "idle";
+        const detected = detectSessionState(text, current);
+        if (detected && detected !== current) {
+          return { ...prev, [tabId]: detected };
+        }
+        return prev;
+      });
+
+      // Track last output lines for compact view (keep last 20 non-empty lines)
+      // Normal display shows 6; hover preview shows up to 20
+      // Strip ANSI escape sequences for cleaner display
+      // eslint-disable-next-line no-control-regex
+      const stripped = text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").replace(/\r/g, "");
+      const newLines = stripped.split("\n").filter((l) => l.trim().length > 0);
+      if (newLines.length > 0) {
+        setLastOutputLines((prev) => {
+          const existing = prev[tabId] ?? [];
+          const combined = [...existing, ...newLines].slice(-20);
+          return { ...prev, [tabId]: combined };
+        });
+      }
+
+      processOutput(tabId, text);
+    },
+    [processOutput],
   );
 
   // ── Resume Claude Code session in terminal ─────────────────────────────────
@@ -706,6 +1371,266 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
     [tabs, renameTab],
   );
 
+  // ── Zone interaction handlers ─────────────────────────────────────────────
+
+  const toggleAutoFocus = useCallback(() => {
+    setAutoFocusNeedsInput((prev) => {
+      const next = !prev;
+      localStorage.setItem("zone-auto-focus", String(next));
+      return next;
+    });
+  }, []);
+
+  const toggleSound = useCallback(() => {
+    setSoundEnabled((prev) => {
+      const next = !prev;
+      localStorage.setItem("zone-sound-notify", String(next));
+      // Play a test chime when enabling
+      if (next) playNeedsInputChime();
+      return next;
+    });
+  }, []);
+
+  const handleZoneClick = useCallback(
+    (zoneIndex: number, ctrlKey?: boolean) => {
+      if (ctrlKey) {
+        // Ctrl+click toggles zone selection
+        setSelectedZones((prev) => {
+          const next = new Set(prev);
+          if (next.has(zoneIndex)) {
+            next.delete(zoneIndex);
+          } else {
+            next.add(zoneIndex);
+          }
+          return next;
+        });
+      } else {
+        // Regular click focuses and clears selection
+        zoneLayout.setFocusedZone(zoneIndex);
+        setSelectedZones(new Set());
+        // Mark the focused tab as "seen" for unseen badge
+        const focusedTabId = zoneLayout.assignments[zoneIndex];
+        if (focusedTabId) {
+          setUnseenNeedsInput((prev) => {
+            if (!prev.has(focusedTabId)) return prev;
+            const next = new Set(prev);
+            next.delete(focusedTabId);
+            return next;
+          });
+        }
+      }
+    },
+    [zoneLayout],
+  );
+
+  const handleZoneDoubleClick = useCallback(
+    (zoneIndex: number) => {
+      if (zoneLayout.isMultiZone) {
+        zoneLayout.toggleMaximize(zoneIndex);
+      }
+    },
+    [zoneLayout],
+  );
+
+  // Create terminal and auto-assign to first empty zone
+  const createAndAssignTerminal = useCallback(
+    async (title?: string, workingDir?: string) => {
+      metricsRef.current.sessionsCreated++;
+      const tabId = await createTerminal(title, workingDir);
+      if (!tabId) return tabId;
+
+      // Auto-switch layout when in "single" and adding a second+ terminal
+      const totalTabs = tabs.length + 1; // +1 for the newly created tab
+      if (autoLayout && zoneLayout.layoutId === "single" && totalTabs >= 2) {
+        let targetLayout = "split";
+        if (totalTabs >= 7) targetLayout = "full-grid";
+        else if (totalTabs >= 5) targetLayout = "six-pack";
+        else if (totalTabs >= 3) targetLayout = "quad";
+        zoneLayout.setLayoutId(targetLayout);
+      }
+
+      if (zoneLayout.isMultiZone || (autoLayout && totalTabs >= 2)) {
+        // Find first empty zone (layout may have just changed)
+        // Use a small defer to let the layout update propagate
+        requestAnimationFrame(() => {
+          const emptyZone = zoneLayout.layout.zones.findIndex(
+            (_, idx) => !zoneLayout.assignments[idx],
+          );
+          if (emptyZone >= 0) {
+            zoneLayout.assignTabToZone(emptyZone, tabId);
+            zoneLayout.setFocusedZone(emptyZone);
+          }
+        });
+      }
+      return tabId;
+    },
+    [createTerminal, zoneLayout, tabs.length, autoLayout],
+  );
+
+  // Sort zones by session state priority (needs-input first, then error, working, idle, completed)
+  const handleSortZones = useCallback(() => {
+    const STATE_PRIORITY: Record<SessionState, number> = {
+      "needs-input": 0,
+      error: 1,
+      working: 2,
+      idle: 3,
+      completed: 4,
+    };
+    const entries = Object.entries(zoneLayout.assignments)
+      .map(([z, tabId]) => ({
+        zoneIndex: Number(z),
+        tabId,
+        priority: STATE_PRIORITY[sessionStates[tabId] ?? "idle"],
+      }))
+      .sort((a, b) => a.priority - b.priority);
+
+    // Reassign: sorted tabs go into zone slots 0, 1, 2, ...
+    const tabIds = entries.map((e) => e.tabId);
+    for (let i = 0; i < tabIds.length; i++) {
+      zoneLayout.assignTabToZone(i, tabIds[i]);
+    }
+  }, [zoneLayout, sessionStates]);
+
+  // Export all session output to a text file
+  const handleExportOutput = useCallback(async () => {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const filePath = await save({
+      defaultPath: `session-output-${timestamp}.txt`,
+      filters: [{ name: "Text Files", extensions: ["txt"] }],
+    });
+    if (!filePath) return;
+
+    const lines: string[] = [];
+    lines.push(`Session Output Export — ${new Date().toLocaleString()}`);
+    lines.push(`Layout: ${zoneLayout.layoutId}, Tabs: ${tabs.length}`);
+    lines.push("=".repeat(60));
+
+    for (const [zoneStr, tabId] of Object.entries(zoneLayout.assignments)) {
+      const tab = tabs.find((t) => t.id === tabId);
+      if (!tab) continue;
+      const state = sessionStates[tabId] ?? "idle";
+      const output = lastOutputLines[tabId] ?? [];
+      lines.push("");
+      lines.push(`--- Zone ${Number(zoneStr) + 1}: ${tab.title} [${state}] ---`);
+      if (tab.workingDir) lines.push(`    Dir: ${tab.workingDir}`);
+      if (output.length > 0) {
+        lines.push(...output);
+      } else {
+        lines.push("    (no output)");
+      }
+    }
+
+    // Include unassigned tabs
+    const assignedTabIds = new Set(Object.values(zoneLayout.assignments));
+    const unassigned = tabs.filter((t) => !assignedTabIds.has(t.id));
+    if (unassigned.length > 0) {
+      lines.push("");
+      lines.push("--- Unassigned Sessions ---");
+      for (const tab of unassigned) {
+        const state = sessionStates[tab.id] ?? "idle";
+        const output = lastOutputLines[tab.id] ?? [];
+        lines.push(`  ${tab.title} [${state}]`);
+        if (output.length > 0) lines.push(...output.map((l) => `    ${l}`));
+      }
+    }
+
+    try {
+      await writeTextFile(filePath, lines.join("\n"));
+      setNotification({ message: `Exported to ${filePath}`, type: "success" });
+    } catch (err) {
+      setNotification({
+        message: `Export failed: ${err instanceof Error ? err.message : String(err)}`,
+        type: "error",
+      });
+    }
+  }, [tabs, zoneLayout, sessionStates, lastOutputLines]);
+
+  // Export a single zone's output in the chosen format
+  const handleExportZone = useCallback(
+    async (zoneIndex: number, format: "text" | "markdown" | "json") => {
+      const tabId = zoneLayout.assignments[zoneIndex];
+      if (!tabId) return;
+      const tab = tabs.find((t) => t.id === tabId);
+      const lines = lastOutputLines[tabId] ?? [];
+      const title = tab?.title ?? `Zone ${zoneIndex + 1}`;
+      const state = sessionStates[tabId] ?? "idle";
+      const label = zoneLabels[zoneIndex] ?? "";
+
+      let content: string;
+      const ext = format === "json" ? "json" : format === "markdown" ? "md" : "txt";
+
+      if (format === "markdown") {
+        content = [
+          `# ${title}`,
+          `- **Zone:** ${zoneIndex + 1}`,
+          `- **State:** ${state}`,
+          label ? `- **Tags:** ${label}` : "",
+          `- **Lines:** ${lines.length}`,
+          `- **Exported:** ${new Date().toISOString()}`,
+          "",
+          "```",
+          ...lines,
+          "```",
+        ]
+          .filter(Boolean)
+          .join("\n");
+      } else if (format === "json") {
+        content = JSON.stringify(
+          {
+            zone: zoneIndex + 1,
+            title,
+            state,
+            tags: label ? label.split(",").map((t) => t.trim()) : [],
+            exportedAt: new Date().toISOString(),
+            lineCount: lines.length,
+            output: lines,
+          },
+          null,
+          2,
+        );
+      } else {
+        content = lines.join("\n");
+      }
+
+      try {
+        const filePath = await save({
+          defaultPath: `zone-${zoneIndex + 1}-output.${ext}`,
+          filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
+        });
+        if (filePath) {
+          await writeTextFile(filePath, content);
+        }
+      } catch (err) {
+        console.error("Export failed:", err);
+      }
+    },
+    [tabs, lastOutputLines, sessionStates, zoneLabels, zoneLayout.assignments],
+  );
+
+  // Restart a terminal in a specific zone (completed/errored)
+  const handleRestartInZone = useCallback(
+    async (zoneIdx: number) => {
+      const oldTabId = zoneLayout.assignments[zoneIdx];
+      const oldTab = tabs.find((t) => t.id === oldTabId);
+      const state = oldTabId ? (sessionStates[oldTabId] ?? "idle") : "idle";
+      if (state !== "completed" && state !== "error") return;
+      const label = zoneLabels[zoneIdx];
+      const tabId = await createTerminal(
+        oldTab?.title ? `${oldTab.title} (2)` : undefined,
+        oldTab?.workingDir ?? undefined,
+      );
+      if (tabId) {
+        zoneLayout.assignTabToZone(zoneIdx, tabId);
+        zoneLayout.setFocusedZone(zoneIdx);
+        if (label) {
+          setZoneLabels((prev) => ({ ...prev, [zoneIdx]: label }));
+        }
+      }
+    },
+    [zoneLayout, tabs, sessionStates, zoneLabels, createTerminal],
+  );
+  handleRestartInZoneRef.current = handleRestartInZone;
+
   // ── Keyboard shortcuts ────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -713,42 +1638,399 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
       // Ctrl+Shift+T — new terminal
       if (e.ctrlKey && e.shiftKey && e.key === "T") {
         e.preventDefault();
-        createTerminal();
+        createAndAssignTerminal();
         return;
       }
-      // Ctrl+Shift+W — close active terminal
+      // Ctrl+Shift+W — close focused terminal
       if (e.ctrlKey && e.shiftKey && e.key === "W") {
         e.preventDefault();
         if (activeId) closeTerminal(activeId);
         return;
       }
-      // Ctrl+Tab / Ctrl+Shift+Tab — cycle tabs
-      if (e.ctrlKey && e.key === "Tab" && tabs.length > 1 && activeId) {
+      // Ctrl+Tab / Ctrl+Shift+Tab — cycle zones (in multi-zone) or tabs (in single)
+      if (e.ctrlKey && e.key === "Tab") {
         e.preventDefault();
-        const idx = tabs.findIndex((t) => t.id === activeId);
-        const next = e.shiftKey ? (idx - 1 + tabs.length) % tabs.length : (idx + 1) % tabs.length;
-        setActiveId(tabs[next].id);
+        if (zoneLayout.isMultiZone) {
+          if (e.shiftKey) {
+            zoneLayout.focusPrevZone();
+          } else {
+            zoneLayout.focusNextZone();
+          }
+        } else if (tabs.length > 1 && activeId) {
+          const idx = tabs.findIndex((t) => t.id === activeId);
+          const next = e.shiftKey ? (idx - 1 + tabs.length) % tabs.length : (idx + 1) % tabs.length;
+          setActiveId(tabs[next].id);
+        }
+        return;
       }
-      // Escape — close right panel
-      if (e.key === "Escape" && rightPanelMode) {
-        setRightPanelMode(null);
-        setSelectedTranscriptSessionId(null);
+      // Ctrl+Shift+L — open layout picker (handled by ZoneLayoutPicker focus)
+      // Ctrl+Shift+N — jump to next session needing input
+      if (e.ctrlKey && e.shiftKey && e.key === "N") {
+        e.preventDefault();
+        zoneLayout.focusNextNeedsInput(sessionStates);
+        return;
+      }
+      // Ctrl+Shift+F — maximize/restore focused zone
+      if (e.ctrlKey && e.shiftKey && e.key === "F") {
+        e.preventDefault();
+        zoneLayout.toggleMaximize(zoneLayout.focusedZone);
+        return;
+      }
+      // Ctrl+Shift+M — cycle view mode (auto → full → compact)
+      if (e.ctrlKey && e.shiftKey && e.key === "M") {
+        e.preventDefault();
+        setViewMode((prev) => {
+          if (prev === "auto") return "full";
+          if (prev === "full") return "compact";
+          return "auto";
+        });
+        return;
+      }
+      // Ctrl+Shift+A — toggle auto-focus on needs-input
+      if (e.ctrlKey && e.shiftKey && e.key === "A") {
+        e.preventDefault();
+        toggleAutoFocus();
+        return;
+      }
+      // Ctrl+Shift+S — toggle sound notification
+      if (e.ctrlKey && e.shiftKey && e.key === "S") {
+        e.preventDefault();
+        toggleSound();
+        return;
+      }
+      // Ctrl+Shift+Enter — approve all waiting sessions
+      if (e.ctrlKey && e.shiftKey && e.key === "Enter") {
+        e.preventDefault();
+        const needsInput = tabs.filter((t) => sessionStates[t.id] === "needs-input");
+        metricsRef.current.totalApprovals += needsInput.length;
+        addHistoryEvent("Approve all", `${needsInput.length} sessions`, undefined, "#9ece6a");
+        for (const tab of needsInput) {
+          const ref = terminalRefs.current.get(tab.id);
+          ref?.current?.writeToTerminal("y\r");
+        }
+        return;
+      }
+      // Ctrl+Shift+[1-8] — quick layout switch
+      if (e.ctrlKey && e.shiftKey && e.key >= "1" && e.key <= "8") {
+        e.preventDefault();
+        const num = parseInt(e.key, 10);
+        const preset = LAYOUT_PRESETS.find((l) => l.shortcutKey === num);
+        if (preset) {
+          zoneLayout.setLayoutId(preset.id);
+        }
+        return;
+      }
+      // Ctrl+[1-9] — focus zone by number (in multi-zone layouts)
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key >= "1" && e.key <= "9") {
+        if (zoneLayout.isMultiZone) {
+          const zoneIdx = parseInt(e.key, 10) - 1;
+          if (zoneIdx < zoneLayout.layout.zones.length) {
+            e.preventDefault();
+            zoneLayout.setFocusedZone(zoneIdx);
+          }
+        }
+        return;
+      }
+      // Ctrl+Shift+X — zone swap (first press marks source, second press swaps)
+      if (e.ctrlKey && e.shiftKey && e.key === "X") {
+        e.preventDefault();
+        if (swapSource === null) {
+          setSwapSource(zoneLayout.focusedZone);
+        } else if (swapSource !== zoneLayout.focusedZone) {
+          // Perform the swap
+          const srcTabId = zoneLayout.assignments[swapSource];
+          const dstTabId = zoneLayout.assignments[zoneLayout.focusedZone];
+          if (srcTabId) zoneLayout.assignTabToZone(zoneLayout.focusedZone, srcTabId);
+          if (dstTabId) zoneLayout.assignTabToZone(swapSource, dstTabId);
+          setSwapSource(null);
+        } else {
+          // Same zone — cancel
+          setSwapSource(null);
+        }
+        return;
+      }
+      // Ctrl+Shift+/ — toggle output search
+      if (e.ctrlKey && e.shiftKey && e.key === "/") {
+        e.preventDefault();
+        setShowOutputSearch((prev) => {
+          if (prev) setOutputSearch("");
+          return !prev;
+        });
+        return;
+      }
+      // Ctrl+Shift+P — toggle pin on focused zone
+      if (e.ctrlKey && e.shiftKey && e.key === "P") {
+        e.preventDefault();
+        setPinnedZones((prev) => {
+          const next = new Set(prev);
+          if (next.has(zoneLayout.focusedZone)) next.delete(zoneLayout.focusedZone);
+          else next.add(zoneLayout.focusedZone);
+          return next;
+        });
+        return;
+      }
+      // Ctrl+Shift+D — toggle focus mode (dim non-focused zones)
+      if (e.ctrlKey && e.shiftKey && e.key === "D") {
+        e.preventDefault();
+        setFocusMode((prev) => {
+          const next = !prev;
+          localStorage.setItem("zone-focus-mode", String(next));
+          return next;
+        });
+        return;
+      }
+      // Ctrl+Shift+R — restart focused zone (completed/error only)
+      if (e.ctrlKey && e.shiftKey && e.key === "R") {
+        e.preventDefault();
+        handleRestartInZone(zoneLayout.focusedZone);
+        return;
+      }
+      // Ctrl+Shift+L — cycle through layout presets
+      if (e.ctrlKey && e.shiftKey && e.key === "L") {
+        e.preventDefault();
+        const currentIdx = LAYOUT_PRESETS.findIndex((l) => l.id === zoneLayout.layoutId);
+        const nextIdx = (currentIdx + 1) % LAYOUT_PRESETS.length;
+        zoneLayout.setLayoutId(LAYOUT_PRESETS[nextIdx].id);
+        return;
+      }
+      // Ctrl+Shift+K — toggle command palette
+      if (e.ctrlKey && e.shiftKey && e.key === "K") {
+        e.preventDefault();
+        setShowCommandPalette((prev) => !prev);
+        return;
+      }
+      // Ctrl+Shift+I — toggle zone timeline
+      if (e.ctrlKey && e.shiftKey && e.key === "I") {
+        e.preventDefault();
+        setShowTimeline((prev) => !prev);
+        return;
+      }
+      // Ctrl+Shift+G — cycle through tag filters
+      if (e.ctrlKey && e.shiftKey && e.key === "G") {
+        e.preventDefault();
+        if (allTags.length === 0) return;
+        setActiveTagFilters((prev) => {
+          const currentTag = prev.size === 1 ? [...prev][0] : null;
+          const currentIdx = currentTag ? allTags.indexOf(currentTag) : -1;
+          const nextIdx = currentIdx + 1;
+          if (nextIdx >= allTags.length) {
+            return new Set();
+          }
+          return new Set([allTags[nextIdx]]);
+        });
+        return;
+      }
+      // Ctrl+Shift+? — toggle keyboard shortcuts overlay
+      if (e.ctrlKey && e.shiftKey && e.key === "?") {
+        e.preventDefault();
+        setShowShortcutsOverlay((prev) => !prev);
+        return;
+      }
+      // Ctrl+Shift+Left — go back in focus history
+      if (e.ctrlKey && e.shiftKey && e.key === "ArrowLeft") {
+        e.preventDefault();
+        if (focusHistoryIndexRef.current > 0) {
+          focusHistoryIndexRef.current--;
+          isNavigatingHistoryRef.current = true;
+          zoneLayout.setFocusedZone(focusHistoryRef.current[focusHistoryIndexRef.current]);
+        }
+        return;
+      }
+      // Ctrl+Shift+Right — go forward in focus history
+      if (e.ctrlKey && e.shiftKey && e.key === "ArrowRight") {
+        e.preventDefault();
+        if (focusHistoryIndexRef.current < focusHistoryRef.current.length - 1) {
+          focusHistoryIndexRef.current++;
+          isNavigatingHistoryRef.current = true;
+          zoneLayout.setFocusedZone(focusHistoryRef.current[focusHistoryIndexRef.current]);
+        }
+        return;
+      }
+      // Escape — cancel swap, clear selection, restore maximized zone, or close right panel
+      if (e.key === "Escape") {
+        if (swapSource !== null) {
+          setSwapSource(null);
+        } else if (selectedZones.size > 0) {
+          setSelectedZones(new Set());
+        } else if (zoneLayout.maximizedZone !== null) {
+          zoneLayout.setMaximizedZone(null);
+        } else if (rightPanelMode) {
+          setRightPanelMode(null);
+          setSelectedTranscriptSessionId(null);
+        }
+        return;
       }
     };
 
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [activeId, tabs, createTerminal, closeTerminal, setActiveId, rightPanelMode]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    activeId,
+    tabs,
+    createAndAssignTerminal,
+    closeTerminal,
+    setActiveId,
+    rightPanelMode,
+    zoneLayout,
+    sessionStates,
+    swapSource,
+    selectedZones,
+    handleRestartInZone,
+    allTags,
+  ]);
+
+  // ── Status bar summary for multi-zone ─────────────────────────────────────
+
+  const needsInputCount = Object.values(sessionStates).filter((s) => s === "needs-input").length;
+  const workingCount = Object.values(sessionStates).filter((s) => s === "working").length;
+  const errorCount = Object.values(sessionStates).filter((s) => s === "error").length;
+
+  // Un-dismiss batch bar when needs-input count increases
+  useEffect(() => {
+    if (needsInputCount > prevNeedsInputCountRef.current) {
+      setBatchBarDismissed(false);
+    }
+    prevNeedsInputCountRef.current = needsInputCount;
+  }, [needsInputCount]);
+
+  // Update window title with waiting count
+  useEffect(() => {
+    const actionCount = needsInputCount + errorCount;
+    if (zoneLayout.isMultiZone && actionCount > 0) {
+      getCurrentWindow()
+        .setTitle(`(${actionCount} waiting) Terminal - Qontinui Runner`)
+        .catch(() => {});
+    } else {
+      getCurrentWindow()
+        .setTitle("Qontinui Runner")
+        .catch(() => {});
+    }
+    return () => {
+      getCurrentWindow()
+        .setTitle("Qontinui Runner")
+        .catch(() => {});
+    };
+  }, [needsInputCount, errorCount, zoneLayout.isMultiZone]);
 
   return (
     <div className="h-full flex flex-col bg-[#1a1b26]">
       <TerminalTabBar
         tabs={tabs}
         activeId={activeId}
-        onSelect={setActiveId}
+        onSelect={(id) => {
+          setActiveId(id);
+          // Find which zone this tab is in and focus it
+          const zoneIdx = Object.entries(zoneLayout.assignments).find(([, tabId]) => tabId === id);
+          if (zoneIdx) {
+            zoneLayout.setFocusedZone(Number(zoneIdx[0]));
+          }
+        }}
         onClose={closeTerminal}
-        onCreate={() => createTerminal()}
+        onCreate={() => createAndAssignTerminal()}
         onRename={renameTab}
+        sessionStates={sessionStates}
+        layoutPicker={
+          <div className="flex items-center gap-1">
+            <ZoneLayoutPicker
+              currentLayoutId={zoneLayout.layoutId}
+              onSelectLayout={zoneLayout.setLayoutId}
+              tabCount={tabs.length}
+            />
+            {zoneLayout.isMultiZone && (
+              <>
+                <button
+                  onClick={() =>
+                    setViewMode((prev) =>
+                      prev === "auto" ? "full" : prev === "full" ? "compact" : "auto",
+                    )
+                  }
+                  className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 transition-colors"
+                  title={`View mode: ${viewMode} (Ctrl+Shift+M to cycle)`}
+                >
+                  <span className="font-mono uppercase tracking-wider">{viewMode}</span>
+                  <span className="text-[#565f89]/50">{zoneLayout.layout.zones.length}z</span>
+                </button>
+                <button
+                  onClick={() => {
+                    setResetRatiosKey((k) => k + 1);
+                  }}
+                  className="px-1.5 py-0.5 rounded text-[10px] text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50 transition-colors"
+                  title="Reset zone sizes to equal"
+                >
+                  Reset
+                </button>
+              </>
+            )}
+            <button
+              onClick={() => {
+                setAutoLayout((prev) => {
+                  const next = !prev;
+                  localStorage.setItem("zone-auto-layout", String(next));
+                  return next;
+                });
+              }}
+              className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${
+                autoLayout
+                  ? "text-[#9ece6a] bg-[#9ece6a]/10"
+                  : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
+              }`}
+              title={`Auto-layout: ${autoLayout ? "ON" : "OFF"} — automatically switch layout based on terminal count`}
+            >
+              Auto
+            </button>
+            <ZoneProfilePicker
+              currentLayoutId={zoneLayout.layoutId}
+              zoneLabels={zoneLabels}
+              zoneNotes={zoneNotes}
+              pinnedZones={pinnedZones}
+              autoApprovePatterns={autoApprovePatterns}
+              onLoadProfile={(profile) => {
+                zoneLayout.setLayoutId(profile.layoutId);
+                setZoneLabels(profile.labels);
+                setZoneNotes(profile.notes);
+                setPinnedZones(new Set(profile.pins));
+                setAutoApprovePatterns(profile.autoApprovePatterns);
+              }}
+            />
+          </div>
+        }
+        statusSummary={
+          zoneLayout.isMultiZone
+            ? {
+                needsInput: needsInputCount,
+                working: workingCount,
+                errors: errorCount,
+                unseen: unseenNeedsInput.size,
+              }
+            : undefined
+        }
+        onQuickLaunch={async (count, autoCommand) => {
+          // Pick matching layout
+          const layoutMap: Record<number, string> = {
+            2: "split",
+            4: "quad",
+            6: "six-pack",
+            9: "full-grid",
+          };
+          const layoutId = layoutMap[count];
+          if (layoutId) zoneLayout.setLayoutId(layoutId);
+          // Create terminals sequentially so they get auto-assigned to zones
+          const createdTabIds: string[] = [];
+          for (let i = 0; i < count; i++) {
+            const tabId = await createAndAssignTerminal();
+            if (tabId) createdTabIds.push(tabId);
+          }
+          // Auto-send command to each terminal after a delay for shell to initialize
+          if (autoCommand && createdTabIds.length > 0) {
+            setTimeout(() => {
+              for (const tabId of createdTabIds) {
+                const ref = terminalRefs.current.get(tabId);
+                ref?.current?.writeToTerminal(`${autoCommand}\r`);
+              }
+            }, 1500);
+          }
+        }}
       />
       <TerminalActionBar
         showSidebar={showSidebar}
@@ -771,7 +2053,150 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
         onDismiss={() => setNotification(null)}
       />
 
-      {/* Main content: optional sidebar + terminal + optional right panel */}
+      {/* Status bar (multi-zone only) */}
+      {zoneLayout.isMultiZone && (
+        <ZoneStatusBar
+          tabs={tabs}
+          assignments={zoneLayout.assignments}
+          sessionStates={sessionStates}
+          focusedZone={zoneLayout.focusedZone}
+          collapsed={statusBarCollapsed}
+          onToggleCollapsed={() => setStatusBarCollapsed((v) => !v)}
+          onJumpToNeedsInput={() => zoneLayout.focusNextNeedsInput(sessionStates)}
+          onFocusZone={zoneLayout.setFocusedZone}
+          onShowShortcuts={() => setShowShortcutsOverlay(true)}
+          autoFocus={autoFocusNeedsInput}
+          onToggleAutoFocus={toggleAutoFocus}
+          soundEnabled={soundEnabled}
+          onToggleSound={toggleSound}
+          desktopNotify={desktopNotify}
+          onToggleDesktopNotify={() => {
+            setDesktopNotify((prev) => {
+              const next = !prev;
+              localStorage.setItem("zone-desktop-notify", String(next));
+              return next;
+            });
+          }}
+          stateDurations={stateDurations}
+          onSelectByState={(state) => {
+            const zones = new Set<number>();
+            for (const [zoneStr, tabId] of Object.entries(zoneLayout.assignments)) {
+              if ((sessionStates[tabId] ?? "idle") === state) {
+                zones.add(Number(zoneStr));
+              }
+            }
+            setSelectedZones(zones);
+          }}
+          pinnedZones={pinnedZones}
+          staleTabs={staleTabs}
+          metrics={metricsRef.current}
+          zoneLabels={zoneLabels}
+          onSetZoneLabel={(z, label) => setZoneLabels((prev) => ({ ...prev, [z]: label }))}
+          flashingTabs={flashingTabs}
+          onExport={handleExportOutput}
+          onSortZones={handleSortZones}
+          eventHistory={eventHistory}
+          labelColorMap={labelColorMap}
+          focusMode={focusMode}
+          autoApprovePatterns={autoApprovePatterns}
+          onSetAutoApprovePatterns={setAutoApprovePatterns}
+          autoApproveCount={autoApproveCountRef.current}
+          stateTimeAccum={stateTimeAccum.current}
+          autoRestart={autoRestart}
+          onToggleAutoRestart={() => {
+            setAutoRestart((prev) => {
+              const next = !prev;
+              localStorage.setItem("zone-auto-restart", String(next));
+              return next;
+            });
+          }}
+          autoRestartCount={autoRestartCountRef.current}
+          onToggleFocusMode={() => {
+            setFocusMode((prev) => {
+              const next = !prev;
+              localStorage.setItem("zone-focus-mode", String(next));
+              return next;
+            });
+          }}
+          activeTagFilters={activeTagFilters}
+          onSetActiveTagFilters={setActiveTagFilters}
+          allTags={allTags}
+          activityData={activityBuffersRef.current}
+          sessionStartTimes={stateEntryTimeRef.current}
+          lastOutputLines={lastOutputLines}
+          unreadTabs={unreadZones}
+          onApproveTab={(tabId) => {
+            terminalRefs.current.get(tabId)?.current?.writeToTerminal("y\r");
+            metricsRef.current.totalApprovals++;
+          }}
+          onRestartZone={handleRestartInZone}
+          onTogglePin={(zoneIdx) => {
+            setPinnedZones((prev) => {
+              const next = new Set(prev);
+              if (next.has(zoneIdx)) next.delete(zoneIdx);
+              else next.add(zoneIdx);
+              return next;
+            });
+          }}
+        />
+      )}
+
+      {/* Zone timeline (multi-zone only) */}
+      {showTimeline && zoneLayout.isMultiZone && (
+        <ZoneTimeline
+          tabs={tabs}
+          assignments={zoneLayout.assignments}
+          sessionStates={sessionStates}
+          eventHistory={eventHistory}
+          onClose={() => setShowTimeline(false)}
+        />
+      )}
+
+      {/* Output search bar */}
+      {showOutputSearch && (
+        <div className="flex items-center gap-2 px-3 h-8 bg-[#13141f] border-b border-[#2a2d3d] shrink-0">
+          <span className="text-[10px] text-[#565f89] shrink-0">Search:</span>
+          <input
+            autoFocus
+            value={outputSearch}
+            onChange={(e) => setOutputSearch(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                setShowOutputSearch(false);
+                setOutputSearch("");
+              }
+              e.stopPropagation();
+            }}
+            placeholder="Search across all session output..."
+            className="flex-1 bg-[#1a1b26] border border-[#2a2d3d] rounded px-2 py-0.5 text-xs text-[#c0caf5] placeholder-[#565f89] outline-none focus:border-[#7aa2f7] transition-colors"
+          />
+          {outputSearch &&
+            (() => {
+              const query = outputSearch.toLowerCase();
+              const matchCount = Object.entries(lastOutputLines).filter(([, lines]) =>
+                lines.some((l) => l.toLowerCase().includes(query)),
+              ).length;
+              return (
+                <span
+                  className={`text-[10px] shrink-0 ${matchCount > 0 ? "text-[#9ece6a]" : "text-[#565f89]"}`}
+                >
+                  {matchCount} match{matchCount !== 1 ? "es" : ""}
+                </span>
+              );
+            })()}
+          <button
+            onClick={() => {
+              setShowOutputSearch(false);
+              setOutputSearch("");
+            }}
+            className="p-1 rounded text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors shrink-0"
+          >
+            <span className="text-xs">✕</span>
+          </button>
+        </div>
+      )}
+
+      {/* Main content: optional sidebar + zone grid + optional right panel */}
       <div className="flex-1 flex flex-row overflow-hidden">
         {/* Left sidebar */}
         {showSidebar && (
@@ -785,23 +2210,86 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
           />
         )}
 
-        {/* Terminal area */}
+        {/* Terminal zone grid */}
         <div className="flex-1 relative overflow-hidden">
-          {tabs.map((tab) => (
-            <TerminalInstance
-              key={tab.id}
-              ref={terminalRefs.current.get(tab.id)}
-              terminalId={tab.id}
-              visible={tab.id === activeId}
-              isReconnecting={tab.isReconnecting}
-              onReconnected={() => markReconnected(tab.id)}
-              onExit={(code) => handleExit(tab.id, code)}
-              onFirstInput={(input) => handleFirstInput(tab.id, input)}
-              onShellIntegration={(event) => handleShellIntegration(tab.id, event)}
-              onOutput={(text) => processOutput(tab.id, text)}
+          {tabs.length > 0 ? (
+            <ZoneGrid
+              layout={zoneLayout.layout}
+              assignments={zoneLayout.assignments}
+              tabs={tabs}
+              focusedZone={zoneLayout.focusedZone}
+              maximizedZone={zoneLayout.maximizedZone}
+              sessionStates={sessionStates}
+              lastOutputLines={lastOutputLines}
+              viewMode={viewMode}
+              terminalRefs={terminalRefs.current}
+              onZoneClick={handleZoneClick}
+              onZoneDoubleClick={handleZoneDoubleClick}
+              onExit={handleExit}
+              onFirstInput={handleFirstInput}
+              onShellIntegration={handleShellIntegration}
+              onOutput={handleOutput}
+              onReconnected={markReconnected}
+              onAssignTab={zoneLayout.assignTabToZone}
+              flashingTabs={flashingTabs}
+              stateDurations={stateDurations}
+              selectedZones={selectedZones}
+              staleTabs={staleTabs}
+              pinnedZones={pinnedZones}
+              onTogglePin={(zoneIdx) => {
+                setPinnedZones((prev) => {
+                  const next = new Set(prev);
+                  if (next.has(zoneIdx)) next.delete(zoneIdx);
+                  else next.add(zoneIdx);
+                  return next;
+                });
+              }}
+              outputSearchQuery={outputSearch || undefined}
+              swapSource={swapSource}
+              activityData={activityBuffersRef.current}
+              zoneLabels={zoneLabels}
+              onSetZoneLabel={(zoneIdx, label) => {
+                setZoneLabels((prev) => {
+                  if (!label) {
+                    const next = { ...prev };
+                    delete next[zoneIdx];
+                    return next;
+                  }
+                  return { ...prev, [zoneIdx]: label };
+                });
+              }}
+              onRestartInZone={handleRestartInZone}
+              resetRatiosKey={resetRatiosKey}
+              labelColorMap={labelColorMap}
+              zoneTags={Object.fromEntries(
+                Object.entries(zoneLabels).map(([z, label]) => [
+                  Number(z),
+                  label
+                    ? label
+                        .split(",")
+                        .map((t) => t.trim())
+                        .filter(Boolean)
+                    : [],
+                ]),
+              )}
+              commandHistories={commandHistories}
+              focusMode={focusMode}
+              zoneNotes={zoneNotes}
+              onSetZoneNote={(zoneIdx, note) => {
+                setZoneNotes((prev) => {
+                  if (!note) {
+                    const next = { ...prev };
+                    delete next[zoneIdx];
+                    return next;
+                  }
+                  return { ...prev, [zoneIdx]: note };
+                });
+              }}
+              onExportZone={handleExportZone}
+              pendingRestarts={pendingRestarts}
+              onCancelRestart={cancelPendingRestart}
             />
-          ))}
-          {tabs.length === 0 && (
+          ) : (
             <div className="h-full flex flex-col items-center justify-center text-[#565f89] gap-2">
               <span className="text-sm">
                 No terminals open. Press{" "}
@@ -811,6 +2299,64 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
                 or click + to create one.
               </span>
             </div>
+          )}
+
+          {/* Zone minimap for large grids */}
+          {zoneLayout.isMultiZone && (
+            <ZoneMinimap
+              layout={zoneLayout.layout}
+              assignments={zoneLayout.assignments}
+              sessionStates={sessionStates}
+              focusedZone={zoneLayout.focusedZone}
+              onFocusZone={zoneLayout.setFocusedZone}
+              zoneTags={Object.fromEntries(
+                Object.entries(zoneLabels).map(([z, label]) => [
+                  Number(z),
+                  label
+                    ? label
+                        .split(",")
+                        .map((t) => t.trim())
+                        .filter(Boolean)
+                    : [],
+                ]),
+              )}
+              labelColorMap={labelColorMap}
+            />
+          )}
+
+          {/* Batch operations floating bar */}
+          {zoneLayout.isMultiZone && !batchBarDismissed && (
+            <BatchOperationsBar
+              tabs={tabs}
+              sessionStates={sessionStates}
+              terminalRefs={terminalRefs.current}
+              onDismiss={() => setBatchBarDismissed(true)}
+              selectedZones={selectedZones}
+              assignments={zoneLayout.assignments}
+              zoneLabels={zoneLabels}
+              onSelectAllWaiting={() => {
+                const waiting = new Set<number>();
+                for (const [zoneStr, tabId] of Object.entries(zoneLayout.assignments)) {
+                  if (sessionStates[tabId] === "needs-input") {
+                    waiting.add(Number(zoneStr));
+                  }
+                }
+                setSelectedZones(waiting);
+              }}
+              onClearSelection={() => setSelectedZones(new Set())}
+              onMetrics={(type, count) => {
+                if (type === "approve") {
+                  metricsRef.current.totalApprovals += count;
+                  addHistoryEvent("Batch approve", `${count} sessions`, undefined, "#9ece6a");
+                } else if (type === "reject") {
+                  metricsRef.current.totalRejections += count;
+                  addHistoryEvent("Batch reject", `${count} sessions`, undefined, "#f7768e");
+                } else if (type === "broadcast") {
+                  metricsRef.current.totalBroadcasts += count;
+                  addHistoryEvent("Broadcast", `${count} sessions`, undefined, "#7aa2f7");
+                }
+              }}
+            />
           )}
         </div>
 
@@ -865,6 +2411,119 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
           />
         )}
       </div>
+
+      {showShortcutsOverlay && (
+        <KeyboardShortcutsOverlay onClose={() => setShowShortcutsOverlay(false)} />
+      )}
+
+      {diffZones &&
+        (() => {
+          const [z1, z2] = diffZones;
+          const tab1 = tabs.find((t) => t.id === zoneLayout.assignments[z1]);
+          const tab2 = tabs.find((t) => t.id === zoneLayout.assignments[z2]);
+          return (
+            <ZoneDiffOverlay
+              leftLabel={`Zone ${z1 + 1}: ${tab1?.title ?? "empty"}`}
+              rightLabel={`Zone ${z2 + 1}: ${tab2?.title ?? "empty"}`}
+              leftLines={tab1 ? (lastOutputLines[tab1.id] ?? []) : []}
+              rightLines={tab2 ? (lastOutputLines[tab2.id] ?? []) : []}
+              onClose={() => setDiffZones(null)}
+            />
+          );
+        })()}
+
+      {snapshotDiff && (
+        <ZoneDiffOverlay
+          leftLabel="Snapshot"
+          rightLabel="Current"
+          leftLines={snapshotDiff.snapshot}
+          rightLines={snapshotDiff.current}
+          onClose={() => setSnapshotDiff(null)}
+        />
+      )}
+
+      {showCommandPalette && (
+        <CommandPalette
+          onClose={() => setShowCommandPalette(false)}
+          tabs={tabs}
+          assignments={zoneLayout.assignments}
+          sessionStates={sessionStates}
+          focusedZone={zoneLayout.focusedZone}
+          onFocusZone={zoneLayout.setFocusedZone}
+          onApproveTab={(tabId) => {
+            terminalRefs.current.get(tabId)?.current?.writeToTerminal("y\r");
+            metricsRef.current.totalApprovals++;
+          }}
+          onRejectTab={(tabId) => {
+            terminalRefs.current.get(tabId)?.current?.writeToTerminal("n\r");
+            metricsRef.current.totalRejections++;
+          }}
+          onRestartZone={handleRestartInZone}
+          onTogglePin={(z) => {
+            setPinnedZones((prev) => {
+              const next = new Set(prev);
+              if (next.has(z)) next.delete(z);
+              else next.add(z);
+              return next;
+            });
+          }}
+          pinnedZones={pinnedZones}
+          onApproveAll={() => {
+            const ni = tabs.filter((t) => sessionStates[t.id] === "needs-input");
+            metricsRef.current.totalApprovals += ni.length;
+            addHistoryEvent("Approve all", `${ni.length} sessions`, undefined, "#9ece6a");
+            for (const tab of ni) {
+              terminalRefs.current.get(tab.id)?.current?.writeToTerminal("y\r");
+            }
+          }}
+          onSortZones={handleSortZones}
+          onExport={handleExportOutput}
+          onToggleFocusMode={() => {
+            setFocusMode((prev) => {
+              const next = !prev;
+              localStorage.setItem("zone-focus-mode", String(next));
+              return next;
+            });
+          }}
+          focusMode={focusMode}
+          onToggleAutoFocus={toggleAutoFocus}
+          autoFocus={autoFocusNeedsInput}
+          onToggleSound={toggleSound}
+          soundEnabled={soundEnabled}
+          zoneLabels={zoneLabels}
+          onSetZoneLabel={(z, label) => {
+            setZoneLabels((prev) => {
+              if (!label) {
+                const next = { ...prev };
+                delete next[z];
+                return next;
+              }
+              return { ...prev, [z]: label };
+            });
+          }}
+          zoneCount={zoneLayout.layout.zones.length}
+          onCompareZones={(z1, z2) => {
+            setShowCommandPalette(false);
+            setDiffZones([z1, z2]);
+          }}
+          onSnapshotZone={(tabId) => {
+            outputSnapshotsRef.current[tabId] = [...(lastOutputLines[tabId] ?? [])];
+            setSnapshotCounter((c) => c + 1);
+          }}
+          onCompareSnapshot={(tabId) => {
+            const snapshot = outputSnapshotsRef.current[tabId];
+            if (snapshot) {
+              setSnapshotDiff({
+                tabId,
+                snapshot,
+                current: lastOutputLines[tabId] ?? [],
+              });
+            }
+            setShowCommandPalette(false);
+          }}
+          snapshotZones={snapshotZones}
+        />
+      )}
     </div>
   );
 }

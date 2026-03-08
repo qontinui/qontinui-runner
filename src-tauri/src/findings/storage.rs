@@ -458,7 +458,11 @@ fn truncate_description(desc: &str, max_len: usize) -> String {
     if desc.len() <= max_len {
         desc.to_string()
     } else {
-        format!("{}...", &desc[..max_len])
+        let mut end = max_len;
+        while end > 0 && !desc.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &desc[..end])
     }
 }
 

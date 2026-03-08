@@ -40,10 +40,12 @@ mod executor;
 mod findings;
 mod follow_up;
 mod health_monitor;
+mod heartbeat;
 mod instance_manager;
 mod iteration_bundle;
 #[cfg(windows)]
 mod job_object;
+mod known_issues;
 mod log_consolidation;
 mod log_migration;
 mod logging;
@@ -308,6 +310,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
+    let heartbeat_app_state = shared_app_state.clone();
 
     // Create error monitor config for later initialization
     let error_monitor_db = checkpoint_db.clone();
@@ -541,6 +544,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::findings::provide_finding_response,
             commands::findings::get_findings_summary,
             commands::findings::list_task_knowledge_cmd,
+            // Known Issues Registry commands
+            commands::known_issues::list_known_issues,
+            commands::known_issues::find_issues_for_spec,
+            commands::known_issues::create_known_issue,
+            commands::known_issues::update_known_issue,
+            commands::known_issues::delete_known_issue,
+            commands::known_issues::resolve_known_issue,
+            commands::known_issues::list_pattern_templates,
+            commands::known_issues::create_pattern_template,
+            commands::known_issues::export_known_issues,
+            commands::known_issues::import_known_issues,
             // State Explorer commands
             commands::state_explorer::start_exploration,
             commands::state_explorer::get_exploration_strategies,
@@ -978,6 +992,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     .inner()
                     .clone();
                 demo_workflows::seed_demo_workflows_if_needed(&seed_db);
+
+                // Seed built-in issue pattern templates
+                if let Ok(conn) = seed_db.get_conn() {
+                    commands::known_issues::seed_built_in_templates(&conn);
+                }
             }
 
             // Window starts maximized via tauri.conf.json
@@ -1048,6 +1067,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => error!("MCP API server error: {}", e),
                 }
             });
+
+            // Start heartbeat background task for fleet registration
+            heartbeat::start_heartbeat(heartbeat_app_state);
 
             // Start scheduler service in background (skip for secondary instances to avoid duplicate executions)
             if std::env::var("QONTINUI_INSTANCE_NAME").is_ok() {

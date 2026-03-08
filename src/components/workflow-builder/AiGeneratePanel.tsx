@@ -191,6 +191,9 @@ export function AiGeneratePanel({
   const [autoIncludeContexts, setAutoIncludeContexts] = useState(true);
   const [investigateCodebase, setInvestigateCodebase] = useState(true);
   const [includeDesignGuidance, setIncludeDesignGuidance] = useState(false);
+  const [verificationDepth, setVerificationDepth] = useState<
+    "smoke" | "standard" | "thorough" | "regression"
+  >("standard");
   const [discoveryMode, setDiscoveryMode] = useState<"auto" | "enabled" | "disabled">("auto");
   const [generationModelOverrides, setGenerationModelOverrides] = useState<
     Record<string, { provider?: string; model?: string }> | undefined
@@ -426,6 +429,7 @@ export function AiGeneratePanel({
     request.auto_include_contexts = autoIncludeContexts;
     request.investigate_codebase = investigateCodebase;
     if (includeDesignGuidance) request.include_design_guidance = true;
+    if (verificationDepth !== "standard") request.verification_depth = verificationDepth;
     if (discoveryMode !== "auto") request.discovery_mode = discoveryMode;
     if (generationModelOverrides) request.model_overrides = generationModelOverrides;
 
@@ -442,6 +446,7 @@ export function AiGeneratePanel({
     autoIncludeContexts,
     investigateCodebase,
     includeDesignGuidance,
+    verificationDepth,
     discoveryMode,
     hasSpecs,
     generationModelOverrides,
@@ -1059,6 +1064,30 @@ export function AiGeneratePanel({
                           </span>
                         </span>
                       </label>
+                    </div>
+                    <div>
+                      <label className="text-sm text-zinc-300">
+                        Verification depth
+                        <span className="relative group ml-1">
+                          <Info className="w-3 h-3 text-zinc-500 cursor-help inline" />
+                          <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 hidden group-hover:block w-52 p-2 bg-zinc-700 border border-zinc-600 rounded text-[10px] text-zinc-300 z-50 shadow-lg">
+                            Controls how many verification steps are generated. Higher levels
+                            include checks for known issues and exploratory anomaly detection.
+                          </span>
+                        </span>
+                      </label>
+                      <select
+                        value={verificationDepth}
+                        onChange={(e) =>
+                          setVerificationDepth(e.target.value as typeof verificationDepth)
+                        }
+                        className="w-full mt-1 px-2 py-1.5 text-sm bg-zinc-800 border border-zinc-600 rounded focus:outline-none focus:ring-1 focus:ring-purple-500/50 text-zinc-200"
+                      >
+                        <option value="smoke">Smoke — minimal build/render checks</option>
+                        <option value="standard">Standard — spec-driven verification</option>
+                        <option value="thorough">Thorough — standard + anomaly detection</option>
+                        <option value="regression">Regression — standard + all known issues</option>
+                      </select>
                     </div>
                   </div>
 
