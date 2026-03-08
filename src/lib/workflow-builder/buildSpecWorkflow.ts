@@ -87,6 +87,8 @@ export interface BuildSpecWorkflowInput {
   selectedGroupIds?: Set<string>;
   /** Custom agentic prompt for failure recovery */
   agenticPrompt?: string;
+  /** Additional instructions appended to the agentic prompt (preserves default context) */
+  additionalInstructions?: string;
   /** Max verification/agentic iterations (default: 3) */
   maxIterations?: number;
   /** Element source: "control" (runner UI) or "external" (browser tab).
@@ -264,6 +266,7 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
     specConfig,
     selectedGroupIds,
     agenticPrompt,
+    additionalInstructions,
     maxIterations = 3,
     pageUrl,
     workflowName,
@@ -368,15 +371,18 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
   // Agentic steps
   const agenticSteps: PromptStep[] = [];
   if (agenticPrompt || selectedGroups.length > 0) {
-    const defaultPrompt =
+    const basePrompt =
       agenticPrompt ||
       `Some verification steps failed. Analyze the failures and fix the issues.\n\nThe test specifications describe what the application should look like and how it should behave. Review the failing assertions and make the necessary code changes to fix them.`;
+    const extraInstructions = additionalInstructions
+      ? `\n\n## Additional Instructions\n\n${additionalInstructions}`
+      : "";
     agenticSteps.push({
       id: crypto.randomUUID(),
       type: "prompt",
       phase: "agentic",
       name: "Fix Verification Failures",
-      content: defaultPrompt,
+      content: `${basePrompt}${extraInstructions}`,
     });
   }
 
@@ -424,8 +430,12 @@ export interface BuildMultiStageSpecWorkflowInput {
   pages: PageSpecGroup[];
   /** Which group IDs to include (default: all groups in each page). */
   selectedGroupIds?: Set<string>;
-  /** Custom agentic prompt for failure recovery (per-stage). */
+  /** Custom agentic prompt for failure recovery (per-stage).
+   *  Replaces the auto-generated page-specific prompt entirely. */
   agenticPrompt?: string;
+  /** Additional instructions appended to each stage's agentic prompt.
+   *  Unlike agenticPrompt, this preserves the auto-generated page context. */
+  additionalInstructions?: string;
   /** Max verification/agentic iterations per stage (default: 3). */
   maxIterations?: number;
   /** Element source: "control" (runner UI) or "external" (browser tab). */
@@ -454,6 +464,7 @@ export function buildMultiStageSpecWorkflow(
     pages,
     selectedGroupIds,
     agenticPrompt,
+    additionalInstructions,
     maxIterations = 3,
     elementSource = "external",
     workflowName,
@@ -532,9 +543,11 @@ export function buildMultiStageSpecWorkflow(
 
     // Agentic step for this stage
     const groupList = groups.map((g) => `- ${g.name}: ${g.description}`).join("\n");
-    const agenticContent =
-      agenticPrompt ??
-      `## Page: ${page.pageName}\n\nSome verification steps for this page failed. Analyze the failures and fix the issues.\n\nSpec groups on this page:\n${groupList}\n\nReview the failing assertions and make the necessary code changes to fix them.`;
+    const defaultPrompt = `## Page: ${page.pageName}\n\nSome verification steps for this page failed. Analyze the failures and fix the issues.\n\nSpec groups on this page:\n${groupList}\n\nReview the failing assertions and make the necessary code changes to fix them.`;
+    const extraInstructions = additionalInstructions
+      ? `\n\n## Additional Instructions\n\n${additionalInstructions}`
+      : "";
+    const agenticContent = agenticPrompt ?? `${defaultPrompt}${extraInstructions}`;
 
     return {
       id: crypto.randomUUID(),

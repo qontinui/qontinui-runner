@@ -501,6 +501,21 @@ export function AiGeneratePanel({
     setSubmittingAction("generate");
     setError(null);
     try {
+      // Specs selected → deterministic builder (instant, loads into builder)
+      if (hasSpecs && onLoadWorkflow) {
+        const workflow = buildDeterministicSpecWorkflow();
+        if (workflow) {
+          onLoadWorkflow(workflow);
+          console.log(
+            "[AiGeneratePanel] Deterministic spec workflow built:",
+            workflow.stages?.length ?? 0,
+            "stages",
+          );
+          setSubmittingAction(null);
+          return;
+        }
+      }
+      // No specs → AI generation
       const taskRunId = await fireGenerateRequest(buildGenerateRequest());
       console.log("[AiGeneratePanel] Generation started:", taskRunId);
       if (description.trim()) {
@@ -528,6 +543,26 @@ export function AiGeneratePanel({
     setSubmittingAction("generate-and-run");
     setError(null);
     try {
+      // Specs selected → deterministic builder + execute inline
+      if (hasSpecs) {
+        const workflow = buildDeterministicSpecWorkflow();
+        if (workflow) {
+          const resp = await tracedFetch(`${getApiBase()}/unified-workflows/execute-inline`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(workflow),
+          });
+          if (!resp.ok) {
+            const json = await resp.json();
+            throw new Error(json.error || `HTTP ${resp.status}`);
+          }
+          console.log("[AiGeneratePanel] Deterministic spec workflow built and executed");
+          onNavigateToActiveRuns();
+          setSubmittingAction(null);
+          return;
+        }
+      }
+      // No specs → AI generation + auto_run
       const request = { ...buildGenerateRequest(), auto_run: true };
       const taskRunId = await fireGenerateRequest(request);
       console.log("[AiGeneratePanel] Generate & Run started:", taskRunId);
@@ -551,10 +586,12 @@ export function AiGeneratePanel({
     }
   };
 
-  /** Build a deterministic multi-stage spec workflow and load it into the builder. */
-  const handleBuildFromSpecs = useCallback(() => {
-    if (!onLoadWorkflow || !hasSpecs) return;
-
+  /**
+   * Build a deterministic spec workflow from selected specs.
+   * Single page → flat workflow; multiple pages → multi-stage (one stage per page).
+   * User description is injected as additionalInstructions into the agentic phase.
+   */
+  const buildDeterministicSpecWorkflow = useCallback(() => {
     // Group discovered specs by page URL
     const pageMap = new Map<string, { pageName: string; specs: DiscoveredSpec[] }>();
     for (const spec of specState.discoveredSpecs) {
@@ -571,34 +608,35 @@ export function AiGeneratePanel({
     // Build PageSpecGroup array
     const pages: PageSpecGroup[] = [];
     for (const [pageUrl, { pageName, specs }] of pageMap) {
-      // Only include pages that have selected groups
       const groups = specs.flatMap((s) => s.config?.groups ?? []) as unknown as BuildSpecGroup[];
       const hasSelectedGroups = groups.some((g) => specState.selectedGroupIds.has(g.id));
       if (!hasSelectedGroups) continue;
       pages.push({ pageUrl, pageName, groups });
     }
 
-    if (pages.length === 0) return;
+    if (pages.length === 0) return null;
+
+    const userPrompt = description.trim() || undefined;
 
     // Single page → flat workflow; multiple pages → multi-stage
     if (pages.length === 1) {
-      const workflow = buildSpecWorkflow({
+      return buildSpecWorkflow({
         specConfig: { version: "1.0", groups: pages[0].groups },
         selectedGroupIds: specState.selectedGroupIds,
+        additionalInstructions: userPrompt,
         elementSource: "external",
         pageUrl: pages[0].pageUrl,
         workflowName: `Spec Verification — ${pages[0].pageName}`,
       });
-      onLoadWorkflow(workflow);
     } else {
-      const workflow = buildMultiStageSpecWorkflow({
+      return buildMultiStageSpecWorkflow({
         pages,
         selectedGroupIds: specState.selectedGroupIds,
+        additionalInstructions: userPrompt,
         elementSource: "external",
       });
-      onLoadWorkflow(workflow);
     }
-  }, [onLoadWorkflow, hasSpecs, specState]);
+  }, [specState, description]);
 
   // Group contexts by scope
   const contextsByScope = savedContexts.reduce(
