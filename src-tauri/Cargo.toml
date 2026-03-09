@@ -102,3 +102,6 @@ path = "src/bin/mock_claude_cli.rs"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.dev]
+debug = 1  # Line tables only — reduces LLVM memory during linking
