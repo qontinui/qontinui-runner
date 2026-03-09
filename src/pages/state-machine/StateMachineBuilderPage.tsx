@@ -480,6 +480,7 @@ export function StateMachineBuilderPage() {
                     setShowNewState(false);
                   }}
                   className="p-1 hover:bg-bg-tertiary rounded"
+                  aria-label="Close sidebar"
                 >
                   <X className="w-3.5 h-3.5 text-text-muted" />
                 </button>

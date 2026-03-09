@@ -1,7 +1,7 @@
 //! SQLite CRUD operations for state machine configs, states, and transitions.
 
 use rusqlite::{params, Connection, OptionalExtension};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::types::*;
 
@@ -155,24 +155,70 @@ pub fn get_config_full(conn: &Connection, id: &str) -> Result<Option<SmConfigFul
 // =============================================================================
 
 fn row_to_state(row: &rusqlite::Row) -> rusqlite::Result<SmState> {
+    let id: String = row.get(0)?;
     let element_ids_json: String = row.get(5)?;
     let render_ids_json: String = row.get(6)?;
     let acceptance_criteria_json: String = row.get(8)?;
     let extra_metadata_json: String = row.get(9)?;
     let domain_knowledge_json: String = row.get(10)?;
 
+    let element_ids = match serde_json::from_str(&element_ids_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Failed to deserialize element_ids for state {}: {}", id, e);
+            Vec::new()
+        }
+    };
+    let render_ids = match serde_json::from_str(&render_ids_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Failed to deserialize render_ids for state {}: {}", id, e);
+            Vec::new()
+        }
+    };
+    let acceptance_criteria = match serde_json::from_str(&acceptance_criteria_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "Failed to deserialize acceptance_criteria for state {}: {}",
+                id, e
+            );
+            Vec::new()
+        }
+    };
+    let extra_metadata = match serde_json::from_str(&extra_metadata_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "Failed to deserialize extra_metadata for state {}: {}",
+                id, e
+            );
+            serde_json::json!({})
+        }
+    };
+    let domain_knowledge = match serde_json::from_str(&domain_knowledge_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "Failed to deserialize domain_knowledge for state {}: {}",
+                id, e
+            );
+            Vec::new()
+        }
+    };
+
     Ok(SmState {
-        id: row.get(0)?,
+        id,
         config_id: row.get(1)?,
         state_id: row.get(2)?,
         name: row.get(3)?,
         description: row.get(4)?,
-        element_ids: serde_json::from_str(&element_ids_json).unwrap_or_default(),
-        render_ids: serde_json::from_str(&render_ids_json).unwrap_or_default(),
+        element_ids,
+        render_ids,
         confidence: row.get(7)?,
-        acceptance_criteria: serde_json::from_str(&acceptance_criteria_json).unwrap_or_default(),
-        extra_metadata: serde_json::from_str(&extra_metadata_json).unwrap_or(serde_json::json!({})),
-        domain_knowledge: serde_json::from_str(&domain_knowledge_json).unwrap_or_default(),
+        acceptance_criteria,
+        extra_metadata,
+        domain_knowledge,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
     })
@@ -346,24 +392,73 @@ pub fn delete_state(conn: &Connection, id: &str) -> Result<bool, String> {
 // =============================================================================
 
 fn row_to_transition(row: &rusqlite::Row) -> rusqlite::Result<SmTransition> {
+    let id: String = row.get(0)?;
     let from_states_json: String = row.get(4)?;
     let activate_states_json: String = row.get(5)?;
     let exit_states_json: String = row.get(6)?;
     let actions_json: String = row.get(7)?;
     let extra_metadata_json: String = row.get(10)?;
 
+    let from_states = match serde_json::from_str(&from_states_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "Failed to deserialize from_states for transition {}: {}",
+                id, e
+            );
+            Vec::new()
+        }
+    };
+    let activate_states = match serde_json::from_str(&activate_states_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "Failed to deserialize activate_states for transition {}: {}",
+                id, e
+            );
+            Vec::new()
+        }
+    };
+    let exit_states = match serde_json::from_str(&exit_states_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "Failed to deserialize exit_states for transition {}: {}",
+                id, e
+            );
+            Vec::new()
+        }
+    };
+    let actions = match serde_json::from_str(&actions_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Failed to deserialize actions for transition {}: {}", id, e);
+            Vec::new()
+        }
+    };
+    let extra_metadata = match serde_json::from_str(&extra_metadata_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "Failed to deserialize extra_metadata for transition {}: {}",
+                id, e
+            );
+            serde_json::json!({})
+        }
+    };
+
     Ok(SmTransition {
-        id: row.get(0)?,
+        id,
         config_id: row.get(1)?,
         transition_id: row.get(2)?,
         name: row.get(3)?,
-        from_states: serde_json::from_str(&from_states_json).unwrap_or_default(),
-        activate_states: serde_json::from_str(&activate_states_json).unwrap_or_default(),
-        exit_states: serde_json::from_str(&exit_states_json).unwrap_or_default(),
-        actions: serde_json::from_str(&actions_json).unwrap_or_default(),
+        from_states,
+        activate_states,
+        exit_states,
+        actions,
         path_cost: row.get(8)?,
         stays_visible: row.get(9)?,
-        extra_metadata: serde_json::from_str(&extra_metadata_json).unwrap_or(serde_json::json!({})),
+        extra_metadata,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
     })
@@ -534,7 +629,7 @@ pub fn delete_transition(conn: &Connection, id: &str) -> Result<bool, String> {
 pub fn import_config(conn: &Connection, req: &SmImportRequest) -> Result<SmConfigFull, String> {
     let data = &req.config;
 
-    // Extract config metadata
+    // Extract config metadata before starting transaction
     let config_data = data
         .get("config")
         .ok_or("Missing 'config' field in import data")?;
@@ -544,132 +639,151 @@ pub fn import_config(conn: &Connection, req: &SmImportRequest) -> Result<SmConfi
         .or_else(|| config_data.get("name").and_then(|v| v.as_str()))
         .unwrap_or("Imported Config");
 
-    let create_req = CreateSmConfigRequest {
-        name: config_name.to_string(),
-        description: config_data
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-    };
+    // Wrap all inserts in a transaction for atomicity
+    conn.execute_batch("BEGIN;")
+        .map_err(|e| format!("Failed to begin import transaction: {}", e))?;
 
-    let mut config = insert_config(conn, &create_req)?;
+    let result = (|| -> Result<SmConfigFull, String> {
+        let create_req = CreateSmConfigRequest {
+            name: config_name.to_string(),
+            description: config_data
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        };
 
-    // Update render/element counts from import
-    let render_count = config_data
-        .get("render_count")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let element_count = config_data
-        .get("element_count")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let include_html_ids = config_data
-        .get("include_html_ids")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        let mut config = insert_config(conn, &create_req)?;
 
-    config = update_config(
-        conn,
-        &config.id,
-        &UpdateSmConfigRequest {
-            name: None,
-            description: None,
-            render_count: Some(render_count),
-            element_count: Some(element_count),
-            include_html_ids: Some(include_html_ids),
-        },
-    )?;
+        // Update render/element counts from import
+        let render_count = config_data
+            .get("render_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let element_count = config_data
+            .get("element_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let include_html_ids = config_data
+            .get("include_html_ids")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-    // Import states
-    let mut states = Vec::new();
-    if let Some(states_obj) = data.get("states").and_then(|v| v.as_object()) {
-        for (state_id, state_data) in states_obj {
-            let element_ids: Vec<String> = state_data
-                .get("element_ids")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-            let render_ids: Vec<String> = state_data
-                .get("render_ids")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-            let acceptance_criteria: Vec<String> = state_data
-                .get("acceptance_criteria")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
+        config = update_config(
+            conn,
+            &config.id,
+            &UpdateSmConfigRequest {
+                name: None,
+                description: None,
+                render_count: Some(render_count),
+                element_count: Some(element_count),
+                include_html_ids: Some(include_html_ids),
+            },
+        )?;
 
-            let req = CreateSmStateRequest {
-                state_id: Some(state_id.clone()),
-                name: state_data
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(state_id)
-                    .to_string(),
-                description: state_data
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                element_ids: Some(element_ids),
-                render_ids: Some(render_ids),
-                confidence: state_data.get("confidence").and_then(|v| v.as_f64()),
-                acceptance_criteria: Some(acceptance_criteria),
-                extra_metadata: state_data.get("extra_metadata").cloned(),
-                domain_knowledge: None,
-            };
+        // Import states
+        let mut states = Vec::new();
+        if let Some(states_obj) = data.get("states").and_then(|v| v.as_object()) {
+            for (state_id, state_data) in states_obj {
+                let element_ids: Vec<String> = state_data
+                    .get("element_ids")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let render_ids: Vec<String> = state_data
+                    .get("render_ids")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let acceptance_criteria: Vec<String> = state_data
+                    .get("acceptance_criteria")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
 
-            states.push(insert_state(conn, &config.id, &req)?);
+                let req = CreateSmStateRequest {
+                    state_id: Some(state_id.clone()),
+                    name: state_data
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(state_id)
+                        .to_string(),
+                    description: state_data
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    element_ids: Some(element_ids),
+                    render_ids: Some(render_ids),
+                    confidence: state_data.get("confidence").and_then(|v| v.as_f64()),
+                    acceptance_criteria: Some(acceptance_criteria),
+                    extra_metadata: state_data.get("extra_metadata").cloned(),
+                    domain_knowledge: None,
+                };
+
+                states.push(insert_state(conn, &config.id, &req)?);
+            }
+        }
+
+        // Import transitions
+        let mut transitions = Vec::new();
+        if let Some(transitions_obj) = data.get("transitions").and_then(|v| v.as_object()) {
+            for (_transition_id, t_data) in transitions_obj {
+                let from_states: Vec<String> = t_data
+                    .get("from_states")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let activate_states: Vec<String> = t_data
+                    .get("activate_states")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let exit_states: Vec<String> = t_data
+                    .get("exit_states")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let actions: Vec<serde_json::Value> = t_data
+                    .get("actions")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+
+                let req = CreateSmTransitionRequest {
+                    name: t_data
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unnamed")
+                        .to_string(),
+                    from_states,
+                    activate_states,
+                    exit_states,
+                    actions,
+                    path_cost: t_data.get("path_cost").and_then(|v| v.as_f64()),
+                    stays_visible: t_data.get("stays_visible").and_then(|v| v.as_bool()),
+                    extra_metadata: t_data.get("extra_metadata").cloned(),
+                };
+
+                transitions.push(insert_transition(conn, &config.id, &req)?);
+            }
+        }
+
+        Ok(SmConfigFull {
+            config,
+            states,
+            transitions,
+        })
+    })();
+
+    match result {
+        Ok(config_full) => {
+            conn.execute_batch("COMMIT;")
+                .map_err(|e| format!("Failed to commit import transaction: {}", e))?;
+            info!(
+                "Imported state machine config '{}': {} states, {} transitions",
+                config_full.config.name,
+                config_full.states.len(),
+                config_full.transitions.len()
+            );
+            Ok(config_full)
+        }
+        Err(e) => {
+            if let Err(rollback_err) = conn.execute_batch("ROLLBACK;") {
+                warn!("Failed to rollback import transaction: {}", rollback_err);
+            }
+            Err(e)
         }
     }
-
-    // Import transitions
-    let mut transitions = Vec::new();
-    if let Some(transitions_obj) = data.get("transitions").and_then(|v| v.as_object()) {
-        for (_transition_id, t_data) in transitions_obj {
-            let from_states: Vec<String> = t_data
-                .get("from_states")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-            let activate_states: Vec<String> = t_data
-                .get("activate_states")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-            let exit_states: Vec<String> = t_data
-                .get("exit_states")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-            let actions: Vec<serde_json::Value> = t_data
-                .get("actions")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-
-            let req = CreateSmTransitionRequest {
-                name: t_data
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unnamed")
-                    .to_string(),
-                from_states,
-                activate_states,
-                exit_states,
-                actions,
-                path_cost: t_data.get("path_cost").and_then(|v| v.as_f64()),
-                stays_visible: t_data.get("stays_visible").and_then(|v| v.as_bool()),
-                extra_metadata: t_data.get("extra_metadata").cloned(),
-            };
-
-            transitions.push(insert_transition(conn, &config.id, &req)?);
-        }
-    }
-
-    info!(
-        "Imported state machine config '{}': {} states, {} transitions",
-        config.name,
-        states.len(),
-        transitions.len()
-    );
-
-    Ok(SmConfigFull {
-        config,
-        states,
-        transitions,
-    })
 }
