@@ -166,6 +166,7 @@ import { GeneratorEvalPage } from "./pages/GeneratorEvalPage";
 import { SpecsPage } from "./pages/specs/SpecsPage";
 import { UIBridgeIntegrationPage } from "./pages/ui-bridge-integration/UIBridgeIntegrationPage";
 import { TerminalPage } from "./components/terminal";
+import { StateMachineBuilderPage } from "./pages/state-machine";
 
 // Development tools
 import { PerformanceOverlay } from "./components/dev";
@@ -219,6 +220,7 @@ type MainTabId =
   | "context-builder"
   | "playwright-test-builder"
   | "unified-workflow-builder"
+  | "state-machine"
   | "specs"
   | "capture"
   | "config-log-sources"
@@ -288,6 +290,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "context-builder",
   "playwright-test-builder",
   "unified-workflow-builder",
+  "state-machine",
   "specs",
   "capture",
   "config-log-sources",
@@ -1285,6 +1288,13 @@ function AppContent() {
                 setActiveTab("unified-workflow-builder");
               }}
             />
+          </div>
+        );
+
+      case "state-machine":
+        return (
+          <div className="h-full overflow-hidden">
+            <StateMachineBuilderPage />
           </div>
         );
 

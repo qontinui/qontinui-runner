@@ -2583,4 +2583,52 @@ CREATE INDEX IF NOT EXISTS idx_known_issues_severity ON known_issues(severity);
 CREATE INDEX IF NOT EXISTS idx_known_issues_scope_value ON known_issues(scope_value);
 CREATE INDEX IF NOT EXISTS idx_known_issues_scope_compound ON known_issues(scope_type, scope_value, status);
 
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (87, datetime('now'));
+-- State Machine Config Builder tables (for creating/editing state machines in the runner)
+CREATE TABLE IF NOT EXISTS state_machine_configs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT 'default',
+    description TEXT,
+    render_count INTEGER NOT NULL DEFAULT 0,
+    element_count INTEGER NOT NULL DEFAULT 0,
+    include_html_ids BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS state_machine_states (
+    id TEXT PRIMARY KEY,
+    config_id TEXT NOT NULL REFERENCES state_machine_configs(id) ON DELETE CASCADE,
+    state_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    element_ids TEXT NOT NULL DEFAULT '[]',
+    render_ids TEXT NOT NULL DEFAULT '[]',
+    confidence REAL NOT NULL DEFAULT 0.9,
+    acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+    extra_metadata TEXT NOT NULL DEFAULT '{}',
+    domain_knowledge TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sm_states_config_id ON state_machine_states(config_id);
+
+CREATE TABLE IF NOT EXISTS state_machine_transitions (
+    id TEXT PRIMARY KEY,
+    config_id TEXT NOT NULL REFERENCES state_machine_configs(id) ON DELETE CASCADE,
+    transition_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    from_states TEXT NOT NULL DEFAULT '[]',
+    activate_states TEXT NOT NULL DEFAULT '[]',
+    exit_states TEXT NOT NULL DEFAULT '[]',
+    actions TEXT NOT NULL DEFAULT '[]',
+    path_cost REAL NOT NULL DEFAULT 1.0,
+    stays_visible BOOLEAN NOT NULL DEFAULT FALSE,
+    extra_metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sm_transitions_config_id ON state_machine_transitions(config_id);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (92, datetime('now'));

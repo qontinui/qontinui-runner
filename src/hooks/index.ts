@@ -243,3 +243,6 @@ export { useSharedElapsedTime } from "./useSharedElapsedTime";
 export { useRunnerConnectionStatus } from "./useRunnerConnectionStatus";
 
 export { useKnownIssues } from "./useKnownIssues";
+
+export { useStateMachineConfig } from "./useStateMachineConfig";
+export type { UseStateMachineConfigReturn } from "./useStateMachineConfig";

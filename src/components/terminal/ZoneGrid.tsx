@@ -20,6 +20,7 @@ import {
   type TerminalInstanceHandle,
   type ShellIntegrationEvent,
 } from "./TerminalInstance";
+import { PlanViewer } from "./PlanViewer";
 import type { TerminalTab } from "./useTerminalManager";
 import type { LayoutPreset, ZoneAssignments, SessionState } from "./useZoneLayout";
 
@@ -1709,8 +1710,9 @@ export function ZoneGrid({
     [onZoneClick],
   );
 
-  // Unassigned tabs (hidden but alive)
+  // Unassigned tabs (hidden but alive) — exclude plan tabs (no PTY)
   const unassignedTabs = tabs.filter((t) => !Object.values(assignments).includes(t.id));
+  const unassignedTerminals = unassignedTabs.filter((t) => t.type !== "plan");
 
   const renderHiddenTabs = (extraTabs: TerminalTab[]) =>
     extraTabs.map((tab) => (
@@ -1760,22 +1762,26 @@ export function ZoneGrid({
               onMouseDown={(e) => handleZoneMouseDown(zoneIdx, e)}
               onDoubleClick={() => onZoneDoubleClick(zoneIdx)}
             >
-              <TerminalInstance
-                ref={ref}
-                terminalId={zoneTab.id}
-                visible={isVisible}
-                isReconnecting={zoneTab.isReconnecting}
-                onReconnected={() => onReconnected(zoneTab.id)}
-                onExit={(code) => onExit(zoneTab.id, code)}
-                onFirstInput={(input) => onFirstInput(zoneTab.id, input)}
-                onShellIntegration={(event) => onShellIntegration(zoneTab.id, event)}
-                onOutput={(text) => onOutput(zoneTab.id, text)}
-              />
+              {zoneTab.type === "plan" && zoneTab.planFilePath ? (
+                <PlanViewer filePath={zoneTab.planFilePath} visible={isVisible} />
+              ) : (
+                <TerminalInstance
+                  ref={ref}
+                  terminalId={zoneTab.id}
+                  visible={isVisible}
+                  isReconnecting={zoneTab.isReconnecting}
+                  onReconnected={() => onReconnected(zoneTab.id)}
+                  onExit={(code) => onExit(zoneTab.id, code)}
+                  onFirstInput={(input) => onFirstInput(zoneTab.id, input)}
+                  onShellIntegration={(event) => onShellIntegration(zoneTab.id, event)}
+                  onOutput={(text) => onOutput(zoneTab.id, text)}
+                />
+              )}
             </div>
           );
         })}
 
-        {renderHiddenTabs(unassignedTabs)}
+        {renderHiddenTabs(unassignedTerminals)}
       </div>
     );
   }
@@ -1805,7 +1811,8 @@ export function ZoneGrid({
 
         // Decide: compact or full terminal for this zone (pinned zones stay full)
         const isPinned = pinnedZones?.has(zoneIdx);
-        const useCompact = tab && !isFocused && !isPinned && (autoCompact || forceCompact);
+        const useCompact =
+          tab && tab.type !== "plan" && !isFocused && !isPinned && (autoCompact || forceCompact);
         const isFlashing = tab && flashingTabs?.has(tab.id);
         const isStale = tab && staleTabs?.has(tab.id);
         const searchMatch =
@@ -2112,33 +2119,39 @@ export function ZoneGrid({
                     onExportZone={onExportZone ? (fmt) => onExportZone(zoneIdx, fmt) : undefined}
                   />
                 )}
-                {/* Terminal instance - always mounted at same tree position to preserve xterm state */}
-                <div
-                  className={`h-full w-full ${useCompact ? "hidden" : ""}`}
-                  style={{
-                    paddingTop: useCompact
-                      ? undefined
-                      : showLabels
-                        ? showFilterInput === zoneIdx
-                          ? "46px"
-                          : "20px"
-                        : showFilterInput === zoneIdx
-                          ? "26px"
-                          : undefined,
-                  }}
-                >
-                  <TerminalInstance
-                    ref={terminalRefs.get(tab.id)}
-                    terminalId={tab.id}
-                    visible={!useCompact}
-                    isReconnecting={tab.isReconnecting}
-                    onReconnected={() => onReconnected(tab.id)}
-                    onExit={(code) => onExit(tab.id, code)}
-                    onFirstInput={(input) => onFirstInput(tab.id, input)}
-                    onShellIntegration={(event) => onShellIntegration(tab.id, event)}
-                    onOutput={(text) => onOutput(tab.id, text)}
-                  />
-                </div>
+                {/* Terminal or Plan viewer - always mounted at same tree position to preserve state */}
+                {tab.type === "plan" && tab.planFilePath ? (
+                  <div className="h-full w-full">
+                    <PlanViewer filePath={tab.planFilePath} visible={!useCompact} />
+                  </div>
+                ) : (
+                  <div
+                    className={`h-full w-full ${useCompact ? "hidden" : ""}`}
+                    style={{
+                      paddingTop: useCompact
+                        ? undefined
+                        : showLabels
+                          ? showFilterInput === zoneIdx
+                            ? "46px"
+                            : "20px"
+                          : showFilterInput === zoneIdx
+                            ? "26px"
+                            : undefined,
+                    }}
+                  >
+                    <TerminalInstance
+                      ref={terminalRefs.get(tab.id)}
+                      terminalId={tab.id}
+                      visible={!useCompact}
+                      isReconnecting={tab.isReconnecting}
+                      onReconnected={() => onReconnected(tab.id)}
+                      onExit={(code) => onExit(tab.id, code)}
+                      onFirstInput={(input) => onFirstInput(tab.id, input)}
+                      onShellIntegration={(event) => onShellIntegration(tab.id, event)}
+                      onOutput={(text) => onOutput(tab.id, text)}
+                    />
+                  </div>
+                )}
               </>
             ) : (
               <div
@@ -2253,7 +2266,7 @@ export function ZoneGrid({
           );
         })}
 
-      {renderHiddenTabs(unassignedTabs)}
+      {renderHiddenTabs(unassignedTerminals)}
 
       {/* Right-click context menu */}
       {contextMenu &&

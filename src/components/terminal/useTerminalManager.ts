@@ -10,6 +10,10 @@ export interface TerminalTab {
   exitCode: number | null;
   workingDir?: string;
   createdAt?: number;
+  /** Tab type: "terminal" (default) or "plan" (markdown viewer) */
+  type?: "terminal" | "plan";
+  /** Absolute path to the markdown file (only for plan tabs) */
+  planFilePath?: string;
   /** True while the frontend is replaying the scrollback buffer from Rust. */
   isReconnecting?: boolean;
   /** Claude Code session ID running in this tab (set on resume). */
@@ -129,6 +133,24 @@ export function useTerminalManager() {
     [],
   );
 
+  const createPlanTab = useCallback((filePath: string): string => {
+    const fileName = filePath.replace(/\\/g, "/").split("/").pop() || "Plan";
+    const id = `plan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const tab: TerminalTab = {
+      id,
+      title: fileName,
+      pid: null,
+      isAlive: true,
+      exitCode: null,
+      type: "plan",
+      planFilePath: filePath,
+      createdAt: Date.now(),
+    };
+    setTabs((prev) => [...prev, tab]);
+    setActiveId(id);
+    return id;
+  }, []);
+
   const closeTerminal = useCallback((id: string) => {
     // Update React state immediately so the UI is responsive.
     // The Rust-side close (process kill + thread join) runs in the background.
@@ -142,10 +164,12 @@ export function useTerminalManager() {
       return next;
     });
 
-    // Fire-and-forget: let Rust clean up the PTY in the background
-    invoke<CommandResponse>("terminal_close", { terminalId: id }).catch(() => {
-      // Terminal may already be gone
-    });
+    // Only invoke Rust close for terminal tabs (plan tabs have no PTY)
+    if (!id.startsWith("plan-")) {
+      invoke<CommandResponse>("terminal_close", { terminalId: id }).catch(() => {
+        // Terminal may already be gone
+      });
+    }
   }, []);
 
   const renameTab = useCallback((id: string, title: string) => {
@@ -174,6 +198,7 @@ export function useTerminalManager() {
     initialized,
     setInitialized,
     createTerminal,
+    createPlanTab,
     closeTerminal,
     renameTab,
     updateTab,

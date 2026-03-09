@@ -2474,7 +2474,11 @@ export function SpecDetailPanel({
             />
           )}
           {activeTab === "issues" && (
-            <SpecIssuesPanel specId={selectedSpec.specId} pageUrl={pageUrl} onViewAllIssues={onClearSelection} />
+            <SpecIssuesPanel
+              specId={selectedSpec.specId}
+              pageUrl={pageUrl}
+              onViewAllIssues={onClearSelection}
+            />
           )}
         </div>
       </div>

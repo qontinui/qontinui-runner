@@ -29,6 +29,10 @@ export interface SavedSessionConfig {
   claudeSessionId?: string;
   /** Claude config dir */
   claudeConfigDir?: string;
+  /** Tab type: "terminal" (default) or "plan" */
+  type?: "terminal" | "plan";
+  /** File path for plan tabs */
+  planFilePath?: string;
 }
 
 export interface SavedSessionLayout {
@@ -62,6 +66,8 @@ export interface SaveSessionLayoutParams {
     workingDir?: string;
     claudeSessionId?: string;
     claudeConfigDir?: string;
+    type?: "terminal" | "plan";
+    planFilePath?: string;
   }>;
   assignments: Record<number, string>; // zoneIndex -> tabId
   zoneLabels: Record<number, string>;
@@ -114,6 +120,8 @@ export function useSessionPersistence() {
           isClaudeSession: !!tab.claudeSessionId,
           claudeSessionId: tab.claudeSessionId,
           claudeConfigDir: tab.claudeConfigDir,
+          type: tab.type,
+          planFilePath: tab.planFilePath,
         });
       }
 
@@ -128,6 +136,8 @@ export function useSessionPersistence() {
           isClaudeSession: !!tab.claudeSessionId,
           claudeSessionId: tab.claudeSessionId,
           claudeConfigDir: tab.claudeConfigDir,
+          type: tab.type,
+          planFilePath: tab.planFilePath,
         });
       }
 

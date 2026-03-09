@@ -353,11 +353,14 @@ function CreateIssueForm({
           className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
         >
           <option value="">Select a page spec...</option>
-          {getAllSpecs().map((s) => (
-            <option key={s.specId} value={s.specId}>
-              {s.specId} ({s.appName})
-            </option>
-          ))}
+          {getAllSpecs().map((s) => {
+            const displayName = s.specId.replace(/^runner:/, "");
+            return (
+              <option key={s.specId} value={s.specId}>
+                {displayName} ({s.appName})
+              </option>
+            );
+          })}
         </select>
       ) : scopeType !== "global" ? (
         <input
@@ -826,10 +829,7 @@ export function GlobalIssuesPanel() {
 
         {/* Create form */}
         {showForm && (
-          <CreateIssueForm
-            onSubmit={handleCreate}
-            onCancel={() => setShowForm(false)}
-          />
+          <CreateIssueForm onSubmit={handleCreate} onCancel={() => setShowForm(false)} />
         )}
 
         {/* Loading */}

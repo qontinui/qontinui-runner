@@ -17,7 +17,12 @@ interface WorkflowLibraryCardProps {
   onToggleFavorite?: (workflowId: string) => void;
 }
 
-export function WorkflowLibraryCard({ workflow, onAdd, isQueued, onToggleFavorite }: WorkflowLibraryCardProps) {
+export function WorkflowLibraryCard({
+  workflow,
+  onAdd,
+  isQueued,
+  onToggleFavorite,
+}: WorkflowLibraryCardProps) {
   const stepCount = getTotalStepCount(workflow);
   const { stats } = workflow;
 
@@ -55,7 +60,10 @@ export function WorkflowLibraryCard({ workflow, onAdd, isQueued, onToggleFavorit
           <div className="flex items-center gap-1.5">
             {onToggleFavorite && (
               <button
-                onClick={(e) => { e.stopPropagation(); onToggleFavorite(workflow.id); }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleFavorite(workflow.id);
+                }}
                 className="flex-shrink-0 p-0.5 rounded transition-colors hover:bg-white/10"
                 title={workflow.is_favorite ? "Remove from favorites" : "Add to favorites"}
               >

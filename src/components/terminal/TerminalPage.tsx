@@ -24,7 +24,7 @@ import { ZoneTimeline } from "./ZoneTimeline";
 import { ZoneControlPanel } from "./ZoneControlPanel";
 import { useSessionPersistence } from "./useSessionPersistence";
 import { WorkflowPreviewPanel } from "@qontinui/workflow-ui";
-import { save } from "@tauri-apps/plugin-dialog";
+import { save, open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
 
 // ── Extracted hooks ────────────────────────────────────────────────────────────
@@ -71,6 +71,7 @@ export function TerminalPage({
     updateTab,
     reconnectToExistingSessions,
     markReconnected,
+    createPlanTab,
   } = useTerminalManager();
 
   // ── Zone layout ─────────────────────────────────────────────────────────────
@@ -378,7 +379,8 @@ export function TerminalPage({
         if (currentTabs.length === 0) return;
 
         try {
-          const pathMap = await saveScrollbackBuffers(currentTabs);
+          const terminalTabs = currentTabs.filter((t) => t.type !== "plan");
+          const pathMap = await saveScrollbackBuffers(terminalTabs);
           const tabIdToSessionIndex: Record<string, number> = {};
           const currentAssignments = zoneLayoutRef.current.assignments;
           const assignedTabIds = new Set(Object.values(currentAssignments));
@@ -459,6 +461,24 @@ export function TerminalPage({
           const unassignedSessions = saved.sessions.filter((s) => s.zoneIndex < 0);
 
           for (const session of assignedSessions) {
+            // Plan tabs: restore without creating a PTY
+            if (session.type === "plan" && session.planFilePath) {
+              const tabId = createPlanTab(session.planFilePath);
+              if (tabId && session.zoneIndex >= 0) {
+                zoneLayout.assignTabToZone(session.zoneIndex, tabId);
+              }
+              if (session.label) {
+                labelsAndTags.setZoneLabel(session.zoneIndex, session.label);
+              }
+              if (session.notes) {
+                labelsAndTags.setZoneNote(session.zoneIndex, session.notes);
+              }
+              if (session.pinned) {
+                labelsAndTags.setPinnedZones((prev) => new Set([...prev, session.zoneIndex]));
+              }
+              continue;
+            }
+
             const tabId = await createTerminal(session.title, session.workingDir);
             if (tabId && session.zoneIndex >= 0) {
               zoneLayout.assignTabToZone(session.zoneIndex, tabId);
@@ -490,6 +510,10 @@ export function TerminalPage({
           }
 
           for (const session of unassignedSessions) {
+            if (session.type === "plan" && session.planFilePath) {
+              createPlanTab(session.planFilePath);
+              continue;
+            }
             const tabId = await createTerminal(session.title, session.workingDir);
             if (tabId && (session.scrollbackPath || session.isClaudeSession)) {
               pendingRestoresRef.current.push({
@@ -577,6 +601,7 @@ export function TerminalPage({
   }, [
     reconnectToExistingSessions,
     createTerminal,
+    createPlanTab,
     setInitialized,
     getSavedLayout,
     hasSavedLayout,
@@ -639,6 +664,25 @@ export function TerminalPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- granular deps on specific properties
     [zoneLayout.isMultiZone, zoneLayout.toggleMaximize],
   );
+
+  // Open a markdown plan file in a new zone
+  const handleOpenPlanFile = useCallback(async () => {
+    const selected = (await openFileDialog({
+      multiple: false,
+      filters: [{ name: "Markdown", extensions: ["md", "txt", "markdown"] }],
+    })) as string | null;
+    if (!selected) return;
+    const filePath = selected;
+    const tabId = createPlanTab(filePath);
+    if (tabId) {
+      // Auto-assign to first empty zone
+      const emptyZone = zoneLayout.layout.zones.findIndex((_, idx) => !zoneLayout.assignments[idx]);
+      if (emptyZone >= 0) {
+        zoneLayout.assignTabToZone(emptyZone, tabId);
+        zoneLayout.setFocusedZone(emptyZone);
+      }
+    }
+  }, [createPlanTab, zoneLayout]);
 
   // Create terminal and auto-assign to first empty zone.
   // When all zones are full, upgrade the layout to one with more zones
@@ -1292,6 +1336,7 @@ export function TerminalPage({
         onToggleFindings={findingsActions.handleToggleFindings}
         findingsActive={workflowGen.rightPanelMode === "findings"}
         findingsCount={activeFindings.length}
+        onOpenPlanFile={handleOpenPlanFile}
       />
       <TerminalNotification
         message={workflowGen.notification?.message ?? null}

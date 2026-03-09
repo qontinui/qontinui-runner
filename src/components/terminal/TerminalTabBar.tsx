@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo, type ReactNode } from "react";
-import { Terminal, X, Plus, List, ChevronDown } from "lucide-react";
+import { Terminal, X, Plus, List, ChevronDown, FileText } from "lucide-react";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 
@@ -277,8 +277,10 @@ export function TerminalTabBar({
               ${isStale ? "border-dashed border-[#565f89]/40" : ""}
             `}
           >
-            {/* Session state dot */}
-            {sessionStates ? (
+            {/* Session state dot / plan icon */}
+            {tab.type === "plan" ? (
+              <FileText className="w-3 h-3 shrink-0 text-[#7dcfff]" />
+            ) : sessionStates ? (
               <div
                 className={`w-2 h-2 rounded-full shrink-0 ${STATE_DOT_COLORS[state]} ${
                   state === "needs-input" ? "animate-pulse" : ""

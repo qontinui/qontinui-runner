@@ -91,6 +91,7 @@ pub mod setup_wizard; // First-launch setup wizard commands
 pub mod shell_commands; // Shell command management and execution
 pub mod state_explorer; // State explorer for AI-driven state machine exploration
 pub mod state_machine;
+pub mod state_machine_configs; // State machine config builder CRUD
 pub mod step_outputs; // Step output collection for test builder
 pub mod storage;
 pub mod task_sync; // renamed from ai_task_reporting

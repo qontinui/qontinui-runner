@@ -40,5 +40,7 @@ export default defineConfig({
       { find: "@qontinui/shared-types", replacement: path.resolve(__dirname, "../qontinui-schemas/ts/dist/index.js") },
       { find: "@qontinui/workflow-utils", replacement: path.resolve(__dirname, "../qontinui-workflow-utils/dist/index.js") },
     ],
+    // Prevent duplicate React/library instances from symlinked packages
+    dedupe: ["react", "react-dom", "@xyflow/react", "@xyflow/system"],
   },
 });

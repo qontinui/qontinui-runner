@@ -75,6 +75,7 @@ mod semantic_conventions;
 mod settings;
 mod skills;
 mod state_explorer;
+mod state_machine_configs;
 mod step_event_builder;
 mod step_executor;
 mod step_injection;
@@ -555,6 +556,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::known_issues::create_pattern_template,
             commands::known_issues::export_known_issues,
             commands::known_issues::import_known_issues,
+            // State Machine Config Builder commands (CRUD for configs, states, transitions)
+            commands::state_machine_configs::sm_list_configs,
+            commands::state_machine_configs::sm_get_config,
+            commands::state_machine_configs::sm_create_config,
+            commands::state_machine_configs::sm_update_config,
+            commands::state_machine_configs::sm_delete_config,
+            commands::state_machine_configs::sm_create_state,
+            commands::state_machine_configs::sm_update_state,
+            commands::state_machine_configs::sm_delete_state,
+            commands::state_machine_configs::sm_create_transition,
+            commands::state_machine_configs::sm_update_transition,
+            commands::state_machine_configs::sm_delete_transition,
+            commands::state_machine_configs::sm_import_config,
             // State Explorer commands
             commands::state_explorer::start_exploration,
             commands::state_explorer::get_exploration_strategies,

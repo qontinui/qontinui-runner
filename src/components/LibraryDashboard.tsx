@@ -378,23 +378,18 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
   const toggleFavorite = useCallback(async (itemId: string) => {
     // Optimistic toggle
     setItems((prev) =>
-      prev.map((item) =>
-        item.id === itemId ? { ...item, isFavorite: !item.isFavorite } : item,
-      ),
+      prev.map((item) => (item.id === itemId ? { ...item, isFavorite: !item.isFavorite } : item)),
     );
     try {
-      const response = await tracedFetch(
-        `${getApiBase()}/unified-workflows/${itemId}/favorite`,
-        { method: "POST" },
-      );
+      const response = await tracedFetch(`${getApiBase()}/unified-workflows/${itemId}/favorite`, {
+        method: "POST",
+      });
       const result = await response.json();
       if (result.success) {
         // Sync with server state in case of mismatch
         const newState = result.data.is_favorite;
         setItems((prev) =>
-          prev.map((item) =>
-            item.id === itemId ? { ...item, isFavorite: newState } : item,
-          ),
+          prev.map((item) => (item.id === itemId ? { ...item, isFavorite: newState } : item)),
         );
       } else {
         // Revert on failure
@@ -408,9 +403,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       console.error("Failed to toggle favorite:", error);
       // Revert optimistic update
       setItems((prev) =>
-        prev.map((item) =>
-          item.id === itemId ? { ...item, isFavorite: !item.isFavorite } : item,
-        ),
+        prev.map((item) => (item.id === itemId ? { ...item, isFavorite: !item.isFavorite } : item)),
       );
     }
   }, []);
@@ -651,7 +644,10 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
                     {/* Star toggle for workflows */}
                     {item.type === "unified-workflow" && (
                       <button
-                        onClick={(e) => { e.stopPropagation(); toggleFavorite(item.id); }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleFavorite(item.id);
+                        }}
                         className="flex-shrink-0 p-1 rounded transition-colors hover:bg-white/10 mt-0.5"
                         title={item.isFavorite ? "Remove from favorites" : "Add to favorites"}
                       >
