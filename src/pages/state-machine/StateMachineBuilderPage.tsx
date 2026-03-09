@@ -73,6 +73,16 @@ const TABS: { id: BuilderTab; label: string; icon: React.ReactNode }[] = [
 
 export function StateMachineBuilderPage() {
   const sm = useStateMachineConfig();
+  const {
+    updateState,
+    deleteState,
+    createState,
+    createTransition,
+    updateTransition,
+    deleteTransition,
+    importConfig,
+    loadConfig,
+  } = sm;
 
   const [activeTab, setActiveTab] = useState<BuilderTab>("graph");
   const [selectedStateId, setSelectedStateId] = useState<string | null>(null);
@@ -86,8 +96,11 @@ export function StateMachineBuilderPage() {
   const [isCreatingState, setIsCreatingState] = useState(false);
 
   // Derived data
-  const states = sm.activeConfig?.states ?? [];
-  const transitions = sm.activeConfig?.transitions ?? [];
+  const states = useMemo(() => sm.activeConfig?.states ?? [], [sm.activeConfig?.states]);
+  const transitions = useMemo(
+    () => sm.activeConfig?.transitions ?? [],
+    [sm.activeConfig?.transitions],
+  );
 
   const selectedState = useMemo(
     () => states.find((s) => s.state_id === selectedStateId) ?? null,
@@ -114,21 +127,21 @@ export function StateMachineBuilderPage() {
 
   const handleSaveState = useCallback(
     async (id: string, updates: StateMachineStateUpdate) => {
-      await sm.updateState(id, updates);
+      await updateState(id, updates);
     },
-    [sm],
+    [updateState],
   );
 
   const handleDeleteState = useCallback(
     async (id: string) => {
       // StateDetailPanel passes state.id (database UUID)
       const state = states.find((s) => s.id === id);
-      await sm.deleteState(id);
+      await deleteState(id);
       if (state && selectedStateId === state.state_id) {
         setSelectedStateId(null);
       }
     },
-    [sm, selectedStateId, states],
+    [deleteState, selectedStateId, states],
   );
 
   const handleCreateState = useCallback(async () => {
@@ -136,7 +149,7 @@ export function StateMachineBuilderPage() {
     if (!trimmed) return;
     setIsCreatingState(true);
     try {
-      const created = await sm.createState({
+      const created = await createState({
         name: trimmed,
         description: newStateDescription.trim() || undefined,
       });
@@ -148,7 +161,7 @@ export function StateMachineBuilderPage() {
     } finally {
       setIsCreatingState(false);
     }
-  }, [sm, newStateName, newStateDescription]);
+  }, [createState, newStateName, newStateDescription]);
 
   const handleOpenNewState = useCallback(() => {
     setShowNewState(true);
@@ -181,27 +194,27 @@ export function StateMachineBuilderPage() {
 
   const handleSaveTransition = useCallback(
     async (data: StateMachineTransitionCreate) => {
-      await sm.createTransition(data);
+      await createTransition(data);
       setShowNewTransition(false);
     },
-    [sm],
+    [createTransition],
   );
 
   const handleUpdateTransition = useCallback(
     async (id: string, data: Partial<StateMachineTransitionCreate>) => {
-      await sm.updateTransition(id, data);
+      await updateTransition(id, data);
     },
-    [sm],
+    [updateTransition],
   );
 
   const handleDeleteTransition = useCallback(
     async (id: string) => {
-      await sm.deleteTransition(id);
+      await deleteTransition(id);
       if (selectedTransitionId === id) {
         setSelectedTransitionId(null);
       }
     },
-    [sm, selectedTransitionId],
+    [deleteTransition, selectedTransitionId],
   );
 
   // ---------- Pathfinding ----------
@@ -248,11 +261,11 @@ export function StateMachineBuilderPage() {
         data.name ||
         filePath.toString().split(/[\\/]/).pop()?.replace(".json", "") ||
         "Imported Config";
-      await sm.importConfig(name, data);
+      await importConfig(name, data);
     } catch (err) {
       setImportError(err instanceof Error ? err.message : String(err));
     }
-  }, [sm]);
+  }, [importConfig]);
 
   // ---------- Render ----------
 
@@ -262,7 +275,7 @@ export function StateMachineBuilderPage() {
         <ConfigHeader
           configs={sm.configs}
           activeConfigId={null}
-          onSelectConfig={(id) => sm.loadConfig(id)}
+          onSelectConfig={(id) => loadConfig(id)}
           onCreateConfig={sm.createConfig}
           onDeleteConfig={sm.deleteConfig}
           isLoading={sm.isLoading}
@@ -286,7 +299,7 @@ export function StateMachineBuilderPage() {
         <ConfigHeader
           configs={sm.configs}
           activeConfigId={sm.activeConfig.id}
-          onSelectConfig={(id) => sm.loadConfig(id)}
+          onSelectConfig={(id) => loadConfig(id)}
           onCreateConfig={sm.createConfig}
           onDeleteConfig={sm.deleteConfig}
           isLoading={sm.isLoading}

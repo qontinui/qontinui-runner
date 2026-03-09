@@ -5,7 +5,7 @@
  * and view an activity log. Requires the Python executor to be running.
  */
 
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Play,
@@ -45,8 +45,6 @@ interface LogEntry {
 // Helpers
 // =============================================================================
 
-let logCounter = 0;
-
 const LOG_COLORS: Record<LogEntry["type"], string> = {
   transition: "text-blue-400",
   navigate: "text-cyan-400",
@@ -59,6 +57,7 @@ const LOG_COLORS: Record<LogEntry["type"], string> = {
 // =============================================================================
 
 export function LiveTestPanel({ states, transitions }: LiveTestPanelProps) {
+  const logCounterRef = useRef(0);
   const [selectedTransitionId, setSelectedTransitionId] = useState<string | null>(null);
   const [selectedStateId, setSelectedStateId] = useState<string | null>(null);
   const [executing, setExecuting] = useState(false);
@@ -68,8 +67,9 @@ export function LiveTestPanel({ states, transitions }: LiveTestPanelProps) {
   const [transitionFilter, setTransitionFilter] = useState("");
 
   const addLog = useCallback((type: LogEntry["type"], message: string) => {
+    logCounterRef.current += 1;
     const entry: LogEntry = {
-      id: ++logCounter,
+      id: logCounterRef.current,
       timestamp: new Date().toLocaleTimeString(),
       type,
       message,
@@ -169,7 +169,7 @@ export function LiveTestPanel({ states, transitions }: LiveTestPanelProps) {
 
   const handleClearLog = useCallback(() => {
     setLog([]);
-    logCounter = 0;
+    logCounterRef.current = 0;
   }, []);
 
   // ---------- Quick-execute a transition by clicking in the list ----------

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { readTextFile, watch } from "@tauri-apps/plugin-fs";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -33,8 +33,9 @@ export function PlanViewer({ filePath, visible }: PlanViewerProps) {
     }
   }, [filePath]);
 
+  const unwatchRef = useRef<(() => void) | null>(null);
+
   useEffect(() => {
-    let unwatchFn: (() => void) | null = null;
     let mounted = true;
 
     const loadFileGuarded = async () => {
@@ -66,13 +67,19 @@ export function PlanViewer({ filePath, visible }: PlanViewerProps) {
       { delayMs: 500 },
     )
       .then((fn) => {
-        unwatchFn = fn;
+        if (mounted) {
+          unwatchRef.current = fn;
+        } else {
+          // Component unmounted before watch resolved — clean up immediately
+          fn();
+        }
       })
       .catch(() => {});
 
     return () => {
       mounted = false;
-      unwatchFn?.();
+      unwatchRef.current?.();
+      unwatchRef.current = null;
     };
   }, [filePath]);
 

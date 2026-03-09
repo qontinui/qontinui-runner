@@ -2631,4 +2631,4 @@ CREATE TABLE IF NOT EXISTS state_machine_transitions (
 
 CREATE INDEX IF NOT EXISTS idx_sm_transitions_config_id ON state_machine_transitions(config_id);
 
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (92, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (93, datetime('now'));
