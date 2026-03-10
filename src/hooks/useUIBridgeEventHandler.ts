@@ -423,11 +423,22 @@ export function useUIBridgeEventHandler(): void {
           case "get_snapshot": {
             const snapshot: BridgeSnapshot = await currentBridge.createSnapshotAsync();
 
+            // Enrich with page context from NavigationTracker if available
+            const w = window as unknown as Record<string, unknown>;
+            const uiBridgeGlobal = w.__UI_BRIDGE__ as Record<string, unknown> | undefined;
+            const navTracker = uiBridgeGlobal?.navigationTracker as
+              | { getSnapshotPageContext: () => unknown }
+              | undefined;
+            const enrichedSnapshot = {
+              ...snapshot,
+              page: navTracker?.getSnapshotPageContext(),
+            };
+
             await sendResponse({
               requestId,
               type,
               success: true,
-              data: snapshot,
+              data: enrichedSnapshot,
               timestamp: Date.now(),
             });
             break;

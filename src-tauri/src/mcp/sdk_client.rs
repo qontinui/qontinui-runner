@@ -776,6 +776,14 @@ async fn handle_ai_assert(
     }
 }
 
+/// GET /ui-bridge/sdk/forms — Form state awareness
+async fn handle_forms(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/forms", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
 /// GET /ui-bridge/sdk/ai/snapshot — Semantic AI snapshot
 async fn handle_ai_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/ai/snapshot", None).await {
@@ -1448,6 +1456,198 @@ async fn handle_design_clear_style_guide(
 }
 
 // =============================================================================
+// Console Capture / Error Tracking Handlers
+// =============================================================================
+
+/// GET /ui-bridge/sdk/console/health — Check UI health status
+///
+/// Returns a health score (0-100), status (healthy/degraded/broken),
+/// error breakdown, and top issue.
+async fn handle_console_health(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/health", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/console/browser-events — Get browser events with filtering
+///
+/// Optional query parameters:
+/// - `severity`: crash, error, warning, noise
+/// - `deduplicate`: boolean
+/// - `since`: timestamp (number)
+/// - `limit`: max results (number)
+async fn handle_console_browser_events(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let mut path = "/control/browser-events".to_string();
+    let mut params = vec![];
+    if let Some(severity) = query.get("severity") {
+        params.push(format!("severity={}", severity));
+    }
+    if let Some(deduplicate) = query.get("deduplicate") {
+        params.push(format!("deduplicate={}", deduplicate));
+    }
+    if let Some(since) = query.get("since") {
+        params.push(format!("since={}", since));
+    }
+    if let Some(limit) = query.get("limit") {
+        params.push(format!("limit={}", limit));
+    }
+    if !params.is_empty() {
+        path = format!("{}?{}", path, params.join("&"));
+    }
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/console/timeline — Get interleaved action/error timeline
+///
+/// Optional query parameters:
+/// - `since`: timestamp (number)
+/// - `limit`: max results (number)
+/// - `minSeverity`: minimum severity level (string)
+async fn handle_console_timeline(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let mut path = "/control/timeline".to_string();
+    let mut params = vec![];
+    if let Some(since) = query.get("since") {
+        params.push(format!("since={}", since));
+    }
+    if let Some(limit) = query.get("limit") {
+        params.push(format!("limit={}", limit));
+    }
+    if let Some(min_severity) = query.get("minSeverity") {
+        params.push(format!("minSeverity={}", min_severity));
+    }
+    if !params.is_empty() {
+        path = format!("{}?{}", path, params.join("&"));
+    }
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/console/network-chains — Get network request-response chains
+///
+/// Optional query parameters:
+/// - `failuresOnly`: boolean
+/// - `limit`: max results (number)
+/// - `url`: filter by URL pattern (string)
+async fn handle_console_network_chains(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let mut path = "/control/network-chains".to_string();
+    let mut params = vec![];
+    if let Some(failures_only) = query.get("failuresOnly") {
+        params.push(format!("failuresOnly={}", failures_only));
+    }
+    if let Some(limit) = query.get("limit") {
+        params.push(format!("limit={}", limit));
+    }
+    if let Some(url) = query.get("url") {
+        params.push(format!("url={}", url));
+    }
+    if !params.is_empty() {
+        path = format!("{}?{}", path, params.join("&"));
+    }
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/console/error-sessions/start — Start error tracking session
+///
+/// Optional body: `{ "label": "..." }`
+async fn handle_console_error_session_start(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/error-sessions/start",
+        body.map(|b| b.0),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/console/error-sessions/end — End error tracking session
+///
+/// Returns a summary of captured errors during the session.
+async fn handle_console_error_session_end(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/error-sessions/end", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/console/error-sessions — List all error session summaries
+async fn handle_console_error_sessions_list(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/error-sessions", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/console/error-baselines/capture — Capture error baseline
+///
+/// Required body: `{ "label": "..." }`
+async fn handle_console_error_baseline_capture(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/error-baselines/capture",
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/console/error-baselines/compare — Compare against baseline
+///
+/// Required body: `{ "label": "..." }`
+/// Returns new errors (regressions) and fixed errors.
+async fn handle_console_error_baseline_compare(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/error-baselines/compare",
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
 // Router
 // =============================================================================
 
@@ -1488,6 +1688,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/ai/execute", post(handle_ai_execute))
         .route("/ui-bridge/sdk/ai/assert", post(handle_ai_assert))
         .route("/ui-bridge/sdk/ai/snapshot", get(handle_ai_snapshot))
+        // Form state awareness
+        .route("/ui-bridge/sdk/forms", get(handle_forms))
         .route("/ui-bridge/sdk/ai/summary", get(handle_ai_summary))
         // AI analysis endpoints
         .route(
@@ -1557,6 +1759,40 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/sdk/design/style-guide",
             get(handle_design_get_style_guide).delete(handle_design_clear_style_guide),
+        )
+        // Console capture / error tracking
+        .route("/ui-bridge/sdk/console/health", get(handle_console_health))
+        .route(
+            "/ui-bridge/sdk/console/browser-events",
+            get(handle_console_browser_events),
+        )
+        .route(
+            "/ui-bridge/sdk/console/timeline",
+            get(handle_console_timeline),
+        )
+        .route(
+            "/ui-bridge/sdk/console/network-chains",
+            get(handle_console_network_chains),
+        )
+        .route(
+            "/ui-bridge/sdk/console/error-sessions/start",
+            post(handle_console_error_session_start),
+        )
+        .route(
+            "/ui-bridge/sdk/console/error-sessions/end",
+            post(handle_console_error_session_end),
+        )
+        .route(
+            "/ui-bridge/sdk/console/error-sessions",
+            get(handle_console_error_sessions_list),
+        )
+        .route(
+            "/ui-bridge/sdk/console/error-baselines/capture",
+            post(handle_console_error_baseline_capture),
+        )
+        .route(
+            "/ui-bridge/sdk/console/error-baselines/compare",
+            post(handle_console_error_baseline_compare),
         )
 }
 

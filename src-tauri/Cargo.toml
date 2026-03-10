@@ -13,7 +13,7 @@ default-run = "qontinui-runner"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "qontinui_runner_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.5", features = [] }
@@ -104,4 +104,5 @@ path = "src/bin/mock_claude_cli.rs"
 tempfile = "3"
 
 [profile.dev]
-debug = 1  # Line tables only — reduces LLVM memory during linking
+debug = 0  # No debug info — prevents LLVM OOM during linking
+split-debuginfo = "packed"

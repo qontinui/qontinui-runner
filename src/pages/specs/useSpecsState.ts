@@ -4,6 +4,7 @@
 
 import { useState, useCallback, useMemo, useEffect } from "react";
 import { getAllSpecs } from "@/lib/spec-registry";
+import { getKnownPages, type KnownPage } from "@/lib/page-catalog";
 import { useSpecFileLoader } from "./useSpecFileLoader";
 import type { LoadedSpec, SpecSelection, SpecTreeNode, ConnectionState } from "./types";
 import type { SpecConfig, SpecGroup, SpecAssertion, SetupAction } from "ui-bridge";
@@ -104,7 +105,7 @@ function buildNodeFromSpec(spec: LoadedSpec): SpecTreeNode {
   };
 }
 
-function buildTreeFromSpecs(specs: LoadedSpec[]): SpecTreeNode[] {
+function buildTreeFromSpecs(specs: LoadedSpec[], unspeccedPages: KnownPage[]): SpecTreeNode[] {
   // Group specs by app name
   const byApp = new Map<string, LoadedSpec[]>();
   for (const spec of specs) {
@@ -113,21 +114,47 @@ function buildTreeFromSpecs(specs: LoadedSpec[]): SpecTreeNode[] {
     byApp.get(appName)!.push(spec);
   }
 
+  // Group unspecced pages by app name
+  const unspeccedByApp = new Map<string, KnownPage[]>();
+  for (const page of unspeccedPages) {
+    if (!unspeccedByApp.has(page.appName)) unspeccedByApp.set(page.appName, []);
+    unspeccedByApp.get(page.appName)!.push(page);
+  }
+
+  // Merge app names from both sources
+  const allAppNames = new Set([...byApp.keys(), ...unspeccedByApp.keys()]);
   const roots: SpecTreeNode[] = [];
 
-  for (const [appName, appSpecs] of byApp) {
+  for (const appName of allAppNames) {
+    const appSpecs = byApp.get(appName) || [];
+    const appUnspecced = unspeccedByApp.get(appName) || [];
+
     const specChildren: SpecTreeNode[] = appSpecs.map(buildNodeFromSpec);
 
-    // If only one app, don't nest under app name
-    if (byApp.size === 1) {
-      roots.push(...specChildren);
+    // Add unspecced page nodes (sorted alphabetically, at the end)
+    const unspeccedNodes: SpecTreeNode[] = appUnspecced
+      .sort((a, b) => a.label.localeCompare(b.label))
+      .map((page) => ({
+        id: `unspecced:${page.expectedSpecId}`,
+        label: page.label,
+        type: "page-spec" as const,
+        appName: page.appName,
+        unspecced: true,
+        description: page.description,
+        specId: page.expectedSpecId,
+      }));
+
+    const allChildren = [...specChildren, ...unspeccedNodes];
+
+    if (allAppNames.size === 1) {
+      roots.push(...allChildren);
     } else {
       roots.push({
         id: `app:${appName}`,
         label: appName,
         type: "page-spec",
-        childCount: appSpecs.length,
-        children: specChildren,
+        childCount: allChildren.length,
+        children: allChildren,
       });
     }
   }
@@ -185,8 +212,14 @@ export function useSpecsState() {
     setSpecs(loaded);
   }, []);
 
-  // Build tree from current specs
-  const tree = useMemo(() => buildTreeFromSpecs(specs), [specs]);
+  // Compute unspecced pages — pages in the app that don't have specs
+  const unspeccedPages = useMemo(() => {
+    const specIds = new Set(specs.map((s) => s.specId));
+    return getKnownPages().filter((page) => !specIds.has(page.expectedSpecId));
+  }, [specs]);
+
+  // Build tree from current specs + unspecced pages
+  const tree = useMemo(() => buildTreeFromSpecs(specs, unspeccedPages), [specs, unspeccedPages]);
 
   // Toggle tree node expansion
   const toggleNode = useCallback((nodeId: string) => {
@@ -200,7 +233,14 @@ export function useSpecsState() {
 
   // Select a tree node
   const selectNode = useCallback((node: SpecTreeNode) => {
-    if (node.type === "group" && node.specId && node.groupId) {
+    if (node.unspecced && node.specId) {
+      setSelection({
+        type: "unspecced-page",
+        expectedSpecId: node.specId,
+        label: node.label,
+        description: node.description || "",
+      });
+    } else if (node.type === "group" && node.specId && node.groupId) {
       setSelection({ type: "group", specId: node.specId, groupId: node.groupId });
     } else if (node.specId) {
       setSelection({ type: "spec", specId: node.specId });
@@ -209,7 +249,7 @@ export function useSpecsState() {
 
   // Get the currently selected spec
   const selectedSpec = useMemo(() => {
-    if (selection.type === "none") return null;
+    if (selection.type === "none" || selection.type === "unspecced-page") return null;
     return specs.find((s) => s.specId === selection.specId) || null;
   }, [specs, selection]);
 

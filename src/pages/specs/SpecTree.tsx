@@ -82,6 +82,7 @@ function TreeNode({
   const hasChildren = node.children && node.children.length > 0;
   const Icon = getTypeIcon(node.type);
   const isGroup = node.type === "group";
+  const isUnspecced = node.unspecced === true;
 
   return (
     <div>
@@ -92,7 +93,7 @@ function TreeNode({
         }}
         className={`w-full flex items-center gap-1.5 px-2 py-1 text-left text-xs rounded
           hover:bg-white/5 transition-colors
-          ${selected ? "bg-white/10 text-white" : "text-muted-foreground"}`}
+          ${selected ? "bg-white/10 text-white" : isUnspecced ? "text-muted-foreground/40 italic" : "text-muted-foreground"}`}
         style={{ paddingLeft: `${depth * 12 + 8}px` }}
       >
         {hasChildren ? (
@@ -105,11 +106,19 @@ function TreeNode({
           <span className="w-3 shrink-0" />
         )}
 
-        {!isGroup && <Icon className="w-3 h-3 shrink-0 opacity-60" />}
+        {!isGroup && (
+          <Icon className={`w-3 h-3 shrink-0 ${isUnspecced ? "opacity-30" : "opacity-60"}`} />
+        )}
 
         <span className="truncate flex-1">{node.label}</span>
 
-        {node.childCount !== undefined && node.childCount > 0 && (
+        {isUnspecced && (
+          <span className="text-[9px] px-1 py-0.5 rounded bg-amber-500/10 text-amber-500/60 border border-amber-500/20 shrink-0 not-italic">
+            no spec
+          </span>
+        )}
+
+        {!isUnspecced && node.childCount !== undefined && node.childCount > 0 && (
           <span className="text-[10px] opacity-40 tabular-nums shrink-0">{node.childCount}</span>
         )}
       </button>

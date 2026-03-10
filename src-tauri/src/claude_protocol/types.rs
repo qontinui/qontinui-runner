@@ -415,4 +415,23 @@ impl ClaudeOutputMessage {
             _ => None,
         }
     }
+
+    /// Extract the first tool_use content block from an assistant message.
+    /// Returns (tool_name, input_object) if found.
+    /// Used to emit tool_activity events in bypassPermissions mode where
+    /// can_use_tool control requests are never sent.
+    pub fn extract_tool_use(&self) -> Option<(&str, serde_json::Map<String, serde_json::Value>)> {
+        match self {
+            ClaudeOutputMessage::Assistant(msg) => {
+                for block in &msg.message.content {
+                    if let ContentBlock::ToolUse { name, input, .. } = block {
+                        let data = input.as_object().cloned().unwrap_or_default();
+                        return Some((name.as_str(), data));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
 }

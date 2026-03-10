@@ -164,9 +164,27 @@ struct PendingCommand {
     args: Vec<serde_json::Value>,
 }
 
+/// A network event captured at the proxy layer (not visible to the inject script).
+#[derive(Debug, Clone, Serialize)]
+struct ProxyNetworkEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    timestamp: u64,
+    method: String,
+    url: String,
+    status: u16,
+    #[serde(rename = "durationMs")]
+    duration_ms: u64,
+    source: String,
+}
+
+const MAX_PROXY_NETWORK_EVENTS: usize = 200;
+
 struct ProxyControlState {
     pending: Vec<PendingCommand>,
     waiters: HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
+    /// Network errors captured at the proxy layer (4xx/5xx responses).
+    network_events: Vec<ProxyNetworkEvent>,
 }
 
 impl ProxyControlState {
@@ -174,6 +192,15 @@ impl ProxyControlState {
         Self {
             pending: Vec::new(),
             waiters: HashMap::new(),
+            network_events: Vec::new(),
+        }
+    }
+
+    fn record_network_event(&mut self, event: ProxyNetworkEvent) {
+        self.network_events.push(event);
+        if self.network_events.len() > MAX_PROXY_NETWORK_EVENTS {
+            let excess = self.network_events.len() - MAX_PROXY_NETWORK_EVENTS;
+            self.network_events.drain(..excess);
         }
     }
 }
@@ -781,6 +808,26 @@ async fn start_proxy(
         async move { enqueue_and_wait(&cs, "clearConsoleErrors", vec![]).await }
     };
 
+    // Browser events: returns proxy-captured network events (4xx/5xx responses).
+    // Console errors from the inject script are available via /console-errors.
+    let cs = control_state.clone();
+    let browser_events_handler = move || {
+        let cs = cs.clone();
+        async move {
+            let state = cs.lock().await;
+            let events = state.network_events.clone();
+            drop(state);
+            Json(serde_json::json!({
+                "success": true,
+                "data": {
+                    "events": events,
+                    "count": events.len(),
+                    "source": "proxy",
+                }
+            }))
+        }
+    };
+
     let cs = control_state.clone();
     let navigate_handler = move |Json(body): Json<NavigateRequest>| {
         let cs = cs.clone();
@@ -911,6 +958,10 @@ async fn start_proxy(
             "/__ui-bridge/control/console-errors/clear",
             post(clear_console_errors_handler),
         )
+        .route(
+            "/__ui-bridge/control/browser-events",
+            get(browser_events_handler),
+        )
         .route("/__ui-bridge/control/page/navigate", post(navigate_handler))
         .route("/__ui-bridge/control/page/refresh", post(refresh_handler))
         .route("/__ui-bridge/control/page/back", post(back_handler))
@@ -936,23 +987,27 @@ async fn start_proxy(
             "/__ui-bridge/control/design-snapshot",
             get(design_snapshot_handler),
         )
-        .fallback(move |req: axum::http::Request<Body>| {
-            let client = client.clone();
-            let target = target.clone();
-            let ws_target = ws_target.clone();
-            async move {
-                // Check for WebSocket upgrade requests (e.g., HMR)
-                let is_ws_upgrade = req
-                    .headers()
-                    .get("upgrade")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| v.eq_ignore_ascii_case("websocket"))
-                    .unwrap_or(false);
+        .fallback({
+            let fallback_cs = control_state.clone();
+            move |req: axum::http::Request<Body>| {
+                let client = client.clone();
+                let target = target.clone();
+                let ws_target = ws_target.clone();
+                let cs = fallback_cs.clone();
+                async move {
+                    // Check for WebSocket upgrade requests (e.g., HMR)
+                    let is_ws_upgrade = req
+                        .headers()
+                        .get("upgrade")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v.eq_ignore_ascii_case("websocket"))
+                        .unwrap_or(false);
 
-                if is_ws_upgrade {
-                    proxy_websocket(ws_target, req).await
-                } else {
-                    proxy_request(client, target, req).await
+                    if is_ws_upgrade {
+                        proxy_websocket(ws_target, req).await
+                    } else {
+                        proxy_request(client, target, req, Some(cs)).await
+                    }
                 }
             }
         });
@@ -1077,6 +1132,7 @@ async fn proxy_request(
     client: Client,
     target_base: String,
     req: axum::http::Request<Body>,
+    control_state: Option<Arc<Mutex<ProxyControlState>>>,
 ) -> Response<Body> {
     let uri = req.uri().clone();
     let method = req.method().clone();
@@ -1084,6 +1140,7 @@ async fn proxy_request(
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
     let target_url = format!("{}{}", target_base.trim_end_matches('/'), path_and_query);
+    let request_start = std::time::Instant::now();
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
         Ok(bytes) => bytes,
@@ -1095,7 +1152,7 @@ async fn proxy_request(
         }
     };
 
-    let mut proxy_req = client.request(method, &target_url);
+    let mut proxy_req = client.request(method.clone(), &target_url);
     for (key, value) in headers.iter() {
         let key_str = key.as_str();
         if key_str == "host"
@@ -1195,6 +1252,27 @@ async fn proxy_request(
     } else {
         Body::from(resp_bytes)
     };
+
+    // Record proxy-level network events for 4xx/5xx responses
+    let status_code = status.as_u16();
+    if status_code >= 400 {
+        if let Some(cs) = &control_state {
+            let event = ProxyNetworkEvent {
+                event_type: "network".to_string(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                method: method.to_string(),
+                url: target_url.clone(),
+                status: status_code,
+                duration_ms: request_start.elapsed().as_millis() as u64,
+                source: "proxy".to_string(),
+            };
+            let mut state = cs.lock().await;
+            state.record_network_event(event);
+        }
+    }
 
     let injected_html = is_html && is_utf8_compatible;
     let mut response = Response::builder().status(status);

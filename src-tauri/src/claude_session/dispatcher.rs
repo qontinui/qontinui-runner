@@ -89,6 +89,16 @@ pub fn dispatch_line(
         }
     };
 
+    // Emit tool activity from assistant messages with tool_use blocks.
+    // This is the primary path for tool activity in bypassPermissions mode,
+    // where can_use_tool control requests are never sent by the CLI.
+    if let Some((tool_name, data)) = msg.extract_tool_use() {
+        let activity = format_tool_activity(tool_name, &data);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            emit_ai_output(app_handle, &activity, "tool_activity", None, session_ctx);
+        }));
+    }
+
     // Handle control requests from CLI (auto-approve tool use in bypass mode)
     if let Some(ctrl_req) = msg.as_control_request() {
         // Emit tool activity event so the frontend can show what the AI is doing
@@ -243,6 +253,14 @@ fn handle_control_request(
             subtype
         );
     }
+}
+
+/// Public wrapper for format_tool_activity (used by runner.rs for bypass-mode tool activity).
+pub fn format_tool_activity_pub(
+    tool_name: &str,
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    format_tool_activity(tool_name, data)
 }
 
 /// Format a human-readable description of a tool activity.

@@ -21,7 +21,15 @@
  * Other: Configure, Schedule, System
  */
 
-import { useEffect, useState, useCallback, createContext, useContext, useRef } from "react";
+import {
+  useEffect,
+  useState,
+  useCallback,
+  createContext,
+  useContext,
+  useRef,
+  useMemo,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -50,7 +58,7 @@ import { TutorialProvider } from "./contexts/TutorialContext";
 import { ContextualTutorial } from "./components/tutorial";
 
 // UI Bridge for AI-driven UI automation
-import { UIBridgeProvider, AutoRegisterProvider } from "ui-bridge";
+import { UIBridgeProvider, AutoRegisterProvider, usePageContext } from "ui-bridge";
 
 // Navigation context for tutorials to navigate to pages
 interface NavigationContextValue {
@@ -392,6 +400,139 @@ function migrateTabId(stored: string | null): MainTabId {
   }
 
   return "gui-automation";
+}
+
+/**
+ * Provides semantic page context based on activeTab for UI Bridge snapshots.
+ * Renders nothing — just calls usePageContext to annotate the current page.
+ */
+function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
+  const context = useMemo(() => {
+    // Settings sub-tabs all map to the same page
+    if (activeTab.startsWith("settings")) {
+      return { name: "Settings", section: "configure", breadcrumb: ["Configure", "Settings"] };
+    }
+
+    const map: Record<string, { name: string; section: string; breadcrumb: string[] }> = {
+      // RUN
+      "gui-automation": { name: "Execute", section: "run", breadcrumb: ["Run", "Execute"] },
+      active: { name: "Active Dashboard", section: "run", breadcrumb: ["Run", "Active Dashboard"] },
+      history: { name: "History", section: "run", breadcrumb: ["Run", "History"] },
+      runs: { name: "History", section: "run", breadcrumb: ["Run", "History"] },
+      "workflow-queue": {
+        name: "Workflow Queue",
+        section: "run",
+        breadcrumb: ["Run", "Workflow Queue"],
+      },
+
+      // OBSERVE (run-specific)
+      "run-recap": { name: "Run Recap", section: "observe", breadcrumb: ["Observe", "Run Recap"] },
+      "run-actions": {
+        name: "Run Actions",
+        section: "observe",
+        breadcrumb: ["Observe", "Run Actions"],
+      },
+      "run-image": {
+        name: "Image Recognition",
+        section: "observe",
+        breadcrumb: ["Observe", "Image Recognition"],
+      },
+      "run-findings": { name: "Findings", section: "observe", breadcrumb: ["Observe", "Findings"] },
+      "run-state-explorer": {
+        name: "State Explorer",
+        section: "observe",
+        breadcrumb: ["Observe", "State Explorer"],
+      },
+      "run-tests": {
+        name: "Test Results",
+        section: "observe",
+        breadcrumb: ["Observe", "Test Results"],
+      },
+      "run-ai-output": {
+        name: "AI Output",
+        section: "observe",
+        breadcrumb: ["Observe", "AI Output"],
+      },
+      "run-ai-data": {
+        name: "AI Data Viewer",
+        section: "observe",
+        breadcrumb: ["Observe", "AI Data Viewer"],
+      },
+      "run-statistics": {
+        name: "Statistics",
+        section: "observe",
+        breadcrumb: ["Observe", "Statistics"],
+      },
+      "run-traces": { name: "Traces", section: "observe", breadcrumb: ["Observe", "Traces"] },
+
+      // BUILD
+      "unified-workflow-builder": {
+        name: "Workflow Builder",
+        section: "build",
+        breadcrumb: ["Build", "Workflow Builder"],
+      },
+      library: { name: "Library", section: "build", breadcrumb: ["Build", "Library"] },
+      "step-builders": { name: "Library", section: "build", breadcrumb: ["Build", "Library"] },
+      capture: { name: "Capture", section: "build", breadcrumb: ["Build", "Capture"] },
+
+      // CONFIGURE
+      triggers: { name: "Triggers", section: "configure", breadcrumb: ["Configure", "Triggers"] },
+      tasks: { name: "Scheduler", section: "configure", breadcrumb: ["Configure", "Scheduler"] },
+      "config-log-sources": {
+        name: "Log Sources",
+        section: "configure",
+        breadcrumb: ["Configure", "Log Sources"],
+      },
+      "config-findings": {
+        name: "Findings Config",
+        section: "configure",
+        breadcrumb: ["Configure", "Findings"],
+      },
+      "config-hooks": { name: "Hooks", section: "configure", breadcrumb: ["Configure", "Hooks"] },
+      "config-ui-bridge": {
+        name: "UI Bridge",
+        section: "tools",
+        breadcrumb: ["Tools", "UI Bridge"],
+      },
+
+      // TOOLS
+      terminal: { name: "Terminal", section: "tools", breadcrumb: ["Tools", "Terminal"] },
+      specs: { name: "Specs", section: "tools", breadcrumb: ["Tools", "Specs"] },
+      "state-machine": {
+        name: "State Machine Builder",
+        section: "tools",
+        breadcrumb: ["Tools", "State Machine Builder"],
+      },
+      "generator-eval": {
+        name: "Generator Eval",
+        section: "tools",
+        breadcrumb: ["Tools", "Generator Eval"],
+      },
+
+      // OTHER
+      "error-monitor": {
+        name: "Error Monitor",
+        section: "system",
+        breadcrumb: ["System", "Error Monitor"],
+      },
+      processes: {
+        name: "Process Manager",
+        section: "system",
+        breadcrumb: ["System", "Process Manager"],
+      },
+      reflection: { name: "Reflection", section: "system", breadcrumb: ["System", "Reflection"] },
+      logs: { name: "Logs", section: "system", breadcrumb: ["System", "Logs"] },
+      help: { name: "Help", section: "system", breadcrumb: ["Help"] },
+
+      // Legacy observe tabs
+      ai: { name: "AI Output", section: "observe", breadcrumb: ["Observe", "AI Output"] },
+    };
+
+    return map[activeTab] ?? { name: activeTab, section: "other", breadcrumb: [activeTab] };
+  }, [activeTab]);
+
+  usePageContext(context);
+  return null;
 }
 
 /**
@@ -1571,6 +1712,7 @@ function AppContent() {
       enableMutationObserver={true}
       mutationDebounceMs={500}
     >
+      <RunnerPageContext activeTab={activeTab} />
       <div className="h-screen w-screen bg-background grid-dots flex flex-col overflow-hidden min-w-[1200px] min-h-[700px]">
         {/* Status Bar - Sticky Top */}
         <StatusIndicator

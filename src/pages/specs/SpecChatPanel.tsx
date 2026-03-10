@@ -21,6 +21,7 @@ import {
   Hammer,
   FilePlus,
   Download,
+  RefreshCw,
 } from "lucide-react";
 import { useAiSession } from "@/hooks/useAiSession";
 import { MarkdownViewer } from "@/components/MarkdownViewer";
@@ -28,6 +29,7 @@ import {
   SPEC_CREATION_INSTRUCTIONS,
   buildDetailedSpecContext,
   buildSpecReviewPrompt,
+  buildSpecCreationWithMergeContext,
 } from "@/lib/spec-prompt-builder";
 import type { LoadedSpec, SpecKind } from "./types";
 
@@ -257,13 +259,28 @@ interface SpecChatPanelProps {
   selectedSpec: LoadedSpec | null;
   onAddSpec?: (spec: LoadedSpec) => void;
   onBuildWorkflow?: (spec: LoadedSpec) => void;
+  /** Triggered when user clicks "Generate Spec" from unspecced page detail panel */
+  generateSpecRequest?: {
+    expectedSpecId: string;
+    label: string;
+    description: string;
+  } | null;
+  onGenerateSpecHandled?: () => void;
 }
 
-export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: SpecChatPanelProps) {
+export function SpecChatPanel({
+  selectedSpec,
+  onAddSpec,
+  onBuildWorkflow,
+  generateSpecRequest,
+  onGenerateSpecHandled,
+}: SpecChatPanelProps) {
   const session = useAiSession();
   const [input, setInput] = useState("");
   const [showCreateActions, setShowCreateActions] = useState(false);
   const [pendingCreateType, setPendingCreateType] = useState<CreateSpecType | null>(null);
+  // Track the target spec ID for generated specs (so Apply uses the right ID)
+  const [targetSpecId, setTargetSpecId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -280,6 +297,36 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
   useEffect(() => {
     resizeTextarea();
   }, [input, resizeTextarea]);
+
+  // Handle generate spec request from detail panel (unspecced page "Generate Spec" button)
+  // Directly creates session and sends the creation message (bypasses handleSend to avoid React timing issues)
+  useEffect(() => {
+    if (!generateSpecRequest) return;
+    const { label, description, expectedSpecId } = generateSpecRequest;
+    onGenerateSpecHandled?.();
+
+    // Reset session and enter create mode
+    if (session.taskRunId) {
+      session.close();
+      session.resetSession();
+    }
+    setTargetSpecId(expectedSpecId);
+    setShowCreateActions(true);
+    setPendingCreateType(null); // Will be consumed immediately
+    setInput(""); // Clear — message will be sent directly
+
+    const pageInfo = `Page: ${label}\nDescription: ${description}\nSpec ID: ${expectedSpecId}`;
+    const message = `${SPEC_CREATION_INSTRUCTIONS}\n\n---\n\nCreate a comprehensive page spec for the following page. Read the source code first, then generate a complete JSON spec.\n\n${pageInfo}`;
+
+    // Create session and send in one go
+    (async () => {
+      const specLabel = label.length > 60 ? label.slice(0, 57) + "..." : label;
+      const id = await session.createSession(`Spec Chat: ${specLabel}`);
+      if (!id) return;
+      await session.sendMessage(message);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generateSpecRequest]);
 
   // Auto-scroll on new messages
   useEffect(() => {
@@ -307,8 +354,22 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
 
       // First message: include context
       if (pendingCreateType === "page-spec") {
-        // Prepend creation instructions for page specs
-        const message = `${SPEC_CREATION_INSTRUCTIONS}\n\n---\n\nCreate a comprehensive page spec for the following page. Read the source code first, then generate a complete JSON spec.\n\n${text}`;
+        let message: string;
+        if (selectedSpec && selectedSpec.kind === "page-spec") {
+          // Merge mode: existing spec selected, use merge-aware creation
+          message = buildSpecCreationWithMergeContext(
+            {
+              specId: selectedSpec.specId,
+              config: selectedSpec.config,
+              appName: selectedSpec.appName,
+            },
+            text,
+          );
+          setTargetSpecId(selectedSpec.specId);
+        } else {
+          // Fresh creation: no existing spec
+          message = `${SPEC_CREATION_INSTRUCTIONS}\n\n---\n\nCreate a comprehensive page spec for the following page. Read the source code first, then generate a complete JSON spec.\n\n${text}`;
+        }
         setPendingCreateType(null);
         await session.sendMessage(message);
       } else if (selectedSpec) {
@@ -395,6 +456,7 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
                 session.resetSession();
                 setShowCreateActions(false);
                 setPendingCreateType(null);
+                setTargetSpecId(null);
               }}
               className="text-[10px] text-muted-foreground/50 hover:text-muted-foreground transition-colors"
             >
@@ -450,6 +512,27 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
                   </button>
                 ))}
 
+                {/* Regenerate & merge for page specs */}
+                {selectedSpec.kind === "page-spec" && (
+                  <button
+                    onClick={() => {
+                      setPendingCreateType("page-spec");
+                      setTargetSpecId(selectedSpec.specId);
+                      setShowCreateActions(true);
+                      setInput(
+                        `Page: ${selectedSpec.config.description || selectedSpec.specId}\nSpec ID: ${selectedSpec.specId}`,
+                      );
+                      textareaRef.current?.focus();
+                    }}
+                    className="w-full flex items-center gap-1.5 px-2 py-1.5 text-[10px] text-green-400/70 rounded
+                      bg-green-500/5 border border-green-500/10 hover:bg-green-500/10 hover:text-green-400
+                      transition-colors"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    Regenerate & merge spec
+                  </button>
+                )}
+
                 {/* Build workflow button for page specs */}
                 {selectedSpec.kind === "page-spec" && (
                   <button
@@ -473,7 +556,11 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
                     key={action.label}
                     onClick={() => {
                       setPendingCreateType(action.specType);
-                      setInput("");
+                      // Only clear input when switching spec types, not when re-clicking the active type
+                      // (preserves pre-filled text from "Generate Spec" button)
+                      if (pendingCreateType !== action.specType) {
+                        setInput("");
+                      }
                       textareaRef.current?.focus();
                     }}
                     className={`w-full flex items-center gap-1.5 text-left px-2 py-1.5 text-[10px] rounded
@@ -500,10 +587,20 @@ export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: Spec
                   kind: extracted.kind,
                   label: extracted.label,
                   onApply: () => {
-                    const specId = `ai-${extracted.kind}-${Date.now()}`;
+                    // Use targetSpecId if set (from merge or unspecced generation), otherwise generate new
+                    const specId =
+                      targetSpecId && extracted.kind === "page-spec"
+                        ? targetSpecId
+                        : `ai-${extracted.kind}-${Date.now()}`;
+                    const appName =
+                      targetSpecId && extracted.kind === "page-spec"
+                        ? targetSpecId.startsWith("runner:")
+                          ? "Qontinui Runner"
+                          : "Qontinui Web"
+                        : "AI Generated";
                     onAddSpec({
                       specId,
-                      appName: "AI Generated",
+                      appName,
                       kind: extracted.kind,
                       config: extracted.config as never,
                       source: "file",

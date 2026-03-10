@@ -115,7 +115,6 @@ export function TranscriptSessionSidebar({
                   )}
 
                   <div
-                    data-ui-bridge-id={`session-${session.session_id}`}
                     className={`
                       group relative border-l-2 transition-colors
                       ${

@@ -22,8 +22,7 @@
   let nextAutoId = 1;
 
   function generateId(el) {
-    // Priority: data-ui-bridge-id > id > aria-label > name > text content > auto
-    if (el.dataset.uiBridgeId) return el.dataset.uiBridgeId;
+    // Priority: id > aria-label > name > text content > auto
     if (el.id) return `id:${el.id}`;
     const ariaLabel = el.getAttribute("aria-label");
     if (ariaLabel) return `aria:${slugify(ariaLabel)}`;

@@ -47,6 +47,7 @@ export function useAiSession() {
   const sessionStateRef = useRef<AiSessionState>("disconnected");
   const restoredRef = useRef(false);
   const restorePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastToolActivityRef = useRef(0);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -179,7 +180,19 @@ export function useAiSession() {
 
       // Track tool activity (e.g., "Reading file...", "Running command...")
       if (source === "tool_activity") {
+        lastToolActivityRef.current = Date.now();
         setToolActivity(line);
+        return;
+      }
+
+      // Status heartbeats (e.g., "⏳ AI is working... (30s)") — show as single updating line.
+      // Only overwrite if no tool_activity arrived in the last 5 seconds (preserves useful info
+      // like "Reading StateMachine.tsx" over the generic "AI is working" timer).
+      if (source === "status") {
+        const sinceLastTool = Date.now() - lastToolActivityRef.current;
+        if (sinceLastTool > 5000) {
+          setToolActivity(line);
+        }
         return;
       }
 

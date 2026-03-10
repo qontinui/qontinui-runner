@@ -24,7 +24,7 @@ import { ZoneTimeline } from "./ZoneTimeline";
 import { ZoneControlPanel } from "./ZoneControlPanel";
 import { useSessionPersistence } from "./useSessionPersistence";
 import { WorkflowPreviewPanel } from "@qontinui/workflow-ui";
-import { save, open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import { save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
 
 // ── Extracted hooks ────────────────────────────────────────────────────────────
@@ -665,24 +665,23 @@ export function TerminalPage({
     [zoneLayout.isMultiZone, zoneLayout.toggleMaximize],
   );
 
-  // Open a markdown plan file in a new zone
-  const handleOpenPlanFile = useCallback(async () => {
-    const selected = (await openFileDialog({
-      multiple: false,
-      filters: [{ name: "Markdown", extensions: ["md", "txt", "markdown"] }],
-    })) as string | null;
-    if (!selected) return;
-    const filePath = selected;
-    const tabId = createPlanTab(filePath);
-    if (tabId) {
-      // Auto-assign to first empty zone
-      const emptyZone = zoneLayout.layout.zones.findIndex((_, idx) => !zoneLayout.assignments[idx]);
-      if (emptyZone >= 0) {
-        zoneLayout.assignTabToZone(emptyZone, tabId);
-        zoneLayout.setFocusedZone(emptyZone);
+  // Open a document file in a new zone
+  const handleOpenDocFile = useCallback(
+    (filePath: string) => {
+      const tabId = createPlanTab(filePath);
+      if (tabId) {
+        // Auto-assign to first empty zone
+        const emptyZone = zoneLayout.layout.zones.findIndex(
+          (_, idx) => !zoneLayout.assignments[idx],
+        );
+        if (emptyZone >= 0) {
+          zoneLayout.assignTabToZone(emptyZone, tabId);
+          zoneLayout.setFocusedZone(emptyZone);
+        }
       }
-    }
-  }, [createPlanTab, zoneLayout]);
+    },
+    [createPlanTab, zoneLayout],
+  );
 
   // Create terminal and auto-assign to first empty zone.
   // When all zones are full, upgrade the layout to one with more zones
@@ -1336,7 +1335,7 @@ export function TerminalPage({
         onToggleFindings={findingsActions.handleToggleFindings}
         findingsActive={workflowGen.rightPanelMode === "findings"}
         findingsCount={activeFindings.length}
-        onOpenPlanFile={handleOpenPlanFile}
+        onOpenDocFile={handleOpenDocFile}
       />
       <TerminalNotification
         message={workflowGen.notification?.message ?? null}

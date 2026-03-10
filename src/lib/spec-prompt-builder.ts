@@ -231,7 +231,32 @@ You are creating specifications for UI pages in the UI Bridge spec format. These
 1. **Automated verification** — workflows use them to verify page correctness
 2. **Bug fixing** — AI workflows read specs to understand expected behavior and fix issues autonomously
 
-## CRITICAL: Read the Source Code First
+## CRITICAL: Communicate Progress During Exploration
+
+**Output brief progress notes as you work.** After each major exploration step, write a short summary of what you found. This serves two purposes:
+1. The user can see what you're doing (instead of a silent "working..." indicator)
+2. If the session is interrupted, your exploration is captured
+
+**Format:** After each file or group of related files you read, write 1-3 sentences summarizing what you learned. For example:
+- "📂 **Page component:** StateMachine.tsx renders 4 tabs: States, Transitions, Graph, Settings. Uses useStateMachineConfig() hook for data."
+- "📂 **API layer:** Tauri IPC command \`get_state_machine_config\` returns { states, transitions, elements }. Config stored in SQLite."
+- "📂 **Domain logic:** State discovery in \`discovery.rs\` groups elements by co-occurrence across screenshots. Uses cosine similarity clustering."
+
+**Do NOT wait until you've read everything to start writing.** Narrate as you go.
+
+## CRITICAL: Generate Spec Incrementally
+
+**Write each spec group as soon as you have enough information**, rather than reading ALL code first and writing ALL groups at the end. This prevents context overflow on complex pages.
+
+**Pattern:**
+1. Read the page component → write the "Page Structure" and "Navigation" groups
+2. Read each major section/widget → write that section's group immediately
+3. Read domain logic → write the domain logic group immediately
+4. At the end, review and add any cross-cutting groups you missed
+
+This incremental approach ensures that even if the context window fills up, most of the spec is already written.
+
+## Read the Source Code Thoroughly
 
 **You MUST explore the actual source code before writing any spec.** Do not guess at page structure or behavior — read the components, hooks, API calls, and data models to understand what the page actually does.
 
@@ -250,8 +275,47 @@ Pages often trigger operations in other packages or libraries. You MUST follow t
 - If a page triggers operations in the **qontinui core library** (e.g., state machine creation, image recognition), read the library code to understand what the operation produces — its inputs, outputs, data structures, and success/failure modes
 - If a page uses a **shared package** (e.g., \`@qontinui/workflow-utils\`, \`@qontinui/shared-types\`), read the type definitions and utility functions to understand the data model
 - If a page interacts with the **Rust backend** via Tauri IPC, read the Rust command handler to understand the full operation
+- If a page uses **shared components** (e.g., from \`@qontinui/workflow-ui\`), read the component implementations when your assertions describe what those components render — prop types and usage patterns alone don't tell you the full rendered output
 
 The goal is to write semantic assertions that describe expected results with the same precision as someone who has read the code. For example, if a "Discover States" button triggers state discovery in the qontinui library, the spec should describe what states are expected to be discovered, what format they take, and how they appear in the UI — not just "states are discovered."
+
+### CRITICAL: Identify domain logic behind the page
+
+Many pages are **windows into library or backend algorithms**. The page displays the output of domain logic that lives elsewhere. For these pages, the spec must go beyond "does the UI render correctly" and specify **what correct output looks like from the underlying algorithm**.
+
+**How to identify domain logic pages:**
+- The page triggers an operation (e.g., "Discover States", "Generate Workflow", "Analyze Code") and displays the result
+- The result comes from a library function, backend service, or Rust module — not just a database query
+- The page is the primary (or only) way users see the output of that algorithm
+
+**When you find a domain logic page, you MUST:**
+
+1. **Read the algorithm's source code** — not just the API endpoint, but the actual implementation. Follow the call chain from the UI action into the library or module that does the computation. Understand the algorithm's inputs, processing steps, and output data structures.
+
+2. **Define correctness criteria as semantic assertions** — write assertions that specify what CORRECT output looks like. These are the specification of the algorithm. They should be precise enough that an AI could:
+   - Determine whether the algorithm's output is correct or incorrect by examining the page
+   - Fix the algorithm in the library if the output doesn't match the spec
+   - Implement the algorithm from scratch using only the spec
+
+3. **Include algorithm invariants** — properties that must always hold regardless of input. Example: "Every state must contain at least one element", "No two states should have identical element sets", "The total element count across states equals the number of unique elements discovered."
+
+4. **Include input-output relationships** — describe how inputs map to outputs. Example: "Given N screenshots with K distinct element configurations, the algorithm should produce exactly K states."
+
+5. **Include edge cases and error modes** — describe what should happen with unusual inputs. Example: "If all screenshots have identical elements, exactly one state should be created with no transitions."
+
+6. **Describe data structures visible in the UI** — what fields, properties, and relationships should the displayed data have.
+
+**The goal: if someone reads ONLY the spec (not the source code), they should understand what the algorithm does, what correct output looks like, and how to verify it.** The spec is the authoritative definition of correct behavior — spec-driven development and debugging workflows depend on this.
+
+### CONSTRAINT: Every assertion must be verifiable from the page
+
+**Every assertion must be something that can be verified by examining the page.** The page is the only thing a verification workflow can observe. The verification loop works like this: the algorithm produces output → the page displays it → a workflow reads the spec and examines the page → the workflow determines if the output matches the spec.
+
+This means:
+- **Write assertions in terms of what the page SHOWS, not what the code DOES internally.**
+- **Good:** "The state list should display exactly K states, where K is the number of distinct element configurations. Each state card shows its element count and the list of interactive elements that define it."
+- **Bad:** "The clustering algorithm uses cosine similarity with a threshold of 0.85."
+- If an assertion describes something not visible on the page, reframe it in terms of what IS visible, or drop it — it belongs in unit tests, not page specs.
 
 ### What to extract from code for specs:
 - **Rendered text** — headings, button labels, tab names, placeholder text, empty state messages, error messages
@@ -260,6 +324,7 @@ The goal is to write semantic assertions that describe expected results with the
 - **Data flow** — what data is fetched, how is it displayed, what transformations happen?
 - **Business logic** — validation rules, required fields, state machine transitions, creation flows
 - **Cross-project operations** — what happens in the backend/library when the user triggers an action? What are the expected results?
+- **Domain logic outputs** — algorithm results displayed on the page, their expected structure, correctness criteria, and invariants
 
 ## JSON Schema
 
@@ -455,9 +520,98 @@ Use preconditions liberally. They tell the automation system what state the page
 
 Notice: the Save button gets TWO assertions — \`exists\` (is it there?) and \`behavior\` (what happens when you click it?). This is the correct pattern. Do NOT put behavioral descriptions on \`exists\` assertions.
 
+## Example: Domain Logic Group (State Machine Builder)
+
+This example shows how to specify **algorithm correctness** for a page that displays the output of a backend algorithm. The State Machine Builder page triggers state discovery in the qontinui library and displays the resulting states and transitions. The specs define what correct output looks like so a workflow can verify the algorithm by examining the page.
+
+\`\`\`json
+{
+  "id": "sm-discovery-state-grouping",
+  "name": "State Discovery — Grouping Correctness",
+  "description": "After running state discovery, the page displays the discovered states in the States tab and Graph tab. Each state represents a distinct UI configuration defined by which interactive elements appear together. The correctness of the grouping algorithm is verifiable by examining the element lists shown on each state card.",
+  "category": "state-consistency",
+  "assertions": [
+    {
+      "id": "sm-states-have-elements",
+      "description": "Every state card in the state list displays at least one element in its element list. A state with zero elements indicates a grouping error in the discovery algorithm.",
+      "category": "state-consistency",
+      "severity": "critical",
+      "target": { "type": "search", "criteria": { "role": "list" }, "label": "State list" },
+      "assertionType": "semantic",
+      "precondition": "Discovery has completed and at least one state exists",
+      "source": "manual", "reviewed": true, "enabled": true
+    },
+    {
+      "id": "sm-states-distinct-elements",
+      "description": "No two states in the state list should display identical element sets. Each state card shows its element IDs — if two states show the exact same elements, the discovery algorithm failed to merge them into a single state. Compare the element lists across all state cards.",
+      "category": "state-consistency",
+      "severity": "critical",
+      "target": { "type": "search", "criteria": { "role": "list" }, "label": "State list" },
+      "assertionType": "semantic",
+      "precondition": "Discovery has completed and at least two states exist",
+      "source": "manual", "reviewed": true, "enabled": true
+    },
+    {
+      "id": "sm-element-coverage",
+      "description": "The total number of unique elements across all states should equal the config's element_count shown in the header. If the sum is less, some elements were dropped during discovery. If more, elements were duplicated across states.",
+      "category": "state-consistency",
+      "severity": "critical",
+      "target": { "type": "search", "criteria": { "role": "list" }, "label": "State list" },
+      "assertionType": "semantic",
+      "precondition": "Discovery has completed and config header is visible",
+      "source": "manual", "reviewed": true, "enabled": true
+    },
+    {
+      "id": "sm-transitions-connect-states",
+      "description": "Each transition in the Transitions tab shows a source state and target state, both of which must exist in the States list. The triggering action (click, type, navigate) and its target element must be shown. A transition pointing to a nonexistent state indicates a bug in the transition detection algorithm.",
+      "category": "state-consistency",
+      "severity": "critical",
+      "target": { "type": "search", "criteria": { "role": "list" }, "label": "Transition list" },
+      "assertionType": "semantic",
+      "precondition": "Discovery has completed and at least one transition exists",
+      "source": "manual", "reviewed": true, "enabled": true
+    },
+    {
+      "id": "sm-graph-matches-data",
+      "description": "The Graph tab renders one node per state and one edge per transition. The node count must match the state list count. Each edge connects two nodes corresponding to the transition's from/to states. Missing nodes or edges indicate a rendering bug; extra nodes indicate a data inconsistency.",
+      "category": "state-consistency",
+      "severity": "critical",
+      "target": { "type": "search", "criteria": { "role": "graphics-document" }, "label": "State machine graph" },
+      "assertionType": "semantic",
+      "precondition": "Graph tab is selected and discovery has completed",
+      "source": "manual", "reviewed": true, "enabled": true
+    }
+  ],
+  "source": "manual"
+}
+\`\`\`
+
+Key points about domain logic groups:
+- Every assertion is **verifiable from the page** — it describes what you can SEE (element lists on cards, confidence badges, node/edge counts in the graph)
+- Assertions define **what correct algorithm output looks like** — an AI reading these can determine if the discovery algorithm is broken
+- Assertions explain **what a failure means** — "if two states show identical elements, the algorithm failed to merge them" tells the AI exactly what to fix
+- The \`state-consistency\` category signals these are data correctness checks, not just UI layout checks
+
+### CSS & Canvas Assertion Guidance
+
+**CSS variable resolution:** Computed CSS styles depend on CSS variable resolution (e.g., \`text-text-primary\` resolves differently in dark/light mode). Exact hex values in \`cssProperty\` assertions are fragile — prefer \`semantic\` assertions describing the visual intent, or note the design token name in the description.
+
+**Canvas and graph-based UIs:** ReactFlow, SVG canvases, and \`<canvas>\` elements render content outside the standard DOM tree. Standard DOM queries cannot reliably count nodes or verify edges. For graph/canvas UIs, use \`semantic\` assertions describing expected visual structure rather than \`count\` or \`exists\` targeting internal SVG/canvas children.
+
+## Output Format
+
+**Output the spec as a single JSON code block** wrapped in \`\`\`json ... \`\`\` fences.
+
+**IMPORTANT: Write spec groups incrementally.** As you explore each area of the codebase, immediately write the corresponding spec group(s). Do NOT accumulate all exploration notes and write the entire spec at the end — this risks context overflow on complex pages.
+
+**Recommended workflow:**
+1. Read the page component → immediately output progress notes about page structure
+2. For each major section/feature: read the code → output progress notes → mentally compose the group
+3. After exploring the full page, output the complete JSON spec with all groups
+
 ## Instructions
 
-1. **Read the source code first** — explore components, hooks, API calls, and data models before writing any assertions
+1. **Read the source code thoroughly** — explore components, hooks, API calls, and data models. Output progress notes as you go.
 2. Always output a complete, valid JSON spec (not partial)
 3. **Choose assertionType based on what is being verified, not the element being targeted.** If the description mentions an interaction result, state change, or multi-step flow, it MUST be \`behavior\` or \`semantic\`, never \`exists\`. Review every assertion before finalizing: does the description match the type?
 4. Every group should contain a mix of types — typically 2-3 deterministic (\`exists\`, \`visible\`, \`hasText\`) plus 1-2 semantic (\`behavior\`, \`semantic\`). A spec with only \`exists\` assertions is incomplete.
@@ -590,4 +744,83 @@ Output each assertion as a complete JSON object inside a code block so it can be
   };
 
   return `${specContext}\n\n---\n\n${reviewInstructions[reviewType]}`;
+}
+
+// =============================================================================
+// Spec merge (updating existing specs)
+// =============================================================================
+
+/**
+ * Instructions for AI-driven spec merge — appended when updating existing specs.
+ * Teaches the AI to compare old vs new and keep the more detailed version.
+ */
+export const SPEC_MERGE_INSTRUCTIONS = `
+## Merge Mode — Updating an Existing Spec
+
+You are UPDATING an existing spec, not creating from scratch. The current spec is provided below.
+
+### Merge Rules (CRITICAL — follow these exactly)
+
+1. **Read the source code first** (same process as creation — explore components, hooks, API calls)
+2. **Compare each existing group against what you find in the code:**
+   - If an existing group covers functionality that still exists → KEEP it, enhance if you can add detail
+   - If an existing group covers functionality that was removed → REMOVE it
+   - If you find functionality not covered by any existing group → ADD a new group
+3. **For individual assertions within kept groups:**
+   - KEEP assertions that are still accurate — preserve their IDs
+   - ENHANCE assertions that are correct but could be more specific or detailed — keep the same ID
+   - REMOVE assertions only if the feature they describe no longer exists
+   - ADD new assertions for uncovered functionality — give them new unique IDs
+4. **NEVER reduce detail** — if an existing assertion has a detailed behavioral description, your replacement must be AT LEAST as detailed. When in doubt, keep the existing version.
+5. **Preserve assertion IDs** for assertions that haven't meaningfully changed — this enables tracking changes over time
+
+### Output Format
+
+Output a SINGLE complete JSON spec (the merged result). After the JSON block, add a brief merge summary:
+
+\`\`\`
+### Merge Summary
+- **Kept**: X groups unchanged, Y assertions unchanged
+- **Enhanced**: X groups improved, Y assertions made more detailed
+- **Added**: X new groups, Y new assertions
+- **Removed**: X groups (list reasons), Y assertions (list reasons)
+\`\`\`
+`.trim();
+
+/**
+ * Build a creation prompt that includes existing spec context for merge.
+ * Used when generating/regenerating specs for a page that already has specs.
+ */
+export function buildSpecCreationWithMergeContext(
+  existingSpec: { specId: string; config: SpecConfig; appName?: string },
+  pageDescription: string,
+): string {
+  const existingContext = buildDetailedSpecContext(existingSpec);
+  const existingJson = JSON.stringify(existingSpec.config, null, 2);
+
+  return [
+    SPEC_CREATION_INSTRUCTIONS,
+    "",
+    "---",
+    "",
+    SPEC_MERGE_INSTRUCTIONS,
+    "",
+    "---",
+    "",
+    "## Current Spec to Merge With",
+    "",
+    existingContext,
+    "",
+    "### Raw JSON (preserve IDs from this when keeping assertions)",
+    "",
+    "```json",
+    existingJson,
+    "```",
+    "",
+    "---",
+    "",
+    `Create an updated, comprehensive page spec by merging improvements with the existing spec above.`,
+    "",
+    pageDescription,
+  ].join("\n");
 }

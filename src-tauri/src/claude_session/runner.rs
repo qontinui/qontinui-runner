@@ -57,6 +57,30 @@ fn join_with_timeout<T: Send + Default + 'static>(
     }
 }
 
+/// Extract tool activity from an assistant message's tool_use content blocks.
+/// Returns a human-readable description like "Reading src/pages/StateMachine.tsx".
+fn extract_tool_activity_from_stream_json(json_line: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(json_line).ok()?;
+    if parsed.get("type")?.as_str()? != "assistant" {
+        return None;
+    }
+    let content = parsed.get("message")?.get("content")?.as_array()?;
+    for item in content {
+        if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+            let tool_name = item
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("unknown");
+            let input = item.get("input").and_then(|i| i.as_object());
+            let data = input.cloned().unwrap_or_default();
+            return Some(crate::claude_session::dispatcher::format_tool_activity_pub(
+                tool_name, &data,
+            ));
+        }
+    }
+    None
+}
+
 /// Extract text from Claude CLI stream-json output line
 fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
     // Parse the JSON line
@@ -423,6 +447,20 @@ fn run_claude_session_inline(
                     .unwrap_or_default()
                     .as_secs();
                 last_activity_stdout.store(now, Ordering::Relaxed);
+
+                // Extract tool activity from assistant messages with tool_use blocks
+                // (needed because bypassPermissions mode doesn't send can_use_tool control requests)
+                if let Some(activity) = extract_tool_activity_from_stream_json(&line) {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        emit_ai_output(
+                            &app_handle_stdout,
+                            &activity,
+                            "tool_activity",
+                            None,
+                            session_ctx_stdout.as_ref(),
+                        );
+                    }));
+                }
 
                 // Extract text from JSON
                 if let Some(text) = extract_text_from_stream_json(&line) {

@@ -23,6 +23,7 @@ import {
   Wand2,
 } from "lucide-react";
 import type { AnalysisType } from "./TerminalAnalysisPanel";
+import { DocFinderModal } from "./DocFinderModal";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 
@@ -99,7 +100,7 @@ interface ZoneStatusBarProps {
   onToggleFindings: () => void;
   findingsActive: boolean;
   findingsCount: number;
-  onOpenPlanFile?: () => void;
+  onOpenDocFile?: (filePath: string) => void;
 }
 
 const STATE_COLORS: Record<SessionState, string> = {
@@ -164,8 +165,9 @@ export function ZoneStatusBar({
   onToggleFindings,
   findingsActive,
   findingsCount,
-  onOpenPlanFile,
+  onOpenDocFile,
 }: ZoneStatusBarProps) {
+  const [showDocFinder, setShowDocFinder] = useState(false);
   const stateCounts = useMemo(() => {
     const counts: Record<SessionState, number> = {
       idle: 0,
@@ -249,17 +251,15 @@ export function ZoneStatusBar({
         {showSidebar ? "Hide" : "Sessions"}
       </button>
 
-      {onOpenPlanFile && (
-        <>
-          <button
-            onClick={onOpenPlanFile}
-            className="flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium transition-colors text-[#7dcfff] hover:bg-[#7dcfff]/10 hover:text-[#89d4ff] shrink-0"
-            title="Open a markdown plan file in a zone"
-          >
-            <FileText className="w-3 h-3" />
-            Plan
-          </button>
-        </>
+      {onOpenDocFile && (
+        <button
+          onClick={() => setShowDocFinder(true)}
+          className="flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium transition-colors text-[#7dcfff] hover:bg-[#7dcfff]/10 hover:text-[#89d4ff] shrink-0"
+          title="Open a document file in a zone"
+        >
+          <FileText className="w-3 h-3" />
+          Doc
+        </button>
       )}
 
       <div className="w-px h-4 bg-[#2a2d3d]" />
@@ -614,6 +614,16 @@ export function ZoneStatusBar({
           <RefreshCw className="w-3 h-3" />
         </button>
       </div>
+
+      {showDocFinder && onOpenDocFile && (
+        <DocFinderModal
+          onSelect={(filePath) => {
+            onOpenDocFile(filePath);
+            setShowDocFinder(false);
+          }}
+          onClose={() => setShowDocFinder(false)}
+        />
+      )}
     </div>
   );
 }

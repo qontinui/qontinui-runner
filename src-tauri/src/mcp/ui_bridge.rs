@@ -406,6 +406,21 @@ pub async fn ui_bridge_get_snapshot_handler(
     }
 }
 
+/// Get form state awareness data from the UI Bridge.
+pub async fn ui_bridge_get_forms_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting form state");
+
+    match ui_bridge_request_sync(&state, "get_forms", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// Get console errors captured by the UI Bridge ConsoleCapture.
 pub async fn ui_bridge_get_console_errors_handler(
     State(state): State<Arc<ApiState>>,
@@ -1219,6 +1234,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/control/console-errors/clear",
             post(ui_bridge_clear_console_errors_handler),
         )
+        // Form state awareness
+        .route("/ui-bridge/control/forms", get(ui_bridge_get_forms_handler))
         .route("/ui-bridge/control/specs", get(ui_bridge_get_specs_handler))
         .route(
             "/ui-bridge/control/spec/:id",

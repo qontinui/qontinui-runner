@@ -71,6 +71,10 @@ export interface SpecTreeNode {
   appName?: string;
   /** Page URL */
   pageUrl?: string;
+  /** True if this page has no spec yet */
+  unspecced?: boolean;
+  /** Navigation item description (for unspecced pages) */
+  description?: string;
   children?: SpecTreeNode[];
 }
 
@@ -87,7 +91,8 @@ export type SpecSelection =
   | { type: "none" }
   | { type: "spec"; specId: string }
   | { type: "group"; specId: string; groupId: string }
-  | { type: "assertion"; specId: string; groupId: string; assertionId: string };
+  | { type: "assertion"; specId: string; groupId: string; assertionId: string }
+  | { type: "unspecced-page"; expectedSpecId: string; label: string; description: string };
 
 // Loaded spec — supports all spec kinds
 export type LoadedSpec =

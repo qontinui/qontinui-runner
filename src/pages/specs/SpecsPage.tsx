@@ -41,6 +41,12 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
   const [forcePromptOnly, setForcePromptOnly] = useState(false);
   const [includeRegressionChecks, setIncludeRegressionChecks] = useState(false);
   const { issues: knownIssues, loadIssuesForSpec } = useKnownIssues();
+  // Spec generation trigger — set when user clicks "Generate Spec" from detail panel or chat
+  const [generateSpecRequest, setGenerateSpecRequest] = useState<{
+    expectedSpecId: string;
+    label: string;
+    description: string;
+  } | null>(null);
 
   // Auto-load bundled specs on first mount only (skip if restored from cache)
   useEffect(() => {
@@ -233,6 +239,15 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
             selectedGroup={state.selectedGroup}
             selectionType={state.selection.type}
             editMode={state.editMode}
+            unspeccedPageInfo={
+              state.selection.type === "unspecced-page"
+                ? {
+                    label: state.selection.label,
+                    description: state.selection.description,
+                    expectedSpecId: state.selection.expectedSpecId,
+                  }
+                : null
+            }
             onToggleAssertion={state.toggleAssertion}
             onRemoveAssertion={state.removeAssertion}
             onAddAssertion={state.addAssertion}
@@ -240,6 +255,23 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
             onRemoveGroup={state.removeGroup}
             onUpdateSetupActions={state.updateSetupActions}
             onClearSelection={() => state.setSelection({ type: "none" })}
+            onGenerateSpec={
+              state.selection.type === "unspecced-page"
+                ? () => {
+                    const sel = state.selection as {
+                      type: "unspecced-page";
+                      expectedSpecId: string;
+                      label: string;
+                      description: string;
+                    };
+                    setGenerateSpecRequest({
+                      expectedSpecId: sel.expectedSpecId,
+                      label: sel.label,
+                      description: sel.description,
+                    });
+                  }
+                : undefined
+            }
           />
         </div>
 
@@ -249,6 +281,8 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
             selectedSpec={state.selectedSpec}
             onAddSpec={state.addSpec}
             onBuildWorkflow={handleBuildWorkflow}
+            generateSpecRequest={generateSpecRequest}
+            onGenerateSpecHandled={() => setGenerateSpecRequest(null)}
           />
         </div>
       </div>
