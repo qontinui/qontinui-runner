@@ -801,6 +801,84 @@ async fn handle_ai_summary(State(state): State<Arc<ApiState>>) -> Json<serde_jso
 }
 
 // =============================================================================
+// Idle Detection Relay Handlers
+// =============================================================================
+
+/// GET /ui-bridge/sdk/idle-status — Get idle status from SDK app
+async fn handle_idle_status(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/idle-status", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/idle-status/:signal — Get single signal idle status from SDK app
+async fn handle_idle_status_signal(
+    State(state): State<Arc<ApiState>>,
+    Path(signal): Path<String>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::GET,
+        &format!("/control/idle-status/{}", signal),
+        None,
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/wait-for-idle — Block until SDK app is idle
+async fn handle_wait_for_idle(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/wait-for-idle", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/wait-for-idle/:signal — Block until specific signal is idle in SDK app
+async fn handle_wait_for_signal(
+    State(state): State<Arc<ApiState>>,
+    Path(signal): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        &format!("/control/wait-for-idle/{}", signal),
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/wait-for-targets — Wait for specific targets in SDK app
+async fn handle_wait_for_targets(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/wait-for-targets",
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
 // Page Navigation Relay Handlers
 // =============================================================================
 
@@ -1707,6 +1785,21 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/sdk/ai/analyze/cross-app-compare",
             post(handle_ai_analyze_cross_app_compare),
+        )
+        // Idle detection
+        .route("/ui-bridge/sdk/idle-status", get(handle_idle_status))
+        .route(
+            "/ui-bridge/sdk/idle-status/:signal",
+            get(handle_idle_status_signal),
+        )
+        .route("/ui-bridge/sdk/wait-for-idle", post(handle_wait_for_idle))
+        .route(
+            "/ui-bridge/sdk/wait-for-idle/:signal",
+            post(handle_wait_for_signal),
+        )
+        .route(
+            "/ui-bridge/sdk/wait-for-targets",
+            post(handle_wait_for_targets),
         )
         // Tab registry
         .route("/ui-bridge/sdk/tabs", get(handle_tabs))
