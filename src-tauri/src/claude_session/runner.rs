@@ -73,7 +73,7 @@ fn extract_tool_activity_from_stream_json(json_line: &str) -> Option<String> {
                 .unwrap_or("unknown");
             let input = item.get("input").and_then(|i| i.as_object());
             let data = input.cloned().unwrap_or_default();
-            return Some(crate::claude_session::dispatcher::format_tool_activity_pub(
+            return Some(crate::claude_session::dispatcher::format_tool_activity(
                 tool_name, &data,
             ));
         }

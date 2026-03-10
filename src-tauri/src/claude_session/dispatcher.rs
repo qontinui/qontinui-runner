@@ -255,19 +255,11 @@ fn handle_control_request(
     }
 }
 
-/// Public wrapper for format_tool_activity (used by runner.rs for bypass-mode tool activity).
-pub fn format_tool_activity_pub(
-    tool_name: &str,
-    data: &serde_json::Map<String, serde_json::Value>,
-) -> String {
-    format_tool_activity(tool_name, data)
-}
-
 /// Format a human-readable description of a tool activity.
 ///
 /// Extracts the tool name and key details (file path, command, etc.)
 /// to show what the AI is currently doing.
-fn format_tool_activity(
+pub(crate) fn format_tool_activity(
     tool_name: &str,
     data: &serde_json::Map<String, serde_json::Value>,
 ) -> String {
