@@ -324,16 +324,10 @@ fn now_ms() -> u64 {
 }
 
 fn rand_hex(bytes: usize) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    now_ms().hash(&mut hasher);
-    std::thread::current().id().hash(&mut hasher);
-    let hash = hasher.finish();
-    format!("{:0width$x}", hash, width = bytes * 2)
-        .chars()
-        .take(bytes * 2)
-        .collect()
+    use rand::Rng;
+    let mut buf = vec![0u8; bytes];
+    rand::thread_rng().fill(&mut buf[..]);
+    buf.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 // ---------------------------------------------------------------------------
