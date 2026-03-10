@@ -30,6 +30,7 @@ import { useErrorEvents, useErrorSummary } from "../../hooks/useErrorMonitor";
 import { formatErrorTime } from "../../services/error-monitor-service";
 import type { StoredErrorEvent, ErrorSeverity, ErrorStatus } from "../../types/errorMonitor";
 import { FixErrorsButton } from "./FixErrorsButton";
+import { BrowserErrorsPanel } from "./BrowserErrorsPanel";
 // Log source management is now in Settings > Log Sources (LogSourcesSettings.tsx)
 
 // =============================================================================
@@ -568,6 +569,9 @@ export function ErrorMonitorTab({
           </div>
         )}
       </div>
+
+      {/* Browser errors from UI Bridge SDK */}
+      <BrowserErrorsPanel defaultCollapsed={true} />
 
       {/* Error list */}
       <ScrollArea className="flex-1">

@@ -179,12 +179,182 @@ struct ProxyNetworkEvent {
 }
 
 const MAX_PROXY_NETWORK_EVENTS: usize = 200;
+const MAX_BROWSER_EVENTS: usize = 500;
+const MAX_ERROR_SESSIONS: usize = 50;
+const MAX_ERROR_SNAPSHOTS: usize = 20;
+
+// ---------------------------------------------------------------------------
+// Error Session (lightweight in-proxy tracking, mirrors ErrorSessionManager)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct ProxyErrorSession {
+    id: String,
+    label: Option<String>,
+    started_at: u64,
+    ended_at: Option<u64>,
+    events: Vec<serde_json::Value>,
+    unique_fingerprints: Vec<String>,
+}
+
+impl ProxyErrorSession {
+    fn new(label: Option<String>) -> Self {
+        let id = format!("session-{}-{}", now_ms(), rand_hex(4));
+        Self {
+            id,
+            label,
+            started_at: now_ms(),
+            ended_at: None,
+            events: Vec::new(),
+            unique_fingerprints: Vec::new(),
+        }
+    }
+
+    fn record_event(&mut self, event: &serde_json::Value) {
+        if self.ended_at.is_some() {
+            return;
+        }
+        self.events.push(event.clone());
+        if let Some(fp) = event_fingerprint(event) {
+            if !self.unique_fingerprints.contains(&fp) {
+                self.unique_fingerprints.push(fp);
+            }
+        }
+    }
+
+    fn end(&mut self) {
+        if self.ended_at.is_none() {
+            self.ended_at = Some(now_ms());
+        }
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        let mut by_severity = serde_json::Map::new();
+        by_severity.insert("crash".into(), serde_json::json!(0));
+        by_severity.insert("error".into(), serde_json::json!(0));
+        by_severity.insert("warning".into(), serde_json::json!(0));
+        by_severity.insert("noise".into(), serde_json::json!(0));
+
+        for event in &self.events {
+            let severity = classify_event_severity(event);
+            if let Some(count) = by_severity.get_mut(&severity) {
+                if let Some(n) = count.as_u64() {
+                    *count = serde_json::json!(n + 1);
+                }
+            }
+        }
+
+        let has_crashes = by_severity
+            .get("crash")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            > 0;
+
+        serde_json::json!({
+            "id": self.id,
+            "label": self.label,
+            "startedAt": self.started_at,
+            "endedAt": self.ended_at,
+            "uniqueErrorCount": self.unique_fingerprints.len(),
+            "totalEventCount": self.events.len(),
+            "bySeverity": by_severity,
+            "hasCrashes": has_crashes,
+        })
+    }
+}
+
+/// Simple fingerprint: type + first 80 chars of message
+fn event_fingerprint(event: &serde_json::Value) -> Option<String> {
+    let etype = event
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let message = event
+        .get("message")
+        .and_then(|v| v.as_str())
+        .or_else(|| event.get("errorMessage").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let truncated: String = message.chars().take(80).collect();
+    Some(format!("{}:{}", etype, truncated))
+}
+
+/// Classify an event into a severity bucket (mirrors classifyEvent in error-severity.ts)
+fn classify_event_severity(event: &serde_json::Value) -> String {
+    let etype = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let level = event.get("level").and_then(|v| v.as_str()).unwrap_or("");
+
+    match etype {
+        "console" => match level {
+            "error" | "unhandledrejection" => "error".to_string(),
+            "warn" => "warning".to_string(),
+            _ => "noise".to_string(),
+        },
+        "network" => {
+            let status = event.get("status").and_then(|v| v.as_u64()).unwrap_or(0);
+            if status >= 500 {
+                "error".to_string()
+            } else if status >= 400 {
+                "warning".to_string()
+            } else {
+                "noise".to_string()
+            }
+        }
+        "react-error" => "error".to_string(),
+        "resource-error" => "warning".to_string(),
+        _ => "noise".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error Snapshot
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct ProxyErrorSnapshot {
+    id: String,
+    error: serde_json::Value,
+    captured_at: u64,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn rand_hex(bytes: usize) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    now_ms().hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    let hash = hasher.finish();
+    format!("{:0width$x}", hash, width = bytes * 2)
+        .chars()
+        .take(bytes * 2)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// ProxyControlState
+// ---------------------------------------------------------------------------
 
 struct ProxyControlState {
     pending: Vec<PendingCommand>,
     waiters: HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
     /// Network errors captured at the proxy layer (4xx/5xx responses).
     network_events: Vec<ProxyNetworkEvent>,
+    /// Browser events pushed from the inject script (AnyCapturedEvent format).
+    browser_events: Vec<serde_json::Value>,
+    /// Error sessions for tracking errors over time intervals.
+    error_sessions: Vec<ProxyErrorSession>,
+    /// Currently active error session (index into error_sessions).
+    active_session_idx: Option<usize>,
+    /// Error snapshots triggered by significant events.
+    error_snapshots: Vec<ProxyErrorSnapshot>,
+    /// Set of fingerprints already snapshotted (for dedup).
+    snapshot_fingerprints: Vec<String>,
 }
 
 impl ProxyControlState {
@@ -193,6 +363,11 @@ impl ProxyControlState {
             pending: Vec::new(),
             waiters: HashMap::new(),
             network_events: Vec::new(),
+            browser_events: Vec::new(),
+            error_sessions: Vec::new(),
+            active_session_idx: None,
+            error_snapshots: Vec::new(),
+            snapshot_fingerprints: Vec::new(),
         }
     }
 
@@ -202,6 +377,112 @@ impl ProxyControlState {
             let excess = self.network_events.len() - MAX_PROXY_NETWORK_EVENTS;
             self.network_events.drain(..excess);
         }
+    }
+
+    /// Ingest a batch of browser events from the inject script.
+    /// Feeds them to the active error session and snapshot buffer.
+    fn ingest_browser_events(&mut self, events: Vec<serde_json::Value>) {
+        for event in events {
+            // Feed active error session
+            if let Some(idx) = self.active_session_idx {
+                if let Some(session) = self.error_sessions.get_mut(idx) {
+                    session.record_event(&event);
+                }
+            }
+
+            // Error snapshot: capture on significant events (error/crash severity)
+            let severity = classify_event_severity(&event);
+            if severity == "error" || severity == "crash" {
+                if let Some(fp) = event_fingerprint(&event) {
+                    if !self.snapshot_fingerprints.contains(&fp) {
+                        self.snapshot_fingerprints.push(fp.clone());
+                        let message = event
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| event.get("errorMessage").and_then(|v| v.as_str()))
+                            .unwrap_or("Unknown error")
+                            .to_string();
+                        let snapshot = ProxyErrorSnapshot {
+                            id: format!("snap-{}-{}", now_ms(), rand_hex(3)),
+                            error: serde_json::json!({
+                                "message": message,
+                                "severity": severity,
+                                "fingerprint": fp,
+                                "sourceLocation": event.get("stack").and_then(|v| v.as_str()).and_then(|s| {
+                                    s.lines().nth(1).map(|line| line.trim().to_string())
+                                }),
+                                "stack": event.get("stack"),
+                                "timestamp": event.get("timestamp"),
+                            }),
+                            captured_at: now_ms(),
+                        };
+                        self.error_snapshots.push(snapshot);
+                        // Trim snapshots
+                        if self.error_snapshots.len() > MAX_ERROR_SNAPSHOTS {
+                            let excess = self.error_snapshots.len() - MAX_ERROR_SNAPSHOTS;
+                            self.error_snapshots.drain(..excess);
+                            // Rebuild fingerprints from remaining snapshots
+                            self.snapshot_fingerprints.clear();
+                            for snap in &self.error_snapshots {
+                                if let Some(fp_val) =
+                                    snap.error.get("fingerprint").and_then(|v| v.as_str())
+                                {
+                                    self.snapshot_fingerprints.push(fp_val.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Store in the ring buffer
+            self.browser_events.push(event);
+            if self.browser_events.len() > MAX_BROWSER_EVENTS {
+                let excess = self.browser_events.len() - MAX_BROWSER_EVENTS;
+                self.browser_events.drain(..excess);
+            }
+        }
+    }
+
+    /// Start a new error session, ending the active one if any.
+    fn start_error_session(&mut self, label: Option<String>) -> serde_json::Value {
+        // End active session
+        if let Some(idx) = self.active_session_idx.take() {
+            if let Some(session) = self.error_sessions.get_mut(idx) {
+                session.end();
+            }
+        }
+
+        let session = ProxyErrorSession::new(label);
+        let summary = session.summary();
+        self.error_sessions.push(session);
+        self.active_session_idx = Some(self.error_sessions.len() - 1);
+
+        // Trim old sessions
+        if self.error_sessions.len() > MAX_ERROR_SESSIONS {
+            let excess = self.error_sessions.len() - MAX_ERROR_SESSIONS;
+            self.error_sessions.drain(..excess);
+            if let Some(idx) = self.active_session_idx.as_mut() {
+                if *idx >= excess {
+                    *idx -= excess;
+                } else {
+                    self.active_session_idx = None;
+                }
+            }
+        }
+
+        summary
+    }
+
+    /// End the active error session and return its summary.
+    fn end_error_session(&mut self) -> Option<serde_json::Value> {
+        if let Some(idx) = self.active_session_idx.take() {
+            if let Some(session) = self.error_sessions.get_mut(idx) {
+                session.end();
+                return Some(session.summary());
+            }
+        }
+        None
     }
 }
 
@@ -259,7 +540,9 @@ pub struct IntegrateRequest {
 pub struct IntegrationOptions {
     #[serde(default = "default_true")]
     pub install_deps: bool,
-    #[serde(default = "default_true")]
+    /// Deprecated: AutoRegisterProvider replaces build-time babel/swc instrumentation.
+    /// This field is accepted but ignored.
+    #[serde(default)]
     pub auto_instrument: bool,
     pub sdk_version: Option<String>,
 }
@@ -808,21 +1091,161 @@ async fn start_proxy(
         async move { enqueue_and_wait(&cs, "clearConsoleErrors", vec![]).await }
     };
 
-    // Browser events: returns proxy-captured network events (4xx/5xx responses).
-    // Console errors from the inject script are available via /console-errors.
+    // Browser events: returns all captured events (proxy network + inject script).
     let cs = control_state.clone();
     let browser_events_handler = move || {
         let cs = cs.clone();
         async move {
             let state = cs.lock().await;
-            let events = state.network_events.clone();
+            // Merge proxy network events and inject-script browser events
+            let mut all_events: Vec<serde_json::Value> = state
+                .network_events
+                .iter()
+                .map(|e| serde_json::to_value(e).unwrap_or_default())
+                .collect();
+            all_events.extend(state.browser_events.clone());
+            // Sort by timestamp
+            all_events.sort_by(|a, b| {
+                let ts_a = a.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+                let ts_b = b.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+                ts_a.cmp(&ts_b)
+            });
+            let count = all_events.len();
             drop(state);
             Json(serde_json::json!({
                 "success": true,
                 "data": {
-                    "events": events,
-                    "count": events.len(),
-                    "source": "proxy",
+                    "events": all_events,
+                    "count": count,
+                    "source": "proxy+inject",
+                }
+            }))
+        }
+    };
+
+    // Browser events push: receives events from the inject script
+    let cs = control_state.clone();
+    let browser_events_push_handler = move |Json(events): Json<Vec<serde_json::Value>>| {
+        let cs = cs.clone();
+        async move {
+            let mut state = cs.lock().await;
+            state.ingest_browser_events(events);
+            Json(serde_json::json!({"ok": true}))
+        }
+    };
+
+    // Error sessions
+    let cs = control_state.clone();
+    let error_session_start_handler = move |body: Option<Json<serde_json::Value>>| {
+        let cs = cs.clone();
+        async move {
+            let label = body.and_then(|b| {
+                b.get("label")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+            let mut state = cs.lock().await;
+            let summary = state.start_error_session(label);
+            Json(serde_json::json!({ "success": true, "data": summary }))
+        }
+    };
+
+    let cs = control_state.clone();
+    let error_session_end_handler = move || {
+        let cs = cs.clone();
+        async move {
+            let mut state = cs.lock().await;
+            match state.end_error_session() {
+                Some(summary) => Json(serde_json::json!({ "success": true, "data": summary })),
+                None => Json(serde_json::json!({ "success": false, "error": "No active session" })),
+            }
+        }
+    };
+
+    let cs = control_state.clone();
+    let error_sessions_list_handler = move || {
+        let cs = cs.clone();
+        async move {
+            let state = cs.lock().await;
+            let summaries: Vec<serde_json::Value> =
+                state.error_sessions.iter().map(|s| s.summary()).collect();
+            Json(serde_json::json!({ "success": true, "data": summaries }))
+        }
+    };
+
+    // Error snapshots
+    let cs = control_state.clone();
+    let error_snapshots_handler = move || {
+        let cs = cs.clone();
+        async move {
+            let state = cs.lock().await;
+            let snapshots: Vec<serde_json::Value> = state
+                .error_snapshots
+                .iter()
+                .rev()
+                .take(10)
+                .map(|s| {
+                    serde_json::json!({
+                        "id": s.id,
+                        "error": s.error,
+                        "pageState": { "url": "", "title": "", "elementCount": 0, "visibleErrors": [] },
+                        "recentActions": [],
+                        "capturedAt": s.captured_at,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "success": true, "data": snapshots }))
+        }
+    };
+
+    // Error report: combined view of active session + recent snapshots
+    let cs = control_state.clone();
+    let error_report_handler = move || {
+        let cs = cs.clone();
+        async move {
+            let state = cs.lock().await;
+            let active_session = state
+                .active_session_idx
+                .and_then(|idx| state.error_sessions.get(idx))
+                .map(|s| s.summary());
+            let snapshots: Vec<serde_json::Value> = state
+                .error_snapshots
+                .iter()
+                .rev()
+                .take(5)
+                .map(|s| {
+                    serde_json::json!({
+                        "id": s.id,
+                        "error": s.error,
+                        "capturedAt": s.captured_at,
+                    })
+                })
+                .collect();
+            let total_events = state.browser_events.len() + state.network_events.len();
+            let error_count = state
+                .browser_events
+                .iter()
+                .filter(|e| {
+                    let sev = classify_event_severity(e);
+                    sev == "error" || sev == "crash"
+                })
+                .count();
+            let warning_count = state
+                .browser_events
+                .iter()
+                .filter(|e| classify_event_severity(e) == "warning")
+                .count();
+            drop(state);
+            Json(serde_json::json!({
+                "success": true,
+                "data": {
+                    "activeSession": active_session,
+                    "recentSnapshots": snapshots,
+                    "summary": {
+                        "totalEvents": total_events,
+                        "errors": error_count,
+                        "warnings": warning_count,
+                    }
                 }
             }))
         }
@@ -917,6 +1340,12 @@ async fn start_proxy(
         async move { enqueue_and_wait(&cs, "getDesignSnapshot", vec![]).await }
     };
 
+    let cs = control_state.clone();
+    let forms_handler = move || {
+        let cs = cs.clone();
+        async move { enqueue_and_wait(&cs, "getForms", vec![]).await }
+    };
+
     let proxy_router = Router::new()
         .route(
             "/__ui-bridge/inject.js",
@@ -962,6 +1391,33 @@ async fn start_proxy(
             "/__ui-bridge/control/browser-events",
             get(browser_events_handler),
         )
+        .route(
+            "/__ui-bridge/control/browser-events/push",
+            post(browser_events_push_handler),
+        )
+        // Error session management (mirrors ErrorSessionManager API)
+        .route(
+            "/__ui-bridge/control/error-sessions/start",
+            post(error_session_start_handler),
+        )
+        .route(
+            "/__ui-bridge/control/error-sessions/end",
+            post(error_session_end_handler),
+        )
+        .route(
+            "/__ui-bridge/control/error-sessions",
+            get(error_sessions_list_handler),
+        )
+        // Error snapshots
+        .route(
+            "/__ui-bridge/control/error-snapshots",
+            get(error_snapshots_handler),
+        )
+        // Error report (combined view)
+        .route(
+            "/__ui-bridge/control/error-report",
+            get(error_report_handler),
+        )
         .route("/__ui-bridge/control/page/navigate", post(navigate_handler))
         .route("/__ui-bridge/control/page/refresh", post(refresh_handler))
         .route("/__ui-bridge/control/page/back", post(back_handler))
@@ -987,6 +1443,7 @@ async fn start_proxy(
             "/__ui-bridge/control/design-snapshot",
             get(design_snapshot_handler),
         )
+        .route("/__ui-bridge/control/forms", get(forms_handler))
         .fallback({
             let fallback_cs = control_state.clone();
             move |req: axum::http::Request<Body>| {
@@ -1374,6 +1831,18 @@ async fn integrate_source(
             )
             .await;
             next_steps.push("Restart your dev server to apply changes".to_string());
+            next_steps.push(
+                "Enabled features: element auto-registration, render logging, control API, debug tools, idle detection, browser event capture, modal/toast detection, navigation tracking, keyboard shortcut discovery, drag-drop detection, undo/redo awareness".to_string()
+            );
+            next_steps.push(
+                "Use the runner's runtime injection proxy for HTTP control API access (live snapshots, actions, AI search)".to_string()
+            );
+            next_steps.push(
+                "Optional: Add useUIRelationship() for element relationships, useUIComponent() for component-level actions, usePageContext() for route metadata, useKeyboardShortcuts() for shortcut registration".to_string()
+            );
+            next_steps.push(
+                "Optional: Register form library adapters (React Hook Form, Formik) for accurate form state extraction".to_string()
+            );
         }
         Framework::NextJs => {
             integrate_nextjs(
@@ -1385,6 +1854,21 @@ async fn integrate_source(
             )
             .await;
             next_steps.push("Restart your dev server to apply changes".to_string());
+            next_steps.push(
+                "Enabled features: element auto-registration, render logging, control API, debug tools, idle detection, browser event capture, modal/toast detection, navigation tracking, keyboard shortcut discovery, drag-drop detection, undo/redo awareness".to_string()
+            );
+            next_steps.push(
+                "Use the runner's runtime injection proxy for HTTP control API access (live snapshots, actions, AI search)".to_string()
+            );
+            next_steps.push(
+                "Optional: Add <RenderLogWrapper> inside <AutoRegisterProvider> in your root layout for automatic DOM snapshot capture".to_string()
+            );
+            next_steps.push(
+                "Optional: Add useUIRelationship() for element relationships, useUIComponent() for component-level actions, usePageContext() for route metadata, useKeyboardShortcuts() for shortcut registration".to_string()
+            );
+            next_steps.push(
+                "Optional: Register form library adapters (React Hook Form, Formik) for accurate form state extraction".to_string()
+            );
         }
         Framework::Vue | Framework::Angular | Framework::Svelte => {
             integrate_generic_html(&project, &mut modifications, &mut warnings).await;
@@ -1478,10 +1962,8 @@ async fn integrate_react(
 ) {
     add_sdk_to_package_json(project, options, modifications, warnings).await;
 
-    // Auto-instrument: add babel plugin to devDependencies
-    if options.auto_instrument && !analysis.has_babel_plugin {
-        add_babel_plugin_to_package_json(project, modifications).await;
-    }
+    // AutoRegisterProvider replaces build-time babel/swc plugins for element discovery.
+    // No babel plugin installation needed.
 
     let root_entry = analysis
         .entry_points
@@ -1496,7 +1978,7 @@ async fn integrate_react(
                 modifications.push(FileModification {
                     file_path: entry.path.clone(),
                     modification_type: ModificationType::Replace,
-                    description: "Wrap root component with UIBridgeProvider".to_string(),
+                    description: "Wrap root component with UIBridgeProvider (features: renderLog, control, debug)".to_string(),
                     original_content: Some(content),
                     new_content,
                 });
@@ -1516,13 +1998,9 @@ async fn integrate_nextjs(
     warnings: &mut Vec<String>,
 ) {
     add_sdk_to_package_json(project, options, modifications, warnings).await;
-    add_server_to_package_json(project, modifications).await;
 
-    // Auto-instrument: add babel plugin and configure in next.config
-    if options.auto_instrument && !analysis.has_babel_plugin {
-        add_babel_plugin_to_package_json(project, modifications).await;
-        add_babel_to_next_config(project, modifications, warnings).await;
-    }
+    // Server adapter is bundled in @qontinui/ui-bridge (no separate server package needed).
+    // AutoRegisterProvider replaces build-time babel/swc plugins for element discovery.
 
     let layout_entry = analysis
         .entry_points
@@ -1537,7 +2015,7 @@ async fn integrate_nextjs(
                 modifications.push(FileModification {
                     file_path: entry.path.clone(),
                     modification_type: ModificationType::Replace,
-                    description: "Wrap root layout with UIBridgeProvider".to_string(),
+                    description: "Wrap root layout with UIBridgeProvider (features: renderLog, control, debug)".to_string(),
                     original_content: Some(content),
                     new_content,
                 });
@@ -1549,6 +2027,7 @@ async fn integrate_nextjs(
         );
     }
 
+    // Create API route for UI Bridge endpoints
     let api_route_path = if project.join("src/app").exists() {
         "src/app/api/ui-bridge/[...path]/route.ts"
     } else {
@@ -1559,10 +2038,35 @@ async fn integrate_nextjs(
         modifications.push(FileModification {
             file_path: api_route_path.to_string(),
             modification_type: ModificationType::CreateNew,
-            description: "Create Next.js API route for UI Bridge server adapter".to_string(),
+            description: "Create Next.js API route for UI Bridge server endpoints".to_string(),
             original_content: None,
             new_content: NEXTJS_API_ROUTE_TEMPLATE.to_string(),
         });
+    }
+
+    // Create RenderLogWrapper component for DOM snapshot capture on navigation
+    let wrapper_path = if project.join("src/lib").exists() || project.join("src/app").exists() {
+        "src/lib/ui-bridge/RenderLogWrapper.tsx"
+    } else if project.join("lib").exists() {
+        "lib/ui-bridge/RenderLogWrapper.tsx"
+    } else {
+        "src/lib/ui-bridge/RenderLogWrapper.tsx"
+    };
+
+    if !project.join(wrapper_path).exists() {
+        modifications.push(FileModification {
+            file_path: wrapper_path.to_string(),
+            modification_type: ModificationType::CreateNew,
+            description:
+                "Create RenderLogWrapper for DOM snapshot capture on navigation and mutations"
+                    .to_string(),
+            original_content: None,
+            new_content: NEXTJS_RENDER_LOG_WRAPPER_TEMPLATE.to_string(),
+        });
+        warnings.push(format!(
+            "Created {}. Add <RenderLogWrapper> inside <AutoRegisterProvider> in your root layout for automatic DOM snapshot capture on route changes.",
+            wrapper_path
+        ));
     }
 }
 
@@ -1663,174 +2167,16 @@ async fn add_sdk_to_package_json(
     }
 }
 
-async fn add_server_to_package_json(
-    project: &std::path::Path,
-    modifications: &mut Vec<FileModification>,
-) {
-    let pkg_path = project.join("package.json");
-    if let Ok(content) = tokio::fs::read_to_string(&pkg_path).await {
-        if let Ok(mut pkg) = serde_json::from_str::<serde_json::Value>(&content) {
-            let deps = pkg.get_mut("dependencies").and_then(|d| d.as_object_mut());
-            if let Some(deps) = deps {
-                if !deps.contains_key("@qontinui/ui-bridge-server") {
-                    deps.insert(
-                        "@qontinui/ui-bridge-server".to_string(),
-                        serde_json::Value::String("latest".to_string()),
-                    );
-                    let existing_mod = modifications
-                        .iter_mut()
-                        .find(|m| m.file_path == "package.json");
-                    if let Some(existing) = existing_mod {
-                        existing.new_content = serde_json::to_string_pretty(&pkg)
-                            .unwrap_or_else(|_| existing.new_content.clone());
-                    } else {
-                        let new_content =
-                            serde_json::to_string_pretty(&pkg).unwrap_or_else(|_| content.clone());
-                        modifications.push(FileModification {
-                            file_path: "package.json".to_string(),
-                            modification_type: ModificationType::Replace,
-                            description: "Add @qontinui/ui-bridge-server to dependencies"
-                                .to_string(),
-                            original_content: Some(content),
-                            new_content,
-                        });
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn add_babel_plugin_to_package_json(
-    project: &std::path::Path,
-    modifications: &mut Vec<FileModification>,
-) {
-    let pkg_path = project.join("package.json");
-    if let Ok(content) = tokio::fs::read_to_string(&pkg_path).await {
-        if let Ok(mut pkg) = serde_json::from_str::<serde_json::Value>(&content) {
-            let dev_deps = pkg.as_object_mut().and_then(|obj| {
-                if !obj.contains_key("devDependencies") {
-                    obj.insert("devDependencies".to_string(), serde_json::json!({}));
-                }
-                obj.get_mut("devDependencies")
-                    .and_then(|d| d.as_object_mut())
-            });
-            if let Some(dev_deps) = dev_deps {
-                if !dev_deps.contains_key("@qontinui/ui-bridge-babel-plugin") {
-                    dev_deps.insert(
-                        "@qontinui/ui-bridge-babel-plugin".to_string(),
-                        serde_json::Value::String("latest".to_string()),
-                    );
-                    // Merge with existing package.json modification if one exists
-                    let existing_mod = modifications
-                        .iter_mut()
-                        .find(|m| m.file_path == "package.json");
-                    if let Some(existing) = existing_mod {
-                        // Re-parse the existing new_content and merge devDependencies
-                        if let Ok(mut existing_pkg) =
-                            serde_json::from_str::<serde_json::Value>(&existing.new_content)
-                        {
-                            let existing_dev = existing_pkg.as_object_mut().and_then(|obj| {
-                                if !obj.contains_key("devDependencies") {
-                                    obj.insert(
-                                        "devDependencies".to_string(),
-                                        serde_json::json!({}),
-                                    );
-                                }
-                                obj.get_mut("devDependencies")
-                                    .and_then(|d| d.as_object_mut())
-                            });
-                            if let Some(existing_dev) = existing_dev {
-                                existing_dev.insert(
-                                    "@qontinui/ui-bridge-babel-plugin".to_string(),
-                                    serde_json::Value::String("latest".to_string()),
-                                );
-                            }
-                            existing.new_content = serde_json::to_string_pretty(&existing_pkg)
-                                .unwrap_or_else(|_| existing.new_content.clone());
-                        }
-                    } else {
-                        let new_content =
-                            serde_json::to_string_pretty(&pkg).unwrap_or_else(|_| content.clone());
-                        modifications.push(FileModification {
-                            file_path: "package.json".to_string(),
-                            modification_type: ModificationType::Replace,
-                            description: "Add @qontinui/ui-bridge-babel-plugin to devDependencies"
-                                .to_string(),
-                            original_content: Some(content),
-                            new_content,
-                        });
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn add_babel_to_next_config(
-    project: &std::path::Path,
-    modifications: &mut Vec<FileModification>,
-    warnings: &mut Vec<String>,
-) {
-    // Check for .babelrc first
-    let babelrc_path = project.join(".babelrc");
-    if babelrc_path.exists() {
-        if let Ok(content) = tokio::fs::read_to_string(&babelrc_path).await {
-            if !content.contains("@qontinui/ui-bridge-babel-plugin") {
-                if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
-                    let plugins = config.as_object_mut().and_then(|obj| {
-                        if !obj.contains_key("plugins") {
-                            obj.insert("plugins".to_string(), serde_json::json!([]));
-                        }
-                        obj.get_mut("plugins").and_then(|p| p.as_array_mut())
-                    });
-                    if let Some(plugins) = plugins {
-                        plugins.push(serde_json::json!("@qontinui/ui-bridge-babel-plugin"));
-                        let new_content = serde_json::to_string_pretty(&config)
-                            .unwrap_or_else(|_| content.clone());
-                        modifications.push(FileModification {
-                            file_path: ".babelrc".to_string(),
-                            modification_type: ModificationType::Replace,
-                            description: "Add UI Bridge babel plugin to .babelrc".to_string(),
-                            original_content: Some(content),
-                            new_content,
-                        });
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    // For Next.js without .babelrc, create one
-    let next_config_exists = project.join("next.config.js").exists()
-        || project.join("next.config.mjs").exists()
-        || project.join("next.config.ts").exists();
-
-    if next_config_exists {
-        modifications.push(FileModification {
-            file_path: ".babelrc".to_string(),
-            modification_type: ModificationType::CreateNew,
-            description: "Create .babelrc with UI Bridge babel plugin for auto-instrumentation"
-                .to_string(),
-            original_content: None,
-            new_content: serde_json::to_string_pretty(&serde_json::json!({
-                "presets": ["next/babel"],
-                "plugins": ["@qontinui/ui-bridge-babel-plugin"]
-            }))
-            .unwrap(),
-        });
-        warnings.push(
-            "Created .babelrc — this disables Next.js SWC compiler. Build times may increase."
-                .to_string(),
-        );
-    }
-}
+// Server adapter is now bundled in @qontinui/ui-bridge (no separate @qontinui/ui-bridge-server needed).
+// Babel/SWC plugins are deprecated — AutoRegisterProvider handles element discovery at runtime.
 
 fn wrap_with_provider_react(content: &str, file_path: &str) -> String {
     let import_line =
         "import { UIBridgeProvider, AutoRegisterProvider } from '@qontinui/ui-bridge/react';\n";
     let insert_pos = find_last_import_pos(content);
+
+    let provider_open = "<UIBridgeProvider\n          features={{ renderLog: true, control: true, debug: process.env.NODE_ENV === 'development' }}\n        >";
+    let provider_close = "</UIBridgeProvider>";
 
     let is_main = file_path.contains("main.") || file_path.contains("index.");
     if is_main {
@@ -1841,11 +2187,11 @@ fn wrap_with_provider_react(content: &str, file_path: &str) -> String {
         let wrapped = rest
             .replace(
                 "<App />",
-                "<UIBridgeProvider>\n      <AutoRegisterProvider>\n        <App />\n      </AutoRegisterProvider>\n    </UIBridgeProvider>",
+                &format!("{}\n          <AutoRegisterProvider>\n            <App />\n          </AutoRegisterProvider>\n        {}", provider_open, provider_close),
             )
             .replace(
                 "<App/>",
-                "<UIBridgeProvider>\n      <AutoRegisterProvider>\n        <App />\n      </AutoRegisterProvider>\n    </UIBridgeProvider>",
+                &format!("{}\n          <AutoRegisterProvider>\n            <App />\n          </AutoRegisterProvider>\n        {}", provider_open, provider_close),
             );
         result.push_str(&wrapped);
         result
@@ -1869,7 +2215,7 @@ fn wrap_with_provider_nextjs(content: &str) -> String {
     let rest = &content[insert_pos..];
     let wrapped = rest.replace(
         "{children}",
-        "{/* UI Bridge Integration */}\n          <UIBridgeProvider>\n            <AutoRegisterProvider>\n              {children}\n            </AutoRegisterProvider>\n          </UIBridgeProvider>",
+        "{/* UI Bridge Integration */}\n          <UIBridgeProvider\n            features={{ renderLog: true, control: true, debug: process.env.NODE_ENV === 'development' }}\n          >\n            <AutoRegisterProvider>\n              {children}\n            </AutoRegisterProvider>\n          </UIBridgeProvider>",
     );
     result.push_str(&wrapped);
     result
@@ -1893,14 +2239,164 @@ fn find_last_import_pos(content: &str) -> usize {
     last_import_end
 }
 
-const NEXTJS_API_ROUTE_TEMPLATE: &str = r#"import { createUIBridgeHandler } from '@qontinui/ui-bridge-server/nextjs';
+const NEXTJS_API_ROUTE_TEMPLATE: &str = r#"import {
+  createNextRouteHandlers,
+  createHandlers,
+  type RegistryLike,
+  type ActionExecutorLike,
+} from '@qontinui/ui-bridge/server';
+import type { ControlSnapshot } from '@qontinui/ui-bridge/control';
 
-const handler = createUIBridgeHandler();
+// Server-side UI Bridge API route.
+// This provides the endpoint structure for UI Bridge. The global registry
+// is populated by the UIBridgeProvider on the client side. For full control
+// API access (live snapshots, actions), use the runtime injection proxy.
+const registry: RegistryLike = {
+  getAllElements: () => [],
+  getElement: () => undefined,
+  getAllComponents: () => [],
+  getComponent: () => undefined,
+  createSnapshot: () =>
+    ({
+      timestamp: Date.now(),
+      elements: [],
+      components: [],
+      workflows: [],
+      activeRuns: [],
+    }) as unknown as ControlSnapshot,
+};
 
-export const GET = handler;
-export const POST = handler;
-export const PUT = handler;
-export const DELETE = handler;
+const executor: ActionExecutorLike = {
+  executeAction: async () => ({
+    success: false,
+    error: 'Server-side action execution not available. Use the runtime injection proxy.',
+    timestamp: Date.now(),
+  }),
+  executeComponentAction: async () => ({
+    success: false,
+    error: 'Server-side action execution not available. Use the runtime injection proxy.',
+    timestamp: Date.now(),
+  }),
+};
+
+const handlers = createHandlers(registry, executor);
+const routeHandlers = createNextRouteHandlers(handlers);
+
+export const GET = routeHandlers.GET;
+export const POST = routeHandlers.POST;
+export const DELETE = routeHandlers.DELETE;
+
+export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
+"#;
+
+const NEXTJS_RENDER_LOG_WRAPPER_TEMPLATE: &str = r#"'use client';
+
+import { useEffect, useRef, useCallback, type ReactNode } from 'react';
+import { usePathname, useSearchParams } from 'next/navigation';
+import { useUIBridgeOptional } from '@qontinui/ui-bridge/react';
+
+/**
+ * RenderLogWrapper — captures DOM snapshots on navigation and significant mutations.
+ *
+ * Place inside <AutoRegisterProvider> in your root layout:
+ *
+ *   <UIBridgeProvider features={{ renderLog: true, control: true }}>
+ *     <AutoRegisterProvider>
+ *       <RenderLogWrapper>{children}</RenderLogWrapper>
+ *     </AutoRegisterProvider>
+ *   </UIBridgeProvider>
+ */
+export function RenderLogWrapper({
+  children,
+  enableOnMount = true,
+  enableMutationObserver = true,
+  mutationDebounceMs = 500,
+}: {
+  children: ReactNode;
+  enableOnMount?: boolean;
+  enableMutationObserver?: boolean;
+  mutationDebounceMs?: number;
+}) {
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const bridge = useUIBridgeOptional();
+  const isDev = process.env.NODE_ENV === 'development';
+
+  const lastPathRef = useRef<string | null>(null);
+  const mutationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const fullPath = pathname + (searchParams?.toString() ? `?${searchParams.toString()}` : '');
+
+  const captureSnapshot = useCallback(
+    async (trigger: string, metadata?: Record<string, unknown>) => {
+      if (!isDev || !bridge?.renderLog) return;
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      await bridge.renderLog.captureSnapshot({ trigger, pathname, ...metadata });
+    },
+    [isDev, bridge, pathname]
+  );
+
+  // Capture on route change
+  useEffect(() => {
+    if (!isDev || !bridge?.renderLog) return;
+    if (lastPathRef.current === fullPath) return;
+
+    const previousPath = lastPathRef.current;
+    lastPathRef.current = fullPath;
+    if (previousPath === null && enableOnMount) return;
+
+    const timeoutId = setTimeout(() => {
+      captureSnapshot('route_change', { previousPath, newPath: fullPath });
+    }, 100);
+    return () => clearTimeout(timeoutId);
+  }, [fullPath, isDev, bridge, captureSnapshot, enableOnMount]);
+
+  // Capture on mount
+  useEffect(() => {
+    if (!isDev || !bridge?.renderLog || !enableOnMount) return;
+    const timeoutId = setTimeout(() => {
+      captureSnapshot('mount');
+      lastPathRef.current = fullPath;
+    }, 500);
+    return () => clearTimeout(timeoutId);
+  }, [isDev, bridge]);
+
+  // Mutation observer for significant DOM changes
+  useEffect(() => {
+    if (!isDev || !bridge?.renderLog || !enableMutationObserver) return;
+
+    const observer = new MutationObserver((mutations) => {
+      const significant = mutations.some((m) => {
+        if (m.addedNodes.length || m.removedNodes.length) {
+          for (const node of m.addedNodes) {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              const el = node as Element;
+              if (!['SCRIPT', 'STYLE', 'SVG'].includes(el.tagName)) return true;
+            }
+          }
+        }
+        return false;
+      });
+
+      if (significant) {
+        if (mutationTimeoutRef.current) clearTimeout(mutationTimeoutRef.current);
+        mutationTimeoutRef.current = setTimeout(() => {
+          captureSnapshot('mutation');
+        }, mutationDebounceMs);
+      }
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    return () => {
+      observer.disconnect();
+      if (mutationTimeoutRef.current) clearTimeout(mutationTimeoutRef.current);
+    };
+  }, [isDev, bridge, enableMutationObserver, mutationDebounceMs, captureSnapshot]);
+
+  return <>{children}</>;
+}
 "#;
 
 // ============================================================================

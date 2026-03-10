@@ -308,12 +308,11 @@ export function DocFinderModal({ onSelect, onClose, defaultRoot }: DocFinderModa
     }
   }, [onSelect]);
 
-  // Content search
+  // Content search — process files in parallel batches for performance
   const handleContentSearch = useCallback(async () => {
     if (!contentQuery.trim() || scannedFiles.length === 0) return;
 
     setIsSearchingContent(true);
-    const results: ContentResult[] = [];
     const keywords = contentQuery
       .toLowerCase()
       .split(/\s+/)
@@ -324,62 +323,65 @@ export function DocFinderModal({ onSelect, onClose, defaultRoot }: DocFinderModa
       return;
     }
 
-    for (const file of scannedFiles) {
-      try {
-        const content = await readTextFile(file.path);
-        const lines = content.split("\n").slice(0, 30);
+    const results: ContentResult[] = [];
+    const BATCH_SIZE = 20;
 
-        // Extract metadata
-        let title = "";
-        const headers: string[] = [];
-        let firstParagraph = "";
+    for (let i = 0; i < scannedFiles.length; i += BATCH_SIZE) {
+      const batch = scannedFiles.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.allSettled(
+        batch.map(async (file) => {
+          const content = await readTextFile(file.path);
+          const lines = content.split("\n").slice(0, 50);
+          const fullText = lines.join("\n").toLowerCase();
 
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith("# ") && !title) {
-            title = trimmed.slice(2).trim();
-          } else if (trimmed.startsWith("## ")) {
-            headers.push(trimmed.slice(3).trim());
-          } else if (
-            trimmed.length > 0 &&
-            !trimmed.startsWith("#") &&
-            !trimmed.startsWith("---") &&
-            !firstParagraph
-          ) {
-            firstParagraph = trimmed;
+          // Extract metadata
+          let title = "";
+          const headers: string[] = [];
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed.startsWith("# ") && !title) {
+              title = trimmed.slice(2).trim();
+            } else if (trimmed.startsWith("## ") || trimmed.startsWith("### ")) {
+              headers.push(trimmed.replace(/^#+\s*/, "").trim());
+            }
           }
+
+          // Score by keyword overlap across filename, title, headers, and body
+          let score = 0;
+          const filenameLower = file.name.toLowerCase();
+          const titleLower = title.toLowerCase();
+          const headersLower = headers.join(" ").toLowerCase();
+
+          for (const keyword of keywords) {
+            if (filenameLower.includes(keyword)) score += 3;
+            if (titleLower.includes(keyword)) score += 2;
+            if (headersLower.includes(keyword)) score += 1;
+            if (fullText.includes(keyword)) score += 1;
+          }
+
+          if (score > 0) {
+            const previewLines = lines
+              .filter((l) => l.trim().length > 0 && !l.trim().startsWith("#"))
+              .slice(0, 2)
+              .join(" ")
+              .slice(0, 150);
+
+            return {
+              file,
+              title: title || file.name,
+              preview: previewLines || "(no preview)",
+              score,
+            } as ContentResult;
+          }
+          return null;
+        }),
+      );
+
+      for (const r of batchResults) {
+        if (r.status === "fulfilled" && r.value) {
+          results.push(r.value);
         }
-
-        // Score by keyword overlap
-        let score = 0;
-        const filenameLower = file.name.toLowerCase();
-        const titleLower = title.toLowerCase();
-        const headersLower = headers.join(" ").toLowerCase();
-        const contentLower = firstParagraph.toLowerCase();
-
-        for (const keyword of keywords) {
-          if (filenameLower.includes(keyword)) score += 3;
-          if (titleLower.includes(keyword)) score += 2;
-          if (headersLower.includes(keyword)) score += 1;
-          if (contentLower.includes(keyword)) score += 1;
-        }
-
-        if (score > 0) {
-          const previewLines = lines
-            .filter((l) => l.trim().length > 0 && !l.trim().startsWith("#"))
-            .slice(0, 2)
-            .join(" ")
-            .slice(0, 150);
-
-          results.push({
-            file,
-            title: title || file.name,
-            preview: previewLines || "(no preview)",
-            score,
-          });
-        }
-      } catch {
-        // Skip files that can't be read
       }
     }
 

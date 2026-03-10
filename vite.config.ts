@@ -40,6 +40,8 @@ export default defineConfig({
       { find: "@qontinui/shared-types", replacement: path.resolve(__dirname, "../qontinui-schemas/ts/dist/index.js") },
       { find: "@qontinui/workflow-utils", replacement: path.resolve(__dirname, "../qontinui-workflow-utils/dist/index.js") },
       // workflow-ui subpaths resolve to source (Vite transpiles TSX on the fly)
+      { find: "@qontinui/workflow-ui/state-machine", replacement: path.resolve(__dirname, "../qontinui-workflow-ui/src/components/state-machine/index.ts") },
+      { find: "@qontinui/workflow-ui/chat", replacement: path.resolve(__dirname, "../qontinui-workflow-ui/src/components/chat/index.ts") },
       { find: /^@qontinui\/workflow-ui\/(.+)$/, replacement: path.resolve(__dirname, "../qontinui-workflow-ui/src/$1/index.ts") },
     ],
     // Prevent duplicate React/library instances from symlinked packages

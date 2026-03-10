@@ -358,6 +358,84 @@ Optional fields: `"priority":10` (lower=first, default 50), `"size":"compact"|"n
 "##
 }
 
+/// Build UI Bridge error monitoring API documentation for the AI agent.
+///
+/// This documents the console capture and error tracking endpoints available
+/// through the UI Bridge SDK proxy, so the agent can detect console errors,
+/// network failures, and regressions introduced by code changes.
+fn build_error_monitoring_api_docs() -> &'static str {
+    r##"## UI Bridge Error Monitoring
+
+When the target app is connected via UI Bridge SDK, these endpoints provide runtime error monitoring. Use them to detect console errors, network failures, and regressions introduced by code changes.
+
+### Quick Health Check
+
+```bash
+curl http://localhost:9876/ui-bridge/sdk/console/health
+```
+Returns a health score (0-100), status (healthy/degraded/broken), error breakdown by severity, and top issue. **Start here** to see if the app has problems.
+
+### Browser Events & Timeline
+
+```bash
+# Recent browser console events
+# Query params: severity (crash|error|warning|noise), deduplicate (bool), since (timestamp), limit (number)
+curl "http://localhost:9876/ui-bridge/sdk/console/browser-events?severity=error&deduplicate=true"
+
+# Interleaved action+error timeline
+# Query params: since, limit, minSeverity
+curl "http://localhost:9876/ui-bridge/sdk/console/timeline?limit=20"
+
+# Network request chains with error correlation
+# Query params: failuresOnly (bool), limit, url (pattern)
+curl "http://localhost:9876/ui-bridge/sdk/console/network-chains?failuresOnly=true"
+```
+
+### Error Sessions (Track Errors Around an Action)
+
+Wrap an action with start/end to capture only the errors it produces:
+
+```bash
+# 1. Start tracking before performing an action
+curl -X POST http://localhost:9876/ui-bridge/sdk/console/error-sessions/start \
+  -H "Content-Type: application/json" -d '{"label":"my-action"}'
+
+# 2. ... perform the action (make code changes, click buttons, etc.) ...
+
+# 3. End session — returns summary of errors captured during the session
+curl -X POST http://localhost:9876/ui-bridge/sdk/console/error-sessions/end
+
+# List all session summaries
+curl http://localhost:9876/ui-bridge/sdk/console/error-sessions
+```
+
+### Error Baselines (Detect Regressions)
+
+Capture a snapshot of current errors before making changes, then compare after to confirm no new errors were introduced:
+
+```bash
+# 1. Capture baseline before making changes
+curl -X POST http://localhost:9876/ui-bridge/sdk/console/error-baselines/capture \
+  -H "Content-Type: application/json" -d '{"label":"before-fix"}'
+
+# 2. ... make code changes ...
+
+# 3. Compare current state against baseline — returns new errors (regressions) and fixed errors
+curl -X POST http://localhost:9876/ui-bridge/sdk/console/error-baselines/compare \
+  -H "Content-Type: application/json" -d '{"label":"before-fix"}'
+```
+
+### Recommended Workflow Pattern
+
+1. Check health first: `GET /ui-bridge/sdk/console/health`
+2. Capture baseline: `POST /ui-bridge/sdk/console/error-baselines/capture`
+3. Start error session: `POST /ui-bridge/sdk/console/error-sessions/start`
+4. Make your changes
+5. End error session: `POST /ui-bridge/sdk/console/error-sessions/end` — check for new errors
+6. Compare to baseline: `POST /ui-bridge/sdk/console/error-baselines/compare` — confirm no regressions
+"##
+}
+
 /// Strip [TASK_COMPLETE] and similar completion marker instructions from prompts.
 ///
 /// In unified workflows, verification determines completion, not the AI.
@@ -910,13 +988,14 @@ impl UnifiedAiSessionExecutor {
             result = format!("{}{}", autonomous_context, result);
         }
 
-        // Append canvas and trigger API documentation for agentic phases
+        // Append canvas, trigger, and error monitoring API documentation for agentic phases
         if config.add_autonomous_context {
             result = format!(
-                "{}\n\n{}\n\n{}",
+                "{}\n\n{}\n\n{}\n\n{}",
                 result,
                 build_canvas_api_docs(),
-                build_trigger_api_docs()
+                build_trigger_api_docs(),
+                build_error_monitoring_api_docs()
             );
         }
 

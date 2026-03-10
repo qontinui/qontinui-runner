@@ -776,9 +776,187 @@ async fn handle_ai_assert(
     }
 }
 
+/// GET /ui-bridge/sdk/clipboard — Read clipboard (system-level, same as control)
+async fn handle_clipboard_read(State(_state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    // Clipboard is a system resource — read directly via arboard, not through the SDK app
+    match arboard::Clipboard::new() {
+        Ok(mut clipboard) => {
+            let text = clipboard.get_text().ok();
+            let has_text = text.is_some();
+            Json(serde_json::json!({
+                "success": true,
+                "data": {
+                    "text": text,
+                    "formats": if has_text { vec!["text/plain"] } else { vec![] as Vec<&str> },
+                }
+            }))
+        }
+        Err(e) => Json(
+            serde_json::json!({ "success": false, "error": format!("Clipboard read failed: {}", e) }),
+        ),
+    }
+}
+
+/// POST /ui-bridge/sdk/clipboard — Write to clipboard (system-level, same as control)
+async fn handle_clipboard_write(
+    State(_state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let html = body.get("html").and_then(|v| v.as_str());
+
+    match arboard::Clipboard::new() {
+        Ok(mut clipboard) => {
+            let result = if let Some(html_content) = html {
+                clipboard.set_html(html_content, Some(text))
+            } else {
+                clipboard.set_text(text)
+            };
+            match result {
+                Ok(()) => Json(serde_json::json!({
+                    "success": true,
+                    "data": {
+                        "written": true,
+                        "formats": if html.is_some() { vec!["text/html", "text/plain"] } else { vec!["text/plain"] },
+                    }
+                })),
+                Err(e) => Json(
+                    serde_json::json!({ "success": false, "error": format!("Clipboard write failed: {}", e) }),
+                ),
+            }
+        }
+        Err(e) => Json(
+            serde_json::json!({ "success": false, "error": format!("Clipboard init failed: {}", e) }),
+        ),
+    }
+}
+
 /// GET /ui-bridge/sdk/forms — Form state awareness
 async fn handle_forms(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/control/forms", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/fill — Smart form fill
+async fn handle_fill_form(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/fill", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/forms/snapshot — Capture form state snapshot
+async fn handle_snapshot_forms(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/forms/snapshot", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/forms/diff — Diff two form snapshots
+async fn handle_diff_forms(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/forms/diff", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
+// Network Request Monitoring
+// =============================================================================
+
+/// GET /ui-bridge/sdk/network-requests — List network requests with optional filters
+///
+/// Optional query parameters:
+/// - `status`: filter by status (string)
+/// - `method`: filter by HTTP method (string)
+/// - `urlPattern`: filter by URL pattern (string)
+/// - `failuresOnly`: only return failed requests (boolean)
+/// - `since`: timestamp (number)
+/// - `limit`: max results (number)
+async fn handle_network_requests(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let mut path = "/control/network-requests".to_string();
+    let mut params = vec![];
+    if let Some(status) = query.get("status") {
+        params.push(format!("status={}", status));
+    }
+    if let Some(method) = query.get("method") {
+        params.push(format!("method={}", method));
+    }
+    if let Some(url_pattern) = query.get("urlPattern") {
+        params.push(format!("urlPattern={}", url_pattern));
+    }
+    if let Some(failures_only) = query.get("failuresOnly") {
+        params.push(format!("failuresOnly={}", failures_only));
+    }
+    if let Some(since) = query.get("since") {
+        params.push(format!("since={}", since));
+    }
+    if let Some(limit) = query.get("limit") {
+        params.push(format!("limit={}", limit));
+    }
+    if !params.is_empty() {
+        path = format!("{}?{}", path, params.join("&"));
+    }
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/network-requests/in-flight — Currently in-flight requests
+async fn handle_network_requests_in_flight(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::GET,
+        "/control/network-requests/in-flight",
+        None,
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/network-requests/wait — Wait for a specific request matching criteria
+async fn handle_wait_for_network_request(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/network-requests/wait",
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/network-request/:id — Get specific request by ID
+async fn handle_network_request(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/network-request/{}", id);
+    match sdk_request(&state, Method::GET, &path, None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -1726,6 +1904,170 @@ async fn handle_console_error_baseline_compare(
 }
 
 // =============================================================================
+// Change tracking (SDK proxy)
+// =============================================================================
+
+/// GET /ui-bridge/sdk/ai/bookmarks — List all bookmarks
+async fn handle_ct_list_bookmarks(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/ai/bookmarks", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/bookmarks — Save a bookmark
+async fn handle_ct_save_bookmark(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/bookmarks", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/ai/bookmark/:name — Get a specific bookmark
+async fn handle_ct_get_bookmark(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/ai/bookmark/{}", name);
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// DELETE /ui-bridge/sdk/ai/bookmark/:name — Delete a bookmark
+async fn handle_ct_delete_bookmark(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/ai/bookmark/{}", name);
+    match sdk_request(&state, Method::DELETE, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/ai/bookmark/:name/diff — Diff from a bookmark
+async fn handle_ct_diff_from_bookmark(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/ai/bookmark/{}/diff", name);
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/execute-with-diff — Execute action and return diff
+async fn handle_ct_execute_with_diff(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/execute-with-diff", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/wait-for-change — Wait for a change matching predicate
+async fn handle_ct_wait_for_change(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/wait-for-change", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/ai/categorize-last-diff — Categorize the last diff
+async fn handle_ct_categorize_last_diff(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/ai/categorize-last-diff", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/scoped-diff — Get scoped diff
+async fn handle_ct_scoped_diff(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/scoped-diff", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/summarize-diff — Summarize a diff with budget
+async fn handle_ct_summarize_diff(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/summarize-diff", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/structured-changes — Analyze structured changes
+async fn handle_ct_structured_changes(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/structured-changes", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/change-buffer/enable — Enable change buffer
+async fn handle_ct_enable_change_buffer(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/change-buffer/enable", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/change-buffer/disable — Disable change buffer
+async fn handle_ct_disable_change_buffer(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/change-buffer/disable", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/change-buffer/drain — Drain change buffer
+async fn handle_ct_drain_change_buffer(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/change-buffer/drain", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/ai/change-buffer/size — Get change buffer size
+async fn handle_ct_get_change_buffer_size(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/ai/change-buffer/size", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
 // Router
 // =============================================================================
 
@@ -1766,8 +2108,33 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/ai/execute", post(handle_ai_execute))
         .route("/ui-bridge/sdk/ai/assert", post(handle_ai_assert))
         .route("/ui-bridge/sdk/ai/snapshot", get(handle_ai_snapshot))
+        // Clipboard
+        .route(
+            "/ui-bridge/sdk/clipboard",
+            get(handle_clipboard_read).post(handle_clipboard_write),
+        )
         // Form state awareness
         .route("/ui-bridge/sdk/forms", get(handle_forms))
+        .route("/ui-bridge/sdk/fill", post(handle_fill_form))
+        .route("/ui-bridge/sdk/forms/snapshot", post(handle_snapshot_forms))
+        .route("/ui-bridge/sdk/forms/diff", post(handle_diff_forms))
+        // Network request monitoring
+        .route(
+            "/ui-bridge/sdk/network-requests",
+            get(handle_network_requests),
+        )
+        .route(
+            "/ui-bridge/sdk/network-requests/in-flight",
+            get(handle_network_requests_in_flight),
+        )
+        .route(
+            "/ui-bridge/sdk/network-requests/wait",
+            post(handle_wait_for_network_request),
+        )
+        .route(
+            "/ui-bridge/sdk/network-request/:id",
+            get(handle_network_request),
+        )
         .route("/ui-bridge/sdk/ai/summary", get(handle_ai_summary))
         // AI analysis endpoints
         .route(
@@ -1886,6 +2253,56 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/sdk/console/error-baselines/compare",
             post(handle_console_error_baseline_compare),
+        )
+        // Change tracking
+        .route(
+            "/ui-bridge/sdk/ai/bookmarks",
+            get(handle_ct_list_bookmarks).post(handle_ct_save_bookmark),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/bookmark/:name",
+            get(handle_ct_get_bookmark).delete(handle_ct_delete_bookmark),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/bookmark/:name/diff",
+            get(handle_ct_diff_from_bookmark),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/execute-with-diff",
+            post(handle_ct_execute_with_diff),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/wait-for-change",
+            post(handle_ct_wait_for_change),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/categorize-last-diff",
+            get(handle_ct_categorize_last_diff),
+        )
+        .route("/ui-bridge/sdk/ai/scoped-diff", post(handle_ct_scoped_diff))
+        .route(
+            "/ui-bridge/sdk/ai/summarize-diff",
+            post(handle_ct_summarize_diff),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/structured-changes",
+            post(handle_ct_structured_changes),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/change-buffer/enable",
+            post(handle_ct_enable_change_buffer),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/change-buffer/disable",
+            post(handle_ct_disable_change_buffer),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/change-buffer/drain",
+            post(handle_ct_drain_change_buffer),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/change-buffer/size",
+            get(handle_ct_get_change_buffer_size),
         )
 }
 

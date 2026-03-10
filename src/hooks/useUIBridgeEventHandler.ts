@@ -76,7 +76,23 @@ type UIBridgeRequestType =
   | "design_get_element_styles"
   | "design_get_state_styles"
   | "query_selector"
-  | "page_evaluate";
+  | "page_evaluate"
+  // Change tracking
+  | "save_bookmark"
+  | "get_bookmark"
+  | "delete_bookmark"
+  | "list_bookmarks"
+  | "diff_from_bookmark"
+  | "execute_with_diff"
+  | "wait_for_change"
+  | "categorize_last_diff"
+  | "scoped_diff"
+  | "summarize_diff"
+  | "structured_changes"
+  | "enable_change_buffer"
+  | "disable_change_buffer"
+  | "drain_change_buffer"
+  | "get_change_buffer_size";
 
 /**
  * Payload structure for UI Bridge requests from Rust
@@ -111,6 +127,10 @@ interface UIBridgeRequestPayload {
   elementIds?: string[];
   includePseudoElements?: boolean;
   viewports?: Record<string, number>;
+  /** Bookmark name for change tracking */
+  name?: string;
+  /** Full request body for change tracking commands */
+  body?: Record<string, unknown>;
   options?: {
     root?: string;
     interactiveOnly?: boolean;
@@ -211,6 +231,9 @@ export function useUIBridgeEventHandler(): void {
   const bridge = useUIBridge();
   const bridgeRef = useRef(bridge);
   const loadedStyleGuideRef = useRef<StyleGuideConfig | null>(null);
+  const changeTrackerRef = useRef<InstanceType<typeof import("ui-bridge/ai").ChangeTracker> | null>(
+    null,
+  );
 
   // Keep bridge ref updated to avoid stale closures
   useEffect(() => {
@@ -423,15 +446,43 @@ export function useUIBridgeEventHandler(): void {
           case "get_snapshot": {
             const snapshot: BridgeSnapshot = await currentBridge.createSnapshotAsync();
 
-            // Enrich with page context from NavigationTracker if available
+            // Enrich with page context, modals, and toasts from trackers if available
             const w = window as unknown as Record<string, unknown>;
             const uiBridgeGlobal = w.__UI_BRIDGE__ as Record<string, unknown> | undefined;
             const navTracker = uiBridgeGlobal?.navigationTracker as
               | { getSnapshotPageContext: () => unknown }
               | undefined;
+            const modalDet = uiBridgeGlobal?.modalDetector as
+              | { getSnapshotModalContext: () => unknown }
+              | undefined;
+            const toastCap = uiBridgeGlobal?.toastCapture as
+              | { getSnapshotToastContext: () => unknown }
+              | undefined;
+            const relTracker = uiBridgeGlobal?.relationshipTracker as
+              | {
+                  getSnapshotRelationshipContext: (
+                    elements?: Array<{ id: string; element: Element }>,
+                  ) => unknown;
+                }
+              | undefined;
+            const dndDetector = uiBridgeGlobal?.dragDropDetector as
+              | {
+                  getSnapshotDragDropContext: (
+                    elements?: Array<{ id: string; element: Element }>,
+                  ) => unknown;
+                }
+              | undefined;
+            const elementPairs = currentBridge.elements.map((e) => ({
+              id: e.id,
+              element: e.element,
+            }));
             const enrichedSnapshot = {
               ...snapshot,
               page: navTracker?.getSnapshotPageContext(),
+              modalStack: modalDet?.getSnapshotModalContext(),
+              toasts: toastCap?.getSnapshotToastContext(),
+              relationships: relTracker?.getSnapshotRelationshipContext(elementPairs),
+              dragDrop: dndDetector?.getSnapshotDragDropContext(elementPairs),
             };
 
             await sendResponse({
@@ -1005,6 +1056,207 @@ export function useUIBridgeEventHandler(): void {
               type,
               success: true,
               data: { cleared: true },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          // ========== Change Tracking ==========
+          case "save_bookmark":
+          case "get_bookmark":
+          case "delete_bookmark":
+          case "list_bookmarks":
+          case "diff_from_bookmark":
+          case "execute_with_diff":
+          case "wait_for_change":
+          case "categorize_last_diff":
+          case "scoped_diff":
+          case "summarize_diff":
+          case "structured_changes":
+          case "enable_change_buffer":
+          case "disable_change_buffer":
+          case "drain_change_buffer":
+          case "get_change_buffer_size": {
+            const {
+              ChangeTracker,
+              createSnapshotManager,
+              analyzeStructuredChanges: analyzeStructured,
+            } = await import("ui-bridge/ai");
+
+            // Lazy-init ChangeTracker singleton
+            if (!changeTrackerRef.current) {
+              const manager = createSnapshotManager({});
+              changeTrackerRef.current = new ChangeTracker(
+                {
+                  idleDetector: null,
+                  createControlSnapshot: () => {
+                    const snap = currentBridge.createSnapshot();
+                    return {
+                      timestamp: Date.now(),
+                      elements: snap.elements.map((e) => ({
+                        id: e.id,
+                        type: e.type,
+                        label: e.label ?? "",
+                        actions: e.actions,
+                        state: e.state,
+                      })),
+                      components: [],
+                      workflows: [],
+                      activeRuns: [],
+                    };
+                  },
+                  refreshElements: () => {},
+                  snapshotManager: manager,
+                  executeElementAction: async (
+                    id: string,
+                    request: { action: string; params?: Record<string, unknown> },
+                  ) => {
+                    const result = await currentBridge.executeAction(id, {
+                      action: request.action,
+                      params: request.params,
+                    });
+                    return result;
+                  },
+                  resolveScope: (scope: string) => {
+                    const container = document.querySelector(scope);
+                    if (!container) return null;
+                    const ids = new Set<string>();
+                    for (const el of currentBridge.elements) {
+                      if (el.element && container.contains(el.element as Node)) {
+                        ids.add(el.id);
+                      }
+                    }
+                    return ids;
+                  },
+                },
+                {
+                  defaultSettleTimeout: 3000,
+                  defaultSettleMinStable: 300,
+                  defaultPollInterval: 200,
+                },
+              );
+            }
+
+            const ct = changeTrackerRef.current;
+            let ctResult: unknown;
+
+            switch (type) {
+              case "save_bookmark":
+                ctResult = ct.saveBookmark(payload.name!);
+                break;
+              case "get_bookmark": {
+                const bm = ct.getBookmark(payload.name!);
+                if (!bm) throw new Error(`Bookmark '${payload.name}' not found`);
+                ctResult = bm;
+                break;
+              }
+              case "delete_bookmark":
+                ctResult = { deleted: ct.deleteBookmark(payload.name!) };
+                break;
+              case "list_bookmarks":
+                ctResult = ct.listBookmarks();
+                break;
+              case "diff_from_bookmark":
+                ctResult = ct.diffFromBookmark(payload.name!);
+                break;
+              case "execute_with_diff":
+                ctResult = await ct.executeWithDiff(
+                  payload as unknown as Parameters<typeof ct.executeWithDiff>[0],
+                );
+                break;
+              case "wait_for_change": {
+                const wfcPayload = payload as unknown as {
+                  predicate: Parameters<typeof ct.waitForChange>[0];
+                  options?: Parameters<typeof ct.waitForChange>[1];
+                };
+                ctResult = await ct.waitForChange(wfcPayload.predicate, wfcPayload.options);
+                break;
+              }
+              case "categorize_last_diff":
+                ctResult = ct.categorizeLastDiff();
+                break;
+              case "scoped_diff": {
+                const sdPayload = payload as unknown as { scope: string; fromBookmark?: string };
+                if (sdPayload.fromBookmark) {
+                  ctResult = ct.scopedDiffFromBookmark(sdPayload.fromBookmark, sdPayload.scope);
+                } else {
+                  ctResult = null;
+                }
+                break;
+              }
+              case "summarize_diff": {
+                const sumBody = payload as unknown as {
+                  budget: number;
+                  includeIds?: boolean;
+                  includeCategory?: boolean;
+                  fromBookmark?: string;
+                };
+                let diff = null as ReturnType<typeof ct.diffFromBookmark>;
+                if (sumBody.fromBookmark) {
+                  diff = ct.diffFromBookmark(sumBody.fromBookmark);
+                } else {
+                  diff = ct.categorizeLastDiff()?.diff ?? null;
+                }
+                if (!diff) {
+                  ctResult = { summary: "No changes detected" };
+                } else {
+                  ctResult = {
+                    summary: ct.summarizeDiff(diff, {
+                      budget: sumBody.budget,
+                      includeIds: sumBody.includeIds,
+                      includeCategory: sumBody.includeCategory,
+                    }),
+                  };
+                }
+                break;
+              }
+              case "structured_changes": {
+                const scPayload = payload as unknown as { fromBookmark?: string };
+                if (scPayload?.fromBookmark) {
+                  const bm = ct.getBookmark(scPayload.fromBookmark);
+                  if (!bm) throw new Error(`Bookmark '${scPayload.fromBookmark}' not found`);
+                  const snap = currentBridge.createSnapshot();
+                  const mgr = createSnapshotManager({});
+                  const currentSemantic = mgr.createSnapshot({
+                    timestamp: Date.now(),
+                    elements: snap.elements.map((e) => ({
+                      id: e.id,
+                      type: e.type,
+                      label: e.label ?? "",
+                      actions: e.actions,
+                      state: e.state,
+                    })),
+                    components: [],
+                    workflows: [],
+                    activeRuns: [],
+                  });
+                  ctResult = analyzeStructured(bm.snapshot, currentSemantic);
+                } else {
+                  ctResult = { hasStructuredData: false, tableChanges: [], listChanges: [] };
+                }
+                break;
+              }
+              case "enable_change_buffer":
+                ct.enableBuffer();
+                ctResult = { enabled: true };
+                break;
+              case "disable_change_buffer":
+                ct.disableBuffer();
+                ctResult = { enabled: false };
+                break;
+              case "drain_change_buffer":
+                ctResult = ct.drainBuffer();
+                break;
+              case "get_change_buffer_size":
+                ctResult = { size: ct.getBufferSize(), enabled: ct.isBufferEnabled() };
+                break;
+            }
+
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: ctResult,
               timestamp: Date.now(),
             });
             break;

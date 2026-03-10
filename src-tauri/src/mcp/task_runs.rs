@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::database::{CreateTaskRunInput, TaskRun};
-use crate::mcp::shared::emit_ai_output;
+use crate::mcp::shared::{emit_ai_output, AiSessionContext};
 use crate::mcp::types::ApiState;
 use crate::safe_lock::safe_lock_or_recover;
 use crate::summary_generator;
@@ -2409,15 +2409,15 @@ pub async fn send_message_to_session(
         }
     };
 
-    // Emit the user's message as an ai-output event so it appears in the conversation
-    let session_ctx = None;
+    // Build session context so the output event is associated with this task run
+    let session_ctx = AiSessionContext::setup(&id, "Ad-hoc Chat");
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         emit_ai_output(
             &state.app_handle,
             &req.message,
             "user_message",
             None,
-            session_ctx,
+            Some(&session_ctx),
         );
     }));
 
@@ -3037,12 +3037,15 @@ pub async fn create_ai_session(
         workflows, automation, code questions, or general topics."
         .to_string();
 
+    // Create session context so output is properly captured and associated
+    let session_ctx = AiSessionContext::setup(&task_run_id, &req.task_name);
+
     // Spawn the Claude session
     match crate::claude_session::ClaudeSession::spawn(
         &working_dir,
         &task_run_id,
         &state.app_handle,
-        None, // session_ctx
+        Some(session_ctx),
         None, // finding_ctx
         None, // progress_ctx
         None, // pid_tracker

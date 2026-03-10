@@ -1231,6 +1231,68 @@ fn build_compressed_iteration_history(
         sections_skipped += 1;
     }
 
+    // 7. UI Bridge error monitoring APIs
+    // Priority: LOW -- static reference content
+    if budget_remaining > 600 {
+        let mut em_lines = vec!["### UI Bridge Error Monitoring APIs".to_string()];
+        em_lines.push(String::new());
+        em_lines.push(
+            "When the target app is connected via UI Bridge SDK, these endpoints provide runtime error monitoring. \
+             Use them to detect console errors, network failures, and regressions introduced by code changes."
+                .to_string(),
+        );
+        em_lines.push(String::new());
+        em_lines.push("**Quick health check:**".to_string());
+        em_lines.push(
+            "- `curl http://localhost:9876/ui-bridge/sdk/console/health` — Returns a health score (0-100), status (healthy/degraded/broken), error breakdown by severity, and top issue. **Start here** to see if the app has problems.".to_string(),
+        );
+        em_lines.push(String::new());
+        em_lines.push("**Browser events & timeline:**".to_string());
+        em_lines.push(
+            "- `curl http://localhost:9876/ui-bridge/sdk/console/browser-events` — Recent browser console events. Query params: `severity` (crash|error|warning|noise), `deduplicate` (bool), `since` (timestamp), `limit` (number).".to_string(),
+        );
+        em_lines.push(
+            "- `curl http://localhost:9876/ui-bridge/sdk/console/timeline` — Interleaved action+error timeline. Query params: `since`, `limit`, `minSeverity`.".to_string(),
+        );
+        em_lines.push(
+            "- `curl http://localhost:9876/ui-bridge/sdk/console/network-chains` — Network request chains with error correlation. Query params: `failuresOnly` (bool), `limit`, `url` (pattern).".to_string(),
+        );
+        em_lines.push(String::new());
+        em_lines.push("**Error sessions (track errors around an action):**".to_string());
+        em_lines.push(
+            "- `curl -X POST http://localhost:9876/ui-bridge/sdk/console/error-sessions/start -d '{\"label\":\"my-action\"}'` — Start tracking. Call before performing an action.".to_string(),
+        );
+        em_lines.push(
+            "- `curl -X POST http://localhost:9876/ui-bridge/sdk/console/error-sessions/end` — End session and get a summary of errors captured during the session.".to_string(),
+        );
+        em_lines.push(
+            "- `curl http://localhost:9876/ui-bridge/sdk/console/error-sessions` — List all session summaries.".to_string(),
+        );
+        em_lines.push(String::new());
+        em_lines.push("**Error baselines (detect regressions):**".to_string());
+        em_lines.push(
+            "- `curl -X POST http://localhost:9876/ui-bridge/sdk/console/error-baselines/capture -d '{\"label\":\"before-fix\"}'` — Snapshot current errors as a baseline.".to_string(),
+        );
+        em_lines.push(
+            "- `curl -X POST http://localhost:9876/ui-bridge/sdk/console/error-baselines/compare -d '{\"label\":\"before-fix\"}'` — Compare current state against the baseline. Returns new errors (regressions) and fixed errors.".to_string(),
+        );
+        em_lines.push(String::new());
+        em_lines.push(
+            "**Workflow pattern:** Capture a baseline before making changes, then compare after to confirm you haven't introduced new errors.".to_string(),
+        );
+        let section = em_lines.join("\n");
+        let tokens = estimate_tokens(&section);
+        if tokens <= budget_remaining {
+            budget_remaining = budget_remaining.saturating_sub(tokens);
+            sections.push(section);
+            sections_included += 1;
+        } else {
+            sections_skipped += 1;
+        }
+    } else {
+        sections_skipped += 1;
+    }
+
     // Log budget summary
     let tokens_used = max_context_tokens.saturating_sub(budget_remaining);
     info!(
