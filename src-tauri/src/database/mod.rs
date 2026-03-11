@@ -7336,7 +7336,10 @@ impl CheckpointDb {
                 params![task_run_id],
                 |row| row.get(0),
             )
-            .unwrap_or(1);
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to get max chunk_sequence for {}: {} — defaulting to 1", task_run_id, e);
+                1
+            });
 
         tx.execute(
             "INSERT INTO task_run_output_chunks (task_run_id, chunk_sequence, content, created_at) VALUES (?, ?, ?, ?)",

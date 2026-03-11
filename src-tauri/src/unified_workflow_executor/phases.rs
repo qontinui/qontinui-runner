@@ -2982,6 +2982,13 @@ impl AgenticExecutor {
                 );
                 (prev_cli_id, true)
             }
+            Err(e) => {
+                warn!(
+                    "AGENTIC-PHASE: Failed to check for interrupted AI session: {} — starting fresh",
+                    e
+                );
+                (uuid::Uuid::new_v4().to_string(), false)
+            }
             _ => (uuid::Uuid::new_v4().to_string(), false),
         };
 
