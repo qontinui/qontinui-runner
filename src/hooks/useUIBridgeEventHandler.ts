@@ -238,6 +238,18 @@ function serializeComponent(component: RegisteredComponent): SerializedComponent
 }
 
 /**
+ * Typed accessor for the global `window.__UI_BRIDGE__` object.
+ *
+ * Centralises the repeated cast so callers get a typed record (or undefined)
+ * without duplicating the `as unknown as Record<…>` dance everywhere.
+ */
+function getUIBridgeGlobal(): Record<string, unknown> | undefined {
+  return (window as unknown as Record<string, unknown>).__UI_BRIDGE__ as
+    | Record<string, unknown>
+    | undefined;
+}
+
+/**
  * Hook that handles UI Bridge requests from Tauri events.
  *
  * This hook should be used inside the UIBridgeProvider to have access
@@ -469,8 +481,7 @@ export function useUIBridgeEventHandler(): void {
             const snapshot: BridgeSnapshot = await currentBridge.createSnapshotAsync();
 
             // Enrich with page context, modals, and toasts from trackers if available
-            const w = window as unknown as Record<string, unknown>;
-            const uiBridgeGlobal = w.__UI_BRIDGE__ as Record<string, unknown> | undefined;
+            const uiBridgeGlobal = getUIBridgeGlobal();
             const navTracker = uiBridgeGlobal?.navigationTracker as
               | { getSnapshotPageContext: () => unknown }
               | undefined;
@@ -526,8 +537,7 @@ export function useUIBridgeEventHandler(): void {
           }
 
           case "get_console_errors": {
-            const w = window as unknown as Record<string, unknown>;
-            const bridge = w.__UI_BRIDGE__ as Record<string, unknown> | undefined;
+            const bridge = getUIBridgeGlobal();
             const capture = bridge?.consoleCapture as
               | {
                   getSince: (ts: number) => unknown[];
@@ -562,8 +572,7 @@ export function useUIBridgeEventHandler(): void {
           }
 
           case "clear_console_errors": {
-            const w2 = window as unknown as Record<string, unknown>;
-            const bridge2 = w2.__UI_BRIDGE__ as Record<string, unknown> | undefined;
+            const bridge2 = getUIBridgeGlobal();
             const capture2 = bridge2?.consoleCapture as { clear: () => void } | undefined;
 
             if (capture2) {
@@ -1191,8 +1200,7 @@ export function useUIBridgeEventHandler(): void {
 
           // ========== Undo/Redo ==========
           case "get_undo_state": {
-            const w = window as unknown as Record<string, unknown>;
-            const uiBridgeGlobal = w.__UI_BRIDGE__ as Record<string, unknown> | undefined;
+            const uiBridgeGlobal = getUIBridgeGlobal();
             const undoTracker = uiBridgeGlobal?.undoTracker as
               | { getSnapshotUndoContext: () => unknown }
               | undefined;
@@ -1307,8 +1315,7 @@ export function useUIBridgeEventHandler(): void {
 
           // ========== Keyboard Shortcuts ==========
           case "get_keyboard_shortcuts": {
-            const w = window as unknown as Record<string, unknown>;
-            const uiBridgeGlobal = w.__UI_BRIDGE__ as Record<string, unknown> | undefined;
+            const uiBridgeGlobal = getUIBridgeGlobal();
             const tracker = uiBridgeGlobal?.shortcutTracker as
               | { getSnapshotShortcutContext: () => unknown }
               | undefined;
@@ -1357,8 +1364,7 @@ export function useUIBridgeEventHandler(): void {
             const confidenceThreshold = payload.params?.confidenceThreshold as number | undefined;
 
             // Auto-detect active modal for context-aware scoring
-            const w = window as unknown as Record<string, unknown>;
-            const uiBridgeGlobal = w.__UI_BRIDGE__ as Record<string, unknown> | undefined;
+            const uiBridgeGlobal = getUIBridgeGlobal();
             const modalDet = uiBridgeGlobal?.modalDetector as
               | { detect: () => { modals: Array<{ id: string }> } }
               | undefined;
@@ -1454,6 +1460,14 @@ export function useUIBridgeEventHandler(): void {
       isMounted = false;
       if (unlisten) {
         unlisten();
+      }
+      if (networkTrackerRef.current) {
+        networkTrackerRef.current.destroy();
+        networkTrackerRef.current = null;
+      }
+      if (idleDetectorRef.current) {
+        idleDetectorRef.current.destroy();
+        idleDetectorRef.current = null;
       }
     };
   }, [handleRequest]);

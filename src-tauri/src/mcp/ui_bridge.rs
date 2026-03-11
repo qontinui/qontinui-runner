@@ -1580,6 +1580,9 @@ fn capture_monitor_screenshot(
     }
 
     let monitor = if let Some(idx) = monitor_index {
+        if idx < 0 {
+            return Err(format!("Monitor index must be non-negative, got {}", idx));
+        }
         monitors
             .into_iter()
             .nth(idx as usize)

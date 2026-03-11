@@ -56,19 +56,34 @@ export async function handleChangeTrackingCommand(
   deps: ChangeTrackingDeps,
 ): Promise<unknown> {
   switch (type) {
-    case "save_bookmark":
-      return ct.saveBookmark(payload.name as string);
+    case "save_bookmark": {
+      if (typeof payload.name !== "string") {
+        throw new Error("save_bookmark requires a 'name' parameter");
+      }
+      return ct.saveBookmark(payload.name);
+    }
     case "get_bookmark": {
-      const bm = ct.getBookmark(payload.name as string);
+      if (typeof payload.name !== "string") {
+        throw new Error("get_bookmark requires a 'name' parameter");
+      }
+      const bm = ct.getBookmark(payload.name);
       if (!bm) throw new Error(`Bookmark '${payload.name}' not found`);
       return bm;
     }
-    case "delete_bookmark":
-      return { deleted: ct.deleteBookmark(payload.name as string) };
+    case "delete_bookmark": {
+      if (typeof payload.name !== "string") {
+        throw new Error("delete_bookmark requires a 'name' parameter");
+      }
+      return { deleted: ct.deleteBookmark(payload.name) };
+    }
     case "list_bookmarks":
       return ct.listBookmarks();
-    case "diff_from_bookmark":
-      return ct.diffFromBookmark(payload.name as string);
+    case "diff_from_bookmark": {
+      if (typeof payload.name !== "string") {
+        throw new Error("diff_from_bookmark requires a 'name' parameter");
+      }
+      return ct.diffFromBookmark(payload.name);
+    }
     case "execute_with_diff":
       return ct.executeWithDiff(payload);
     case "wait_for_change": {

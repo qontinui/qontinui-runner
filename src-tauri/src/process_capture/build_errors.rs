@@ -127,7 +127,6 @@ pub fn analyze_process_output(
     let stderr_text = stderr_lines.join("\n");
 
     let mut errors = Vec::new();
-    let mut matched_line_indices = std::collections::HashSet::new();
 
     // Try each parser in order of specificity
 
@@ -151,10 +150,9 @@ pub fn analyze_process_output(
     // 2. ESLint errors (need to track the current file header)
     {
         let mut current_file: Option<String> = None;
-        for (idx, line) in stderr_lines.iter().enumerate() {
+        for line in &stderr_lines {
             if let Some(caps) = ESLINT_FILE.captures(line) {
                 current_file = Some(caps[1].to_string());
-                matched_line_indices.insert(idx);
             } else if let Some(caps) = ESLINT_ERROR.captures(line) {
                 let severity = if &caps[3] == "warning" {
                     "warning"
@@ -170,7 +168,6 @@ pub fn analyze_process_output(
                     severity,
                     tool: "ESLint",
                 });
-                matched_line_indices.insert(idx);
             }
         }
     }
@@ -178,14 +175,13 @@ pub fn analyze_process_output(
     // 3. Next.js errors (file path on one line, error on next)
     {
         let mut nextjs_file: Option<(String, Option<u32>, Option<u32>)> = None;
-        for (idx, line) in stderr_lines.iter().enumerate() {
+        for line in &stderr_lines {
             if let Some(caps) = NEXTJS_FILE_ERROR.captures(line) {
                 nextjs_file = Some((
                     caps[1].to_string(),
                     caps.get(2).and_then(|m| m.as_str().parse().ok()),
                     caps.get(3).and_then(|m| m.as_str().parse().ok()),
                 ));
-                matched_line_indices.insert(idx);
             } else if let Some(caps) = NEXTJS_TYPE_ERROR.captures(line) {
                 if let Some((ref file, ref ln, ref col)) = nextjs_file {
                     errors.push(BuildError {
@@ -197,7 +193,6 @@ pub fn analyze_process_output(
                         severity: "error",
                         tool: "Next.js",
                     });
-                    matched_line_indices.insert(idx);
                     nextjs_file = None;
                 }
             }
