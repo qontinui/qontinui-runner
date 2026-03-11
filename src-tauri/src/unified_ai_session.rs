@@ -87,6 +87,12 @@ pub struct AiSessionConfig {
     pub temperature_override: Option<f32>,
     /// Optional max output tokens override for API providers.
     pub max_tokens_override: Option<u32>,
+    /// Optional CLI session context for restart survival.
+    /// When set, the Claude CLI will be invoked with --session-id or --resume.
+    pub cli_session_ctx: Option<crate::claude_session::runner::CliSessionContext>,
+    /// Optional DB flush context for periodic output persistence.
+    /// When set, AI output is periodically flushed to the database during execution.
+    pub db_flush_ctx: Option<crate::claude_session::runner::DbFlushContext>,
 }
 
 impl AiSessionConfig {
@@ -112,6 +118,8 @@ impl AiSessionConfig {
             model_override: None,
             temperature_override: None,
             max_tokens_override: None,
+            cli_session_ctx: None,
+            db_flush_ctx: None,
         }
     }
 
@@ -137,6 +145,8 @@ impl AiSessionConfig {
             model_override: None,
             temperature_override: None,
             max_tokens_override: None,
+            cli_session_ctx: None,
+            db_flush_ctx: None,
         }
     }
 
@@ -163,6 +173,8 @@ impl AiSessionConfig {
             model_override: None,
             temperature_override: None,
             max_tokens_override: None,
+            cli_session_ctx: None,
+            db_flush_ctx: None,
         }
     }
 
@@ -637,6 +649,8 @@ impl UnifiedAiSessionExecutor {
         let reflection_fix_ctx = config.reflection_fix_ctx.clone();
         let step_injection_ctx = config.step_injection_ctx.clone();
         let model_override = config.model_override.clone();
+        let cli_session_ctx = config.cli_session_ctx.clone();
+        let db_flush_ctx = config.db_flush_ctx.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             let doctor_ref = doctor_handle.as_ref();
@@ -681,6 +695,8 @@ impl UnifiedAiSessionExecutor {
                     model_override.as_deref(),
                     inline_session_manager.as_ref(),
                     Some(&task_run_id_for_claude),
+                    cli_session_ctx.as_ref(),
+                    db_flush_ctx.as_ref(),
                 )
             }
         })

@@ -27,6 +27,36 @@ use crate::step_injection::parser::InjectedStepParser;
 use crate::step_injection::types::StepInjectionContext;
 use crate::workflow_state::{ParsedProgress, ProgressParser};
 
+/// Context for periodic flushing of AI output to the database during a session.
+/// When provided, the runner will flush accumulated output every ~30 seconds
+/// so that output survives runner restarts.
+#[derive(Clone)]
+pub struct DbFlushContext {
+    pub db: Arc<CheckpointDb>,
+    pub task_run_id: String,
+    pub iteration: i32,
+}
+
+impl std::fmt::Debug for DbFlushContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbFlushContext")
+            .field("task_run_id", &self.task_run_id)
+            .field("iteration", &self.iteration)
+            .finish()
+    }
+}
+
+/// Context for tracking the Claude CLI session ID.
+/// When provided, the runner will pass `--session-id <uuid>` to the CLI
+/// so the session can be resumed with `--resume <uuid>` after a restart.
+#[derive(Clone, Debug)]
+pub struct CliSessionContext {
+    pub cli_session_id: String,
+    /// If true, pass `--resume <cli_session_id>` instead of `--session-id`.
+    /// Used when resuming a previously interrupted session.
+    pub is_resume: bool,
+}
+
 #[cfg(target_os = "windows")]
 use std::os::windows::io::AsRawHandle;
 
@@ -180,6 +210,8 @@ fn run_claude_session_inline(
     model_override: Option<&str>,
     session_manager: Option<&Arc<crate::claude_session::SessionManager>>,
     task_run_id: Option<&str>,
+    cli_session_ctx: Option<&CliSessionContext>,
+    db_flush_ctx: Option<&DbFlushContext>,
 ) -> Result<(bool, String, Vec<ExecutionStepConfig>), String> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -231,6 +263,27 @@ fn run_claude_session_inline(
         cli_args.push("--model");
         cli_args.push(&model_flag);
         info!("Using model override for session {}: {}", session_id, model);
+    }
+    // Add CLI session ID for restart survival.
+    // --session-id sets the ID for a new session; --resume resumes a previous one.
+    let cli_session_id_str;
+    if let Some(ctx) = cli_session_ctx {
+        cli_session_id_str = ctx.cli_session_id.clone();
+        if ctx.is_resume {
+            cli_args.push("--resume");
+            cli_args.push(&cli_session_id_str);
+            info!(
+                "Resuming Claude CLI session {} for runner session {}",
+                cli_session_id_str, session_id
+            );
+        } else {
+            cli_args.push("--session-id");
+            cli_args.push(&cli_session_id_str);
+            info!(
+                "Using Claude CLI session ID {} for runner session {}",
+                cli_session_id_str, session_id
+            );
+        }
     }
     let mut cmd = crate::process_helpers::cmd_no_window();
     cmd.args(&cli_args)
@@ -401,6 +454,54 @@ fn run_claude_session_inline(
     // thread hangs (e.g., on Windows when child processes hold pipe handles open).
     let shared_output_buf = Arc::new(std::sync::Mutex::new(String::new()));
     let shared_output_for_thread = shared_output_buf.clone();
+
+    // DB flush thread — periodically writes accumulated AI output to the database
+    // so that output survives runner restarts. Only active when db_flush_ctx is provided.
+    let shared_output_for_flush = shared_output_buf.clone();
+    let session_done_flush = session_done.clone();
+    let (flush_stop_tx, flush_stop_rx) = mpsc::channel::<()>();
+    let db_flush_handle = if let Some(flush_ctx) = db_flush_ctx {
+        let db = flush_ctx.db.clone();
+        let task_run_id = flush_ctx.task_run_id.clone();
+        let iteration = flush_ctx.iteration;
+        let flush_buf = shared_output_for_flush;
+        Some(thread::spawn(move || {
+            let mut last_flushed_len = 0usize;
+            loop {
+                // Wait 30 seconds or until stopped
+                match flush_stop_rx.recv_timeout(Duration::from_secs(30)) {
+                    Ok(()) => break, // Stop signal
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {} // Time to flush
+                }
+                if session_done_flush.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Read current output length
+                let current_len = flush_buf.lock().map(|buf| buf.len()).unwrap_or(0);
+                // Only flush if there's new content (at least 1KB of new data)
+                if current_len > last_flushed_len && (current_len - last_flushed_len) >= 1024 {
+                    let output_snapshot =
+                        flush_buf.lock().map(|buf| buf.clone()).unwrap_or_default();
+                    if !output_snapshot.is_empty() {
+                        if let Err(e) =
+                            db.flush_partial_ai_output(&task_run_id, &output_snapshot, iteration)
+                        {
+                            warn!("Failed to flush partial AI output: {}", e);
+                        } else {
+                            last_flushed_len = output_snapshot.len();
+                            debug!(
+                                "Flushed {} chars of partial AI output for iteration {}",
+                                last_flushed_len, iteration
+                            );
+                        }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     let stdout_handle = thread::spawn(move || {
         let mut all_text = String::new();
@@ -1122,6 +1223,10 @@ fn run_claude_session_inline(
             session_done.store(true, Ordering::Relaxed);
             let _ = stop_tx.send(());
             let _ = heartbeat_handle.join();
+            let _ = flush_stop_tx.send(());
+            if let Some(handle) = db_flush_handle {
+                let _ = handle.join();
+            }
             let _ = std::fs::remove_file(&prompt_file);
             remove_pid(&pid_tracker);
             return Err(format!("Failed to wait for Claude: {}", e));
@@ -1135,6 +1240,12 @@ fn run_claude_session_inline(
     // Cleanup
     let _ = stop_tx.send(());
     let _ = heartbeat_handle.join();
+
+    // Stop the DB flush thread
+    let _ = flush_stop_tx.send(());
+    if let Some(handle) = db_flush_handle {
+        let _ = handle.join();
+    }
 
     // On Windows, close the stdout pipe's read end now that the process has exited.
     // This unblocks the reader thread immediately if child processes are still
@@ -1313,6 +1424,8 @@ pub fn run_claude_session_with_retry(
     model_override: Option<&str>,
     session_manager: Option<&Arc<crate::claude_session::SessionManager>>,
     task_run_id: Option<&str>,
+    cli_session_ctx: Option<&CliSessionContext>,
+    db_flush_ctx: Option<&DbFlushContext>,
 ) -> Result<(bool, String, Option<RetryState>, Vec<ExecutionStepConfig>), String> {
     use std::thread;
     use std::time::Duration;
@@ -1336,6 +1449,8 @@ pub fn run_claude_session_with_retry(
                 model_override,
                 session_manager,
                 task_run_id,
+                cli_session_ctx,
+                db_flush_ctx,
             )?;
             return Ok((result.0, result.1, None, result.2));
         }
@@ -1380,6 +1495,8 @@ pub fn run_claude_session_with_retry(
             model_override,
             session_manager,
             task_run_id,
+            cli_session_ctx,
+            db_flush_ctx,
         );
 
         match result {

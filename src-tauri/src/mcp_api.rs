@@ -180,6 +180,16 @@ pub fn create_router(
         // Small delay to let the server fully start
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
+        // Mark any AI sessions from the previous runner instance as interrupted.
+        // This must happen before resume so the resume logic can detect interrupted sessions.
+        if let Err(e) = state_for_resume
+            .app_state
+            .checkpoint_db
+            .mark_running_ai_sessions_interrupted()
+        {
+            warn!("Failed to mark interrupted AI sessions on startup: {}", e);
+        }
+
         // Note: We no longer use global_auto_continue here.
         // Each workflow's per-task auto_continue setting determines whether it gets resumed.
         // The global setting is now only used for the UI toggle, not startup resume logic.

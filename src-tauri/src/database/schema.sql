@@ -2632,3 +2632,30 @@ CREATE TABLE IF NOT EXISTS state_machine_transitions (
 CREATE INDEX IF NOT EXISTS idx_sm_transitions_config_id ON state_machine_transitions(config_id);
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (93, datetime('now'));
+
+-- =============================================================================
+-- Workflow AI Sessions (Phase 94: Workflow Restart Survival)
+-- =============================================================================
+-- Tracks Claude CLI sessions spawned during workflow execution.
+-- Stores the CLI session ID so workflows can be resumed after runner restarts
+-- using `claude --resume <session-id>`.
+
+CREATE TABLE IF NOT EXISTS workflow_ai_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_run_id TEXT NOT NULL,
+    iteration INTEGER NOT NULL,
+    phase TEXT NOT NULL,                    -- 'setup', 'agentic', 'completion'
+    stage_index INTEGER,
+    claude_cli_session_id TEXT,            -- UUID passed via --session-id to Claude CLI
+    session_started_at TEXT NOT NULL,
+    session_completed_at TEXT,
+    output_length INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'running', -- 'running', 'completed', 'failed', 'interrupted'
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_wf_ai_sessions_task_run ON workflow_ai_sessions(task_run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wf_ai_sessions_unique
+    ON workflow_ai_sessions(task_run_id, iteration, phase, COALESCE(stage_index, -1));
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (94, datetime('now'));

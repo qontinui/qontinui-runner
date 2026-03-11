@@ -537,6 +537,8 @@ impl PromptStepHandler {
                 None, // model_override
                 None, // session_manager — no inline PID tracking for step executor
                 None, // task_run_id
+                None, // cli_session_ctx — not needed for step executor
+                None, // db_flush_ctx — not needed for step executor
             )
         })
         .await;

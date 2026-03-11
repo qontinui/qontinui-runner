@@ -2966,6 +2966,48 @@ impl AgenticExecutor {
                 .with_checkpoint_id(&checkpoint.id)
                 .with_model_override(agentic_model);
 
+        // CLI session context for restart survival.
+        // Check if there's an interrupted session we can resume via `--resume`.
+        // If so, reuse its CLI session ID; otherwise generate a fresh one.
+        let parent_task_id = super::get_parent_task_id(&config.execution_id);
+        let (cli_session_id, is_resume) = match self.checkpoint_db.get_workflow_ai_session(
+            &parent_task_id,
+            iteration as i32,
+            "agentic",
+        ) {
+            Ok(Some((prev_cli_id, prev_status))) if prev_status == "interrupted" => {
+                info!(
+                    "AGENTIC-PHASE: Found interrupted CLI session {} for iteration {} — will resume",
+                    prev_cli_id, iteration
+                );
+                (prev_cli_id, true)
+            }
+            _ => (uuid::Uuid::new_v4().to_string(), false),
+        };
+
+        ai_config.cli_session_ctx = Some(crate::claude_session::runner::CliSessionContext {
+            cli_session_id: cli_session_id.clone(),
+            is_resume,
+        });
+
+        // Record the AI session in the database for restart recovery
+        if let Err(e) = self.checkpoint_db.create_workflow_ai_session(
+            &parent_task_id,
+            iteration as i32,
+            "agentic",
+            config.stage_index.map(|i| i as i32),
+            &cli_session_id,
+        ) {
+            warn!("Failed to create workflow AI session record: {}", e);
+        }
+
+        // Attach DB flush context for periodic output persistence
+        ai_config.db_flush_ctx = Some(crate::claude_session::runner::DbFlushContext {
+            db: self.checkpoint_db.clone(),
+            task_run_id: parent_task_id.clone(),
+            iteration: iteration as i32,
+        });
+
         // Attach reflection fix context if this is a reflection workflow
         if let Some(ref ctx) = self.reflection_fix_ctx {
             ai_config = ai_config.with_reflection_fix_ctx(ctx.clone());
@@ -2976,13 +3018,73 @@ impl AgenticExecutor {
             ai_config = ai_config.with_step_injection_ctx(ctx.clone());
         }
 
-        let (result, duration_ms) = timeout_helper::timed_result_async(self.ai_executor.execute(
+        // When resuming an interrupted CLI session, send a brief continuation message
+        // instead of the full prompt. The CLI already has the full conversation history.
+        let resume_prompt = if is_resume {
+            let resume_msg = format!(
+                "The runner was restarted while you were working on iteration {}. \
+                 Your previous Claude Code session has been resumed — you have full context \
+                 of everything you did before the interruption. \
+                 Continue where you left off. Complete the remaining work for this iteration.",
+                iteration
+            );
+            info!(
+                "AGENTIC-PHASE: Using resume prompt ({} chars) instead of full prompt ({} chars)",
+                resume_msg.len(),
+                enhanced_prompt.len()
+            );
+            Some(resume_msg)
+        } else {
+            None
+        };
+        let final_prompt = resume_prompt.as_deref().unwrap_or(&enhanced_prompt);
+
+        let (mut result, duration) = timeout_helper::timed_result_async(self.ai_executor.execute(
             &ai_config,
-            &enhanced_prompt,
+            final_prompt,
             logger,
         ))
         .await;
-        let duration_ms = duration_ms as i64;
+        let mut duration_ms = duration as i64;
+
+        // Fallback: if --resume failed, retry with a fresh session.
+        // This handles cases where the CLI session was not persisted, expired, or corrupted.
+        // We check for failure regardless of output content, since the CLI may emit
+        // error text (e.g., "Error: session not found") as non-empty output.
+        if is_resume && !result.success {
+            warn!(
+                "AGENTIC-PHASE: CLI session resume failed (error: {}, output_len: {}). Falling back to fresh session.",
+                result.error,
+                result.output.len()
+            );
+            // Create a fresh CLI session
+            let fresh_cli_id = uuid::Uuid::new_v4().to_string();
+            ai_config.cli_session_ctx = Some(crate::claude_session::runner::CliSessionContext {
+                cli_session_id: fresh_cli_id.clone(),
+                is_resume: false,
+            });
+            // Update the DB record with the new session ID
+            if let Err(e) = self.checkpoint_db.create_workflow_ai_session(
+                &parent_task_id,
+                iteration as i32,
+                "agentic",
+                config.stage_index.map(|i| i as i32),
+                &fresh_cli_id,
+            ) {
+                warn!(
+                    "Failed to create fallback workflow AI session record: {}",
+                    e
+                );
+            }
+            // Retry with the full enhanced prompt
+            let (retry_result, retry_duration) = timeout_helper::timed_result_async(
+                self.ai_executor
+                    .execute(&ai_config, &enhanced_prompt, logger),
+            )
+            .await;
+            result = retry_result;
+            duration_ms = retry_duration as i64;
+        }
 
         // Checkpoint completion
         let mut completion_checkpoint = StepCheckpoint::new(
@@ -3035,6 +3137,34 @@ impl AgenticExecutor {
 
         if let Err(e) = checkpoint_mgr.save_step(&completion_checkpoint) {
             warn!("Failed to save agentic step completion checkpoint: {}", e);
+        }
+
+        // Mark the workflow AI session as completed/failed and clean up partial output
+        {
+            let session_status = match &outcome {
+                AgenticOutcome::Success { .. } => "completed",
+                AgenticOutcome::Failed { .. } => "failed",
+                AgenticOutcome::Error { .. } => "failed",
+                AgenticOutcome::Skipped => "completed",
+            };
+            let output_len = outcome.output().map(|o| o.len() as i64).unwrap_or(0);
+            if let Err(e) = self.checkpoint_db.complete_workflow_ai_session(
+                &parent_task_id,
+                iteration as i32,
+                "agentic",
+                config.stage_index.map(|i| i as i32),
+                session_status,
+                output_len,
+            ) {
+                warn!("Failed to complete workflow AI session: {}", e);
+            }
+            // Delete the partial in-progress output now that final output will be written
+            if let Err(e) = self
+                .checkpoint_db
+                .delete_partial_ai_output(&parent_task_id, iteration as i32)
+            {
+                warn!("Failed to delete partial AI output: {}", e);
+            }
         }
 
         // Emit completion event so the Active Dashboard timeline shows agentic phase result

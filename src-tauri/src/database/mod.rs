@@ -6089,6 +6089,38 @@ impl CheckpointDb {
             info!("Successfully migrated to version 93 (state machine config builder tables)");
         }
 
+        // Migration 94: Workflow AI Sessions table for restart survival
+        if current_version < 94 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS workflow_ai_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_run_id TEXT NOT NULL,
+                    iteration INTEGER NOT NULL,
+                    phase TEXT NOT NULL,
+                    stage_index INTEGER,
+                    claude_cli_session_id TEXT,
+                    session_started_at TEXT NOT NULL,
+                    session_completed_at TEXT,
+                    output_length INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_wf_ai_sessions_task_run ON workflow_ai_sessions(task_run_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_wf_ai_sessions_unique
+                    ON workflow_ai_sessions(task_run_id, iteration, phase, COALESCE(stage_index, -1));
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (94, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 94: {}", e))?;
+
+            info!(
+                "Successfully migrated to version 94 (workflow AI sessions for restart survival)"
+            );
+        }
+
         Ok(())
     }
 
@@ -7126,6 +7158,224 @@ impl CheckpointDb {
         increment_session: bool,
     ) -> Result<bool, String> {
         self.append_task_output_ex(id, output, increment_session, true)
+    }
+
+    // ========================================================================
+    // Workflow AI Sessions (restart survival)
+    // ========================================================================
+
+    /// Create a new workflow AI session record.
+    /// Called when a Claude CLI subprocess is spawned for a workflow phase.
+    pub fn create_workflow_ai_session(
+        &self,
+        task_run_id: &str,
+        iteration: i32,
+        phase: &str,
+        stage_index: Option<i32>,
+        claude_cli_session_id: &str,
+    ) -> Result<i64, String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            INSERT INTO workflow_ai_sessions
+                (task_run_id, iteration, phase, stage_index, claude_cli_session_id, session_started_at, status)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running')
+            ON CONFLICT (task_run_id, iteration, phase, COALESCE(stage_index, -1))
+            DO UPDATE SET
+                claude_cli_session_id = ?5,
+                session_started_at = ?6,
+                session_completed_at = NULL,
+                output_length = 0,
+                status = 'running'
+            "#,
+            params![task_run_id, iteration, phase, stage_index, claude_cli_session_id, now],
+        )
+        .map_err(|e| format!("Failed to create workflow AI session: {}", e))?;
+
+        let row_id = conn.last_insert_rowid();
+        info!(
+            "Created workflow AI session: task={}, iter={}, phase={}, cli_session={}",
+            task_run_id, iteration, phase, claude_cli_session_id
+        );
+        Ok(row_id)
+    }
+
+    /// Mark a workflow AI session as completed, failed, or interrupted.
+    pub fn complete_workflow_ai_session(
+        &self,
+        task_run_id: &str,
+        iteration: i32,
+        phase: &str,
+        stage_index: Option<i32>,
+        status: &str,
+        output_length: i64,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE workflow_ai_sessions
+            SET status = ?1, session_completed_at = ?2, output_length = ?3
+            WHERE task_run_id = ?4 AND iteration = ?5 AND phase = ?6
+              AND COALESCE(stage_index, -1) = COALESCE(?7, -1)
+            "#,
+            params![
+                status,
+                now,
+                output_length,
+                task_run_id,
+                iteration,
+                phase,
+                stage_index
+            ],
+        )
+        .map_err(|e| format!("Failed to complete workflow AI session: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get the most recent AI session for a task run, filtered by phase and iteration.
+    /// Returns (claude_cli_session_id, status) if found.
+    pub fn get_workflow_ai_session(
+        &self,
+        task_run_id: &str,
+        iteration: i32,
+        phase: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        let conn = self.get_conn()?;
+
+        let result = conn.query_row(
+            r#"
+            SELECT claude_cli_session_id, status
+            FROM workflow_ai_sessions
+            WHERE task_run_id = ?1 AND iteration = ?2 AND phase = ?3
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+            params![task_run_id, iteration, phase],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        );
+
+        match result {
+            Ok(session) => Ok(Some(session)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get workflow AI session: {}", e)),
+        }
+    }
+
+    /// Mark all running workflow AI sessions as interrupted.
+    /// Called on startup to clean up sessions from a previous runner instance.
+    pub fn mark_running_ai_sessions_interrupted(&self) -> Result<usize, String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        let count = conn
+            .execute(
+                r#"
+                UPDATE workflow_ai_sessions
+                SET status = 'interrupted', session_completed_at = ?1
+                WHERE status = 'running'
+                "#,
+                params![now],
+            )
+            .map_err(|e| format!("Failed to mark AI sessions interrupted: {}", e))?;
+
+        if count > 0 {
+            info!(
+                "Marked {} running AI sessions as interrupted on startup",
+                count
+            );
+        }
+        Ok(count)
+    }
+
+    /// Flush partial AI output to task_run_output_chunks during a running session.
+    /// Uses a dedicated chunk_type marker so the final output can replace it.
+    pub fn flush_partial_ai_output(
+        &self,
+        task_run_id: &str,
+        output: &str,
+        iteration: i32,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+        let like_pattern = format!(
+            "\n--- AI Output (Iteration {} — in progress) ---%",
+            iteration
+        );
+        let formatted = format!(
+            "\n--- AI Output (Iteration {} — in progress) ---\n{}\n",
+            iteration, output
+        );
+
+        // Wrap DELETE + INSERT in a transaction so partial output is never lost
+        // if the runner crashes between the two operations.
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin flush transaction: {}", e))?;
+
+        // Delete any previous partial flush for this iteration
+        // (we always write the full accumulated output, not deltas)
+        tx.execute(
+            r#"
+            DELETE FROM task_run_output_chunks
+            WHERE task_run_id = ?1
+              AND content LIKE ?2
+            "#,
+            params![task_run_id, like_pattern],
+        )
+        .map_err(|e| format!("Failed to delete previous partial flush: {}", e))?;
+
+        // Insert the current partial output
+        let next_seq: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(chunk_sequence), 0) + 1 FROM task_run_output_chunks WHERE task_run_id = ?",
+                params![task_run_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(1);
+
+        tx.execute(
+            "INSERT INTO task_run_output_chunks (task_run_id, chunk_sequence, content, created_at) VALUES (?, ?, ?, ?)",
+            params![task_run_id, next_seq, formatted, now],
+        )
+        .map_err(|e| format!("Failed to flush partial AI output: {}", e))?;
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit flush transaction: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Delete partial (in-progress) output chunks for a given iteration.
+    /// Called when the final output is written, so the partial flush is replaced.
+    pub fn delete_partial_ai_output(
+        &self,
+        task_run_id: &str,
+        iteration: i32,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+
+        conn.execute(
+            r#"
+            DELETE FROM task_run_output_chunks
+            WHERE task_run_id = ?1
+              AND content LIKE ?2
+            "#,
+            params![
+                task_run_id,
+                format!(
+                    "\n--- AI Output (Iteration {} — in progress) ---%",
+                    iteration
+                )
+            ],
+        )
+        .map_err(|e| format!("Failed to delete partial AI output: {}", e))?;
+
+        Ok(())
     }
 
     /// Mark a task run as complete.

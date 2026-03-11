@@ -2233,55 +2233,19 @@ fn find_last_import_pos(content: &str) -> usize {
     last_import_end
 }
 
-const NEXTJS_API_ROUTE_TEMPLATE: &str = r#"import {
-  createNextRouteHandlers,
-  createHandlers,
-  type RegistryLike,
-  type ActionExecutorLike,
-} from '@qontinui/ui-bridge/server';
-import type { ControlSnapshot } from '@qontinui/ui-bridge/control';
+const NEXTJS_API_ROUTE_TEMPLATE: &str = r#"import { createUIBridgeHandler } from '@qontinui/ui-bridge/server';
 
-// Server-side UI Bridge API route.
-// This provides the endpoint structure for UI Bridge. The global registry
-// is populated by the UIBridgeProvider on the client side. For full control
-// API access (live snapshots, actions), use the runtime injection proxy.
-const registry: RegistryLike = {
-  getAllElements: () => [],
-  getElement: () => undefined,
-  getAllComponents: () => [],
-  getComponent: () => undefined,
-  createSnapshot: () =>
-    ({
-      timestamp: Date.now(),
-      elements: [],
-      components: [],
-      workflows: [],
-      activeRuns: [],
-    }) as unknown as ControlSnapshot,
-};
+// UI Bridge API route — zero-config setup.
+// Read operations return empty data; write operations (actions) return errors.
+// For full control API access (live snapshots, actions, AI search),
+// use the runtime injection proxy or implement a custom client-server relay.
+const handler = createUIBridgeHandler();
 
-const executor: ActionExecutorLike = {
-  executeAction: async () => ({
-    success: false,
-    error: 'Server-side action execution not available. Use the runtime injection proxy.',
-    timestamp: Date.now(),
-  }),
-  executeComponentAction: async () => ({
-    success: false,
-    error: 'Server-side action execution not available. Use the runtime injection proxy.',
-    timestamp: Date.now(),
-  }),
-};
-
-const handlers = createHandlers(registry, executor);
-const routeHandlers = createNextRouteHandlers(handlers);
-
-export const GET = routeHandlers.GET;
-export const POST = routeHandlers.POST;
-export const DELETE = routeHandlers.DELETE;
+export const GET = handler;
+export const POST = handler;
+export const DELETE = handler;
 
 export const dynamic = 'force-dynamic';
-export const runtime = 'nodejs';
 "#;
 
 const NEXTJS_RENDER_LOG_WRAPPER_TEMPLATE: &str = r#"'use client';
