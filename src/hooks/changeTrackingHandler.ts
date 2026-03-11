@@ -1,0 +1,154 @@
+/**
+ * Change Tracking Command Handler
+ *
+ * Extracted from useUIBridgeEventHandler.ts for testability.
+ * Dispatches snake_case change tracking commands to a ChangeTracker instance.
+ */
+
+// ---------------------------------------------------------------------------
+// Minimal interface describing the ChangeTracker methods used by dispatch.
+// ---------------------------------------------------------------------------
+
+export interface ChangeTrackerLike {
+  saveBookmark(name: string): unknown;
+  getBookmark(name: string): { snapshot: unknown } | null;
+  deleteBookmark(name: string): boolean;
+  listBookmarks(): unknown;
+  diffFromBookmark(name: string): unknown;
+  executeWithDiff(request: unknown): Promise<unknown>;
+  waitForChange(predicate: unknown, options?: unknown): Promise<unknown>;
+  categorizeLastDiff(): { diff: unknown } | null;
+  scopedDiffFromBookmark(bookmarkName: string, scope: string): unknown;
+  summarizeDiff(
+    diff: unknown,
+    options: {
+      budget: number;
+      includeIds?: boolean;
+      includeCategory?: boolean;
+    },
+  ): string;
+  enableBuffer(): void;
+  disableBuffer(): void;
+  drainBuffer(): unknown;
+  getBufferSize(): number;
+  isBufferEnabled(): boolean;
+}
+
+/** Dependencies needed only for the `structured_changes` command. */
+export interface ChangeTrackingDeps {
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  createSnapshot: (...args: any[]) => any;
+  createSnapshotManager: (...args: any[]) => any;
+  analyzeStructuredChanges: (...args: any[]) => any;
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+}
+
+/**
+ * Dispatch a snake_case change tracking command to the ChangeTracker.
+ *
+ * @returns The command result (varies per action).
+ * @throws On missing required parameters (e.g. bookmark name).
+ */
+export async function handleChangeTrackingCommand(
+  ct: ChangeTrackerLike,
+  type: string,
+  payload: Record<string, unknown>,
+  deps: ChangeTrackingDeps,
+): Promise<unknown> {
+  switch (type) {
+    case "save_bookmark":
+      return ct.saveBookmark(payload.name as string);
+    case "get_bookmark": {
+      const bm = ct.getBookmark(payload.name as string);
+      if (!bm) throw new Error(`Bookmark '${payload.name}' not found`);
+      return bm;
+    }
+    case "delete_bookmark":
+      return { deleted: ct.deleteBookmark(payload.name as string) };
+    case "list_bookmarks":
+      return ct.listBookmarks();
+    case "diff_from_bookmark":
+      return ct.diffFromBookmark(payload.name as string);
+    case "execute_with_diff":
+      return ct.executeWithDiff(payload);
+    case "wait_for_change": {
+      const wfcPayload = payload as {
+        predicate: unknown;
+        options?: unknown;
+      };
+      return ct.waitForChange(wfcPayload.predicate, wfcPayload.options);
+    }
+    case "categorize_last_diff":
+      return ct.categorizeLastDiff();
+    case "scoped_diff": {
+      const sdPayload = payload as { scope: string; fromBookmark?: string };
+      if (sdPayload.fromBookmark) {
+        return ct.scopedDiffFromBookmark(sdPayload.fromBookmark, sdPayload.scope);
+      }
+      return null;
+    }
+    case "summarize_diff": {
+      const sumBody = payload as {
+        budget: number;
+        includeIds?: boolean;
+        includeCategory?: boolean;
+        fromBookmark?: string;
+      };
+      let diff: unknown = null;
+      if (sumBody.fromBookmark) {
+        diff = ct.diffFromBookmark(sumBody.fromBookmark);
+      } else {
+        diff = ct.categorizeLastDiff()?.diff ?? null;
+      }
+      if (!diff) {
+        return { summary: "No changes detected" };
+      }
+      return {
+        summary: ct.summarizeDiff(diff, {
+          budget: sumBody.budget,
+          includeIds: sumBody.includeIds,
+          includeCategory: sumBody.includeCategory,
+        }),
+      };
+    }
+    case "structured_changes": {
+      const scPayload = payload as { fromBookmark?: string };
+      if (scPayload?.fromBookmark) {
+        const bm = ct.getBookmark(scPayload.fromBookmark);
+        if (!bm) throw new Error(`Bookmark '${scPayload.fromBookmark}' not found`);
+        const snap = deps.createSnapshot();
+        const mgr = deps.createSnapshotManager({});
+        const currentSemantic = mgr.createSnapshot({
+          timestamp: Date.now(),
+          elements: snap.elements.map((e) => ({
+            id: e.id,
+            type: e.type,
+            label: e.label ?? "",
+            actions: e.actions,
+            state: e.state,
+          })),
+          components: [],
+          workflows: [],
+          activeRuns: [],
+        });
+        return deps.analyzeStructuredChanges(bm.snapshot, currentSemantic);
+      }
+      return { hasStructuredData: false, tableChanges: [], listChanges: [] };
+    }
+    case "enable_change_buffer":
+      ct.enableBuffer();
+      return { enabled: true };
+    case "disable_change_buffer":
+      ct.disableBuffer();
+      return { enabled: false };
+    case "drain_change_buffer":
+      return ct.drainBuffer();
+    case "get_change_buffer_size":
+      return {
+        size: ct.getBufferSize(),
+        enabled: ct.isBufferEnabled(),
+      };
+    default:
+      return undefined;
+  }
+}

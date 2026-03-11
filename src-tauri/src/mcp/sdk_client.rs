@@ -20,7 +20,7 @@ use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::types::{ApiResponse, ApiState};
 use super::ui_bridge::ui_bridge_request_sync;
@@ -1265,93 +1265,26 @@ async fn handle_check_health(State(state): State<Arc<ApiState>>) -> Json<serde_j
 // Screenshot Capture
 // =============================================================================
 
-/// Query parameters for screenshot capture
-#[derive(Debug, Deserialize)]
-struct ScreenshotQuery {
-    /// Monitor index (0-based), None for primary monitor
-    #[serde(default)]
-    monitor: Option<i32>,
-}
-
-/// Screenshot capture response data
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScreenshotData {
-    /// Base64 encoded PNG screenshot data
-    screenshot: String,
-    /// Screenshot width in pixels
-    width: i32,
-    /// Screenshot height in pixels
-    height: i32,
-    /// Monitor that was captured
-    #[serde(skip_serializing_if = "Option::is_none")]
-    monitor: Option<i32>,
-}
-
-/// GET /ui-bridge/sdk/screenshot — Capture screenshot of the app's monitor
+/// GET /ui-bridge/sdk/screenshot — Capture screenshot for SDK app
 ///
-/// Since SDK apps (browser-based) cannot take screenshots of their own window
-/// due to browser security restrictions, this endpoint uses the runner's
-/// Python IPC screenshot capture infrastructure to capture the monitor where
-/// the SDK app is running.
+/// Uses xcap for native screen capture. Supports window-specific and monitor capture.
+/// Same query parameters as the control screenshot endpoint.
 ///
 /// Query parameters:
+/// - `window_title`: Case-insensitive substring match on window title
+/// - `app_name`: Case-insensitive substring match on app name
+/// - `window_id`: Exact window ID (HWND)
 /// - `monitor`: Monitor index (0-based). If not provided, captures the primary monitor.
 async fn handle_screenshot(
     State(state): State<Arc<ApiState>>,
-    Query(query): Query<ScreenshotQuery>,
-) -> Json<ApiResponse<ScreenshotData>> {
-    info!(
-        monitor = ?query.monitor,
-        "SDK screenshot: Capturing monitor screenshot for SDK app"
-    );
-
-    // Use the existing IPC-based screenshot capture from misc.rs
-    match super::misc::capture_screenshot_ipc(state.app_state.clone(), query.monitor, "png").await {
-        Ok(capture_data) => {
-            // Extract base64 data, width, and height from the IPC response
-            let screenshot_base64 = match capture_data
-                .get("screenshot_base64")
-                .and_then(|s| s.as_str())
-            {
-                Some(s) => s.to_string(),
-                None => {
-                    error!("SDK screenshot: No screenshot_base64 in IPC response");
-                    return Json(ApiResponse::error(
-                        "Screenshot captured but no image data returned",
-                    ));
-                }
-            };
-
-            let width = capture_data
-                .get("width")
-                .and_then(|w| w.as_i64())
-                .unwrap_or(0) as i32;
-            let height = capture_data
-                .get("height")
-                .and_then(|h| h.as_i64())
-                .unwrap_or(0) as i32;
-
-            info!(
-                "SDK screenshot: Captured {}x{} from monitor {:?}",
-                width, height, query.monitor
-            );
-
-            Json(ApiResponse::success(ScreenshotData {
-                screenshot: screenshot_base64,
-                width,
-                height,
-                monitor: query.monitor,
-            }))
-        }
-        Err(e) => {
-            error!("SDK screenshot: Failed to capture: {}", e);
-            Json(ApiResponse::error(format!(
-                "Screenshot capture failed: {}. Ensure the Python executor is running.",
-                e
-            )))
-        }
-    }
+    Query(query): Query<super::ui_bridge::AnnotatedScreenshotQuery>,
+) -> Json<ApiResponse<super::ui_bridge::AnnotatedScreenshotData>> {
+    // Delegate to the control screenshot handler (same xcap-based implementation)
+    super::ui_bridge::ui_bridge_annotated_screenshot_handler(
+        axum::extract::State(state),
+        axum::extract::Query(query),
+    )
+    .await
 }
 
 // =============================================================================
@@ -2068,6 +2001,34 @@ async fn handle_ct_get_change_buffer_size(
 }
 
 // =============================================================================
+// Undo/Redo Awareness
+// =============================================================================
+
+/// GET /ui-bridge/sdk/undo-state — Get undo/redo state
+async fn handle_undo_state(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/undo-state", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/undo — Execute undo
+async fn handle_undo(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/undo", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/redo — Execute redo
+async fn handle_redo(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/redo", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
 // Router
 // =============================================================================
 
@@ -2304,6 +2265,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/ai/change-buffer/size",
             get(handle_ct_get_change_buffer_size),
         )
+        // Undo/Redo awareness
+        .route("/ui-bridge/sdk/undo-state", get(handle_undo_state))
+        .route("/ui-bridge/sdk/undo", post(handle_undo))
+        .route("/ui-bridge/sdk/redo", post(handle_redo))
 }
 
 #[cfg(test)]

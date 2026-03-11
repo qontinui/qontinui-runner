@@ -35,6 +35,7 @@ import {
   captureStateVariations,
   runStyleAudit,
 } from "ui-bridge";
+import { handleChangeTrackingCommand } from "./changeTrackingHandler";
 import type {
   RegisteredElement,
   RegisteredComponent,
@@ -92,7 +93,22 @@ type UIBridgeRequestType =
   | "enable_change_buffer"
   | "disable_change_buffer"
   | "drain_change_buffer"
-  | "get_change_buffer_size";
+  | "get_change_buffer_size"
+  // Undo/Redo
+  | "get_undo_state"
+  // Forms
+  | "get_forms"
+  // Network requests
+  | "get_network_requests"
+  | "get_network_requests_in_flight"
+  // Idle detection
+  | "get_idle_status"
+  | "wait_for_idle"
+  // Keyboard shortcuts
+  | "get_keyboard_shortcuts"
+  // AI search & find
+  | "ai_search"
+  | "ai_find";
 
 /**
  * Payload structure for UI Bridge requests from Rust
@@ -234,6 +250,12 @@ export function useUIBridgeEventHandler(): void {
   const changeTrackerRef = useRef<InstanceType<typeof import("ui-bridge/ai").ChangeTracker> | null>(
     null,
   );
+  const networkTrackerRef = useRef<InstanceType<
+    typeof import("ui-bridge").NetworkRequestTracker
+  > | null>(null);
+  const idleDetectorRef = useRef<InstanceType<
+    typeof import("ui-bridge").CompositeIdleDetector
+  > | null>(null);
 
   // Keep bridge ref updated to avoid stale closures
   useEffect(() => {
@@ -472,6 +494,12 @@ export function useUIBridgeEventHandler(): void {
                   ) => unknown;
                 }
               | undefined;
+            const undoTracker = uiBridgeGlobal?.undoTracker as
+              | { getSnapshotUndoContext: () => unknown }
+              | undefined;
+            const shortcutTracker = uiBridgeGlobal?.shortcutTracker as
+              | { getSnapshotShortcutContext: () => unknown }
+              | undefined;
             const elementPairs = currentBridge.elements.map((e) => ({
               id: e.id,
               element: e.element,
@@ -483,6 +511,8 @@ export function useUIBridgeEventHandler(): void {
               toasts: toastCap?.getSnapshotToastContext(),
               relationships: relTracker?.getSnapshotRelationshipContext(elementPairs),
               dragDrop: dndDetector?.getSnapshotDragDropContext(elementPairs),
+              undoRedo: undoTracker?.getSnapshotUndoContext(),
+              shortcuts: shortcutTracker?.getSnapshotShortcutContext(),
             };
 
             await sendResponse({
@@ -1138,125 +1168,226 @@ export function useUIBridgeEventHandler(): void {
             }
 
             const ct = changeTrackerRef.current;
-            let ctResult: unknown;
-
-            switch (type) {
-              case "save_bookmark":
-                ctResult = ct.saveBookmark(payload.name!);
-                break;
-              case "get_bookmark": {
-                const bm = ct.getBookmark(payload.name!);
-                if (!bm) throw new Error(`Bookmark '${payload.name}' not found`);
-                ctResult = bm;
-                break;
-              }
-              case "delete_bookmark":
-                ctResult = { deleted: ct.deleteBookmark(payload.name!) };
-                break;
-              case "list_bookmarks":
-                ctResult = ct.listBookmarks();
-                break;
-              case "diff_from_bookmark":
-                ctResult = ct.diffFromBookmark(payload.name!);
-                break;
-              case "execute_with_diff":
-                ctResult = await ct.executeWithDiff(
-                  payload as unknown as Parameters<typeof ct.executeWithDiff>[0],
-                );
-                break;
-              case "wait_for_change": {
-                const wfcPayload = payload as unknown as {
-                  predicate: Parameters<typeof ct.waitForChange>[0];
-                  options?: Parameters<typeof ct.waitForChange>[1];
-                };
-                ctResult = await ct.waitForChange(wfcPayload.predicate, wfcPayload.options);
-                break;
-              }
-              case "categorize_last_diff":
-                ctResult = ct.categorizeLastDiff();
-                break;
-              case "scoped_diff": {
-                const sdPayload = payload as unknown as { scope: string; fromBookmark?: string };
-                if (sdPayload.fromBookmark) {
-                  ctResult = ct.scopedDiffFromBookmark(sdPayload.fromBookmark, sdPayload.scope);
-                } else {
-                  ctResult = null;
-                }
-                break;
-              }
-              case "summarize_diff": {
-                const sumBody = payload as unknown as {
-                  budget: number;
-                  includeIds?: boolean;
-                  includeCategory?: boolean;
-                  fromBookmark?: string;
-                };
-                let diff = null as ReturnType<typeof ct.diffFromBookmark>;
-                if (sumBody.fromBookmark) {
-                  diff = ct.diffFromBookmark(sumBody.fromBookmark);
-                } else {
-                  diff = ct.categorizeLastDiff()?.diff ?? null;
-                }
-                if (!diff) {
-                  ctResult = { summary: "No changes detected" };
-                } else {
-                  ctResult = {
-                    summary: ct.summarizeDiff(diff, {
-                      budget: sumBody.budget,
-                      includeIds: sumBody.includeIds,
-                      includeCategory: sumBody.includeCategory,
-                    }),
-                  };
-                }
-                break;
-              }
-              case "structured_changes": {
-                const scPayload = payload as unknown as { fromBookmark?: string };
-                if (scPayload?.fromBookmark) {
-                  const bm = ct.getBookmark(scPayload.fromBookmark);
-                  if (!bm) throw new Error(`Bookmark '${scPayload.fromBookmark}' not found`);
-                  const snap = currentBridge.createSnapshot();
-                  const mgr = createSnapshotManager({});
-                  const currentSemantic = mgr.createSnapshot({
-                    timestamp: Date.now(),
-                    elements: snap.elements.map((e) => ({
-                      id: e.id,
-                      type: e.type,
-                      label: e.label ?? "",
-                      actions: e.actions,
-                      state: e.state,
-                    })),
-                    components: [],
-                    workflows: [],
-                    activeRuns: [],
-                  });
-                  ctResult = analyzeStructured(bm.snapshot, currentSemantic);
-                } else {
-                  ctResult = { hasStructuredData: false, tableChanges: [], listChanges: [] };
-                }
-                break;
-              }
-              case "enable_change_buffer":
-                ct.enableBuffer();
-                ctResult = { enabled: true };
-                break;
-              case "disable_change_buffer":
-                ct.disableBuffer();
-                ctResult = { enabled: false };
-                break;
-              case "drain_change_buffer":
-                ctResult = ct.drainBuffer();
-                break;
-              case "get_change_buffer_size":
-                ctResult = { size: ct.getBufferSize(), enabled: ct.isBufferEnabled() };
-                break;
-            }
+            const ctResult = await handleChangeTrackingCommand(
+              ct,
+              type,
+              payload as unknown as Record<string, unknown>,
+              {
+                createSnapshot: () => currentBridge.createSnapshot(),
+                createSnapshotManager,
+                analyzeStructuredChanges: analyzeStructured,
+              },
+            );
 
             await sendResponse({
               requestId,
               type,
               success: true,
               data: ctResult,
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          // ========== Undo/Redo ==========
+          case "get_undo_state": {
+            const w = window as unknown as Record<string, unknown>;
+            const uiBridgeGlobal = w.__UI_BRIDGE__ as Record<string, unknown> | undefined;
+            const undoTracker = uiBridgeGlobal?.undoTracker as
+              | { getSnapshotUndoContext: () => unknown }
+              | undefined;
+
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: undoTracker?.getSnapshotUndoContext() ?? {
+                note: "UndoTracker not installed",
+              },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          // ========== Forms ==========
+          case "get_forms": {
+            const { discoverForms } = await import("ui-bridge/ai");
+            const formElements = currentBridge.elements
+              .filter((el) =>
+                ["input", "select", "textarea", "checkbox", "radio"].includes(el.type),
+              )
+              .map((el) => ({
+                id: el.id,
+                element: el.element,
+                type: el.type,
+                label: el.label,
+                getState: () => el.getState(),
+              }));
+
+            const formsResult = discoverForms(formElements);
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: formsResult,
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          // ========== Network Requests ==========
+          case "get_network_requests":
+          case "get_network_requests_in_flight": {
+            const { NetworkRequestTracker } = await import("ui-bridge");
+
+            if (!networkTrackerRef.current) {
+              networkTrackerRef.current = new NetworkRequestTracker();
+              networkTrackerRef.current.install();
+            }
+            const tracker = networkTrackerRef.current;
+
+            if (type === "get_network_requests_in_flight") {
+              const requests = tracker.getInFlight();
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: { requests, count: requests.length },
+                timestamp: Date.now(),
+              });
+            } else {
+              const params = payload.params ?? {};
+              const requests = tracker.getAll(params as Parameters<typeof tracker.getAll>[0]);
+              const inFlight = tracker.getInFlight();
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: { requests, count: requests.length, inFlightCount: inFlight.length },
+                timestamp: Date.now(),
+              });
+            }
+            break;
+          }
+
+          // ========== Idle Detection ==========
+          case "get_idle_status":
+          case "wait_for_idle": {
+            const { CompositeIdleDetector } = await import("ui-bridge");
+
+            if (!idleDetectorRef.current) {
+              idleDetectorRef.current = CompositeIdleDetector.create();
+            }
+            const detector = idleDetectorRef.current;
+
+            if (type === "get_idle_status") {
+              const status = detector.getStatus();
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: status,
+                timestamp: Date.now(),
+              });
+            } else {
+              const timeout = (payload.params?.timeout as number) ?? 30000;
+              const minStableMs = (payload.params?.minStableMs as number) ?? 500;
+              const exclude = (payload.params?.exclude as string[]) ?? undefined;
+              const status = await detector.waitForIdle({ timeout, minStableMs, exclude });
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: status,
+                timestamp: Date.now(),
+              });
+            }
+            break;
+          }
+
+          // ========== Keyboard Shortcuts ==========
+          case "get_keyboard_shortcuts": {
+            const w = window as unknown as Record<string, unknown>;
+            const uiBridgeGlobal = w.__UI_BRIDGE__ as Record<string, unknown> | undefined;
+            const tracker = uiBridgeGlobal?.shortcutTracker as
+              | { getSnapshotShortcutContext: () => unknown }
+              | undefined;
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: tracker?.getSnapshotShortcutContext() ?? {
+                shortcuts: [],
+                totalCount: 0,
+                lastScanTimestamp: 0,
+              },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          // ========== AI Search & Find ==========
+          case "ai_search": {
+            const { SearchEngine } = await import("ui-bridge/ai");
+            // Use discover() for fresh elements with up-to-date visibility state
+            // (currentBridge.elements is memoized and may have stale DOM refs)
+            const discovered = await currentBridge.discover({ includeHidden: true });
+            const engine = new SearchEngine({ includeHidden: true });
+            engine.updateElements(discovered.elements);
+            const criteria = payload.params ?? payload.body ?? {};
+            const results = engine.search(criteria as Parameters<typeof engine.search>[0]);
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: results,
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "ai_find": {
+            const { SearchEngine, find: aiFindFn } = await import("ui-bridge/ai");
+            const discovered = await currentBridge.discover({ includeHidden: true });
+            const engine = new SearchEngine({ includeHidden: true });
+            engine.updateElements(discovered.elements);
+
+            const query = (payload.params?.query as string) ?? "";
+            const context = payload.params?.context as Record<string, unknown> | undefined;
+            const confidenceThreshold = payload.params?.confidenceThreshold as number | undefined;
+
+            // Auto-detect active modal for context-aware scoring
+            const w = window as unknown as Record<string, unknown>;
+            const uiBridgeGlobal = w.__UI_BRIDGE__ as Record<string, unknown> | undefined;
+            const modalDet = uiBridgeGlobal?.modalDetector as
+              | { detect: () => { modals: Array<{ id: string }> } }
+              | undefined;
+            const findContext: Record<string, unknown> = { ...context };
+            if (!findContext.activeModalId && modalDet) {
+              try {
+                const modalStack = modalDet.detect();
+                if (modalStack.modals.length > 0) {
+                  findContext.activeModalId = modalStack.modals[modalStack.modals.length - 1].id;
+                }
+              } catch {
+                /* ignore */
+              }
+            }
+
+            const result = aiFindFn(query, engine, {
+              context: findContext as Parameters<typeof aiFindFn>[2] extends
+                | { context?: infer C }
+                | undefined
+                ? C
+                : never,
+              confidenceThreshold,
+              pickFirst: true,
+            });
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: result,
               timestamp: Date.now(),
             });
             break;

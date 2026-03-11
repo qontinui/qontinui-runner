@@ -917,6 +917,15 @@ pub struct VerificationPhaseResult {
     /// Console errors captured during the entire verification phase
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console_errors: Option<Vec<serde_json::Value>>,
+    /// Health status from the SDK app's UI Bridge (score, status, breakdown)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_health: Option<serde_json::Value>,
+    /// Deduplicated browser events captured during verification (HMR, React errors, network, etc.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_events: Option<Vec<serde_json::Value>>,
+    /// Failed network requests captured during verification
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_failures: Option<Vec<serde_json::Value>>,
 }
 
 /// Extract a text representation from a handler's output_data for AI context.
@@ -1077,6 +1086,51 @@ impl VerificationPhaseResult {
             "**Status:** {} of {} verification steps passed\n\n",
             self.passed_steps, self.total_steps
         ));
+
+        // App health status from UI Bridge (if available)
+        if let Some(ref health) = self.app_health {
+            let status = health
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            // Only include health info when the app is unhealthy — don't add noise for healthy apps
+            if status == "degraded" || status == "broken" {
+                let score = health.get("score").and_then(|v| v.as_u64()).unwrap_or(0);
+                context.push_str(&format!(
+                    "**App Health:** {} (score: {}/100)\n",
+                    status.to_uppercase(),
+                    score
+                ));
+                if let Some(breakdown) = health.get("breakdown") {
+                    let crashes = breakdown
+                        .get("crashes")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let errors = breakdown
+                        .get("errors")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let warnings = breakdown
+                        .get("warnings")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    context.push_str(&format!(
+                        "  Crashes: {}, Errors: {}, Warnings: {}\n",
+                        crashes, errors, warnings
+                    ));
+                }
+                if let Some(top_issue) = health.get("topIssue") {
+                    if let Some(msg) = top_issue.get("message").and_then(|v| v.as_str()) {
+                        let severity = top_issue
+                            .get("severity")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("error");
+                        context.push_str(&format!("  Top issue: [{}] {}\n", severity, msg));
+                    }
+                }
+                context.push('\n');
+            }
+        }
 
         // List failed steps with details including command and failure category
         context.push_str("### Failed Steps\n\n");
@@ -1334,11 +1388,93 @@ impl VerificationPhaseResult {
                         .get("message")
                         .and_then(|v| v.as_str())
                         .unwrap_or("Unknown error");
-                    let err_type = err.get("type").and_then(|v| v.as_str()).unwrap_or("error");
-                    context.push_str(&format!("- [{}] {}\n", err_type, msg));
+                    let err_level = err.get("level").and_then(|v| v.as_str()).unwrap_or("error");
+                    context.push_str(&format!("- [{}] {}\n", err_level, msg));
                 }
                 if console_errors.len() > 15 {
                     context.push_str(&format!("  ... and {} more\n", console_errors.len() - 15));
+                }
+                context.push('\n');
+            }
+        }
+
+        // Browser events — richer than console errors, includes HMR failures,
+        // React error boundaries, resource load errors, network errors
+        if let Some(ref events) = self.browser_events {
+            if !events.is_empty() {
+                context.push_str("### Browser Events During Verification\n\n");
+                for event in events.iter().take(15) {
+                    // FingerprintedEvent shape: { fingerprint, event: AnyCapturedEvent, count, firstSeen, lastSeen }
+                    // AnyCapturedEvent has: type, level, message, stack, timestamp, url
+                    let inner = event.get("event");
+                    let msg = inner
+                        .and_then(|e| e.get("message"))
+                        .and_then(|v| v.as_str())
+                        // Fallback: raw (non-fingerprinted) event with top-level message
+                        .or_else(|| event.get("message").and_then(|v| v.as_str()));
+
+                    if let Some(msg) = msg {
+                        let severity = inner
+                            .and_then(|e| e.get("level"))
+                            .and_then(|v| v.as_str())
+                            .or_else(|| inner.and_then(|e| e.get("type")).and_then(|v| v.as_str()))
+                            .unwrap_or("error");
+                        let count = event.get("count").and_then(|v| v.as_u64()).unwrap_or(1);
+                        if count > 1 {
+                            context.push_str(&format!("- [{}] {} (x{})\n", severity, msg, count));
+                        } else {
+                            context.push_str(&format!("- [{}] {}\n", severity, msg));
+                        }
+                    }
+                }
+                if events.len() > 15 {
+                    context.push_str(&format!("  ... and {} more events\n", events.len() - 15));
+                }
+                context.push('\n');
+            }
+        }
+
+        // Network failures — failed HTTP requests from the SDK app
+        if let Some(ref failures) = self.network_failures {
+            if !failures.is_empty() {
+                context.push_str("### Failed Network Requests\n\n");
+                for failure in failures.iter().take(10) {
+                    let request = failure.get("request");
+                    let response = failure.get("response");
+                    let error = failure.get("error").and_then(|v| v.as_str());
+
+                    let method = request
+                        .and_then(|r| r.get("method"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let url = request
+                        .and_then(|r| r.get("url"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let status = response
+                        .and_then(|r| r.get("statusCode"))
+                        .and_then(|v| v.as_u64());
+
+                    if let Some(status_code) = status {
+                        let status_text = response
+                            .and_then(|r| r.get("statusText"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        context.push_str(&format!(
+                            "- {} {} → {} {}\n",
+                            method, url, status_code, status_text
+                        ));
+                    } else if let Some(err_msg) = error {
+                        context.push_str(&format!("- {} {} → {}\n", method, url, err_msg));
+                    } else {
+                        context.push_str(&format!("- {} {} → failed\n", method, url));
+                    }
+                }
+                if failures.len() > 10 {
+                    context.push_str(&format!(
+                        "  ... and {} more failed requests\n",
+                        failures.len() - 10
+                    ));
                 }
                 context.push('\n');
             }
@@ -3708,6 +3844,9 @@ impl StepExecutor {
             step_results,
             critical_failure,
             console_errors: None, // Populated by phases.rs after verification completes
+            app_health: None,     // Populated by phases.rs after verification completes
+            browser_events: None, // Populated by phases.rs after verification completes
+            network_failures: None, // Populated by phases.rs after verification completes
         };
 
         info!("{}", result.summary());

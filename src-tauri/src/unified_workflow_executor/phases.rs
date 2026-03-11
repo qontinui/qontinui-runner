@@ -240,6 +240,111 @@ async fn fetch_console_errors_from_ui_bridge() -> Result<Vec<serde_json::Value>,
     Ok(all_errors)
 }
 
+/// Fetch the health status from the SDK app's UI Bridge.
+///
+/// Returns the health assessment (status, score, breakdown, top issue).
+/// Best-effort — returns None if the SDK app isn't connected.
+async fn fetch_health_from_ui_bridge() -> Option<serde_json::Value> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+
+    let url = format!("http://127.0.0.1:{}/ui-bridge/sdk/health", MCP_API_PORT);
+
+    let response = client.get(&url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let body: serde_json::Value = response.json().await.ok()?;
+
+    // Extract the data field from { "success": true, "data": { ... } }
+    body.get("data").cloned()
+}
+
+/// Fetch browser events from the SDK app's UI Bridge.
+///
+/// Returns deduplicated error-level events (console errors, React errors,
+/// HMR failures, network errors, resource errors) since the given timestamp.
+/// These provide richer context than console-errors alone.
+async fn fetch_browser_events_from_ui_bridge(since: u64) -> Vec<serde_json::Value> {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let url = format!(
+        "http://127.0.0.1:{}/ui-bridge/sdk/browser-events?deduplicate=true&since={}&limit=50",
+        MCP_API_PORT, since
+    );
+
+    let response = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+
+    let body: serde_json::Value = match response.json().await {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+
+    // With deduplicate=true, the response has data.deduplicated (grouped events)
+    // and data.events (raw). We prefer deduplicated for conciseness.
+    if let Some(deduped) = body
+        .get("data")
+        .and_then(|d| d.get("deduplicated"))
+        .and_then(|v| v.as_array())
+    {
+        return deduped.clone();
+    }
+
+    // Fallback to raw events
+    body.get("data")
+        .and_then(|d| d.get("events"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Fetch failed network requests from the SDK app's UI Bridge.
+///
+/// Returns HTTP requests that failed (4xx/5xx, timeouts, CORS) since the
+/// given timestamp. Helps identify broken API calls during verification.
+async fn fetch_network_failures_from_ui_bridge(since: u64) -> Vec<serde_json::Value> {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let url = format!(
+        "http://127.0.0.1:{}/ui-bridge/sdk/network-requests?failuresOnly=true&since={}&limit=20",
+        MCP_API_PORT, since
+    );
+
+    let response = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+
+    let body: serde_json::Value = match response.json().await {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+
+    body.get("data")
+        .and_then(|d| d.get("requests"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
 // =============================================================================
 // Execution Timing Context
 // =============================================================================
@@ -2012,6 +2117,12 @@ impl VerificationExecutor {
         // only captures its own errors
         clear_console_errors().await;
 
+        // Record verification start time for browser event filtering
+        let verification_start_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
         if steps.is_empty() {
             info!(
                 "VERIFICATION-PHASE: No verification steps defined (iteration {})",
@@ -2030,9 +2141,30 @@ impl VerificationExecutor {
                     total_duration_ms: 0,
                     step_results: Vec::new(),
                     console_errors: None,
+                    app_health: None,
+                    browser_events: None,
+                    network_failures: None,
                 },
                 Vec::new(),
             );
+        }
+
+        // Pre-verification health check: detect if the SDK app is already broken
+        // (e.g., showing a framework error overlay) before running expensive verification steps.
+        // This gives the AI faster feedback about app-breaking changes.
+        let pre_check_health = fetch_health_from_ui_bridge().await;
+        if let Some(ref health) = pre_check_health {
+            let status = health
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            if status == "broken" {
+                let summary = health.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                warn!(
+                    "VERIFICATION-PHASE: SDK app health is BROKEN before verification (iteration {}): {}",
+                    iteration, summary
+                );
+            }
         }
 
         info!(
@@ -2134,8 +2266,15 @@ impl VerificationExecutor {
             }
         }
 
-        // Fetch accumulated console errors from UI Bridge (best-effort)
-        let console_errors = match fetch_console_errors_from_ui_bridge().await {
+        // Fetch UI Bridge diagnostics concurrently (all best-effort)
+        let (console_errors_result, app_health, browser_events, network_failures) = tokio::join!(
+            fetch_console_errors_from_ui_bridge(),
+            fetch_health_from_ui_bridge(),
+            fetch_browser_events_from_ui_bridge(verification_start_ms),
+            fetch_network_failures_from_ui_bridge(verification_start_ms),
+        );
+
+        let console_errors = match console_errors_result {
             Ok(errors) => {
                 if !errors.is_empty() {
                     debug!(
@@ -2151,8 +2290,23 @@ impl VerificationExecutor {
             }
         };
 
+        if app_health.is_some() || !browser_events.is_empty() || !network_failures.is_empty() {
+            debug!(
+                "VERIFICATION-PHASE: UI Bridge diagnostics: health={}, browser_events={}, network_failures={}",
+                app_health.is_some(),
+                browser_events.len(),
+                network_failures.len()
+            );
+        }
+
+        // Use post-verification health if available, fall back to pre-check health
+        let effective_health = app_health.or(pre_check_health);
+
         let mut result = result;
         result.console_errors = console_errors;
+        result.app_health = effective_health;
+        result.browser_events = Some(browser_events).filter(|e| !e.is_empty());
+        result.network_failures = Some(network_failures).filter(|e| !e.is_empty());
 
         let step_results = result.step_results.clone();
         (result, step_results)

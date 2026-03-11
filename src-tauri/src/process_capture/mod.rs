@@ -24,6 +24,7 @@
 //!             └─ Existing dedup + SQLite storage
 //! ```
 
+pub mod build_errors;
 pub mod commands;
 pub mod health;
 pub mod manager;

@@ -1233,15 +1233,100 @@ pub async fn discover_states_from_renders(
 }
 
 // =============================================================================
-// Annotated Screenshot (for agent mode)
+// Window Listing & App-Specific Screenshots (xcap)
 // =============================================================================
+
+/// Info about a capturable window
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowInfo {
+    id: u32,
+    title: String,
+    app_name: String,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    is_minimized: bool,
+    is_maximized: bool,
+    is_focused: bool,
+}
+
+/// List all capturable windows using xcap.
+fn list_windows_native() -> Result<Vec<WindowInfo>, String> {
+    use xcap::Window;
+
+    let windows = Window::all().map_err(|e| format!("Failed to enumerate windows: {}", e))?;
+    let mut result = Vec::new();
+
+    for w in &windows {
+        let id = w.id().unwrap_or(0);
+        let title = w.title().unwrap_or_default();
+        let app_name = w.app_name().unwrap_or_default();
+
+        // Skip windows with no title (background/system windows)
+        if title.is_empty() {
+            continue;
+        }
+
+        result.push(WindowInfo {
+            id,
+            title,
+            app_name,
+            x: w.x().unwrap_or(0),
+            y: w.y().unwrap_or(0),
+            width: w.width().unwrap_or(0),
+            height: w.height().unwrap_or(0),
+            is_minimized: w.is_minimized().unwrap_or(false),
+            is_maximized: w.is_maximized().unwrap_or(false),
+            is_focused: w.is_focused().unwrap_or(false),
+        });
+    }
+
+    Ok(result)
+}
+
+/// GET /ui-bridge/control/windows — List all capturable windows
+pub async fn ui_bridge_list_windows_handler(
+    State(_state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<Vec<WindowInfo>>> {
+    match tokio::task::spawn_blocking(list_windows_native).await {
+        Ok(Ok(windows)) => {
+            info!("UI Bridge: Listed {} capturable windows", windows.len());
+            Json(ApiResponse::success(windows))
+        }
+        Ok(Err(e)) => {
+            error!("UI Bridge: Failed to list windows: {}", e);
+            Json(ApiResponse::error(format!("Failed to list windows: {}", e)))
+        }
+        Err(e) => {
+            error!("UI Bridge: Window list task failed: {}", e);
+            Json(ApiResponse::error(format!(
+                "Window list task failed: {}",
+                e
+            )))
+        }
+    }
+}
 
 /// Query parameters for annotated screenshot
 #[derive(Debug, Deserialize)]
 pub struct AnnotatedScreenshotQuery {
-    /// Monitor index (0-based), None for primary monitor
+    /// Monitor index (0-based), None for primary monitor. Used for full-screen capture.
     #[serde(default)]
     monitor: Option<i32>,
+    /// Capture a specific window by title (case-insensitive substring match)
+    #[serde(default)]
+    window_title: Option<String>,
+    /// Capture a specific window by app name (case-insensitive substring match)
+    #[serde(default)]
+    app_name: Option<String>,
+    /// Capture a specific window by its ID (HWND as u32)
+    #[serde(default)]
+    window_id: Option<u32>,
+    /// Capture the runner's own window
+    #[serde(default)]
+    runner: Option<bool>,
 }
 
 /// Annotated screenshot response
@@ -1253,55 +1338,418 @@ pub struct AnnotatedScreenshotData {
     height: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     monitor: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_app_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_id: Option<u32>,
 }
 
-/// GET /ui-bridge/control/annotated-screenshot — Screenshot with metadata for annotation
+/// Encode a DynamicImage as base64 PNG.
+fn encode_image_to_base64(image: &image::DynamicImage) -> Result<String, String> {
+    use base64::Engine;
+    let mut png_bytes = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut png_bytes, image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png_bytes.into_inner()))
+}
+
+/// Capture a specific window by matching criteria.
+fn capture_window_screenshot(
+    window_title: Option<String>,
+    app_name: Option<String>,
+    window_id: Option<u32>,
+) -> Result<AnnotatedScreenshotData, String> {
+    use xcap::Window;
+
+    let windows = Window::all().map_err(|e| format!("Failed to enumerate windows: {}", e))?;
+
+    let target = if let Some(id) = window_id {
+        windows
+            .iter()
+            .find(|w| w.id().unwrap_or(0) == id)
+            .ok_or_else(|| format!("No window found with id {}", id))?
+    } else if let Some(ref title_query) = window_title {
+        let query_lower = title_query.to_lowercase();
+        windows
+            .iter()
+            .find(|w| {
+                w.title()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&query_lower)
+            })
+            .ok_or_else(|| {
+                let available: Vec<String> = windows
+                    .iter()
+                    .filter_map(|w| {
+                        let t = w.title().unwrap_or_default();
+                        if t.is_empty() {
+                            None
+                        } else {
+                            Some(t)
+                        }
+                    })
+                    .take(10)
+                    .collect();
+                format!(
+                    "No window found matching title '{}'. Available: {:?}",
+                    title_query, available
+                )
+            })?
+    } else if let Some(ref app_query) = app_name {
+        let query_lower = app_query.to_lowercase();
+        windows
+            .iter()
+            .find(|w| {
+                w.app_name()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&query_lower)
+            })
+            .ok_or_else(|| {
+                let available: Vec<String> = windows
+                    .iter()
+                    .filter_map(|w| {
+                        let a = w.app_name().unwrap_or_default();
+                        if a.is_empty() {
+                            None
+                        } else {
+                            Some(a)
+                        }
+                    })
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .take(10)
+                    .collect();
+                format!(
+                    "No window found matching app_name '{}'. Available: {:?}",
+                    app_query, available
+                )
+            })?
+    } else {
+        return Err("No window selection criteria provided".to_string());
+    };
+
+    let title = target.title().unwrap_or_default();
+    let app = target.app_name().unwrap_or_default();
+    let id = target.id().unwrap_or(0);
+
+    if target.is_minimized().unwrap_or(false) {
+        return Err(format!(
+            "Window '{}' ({}) is minimized — cannot capture",
+            title, app
+        ));
+    }
+
+    let image = target
+        .capture_image()
+        .map_err(|e| format!("Failed to capture window '{}': {}", title, e))?;
+
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+    let dynamic = image::DynamicImage::ImageRgba8(image);
+    let b64 = encode_image_to_base64(&dynamic)?;
+
+    Ok(AnnotatedScreenshotData {
+        screenshot: b64,
+        width,
+        height,
+        monitor: None,
+        window_title: Some(title),
+        window_app_name: Some(app),
+        window_id: Some(id),
+    })
+}
+
+/// Capture the runner's own window by cropping from a monitor screenshot.
+/// xcap skips same-process windows, so we capture the monitor and crop.
+///
+/// DPI handling:
+/// - Tauri `outer_position()` / `outer_size()` return physical pixels.
+/// - xcap `Monitor::x()` / `y()` return logical coordinates (dmPosition).
+/// - xcap `Monitor::width()` / `height()` return physical pixels (dmPelsWidth/Height).
+/// - The captured image is at physical resolution.
+///
+/// To match monitors: convert Tauri physical position to logical using scale_factor.
+/// To crop the image: work in physical pixels (image coords = physical).
+fn capture_runner_window(
+    phys_x: i32,
+    phys_y: i32,
+    phys_w: u32,
+    phys_h: u32,
+    scale: f64,
+    title: &str,
+) -> Result<AnnotatedScreenshotData, String> {
+    use xcap::Monitor;
+
+    let monitors = Monitor::all().map_err(|e| format!("Failed to enumerate monitors: {}", e))?;
+    if monitors.is_empty() {
+        return Err("No monitors found".to_string());
+    }
+
+    // Convert Tauri physical position to logical for monitor matching.
+    // xcap monitor x/y are logical (dmPosition), width/height are physical (dmPelsWidth).
+    let logical_x = (phys_x as f64 / scale) as i32;
+    let logical_y = (phys_y as f64 / scale) as i32;
+    let logical_center_x = logical_x + (phys_w as f64 / scale / 2.0) as i32;
+    let logical_center_y = logical_y + (phys_h as f64 / scale / 2.0) as i32;
+
+    let (monitor, mon_logical_x, mon_logical_y) = monitors
+        .iter()
+        .find_map(|m| {
+            let mx = m.x().unwrap_or(0);
+            let my = m.y().unwrap_or(0);
+            let mon_scale = m.scale_factor().unwrap_or(1.0) as f64;
+            // Monitor logical dimensions = physical / scale
+            let mw_logical = (m.width().unwrap_or(0) as f64 / mon_scale) as i32;
+            let mh_logical = (m.height().unwrap_or(0) as f64 / mon_scale) as i32;
+            if logical_center_x >= mx
+                && logical_center_x < mx + mw_logical
+                && logical_center_y >= my
+                && logical_center_y < my + mh_logical
+            {
+                Some((m, mx, my))
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| "Runner window not on any monitor".to_string())?;
+
+    let mon_scale = monitor.scale_factor().unwrap_or(1.0) as f64;
+    let full_image = monitor
+        .capture_image()
+        .map_err(|e| format!("Failed to capture monitor: {}", e))?;
+
+    // Convert logical window position to physical pixel offset in the captured image.
+    // Offset in logical coords relative to monitor origin, then scale to physical.
+    let rel_logical_x = logical_x - mon_logical_x;
+    let rel_logical_y = logical_y - mon_logical_y;
+    let rel_phys_x = (rel_logical_x as f64 * mon_scale) as i32;
+    let rel_phys_y = (rel_logical_y as f64 * mon_scale) as i32;
+
+    // Handle negative offsets (window partially off-screen)
+    let crop_x = rel_phys_x.max(0) as u32;
+    let crop_y = rel_phys_y.max(0) as u32;
+    let crop_w = if rel_phys_x < 0 {
+        phys_w.saturating_sub((-rel_phys_x) as u32)
+    } else {
+        phys_w
+    }
+    .min(full_image.width().saturating_sub(crop_x));
+    let crop_h = if rel_phys_y < 0 {
+        phys_h.saturating_sub((-rel_phys_y) as u32)
+    } else {
+        phys_h
+    }
+    .min(full_image.height().saturating_sub(crop_y));
+
+    if crop_w == 0 || crop_h == 0 {
+        return Err(format!(
+            "Runner window has zero visible area (crop: {}x{} at ({}, {}), image: {}x{}, scale: {})",
+            crop_w, crop_h, crop_x, crop_y, full_image.width(), full_image.height(), mon_scale
+        ));
+    }
+
+    let full_dynamic = image::DynamicImage::ImageRgba8(full_image);
+    let cropped = full_dynamic.crop_imm(crop_x, crop_y, crop_w, crop_h);
+    let b64 = encode_image_to_base64(&cropped)?;
+
+    Ok(AnnotatedScreenshotData {
+        screenshot: b64,
+        width: crop_w as i32,
+        height: crop_h as i32,
+        monitor: None,
+        window_title: Some(title.to_string()),
+        window_app_name: Some("Qontinui Runner".to_string()),
+        window_id: None,
+    })
+}
+
+/// Capture a full monitor screenshot.
+fn capture_monitor_screenshot(
+    monitor_index: Option<i32>,
+) -> Result<AnnotatedScreenshotData, String> {
+    use xcap::Monitor;
+
+    let monitors = Monitor::all().map_err(|e| format!("Failed to enumerate monitors: {}", e))?;
+    if monitors.is_empty() {
+        return Err("No monitors found".to_string());
+    }
+
+    let monitor = if let Some(idx) = monitor_index {
+        monitors
+            .into_iter()
+            .nth(idx as usize)
+            .ok_or_else(|| format!("Monitor index {} out of range", idx))?
+    } else {
+        monitors.into_iter().next().unwrap()
+    };
+
+    let image = monitor
+        .capture_image()
+        .map_err(|e| format!("Failed to capture monitor: {}", e))?;
+
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+    let dynamic = image::DynamicImage::ImageRgba8(image);
+    let b64 = encode_image_to_base64(&dynamic)?;
+
+    Ok(AnnotatedScreenshotData {
+        screenshot: b64,
+        width,
+        height,
+        monitor: monitor_index,
+        window_title: None,
+        window_app_name: None,
+        window_id: None,
+    })
+}
+
+/// GET /ui-bridge/control/annotated-screenshot — Screenshot with metadata
+///
+/// Captures natively via xcap (Rust). No Python executor dependency.
+///
+/// Query params (all optional, first match wins):
+/// - `runner=true` — capture the runner's own Tauri window
+/// - `window_title=...` — case-insensitive substring match on window title
+/// - `app_name=...` — case-insensitive substring match on app name
+/// - `window_id=N` — exact window ID (HWND)
+/// - `monitor=N` — full monitor capture (0-based index, default: primary)
+/// - (none) — captures primary monitor
 pub async fn ui_bridge_annotated_screenshot_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<AnnotatedScreenshotQuery>,
 ) -> Json<ApiResponse<AnnotatedScreenshotData>> {
-    info!(
-        monitor = ?query.monitor,
-        "UI Bridge API: Capturing screenshot for annotation"
-    );
+    let is_window_capture = query.runner.unwrap_or(false)
+        || query.window_title.is_some()
+        || query.app_name.is_some()
+        || query.window_id.is_some();
 
-    match super::misc::capture_screenshot_ipc(state.app_state.clone(), query.monitor, "png").await {
-        Ok(capture_data) => {
-            let screenshot_base64 = match capture_data
-                .get("screenshot_base64")
-                .and_then(|s| s.as_str())
-            {
-                Some(s) => s.to_string(),
-                None => {
-                    error!("UI Bridge annotated screenshot: No screenshot_base64 in IPC response");
-                    return Json(ApiResponse::error(
-                        "Screenshot captured but no image data returned",
-                    ));
-                }
-            };
+    if is_window_capture {
+        info!(
+            runner = ?query.runner,
+            window_title = ?query.window_title,
+            app_name = ?query.app_name,
+            window_id = ?query.window_id,
+            "UI Bridge API: Capturing window screenshot (native)"
+        );
 
-            let width = capture_data
-                .get("width")
-                .and_then(|w| w.as_i64())
-                .unwrap_or(0) as i32;
-            let height = capture_data
-                .get("height")
-                .and_then(|h| h.as_i64())
-                .unwrap_or(0) as i32;
+        // For runner's own window, xcap skips same-process windows,
+        // so we capture the monitor and crop to the window bounds.
+        if query.runner.unwrap_or(false) {
+            use tauri::Manager;
+            let window = state.app_handle.get_webview_window("main");
+            if let Some(win) = window {
+                let scale = win.scale_factor().unwrap_or(1.0);
+                let pos = win.outer_position().unwrap_or_default();
+                let size = win.outer_size().unwrap_or_default();
+                let x = pos.x;
+                let y = pos.y;
+                let w = size.width;
+                let h = size.height;
+                let title = win
+                    .title()
+                    .unwrap_or_else(|_| "Qontinui Runner".to_string());
 
-            Json(ApiResponse::success(AnnotatedScreenshotData {
-                screenshot: screenshot_base64,
-                width,
-                height,
-                monitor: query.monitor,
-            }))
+                return match tokio::task::spawn_blocking(move || {
+                    capture_runner_window(x, y, w, h, scale, &title)
+                })
+                .await
+                {
+                    Ok(Ok(data)) => {
+                        info!(
+                            "UI Bridge screenshot: Captured runner window ({}x{})",
+                            data.width, data.height
+                        );
+                        Json(ApiResponse::success(data))
+                    }
+                    Ok(Err(e)) => {
+                        error!("UI Bridge screenshot: Runner capture failed: {}", e);
+                        Json(ApiResponse::error(format!(
+                            "Runner screenshot failed: {}",
+                            e
+                        )))
+                    }
+                    Err(e) => {
+                        error!("UI Bridge screenshot: Task join error: {}", e);
+                        Json(ApiResponse::error(format!(
+                            "Screenshot capture task failed: {}",
+                            e
+                        )))
+                    }
+                };
+            } else {
+                return Json(ApiResponse::error("Runner window not found".to_string()));
+            }
         }
-        Err(e) => {
-            error!("UI Bridge annotated screenshot: Failed to capture: {}", e);
-            Json(ApiResponse::error(format!(
-                "Screenshot capture failed: {}",
-                e
-            )))
+
+        let window_title = query.window_title;
+        let app_name = query.app_name;
+        let window_id = query.window_id;
+
+        match tokio::task::spawn_blocking(move || {
+            capture_window_screenshot(window_title, app_name, window_id)
+        })
+        .await
+        {
+            Ok(Ok(data)) => {
+                info!(
+                    "UI Bridge screenshot: Captured window '{}' ({}x{}, id={})",
+                    data.window_title.as_deref().unwrap_or("?"),
+                    data.width,
+                    data.height,
+                    data.window_id.unwrap_or(0),
+                );
+                Json(ApiResponse::success(data))
+            }
+            Ok(Err(e)) => {
+                error!("UI Bridge screenshot: Window capture failed: {}", e);
+                Json(ApiResponse::error(format!(
+                    "Window screenshot failed: {}",
+                    e
+                )))
+            }
+            Err(e) => {
+                error!("UI Bridge screenshot: Task join error: {}", e);
+                Json(ApiResponse::error(format!(
+                    "Screenshot capture task failed: {}",
+                    e
+                )))
+            }
+        }
+    } else {
+        // Full monitor capture (existing behavior)
+        info!(
+            monitor = ?query.monitor,
+            "UI Bridge API: Capturing monitor screenshot (native)"
+        );
+
+        let monitor = query.monitor;
+        match tokio::task::spawn_blocking(move || capture_monitor_screenshot(monitor)).await {
+            Ok(Ok(data)) => {
+                info!(
+                    "UI Bridge screenshot: Captured {}x{} from monitor {:?}",
+                    data.width, data.height, data.monitor
+                );
+                Json(ApiResponse::success(data))
+            }
+            Ok(Err(e)) => {
+                error!("UI Bridge screenshot: Monitor capture failed: {}", e);
+                Json(ApiResponse::error(format!(
+                    "Screenshot capture failed: {}",
+                    e
+                )))
+            }
+            Err(e) => {
+                error!("UI Bridge screenshot: Task join error: {}", e);
+                Json(ApiResponse::error(format!(
+                    "Screenshot capture task failed: {}",
+                    e
+                )))
+            }
         }
     }
 }
@@ -1689,6 +2137,108 @@ pub async fn ui_bridge_get_change_buffer_size_handler(
     }
 }
 
+// ============================================================================
+// Keyboard Shortcuts Handler
+// ============================================================================
+
+/// Get discovered keyboard shortcuts.
+pub async fn ui_bridge_get_keyboard_shortcuts_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting keyboard shortcuts");
+
+    match ui_bridge_request_sync(&state, "get_keyboard_shortcuts", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
+// Idle Detection Handlers
+// ============================================================================
+
+/// Get composite idle status.
+pub async fn ui_bridge_get_idle_status_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting idle status");
+
+    match ui_bridge_request_sync(&state, "get_idle_status", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Wait for composite idle state.
+pub async fn ui_bridge_wait_for_idle_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Wait for idle");
+
+    let payload = serde_json::json!({
+        "params": {
+            "timeout": body.get("timeout").and_then(|v| v.as_i64()).unwrap_or(30000),
+            "minStableMs": body.get("minStableMs").and_then(|v| v.as_i64()).unwrap_or(500),
+            "exclude": body.get("exclude")
+        }
+    });
+
+    match ui_bridge_request_sync(&state, "wait_for_idle", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Wait for idle failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
+// AI Search & Find Handlers
+// ============================================================================
+
+/// AI-powered element search.
+pub async fn ui_bridge_ai_search_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: AI search");
+
+    let payload = serde_json::json!({ "params": body });
+
+    match ui_bridge_request_sync(&state, "ai_search", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: AI search failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Natural language element find.
+pub async fn ui_bridge_ai_find_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: AI find");
+
+    let payload = serde_json::json!({ "params": body });
+
+    match ui_bridge_request_sync(&state, "ai_find", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: AI find failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// Create routes for this module.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
@@ -1724,6 +2274,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/snapshot",
             get(ui_bridge_get_snapshot_handler),
+        )
+        .route(
+            "/ui-bridge/control/windows",
+            get(ui_bridge_list_windows_handler),
         )
         .route(
             "/ui-bridge/control/annotated-screenshot",
@@ -1891,6 +2445,29 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/ai/change-buffer/size",
             get(ui_bridge_get_change_buffer_size_handler),
+        )
+        // Keyboard shortcuts
+        .route(
+            "/ui-bridge/control/keyboard-shortcuts",
+            get(ui_bridge_get_keyboard_shortcuts_handler),
+        )
+        // Idle detection
+        .route(
+            "/ui-bridge/control/idle-status",
+            get(ui_bridge_get_idle_status_handler),
+        )
+        .route(
+            "/ui-bridge/control/wait-for-idle",
+            post(ui_bridge_wait_for_idle_handler),
+        )
+        // AI search & find
+        .route(
+            "/ui-bridge/control/ai/search",
+            post(ui_bridge_ai_search_handler),
+        )
+        .route(
+            "/ui-bridge/control/ai/find",
+            post(ui_bridge_ai_find_handler),
         )
         // Exploration
         .route("/ui-bridge/explore", post(start_ui_bridge_exploration))

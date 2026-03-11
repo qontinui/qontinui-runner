@@ -20,6 +20,7 @@ use crate::config_storage::ConfigStorage;
 use crate::database::CreateTaskRunEventInput;
 use crate::doctor::DoctorHandle;
 use crate::event_system::EventBroadcaster;
+use crate::mcp::types::MCP_API_PORT;
 use crate::orchestrator::integration::StageTransition;
 use crate::orchestrator::knowledge::{parse_findings_from_output, AgentType, KnowledgeBase};
 use crate::step_executor::ExecutionStepConfig;
@@ -1479,6 +1480,11 @@ impl LoopController {
             );
         }
 
+        // Health regression warning from previous iteration's agentic phase.
+        // Injected into the current iteration's failure context so the AI knows
+        // its changes degraded the app.
+        let mut pending_health_regression: Option<String> = None;
+
         let loop_result = loop {
             iteration += 1;
 
@@ -2098,55 +2104,47 @@ impl LoopController {
                 failure_context
             };
 
-            // Enrich failure context with recent process stderr from managed processes.
-            // This gives the AI direct visibility into runtime/compiler errors.
+            // Inject health regression warning from previous iteration's agentic phase
+            let failure_context = if let Some(warning) = pending_health_regression.take() {
+                format!("{}\n\n{}", failure_context, warning)
+            } else {
+                failure_context
+            };
+
+            // Enrich failure context with structured build errors from managed processes.
+            // Parses stderr from dev servers to extract actionable errors (file, line, message)
+            // instead of dumping raw stderr output.
             let failure_context = {
                 let mut enriched = failure_context;
                 let mgr_lock = self.app_state.process_capture_manager.lock().await;
                 if let Some(ref mgr) = *mgr_lock {
                     let statuses = mgr.get_all_status().await;
-                    let running_ids: Vec<(String, String)> = statuses
-                        .iter()
-                        .filter(|s| s.state != crate::process_capture::types::ProcessState::Stopped)
-                        .map(|s| (s.id.clone(), s.name.clone()))
-                        .collect();
+                    let active_processes: Vec<&crate::process_capture::types::ProcessStatus> =
+                        statuses
+                            .iter()
+                            .filter(|s| {
+                                s.state != crate::process_capture::types::ProcessState::Stopped
+                            })
+                            .collect();
 
-                    let mut stderr_sections: Vec<String> = Vec::new();
-                    for (id, name) in &running_ids {
-                        if let Ok(lines) = mgr.get_output(id, 80).await {
-                            let stderr_lines: Vec<&crate::process_capture::types::OutputLine> =
-                                lines
-                                    .iter()
-                                    .filter(|l| {
-                                        l.stream
-                                            == crate::process_capture::types::OutputStream::Stderr
-                                    })
-                                    .collect();
-                            // Take last 50 stderr lines
-                            let tail: Vec<&&crate::process_capture::types::OutputLine> =
-                                if stderr_lines.len() > 50 {
-                                    stderr_lines[stderr_lines.len() - 50..].iter().collect()
-                                } else {
-                                    stderr_lines.iter().collect()
-                                };
-                            if !tail.is_empty() {
-                                let mut section = format!("**{} (stderr):**\n```\n", name);
-                                for line in &tail {
-                                    section.push_str(&line.line);
-                                    section.push('\n');
-                                }
-                                section.push_str("```");
-                                stderr_sections.push(section);
-                            }
+                    let mut analyses = Vec::new();
+                    for status in &active_processes {
+                        if let Ok(lines) = mgr.get_output(&status.id, 100).await {
+                            let analysis =
+                                crate::process_capture::build_errors::analyze_process_output(
+                                    &status.name,
+                                    &lines,
+                                    status,
+                                );
+                            analyses.push(analysis);
                         }
                     }
 
-                    if !stderr_sections.is_empty() {
-                        enriched.push_str("\n\n## Recent Process Errors\n\n");
-                        enriched.push_str(
-                            "The following stderr output was captured from managed dev processes:\n\n",
-                        );
-                        enriched.push_str(&stderr_sections.join("\n\n"));
+                    if let Some(build_section) =
+                        crate::process_capture::build_errors::format_build_analysis(&analyses)
+                    {
+                        enriched.push_str("\n\n");
+                        enriched.push_str(&build_section);
                     }
                 }
                 enriched
@@ -2170,6 +2168,10 @@ impl LoopController {
                 iteration,
             );
 
+            // Capture error baseline before agentic phase for regression detection.
+            // After the AI makes changes, we compare to identify newly introduced errors.
+            let pre_agentic_health = fetch_pre_agentic_health_baseline().await;
+
             let agentic_phase_start = std::time::Instant::now();
             let (agentic_outcome, new_injected_steps) = self
                 .agentic_executor
@@ -2183,6 +2185,19 @@ impl LoopController {
                 )
                 .await;
             let agentic_duration_ms = agentic_phase_start.elapsed().as_millis() as u64;
+
+            // Compare post-agentic health with baseline to detect regressions.
+            // Store for the NEXT iteration's failure context (since this iteration's
+            // failure context was already built from verification results).
+            if agentic_outcome.is_success() {
+                pending_health_regression = detect_health_regression(&pre_agentic_health).await;
+                if pending_health_regression.is_some() {
+                    warn!(
+                        "HEALTH-REGRESSION: Detected after agentic phase (iteration {})",
+                        iteration
+                    );
+                }
+            }
 
             // Accumulate any newly injected steps for future verification iterations
             let new_injected_count = new_injected_steps.len();
@@ -4035,6 +4050,149 @@ pub fn extract_prompt_steps_with_phase(
             Some(config)
         })
         .collect()
+}
+
+// =============================================================================
+// Health Baseline & Regression Detection (UI Bridge)
+// =============================================================================
+
+/// Lightweight health baseline captured before the agentic phase.
+/// Used to detect if the AI's changes degraded app health.
+#[derive(Debug)]
+struct HealthBaseline {
+    status: String,
+    score: u64,
+    error_count: u64,
+}
+
+/// Capture a health baseline from the SDK app before the agentic phase.
+/// Returns None if the SDK app isn't connected (best-effort).
+async fn fetch_pre_agentic_health_baseline() -> Option<HealthBaseline> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+
+    let url = format!("http://127.0.0.1:{}/ui-bridge/sdk/health", MCP_API_PORT);
+
+    let response = client.get(&url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let body: serde_json::Value = response.json().await.ok()?;
+    let data = body.get("data")?;
+
+    Some(HealthBaseline {
+        status: data
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        score: data.get("score").and_then(|v| v.as_u64()).unwrap_or(100),
+        error_count: data
+            .get("breakdown")
+            .map(|b| {
+                let crashes = b.get("crashes").and_then(|v| v.as_u64()).unwrap_or(0);
+                let errors = b.get("errors").and_then(|v| v.as_u64()).unwrap_or(0);
+                crashes + errors
+            })
+            .unwrap_or(0),
+    })
+}
+
+/// Compare post-agentic health with the pre-agentic baseline.
+/// Returns a warning string if the AI's changes degraded health.
+async fn detect_health_regression(baseline: &Option<HealthBaseline>) -> Option<String> {
+    let baseline = baseline.as_ref()?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+
+    let url = format!("http://127.0.0.1:{}/ui-bridge/sdk/health", MCP_API_PORT);
+
+    let response = client.get(&url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let body: serde_json::Value = response.json().await.ok()?;
+    let data = body.get("data")?;
+
+    let post_status = data
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let post_score = data.get("score").and_then(|v| v.as_u64()).unwrap_or(100);
+    let post_error_count = data
+        .get("breakdown")
+        .map(|b| {
+            let crashes = b.get("crashes").and_then(|v| v.as_u64()).unwrap_or(0);
+            let errors = b.get("errors").and_then(|v| v.as_u64()).unwrap_or(0);
+            crashes + errors
+        })
+        .unwrap_or(0);
+
+    // Detect meaningful degradation
+    let status_degraded = baseline.status == "healthy" && post_status != "healthy";
+    let newly_broken = baseline.status != "broken" && post_status == "broken";
+    let new_errors = post_error_count.saturating_sub(baseline.error_count);
+    let score_drop = baseline.score.saturating_sub(post_score);
+
+    if !newly_broken && !status_degraded && new_errors == 0 && score_drop < 20 {
+        return None;
+    }
+
+    let mut warning = String::from("### App Health Regression\n\n");
+    warning.push_str(
+        "**Your changes degraded the app's health.** The following issues were detected after your code changes:\n\n",
+    );
+
+    if newly_broken {
+        let summary = data.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+        warning.push_str(&format!(
+            "- App went from **{}** to **BROKEN** (score: {} → {})\n",
+            baseline.status.to_uppercase(),
+            baseline.score,
+            post_score
+        ));
+        if !summary.is_empty() {
+            warning.push_str(&format!("- Health summary: {}\n", summary));
+        }
+    } else if status_degraded {
+        warning.push_str(&format!(
+            "- App health degraded from **{}** to **{}** (score: {} → {})\n",
+            baseline.status.to_uppercase(),
+            post_status.to_uppercase(),
+            baseline.score,
+            post_score
+        ));
+    }
+
+    if new_errors > 0 {
+        warning.push_str(&format!(
+            "- {} new error(s) introduced (was {}, now {})\n",
+            new_errors, baseline.error_count, post_error_count
+        ));
+    }
+
+    if let Some(top_issue) = data.get("topIssue") {
+        if let Some(msg) = top_issue.get("message").and_then(|v| v.as_str()) {
+            let severity = top_issue
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("error");
+            warning.push_str(&format!("- Top issue: [{}] {}\n", severity, msg));
+        }
+    }
+
+    warning.push_str(
+        "\nPlease check that your changes don't break the app. Fix any compilation or runtime errors before proceeding.\n",
+    );
+
+    Some(warning)
 }
 
 // =============================================================================
