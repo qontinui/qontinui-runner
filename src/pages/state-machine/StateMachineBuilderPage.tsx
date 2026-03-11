@@ -319,7 +319,7 @@ export function StateMachineBuilderPage() {
             }`}
           >
             {tab.icon}
-            {tab.label}
+            <span>{tab.label}</span>
           </button>
         ))}
       </div>
@@ -337,14 +337,14 @@ export function StateMachineBuilderPage() {
                   className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-white bg-brand-primary hover:bg-brand-primary/90 rounded shadow-md"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  Add State
+                  <span>Add State</span>
                 </button>
                 <button
                   onClick={handleOpenNewTransition}
                   className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-text-primary border border-border-secondary hover:border-border-primary bg-bg-primary/90 backdrop-blur-sm rounded shadow-md"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  Add Transition
+                  <span>Add Transition</span>
                 </button>
               </div>
               <StateMachineGraph
@@ -367,7 +367,7 @@ export function StateMachineBuilderPage() {
                   className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-white bg-brand-primary hover:bg-brand-primary/90 rounded shadow-md"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  Add State
+                  <span>Add State</span>
                 </button>
               </div>
               <StateViewPanel
@@ -387,7 +387,7 @@ export function StateMachineBuilderPage() {
                   className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-white bg-brand-primary hover:bg-brand-primary/90 rounded shadow-md"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  Add Transition
+                  <span>Add Transition</span>
                 </button>
               </div>
               <TransitionsPanel
@@ -496,6 +496,7 @@ export function StateMachineBuilderPage() {
                       value={newStateName}
                       onChange={(e) => setNewStateName(e.target.value)}
                       placeholder="e.g., Login Page"
+                      aria-label="e.g., Login Page"
                       autoFocus
                       onKeyDown={(e) => {
                         if (e.key === "Enter" && newStateName.trim()) handleCreateState();
@@ -504,12 +505,15 @@ export function StateMachineBuilderPage() {
                     />
                   </div>
                   <div>
-                    <label className="block text-xs text-text-secondary mb-1">Description</label>
+                    <label className="block text-xs text-text-secondary mb-1">
+                      <span>Optional description</span>
+                    </label>
                     <textarea
                       value={newStateDescription}
                       onChange={(e) => setNewStateDescription(e.target.value)}
                       rows={3}
                       placeholder="Optional description"
+                      aria-label="Optional description"
                       className="w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border-secondary rounded text-text-primary placeholder:text-text-muted resize-y"
                     />
                   </div>

@@ -321,18 +321,26 @@ export function LiveTestPanel({ states, transitions }: LiveTestPanelProps) {
         <div className="space-y-2">
           <label className="text-xs font-medium text-text-secondary">Navigate to State</label>
           <div className="flex gap-2">
-            <select
-              value={selectedStateId ?? ""}
-              onChange={(e) => setSelectedStateId(e.target.value || null)}
-              className="flex-1 px-2 py-1.5 text-sm bg-bg-tertiary border border-border-secondary rounded text-text-primary"
-            >
-              <option value="">Select a state...</option>
-              {states.map((s) => (
-                <option key={s.state_id} value={s.state_id}>
-                  {s.name} ({s.element_ids.length} elements)
-                </option>
-              ))}
-            </select>
+            <div className="relative flex-1">
+              <select
+                value={selectedStateId ?? ""}
+                onChange={(e) => setSelectedStateId(e.target.value || null)}
+                aria-label="Select a state..."
+                className={`w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border-secondary rounded appearance-none pr-6 ${selectedStateId ? "text-text-primary" : "text-transparent"}`}
+              >
+                <option value="">Select a state...</option>
+                {states.map((s) => (
+                  <option key={s.state_id} value={s.state_id}>
+                    {s.name} ({s.element_ids.length} elements)
+                  </option>
+                ))}
+              </select>
+              {!selectedStateId && (
+                <span className="pointer-events-none absolute inset-0 flex items-center px-2 text-sm text-text-primary">
+                  Select a state...
+                </span>
+              )}
+            </div>
             <button
               onClick={handleNavigateToState}
               disabled={!selectedStateId || navigating}

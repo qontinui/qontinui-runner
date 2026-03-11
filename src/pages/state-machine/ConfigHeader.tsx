@@ -50,23 +50,31 @@ export function ConfigHeader({
   return (
     <div className="flex items-center gap-3">
       <GitBranch className="w-5 h-5 text-text-secondary shrink-0" />
-      <h1 className="text-lg font-semibold text-text-primary shrink-0">State Machine</h1>
+      <h1 className="text-xl font-bold text-text-primary shrink-0">State Machine</h1>
 
       {/* Config selector */}
-      <select
-        value={activeConfigId ?? ""}
-        onChange={(e) => {
-          if (e.target.value) onSelectConfig(e.target.value);
-        }}
-        className="px-2 py-1.5 text-sm bg-bg-tertiary border border-border-secondary rounded text-text-primary min-w-[180px]"
-      >
-        <option value="">Select config...</option>
-        {configs.map((c) => (
-          <option key={c.id} value={c.id}>
-            {c.name}
-          </option>
-        ))}
-      </select>
+      <div className="relative min-w-[180px]">
+        <select
+          value={activeConfigId ?? ""}
+          onChange={(e) => {
+            if (e.target.value) onSelectConfig(e.target.value);
+          }}
+          aria-label="Select config..."
+          className={`w-full px-2 py-1.5 text-sm bg-bg-tertiary border border-border-secondary rounded appearance-none pr-6 ${activeConfigId ? "text-text-primary" : "text-transparent"}`}
+        >
+          <option value="">Select config...</option>
+          {configs.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+        {!activeConfigId && (
+          <span className="pointer-events-none absolute inset-0 flex items-center px-2 text-sm text-text-primary">
+            Select config...
+          </span>
+        )}
+      </div>
 
       {/* New config button / input */}
       {showNewInput ? (
@@ -80,6 +88,7 @@ export function ConfigHeader({
               if (e.key === "Escape") setShowNewInput(false);
             }}
             placeholder="Config name..."
+            aria-label="Config name..."
             autoFocus
             className="px-2 py-1.5 text-sm bg-bg-tertiary border border-border-secondary rounded text-text-primary w-40"
           />
@@ -113,6 +122,7 @@ export function ConfigHeader({
           onClick={handleDelete}
           className="p-1.5 text-text-muted hover:text-red-400 rounded"
           title="Delete config"
+          aria-label="Delete config"
         >
           <Trash2 className="w-4 h-4" />
         </button>
