@@ -1139,9 +1139,7 @@ pub async fn generate_unified_workflow_async_handler(
             cross_workflow_learning: true,
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
-            project_path: crate::mcp::shared::get_workspace_paths_internal()
-                .ok()
-                .map(|(root, _, _)| root.to_string_lossy().to_string()),
+            project_path: crate::mcp::shared::current_project_path(),
         };
 
         // Clone state fields for the background task
@@ -1503,9 +1501,7 @@ pub async fn run_unified_workflow(
             cross_workflow_learning: true,
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
-            project_path: crate::mcp::shared::get_workspace_paths_internal()
-                .ok()
-                .map(|(root, _, _)| root.to_string_lossy().to_string()),
+            project_path: crate::mcp::shared::current_project_path(),
         };
 
         let checkpoint_db = state.app_state.checkpoint_db.clone();
@@ -1937,9 +1933,7 @@ pub async fn execute_inline_workflow(
             cross_workflow_learning: true,
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
-            project_path: crate::mcp::shared::get_workspace_paths_internal()
-                .ok()
-                .map(|(root, _, _)| root.to_string_lossy().to_string()),
+            project_path: crate::mcp::shared::current_project_path(),
         };
 
         // Spawn in background (non-blocking) — same pattern as run_unified_workflow
@@ -2376,9 +2370,7 @@ pub async fn run_composed_workflow(
                 cross_workflow_learning: true,
                 verification_history: std::collections::HashMap::new(),
                 routing_context: Default::default(),
-                project_path: crate::mcp::shared::get_workspace_paths_internal()
-                    .ok()
-                    .map(|(root, _, _)| root.to_string_lossy().to_string()),
+                project_path: crate::mcp::shared::current_project_path(),
             };
 
             // Run the LoopController once with all stages

@@ -369,9 +369,7 @@ pub fn launch_reflection(
     let reflection_fix_ctx = crate::mcp::shared::ReflectionFixContext {
         source_task_run_id: source_task_run_id.clone(),
         reflection_task_run_id: reflection_id.clone(),
-        project_path: crate::mcp::shared::get_workspace_paths_internal()
-            .ok()
-            .map(|(root, _, _)| root.to_string_lossy().to_string()),
+        project_path: crate::mcp::shared::current_project_path(),
     };
 
     let mut controller = crate::unified_workflow_executor::LoopController::new(

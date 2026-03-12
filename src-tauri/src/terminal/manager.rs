@@ -42,9 +42,7 @@ impl TerminalManager {
             .filter(|d| !d.is_empty())
             .or_else(|| {
                 // Default to workspace root (parent of qontinui-runner)
-                crate::mcp::shared::get_workspace_paths_internal()
-                    .ok()
-                    .map(|(root, _, _)| root.to_string_lossy().to_string())
+                crate::mcp::shared::current_project_path()
             })
             .unwrap_or_default();
         let cols = cols.unwrap_or(120);

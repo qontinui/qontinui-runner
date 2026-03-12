@@ -4486,9 +4486,7 @@ impl Executor for AgenticExecutor {
             cross_workflow_learning: true,
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
-            project_path: crate::mcp::shared::get_workspace_paths_internal()
-                .ok()
-                .map(|(root, _, _)| root.to_string_lossy().to_string()),
+            project_path: crate::mcp::shared::current_project_path(),
         };
 
         let (outcome, _injected_steps) = self

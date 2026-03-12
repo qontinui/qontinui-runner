@@ -276,6 +276,13 @@ pub fn write_ai_debug_log(message: &str) {
     }
 }
 
+/// Get the current workspace root directory as a String, if available.
+pub fn current_project_path() -> Option<String> {
+    get_workspace_paths_internal()
+        .ok()
+        .map(|(root, _, _)| root.to_string_lossy().to_string())
+}
+
 /// Helper function to get workspace paths (reused from config.rs pattern)
 pub fn get_workspace_paths_internal(
 ) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf), String> {
