@@ -742,6 +742,10 @@ pub fn import_config(conn: &Connection, req: &SmImportRequest) -> Result<SmConfi
                     .unwrap_or_default();
 
                 let req = CreateSmTransitionRequest {
+                    transition_id: t_data
+                        .get("transition_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                     name: t_data
                         .get("name")
                         .and_then(|v| v.as_str())

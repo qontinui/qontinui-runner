@@ -5035,6 +5035,56 @@ class QontinuiExecutor:
     # UI Bridge State Machine handlers
     # =========================================================================
 
+    @staticmethod
+    def _normalize_sm_config(config_data: dict[str, Any]) -> dict[str, Any]:
+        """Normalize state machine config from CRUD API format to from_dict format.
+
+        The CRUD API returns states/transitions as lists with database fields
+        (state_id, extra_metadata, config_id, etc). UIBridgeRuntime.from_dict
+        expects dicts keyed by ID with UIBridgeState/UIBridgeTransition fields.
+        """
+        result: dict[str, Any] = {}
+
+        # Transform states: list -> dict keyed by state_id
+        states = config_data.get("states", {})
+        if isinstance(states, list):
+            result["states"] = {}
+            for s in states:
+                sid = s.get("state_id", s.get("id", ""))
+                result["states"][sid] = {
+                    "id": sid,
+                    "name": s.get("name", sid),
+                    "element_ids": s.get("element_ids", []),
+                    "metadata": s.get("extra_metadata", s.get("metadata", {})),
+                }
+        else:
+            result["states"] = states
+
+        # Transform transitions: list -> dict keyed by transition_id
+        transitions = config_data.get("transitions", {})
+        if isinstance(transitions, list):
+            result["transitions"] = {}
+            for t in transitions:
+                tid = t.get("transition_id", t.get("id", ""))
+                result["transitions"][tid] = {
+                    "id": tid,
+                    "name": t.get("name", tid),
+                    "from_states": t.get("from_states", []),
+                    "activate_states": t.get("activate_states", []),
+                    "exit_states": t.get("exit_states", []),
+                    "actions": t.get("actions", []),
+                    "path_cost": t.get("path_cost", 1.0),
+                    "stays_visible": t.get("stays_visible", False),
+                    "metadata": t.get("extra_metadata", t.get("metadata", {})),
+                }
+        else:
+            result["transitions"] = transitions
+
+        if "config" in config_data:
+            result["config"] = config_data["config"]
+
+        return result
+
     def _handle_load_state_machine(self, params: dict[str, Any]) -> dict[str, Any]:
         """Load a UI Bridge state machine configuration.
 
@@ -5062,7 +5112,9 @@ class QontinuiExecutor:
             resolver = ElementResolver(persistence)
             client = ResolvingUIBridgeClient(inner_client, resolver)
 
-            runtime = UIBridgeRuntime.from_dict(config_data, client)
+            # Normalize CRUD API format to from_dict format if needed
+            normalized = self._normalize_sm_config(config_data)
+            runtime = UIBridgeRuntime.from_dict(normalized, client)
             self._ui_bridge_runtime = runtime
             self._element_resolver = resolver
 

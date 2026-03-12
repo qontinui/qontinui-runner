@@ -110,6 +110,7 @@ pub struct SmTransition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSmTransitionRequest {
+    pub transition_id: Option<String>,
     pub name: String,
     pub from_states: Vec<String>,
     pub activate_states: Vec<String>,
