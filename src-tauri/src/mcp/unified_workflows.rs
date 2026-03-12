@@ -376,6 +376,9 @@ pub async fn get_unified_workflow(
                 reflection_mode: Some(workflow.reflection_mode),
                 completion_prompts_first: Some(workflow.completion_prompts_first),
                 model_overrides: Some(workflow.model_overrides.clone()),
+                dependency_graph: workflow.dependency_graph.clone(),
+                cost_annotations: workflow.cost_annotations.clone(),
+                quality_report: workflow.quality_report.clone(),
             };
             if let Err(e) = state
                 .app_state
@@ -782,6 +785,9 @@ pub async fn import_unified_workflow(
         reflection_mode: Some(workflow.reflection_mode),
         completion_prompts_first: Some(workflow.completion_prompts_first),
         model_overrides: Some(workflow.model_overrides.clone()),
+        dependency_graph: workflow.dependency_graph.clone(),
+        cost_annotations: workflow.cost_annotations.clone(),
+        quality_report: workflow.quality_report.clone(),
     };
 
     // Use the database's create function but with our custom ID
@@ -872,6 +878,7 @@ pub async fn generate_unified_workflow_handler(
                     hardening_summary: None,
                     discovery_calls: vec![],
                     acceptance_criteria: None,
+                    quality_report: None,
                 }
             }
         }
@@ -1002,6 +1009,9 @@ pub async fn generate_unified_workflow_async_handler(
         reflection_mode: Some(meta_workflow.reflection_mode),
         completion_prompts_first: Some(meta_workflow.completion_prompts_first),
         model_overrides: Some(meta_workflow.model_overrides.clone()),
+        dependency_graph: meta_workflow.dependency_graph.clone(),
+        cost_annotations: meta_workflow.cost_annotations.clone(),
+        quality_report: meta_workflow.quality_report.clone(),
     };
 
     let saved_workflow = match state
@@ -1790,6 +1800,9 @@ pub async fn execute_inline_workflow(
         reflection_mode: false,
         completion_prompts_first: false,
         is_favorite: false,
+        dependency_graph: None,
+        cost_annotations: None,
+        quality_report: None,
         model_overrides: std::collections::HashMap::new(),
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),

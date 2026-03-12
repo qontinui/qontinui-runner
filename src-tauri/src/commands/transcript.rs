@@ -277,6 +277,7 @@ pub async fn generate_workflow_standalone(
                     hardening_summary: None,
                     discovery_calls: vec![],
                     acceptance_criteria: None,
+                    quality_report: None,
                 }
             }
         }
@@ -329,6 +330,9 @@ pub async fn generate_workflow_standalone(
                         reflection_mode: Some(workflow.reflection_mode),
                         completion_prompts_first: Some(workflow.completion_prompts_first),
                         model_overrides: Some(workflow.model_overrides.clone()),
+                        dependency_graph: workflow.dependency_graph.clone(),
+                        cost_annotations: workflow.cost_annotations.clone(),
+                        quality_report: workflow.quality_report.clone(),
                     };
 
                     let save_result = tokio::task::spawn_blocking(move || {

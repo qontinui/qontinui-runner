@@ -899,6 +899,11 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     -- Sync status
     sync_pending INTEGER DEFAULT 0,  -- Whether workflow needs to be synced to backend
 
+    -- Quality improvements (generation metadata)
+    dependency_graph TEXT DEFAULT NULL,
+    cost_annotations TEXT DEFAULT NULL,
+    quality_report TEXT DEFAULT NULL,
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -2315,6 +2320,11 @@ CREATE TABLE IF NOT EXISTS generation_pipeline_artifacts (
     builder_prompt TEXT,
     verification_prompts TEXT,
     hardener_prompt TEXT,
+
+    -- Revision phase
+    revision_duration_ms INTEGER DEFAULT NULL,
+    quality_report TEXT DEFAULT NULL,
+    revision_cycles INTEGER DEFAULT NULL,
 
     -- Outcome
     success INTEGER NOT NULL DEFAULT 1,

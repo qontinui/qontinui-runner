@@ -157,6 +157,51 @@ pub struct StageCondition {
 /// A workflow stage — a self-contained unit of execution with its own
 /// setup/verification/agentic/completion steps and verification-agentic loop.
 ///
+/// Retry policy for a step or stage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// Number of retry attempts (0 = no retries)
+    #[serde(default)]
+    pub count: u32,
+    /// Delay between retries in milliseconds
+    #[serde(default = "default_retry_delay_ms")]
+    pub delay_ms: u64,
+    /// Whether to use exponential backoff
+    #[serde(default)]
+    pub backoff: bool,
+}
+
+fn default_retry_delay_ms() -> u64 {
+    2000
+}
+
+/// An output declared by a stage, available to subsequent stages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageOutput {
+    /// Unique key for this output (e.g. "api_url", "auth_token")
+    pub key: String,
+    /// Human-readable description
+    #[serde(default)]
+    pub description: String,
+}
+
+/// An input required by a stage, referencing a prior stage's output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageInput {
+    /// The key to bind this input to (matches a StageOutput.key from a prior stage)
+    pub key: String,
+    /// Which stage provides this input (stage id). If omitted, searches all prior stages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_stage: Option<String>,
+    /// Whether this input is required (default: true). Missing required inputs are Critical findings.
+    #[serde(default = "default_true")]
+    pub required: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Multi-stage workflows execute stages sequentially. Each stage gets its own
 /// verification-agentic loop, and later stages see full output from all prior stages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +253,15 @@ pub struct WorkflowStage {
     /// Default (false) runs automation first, then prompts.
     #[serde(default)]
     pub completion_prompts_first: bool,
+    /// Retry policy for this stage (overrides per-step defaults)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_policy: Option<RetryPolicy>,
+    /// Declared outputs that this stage produces for downstream stages
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Vec<StageOutput>>,
+    /// Inputs required from prior stages
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<Vec<StageInput>>,
 }
 
 /// A unified workflow with steps organized by phase
@@ -375,6 +429,18 @@ pub struct UnifiedWorkflow {
     #[serde(default)]
     pub is_favorite: bool,
 
+    /// Dependency graph computed during generation (JSON blob)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_graph: Option<Value>,
+
+    /// Cost annotations computed during generation (JSON blob)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_annotations: Option<Value>,
+
+    /// Quality report from the revision phase (JSON blob)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_report: Option<Value>,
+
     /// ISO 8601 timestamp of creation
     #[serde(default)]
     pub created_at: String,
@@ -419,6 +485,9 @@ impl UnifiedWorkflow {
             approval_gate: self.approval_gate,
             condition: None,
             completion_prompts_first: self.completion_prompts_first,
+            retry_policy: None,
+            outputs: None,
+            inputs: None,
         }]
     }
 }
@@ -537,6 +606,15 @@ pub struct CreateUnifiedWorkflowRequest {
     /// When true, run completion prompt steps BEFORE automation steps
     #[serde(default)]
     pub completion_prompts_first: Option<bool>,
+    /// Dependency graph (JSON blob, set by generator)
+    #[serde(default)]
+    pub dependency_graph: Option<Value>,
+    /// Cost annotations (JSON blob, set by generator)
+    #[serde(default)]
+    pub cost_annotations: Option<Value>,
+    /// Quality report (JSON blob, set by generator)
+    #[serde(default)]
+    pub quality_report: Option<Value>,
 }
 
 /// Request body for updating a unified workflow
@@ -588,6 +666,12 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub reflection_mode: Option<bool>,
     /// When true, run completion prompt steps BEFORE automation steps
     pub completion_prompts_first: Option<bool>,
+    /// Dependency graph (JSON blob, set by generator)
+    pub dependency_graph: Option<Value>,
+    /// Cost annotations (JSON blob, set by generator)
+    pub cost_annotations: Option<Value>,
+    /// Quality report (JSON blob, set by generator)
+    pub quality_report: Option<Value>,
 }
 
 /// Query parameters for searching unified workflows

@@ -342,6 +342,9 @@ pub fn build_meta_workflow_template(
         reflection_mode: false,
         completion_prompts_first: true, // AI hardener must run BEFORE save_workflow_artifact
         is_favorite: false,
+        dependency_graph: None,
+        cost_annotations: None,
+        quality_report: None,
         model_overrides: std::collections::HashMap::new(),
         created_at: now.clone(),
         updated_at: now,

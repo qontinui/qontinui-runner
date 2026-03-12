@@ -4,6 +4,7 @@
 //! natural language descriptions using AI.
 
 pub mod benchmark;
+pub mod dependency_analysis;
 pub mod discovery_tools;
 pub mod example_workflows;
 pub mod feedback;
@@ -14,6 +15,7 @@ pub mod meta_workflow;
 pub mod pipeline_artifacts;
 pub mod prompt_analysis;
 pub mod relevance_filter;
+pub mod revision;
 pub mod rules;
 pub mod schema_context;
 pub mod self_improve;
@@ -23,6 +25,7 @@ pub mod step_type_knowledge;
 pub mod step_type_metadata;
 pub mod training_data;
 pub mod validation;
+pub mod verification_templates;
 
 pub use generator::{
     extract_json_from_response, generate_workflow, GenerateWorkflowRequest,

@@ -3210,6 +3210,7 @@ pub async fn generate_workflow_from_session(
                 hardening_summary: None,
                 discovery_calls: vec![],
                 acceptance_criteria: None,
+                quality_report: None,
             },
         }
     })

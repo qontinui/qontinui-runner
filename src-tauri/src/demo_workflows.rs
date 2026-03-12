@@ -202,6 +202,9 @@ fn build_calculator_workflow(
         reflection_mode: Some(false),
         completion_prompts_first: None,
         model_overrides: None,
+        dependency_graph: None,
+        cost_annotations: None,
+        quality_report: None,
     }
 }
 
@@ -282,6 +285,9 @@ fn build_tdd_workflow(
         reflection_mode: Some(false),
         completion_prompts_first: None,
         model_overrides: None,
+        dependency_graph: None,
+        cost_annotations: None,
+        quality_report: None,
     }
 }
 
@@ -363,5 +369,8 @@ fn build_pipeline_workflow(
         reflection_mode: Some(false),
         completion_prompts_first: None,
         model_overrides: None,
+        dependency_graph: None,
+        cost_annotations: None,
+        quality_report: None,
     }
 }

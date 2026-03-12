@@ -27,6 +27,8 @@ import { PhaseTimelinePanel } from "./PhaseTimelinePanel";
 import { IterationComparisonPanel } from "./IterationComparisonPanel";
 import { StepDurationChartPanel } from "./StepDurationChartPanel";
 import { PhaseDistributionPanel } from "./PhaseDistributionPanel";
+import { DependencyGraphPanel } from "./DependencyGraphPanel";
+import { CostBreakdownPanel } from "./CostBreakdownPanel";
 
 /**
  * Props that all canvas panel components receive.
@@ -77,6 +79,8 @@ const COMPONENT_MAP: Record<string, ComponentType<CanvasPanelComponentProps>> = 
   IterationComparison: IterationComparisonPanel,
   StepDurationChart: StepDurationChartPanel,
   PhaseDistribution: PhaseDistributionPanel,
+  DependencyGraph: DependencyGraphPanel,
+  CostBreakdown: CostBreakdownPanel,
 };
 
 /**

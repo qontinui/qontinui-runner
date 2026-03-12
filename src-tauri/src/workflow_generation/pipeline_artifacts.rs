@@ -52,6 +52,11 @@ pub struct PipelineArtifact {
     pub final_json: Option<serde_json::Value>,
     pub validation_errors: Option<serde_json::Value>,
 
+    // Revision phase
+    pub revision_duration_ms: Option<u64>,
+    pub quality_report: Option<serde_json::Value>,
+    pub revision_cycles: Option<u32>,
+
     // Outcome
     pub success: bool,
     pub error_message: Option<String>,
@@ -106,6 +111,10 @@ pub struct PipelineArtifactBuilder {
     pub hardened_json: Option<serde_json::Value>,
     pub final_json: Option<serde_json::Value>,
     pub validation_errors: Option<serde_json::Value>,
+
+    pub revision_duration_ms: Option<u64>,
+    pub quality_report: Option<serde_json::Value>,
+    pub revision_cycles: Option<u32>,
 
     pub success: bool,
     pub error_message: Option<String>,
@@ -165,6 +174,10 @@ impl PipelineArtifactBuilder {
             hardened_json: self.hardened_json,
             final_json: self.final_json,
             validation_errors: self.validation_errors,
+
+            revision_duration_ms: self.revision_duration_ms,
+            quality_report: self.quality_report,
+            revision_cycles: self.revision_cycles,
 
             success: self.success,
             error_message: self.error_message,

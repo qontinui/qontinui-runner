@@ -1755,6 +1755,9 @@ mod tests {
             reflection_mode: false,
             completion_prompts_first: false,
             is_favorite: false,
+            dependency_graph: None,
+            cost_annotations: None,
+            quality_report: None,
             model_overrides: std::collections::HashMap::new(),
             created_at: "2025-01-01T00:00:00Z".to_string(),
             updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -2589,5 +2592,159 @@ mod tests {
         let cmd = steps[0].get("command").unwrap().as_str().unwrap();
         assert!(!cmd.contains("-sf"), "Should not contain -sf: {}", cmd);
         assert!(cmd.contains("-s "), "Should contain -s: {}", cmd);
+    }
+}
+
+// ==========================================================================
+// Retry Standardization (Feature 6)
+// ==========================================================================
+
+/// Get default retry policy for a step based on its type and content.
+///
+/// Returns `(count, delay_ms)` or `None` if no retry is appropriate.
+pub fn retry_defaults(step: &serde_json::Value) -> Option<(u32, u64)> {
+    let step_type = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let cmd = step.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    let check_type = step
+        .get("check_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let action = step.get("action").and_then(|v| v.as_str()).unwrap_or("");
+
+    match step_type {
+        "command" => {
+            if check_type == "http_status" || cmd.contains("curl") {
+                // HTTP health checks: 3 retries, 2s delay
+                Some((3, 2000))
+            } else if cmd.contains("sqlite3") || cmd.contains(".db") {
+                // SQLite queries: no retries (deterministic)
+                None
+            } else if check_type == "ai_review" {
+                // AI review: 1 retry, 5s delay
+                Some((1, 5000))
+            } else {
+                None
+            }
+        }
+        "ui_bridge" => {
+            if action == "assert" || action == "snapshot_assert" {
+                // UI Bridge assertions: 2 retries, 1s delay
+                Some((2, 1000))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Apply retry policies to all steps in a workflow.
+///
+/// Steps that already have a retry config are left unchanged.
+/// Stage-level retry_policy overrides per-step defaults for steps within that stage.
+pub fn apply_retry_policies(workflow: &mut crate::unified_workflows::UnifiedWorkflow) {
+    // Apply to top-level verification steps
+    apply_retry_to_steps(&mut workflow.verification_steps, None);
+
+    // Apply to stage verification steps
+    for stage in &mut workflow.stages {
+        let stage_policy = stage.retry_policy.as_ref().map(|p| (p.count, p.delay_ms));
+        apply_retry_to_steps(&mut stage.verification_steps, stage_policy);
+    }
+}
+
+fn apply_retry_to_steps(steps: &mut [serde_json::Value], stage_override: Option<(u32, u64)>) {
+    for step in steps.iter_mut() {
+        // Skip steps that already have retry configured (flat format)
+        if step.get("retry_count").is_some() {
+            continue;
+        }
+
+        // Determine retry config: stage override > step defaults
+        let retry_config = if let Some((count, delay_ms)) = stage_override {
+            Some((count, delay_ms))
+        } else {
+            retry_defaults(step)
+        };
+
+        if let Some((count, delay_ms)) = retry_config {
+            if count > 0 {
+                if let Some(obj) = step.as_object_mut() {
+                    obj.insert("retry_count".to_string(), serde_json::json!(count));
+                    obj.insert("retry_delay_ms".to_string(), serde_json::json!(delay_ms));
+                }
+            }
+        }
+    }
+}
+
+// ==========================================================================
+// Required-Flag Enforcement (Feature 7)
+// ==========================================================================
+
+/// Enforce required=true on verification steps linked to Critical criteria.
+///
+/// Called after the hardener agent returns, before the revision phase.
+pub fn enforce_required_flag_discipline(
+    workflow: &mut crate::unified_workflows::UnifiedWorkflow,
+    criteria: Option<&crate::workflow_generation::specification::AcceptanceCriteria>,
+) {
+    use crate::workflow_generation::specification::CriterionPriority;
+
+    let criteria = match criteria {
+        Some(c) => c,
+        None => return,
+    };
+
+    // Build set of critical criterion IDs
+    let critical_ids: std::collections::HashSet<&str> = criteria
+        .criteria
+        .iter()
+        .filter(|c| c.priority == CriterionPriority::Critical)
+        .map(|c| c.id.as_str())
+        .collect();
+
+    if critical_ids.is_empty() {
+        return;
+    }
+
+    // Enforce on top-level verification steps
+    enforce_required_on_steps(&mut workflow.verification_steps, &critical_ids);
+
+    // Enforce on stage verification steps
+    for stage in &mut workflow.stages {
+        enforce_required_on_steps(&mut stage.verification_steps, &critical_ids);
+    }
+}
+
+fn enforce_required_on_steps(
+    steps: &mut [serde_json::Value],
+    critical_ids: &std::collections::HashSet<&str>,
+) {
+    for step in steps.iter_mut() {
+        let mut is_critical = false;
+
+        if let Some(cid) = step.get("criterion_id").and_then(|v| v.as_str()) {
+            if critical_ids.contains(cid) {
+                is_critical = true;
+            }
+        }
+
+        if let Some(cids) = step.get("criterion_ids").and_then(|v| v.as_array()) {
+            for cid in cids {
+                if let Some(cid_str) = cid.as_str() {
+                    if critical_ids.contains(cid_str) {
+                        is_critical = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if is_critical {
+            if let Some(obj) = step.as_object_mut() {
+                obj.insert("required".to_string(), serde_json::Value::Bool(true));
+            }
+        }
     }
 }

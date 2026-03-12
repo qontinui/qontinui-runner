@@ -47,6 +47,8 @@ const ALLOWED_COMPONENTS: &[&str] = &[
     "IterationComparison",
     "StepDurationChart",
     "PhaseDistribution",
+    "DependencyGraph",
+    "CostBreakdown",
 ];
 
 /// In-memory canvas state.

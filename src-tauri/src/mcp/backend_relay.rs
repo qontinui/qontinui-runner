@@ -825,6 +825,7 @@ async fn handle_relay_command(
                             hardening_summary: None,
                             discovery_calls: vec![],
                             acceptance_criteria: None,
+                            quality_report: None,
                         }
                     }
                 }

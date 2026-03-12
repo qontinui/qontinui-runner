@@ -69,6 +69,8 @@ const VALID_CHECK_TYPES: &[&str] = &[
     "security",
     "custom_command",
     "ci_cd",
+    "http_status",
+    "ai_review",
 ];
 
 /// Valid test_type enum values
@@ -1018,8 +1020,17 @@ pub fn validate_criteria_coverage(
         .collect();
 
     for step in &all_verification_steps {
+        // Support single criterion_id
         if let Some(cid) = step.get("criterion_id").and_then(|v| v.as_str()) {
             found_criterion_ids.insert(cid.to_string());
+        }
+        // Support criterion_ids array
+        if let Some(cids) = step.get("criterion_ids").and_then(|v| v.as_array()) {
+            for cid in cids {
+                if let Some(cid_str) = cid.as_str() {
+                    found_criterion_ids.insert(cid_str.to_string());
+                }
+            }
         }
     }
 
@@ -1079,6 +1090,186 @@ pub fn validate_criteria_coverage(
     errors
 }
 
+/// Validate data contracts between stages.
+///
+/// For stages with `inputs`, checks that each required input has a matching
+/// `output` from a prior stage. Missing outputs → Critical, unconsumed outputs → Info.
+pub fn validate_data_contracts(workflow: &UnifiedWorkflow) -> Vec<super::revision::QualityFinding> {
+    use super::revision::{FindingCategory, FindingSeverity, QualityFinding};
+    use std::collections::HashSet;
+
+    let mut findings = Vec::new();
+
+    if workflow.stages.len() < 2 {
+        return findings;
+    }
+
+    // Collect all outputs declared by each stage
+    let mut available_outputs: HashSet<String> = HashSet::new();
+
+    for (i, stage) in workflow.stages.iter().enumerate() {
+        // Check inputs against available outputs
+        if let Some(ref inputs) = stage.inputs {
+            for input in inputs {
+                if !available_outputs.contains(&input.key) {
+                    let severity = if input.required {
+                        FindingSeverity::Critical
+                    } else {
+                        FindingSeverity::Info
+                    };
+                    findings.push(QualityFinding {
+                        finding_id: format!("data-contract-missing-{}-{}", i, input.key),
+                        step_id: Some(stage.id.clone()),
+                        severity,
+                        category: FindingCategory::DataContractViolation,
+                        description: format!(
+                            "Stage '{}' requires input '{}' but no prior stage declares it as an output",
+                            stage.name, input.key
+                        ),
+                        suggested_fix: Some(format!(
+                            "Add an output with key '{}' to a stage that runs before '{}'",
+                            input.key, stage.name
+                        )),
+                    });
+                }
+            }
+        }
+
+        // Register this stage's outputs for subsequent stages
+        if let Some(ref outputs) = stage.outputs {
+            for output in outputs {
+                available_outputs.insert(output.key.clone());
+            }
+        }
+    }
+
+    // Check for unconsumed outputs (Info level)
+    let consumed_keys: HashSet<String> = workflow
+        .stages
+        .iter()
+        .filter_map(|s| s.inputs.as_ref())
+        .flat_map(|inputs| inputs.iter().map(|i| i.key.clone()))
+        .collect();
+
+    for stage in &workflow.stages {
+        if let Some(ref outputs) = stage.outputs {
+            for output in outputs {
+                if !consumed_keys.contains(&output.key) {
+                    findings.push(QualityFinding {
+                        finding_id: format!("data-contract-unconsumed-{}", output.key),
+                        step_id: Some(stage.id.clone()),
+                        severity: FindingSeverity::Info,
+                        category: FindingCategory::DataContractViolation,
+                        description: format!(
+                            "Stage '{}' declares output '{}' but no downstream stage consumes it",
+                            stage.name, output.key
+                        ),
+                        suggested_fix: None,
+                    });
+                }
+            }
+        }
+    }
+
+    findings
+}
+
+/// Validate required-flag discipline.
+///
+/// If a verification step is linked to a Critical acceptance criterion but has
+/// `required: false`, that's a Critical finding.
+pub fn validate_required_flag_discipline(
+    workflow: &UnifiedWorkflow,
+    criteria: Option<&super::specification::AcceptanceCriteria>,
+) -> Vec<super::revision::QualityFinding> {
+    use super::revision::{FindingCategory, FindingSeverity, QualityFinding};
+    use super::specification::CriterionPriority;
+
+    let mut findings = Vec::new();
+
+    let criteria = match criteria {
+        Some(c) => c,
+        None => return findings,
+    };
+
+    // Build set of critical criterion IDs
+    let critical_ids: std::collections::HashSet<&str> = criteria
+        .criteria
+        .iter()
+        .filter(|c| c.priority == CriterionPriority::Critical)
+        .map(|c| c.id.as_str())
+        .collect();
+
+    if critical_ids.is_empty() {
+        return findings;
+    }
+
+    // Check all verification steps
+    let all_verification_steps: Vec<&serde_json::Value> = workflow
+        .verification_steps
+        .iter()
+        .chain(
+            workflow
+                .stages
+                .iter()
+                .flat_map(|s| s.verification_steps.iter()),
+        )
+        .collect();
+
+    for step in all_verification_steps {
+        let step_required = step
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true); // default is true
+
+        if step_required {
+            continue; // already required, no issue
+        }
+
+        // Check if this step is linked to a critical criterion
+        let mut linked_critical = false;
+
+        if let Some(cid) = step.get("criterion_id").and_then(|v| v.as_str()) {
+            if critical_ids.contains(cid) {
+                linked_critical = true;
+            }
+        }
+
+        if let Some(cids) = step.get("criterion_ids").and_then(|v| v.as_array()) {
+            for cid in cids {
+                if let Some(cid_str) = cid.as_str() {
+                    if critical_ids.contains(cid_str) {
+                        linked_critical = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if linked_critical {
+            let step_name = step
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let step_id = step.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+            findings.push(QualityFinding {
+                finding_id: format!("required-flag-{}", step_id),
+                step_id: Some(step_id.to_string()),
+                severity: FindingSeverity::Critical,
+                category: FindingCategory::RequiredFlagViolation,
+                description: format!(
+                    "Verification step '{}' is linked to a Critical criterion but has required=false",
+                    step_name
+                ),
+                suggested_fix: Some("Set required=true on this step".to_string()),
+            });
+        }
+    }
+
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1121,6 +1312,9 @@ mod tests {
             reflection_mode: false,
             completion_prompts_first: false,
             is_favorite: false,
+            dependency_graph: None,
+            cost_annotations: None,
+            quality_report: None,
             model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -1238,6 +1432,9 @@ mod tests {
             reflection_mode: false,
             completion_prompts_first: false,
             is_favorite: false,
+            dependency_graph: None,
+            cost_annotations: None,
+            quality_report: None,
             model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -1366,6 +1563,9 @@ mod tests {
             reflection_mode: false,
             completion_prompts_first: false,
             is_favorite: false,
+            dependency_graph: None,
+            cost_annotations: None,
+            quality_report: None,
             model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -1440,6 +1640,9 @@ mod tests {
             reflection_mode: false,
             completion_prompts_first: false,
             is_favorite: false,
+            dependency_graph: None,
+            cost_annotations: None,
+            quality_report: None,
             model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -1786,6 +1989,9 @@ mod tests {
             reflection_mode: false,
             completion_prompts_first: false,
             is_favorite: false,
+            dependency_graph: None,
+            cost_annotations: None,
+            quality_report: None,
             model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),

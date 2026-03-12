@@ -6121,6 +6121,26 @@ impl CheckpointDb {
             );
         }
 
+        // Version 95: Quality improvements — dependency graph, cost annotations, quality report
+        if current_version < 95 {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN dependency_graph TEXT DEFAULT NULL;
+                ALTER TABLE unified_workflows ADD COLUMN cost_annotations TEXT DEFAULT NULL;
+                ALTER TABLE unified_workflows ADD COLUMN quality_report TEXT DEFAULT NULL;
+
+                ALTER TABLE generation_pipeline_artifacts ADD COLUMN revision_duration_ms INTEGER DEFAULT NULL;
+                ALTER TABLE generation_pipeline_artifacts ADD COLUMN quality_report TEXT DEFAULT NULL;
+                ALTER TABLE generation_pipeline_artifacts ADD COLUMN revision_cycles INTEGER DEFAULT NULL;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (95, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 95: {}", e))?;
+
+            info!("Successfully migrated to version 95 (quality improvements)");
+        }
+
         Ok(())
     }
 
@@ -12572,7 +12592,8 @@ impl CheckpointDb {
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                        stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
-                       completion_prompts_first, is_favorite
+                       completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
+                       quality_report
                 FROM unified_workflows
                 ORDER BY is_favorite DESC, updated_at DESC
                 "#,
@@ -12654,6 +12675,15 @@ impl CheckpointDb {
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
                     is_favorite: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
+                    dependency_graph: row
+                        .get::<_, Option<String>>(35)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    cost_annotations: row
+                        .get::<_, Option<String>>(36)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    quality_report: row
+                        .get::<_, Option<String>>(37)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -12681,7 +12711,8 @@ impl CheckpointDb {
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
-                   completion_prompts_first, is_favorite
+                   completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
+                   quality_report
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -12758,6 +12789,9 @@ impl CheckpointDb {
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
                     is_favorite: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
+                    dependency_graph: row.get::<_, Option<String>>(35)?.and_then(|s| serde_json::from_str(&s).ok()),
+                    cost_annotations: row.get::<_, Option<String>>(36)?.and_then(|s| serde_json::from_str(&s).ok()),
+                    quality_report: row.get::<_, Option<String>>(37)?.and_then(|s| serde_json::from_str(&s).ok()),
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -12787,7 +12821,8 @@ impl CheckpointDb {
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
-                   completion_prompts_first, is_favorite
+                   completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
+                   quality_report
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -12866,6 +12901,9 @@ impl CheckpointDb {
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
                     is_favorite: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
+                    dependency_graph: row.get::<_, Option<String>>(35)?.and_then(|s| serde_json::from_str(&s).ok()),
+                    cost_annotations: row.get::<_, Option<String>>(36)?.and_then(|s| serde_json::from_str(&s).ok()),
+                    quality_report: row.get::<_, Option<String>>(37)?.and_then(|s| serde_json::from_str(&s).ok()),
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -12932,8 +12970,8 @@ impl CheckpointDb {
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                 stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
-                completion_prompts_first
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
+                completion_prompts_first, dependency_graph, cost_annotations, quality_report
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)
             "#,
             params![
                 id,
@@ -12970,6 +13008,9 @@ impl CheckpointDb {
                 serde_json::to_string(&request.model_overrides.clone().unwrap_or_default()).unwrap_or_else(|_| "{}".to_string()),
                 request.approval_gate.unwrap_or(false),
                 request.completion_prompts_first.unwrap_or(false),
+                request.dependency_graph.as_ref().map(|v| v.to_string()),
+                request.cost_annotations.as_ref().map(|v| v.to_string()),
+                request.quality_report.as_ref().map(|v| v.to_string()),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -13031,8 +13072,8 @@ impl CheckpointDb {
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                 stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
-                completion_prompts_first
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
+                completion_prompts_first, dependency_graph, cost_annotations, quality_report
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)
             "#,
             params![
                 id,
@@ -13069,6 +13110,9 @@ impl CheckpointDb {
                 serde_json::to_string(&request.model_overrides.clone().unwrap_or_default()).unwrap_or_else(|_| "{}".to_string()),
                 request.approval_gate.unwrap_or(false),
                 request.completion_prompts_first.unwrap_or(false),
+                request.dependency_graph.as_ref().map(|v| v.to_string()),
+                request.cost_annotations.as_ref().map(|v| v.to_string()),
+                request.quality_report.as_ref().map(|v| v.to_string()),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -13177,6 +13221,18 @@ impl CheckpointDb {
             .model_overrides
             .as_ref()
             .unwrap_or(&existing.model_overrides);
+        let dependency_graph = request
+            .dependency_graph
+            .as_ref()
+            .or(existing.dependency_graph.as_ref());
+        let cost_annotations = request
+            .cost_annotations
+            .as_ref()
+            .or(existing.cost_annotations.as_ref());
+        let quality_report = request
+            .quality_report
+            .as_ref()
+            .or(existing.quality_report.as_ref());
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
         let setup_steps_json =
@@ -13232,8 +13288,11 @@ impl CheckpointDb {
                 approval_gate = ?28,
                 reflection_mode = ?29,
                 model_overrides = ?30,
-                completion_prompts_first = ?31
-            WHERE id = ?32
+                completion_prompts_first = ?31,
+                dependency_graph = ?32,
+                cost_annotations = ?33,
+                quality_report = ?34
+            WHERE id = ?35
             "#,
             params![
                 name,
@@ -13267,6 +13326,9 @@ impl CheckpointDb {
                 reflection_mode,
                 model_overrides_json,
                 completion_prompts_first,
+                dependency_graph.map(|v| v.to_string()),
+                cost_annotations.map(|v| v.to_string()),
+                quality_report.map(|v| v.to_string()),
                 id,
             ],
         )
@@ -13303,7 +13365,8 @@ impl CheckpointDb {
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
-                   completion_prompts_first, is_favorite
+                   completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
+                   quality_report
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -13414,6 +13477,15 @@ impl CheckpointDb {
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
                     is_favorite: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
+                    dependency_graph: row
+                        .get::<_, Option<String>>(35)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    cost_annotations: row
+                        .get::<_, Option<String>>(36)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    quality_report: row
+                        .get::<_, Option<String>>(37)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -13467,6 +13539,9 @@ impl CheckpointDb {
             reflection_mode: Some(original.reflection_mode),
             completion_prompts_first: Some(original.completion_prompts_first),
             model_overrides: Some(original.model_overrides),
+            dependency_graph: original.dependency_graph,
+            cost_annotations: original.cost_annotations,
+            quality_report: original.quality_report,
         };
 
         self.create_unified_workflow(&create_request)
@@ -13519,7 +13594,8 @@ impl CheckpointDb {
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep,
                        max_sweep_iterations, stages, stop_on_failure, reflection_mode, model_overrides,
-                       approval_gate, completion_prompts_first, is_favorite
+                       approval_gate, completion_prompts_first, is_favorite, dependency_graph,
+                       cost_annotations, quality_report
                 FROM unified_workflows
                 WHERE sync_pending = 1
                 "#,
@@ -13601,6 +13677,15 @@ impl CheckpointDb {
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
                     is_favorite: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
+                    dependency_graph: row
+                        .get::<_, Option<String>>(35)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    cost_annotations: row
+                        .get::<_, Option<String>>(36)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    quality_report: row
+                        .get::<_, Option<String>>(37)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
                     targeted_error_ids: vec![],
                 })
             })
@@ -16207,7 +16292,8 @@ impl CheckpointDb {
                        disabled_context_ids, auto_include_contexts, prompt_template,
                        generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                        stages, stop_on_failure, reflection_mode, sync_pending, example_status,
-                       model_overrides, approval_gate, completion_prompts_first, is_favorite
+                       model_overrides, approval_gate, completion_prompts_first, is_favorite,
+                       dependency_graph, cost_annotations, quality_report
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -16298,6 +16384,9 @@ impl CheckpointDb {
                     "approval_gate": row.get::<_, Option<i64>>(34)?,
                     "completion_prompts_first": row.get::<_, Option<i64>>(35)?,
                     "is_favorite": row.get::<_, Option<i64>>(36)?,
+                    "dependency_graph": row.get::<_, Option<String>>(37)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "cost_annotations": row.get::<_, Option<String>>(38)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "quality_report": row.get::<_, Option<String>>(39)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                 }))
             })
             .map_err(|e| format!("Failed to export unified workflows: {}", e))?
@@ -18771,10 +18860,11 @@ impl CheckpointDb {
                  discovery_calls, builder_raw_output, builder_parsed_json, autofix_diff,
                  verification_iterations, fixer_snapshots, hardening_summary,
                  hardened_json, final_json, validation_errors,
-                 success, error_message, model_used)
+                 success, error_message, model_used,
+                 revision_duration_ms, quality_report, revision_cycles)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
-                    ?28, ?29, ?30, ?31, ?32, ?33)"#,
+                    ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)"#,
             params![
                 artifact.id,
                 artifact.workflow_id,
@@ -18821,6 +18911,9 @@ impl CheckpointDb {
                 artifact.success,
                 artifact.error_message,
                 artifact.model_used,
+                artifact.revision_duration_ms.map(|v| v as i64),
+                artifact.quality_report.as_ref().map(|v| v.to_string()),
+                artifact.revision_cycles.map(|v| v as i32),
             ],
         )
         .map_err(|e| format!("Failed to save pipeline artifact: {}", e))?;
@@ -18844,7 +18937,8 @@ impl CheckpointDb {
                       discovery_calls, builder_raw_output, builder_parsed_json, autofix_diff,
                       verification_iterations, fixer_snapshots, hardening_summary,
                       hardened_json, final_json, validation_errors,
-                      success, error_message, model_used
+                      success, error_message, model_used,
+                      revision_duration_ms, quality_report, revision_cycles
                FROM generation_pipeline_artifacts WHERE id = ?1"#,
             params![id],
             |row| Ok(Self::row_to_pipeline_artifact(row)),
@@ -18931,7 +19025,8 @@ impl CheckpointDb {
                       discovery_calls, builder_raw_output, builder_parsed_json, autofix_diff,
                       verification_iterations, fixer_snapshots, hardening_summary,
                       hardened_json, final_json, validation_errors,
-                      success, error_message, model_used
+                      success, error_message, model_used,
+                      revision_duration_ms, quality_report, revision_cycles
                FROM generation_pipeline_artifacts
                WHERE workflow_id = ?1
                ORDER BY created_at DESC LIMIT 1"#,
@@ -19025,6 +19120,15 @@ impl CheckpointDb {
             success: row.get(30).unwrap_or(true),
             error_message: row.get(31).unwrap_or(None),
             model_used: row.get(32).unwrap_or(None),
+            revision_duration_ms: row
+                .get::<_, Option<i64>>(33)
+                .unwrap_or(None)
+                .map(|v| v as u64),
+            quality_report: parse_json(row.get(34).unwrap_or(None)),
+            revision_cycles: row
+                .get::<_, Option<i32>>(35)
+                .unwrap_or(None)
+                .map(|v| v as u32),
         }
     }
 
