@@ -38,6 +38,8 @@
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use crate::str_utils::truncate_str;
+
 use super::types::{Constraint, ConstraintCheck, ConstraintSeverity};
 
 /// A constraint proposal from the AI.
@@ -126,7 +128,7 @@ pub fn parse_proposals(output: &str) -> Vec<ConstraintProposal> {
                     None => {
                         debug!(
                             "CONSTRAINT-PROPOSAL: Failed to parse proposal block: {}",
-                            truncate(block, 200),
+                            truncate_str(block, 200),
                         );
                     }
                 }
@@ -248,18 +250,6 @@ fn proposal_summary(proposal: &ConstraintProposal) -> String {
                 if *enabled { "enable" } else { "disable" },
             )
         }
-    }
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        &s[..end]
     }
 }
 

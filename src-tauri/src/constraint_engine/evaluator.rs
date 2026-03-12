@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 
 use super::builtins::builtin_constraints;
 use super::types::*;
+use crate::str_utils::truncate_str;
 use crate::unified_workflow_executor::convergence::ConvergenceAction;
 
 /// The constraint engine. Evaluates constraints against the working directory
@@ -283,7 +284,7 @@ impl ConstraintEngine {
                         line: Some((line_num + 1) as u32),
                         detail: format!(
                             "Forbidden pattern found: `{}`",
-                            truncate(line.trim(), 120),
+                            truncate_str(line.trim(), 120),
                         ),
                     });
                 }
@@ -477,7 +478,7 @@ impl ConstraintEngine {
                             "Command `{}` failed (exit {}): {}",
                             cmd,
                             status.code().unwrap_or(-1),
-                            truncate(stderr.trim(), 500),
+                            truncate_str(stderr.trim(), 500),
                         ),
                     }];
                 }
@@ -680,20 +681,6 @@ fn is_likely_binary(path: &str) -> bool {
             | "pyo"
             | "class"
     )
-}
-
-/// Truncate a string to a maximum length.
-fn truncate(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len {
-        s
-    } else {
-        // Find a safe UTF-8 boundary
-        let mut end = max_len;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        &s[..end]
-    }
 }
 
 #[cfg(test)]
