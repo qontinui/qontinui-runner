@@ -11,8 +11,6 @@
 //! - `trigger` - Post-workflow trigger with recursion prevention
 //! - `workflow` - Programmatic reflection workflow definition
 
-#![allow(dead_code)]
-
 pub mod effectiveness;
 pub mod parser;
 pub mod storage;

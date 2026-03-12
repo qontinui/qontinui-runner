@@ -3,6 +3,8 @@
 //! Defines the core data structures for tracking fixes applied by reflection
 //! workflows and their effectiveness over time.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// A fix applied by a reflection workflow after analyzing a completed run.
@@ -128,6 +130,12 @@ impl FixType {
     }
 }
 
+impl fmt::Display for FixType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Status of a reflection fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixStatus {
@@ -155,6 +163,12 @@ impl FixStatus {
             "superseded" => Some(Self::Superseded),
             _ => None,
         }
+    }
+}
+
+impl fmt::Display for FixStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -189,6 +203,12 @@ impl FixEffectiveness {
             "inconclusive" => Some(Self::Inconclusive),
             _ => None,
         }
+    }
+}
+
+impl fmt::Display for FixEffectiveness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
