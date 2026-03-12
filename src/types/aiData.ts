@@ -66,6 +66,8 @@ export interface TaskRun {
   config_id?: string | null;
   /** Workflow name being executed */
   workflow_name?: string | null;
+  /** Unified workflow ID that this task run executes */
+  workflow_id?: string | null;
   /** AI-generated paragraph summary of the task run (unified field) */
   summary?: string | null;
   /** @deprecated Use summary instead - kept for backward compatibility */

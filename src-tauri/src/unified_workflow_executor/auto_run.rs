@@ -109,6 +109,7 @@ pub fn launch_generated_workflow(
         .with_prompt(&combined_prompt)
         .with_task_type("ai")
         .with_workflow_name(&workflow.name)
+        .with_workflow_id(&workflow.id)
         .with_max_sessions(workflow.max_iterations)
         .with_auto_continue(true)
         .with_workflow_type("unified")
@@ -144,6 +145,9 @@ pub fn launch_generated_workflow(
         cross_workflow_learning: true,
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
+        project_path: crate::mcp::shared::get_workspace_paths_internal()
+            .ok()
+            .map(|(root, _, _)| root.to_string_lossy().to_string()),
     };
 
     // 6. Spawn the workflow

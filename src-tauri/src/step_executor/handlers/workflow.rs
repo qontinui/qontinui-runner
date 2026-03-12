@@ -129,6 +129,7 @@ impl StepHandler for WorkflowStepHandler {
             .with_prompt(format!("Nested execution of workflow '{}'", workflow.name))
             .with_task_type("ai")
             .with_workflow_name(&workflow.name)
+            .with_workflow_id(&workflow.id)
             .with_auto_continue(true)
             .with_workflow_type("unified");
 
@@ -167,6 +168,9 @@ impl StepHandler for WorkflowStepHandler {
             cross_workflow_learning: true,
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
+            project_path: crate::mcp::shared::get_workspace_paths_internal()
+                .ok()
+                .map(|(root, _, _)| root.to_string_lossy().to_string()),
         };
 
         // 8. Create LoopController and get session manager

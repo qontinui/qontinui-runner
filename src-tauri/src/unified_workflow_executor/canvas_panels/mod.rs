@@ -18,6 +18,7 @@ use crate::event_system::AppEvent;
 use crate::mcp::canvas::{CanvasState, StoredPanel};
 use crate::orchestrator::types::Finding;
 use crate::step_executor::{StepExecutionResult, VerificationPhaseResult};
+use crate::str_utils::truncate_str;
 use crate::unified_workflow_executor::types::{AgenticOutcome, LoopConfig, LoopResult};
 
 /// Snapshot of a single iteration's results (internal tracking).
@@ -55,6 +56,16 @@ pub struct CanvasPanelManager {
     max_sessions: Option<u32>,
     setup_duration_ms: u64,
     setup_step_count: usize,
+    // Mission Brief state for live updates
+    brief_prompt: String,
+    brief_model: String,
+    brief_reflection: bool,
+    brief_approval_gate: bool,
+    brief_stages: Vec<Value>,
+    brief_current_stage: Option<u32>,
+    brief_current_iteration: u32,
+    brief_phase: Option<String>,
+    brief_activity: Option<String>,
 }
 
 impl CanvasPanelManager {
@@ -81,6 +92,15 @@ impl CanvasPanelManager {
             max_sessions: None,
             setup_duration_ms: 0,
             setup_step_count: 0,
+            brief_prompt: String::new(),
+            brief_model: String::from("default"),
+            brief_reflection: false,
+            brief_approval_gate: false,
+            brief_stages: Vec::new(),
+            brief_current_stage: None,
+            brief_current_iteration: 0,
+            brief_phase: None,
+            brief_activity: None,
         }
     }
 
@@ -96,6 +116,37 @@ impl CanvasPanelManager {
         self.iteration_snapshots.clear();
         self.accumulated_findings.clear();
         self.stage_prefix = None;
+
+        // Store Mission Brief state for live updates
+        self.brief_prompt = config.base_prompt.clone();
+        self.brief_model = config
+            .model_override
+            .as_deref()
+            .unwrap_or("default")
+            .to_string();
+        self.brief_reflection = config.reflection_mode;
+        self.brief_approval_gate = config.approval_gate;
+        self.brief_stages = if config.stages.is_empty() {
+            vec![
+                serde_json::json!({ "name": config.workflow_name, "index": 0, "max_iterations": config.max_iterations }),
+            ]
+        } else {
+            config
+                .stages
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "name": s.name,
+                        "index": s.index,
+                        "max_iterations": s.max_iterations,
+                    })
+                })
+                .collect()
+        };
+        self.brief_current_stage = None;
+        self.brief_current_iteration = 0;
+        self.brief_phase = None;
+        self.brief_activity = None;
 
         // Clear canvas for fresh run
         {
@@ -115,11 +166,11 @@ impl CanvasPanelManager {
         let data = builders::build_mission_brief(config);
         self.emit_panel(
             "overview",
-            "Markdown",
+            "MissionBrief",
             "Mission Brief",
             data,
             5,
-            "compact",
+            "normal",
             Some("Overview"),
         )
         .await;
@@ -141,6 +192,13 @@ impl CanvasPanelManager {
             total_stages,
             stage_name
         );
+
+        // Update Mission Brief with stage progress
+        self.brief_current_stage = Some(stage_idx);
+        self.brief_current_iteration = 0;
+        self.brief_phase = Some("setup".to_string());
+        self.brief_activity = Some(format!("Starting stage: {}", stage_name));
+        self.emit_mission_brief_update().await;
     }
 
     /// Called after setup phase completes.
@@ -159,6 +217,16 @@ impl CanvasPanelManager {
             Some("Overview"),
         )
         .await;
+
+        // Update Mission Brief: setup done, entering verification
+        let status = if success {
+            "Setup complete"
+        } else {
+            "Setup failed"
+        };
+        self.brief_phase = Some("verification".to_string());
+        self.brief_activity = Some(status.to_string());
+        self.emit_mission_brief_update().await;
     }
 
     /// Called after verification phase completes.
@@ -382,6 +450,23 @@ impl CanvasPanelManager {
             Some("Resources"),
         )
         .await;
+
+        // Update Mission Brief with verification results
+        self.brief_current_iteration = iteration;
+        if result.all_passed {
+            self.brief_phase = Some("completion".to_string());
+            self.brief_activity = Some(format!(
+                "Verification passed ({}/{} checks)",
+                result.passed_steps, result.total_steps
+            ));
+        } else {
+            self.brief_phase = Some("agentic".to_string());
+            self.brief_activity = Some(format!(
+                "Verification: {}/{} passed — running AI fix",
+                result.passed_steps, result.total_steps
+            ));
+        }
+        self.emit_mission_brief_update().await;
     }
 
     /// Called after agentic phase completes.
@@ -442,6 +527,23 @@ impl CanvasPanelManager {
             )
             .await;
         }
+
+        // Update Mission Brief with agentic outcome
+        let activity = match outcome {
+            AgenticOutcome::Success { .. } => {
+                format!("AI completed — re-verifying (iteration {})", iteration)
+            }
+            AgenticOutcome::Failed { error, .. } => {
+                format!("AI failed: {}", truncate_str(error, 80))
+            }
+            AgenticOutcome::Error { error } => {
+                format!("AI error: {}", truncate_str(error, 80))
+            }
+            AgenticOutcome::Skipped => "AI phase skipped".to_string(),
+        };
+        self.brief_phase = Some("verification".to_string());
+        self.brief_activity = Some(activity);
+        self.emit_mission_brief_update().await;
     }
 
     /// Called when the workflow completes (success or failure).
@@ -462,6 +564,11 @@ impl CanvasPanelManager {
             Some("Overview"),
         )
         .await;
+
+        // Final Mission Brief update
+        self.brief_phase = Some("completed".to_string());
+        self.brief_activity = Some(result.summary());
+        self.emit_mission_brief_update().await;
 
         // Waterfall timing panel
         let mut step_timings: Vec<(String, u64, u64, &str, Option<&str>)> = Vec::new();
@@ -588,6 +695,33 @@ impl CanvasPanelManager {
     }
 
     // ─── Internal Helpers ───
+
+    /// Re-emit the Mission Brief panel with updated progress data.
+    async fn emit_mission_brief_update(&self) {
+        let data = builders::build_mission_brief_progress(
+            &self.workflow_name,
+            &self.brief_prompt,
+            &self.brief_model,
+            self.brief_reflection,
+            self.brief_approval_gate,
+            &self.brief_stages,
+            self.max_iterations,
+            self.brief_current_stage,
+            self.brief_current_iteration,
+            self.brief_phase.as_deref(),
+            self.brief_activity.as_deref(),
+        );
+        self.emit_panel(
+            "overview",
+            "MissionBrief",
+            "Mission Brief",
+            data,
+            5,
+            "normal",
+            Some("Overview"),
+        )
+        .await;
+    }
 
     /// Emit a panel to canvas state, persist to SQLite, and broadcast event.
     async fn emit_panel(

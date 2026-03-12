@@ -23,6 +23,7 @@ mod commands;
 mod config;
 mod config_facade;
 mod config_storage;
+mod constraint_engine;
 mod context;
 mod database;
 mod debug_lifecycle;

@@ -1042,6 +1042,7 @@ pub async fn generate_unified_workflow_async_handler(
         .with_prompt(&simple_prompt)
         .with_workflow_type("unified")
         .with_workflow_name(&saved_workflow.name)
+        .with_workflow_id(&saved_workflow.id)
         .with_max_sessions(saved_workflow.max_iterations)
         .with_auto_continue(true);
 
@@ -1138,6 +1139,9 @@ pub async fn generate_unified_workflow_async_handler(
             cross_workflow_learning: true,
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
+            project_path: crate::mcp::shared::get_workspace_paths_internal()
+                .ok()
+                .map(|(root, _, _)| root.to_string_lossy().to_string()),
         };
 
         // Clone state fields for the background task
@@ -1458,6 +1462,7 @@ pub async fn run_unified_workflow(
             .with_prompt(&combined_prompt)
             .with_task_type("ai")
             .with_workflow_name(&workflow.name)
+            .with_workflow_id(&workflow.id)
             .with_max_sessions(workflow.max_iterations)
             .with_auto_continue(true)
             .with_workflow_type("unified");
@@ -1498,6 +1503,9 @@ pub async fn run_unified_workflow(
             cross_workflow_learning: true,
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
+            project_path: crate::mcp::shared::get_workspace_paths_internal()
+                .ok()
+                .map(|(root, _, _)| root.to_string_lossy().to_string()),
         };
 
         let checkpoint_db = state.app_state.checkpoint_db.clone();
@@ -1582,7 +1590,8 @@ pub async fn run_unified_workflow(
 
     let mut input = CreateTaskRunInput::new(&execution_id, &workflow.name)
         .with_task_type("automation")
-        .with_workflow_name(&workflow.name);
+        .with_workflow_name(&workflow.name)
+        .with_workflow_id(&workflow.id);
     if let Some(esj) = execution_steps_json {
         input = input.with_execution_steps_json(esj);
     }
@@ -1887,6 +1896,7 @@ pub async fn execute_inline_workflow(
             .with_prompt(&combined_prompt)
             .with_task_type("ai")
             .with_workflow_name(format!("[Inline] {}", workflow.name))
+            .with_workflow_id(&workflow.id)
             .with_max_sessions(workflow.max_iterations)
             .with_auto_continue(true)
             .with_workflow_type(wf_type);
@@ -1927,6 +1937,9 @@ pub async fn execute_inline_workflow(
             cross_workflow_learning: true,
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
+            project_path: crate::mcp::shared::get_workspace_paths_internal()
+                .ok()
+                .map(|(root, _, _)| root.to_string_lossy().to_string()),
         };
 
         // Spawn in background (non-blocking) — same pattern as run_unified_workflow
@@ -2002,7 +2015,8 @@ pub async fn execute_inline_workflow(
     let execution_steps_json = serde_json::to_string(&all_auto_steps).ok();
     let mut input = crate::database::CreateTaskRunInput::new(&execution_id, &workflow.name)
         .with_task_type("automation")
-        .with_workflow_name(format!("[Inline] {}", workflow.name));
+        .with_workflow_name(format!("[Inline] {}", workflow.name))
+        .with_workflow_id(&workflow.id);
     if let Some(esj) = execution_steps_json {
         input = input.with_execution_steps_json(esj);
     }
@@ -2362,6 +2376,9 @@ pub async fn run_composed_workflow(
                 cross_workflow_learning: true,
                 verification_history: std::collections::HashMap::new(),
                 routing_context: Default::default(),
+                project_path: crate::mcp::shared::get_workspace_paths_internal()
+                    .ok()
+                    .map(|(root, _, _)| root.to_string_lossy().to_string()),
             };
 
             // Run the LoopController once with all stages

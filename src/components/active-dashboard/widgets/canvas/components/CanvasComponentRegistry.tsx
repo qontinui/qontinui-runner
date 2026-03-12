@@ -29,6 +29,7 @@ import { StepDurationChartPanel } from "./StepDurationChartPanel";
 import { PhaseDistributionPanel } from "./PhaseDistributionPanel";
 import { DependencyGraphPanel } from "./DependencyGraphPanel";
 import { CostBreakdownPanel } from "./CostBreakdownPanel";
+import { MissionBriefPanel } from "./MissionBriefPanel";
 
 /**
  * Props that all canvas panel components receive.
@@ -81,6 +82,7 @@ const COMPONENT_MAP: Record<string, ComponentType<CanvasPanelComponentProps>> = 
   PhaseDistribution: PhaseDistributionPanel,
   DependencyGraph: DependencyGraphPanel,
   CostBreakdown: CostBreakdownPanel,
+  MissionBrief: MissionBriefPanel,
 };
 
 /**

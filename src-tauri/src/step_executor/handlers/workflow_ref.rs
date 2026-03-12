@@ -170,6 +170,7 @@ impl StepHandler for WorkflowRefHandler {
             .with_prompt(base_prompt.clone())
             .with_task_type("ai")
             .with_workflow_name(&workflow.name)
+            .with_workflow_id(&workflow.id)
             .with_auto_continue(true)
             .with_workflow_type("unified");
 
@@ -216,6 +217,9 @@ impl StepHandler for WorkflowRefHandler {
             cross_workflow_learning: false, // Nested workflows don't need cross-workflow learning
             verification_history: HashMap::new(),
             routing_context: Default::default(),
+            project_path: crate::mcp::shared::get_workspace_paths_internal()
+                .ok()
+                .map(|(root, _, _)| root.to_string_lossy().to_string()),
         };
 
         // 9. Create LoopController with session manager

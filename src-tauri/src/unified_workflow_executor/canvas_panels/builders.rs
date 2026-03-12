@@ -12,34 +12,80 @@ use crate::unified_workflow_executor::types::LoopConfig;
 use crate::unified_workflow_executor::types::LoopResult;
 use std::collections::HashMap;
 
-/// Build the Mission Brief panel (Markdown).
+/// Build the Mission Brief panel (structured data for MissionBrief component).
 pub fn build_mission_brief(config: &LoopConfig) -> Value {
-    let stages_count = if config.stages.is_empty() {
-        1
-    } else {
-        config.stages.len()
-    };
-    let reflection = if config.reflection_mode { "On" } else { "Off" };
-    let approval = if config.approval_gate { "On" } else { "Off" };
     let model = config
         .model_override
         .as_deref()
         .unwrap_or("default")
         .to_string();
 
-    let content = format!(
-        "## {}\n\n\
-         | | |\n\
-         |---|---|\n\
-         | **Max Iterations** | {} |\n\
-         | **Stages** | {} |\n\
-         | **Reflection** | {} |\n\
-         | **Approval Gate** | {} |\n\
-         | **Model** | {} |",
-        config.workflow_name, config.max_iterations, stages_count, reflection, approval, model,
-    );
+    let stages: Vec<Value> = if config.stages.is_empty() {
+        vec![
+            json!({ "name": config.workflow_name, "index": 0, "max_iterations": config.max_iterations }),
+        ]
+    } else {
+        config
+            .stages
+            .iter()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "index": s.index,
+                    "max_iterations": s.max_iterations,
+                })
+            })
+            .collect()
+    };
 
-    json!({ "content": content })
+    json!({
+        "workflow_name": config.workflow_name,
+        "prompt": config.base_prompt,
+        "model": model,
+        "reflection": config.reflection_mode,
+        "approval_gate": config.approval_gate,
+        "stages": stages,
+        "total_stages": stages.len(),
+        "max_iterations": config.max_iterations,
+        "progress": {
+            "current_stage_index": null,
+            "current_iteration": 0,
+            "phase": null,
+            "activity": null,
+        }
+    })
+}
+
+/// Build an updated progress payload for the Mission Brief panel.
+pub fn build_mission_brief_progress(
+    workflow_name: &str,
+    prompt: &str,
+    model: &str,
+    reflection: bool,
+    approval_gate: bool,
+    stages: &[Value],
+    max_iterations: u32,
+    current_stage_index: Option<u32>,
+    current_iteration: u32,
+    phase: Option<&str>,
+    activity: Option<&str>,
+) -> Value {
+    json!({
+        "workflow_name": workflow_name,
+        "prompt": prompt,
+        "model": model,
+        "reflection": reflection,
+        "approval_gate": approval_gate,
+        "stages": stages,
+        "total_stages": stages.len(),
+        "max_iterations": max_iterations,
+        "progress": {
+            "current_stage_index": current_stage_index,
+            "current_iteration": current_iteration,
+            "phase": phase,
+            "activity": activity,
+        }
+    })
 }
 
 /// Build the Setup Report panel (KeyValue).

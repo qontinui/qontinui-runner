@@ -162,6 +162,20 @@ function serializePanelData(panel: CanvasPanel): string {
         .join("\n");
     }
 
+    case "MissionBrief": {
+      const name = (data.workflow_name as string) ?? "";
+      const prompt = (data.prompt as string) ?? "";
+      const progress = data.progress as
+        | { phase?: string; activity?: string; current_iteration?: number }
+        | undefined;
+      const lines = [name];
+      if (prompt) lines.push(`\nPrompt:\n${prompt}`);
+      if (progress?.phase) lines.push(`Phase: ${progress.phase}`);
+      if (progress?.current_iteration) lines.push(`Iteration: ${progress.current_iteration}`);
+      if (progress?.activity) lines.push(`Activity: ${progress.activity}`);
+      return lines.join("\n");
+    }
+
     default:
       return JSON.stringify(data, null, 2);
   }
