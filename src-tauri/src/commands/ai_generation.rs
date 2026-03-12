@@ -3,11 +3,12 @@
 //! This module contains Tauri commands for AI-powered content generation
 //! across various builder tabs (Context, API Request, Task, Exploration).
 //!
-//! Also includes direct AI API calls for lightweight generation tasks
-//! like element descriptions that don't require the full Python bridge.
+//! Also includes AI-powered generation for lightweight tasks like element
+//! descriptions, routed through the provider system (ai_provider).
 
+use crate::ai_provider;
+use crate::ai_router::TaskContext;
 use crate::commands::{AppState, CommandResponse};
-use crate::config_facade::ai_keychain;
 use crate::executor::with_default_bridge;
 use crate::str_utils::truncate_str;
 use serde::{Deserialize, Serialize};
@@ -725,43 +726,48 @@ pub struct ElementAiDescription {
 
 /// Generate an AI description for a UI element.
 ///
-/// Uses the Claude API directly for fast, lightweight description generation.
-/// Falls back to Gemini API if Claude is not configured.
+/// Routes through the provider system (ai_provider) so it respects the user's
+/// configured provider (Claude CLI, Claude API, Gemini CLI, Gemini API).
 #[tauri::command]
 pub async fn generate_element_ai_description(
     input: GenerateElementAiDescriptionInput,
 ) -> Result<CommandResponse, String> {
-    use crate::settings;
-
     info!(
         "Generating AI element description for: {} ({})",
         input.element_type,
         input.label.as_deref().unwrap_or("unlabeled")
     );
 
-    let ai_settings = settings::get_ai_settings();
-
-    // Build the prompt
     let prompt = build_element_description_prompt(&input);
 
-    // Try Claude API first, then Gemini API
-    let result = match ai_settings.provider {
-        settings::AiProvider::ClaudeApi | settings::AiProvider::ClaudeCli => {
-            call_claude_api_for_description(&ai_settings.claude_api, &prompt).await
-        }
-        settings::AiProvider::GeminiApi | settings::AiProvider::GeminiCli => {
-            call_gemini_api_for_description(&ai_settings.gemini_api, &prompt).await
-        }
-    };
+    // Route through the provider system (respects user's configured provider)
+    let ai_response = tokio::task::spawn_blocking(move || {
+        let context = TaskContext::from_prompt(&prompt);
+        ai_provider::run_prompt_with_routing(&prompt, &context, None)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
 
-    match result {
+    if !ai_response.success {
+        let error = ai_response
+            .error
+            .unwrap_or_else(|| "Unknown AI error".to_string());
+        error!("Failed to generate AI description: {}", error);
+        return Ok(CommandResponse {
+            success: false,
+            message: Some(error),
+            data: None,
+        });
+    }
+
+    match parse_ai_description_response(&ai_response.output) {
         Ok(description) => Ok(CommandResponse {
             success: true,
             message: Some("AI description generated successfully".to_string()),
             data: Some(serde_json::to_value(&description).map_err(|e| e.to_string())?),
         }),
         Err(e) => {
-            error!("Failed to generate AI description: {}", e);
+            error!("Failed to parse AI description: {}", e);
             Ok(CommandResponse {
                 success: false,
                 message: Some(e),
@@ -846,119 +852,6 @@ Respond ONLY with the JSON object, no markdown or extra text."#,
     );
 
     prompt
-}
-
-/// Call Claude API for element description
-async fn call_claude_api_for_description(
-    settings: &crate::settings::ClaudeApiSettings,
-    prompt: &str,
-) -> Result<ElementAiDescription, String> {
-    // Get API key from keychain
-    let api_key = ai_keychain()
-        .get("claude_api")
-        .map_err(|e| format!("Failed to retrieve API key: {}", e))?
-        .ok_or_else(|| {
-            "No Claude API key configured. Please enter your API key in Settings.".to_string()
-        })?;
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&serde_json::json!({
-            "model": settings.model,
-            "max_tokens": 500,
-            "messages": [{"role": "user", "content": prompt}]
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_body = response.text().await.unwrap_or_default();
-
-        if status.as_u16() == 401 {
-            return Err("Invalid API key. Please check your Claude API key.".to_string());
-        }
-        return Err(format!("Claude API error ({}): {}", status, error_body));
-    }
-
-    let response_json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-    // Extract the content text from Claude's response
-    let content = response_json["content"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|obj| obj["text"].as_str())
-        .ok_or_else(|| "Invalid response format from Claude API".to_string())?;
-
-    parse_ai_description_response(content)
-}
-
-/// Call Gemini API for element description
-async fn call_gemini_api_for_description(
-    settings: &crate::settings::GeminiApiSettings,
-    prompt: &str,
-) -> Result<ElementAiDescription, String> {
-    // Get API key from keychain
-    let api_key = ai_keychain()
-        .get("gemini_api")
-        .map_err(|e| format!("Failed to retrieve API key: {}", e))?
-        .ok_or_else(|| {
-            "No Gemini API key configured. Please enter your API key in Settings.".to_string()
-        })?;
-
-    let client = reqwest::Client::new();
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        settings.model, api_key
-    );
-
-    let response = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .json(&serde_json::json!({
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "maxOutputTokens": 500,
-                "temperature": 0.3
-            }
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_body = response.text().await.unwrap_or_default();
-
-        if error_body.contains("API_KEY_INVALID") {
-            return Err("Invalid API key. Please check your Gemini API key.".to_string());
-        }
-        return Err(format!("Gemini API error ({}): {}", status, error_body));
-    }
-
-    let response_json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-    // Extract the content text from Gemini's response
-    let content = response_json["candidates"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|obj| obj["content"]["parts"].as_array())
-        .and_then(|parts| parts.first())
-        .and_then(|part| part["text"].as_str())
-        .ok_or_else(|| "Invalid response format from Gemini API".to_string())?;
-
-    parse_ai_description_response(content)
 }
 
 /// Parse the AI response into ElementAiDescription

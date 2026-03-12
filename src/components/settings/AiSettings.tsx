@@ -1,5 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   Bot,
   Check,
@@ -12,6 +13,9 @@ import {
   Video,
   Sparkles,
   MessageSquare,
+  AlertTriangle,
+  RefreshCw,
+  ShieldCheck,
 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { getAccentColors, getStatusColors } from "@/design-system";
@@ -33,6 +37,16 @@ interface TauriResult<T> {
 
 interface HasApiKeyData {
   has_key: boolean;
+}
+
+interface CliAuthStatus {
+  has_credentials: boolean;
+  expired: boolean;
+  is_cli_provider: boolean;
+  expires_at: string | null;
+  minutes_until_expiry: number | null;
+  subscription_type: string | null;
+  credentials_path: string | null;
 }
 
 interface AiSettingsProps {
@@ -162,10 +176,55 @@ export function AiSettings({ onLog }: AiSettingsProps) {
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<AiConnectionTestResult | null>(null);
 
+  // CLI auth state
+  const [cliAuth, setCliAuth] = useState<CliAuthStatus | null>(null);
+  const [refreshingAuth, setRefreshingAuth] = useState(false);
+
+  const checkCliAuth = useCallback(async () => {
+    try {
+      const result = await invoke<TauriResult<CliAuthStatus>>("check_claude_cli_auth");
+      if (result?.data) {
+        setCliAuth(result.data);
+        if (result.data.expired && result.data.is_cli_provider) {
+          onLog("error", "Claude CLI authentication has expired");
+        }
+      }
+    } catch (err) {
+      console.error("Failed to check CLI auth:", err);
+    }
+  }, [onLog]);
+
+  const refreshCliAuth = async () => {
+    try {
+      setRefreshingAuth(true);
+      await invoke<TauriResult<void>>("refresh_claude_cli_auth");
+      onLog("info", "Authentication window opened — complete the browser login flow");
+      // Poll for auth status update after a delay
+      setTimeout(() => checkCliAuth(), 10000);
+      setTimeout(() => checkCliAuth(), 20000);
+      setTimeout(() => checkCliAuth(), 30000);
+    } catch (err) {
+      console.error("Failed to refresh CLI auth:", err);
+      onLog("error", `Failed to open auth window: ${err}`);
+    } finally {
+      setRefreshingAuth(false);
+    }
+  };
+
   useEffect(() => {
     loadSettings();
     checkApiKey();
     checkGeminiApiKey();
+    checkCliAuth();
+
+    // Listen for startup auth-expired events
+    const unlisten = listen<CliAuthStatus>("cli-auth-expired", (event) => {
+      setCliAuth(event.payload);
+    });
+
+    return () => {
+      unlisten.then((fn) => fn());
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -534,6 +593,74 @@ export function AiSettings({ onLog }: AiSettingsProps) {
             <Terminal className="w-4 h-4 text-primary" />
             Claude Code CLI Settings
           </h4>
+
+          {/* Auth Status */}
+          {cliAuth && (
+            <div
+              className={`p-3 rounded-lg flex items-start gap-2 ${
+                cliAuth.expired
+                  ? `${getAccentColors("red").bg}`
+                  : cliAuth.has_credentials
+                    ? `${getAccentColors("green").bg}`
+                    : "bg-muted/50"
+              }`}
+            >
+              {cliAuth.expired ? (
+                <AlertTriangle
+                  className={`w-4 h-4 ${getAccentColors("red").text} shrink-0 mt-0.5`}
+                />
+              ) : cliAuth.has_credentials ? (
+                <ShieldCheck
+                  className={`w-4 h-4 ${getAccentColors("green").text} shrink-0 mt-0.5`}
+                />
+              ) : null}
+              <div className="flex-1 space-y-1.5">
+                <div
+                  className={`text-xs font-medium ${
+                    cliAuth.expired
+                      ? getAccentColors("red").text
+                      : cliAuth.has_credentials
+                        ? getAccentColors("green").text
+                        : "text-muted-foreground"
+                  }`}
+                >
+                  {cliAuth.expired
+                    ? "Authentication expired — workflows will fail"
+                    : cliAuth.has_credentials
+                      ? `Authenticated${cliAuth.subscription_type ? ` (${cliAuth.subscription_type})` : ""}`
+                      : "No credentials found"}
+                </div>
+                {cliAuth.has_credentials &&
+                  !cliAuth.expired &&
+                  cliAuth.minutes_until_expiry != null && (
+                    <div className="text-[10px] text-muted-foreground">
+                      {cliAuth.minutes_until_expiry > 60
+                        ? `Expires in ${Math.round(cliAuth.minutes_until_expiry / 60)} hours`
+                        : `Expires in ${cliAuth.minutes_until_expiry} minutes`}
+                    </div>
+                  )}
+                {(cliAuth.expired || !cliAuth.has_credentials) && (
+                  <button
+                    onClick={refreshCliAuth}
+                    disabled={refreshingAuth}
+                    className="mt-1 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${refreshingAuth ? "animate-spin" : ""}`} />
+                    {refreshingAuth ? "Opening..." : "Re-authenticate"}
+                  </button>
+                )}
+              </div>
+              {cliAuth.has_credentials && !cliAuth.expired && (
+                <button
+                  onClick={checkCliAuth}
+                  className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                  title="Refresh auth status"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          )}
 
           <div className="space-y-4">
             <div className="space-y-1.5">

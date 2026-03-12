@@ -754,6 +754,269 @@ pub fn save_agentic_settings(
     })
 }
 
+// ============================================================================
+// Claude CLI Auth Status
+// ============================================================================
+
+/// Status of Claude CLI OAuth credentials
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CliAuthStatus {
+    /// Whether credentials exist at all
+    pub has_credentials: bool,
+    /// Whether the access token has expired
+    pub expired: bool,
+    /// Whether the provider is claude_cli (relevant to check)
+    pub is_cli_provider: bool,
+    /// ISO 8601 expiry time
+    pub expires_at: Option<String>,
+    /// Minutes until expiry (negative = already expired)
+    pub minutes_until_expiry: Option<i64>,
+    /// Subscription type from credentials
+    pub subscription_type: Option<String>,
+    /// Path to the credentials file found
+    pub credentials_path: Option<String>,
+}
+
+/// Find the Claude CLI credentials file, respecting config_dir settings.
+fn find_claude_credentials_path() -> Option<std::path::PathBuf> {
+    // 1. Check config_dir from runner AI settings
+    let ai_settings = settings::get_ai_settings();
+    if let Some(ref dir) = ai_settings.claude_cli.config_dir {
+        let path = std::path::PathBuf::from(dir).join(".credentials.json");
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    // 2. Check CLAUDE_CONFIG_DIR env var
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        let path = std::path::PathBuf::from(&dir).join(".credentials.json");
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    // 3. Check default ~/.claude/
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".claude").join(".credentials.json");
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+/// Read and parse Claude CLI auth status from credentials file.
+pub fn get_cli_auth_status() -> CliAuthStatus {
+    let ai_settings = settings::get_ai_settings();
+    let is_cli = matches!(ai_settings.provider, AiProvider::ClaudeCli);
+
+    let creds_path = match find_claude_credentials_path() {
+        Some(p) => p,
+        None => {
+            return CliAuthStatus {
+                has_credentials: false,
+                expired: true,
+                is_cli_provider: is_cli,
+                expires_at: None,
+                minutes_until_expiry: None,
+                subscription_type: None,
+                credentials_path: None,
+            };
+        }
+    };
+
+    let content = match std::fs::read_to_string(&creds_path) {
+        Ok(c) => c,
+        Err(_) => {
+            return CliAuthStatus {
+                has_credentials: false,
+                expired: true,
+                is_cli_provider: is_cli,
+                expires_at: None,
+                minutes_until_expiry: None,
+                subscription_type: None,
+                credentials_path: Some(creds_path.to_string_lossy().to_string()),
+            };
+        }
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => {
+            return CliAuthStatus {
+                has_credentials: false,
+                expired: true,
+                is_cli_provider: is_cli,
+                expires_at: None,
+                minutes_until_expiry: None,
+                subscription_type: None,
+                credentials_path: Some(creds_path.to_string_lossy().to_string()),
+            };
+        }
+    };
+
+    let oauth = &json["claudeAiOauth"];
+    if oauth.is_null() {
+        return CliAuthStatus {
+            has_credentials: false,
+            expired: true,
+            is_cli_provider: is_cli,
+            expires_at: None,
+            minutes_until_expiry: None,
+            subscription_type: None,
+            credentials_path: Some(creds_path.to_string_lossy().to_string()),
+        };
+    }
+
+    let expires_at_ms = oauth["expiresAt"].as_i64().unwrap_or(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let diff_minutes = (expires_at_ms - now_ms) / 60_000;
+    let expired = now_ms > expires_at_ms;
+
+    // Format expiry as ISO 8601
+    let expires_at_str = if expires_at_ms > 0 {
+        let secs = expires_at_ms / 1000;
+        let nanos = ((expires_at_ms % 1000) * 1_000_000) as u32;
+        std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::new(secs as u64, nanos))
+            .map(|t| {
+                let datetime: chrono::DateTime<chrono::Utc> = t.into();
+                datetime.to_rfc3339()
+            })
+    } else {
+        None
+    };
+
+    let subscription_type = oauth["subscriptionType"].as_str().map(|s| s.to_string());
+
+    CliAuthStatus {
+        has_credentials: true,
+        expired,
+        is_cli_provider: is_cli,
+        expires_at: expires_at_str,
+        minutes_until_expiry: Some(diff_minutes),
+        subscription_type,
+        credentials_path: Some(creds_path.to_string_lossy().to_string()),
+    }
+}
+
+/// Check Claude CLI authentication status.
+///
+/// Reads the credentials file and checks if the OAuth token is expired.
+#[tauri::command]
+pub async fn check_claude_cli_auth() -> Result<CommandResponse, String> {
+    let status = get_cli_auth_status();
+
+    Ok(CommandResponse {
+        success: true,
+        message: if status.expired {
+            Some("Claude CLI authentication has expired".to_string())
+        } else {
+            Some("Claude CLI authentication is valid".to_string())
+        },
+        data: Some(serde_json::to_value(&status).map_err(|e| e.to_string())?),
+    })
+}
+
+/// Open a terminal window for the user to re-authenticate Claude CLI.
+///
+/// Spawns `claude auth login` in a visible terminal so the user can complete
+/// the browser-based OAuth flow.
+#[tauri::command]
+pub async fn refresh_claude_cli_auth() -> Result<CommandResponse, String> {
+    let ai_settings = settings::get_ai_settings();
+    let claude_program = ai_settings
+        .claude_cli
+        .custom_path
+        .as_deref()
+        .unwrap_or("claude");
+
+    let config_env = ai_settings
+        .claude_cli
+        .config_dir
+        .as_ref()
+        .map(|dir| format!("$env:CLAUDE_CONFIG_DIR = '{}'; ", dir))
+        .unwrap_or_default();
+
+    // Open a visible PowerShell window with claude auth login
+    #[cfg(target_os = "windows")]
+    {
+        let ps_script = format!(
+            "{}Write-Host 'Authenticating Claude CLI...' -ForegroundColor Cyan; {} auth login; Write-Host ''; Write-Host 'Authentication complete. You can close this window.' -ForegroundColor Green; Read-Host 'Press Enter to close'",
+            config_env, claude_program
+        );
+
+        tokio::process::Command::new("cmd")
+            .args([
+                "/c",
+                "start",
+                "Claude CLI Authentication",
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                &ps_script,
+            ])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to open authentication window: {}", e))?;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On macOS/Linux, open a terminal with the auth command
+        let script = format!(
+            "echo 'Authenticating Claude CLI...'; {}{} auth login; echo ''; echo 'Authentication complete. You can close this window.'; read -p 'Press Enter to close'",
+            config_env.replace("$env:", "export ").replace(" = ", "=").replace("; ", "; "),
+            claude_program
+        );
+
+        // Try common terminal emulators
+        let terminals = [
+            (
+                "open",
+                vec!["-a", "Terminal", "--args", "bash", "-c", &script],
+            ),
+            ("gnome-terminal", vec!["--", "bash", "-c", &script]),
+            ("xterm", vec!["-e", "bash", "-c", &script]),
+        ];
+
+        let mut launched = false;
+        for (term, args) in &terminals {
+            if tokio::process::Command::new(term)
+                .args(args)
+                .output()
+                .await
+                .is_ok()
+            {
+                launched = true;
+                break;
+            }
+        }
+
+        if !launched {
+            return Err(format!(
+                "Could not open a terminal. Please run '{} auth login' manually.",
+                claude_program
+            ));
+        }
+    }
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(
+            "Authentication window opened. Complete the browser login flow, then check status again."
+                .to_string(),
+        ),
+        data: None,
+    })
+}
+
 /// Get the API key for a provider (used by mcp_api.rs for API calls)
 #[allow(dead_code)]
 pub fn get_provider_api_key(provider: &str) -> Result<Option<String>, String> {

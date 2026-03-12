@@ -493,6 +493,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_settings::delete_ai_api_key_command,
             commands::ai_settings::has_ai_api_key,
             commands::ai_settings::test_ai_connection,
+            commands::ai_settings::check_claude_cli_auth,
+            commands::ai_settings::refresh_claude_cli_auth,
             commands::ai_settings::get_agentic_settings,
             commands::ai_settings::save_agentic_settings,
             // Accessibility commands
@@ -1198,6 +1200,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             // Cloud relay auto-start is handled in mcp_api.rs where ApiState is available
+
+            // Check Claude CLI auth status on startup
+            let app_handle_for_auth = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Small delay to let the frontend initialize
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+                let status = commands::ai_settings::get_cli_auth_status();
+                if status.is_cli_provider && status.expired {
+                    tracing::warn!(
+                        "Claude CLI OAuth token is expired (expired {} minutes ago)",
+                        status.minutes_until_expiry.unwrap_or(0).abs()
+                    );
+                    if let Err(e) =
+                        tauri::Emitter::emit(&app_handle_for_auth, "cli-auth-expired", &status)
+                    {
+                        tracing::warn!("Failed to emit cli-auth-expired event: {}", e);
+                    }
+                } else if status.is_cli_provider && status.has_credentials {
+                    info!(
+                        "Claude CLI auth valid ({} minutes remaining)",
+                        status.minutes_until_expiry.unwrap_or(0)
+                    );
+                }
+            });
 
             info!("Tauri application setup complete");
             Ok(())
