@@ -195,29 +195,6 @@ pub fn get_fixes_for_source_run(
     Ok(fixes)
 }
 
-/// Get all fixes created by a specific reflection run.
-pub fn get_fixes_for_reflection_run(
-    conn: &Connection,
-    reflection_task_run_id: &str,
-) -> Result<Vec<ReflectionFix>, String> {
-    let sql = format!(
-        "SELECT {} FROM reflection_fixes WHERE reflection_task_run_id = ?1 ORDER BY created_at",
-        SELECT_ALL_COLUMNS
-    );
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| format!("Failed to prepare query: {}", e))?;
-    let rows = stmt
-        .query_map(params![reflection_task_run_id], row_to_fix)
-        .map_err(|e| format!("Failed to query fixes for reflection run: {}", e))?;
-
-    let mut fixes = Vec::new();
-    for row in rows {
-        fixes.push(row.map_err(|e| format!("Failed to read fix row: {}", e))?);
-    }
-    Ok(fixes)
-}
-
 /// Get all fixes for runs of a specific workflow, with optional status and effectiveness filters.
 pub fn get_fixes_by_workflow_name(
     conn: &Connection,
@@ -301,17 +278,22 @@ pub fn get_fixes_by_project_path(
         SELECT_ALL_COLUMNS
     );
 
-    if let Some(status) = status_filter {
-        sql.push_str(&format!(" AND status = '{}'", status));
+    if status_filter.is_some() {
+        sql.push_str(" AND status = ?2");
     }
     sql.push_str(" ORDER BY created_at DESC");
 
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| format!("Failed to prepare project fixes query: {}", e))?;
-    let rows = stmt
-        .query_map(params![project_path], row_to_fix)
-        .map_err(|e| format!("Failed to query project fixes: {}", e))?;
+
+    let rows = if let Some(status) = status_filter {
+        stmt.query_map(params![project_path, status], row_to_fix)
+            .map_err(|e| format!("Failed to query project fixes: {}", e))?
+    } else {
+        stmt.query_map(params![project_path], row_to_fix)
+            .map_err(|e| format!("Failed to query project fixes: {}", e))?
+    };
 
     let mut fixes = Vec::new();
     for row in rows {
