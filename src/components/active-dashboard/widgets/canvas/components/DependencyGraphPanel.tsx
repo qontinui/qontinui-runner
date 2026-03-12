@@ -24,7 +24,7 @@
  *   setup_provides       dotted
  */
 
-import { memo, useEffect, useMemo } from "react";
+import { memo, useMemo } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -202,6 +202,30 @@ export function DependencyGraphPanel({ data }: CanvasPanelComponentProps) {
   const rawNodes = useMemo(() => (data.nodes as DepNode[] | undefined) ?? [], [data.nodes]);
   const rawEdges = useMemo(() => (data.edges as DepEdge[] | undefined) ?? [], [data.edges]);
 
+  // Stable key that changes when data changes, forcing ReactFlow to remount
+  // with fresh useNodesState/useEdgesState. This replaces the anti-pattern of
+  // syncing derived state via useEffect.
+  const dataKey = useMemo(
+    () =>
+      rawNodes.map((n) => n.id).join(",") +
+      "|" +
+      rawEdges.map((e) => `${e.source}-${e.target}`).join(","),
+    [rawNodes, rawEdges],
+  );
+
+  if (rawNodes.length === 0) {
+    return (
+      <div className="flex items-center justify-center h-48 text-sm text-zinc-500 italic">
+        No dependency nodes found
+      </div>
+    );
+  }
+
+  return <DependencyGraphFlow key={dataKey} rawNodes={rawNodes} rawEdges={rawEdges} />;
+}
+
+/** Inner component that owns ReactFlow interactive state; remounted via key when data changes. */
+function DependencyGraphFlow({ rawNodes, rawEdges }: { rawNodes: DepNode[]; rawEdges: DepEdge[] }) {
   const { initialNodes, initialEdges } = useMemo(() => {
     const positions = layoutNodes(rawNodes);
 
@@ -237,23 +261,8 @@ export function DependencyGraphPanel({ data }: CanvasPanelComponentProps) {
     return { initialNodes: nodes, initialEdges: edges };
   }, [rawNodes, rawEdges]);
 
-  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
-
-  useEffect(() => {
-    setNodes(initialNodes);
-  }, [initialNodes, setNodes]);
-  useEffect(() => {
-    setEdges(initialEdges);
-  }, [initialEdges, setEdges]);
-
-  if (rawNodes.length === 0) {
-    return (
-      <div className="flex items-center justify-center h-48 text-sm text-zinc-500 italic">
-        No dependency nodes found
-      </div>
-    );
-  }
+  const [nodes, , onNodesChange] = useNodesState(initialNodes);
+  const [edges, , onEdgesChange] = useEdgesState(initialEdges);
 
   return (
     <div className="w-full relative" style={{ height: 420 }}>

@@ -527,6 +527,12 @@ function SearchTab({
   scanError,
 }: SearchTabProps) {
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const [prevResults, setPrevResults] = useState(results);
+  // Reset selection during render when results change (avoids useEffect extra cycle)
+  if (results !== prevResults) {
+    setPrevResults(results);
+    setSelectedIndex(0);
+  }
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
@@ -536,11 +542,6 @@ function SearchTab({
     SEARCH_ITEM_HEIGHT,
     containerHeight,
   );
-
-  // Reset selection when results change
-  useEffect(() => {
-    setSelectedIndex(0);
-  }, [results]);
 
   // Keyboard navigation
   const handleKeyDown = useCallback(
@@ -719,6 +720,12 @@ function ContentTab({
   onSelect,
 }: ContentTabProps) {
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const [prevResults, setPrevResults] = useState(results);
+  // Reset selection during render when results change (avoids useEffect extra cycle)
+  if (results !== prevResults) {
+    setPrevResults(results);
+    setSelectedIndex(0);
+  }
   const itemRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
   const containerHeight = 300;
@@ -727,11 +734,6 @@ function ContentTab({
     CONTENT_ITEM_HEIGHT,
     containerHeight,
   );
-
-  // Reset selection when results change
-  useEffect(() => {
-    setSelectedIndex(0);
-  }, [results]);
 
   // Keyboard: Enter triggers search, Arrow keys navigate results
   const handleKeyDown = useCallback(
