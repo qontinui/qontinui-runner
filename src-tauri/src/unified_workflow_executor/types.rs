@@ -220,6 +220,9 @@ pub struct LoopConfig {
     /// Runtime routing context for conditional model routing.
     /// Updated by the loop controller before each phase invocation.
     pub routing_context: RoutingContext,
+    /// Project/workspace path for project-scoped learning.
+    /// When set, project reflection knowledge is loaded into AI context.
+    pub project_path: Option<String>,
 }
 
 impl LoopConfig {

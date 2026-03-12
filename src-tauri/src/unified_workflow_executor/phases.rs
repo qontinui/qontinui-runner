@@ -761,6 +761,7 @@ fn build_compressed_iteration_history(
     workflow_name: Option<&str>,
     max_context_tokens: usize,
     cross_workflow_learning: bool,
+    project_path: Option<&str>,
 ) -> Option<String> {
     let mut sections = Vec::new();
     let mut budget_remaining = max_context_tokens;
@@ -1210,6 +1211,42 @@ fn build_compressed_iteration_history(
                             source_wf_name,
                             truncate_str(knowledge_text, 400),
                         ));
+                        lines.push(String::new());
+                    }
+                    let section = lines.join("\n");
+                    let tokens = estimate_tokens(&section);
+                    if tokens <= budget_remaining {
+                        budget_remaining -= tokens;
+                        sections.push(section);
+                        sections_included += 1;
+                    } else {
+                        sections_skipped += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4d. Project knowledge (from project reflection — knowledge about the user's project)
+    // Priority: MEDIUM -- only on first iteration when project_path is available
+    if current_iteration <= 1 && budget_remaining > 200 {
+        if let Some(pp) = project_path {
+            if let Ok(knowledge) = checkpoint_db.list_project_knowledge(pp, execution_id, 10) {
+                if !knowledge.is_empty() {
+                    let mut lines = vec!["## Project Knowledge".to_string()];
+                    lines.push(
+                        "(Learned from previous workflows targeting this project)".to_string(),
+                    );
+                    lines.push(String::new());
+                    for (category, content) in &knowledge {
+                        let label = match category.as_str() {
+                            "project_environment" => "Environment",
+                            "project_architecture" => "Architecture",
+                            "project_test_pattern" => "Test Pattern",
+                            "project_recurring_issue" => "Known Issue",
+                            _ => category.as_str(),
+                        };
+                        lines.push(format!("**[{}]** {}", label, truncate_str(content, 400),));
                         lines.push(String::new());
                     }
                     let section = lines.join("\n");
@@ -2926,6 +2963,7 @@ impl AgenticExecutor {
                 Some(&config.workflow_name),
                 config.max_context_tokens,
                 config.cross_workflow_learning,
+                config.project_path.as_deref(),
             ) {
                 Some(ctx) => {
                     let label = if iteration == 1 {
@@ -4448,6 +4486,9 @@ impl Executor for AgenticExecutor {
             cross_workflow_learning: true,
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
+            project_path: crate::mcp::shared::get_workspace_paths_internal()
+                .ok()
+                .map(|(root, _, _)| root.to_string_lossy().to_string()),
         };
 
         let (outcome, _injected_steps) = self

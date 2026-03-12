@@ -61,6 +61,7 @@ pub mod approval;
 pub(crate) mod auto_run;
 mod canvas_panels;
 pub mod conditional_routing;
+pub mod convergence;
 mod loop_controller;
 pub mod output_parser;
 mod phase_configs;

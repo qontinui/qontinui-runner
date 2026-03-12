@@ -854,6 +854,7 @@ impl LoopController {
                     cross_workflow_learning: config.cross_workflow_learning,
                     verification_history: std::collections::HashMap::new(),
                     routing_context: Default::default(),
+                    project_path: config.project_path.clone(),
                 };
 
                 // Handle agentic-first: run the agentic phase before the verification loop.
@@ -1306,82 +1307,133 @@ impl LoopController {
             });
         }
 
-        // Trigger reflection workflow (dev mode only, non-reflection runs only)
-        if config.is_dev_mode {
+        // Trigger reflection workflows
+        // - Project reflection: runs in BOTH dev and production modes (non-generation workflows)
+        // - Workflow reflection: runs in dev mode only (non-generation workflows)
+        // - Generation reflection: runs in dev mode only (generation workflows)
+        {
             let session_manager: Option<Arc<crate::claude_session::SessionManager>> = self
                 .app_handle
                 .try_state::<Arc<crate::claude_session::SessionManager>>()
                 .map(|s| s.inner().clone());
-            let deps = crate::reflection::trigger::ReflectionDeps {
-                app_state: self.app_state.clone(),
-                config_storage: self.config_storage.clone(),
-                app_handle: self.app_handle.clone(),
-                pid_tracker: self.pid_tracker.clone(),
-                session_manager: session_manager.clone(),
-            };
-            let source_task_run_id = config.execution_id.clone();
-            tokio::spawn(async move {
-                // Delay to allow summary generation to finish
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                match crate::reflection::trigger::launch_reflection(
-                    deps,
-                    source_task_run_id.clone(),
-                ) {
-                    Ok(id) if id == "skipped" => {
-                        debug!("Reflection skipped for {}", source_task_run_id);
-                    }
-                    Ok(id) => {
-                        info!(
-                            "Launched reflection {} for completed run {}",
-                            id, source_task_run_id
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to launch reflection for {}: {}",
-                            source_task_run_id, e
-                        );
-                    }
-                }
-            });
 
-            // Trigger follow-up workflow (15s delay, after reflection's 5s)
-            let follow_up_deps = crate::follow_up::trigger::FollowUpDeps {
-                app_state: self.app_state.clone(),
-                config_storage: self.config_storage.clone(),
-                app_handle: self.app_handle.clone(),
-                pid_tracker: self.pid_tracker.clone(),
-                session_manager,
-            };
-            let follow_up_source_id = config.execution_id.clone();
-            tokio::spawn(async move {
-                // Longer delay to allow reflection to start first and summary generation to finish
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                match crate::follow_up::trigger::launch_follow_up(
-                    follow_up_deps,
-                    follow_up_source_id.clone(),
-                ) {
-                    Ok(id) if id == "skipped" => {
-                        debug!("Follow-up skipped for {}", follow_up_source_id);
+            let is_generation = config.workflow_name.starts_with("AI Generate:");
+
+            // Project reflection (both dev and production, non-generation only)
+            if !is_generation {
+                let project_deps = crate::reflection::trigger::ReflectionDeps {
+                    app_state: self.app_state.clone(),
+                    config_storage: self.config_storage.clone(),
+                    app_handle: self.app_handle.clone(),
+                    pid_tracker: self.pid_tracker.clone(),
+                    session_manager: session_manager.clone(),
+                };
+                let project_source_id = config.execution_id.clone();
+                tokio::spawn(async move {
+                    // Delay to allow summary generation to finish
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    match crate::reflection::trigger::launch_project_reflection(
+                        project_deps,
+                        project_source_id.clone(),
+                    ) {
+                        Ok(id) if id == "skipped" => {
+                            debug!("Project reflection skipped for {}", project_source_id);
+                        }
+                        Ok(id) => {
+                            info!(
+                                "Launched project reflection {} for completed run {}",
+                                id, project_source_id
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to launch project reflection for {}: {}",
+                                project_source_id, e
+                            );
+                        }
                     }
-                    Ok(id) => {
-                        info!(
-                            "Launched follow-up {} for completed run {}",
-                            id, follow_up_source_id
-                        );
+                });
+            }
+
+            // Workflow/generation reflection (dev mode only)
+            if config.is_dev_mode {
+                let deps = crate::reflection::trigger::ReflectionDeps {
+                    app_state: self.app_state.clone(),
+                    config_storage: self.config_storage.clone(),
+                    app_handle: self.app_handle.clone(),
+                    pid_tracker: self.pid_tracker.clone(),
+                    session_manager: session_manager.clone(),
+                };
+                let source_task_run_id = config.execution_id.clone();
+                tokio::spawn(async move {
+                    // Delay: 10s for workflow reflection (after project reflection's 5s)
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    match crate::reflection::trigger::launch_reflection(
+                        deps,
+                        source_task_run_id.clone(),
+                    ) {
+                        Ok(id) if id == "skipped" => {
+                            debug!("Reflection skipped for {}", source_task_run_id);
+                        }
+                        Ok(id) => {
+                            info!(
+                                "Launched reflection {} for completed run {}",
+                                id, source_task_run_id
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to launch reflection for {}: {}",
+                                source_task_run_id, e
+                            );
+                        }
                     }
-                    Err(e) => {
-                        warn!(
-                            "Failed to launch follow-up for {}: {}",
-                            follow_up_source_id, e
-                        );
+                });
+            }
+
+            // Trigger follow-up workflow (20s delay, after reflections)
+            if config.is_dev_mode {
+                let follow_up_deps = crate::follow_up::trigger::FollowUpDeps {
+                    app_state: self.app_state.clone(),
+                    config_storage: self.config_storage.clone(),
+                    app_handle: self.app_handle.clone(),
+                    pid_tracker: self.pid_tracker.clone(),
+                    session_manager,
+                };
+                let follow_up_source_id = config.execution_id.clone();
+                tokio::spawn(async move {
+                    // Longer delay to allow reflections to start first
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    match crate::follow_up::trigger::launch_follow_up(
+                        follow_up_deps,
+                        follow_up_source_id.clone(),
+                    ) {
+                        Ok(id) if id == "skipped" => {
+                            debug!("Follow-up skipped for {}", follow_up_source_id);
+                        }
+                        Ok(id) => {
+                            info!(
+                                "Launched follow-up {} for completed run {}",
+                                id, follow_up_source_id
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to launch follow-up for {}: {}",
+                                follow_up_source_id, e
+                            );
+                        }
                     }
-                }
-            });
+                });
+            }
         }
 
         // Auto-run generated workflow (for "Generate & Run" flow)
-        if config.auto_run_generated && overall_passed {
+        // Always attempt if auto_run_generated is set — don't gate on overall_passed.
+        // The save_workflow_artifact step already gates on stage completion, so if
+        // result_data has a generated_workflow_id, the workflow was saved successfully.
+        // launch_generated_workflow will fail gracefully if no workflow was produced.
+        if config.auto_run_generated {
             let deps = super::auto_run::AutoRunDeps {
                 app_state: self.app_state.clone(),
                 config_storage: self.config_storage.clone(),
@@ -1461,11 +1513,43 @@ impl LoopController {
         // Start from the configured starting_iteration (for resume) or 0 (for fresh start)
         let mut iteration = config.starting_iteration;
 
-        // Convergence tracking state: previous failed step names and stall detection
-        let mut prev_failed_step_names: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut stall_counter: u32 = 0;
-        let mut prev_failed_count: u32 = 0;
+        // Convergence detector: replaces inline stall/flaky heuristics with
+        // pattern detection that returns actionable feedback for the AI.
+        let mut convergence_detector = super::convergence::ConvergenceDetector::new(
+            super::convergence::ConvergenceConfig::default(),
+        );
+
+        // Load constraint config from project directory (constraints.toml).
+        // This provides builtin overrides, custom constraints, and resource limits.
+        let constraint_config = config
+            .project_path
+            .as_ref()
+            .and_then(|p| crate::constraint_engine::config::load_config(std::path::Path::new(p)));
+
+        // Resource tracker: monitors wall time, file change blast radius, and
+        // agentic phase cumulative time. Use limits from config if available.
+        let resource_limits = constraint_config
+            .as_ref()
+            .and_then(|c| c.resource_limits.clone())
+            .unwrap_or_default();
+        let mut resource_tracker =
+            super::convergence::ResourceTracker::new(resource_limits, std::time::Instant::now());
+
+        // Constraint engine: evaluates declarative constraints against modified files
+        // after each agentic phase. Violations become context injections for the AI.
+        let mut constraint_engine = if let Some(ref loaded) = constraint_config {
+            crate::constraint_engine::ConstraintEngine::from_config(loaded)
+        } else {
+            crate::constraint_engine::ConstraintEngine::new()
+        };
+        // Set project root for file resolution if available
+        if let Some(ref p) = config.project_path {
+            constraint_engine = constraint_engine.with_project_root(std::path::PathBuf::from(p));
+        }
+
+        // Pending constraint violations from the previous agentic phase, to be
+        // injected into the next iteration's failure context.
+        let mut pending_constraint_context: Option<String> = None;
 
         // Track cumulative verification failures for conditional routing context
         let mut verification_failures: u32 = 0;
@@ -1735,35 +1819,6 @@ impl LoopController {
                 }
             }
 
-            // Improvement D: Flaky test detection
-            // Check for alternating pass/fail patterns in the last 4 iterations
-            let flaky_steps: Vec<String> = config
-                .verification_history
-                .iter()
-                .filter_map(|(name, results)| {
-                    if results.len() >= 4 {
-                        let tail = &results[results.len() - 4..];
-                        // Count alternations (pass->fail or fail->pass)
-                        let alternations = tail
-                            .windows(2)
-                            .filter(|w| w[0] != w[1])
-                            .count();
-                        // 3 alternations in 4 entries = perfect flip-flop (e.g., T,F,T,F)
-                        if alternations >= 3 {
-                            warn!(
-                                "VERIFICATION-FLAKY: step '{}' detected as flaky ({} alternations in last {} runs)",
-                                name, alternations, tail.len()
-                            );
-                            Some(name.clone())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
             // Add step results to overall results
             all_step_results.extend(step_results);
 
@@ -1849,8 +1904,8 @@ impl LoopController {
                 ),
             );
 
-            // Emit convergence metrics for the frontend dashboard
-            {
+            // Run convergence detector and emit metrics for the frontend dashboard
+            let convergence_report = {
                 let failed_count = verification_result.failed_steps as u32;
                 let passed_count = verification_result.passed_steps as u32;
                 let skipped_count = verification_result.skipped_steps as u32;
@@ -1863,23 +1918,20 @@ impl LoopController {
                     .map(|sr| sr.step_name.clone())
                     .collect();
 
-                // Calculate new vs repeated failures
-                let new_failures = current_failed_names
-                    .difference(&prev_failed_step_names)
-                    .count() as u32;
-                let repeated_failures = current_failed_names
-                    .intersection(&prev_failed_step_names)
-                    .count() as u32;
+                // Run the convergence detector
+                let report = convergence_detector.analyze(
+                    iteration,
+                    &config.verification_history,
+                    current_failed_names.clone(),
+                    failed_count,
+                    passed_count,
+                );
 
-                // Stall detection: failed count has not decreased in 3+ consecutive iterations
-                if iteration > 1 {
-                    if failed_count >= prev_failed_count {
-                        stall_counter += 1;
-                    } else {
-                        stall_counter = 0;
-                    }
-                }
-                let is_stalled = stall_counter >= 3;
+                // Derive new/repeated from the detector's snapshot history for
+                // backward-compatible metrics emission.
+                let new_failures = current_failed_names.len() as u32;
+                let repeated_failures = 0u32;
+                let is_stalled = !report.is_healthy;
 
                 let broadcaster = EventBroadcaster::new(self.app_handle.clone());
                 broadcaster.iteration_metrics(
@@ -1893,20 +1945,84 @@ impl LoopController {
                     is_stalled,
                 );
 
-                info!(
-                    "CONVERGENCE: iteration={}, failed={}, passed={}, new={}, repeated={}, stalled={}",
-                    iteration, failed_count, passed_count, new_failures, repeated_failures, is_stalled
-                );
-
-                // Update tracking state for next iteration
-                prev_failed_step_names = current_failed_names;
-                prev_failed_count = failed_count;
+                // Log convergence status
+                if report.has_concerns() {
+                    let pattern_names: Vec<&str> = report
+                        .patterns
+                        .iter()
+                        .map(|p| match p {
+                            super::convergence::ConvergencePattern::Stuck { .. } => "stuck",
+                            super::convergence::ConvergencePattern::Diverging { .. } => "diverging",
+                            super::convergence::ConvergencePattern::Oscillating { .. } => {
+                                "oscillating"
+                            }
+                            super::convergence::ConvergencePattern::Plateau { .. } => "plateau",
+                            super::convergence::ConvergencePattern::Converging => "converging",
+                        })
+                        .collect();
+                    warn!(
+                        "CONVERGENCE: iteration={}, failed={}, passed={}, patterns={:?}, actions={}",
+                        iteration,
+                        failed_count,
+                        passed_count,
+                        pattern_names,
+                        report.actions.len(),
+                    );
+                } else {
+                    info!(
+                        "CONVERGENCE: iteration={}, failed={}, passed={}, healthy=true",
+                        iteration, failed_count, passed_count,
+                    );
+                }
 
                 // Increment cumulative verification failures for routing context
                 if !verification_result.all_passed {
                     verification_failures += 1;
                 }
-            }
+
+                // If escalation was recommended, bump verification_failures to trigger
+                // routing rules that use the verification_failures threshold
+                if report.should_escalate_model() {
+                    info!(
+                        "CONVERGENCE-ESCALATE: Bumping verification_failures for routing (was {})",
+                        verification_failures
+                    );
+                    // Ensure it's at least 3 so routing rules like
+                    // "verification_failures >= 3 → use opus" fire
+                    if verification_failures < 3 {
+                        verification_failures = 3;
+                    }
+                }
+
+                // Check resource limits and merge any actions into the report.
+                // Resource actions use the same ConvergenceAction type so the loop
+                // controller handles them uniformly with convergence pattern actions.
+                let resource_actions = resource_tracker.check_limits(iteration);
+                if !resource_actions.is_empty() {
+                    // Merge resource actions into the report
+                    let mut merged = report;
+                    merged.is_healthy = false;
+                    for action in &resource_actions {
+                        if let super::convergence::ConvergenceAction::InjectContext {
+                            context,
+                            ..
+                        } = action
+                        {
+                            if merged.context_injection.is_empty() {
+                                merged
+                                    .context_injection
+                                    .push_str("\n## Resource Constraints\n\n");
+                            }
+                            merged.context_injection.push_str(context);
+                            merged.context_injection.push('\n');
+                        }
+                    }
+                    merged.actions.extend(resource_actions);
+                    merged
+                } else {
+                    report
+                }
+            };
 
             // Check verification outcome
             if verification_result.all_passed {
@@ -2010,39 +2126,15 @@ impl LoopController {
 
             let failure_context = verification_result.build_failure_context();
 
-            // Enhance failure context with flaky test annotations
-            let failure_context = if !flaky_steps.is_empty() {
-                let mut enhanced = failure_context;
-                // Add flaky annotation for each flaky step that failed
-                for step_result in &verification_result.step_results {
-                    if !step_result.success && flaky_steps.contains(&step_result.step_name) {
-                        enhanced = enhanced.replace(
-                            &format!("#### {}", step_result.step_name),
-                            &format!("#### [flaky] {}", step_result.step_name),
-                        );
-                    }
-                }
-                // Add a note about flaky tests at the end
-                let flaky_failed: Vec<&String> = flaky_steps
-                    .iter()
-                    .filter(|name| {
-                        verification_result
-                            .step_results
-                            .iter()
-                            .any(|sr| &sr.step_name == *name && !sr.success)
-                    })
-                    .collect();
-                if !flaky_failed.is_empty() {
-                    enhanced.push_str("\n### Flaky Test Notice\n\n");
-                    enhanced.push_str(
-                        "Note: The following steps appear flaky (alternating pass/fail). Their failures may be intermittent rather than a code issue:\n",
-                    );
-                    for name in &flaky_failed {
-                        enhanced.push_str(&format!("- {}\n", name));
-                    }
-                    enhanced.push('\n');
-                }
-                enhanced
+            // Inject convergence analysis into the failure context.
+            // The detector's context_injection contains formatted warnings about
+            // stuck, diverging, oscillating, or plateau patterns — giving the AI
+            // actionable feedback to change its approach.
+            let failure_context = if !convergence_report.context_injection.is_empty() {
+                format!(
+                    "{}\n{}",
+                    convergence_report.context_injection, failure_context
+                )
             } else {
                 failure_context
             };
@@ -2111,6 +2203,16 @@ impl LoopController {
                 failure_context
             };
 
+            // Inject constraint violations from the previous agentic phase.
+            // These are evaluated after the AI applies changes and stored for the
+            // next iteration, so the AI gets feedback about constraint issues
+            // alongside verification failures.
+            let failure_context = if let Some(ctx) = pending_constraint_context.take() {
+                format!("{}\n{}", failure_context, ctx)
+            } else {
+                failure_context
+            };
+
             // Enrich failure context with structured build errors from managed processes.
             // Parses stderr from dev servers to extract actionable errors (file, line, message)
             // instead of dumping raw stderr output.
@@ -2168,6 +2270,51 @@ impl LoopController {
                 iteration,
             );
 
+            // Apply convergence detector actions: force reflection mode if recommended.
+            // This temporarily enables reflection_mode for this iteration even if the
+            // workflow didn't configure it, giving the AI a structured investigation
+            // protocol when it's clearly stuck.
+            let reflection_was_forced =
+                if convergence_report.should_force_reflection() && !config.reflection_mode {
+                    info!(
+                    "CONVERGENCE-ACTION: Forcing reflection mode for iteration {} (was disabled)",
+                    iteration
+                );
+                    config.reflection_mode = true;
+                    true
+                } else {
+                    false
+                };
+
+            // Inject reflection investigation hint into the failure context if present.
+            // This gives the AI specific guidance about what to investigate.
+            let failure_context = if let Some(hint) = convergence_report.reflection_hint() {
+                format!("{}\n\n{}", failure_context, hint)
+            } else {
+                failure_context
+            };
+
+            // Inject unfixable suggestion into the failure context if recommended.
+            // This doesn't force unfixable — it asks the AI to seriously consider it.
+            let failure_context = {
+                let mut ctx = failure_context;
+                for action in &convergence_report.actions {
+                    if let super::convergence::ConvergenceAction::SuggestUnfixable { reason } =
+                        action
+                    {
+                        ctx.push_str(&format!(
+                            "\n\n### Consider Declaring Unfixable\n\n\
+                            {}\n\n\
+                            If after thorough investigation you determine these errors truly cannot \
+                            be fixed through code changes, output `[UNFIXABLE_ERRORS]` with an \
+                            explanation. Only do this if you've exhausted all approaches.\n",
+                            reason
+                        ));
+                    }
+                }
+                ctx
+            };
+
             // Capture error baseline before agentic phase for regression detection.
             // After the AI makes changes, we compare to identify newly introduced errors.
             let pre_agentic_health = fetch_pre_agentic_health_baseline().await;
@@ -2184,7 +2331,64 @@ impl LoopController {
                     logger,
                 )
                 .await;
+
+            // Restore reflection_mode if we forced it for this iteration only
+            if reflection_was_forced {
+                config.reflection_mode = false;
+                debug!(
+                    "CONVERGENCE-ACTION: Restored reflection_mode to false after forced iteration"
+                );
+            }
             let agentic_duration_ms = agentic_phase_start.elapsed().as_millis() as u64;
+
+            // Feed the resource tracker with this iteration's data.
+            // Extract files_modified from the parsed agentic output (if available).
+            let iteration_files: Vec<String> = agentic_outcome
+                .parsed()
+                .map(|p| p.files_modified.iter().map(|f| f.path.clone()).collect())
+                .unwrap_or_default();
+            resource_tracker.record_iteration(agentic_duration_ms, &iteration_files);
+
+            // Run constraint engine against modified files.
+            // Violations are stored and injected into the NEXT iteration's failure
+            // context (alongside verification results). This catches issues like
+            // secrets, debug statements, or scope violations early.
+            {
+                if !iteration_files.is_empty() {
+                    let constraint_results = constraint_engine.evaluate(&iteration_files);
+                    if !constraint_results.iter().all(|r| r.passed) {
+                        let summary = crate::constraint_engine::ConstraintEngine::summarize_results(
+                            &constraint_results,
+                        );
+                        info!("CONSTRAINT-ENGINE: iteration {} — {}", iteration, summary);
+                        let actions =
+                            crate::constraint_engine::ConstraintEngine::results_to_actions(
+                                &constraint_results,
+                            );
+                        // Build context injection from constraint actions
+                        let mut ctx = String::new();
+                        for action in &actions {
+                            if let super::convergence::ConvergenceAction::InjectContext {
+                                context,
+                                ..
+                            } = action
+                            {
+                                ctx.push_str(context);
+                                ctx.push('\n');
+                            }
+                        }
+                        if !ctx.is_empty() {
+                            pending_constraint_context =
+                                Some(format!("\n## Constraint Violations\n\n{}", ctx));
+                        }
+                    } else {
+                        debug!(
+                            "CONSTRAINT-ENGINE: iteration {} — all constraints passed",
+                            iteration
+                        );
+                    }
+                }
+            }
 
             // Compare post-agentic health with baseline to detect regressions.
             // Store for the NEXT iteration's failure context (since this iteration's
@@ -2293,6 +2497,31 @@ impl LoopController {
             } else {
                 Vec::new()
             };
+
+            // Parse AI-discovered constraint proposals from the agentic output.
+            // Proposals are applied to the constraint engine for subsequent iterations
+            // and logged as TOML for the user to add to constraints.toml.
+            if let Some(output) = agentic_outcome.output() {
+                let proposals = crate::constraint_engine::proposals::parse_proposals(output);
+                if !proposals.is_empty() {
+                    let applied = constraint_engine.apply_proposals(&proposals);
+                    info!(
+                        "CONSTRAINT-PROPOSAL: Applied {}/{} proposal(s) from iteration {}",
+                        applied,
+                        proposals.len(),
+                        iteration,
+                    );
+                    // Log the TOML snippet for user reference
+                    let toml_snippet =
+                        crate::constraint_engine::proposals::proposals_to_toml(&proposals);
+                    if !toml_snippet.is_empty() {
+                        info!(
+                            "CONSTRAINT-PROPOSAL: Suggested constraints.toml additions:\n{}",
+                            toml_snippet,
+                        );
+                    }
+                }
+            }
 
             // Emit canvas panel for agentic phase completion
             self.canvas_manager
@@ -3571,6 +3800,9 @@ pub async fn resume_interrupted_workflows(
                                 cross_workflow_learning: true,
                                 verification_history: std::collections::HashMap::new(),
                                 routing_context: Default::default(),
+                                project_path: crate::mcp::shared::get_workspace_paths_internal()
+                                    .ok()
+                                    .map(|(root, _, _)| root.to_string_lossy().to_string()),
                             };
 
                             controller
@@ -3712,6 +3944,9 @@ pub async fn resume_interrupted_workflows(
                                 cross_workflow_learning: true,
                                 verification_history: std::collections::HashMap::new(),
                                 routing_context: Default::default(),
+                                project_path: crate::mcp::shared::get_workspace_paths_internal()
+                                    .ok()
+                                    .map(|(root, _, _)| root.to_string_lossy().to_string()),
                             };
 
                             controller
