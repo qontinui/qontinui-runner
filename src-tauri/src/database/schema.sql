@@ -213,6 +213,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- Config linkage (for automation-enabled tasks)
     config_id TEXT,  -- Foreign key to configs table (optional)
     workflow_name TEXT,  -- Workflow name being executed
+    workflow_id TEXT,    -- FK to unified_workflows (links run to workflow definition)
 
     -- Summary (post-completion analysis)
     summary TEXT,  -- AI-generated paragraph summary of the task run (canonical)
@@ -654,6 +655,9 @@ CREATE TABLE IF NOT EXISTS task_knowledge (
     -- Reflection linkage (v58)
     reflection_fix_id TEXT,  -- FK to reflection_fixes if this knowledge was created by a reflection
 
+    -- Project scoping (v97)
+    project_path TEXT,  -- Project/workspace path for project-scoped knowledge
+
     created_at TEXT NOT NULL,
 
     FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
@@ -662,6 +666,7 @@ CREATE TABLE IF NOT EXISTS task_knowledge (
 CREATE INDEX IF NOT EXISTS idx_task_knowledge_task_run_id ON task_knowledge(task_run_id);
 CREATE INDEX IF NOT EXISTS idx_task_knowledge_category ON task_knowledge(category);
 CREATE INDEX IF NOT EXISTS idx_task_knowledge_is_resolved ON task_knowledge(is_resolved);
+CREATE INDEX IF NOT EXISTS idx_task_knowledge_project ON task_knowledge(project_path);
 
 -- Task Knowledge Summaries (Memory Compression)
 -- Stores compressed summaries of old knowledge entries to prevent context overflow
@@ -1591,8 +1596,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_session_type ON sessions(session_type);
 -- Scheduler history: status filtering
 CREATE INDEX IF NOT EXISTS idx_scheduler_history_status ON scheduler_history(status);
 
--- Task runs: workflow_name filtering and updated_at ordering
+-- Task runs: workflow_name filtering, workflow_id lookup, and updated_at ordering
 CREATE INDEX IF NOT EXISTS idx_task_runs_workflow_name ON task_runs(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_task_runs_workflow_id ON task_runs(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_task_runs_updated_at ON task_runs(updated_at);
 
 -- Verification plans: created_at ordering
@@ -2177,6 +2183,8 @@ CREATE TABLE IF NOT EXISTS reflection_fixes (
     evaluated_at TEXT,
     created_at TEXT NOT NULL,
     source_agent TEXT,                        -- Which generation agent caused this (specification, builder, verification, hardener)
+    reflection_scope TEXT DEFAULT 'workflow',  -- 'workflow' (existing) or 'project' (project reflection) (v97)
+    project_path TEXT,                        -- Project/workspace path for project-scoped fixes (v97)
     FOREIGN KEY (source_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
     FOREIGN KEY (reflection_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
     FOREIGN KEY (source_finding_id) REFERENCES task_run_findings(id) ON DELETE SET NULL,
@@ -2190,6 +2198,8 @@ CREATE INDEX IF NOT EXISTS idx_reflection_fixes_status ON reflection_fixes(statu
 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_effectiveness ON reflection_fixes(effectiveness);
 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_applied_at ON reflection_fixes(applied_at);
 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_source_agent ON reflection_fixes(source_agent);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_project ON reflection_fixes(project_path);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_scope ON reflection_fixes(reflection_scope);
 
 -- =============================================================================
 -- Generation Rules (Version 60)

@@ -194,6 +194,12 @@ pub struct TaskRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_name: Option<String>,
 
+    /// Unified workflow ID that this task run executes (FK to unified_workflows).
+    /// Set when executing a generated or saved workflow so the Recap page can
+    /// link runs to their workflow definition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+
     /// AI-generated paragraph summary of the task run
     /// Note: This is the canonical field. `ai_summary` is kept for backward compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -318,6 +324,7 @@ pub struct CreateTaskRunInput {
     pub task_type: Option<String>,
     pub config_id: Option<String>,
     pub workflow_name: Option<String>,
+    pub workflow_id: Option<String>,
     pub max_sessions: Option<u32>,
     pub auto_continue: Option<bool>,
     pub execution_steps_json: Option<String>,
@@ -345,6 +352,7 @@ impl CreateTaskRunInput {
             task_type: None,
             config_id: None,
             workflow_name: None,
+            workflow_id: None,
             max_sessions: None,
             auto_continue: None,
             execution_steps_json: None,
@@ -384,6 +392,12 @@ impl CreateTaskRunInput {
     /// Set the workflow name being executed.
     pub fn with_workflow_name(mut self, workflow_name: impl Into<String>) -> Self {
         self.workflow_name = Some(workflow_name.into());
+        self
+    }
+
+    /// Set the unified workflow ID being executed.
+    pub fn with_workflow_id(mut self, workflow_id: impl Into<String>) -> Self {
+        self.workflow_id = Some(workflow_id.into());
         self
     }
 
@@ -6141,6 +6155,42 @@ impl CheckpointDb {
             info!("Successfully migrated to version 95 (quality improvements)");
         }
 
+        // Version 96: Add workflow_id to task_runs for linking to unified_workflows
+        if current_version < 96 {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE task_runs ADD COLUMN workflow_id TEXT DEFAULT NULL;
+                CREATE INDEX IF NOT EXISTS idx_task_runs_workflow_id ON task_runs(workflow_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (96, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 96: {}", e))?;
+
+            info!("Successfully migrated to version 96 (workflow_id on task_runs)");
+        }
+
+        if current_version < 97 {
+            info!("Migrating to version 97 (project reflection: scope + project_path columns)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE reflection_fixes ADD COLUMN reflection_scope TEXT DEFAULT 'workflow';
+                ALTER TABLE reflection_fixes ADD COLUMN project_path TEXT;
+                ALTER TABLE task_knowledge ADD COLUMN project_path TEXT;
+
+                CREATE INDEX IF NOT EXISTS idx_reflection_fixes_project ON reflection_fixes(project_path);
+                CREATE INDEX IF NOT EXISTS idx_reflection_fixes_scope ON reflection_fixes(reflection_scope);
+                CREATE INDEX IF NOT EXISTS idx_task_knowledge_project ON task_knowledge(project_path);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (97, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 97: {}", e))?;
+
+            info!("Successfully migrated to version 97 (project reflection columns)");
+        }
+
         Ok(())
     }
 
@@ -6566,13 +6616,13 @@ impl CheckpointDb {
             r#"
             INSERT INTO task_runs (id, task_name, prompt, task_type, status, sessions_count, max_sessions,
                                    output_log, auto_continue, execution_steps_json, log_sources_json,
-                                   config_id, workflow_name, workflow_type,
+                                   config_id, workflow_name, workflow_id, workflow_type,
                                    parent_task_run_id, root_task_run_id, depth,
                                    workspace_id, triggered_by, bridge_id,
                                    is_reflection, reflection_source_task_run_id,
                                    is_follow_up, follow_up_source_task_run_id,
                                    created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22)
+            VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?23)
             "#,
             params![
                 input.id,
@@ -6585,6 +6635,7 @@ impl CheckpointDb {
                 input.log_sources_json,
                 input.config_id,
                 input.workflow_name,
+                input.workflow_id,
                 input.workflow_type,
                 input.parent_task_run_id,
                 effective_root,
@@ -6616,6 +6667,7 @@ impl CheckpointDb {
             log_sources_json: input.log_sources_json.clone(),
             config_id: input.config_id.clone(),
             workflow_name: input.workflow_name.clone(),
+            workflow_id: input.workflow_id.clone(),
             summary: None,
             ai_summary: None,
             goal_achieved: None,
@@ -6855,7 +6907,7 @@ impl CheckpointDb {
         let result: SqliteResult<TaskRun> = conn.query_row(
             r#"
             SELECT id, task_name, prompt, task_type, status, sessions_count, max_sessions, error_message, auto_continue,
-                   execution_steps_json, log_sources_json, config_id, workflow_name,
+                   execution_steps_json, log_sources_json, config_id, workflow_name, workflow_id,
                    COALESCE(summary, ai_summary) as summary, ai_summary, goal_achieved, remaining_work,
                    summary_generated_at, transition_history_json, workflow_type,
                    workspace_id, triggered_by,
@@ -6883,27 +6935,28 @@ impl CheckpointDb {
                     log_sources_json: row.get(10)?,
                     config_id: row.get(11)?,
                     workflow_name: row.get(12)?,
-                    summary: row.get(13)?,
-                    ai_summary: row.get(14)?,
-                    goal_achieved: row.get::<_, Option<i32>>(15)?.map(|v| v != 0),
-                    remaining_work: row.get(16)?,
-                    summary_generated_at: row.get(17)?,
-                    transition_history_json: row.get(18)?,
-                    workflow_type: row.get(19)?,
-                    workspace_id: row.get(20)?,
-                    triggered_by: row.get(21)?,
-                    parent_task_run_id: row.get(22)?,
-                    root_task_run_id: row.get(23)?,
-                    depth: row.get::<_, Option<i64>>(24)?.unwrap_or(0) as u32,
-                    bridge_id: row.get(25)?,
-                    result_data: row.get(26)?,
-                    is_reflection: row.get::<_, i32>(27)? != 0,
-                    reflection_source_task_run_id: row.get(28)?,
-                    is_follow_up: row.get::<_, i32>(29)? != 0,
-                    follow_up_source_task_run_id: row.get(30)?,
-                    created_at: row.get(31)?,
-                    updated_at: row.get(32)?,
-                    completed_at: row.get(33)?,
+                    workflow_id: row.get(13)?,
+                    summary: row.get(14)?,
+                    ai_summary: row.get(15)?,
+                    goal_achieved: row.get::<_, Option<i32>>(16)?.map(|v| v != 0),
+                    remaining_work: row.get(17)?,
+                    summary_generated_at: row.get(18)?,
+                    transition_history_json: row.get(19)?,
+                    workflow_type: row.get(20)?,
+                    workspace_id: row.get(21)?,
+                    triggered_by: row.get(22)?,
+                    parent_task_run_id: row.get(23)?,
+                    root_task_run_id: row.get(24)?,
+                    depth: row.get::<_, Option<i64>>(25)?.unwrap_or(0) as u32,
+                    bridge_id: row.get(26)?,
+                    result_data: row.get(27)?,
+                    is_reflection: row.get::<_, i32>(28)? != 0,
+                    reflection_source_task_run_id: row.get(29)?,
+                    is_follow_up: row.get::<_, i32>(30)? != 0,
+                    follow_up_source_task_run_id: row.get(31)?,
+                    created_at: row.get(32)?,
+                    updated_at: row.get(33)?,
+                    completed_at: row.get(34)?,
                 })
             },
         );
@@ -6939,7 +6992,7 @@ impl CheckpointDb {
             .prepare(
                 r#"
                 SELECT id, task_name, prompt, task_type, status, sessions_count, max_sessions, error_message, auto_continue,
-                       execution_steps_json, log_sources_json, config_id, workflow_name,
+                       execution_steps_json, log_sources_json, config_id, workflow_name, workflow_id,
                        COALESCE(summary, ai_summary) as summary, ai_summary, goal_achieved, remaining_work,
                        summary_generated_at, transition_history_json, workflow_type,
                        workspace_id, triggered_by,
@@ -6973,27 +7026,28 @@ impl CheckpointDb {
                     log_sources_json: row.get(10)?,
                     config_id: row.get(11)?,
                     workflow_name: row.get(12)?,
-                    summary: row.get(13)?,
-                    ai_summary: row.get(14)?,
-                    goal_achieved: row.get::<_, Option<i32>>(15)?.map(|v| v != 0),
-                    remaining_work: row.get(16)?,
-                    summary_generated_at: row.get(17)?,
-                    transition_history_json: row.get(18)?,
-                    workflow_type: row.get(19)?,
-                    workspace_id: row.get(20)?,
-                    triggered_by: row.get(21)?,
-                    parent_task_run_id: row.get(22)?,
-                    root_task_run_id: row.get(23)?,
-                    depth: row.get::<_, Option<i64>>(24)?.unwrap_or(0) as u32,
-                    bridge_id: row.get(25)?,
-                    result_data: row.get(26)?,
-                    is_reflection: row.get::<_, i32>(27)? != 0,
-                    reflection_source_task_run_id: row.get(28)?,
-                    is_follow_up: row.get::<_, i32>(29)? != 0,
-                    follow_up_source_task_run_id: row.get(30)?,
-                    created_at: row.get(31)?,
-                    updated_at: row.get(32)?,
-                    completed_at: row.get(33)?,
+                    workflow_id: row.get(13)?,
+                    summary: row.get(14)?,
+                    ai_summary: row.get(15)?,
+                    goal_achieved: row.get::<_, Option<i32>>(16)?.map(|v| v != 0),
+                    remaining_work: row.get(17)?,
+                    summary_generated_at: row.get(18)?,
+                    transition_history_json: row.get(19)?,
+                    workflow_type: row.get(20)?,
+                    workspace_id: row.get(21)?,
+                    triggered_by: row.get(22)?,
+                    parent_task_run_id: row.get(23)?,
+                    root_task_run_id: row.get(24)?,
+                    depth: row.get::<_, Option<i64>>(25)?.unwrap_or(0) as u32,
+                    bridge_id: row.get(26)?,
+                    result_data: row.get(27)?,
+                    is_reflection: row.get::<_, i32>(28)? != 0,
+                    reflection_source_task_run_id: row.get(29)?,
+                    is_follow_up: row.get::<_, i32>(30)? != 0,
+                    follow_up_source_task_run_id: row.get(31)?,
+                    created_at: row.get(32)?,
+                    updated_at: row.get(33)?,
+                    completed_at: row.get(34)?,
                 })
             })
             .map_err(|e| format!("Failed to query child tasks: {}", e))?
@@ -7023,7 +7077,7 @@ impl CheckpointDb {
             .prepare(
                 r#"
                 SELECT id, task_name, prompt, task_type, status, sessions_count, max_sessions, error_message, auto_continue,
-                       execution_steps_json, log_sources_json, config_id, workflow_name,
+                       execution_steps_json, log_sources_json, config_id, workflow_name, workflow_id,
                        COALESCE(summary, ai_summary) as summary, ai_summary, goal_achieved, remaining_work,
                        summary_generated_at, transition_history_json, workflow_type,
                        workspace_id, triggered_by,
@@ -7057,27 +7111,28 @@ impl CheckpointDb {
                     log_sources_json: row.get(10)?,
                     config_id: row.get(11)?,
                     workflow_name: row.get(12)?,
-                    summary: row.get(13)?,
-                    ai_summary: row.get(14)?,
-                    goal_achieved: row.get::<_, Option<i32>>(15)?.map(|v| v != 0),
-                    remaining_work: row.get(16)?,
-                    summary_generated_at: row.get(17)?,
-                    transition_history_json: row.get(18)?,
-                    workflow_type: row.get(19)?,
-                    workspace_id: row.get(20)?,
-                    triggered_by: row.get(21)?,
-                    parent_task_run_id: row.get(22)?,
-                    root_task_run_id: row.get(23)?,
-                    depth: row.get::<_, Option<i64>>(24)?.unwrap_or(0) as u32,
-                    bridge_id: row.get(25)?,
-                    result_data: row.get(26)?,
-                    is_reflection: row.get::<_, i32>(27)? != 0,
-                    reflection_source_task_run_id: row.get(28)?,
-                    is_follow_up: row.get::<_, i32>(29)? != 0,
-                    follow_up_source_task_run_id: row.get(30)?,
-                    created_at: row.get(31)?,
-                    updated_at: row.get(32)?,
-                    completed_at: row.get(33)?,
+                    workflow_id: row.get(13)?,
+                    summary: row.get(14)?,
+                    ai_summary: row.get(15)?,
+                    goal_achieved: row.get::<_, Option<i32>>(16)?.map(|v| v != 0),
+                    remaining_work: row.get(17)?,
+                    summary_generated_at: row.get(18)?,
+                    transition_history_json: row.get(19)?,
+                    workflow_type: row.get(20)?,
+                    workspace_id: row.get(21)?,
+                    triggered_by: row.get(22)?,
+                    parent_task_run_id: row.get(23)?,
+                    root_task_run_id: row.get(24)?,
+                    depth: row.get::<_, Option<i64>>(25)?.unwrap_or(0) as u32,
+                    bridge_id: row.get(26)?,
+                    result_data: row.get(27)?,
+                    is_reflection: row.get::<_, i32>(28)? != 0,
+                    reflection_source_task_run_id: row.get(29)?,
+                    is_follow_up: row.get::<_, i32>(30)? != 0,
+                    follow_up_source_task_run_id: row.get(31)?,
+                    created_at: row.get(32)?,
+                    updated_at: row.get(33)?,
+                    completed_at: row.get(34)?,
                 })
             })
             .map_err(|e| format!("Failed to query task hierarchy: {}", e))?
@@ -7828,6 +7883,7 @@ impl CheckpointDb {
                     task_type: row.get(20)?,
                     config_id: row.get(21)?,
                     workflow_name: row.get(22)?,
+                    workflow_id: None,
                 })
             })
             .map_err(|e| format!("Failed to execute query: {}", e))?
@@ -7897,6 +7953,7 @@ impl CheckpointDb {
                     task_type: row.get(20)?,
                     config_id: row.get(21)?,
                     workflow_name: row.get(22)?,
+                    workflow_id: None,
                 })
             })
             .map_err(|e| format!("Failed to execute query: {}", e))?
@@ -7966,6 +8023,7 @@ impl CheckpointDb {
                     task_type: row.get(20)?,
                     config_id: row.get(21)?,
                     workflow_name: row.get(22)?,
+                    workflow_id: None,
                 })
             })
             .map_err(|e| format!("Failed to execute query: {}", e))?
@@ -8154,6 +8212,7 @@ impl CheckpointDb {
                     log_sources_json: None,
                     config_id: row.get(9)?,
                     workflow_name: row.get(10)?,
+                    workflow_id: None,
                     summary: row.get(11)?,
                     ai_summary: row.get(12)?,
                     goal_achieved: row.get::<_, Option<i32>>(13)?.map(|v| v != 0),
@@ -8255,6 +8314,7 @@ impl CheckpointDb {
                     log_sources_json: None,
                     config_id: row.get(9)?,
                     workflow_name: row.get(10)?,
+                    workflow_id: None,
                     summary: row.get(11)?,
                     ai_summary: row.get(12)?,
                     goal_achieved: row.get::<_, Option<i32>>(13)?.map(|v| v != 0),
@@ -11688,6 +11748,64 @@ impl CheckpointDb {
             .collect();
 
         Ok(results)
+    }
+
+    /// Query project-scoped knowledge entries for a given project path.
+    ///
+    /// Returns knowledge entries created by project reflection workflows
+    /// that analyzed runs targeting the same project directory.
+    pub fn list_project_knowledge(
+        &self,
+        project_path: &str,
+        exclude_task_run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT tk.category, tk.content
+                FROM task_knowledge tk
+                WHERE tk.project_path = ?1
+                  AND tk.task_run_id != ?2
+                  AND tk.agent_type = 'reflection'
+                  AND tk.category IN (
+                      'project_environment', 'project_architecture',
+                      'project_test_pattern', 'project_recurring_issue'
+                  )
+                  AND tk.confidence IN ('high', 'medium')
+                ORDER BY tk.created_at DESC
+                LIMIT ?3
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare project knowledge query: {}", e))?;
+
+        let results: Vec<(String, String)> = stmt
+            .query_map(
+                rusqlite::params![project_path, exclude_task_run_id, limit as u32],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|e| format!("Failed to query project knowledge: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Set the project_path on a task_knowledge entry.
+    pub fn set_knowledge_project_path(
+        &self,
+        knowledge_id: &str,
+        project_path: &str,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        conn.execute(
+            "UPDATE task_knowledge SET project_path = ?1 WHERE id = ?2",
+            rusqlite::params![project_path, knowledge_id],
+        )
+        .map_err(|e| format!("Failed to set knowledge project_path: {}", e))?;
+        Ok(())
     }
 
     /// Helper function to convert a row to StoredTaskKnowledge.

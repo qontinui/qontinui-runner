@@ -290,6 +290,36 @@ pub fn get_fixes_by_workflow_name(
     Ok(fixes)
 }
 
+/// Get all project-scoped fixes for a given project path, with optional filters.
+pub fn get_fixes_by_project_path(
+    conn: &Connection,
+    project_path: &str,
+    status_filter: Option<&str>,
+) -> Result<Vec<ReflectionFix>, String> {
+    let mut sql = format!(
+        "SELECT {} FROM reflection_fixes WHERE project_path = ?1 AND reflection_scope = 'project'",
+        SELECT_ALL_COLUMNS
+    );
+
+    if let Some(status) = status_filter {
+        sql.push_str(&format!(" AND status = '{}'", status));
+    }
+    sql.push_str(" ORDER BY created_at DESC");
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Failed to prepare project fixes query: {}", e))?;
+    let rows = stmt
+        .query_map(params![project_path], row_to_fix)
+        .map_err(|e| format!("Failed to query project fixes: {}", e))?;
+
+    let mut fixes = Vec::new();
+    for row in rows {
+        fixes.push(row.map_err(|e| format!("Failed to read fix row: {}", e))?);
+    }
+    Ok(fixes)
+}
+
 /// Update the status of a reflection fix (applied/reverted/superseded).
 pub fn update_fix_status(conn: &Connection, id: &str, status: &str) -> Result<(), String> {
     let affected = conn

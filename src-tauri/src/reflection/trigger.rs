@@ -369,6 +369,9 @@ pub fn launch_reflection(
     let reflection_fix_ctx = crate::mcp::shared::ReflectionFixContext {
         source_task_run_id: source_task_run_id.clone(),
         reflection_task_run_id: reflection_id.clone(),
+        project_path: crate::mcp::shared::get_workspace_paths_internal()
+            .ok()
+            .map(|(root, _, _)| root.to_string_lossy().to_string()),
     };
 
     let mut controller = crate::unified_workflow_executor::LoopController::new(
@@ -425,6 +428,345 @@ pub fn launch_reflection(
     Ok(reflection_id)
 }
 
+// =============================================================================
+// Project Reflection
+// =============================================================================
+
+/// Check whether a project reflection should be launched.
+///
+/// Similar to `should_launch_reflection` but uses project-scoped convergence
+/// and has its own "already running" guard keyed by project path.
+pub fn should_launch_project_reflection(
+    db: &CheckpointDb,
+    source_task_run_id: &str,
+) -> Result<bool, String> {
+    let source_id = source_task_run_id.to_string();
+
+    db.with_conn(|conn| {
+        // Guard 0: Block if a project reflection for the SAME workflow is already running
+        let has_running: bool = conn
+            .query_row(
+                r#"SELECT COUNT(*) > 0 FROM task_runs r
+                   WHERE r.status = 'running'
+                     AND r.is_reflection = 1
+                     AND r.workflow_type = 'unified'
+                     AND r.workflow_name LIKE 'Project Reflection:%'
+                     AND r.reflection_source_task_run_id IN (
+                         SELECT s.id FROM task_runs s
+                         WHERE s.workflow_name = (
+                             SELECT workflow_name FROM task_runs WHERE id = ?1
+                         )
+                     )"#,
+                rusqlite::params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if has_running {
+            debug!("Skipping project reflection — one for the same workflow is already running");
+            return Ok(false);
+        }
+
+        // Guard 1: Check if source task run is already a reflection run
+        let is_reflection: bool = conn
+            .query_row(
+                "SELECT COALESCE(is_reflection, 0) FROM task_runs WHERE id = ?1",
+                rusqlite::params![source_id],
+                |row| row.get::<_, i32>(0).map(|v| v != 0),
+            )
+            .map_err(|e| format!("Failed to check is_reflection: {}", e))?;
+
+        if is_reflection {
+            debug!(
+                "Skipping project reflection for {} — source is already a reflection run",
+                source_id
+            );
+            return Ok(false);
+        }
+
+        // Guard 2: Check project_reflection_enabled setting (default: true)
+        let project_reflection_enabled: bool = conn
+            .query_row(
+                "SELECT COALESCE(json_extract(value, '$.project_reflection_enabled'), 'true') FROM settings WHERE key = 'dev_mode'",
+                [],
+                |row| {
+                    let val: String = row.get(0)?;
+                    Ok(val == "true" || val == "1")
+                },
+            )
+            .unwrap_or(true);
+
+        if !project_reflection_enabled {
+            debug!("Project reflection disabled in settings");
+            return Ok(false);
+        }
+
+        // Guard 3: Check output threshold
+        let has_output: bool = conn
+            .query_row(
+                r#"SELECT COALESCE(
+                    (SELECT SUM(LENGTH(content)) FROM task_run_output_chunks WHERE task_run_id = ?1),
+                    0
+                ) + LENGTH(COALESCE((SELECT output_log FROM task_runs WHERE id = ?1), '')) > 100"#,
+                rusqlite::params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if !has_output {
+            debug!(
+                "Skipping project reflection for {} — insufficient output",
+                source_id
+            );
+            return Ok(false);
+        }
+
+        // Guard 4: Project-scoped convergence
+        // Check last N project reflections for the same workflow — if all produced 0 fixes,
+        // the project is well-documented and we can skip.
+        let converged = has_project_converged(conn, &source_id)?;
+        if converged {
+            info!(
+                "Skipping project reflection for {} — project knowledge has converged",
+                source_id
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
+    })
+}
+
+/// Check if project reflection has converged — last N project reflections
+/// for the same source workflow produced zero reflection fixes.
+fn has_project_converged(conn: &Connection, source_task_run_id: &str) -> Result<bool, String> {
+    let workflow_name: Option<String> = conn
+        .query_row(
+            "SELECT workflow_name FROM task_runs WHERE id = ?1",
+            rusqlite::params![source_task_run_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Failed to get workflow_name: {}", e))?;
+
+    let workflow_name = match workflow_name {
+        Some(name) => name,
+        None => return Ok(false),
+    };
+
+    // Get last CONVERGENCE_THRESHOLD project reflection runs for this workflow
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT tr.id,
+                   (SELECT COUNT(*) FROM reflection_fixes rf
+                    WHERE rf.reflection_task_run_id = tr.id
+                      AND rf.reflection_scope = 'project') as fix_count
+            FROM task_runs tr
+            WHERE tr.workflow_name LIKE 'Project Reflection:%'
+              AND tr.is_reflection = 1
+              AND tr.status IN ('complete', 'completed')
+              AND tr.reflection_source_task_run_id IN (
+                SELECT id FROM task_runs WHERE workflow_name = ?1
+              )
+            ORDER BY tr.completed_at DESC
+            LIMIT ?2
+            "#,
+        )
+        .map_err(|e| format!("Failed to prepare project convergence query: {}", e))?;
+
+    let rows: Vec<u32> = stmt
+        .query_map(
+            rusqlite::params![workflow_name, CONVERGENCE_THRESHOLD],
+            |row| row.get::<_, u32>(1),
+        )
+        .map_err(|e| format!("Failed to query project convergence: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.len() < CONVERGENCE_THRESHOLD as usize {
+        return Ok(false);
+    }
+
+    let all_empty = rows.iter().all(|count| *count == 0);
+    if all_empty {
+        debug!(
+            "Project reflection for '{}' has {} consecutive runs with zero fixes — converged",
+            workflow_name,
+            rows.len()
+        );
+    }
+
+    Ok(all_empty)
+}
+
+/// Launch a project reflection workflow to learn about the user's project.
+///
+/// Similar to `launch_reflection` but uses project-scoped workflow builder
+/// and stores fixes with `reflection_scope = 'project'`.
+pub fn launch_project_reflection(
+    deps: ReflectionDeps,
+    source_task_run_id: String,
+) -> Result<String, String> {
+    let db = &deps.app_state.checkpoint_db;
+
+    if !should_launch_project_reflection(db, &source_task_run_id)? {
+        return Ok("skipped".to_string());
+    }
+
+    // Get source task run details
+    let source_id = source_task_run_id.clone();
+    let (workflow_name, project_path) = db.with_conn(|conn| {
+        let wf_name: String = conn
+            .query_row(
+                "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = ?1",
+                rusqlite::params![source_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| format!("Failed to get source task run: {}", e))?;
+
+        // Try to get project path from the workflow's step JSON arrays.
+        // shell_command_working_directory is a per-step field stored in JSON, not a table column.
+        let proj_path: Option<String> = conn
+            .query_row(
+                r#"SELECT COALESCE(
+                    json_extract(s.value, '$.shell_command_working_directory'),
+                    json_extract(s.value, '$.working_directory')
+                )
+                FROM unified_workflows uw, json_each(uw.setup_steps) s
+                INNER JOIN task_runs tr ON tr.workflow_name = uw.name
+                WHERE tr.id = ?1
+                  AND COALESCE(
+                    json_extract(s.value, '$.shell_command_working_directory'),
+                    json_extract(s.value, '$.working_directory')
+                  ) IS NOT NULL
+                LIMIT 1"#,
+                rusqlite::params![source_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten()
+            // Fallback: check agentic_steps if setup_steps had nothing
+            .or_else(|| {
+                conn.query_row(
+                    r#"SELECT COALESCE(
+                        json_extract(s.value, '$.shell_command_working_directory'),
+                        json_extract(s.value, '$.working_directory')
+                    )
+                    FROM unified_workflows uw, json_each(uw.agentic_steps) s
+                    INNER JOIN task_runs tr ON tr.workflow_name = uw.name
+                    WHERE tr.id = ?1
+                      AND COALESCE(
+                        json_extract(s.value, '$.shell_command_working_directory'),
+                        json_extract(s.value, '$.working_directory')
+                      ) IS NOT NULL
+                    LIMIT 1"#,
+                    rusqlite::params![source_id],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten()
+            });
+
+        Ok((wf_name, proj_path))
+    })?;
+
+    let reflection_id = uuid::Uuid::new_v4().to_string();
+    let reflection_name = format!("Project Reflection: {}", workflow_name);
+
+    info!(
+        "Launching project reflection {} for source run {} (workflow: {}, project: {:?})",
+        reflection_id, source_task_run_id, workflow_name, project_path
+    );
+
+    // Create the task run record
+    let input = crate::database::CreateTaskRunInput::new(&reflection_id, &reflection_name)
+        .with_prompt(format!(
+            "Learn about the project from the completed workflow run '{}'.",
+            workflow_name
+        ))
+        .with_workflow_name(&reflection_name)
+        .with_workflow_type("unified")
+        .with_task_type("reflection")
+        .with_max_sessions(2)
+        .with_auto_continue(true)
+        .with_is_reflection(true)
+        .with_reflection_source_task_run_id(&source_task_run_id)
+        .with_parent_task_run_id(&source_task_run_id);
+
+    db.create_task_run(&input)?;
+
+    // Build the project reflection workflow
+    let loop_config = super::workflow::build_project_reflection_config(
+        &reflection_id,
+        &reflection_name,
+        &workflow_name,
+        project_path.clone(),
+    );
+
+    let setup_steps =
+        super::workflow::build_project_setup_steps(&source_task_run_id, &workflow_name);
+    let verification_steps = super::workflow::build_project_verification_steps(&source_task_run_id);
+    let mut completion_steps = super::workflow::build_project_completion_steps(&workflow_name);
+    let completion_prompt_steps = completion_steps.split_off(1);
+    let completion_automation_steps = completion_steps;
+
+    // Build LoopController — same pattern as workflow reflection
+    let reflection_fix_ctx = crate::mcp::shared::ReflectionFixContext {
+        source_task_run_id: source_task_run_id.clone(),
+        reflection_task_run_id: reflection_id.clone(),
+        project_path,
+    };
+
+    let mut controller = crate::unified_workflow_executor::LoopController::new(
+        deps.app_state.clone(),
+        deps.config_storage.clone(),
+        deps.app_handle.clone(),
+        deps.pid_tracker.clone(),
+    )
+    .with_reflection_fix_ctx(reflection_fix_ctx);
+
+    if let Some(sm) = deps.session_manager {
+        controller = controller.with_session_manager(sm);
+    }
+
+    info!(
+        "Spawning project reflection '{}' (id: {}) with {} setup steps",
+        reflection_name,
+        reflection_id,
+        setup_steps.len()
+    );
+
+    let exec_id = reflection_id.clone();
+    let wf_name = reflection_name.clone();
+    let url_lock = Some(deps.app_state.url_lock_manager.clone());
+    crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
+        deps.app_state.checkpoint_db.clone(),
+        exec_id,
+        wf_name,
+        url_lock,
+        Box::pin(async move {
+            controller
+                .run(
+                    loop_config,
+                    setup_steps,
+                    Vec::new(),
+                    verification_steps,
+                    Vec::new(),
+                    completion_automation_steps,
+                    completion_prompt_steps,
+                )
+                .await
+        }),
+    );
+
+    info!(
+        "Project reflection '{}' spawned for source {}",
+        reflection_name, source_task_run_id
+    );
+
+    Ok(reflection_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +794,18 @@ mod tests {
                 category TEXT,
                 title TEXT,
                 detected_at TEXT
+            );
+            CREATE TABLE reflection_fixes (
+                id TEXT PRIMARY KEY,
+                reflection_task_run_id TEXT NOT NULL,
+                source_task_run_id TEXT,
+                fix_type TEXT NOT NULL,
+                fix_description TEXT NOT NULL,
+                confidence TEXT NOT NULL DEFAULT 'medium',
+                status TEXT DEFAULT 'applied',
+                reflection_scope TEXT DEFAULT 'workflow',
+                project_path TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             "#,
         )
@@ -695,5 +1049,126 @@ mod tests {
         // Still below threshold because the reflection run is excluded
         let source_id = format!("run-{}", CONVERGENCE_THRESHOLD - 2);
         assert!(!has_converged(&conn, &source_id).unwrap());
+    }
+
+    // --- Project convergence tests ---
+
+    fn insert_project_reflection_run(
+        conn: &Connection,
+        id: &str,
+        source_workflow: &str,
+        source_run_id: &str,
+        completed_at: &str,
+        project_fix_count: u32,
+    ) {
+        let reflection_name = format!("Project Reflection: {}", source_workflow);
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, reflection_source_task_run_id, completed_at, created_at, updated_at) \
+             VALUES (?1, 'Project Reflection', ?2, 'complete', 1, ?3, ?4, ?4, ?4)",
+            rusqlite::params![id, reflection_name, source_run_id, completed_at],
+        )
+        .unwrap();
+        for i in 0..project_fix_count {
+            conn.execute(
+                "INSERT INTO reflection_fixes (id, reflection_task_run_id, source_task_run_id, fix_type, fix_description, confidence, reflection_scope, created_at) \
+                 VALUES (?1, ?2, ?3, 'project_environment', 'test fix', 'high', 'project', ?4)",
+                rusqlite::params![format!("{}-pf{}", id, i), id, source_run_id, completed_at],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_has_project_converged_true_when_all_empty() {
+        let conn = setup_test_db();
+        let wf = "my-workflow";
+        insert_clean_run(&conn, "source-1", wf, "2025-01-01T00:00:00Z");
+
+        // Insert CONVERGENCE_THRESHOLD project reflection runs with zero fixes
+        for i in 0..CONVERGENCE_THRESHOLD {
+            insert_project_reflection_run(
+                &conn,
+                &format!("proj-ref-{}", i),
+                wf,
+                "source-1",
+                &format!("2025-01-01T{:02}:00:00Z", i + 1),
+                0, // zero fixes
+            );
+        }
+
+        assert!(has_project_converged(&conn, "source-1").unwrap());
+    }
+
+    #[test]
+    fn test_has_project_converged_false_below_threshold() {
+        let conn = setup_test_db();
+        let wf = "my-workflow";
+        insert_clean_run(&conn, "source-1", wf, "2025-01-01T00:00:00Z");
+
+        // Insert fewer than threshold project reflection runs
+        for i in 0..(CONVERGENCE_THRESHOLD - 1) {
+            insert_project_reflection_run(
+                &conn,
+                &format!("proj-ref-{}", i),
+                wf,
+                "source-1",
+                &format!("2025-01-01T{:02}:00:00Z", i + 1),
+                0,
+            );
+        }
+
+        assert!(!has_project_converged(&conn, "source-1").unwrap());
+    }
+
+    #[test]
+    fn test_has_project_converged_false_when_fixes_exist() {
+        let conn = setup_test_db();
+        let wf = "my-workflow";
+        insert_clean_run(&conn, "source-1", wf, "2025-01-01T00:00:00Z");
+
+        // Insert CONVERGENCE_THRESHOLD runs, but some have fixes
+        for i in 0..CONVERGENCE_THRESHOLD {
+            let fix_count = if i == 2 { 1 } else { 0 };
+            insert_project_reflection_run(
+                &conn,
+                &format!("proj-ref-{}", i),
+                wf,
+                "source-1",
+                &format!("2025-01-01T{:02}:00:00Z", i + 1),
+                fix_count,
+            );
+        }
+
+        assert!(!has_project_converged(&conn, "source-1").unwrap());
+    }
+
+    #[test]
+    fn test_has_project_converged_ignores_workflow_scoped_fixes() {
+        let conn = setup_test_db();
+        let wf = "my-workflow";
+        insert_clean_run(&conn, "source-1", wf, "2025-01-01T00:00:00Z");
+
+        // Insert CONVERGENCE_THRESHOLD project reflection runs with zero project fixes
+        for i in 0..CONVERGENCE_THRESHOLD {
+            let ref_id = format!("proj-ref-{}", i);
+            insert_project_reflection_run(
+                &conn,
+                &ref_id,
+                wf,
+                "source-1",
+                &format!("2025-01-01T{:02}:00:00Z", i + 1),
+                0,
+            );
+            // Add workflow-scoped fixes (should be ignored by project convergence)
+            conn.execute(
+                "INSERT INTO reflection_fixes (id, reflection_task_run_id, source_task_run_id, fix_type, fix_description, confidence, reflection_scope, created_at) \
+                 VALUES (?1, ?2, 'source-1', 'knowledge_base_update', 'workflow fix', 'high', 'workflow', ?3)",
+                rusqlite::params![format!("{}-wf", ref_id), ref_id, format!("2025-01-01T{:02}:00:00Z", i + 1)],
+            )
+            .unwrap();
+        }
+
+        // Should still converge — only project-scoped fixes count
+        assert!(has_project_converged(&conn, "source-1").unwrap());
     }
 }

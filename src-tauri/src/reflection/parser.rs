@@ -54,6 +54,10 @@ fn normalize_fix_type(s: &str) -> String {
         "tool_config_update" | "tool_config" => "tool_config_update".to_string(),
         "context_addition" | "context" => "context_addition".to_string(),
         "instruction_clarification" | "clarification" => "instruction_clarification".to_string(),
+        "project_environment" | "proj_env" => "project_environment".to_string(),
+        "project_architecture" | "proj_arch" => "project_architecture".to_string(),
+        "project_test_pattern" | "proj_test" => "project_test_pattern".to_string(),
+        "project_recurring_issue" | "proj_issue" => "project_recurring_issue".to_string(),
         other => other.to_string(),
     }
 }

@@ -44,6 +44,9 @@ pub fn build_reflection_config(
         cross_workflow_learning: true,
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
+        project_path: crate::mcp::shared::get_workspace_paths_internal()
+            .ok()
+            .map(|(root, _, _)| root.to_string_lossy().to_string()),
     }
 }
 
@@ -438,6 +441,280 @@ Fixes are deduplicated by content hash (fix_type + description + old_value + new
 If an identical fix already exists with status 'applied', the duplicate will be skipped.
 Only emit fixes for genuinely new insights — do NOT re-emit fixes from previous reflection runs."#
         .to_string()
+}
+
+// =============================================================================
+// Project Reflection Workflow
+// =============================================================================
+// Learns about the user's project/codebase — environment, architecture, test
+// patterns, recurring issues. Runs in both dev and production modes.
+
+/// Build the LoopConfig for a project reflection workflow.
+pub fn build_project_reflection_config(
+    execution_id: &str,
+    workflow_name: &str,
+    source_workflow_name: &str,
+    project_path: Option<String>,
+) -> LoopConfig {
+    LoopConfig {
+        max_iterations: 2, // Project reflection needs fewer iterations
+        base_prompt: build_project_agentic_prompt(source_workflow_name),
+        workflow_name: workflow_name.to_string(),
+        workflow_id: format!("project-reflection-{}", execution_id),
+        execution_id: execution_id.to_string(),
+        targeted_error_ids: Vec::new(),
+        starting_iteration: 0,
+        run_agentic_first: true,
+        artifact_dir: None,
+        is_dev_mode: false, // CRITICAL: Prevents cascade reflection
+        enable_sweep: false,
+        max_sweep_iterations: 5,
+        stages: Vec::new(),
+        stop_on_failure: false,
+        reflection_mode: true,
+        provider_override: None,
+        model_override: None,
+        model_overrides: std::collections::HashMap::new(),
+        stage_index: None,
+        max_sessions: Some(2),
+        auto_run_generated: false,
+        approval_gate: false,
+        max_context_tokens: 80_000,
+        cross_workflow_learning: false, // Not needed — project reflection IS the cross-project learner
+        verification_history: std::collections::HashMap::new(),
+        routing_context: Default::default(),
+        project_path,
+    }
+}
+
+/// Build setup steps for project reflection (loads source run data).
+pub fn build_project_setup_steps(
+    source_task_run_id: &str,
+    source_workflow_name: &str,
+) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url_from_env();
+
+    vec![
+        // Step 1: Load findings from source run
+        build_api_step(
+            "Load source findings",
+            "GET",
+            &format!("{}/findings/task/{}", base_url, source_task_run_id),
+            None,
+            Some("source_findings"),
+            true,
+        ),
+        // Step 2: Load knowledge from source run
+        build_api_step(
+            "Load source knowledge",
+            "GET",
+            &format!("{}/task-runs/{}/knowledge", base_url, source_task_run_id),
+            None,
+            Some("source_knowledge"),
+            true,
+        ),
+        // Step 3: Load AI conversation output
+        build_api_step(
+            "Load AI output",
+            "GET",
+            &format!(
+                "{}/task-runs/{}/output?tail_chars=30000",
+                base_url, source_task_run_id
+            ),
+            None,
+            Some("source_ai_output"),
+            true,
+        ),
+        // Step 4: Load workflow execution state
+        build_api_step(
+            "Load workflow state",
+            "GET",
+            &format!(
+                "{}/task-runs/{}/workflow-state",
+                base_url, source_task_run_id
+            ),
+            None,
+            Some("source_workflow_state"),
+            true,
+        ),
+        // Step 5: Load previous project-scoped fixes
+        build_api_step(
+            "Load previous project fixes",
+            "GET",
+            &format!(
+                "{}/reflection-fixes?workflow_name={}&status=applied",
+                base_url,
+                urlencoding::encode(source_workflow_name)
+            ),
+            None,
+            Some("previous_fixes"),
+            true,
+        ),
+    ]
+}
+
+/// Build verification steps for project reflection (simplified — safety check only).
+pub fn build_project_verification_steps(source_task_run_id: &str) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url_from_env();
+
+    vec![
+        // Single HTTP health check
+        {
+            let mut step = ExecutionStepConfig {
+                step_type: "command".to_string(),
+                command_mode: Some("check".to_string()),
+                name: Some("Verify source data accessible".to_string()),
+                check_type: Some("http_status".to_string()),
+                check_url: Some(format!(
+                    "{}/task-runs/{}/knowledge",
+                    base_url, source_task_run_id
+                )),
+                expected_status: Some(200),
+                ..Default::default()
+            };
+            step.phase = Some("verification".to_string());
+            step
+        },
+    ]
+}
+
+/// Build completion steps for project reflection.
+pub fn build_project_completion_steps(source_workflow_name: &str) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url_from_env();
+
+    vec![
+        // Step 1: Batch evaluate previous fixes
+        build_api_step(
+            "Evaluate fix effectiveness",
+            "POST",
+            &format!(
+                "{}/reflection/evaluate?workflow_name={}",
+                base_url,
+                urlencoding::encode(source_workflow_name)
+            ),
+            None,
+            Some("evaluation_results"),
+            false,
+        ),
+        // Step 2: AI summary
+        {
+            let mut step = build_prompt_step(
+                "Summarize project learnings",
+                r#"Summarize what was learned about this project:
+
+1. List the project knowledge entries you recorded (by category)
+2. Batch effectiveness results: {{evaluation_results}}
+3. Brief assessment: Are there important aspects of the project still not documented?
+
+Keep the summary concise — this is for internal tracking, not user display."#,
+            );
+            step.phase = Some("completion".to_string());
+            step
+        },
+    ]
+}
+
+/// Build the agentic prompt for project reflection.
+///
+/// Unlike workflow reflection which focuses on fixing workflow mechanics,
+/// project reflection focuses on learning about the user's project/codebase.
+fn build_project_agentic_prompt(source_workflow_name: &str) -> String {
+    format!(
+        r#"You are a project reflection agent analyzing the completed workflow run for "{}".
+
+Your goal is NOT to fix workflows — instead, you are learning about the **user's project**.
+Extract lasting knowledge about the project's environment, architecture, test patterns,
+and recurring issues. This knowledge will be injected into future workflows targeting
+the same project directory.
+
+## Tool Access
+
+You have full tool access (file read/write, bash, grep, etc.). Use it to explore the
+project directory when the AI output suggests the workflow struggled with something
+project-specific (e.g., "couldn't find the test runner", "wrong working directory").
+
+## Data Available
+
+The setup phase loaded the following data into runtime variables:
+- `{{{{source_findings}}}}` — Categorized findings from the workflow run
+- `{{{{source_knowledge}}}}` — Knowledge recorded during execution
+- `{{{{source_ai_output}}}}` — The complete AI conversation output (CRITICAL — read this end-to-end)
+- `{{{{source_workflow_state}}}}` — Workflow execution state
+- `{{{{previous_fixes}}}}` — Previous project reflection knowledge (for deduplication)
+
+## Recording Project Knowledge
+
+Use `[REFLECTION_FIX:...]` markers with the **project-scoped fix types**:
+
+### Fix Types
+
+| Type | Shortcut | Use for |
+|------|----------|---------|
+| `project_environment` | `proj_env` | Dependencies, env vars, runtime versions, required services |
+| `project_architecture` | `proj_arch` | Where tests live, routes location, framework patterns, build system |
+| `project_test_pattern` | `proj_test` | Test runner, fixture patterns, setup/teardown, docker requirements |
+| `project_recurring_issue` | `proj_issue` | Flaky areas, slow operations, known quirks, common failure modes |
+
+### Marker Format
+
+```
+[REFLECTION_FIX:project_environment:high]
+Description: Project uses pnpm (not npm). Package install commands must use `pnpm install`.
+[/REFLECTION_FIX]
+```
+
+**confidence** must be: `high`, `medium`, or `low`
+
+## Analysis Steps
+
+### Step 1: Read the AI Conversation Output (PRIMARY)
+Read `{{{{source_ai_output}}}}` end-to-end. Look for:
+
+1. **Environment requirements** the AI discovered or struggled with:
+   - Did the AI fail because a dependency wasn't installed?
+   - Did it use the wrong package manager, runtime version, or env var?
+   - Were specific services (database, redis, etc.) required?
+
+2. **Codebase structure** the AI had to figure out:
+   - Did the AI search extensively for files? Where did it find them?
+   - What framework patterns did it identify (e.g., "tests co-located with source")?
+   - What build system is used? How are things organized?
+
+3. **Test infrastructure** patterns:
+   - What test runner is used? What fixture/setup patterns exist?
+   - Are integration tests separate from unit tests? Do they need docker/services?
+   - Are there conftest.py files, jest.config, vitest.config, etc.?
+
+4. **Recurring friction points**:
+   - Did the same type of error happen multiple times?
+   - Were there flaky tests or timing-sensitive operations?
+   - Were there known workarounds the AI had to discover?
+
+### Step 2: Cross-reference with Findings
+Check `{{{{source_findings}}}}` and `{{{{source_knowledge}}}}` for project-specific patterns
+that the AI documented during execution.
+
+### Step 3: Explore the Project (if needed)
+If the AI output suggests the workflow struggled with project-specific issues,
+use file tools to explore the project directory and verify your observations.
+
+### Step 4: Record Project Knowledge
+For each observation, emit a `[REFLECTION_FIX:...]` marker. Only emit genuinely
+useful, project-specific knowledge. Do NOT emit:
+- Workflow mechanics fixes (those belong in workflow reflection)
+- Generic programming advice
+- Things already in the previous fixes list
+
+**Confidence guidelines:**
+- `high` — Clearly observed in the AI output, verified by exploration
+- `medium` — Inferred from the AI output, plausible but not directly confirmed
+- `low` — Speculative, based on limited evidence
+
+### Deduplication
+Fixes are deduplicated by content hash. Check `{{{{previous_fixes}}}}` before emitting.
+Only emit genuinely new insights — do NOT re-emit existing knowledge."#,
+        source_workflow_name
+    )
 }
 
 /// Helper: Build a command step that makes an HTTP request via curl.

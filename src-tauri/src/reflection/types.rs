@@ -72,6 +72,16 @@ pub enum FixType {
     ContextAddition,
     /// Clarified ambiguous instructions
     InstructionClarification,
+
+    // --- Project-scoped fix types (project reflection) ---
+    /// Environment requirements: deps, env vars, runtime versions, services
+    ProjectEnvironment,
+    /// Codebase structure: where tests live, framework patterns, build system
+    ProjectArchitecture,
+    /// Test infrastructure: runner, fixture patterns, setup/teardown
+    ProjectTestPattern,
+    /// Recurring friction: common failures, flaky areas, known quirks
+    ProjectRecurringIssue,
 }
 
 impl FixType {
@@ -83,6 +93,10 @@ impl FixType {
             Self::ToolConfigUpdate => "tool_config_update",
             Self::ContextAddition => "context_addition",
             Self::InstructionClarification => "instruction_clarification",
+            Self::ProjectEnvironment => "project_environment",
+            Self::ProjectArchitecture => "project_architecture",
+            Self::ProjectTestPattern => "project_test_pattern",
+            Self::ProjectRecurringIssue => "project_recurring_issue",
         }
     }
 
@@ -94,8 +108,23 @@ impl FixType {
             "tool_config_update" | "tool_config" => Some(Self::ToolConfigUpdate),
             "context_addition" | "context" => Some(Self::ContextAddition),
             "instruction_clarification" | "clarification" => Some(Self::InstructionClarification),
+            "project_environment" | "proj_env" => Some(Self::ProjectEnvironment),
+            "project_architecture" | "proj_arch" => Some(Self::ProjectArchitecture),
+            "project_test_pattern" | "proj_test" => Some(Self::ProjectTestPattern),
+            "project_recurring_issue" | "proj_issue" => Some(Self::ProjectRecurringIssue),
             _ => None,
         }
+    }
+
+    /// Returns true if this is a project-scoped fix type (from project reflection).
+    pub fn is_project_scoped(&self) -> bool {
+        matches!(
+            self,
+            Self::ProjectEnvironment
+                | Self::ProjectArchitecture
+                | Self::ProjectTestPattern
+                | Self::ProjectRecurringIssue
+        )
     }
 }
 

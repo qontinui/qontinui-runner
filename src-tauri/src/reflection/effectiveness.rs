@@ -256,7 +256,13 @@ fn evaluate_by_workflow_outcome(
 
     // For knowledge/context fixes: if subsequent runs are cleaner, mark effective
     match fix.fix_type.as_str() {
-        "knowledge_base_update" | "context_addition" | "instruction_clarification" => {
+        "knowledge_base_update"
+        | "context_addition"
+        | "instruction_clarification"
+        | "project_environment"
+        | "project_architecture"
+        | "project_test_pattern"
+        | "project_recurring_issue" => {
             if source_findings == 0 && total_subsequent_findings == 0 {
                 // Source had no findings either — fix may be preventive, mark effective
                 // if subsequent runs succeeded

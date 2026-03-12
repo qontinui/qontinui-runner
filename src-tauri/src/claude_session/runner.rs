@@ -1038,6 +1038,22 @@ fn run_claude_session_inline(
                     match reflection_storage::insert_fix(&conn, &input) {
                         Ok(fix) => {
                             fix_count += 1;
+
+                            // Mark project-scoped fix types with reflection_scope and project_path
+                            let is_project_fix = matches!(
+                                fix.fix_type.as_str(),
+                                "project_environment"
+                                    | "project_architecture"
+                                    | "project_test_pattern"
+                                    | "project_recurring_issue"
+                            );
+                            if is_project_fix {
+                                let _ = conn.execute(
+                                    "UPDATE reflection_fixes SET reflection_scope = 'project', project_path = ?1 WHERE id = ?2",
+                                    rusqlite::params![ctx.project_path, fix.id],
+                                );
+                            }
+
                             let msg = format!(
                                 "Reflection fix recorded: [{}:{}] {}",
                                 fix.fix_type, fix.confidence, fix.fix_description
@@ -1068,10 +1084,68 @@ fn run_claude_session_inline(
                                     | ("context_addition", "high")
                                     | ("instruction_clarification", "high")
                                     | ("workflow_step_rewrite", "high")
+                                    | ("project_environment", "high" | "medium")
+                                    | ("project_architecture", "high" | "medium")
+                                    | ("project_test_pattern", "high" | "medium")
+                                    | ("project_recurring_issue", "high" | "medium")
                             );
 
                             if should_auto_apply {
                                 match fix.fix_type.as_str() {
+                                    // Project-scoped fix types — create knowledge with project_path
+                                    "project_environment"
+                                    | "project_architecture"
+                                    | "project_test_pattern"
+                                    | "project_recurring_issue" => {
+                                        let category = fix.fix_type.as_str();
+                                        let related_files: Vec<String> =
+                                            fix.file_changed.iter().cloned().collect();
+
+                                        match db.create_task_knowledge(
+                                            &ctx.source_task_run_id,
+                                            category,
+                                            "reflection",
+                                            1,
+                                            &fix.fix_description,
+                                            fix.file_changed.as_deref(),
+                                            &fix.confidence,
+                                            &related_files,
+                                        ) {
+                                            Ok(knowledge) => {
+                                                // Set project_path on the knowledge entry
+                                                if let Some(ref pp) = ctx.project_path {
+                                                    let _ = conn.execute(
+                                                        "UPDATE task_knowledge SET project_path = ?1 WHERE id = ?2",
+                                                        rusqlite::params![pp, knowledge.id],
+                                                    );
+                                                }
+
+                                                info!(
+                                                    "Auto-applied project fix as knowledge: {} (category={}, project={:?})",
+                                                    knowledge.id, category, ctx.project_path
+                                                );
+                                                let auto_msg = format!(
+                                                    "Auto-applied project fix as {} knowledge: {}",
+                                                    category, fix.fix_description
+                                                );
+                                                let _ = std::panic::catch_unwind(
+                                                    std::panic::AssertUnwindSafe(|| {
+                                                        emit_ai_output(
+                                                            &app_handle_reflection,
+                                                            &auto_msg,
+                                                            "reflection_auto_apply",
+                                                            None,
+                                                            session_ctx_for_reflection.as_ref(),
+                                                        );
+                                                    }),
+                                                );
+                                            }
+                                            Err(e) => warn!(
+                                                "Failed to auto-apply project fix as knowledge: {}",
+                                                e
+                                            ),
+                                        }
+                                    }
                                     "knowledge_base_update" | "context_addition" => {
                                         // Create task knowledge entry (existing behavior)
                                         let category = match fix.fix_type.as_str() {

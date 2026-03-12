@@ -169,6 +169,8 @@ pub struct ReflectionFixContext {
     pub source_task_run_id: String,
     /// The reflection workflow's own task run ID
     pub reflection_task_run_id: String,
+    /// Project/workspace path (set by project reflection trigger)
+    pub project_path: Option<String>,
 }
 
 /// Emit AI output event to frontend and persist to file.
