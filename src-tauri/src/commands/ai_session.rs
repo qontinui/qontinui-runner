@@ -318,12 +318,15 @@ pub async fn create_ai_session(
         });
     }
 
-    // 2. Spawn session setup in background
+    // 2. Spawn and wait for session to be ready.
+    // ClaudeSession::spawn blocks until the CLI completes its init handshake,
+    // so the session is Ready when this returns. This prevents a race condition
+    // where sendMessage is called before the session is registered.
     let sm = session_manager.inner().clone();
     let handle = app_handle.clone();
     let trid = task_run_id.clone();
     let name_for_ctx = name.clone();
-    tokio::spawn(async move {
+    let spawn_result = tokio::task::spawn_blocking(move || {
         let working_dir = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
@@ -347,7 +350,7 @@ pub async fn create_ai_session(
 
                 if let Err(e) = sm.register(&trid, session.clone()) {
                     warn!("Failed to register AI session: {}", e);
-                    return;
+                    return Err(format!("Failed to register AI session: {}", e));
                 }
 
                 // Emit ready state — session is ready for the user's first message.
@@ -356,22 +359,37 @@ pub async fn create_ai_session(
                 emit_session_state(&handle, &trid, &trid, session.state());
 
                 info!("AI session ready: task_run_id={}", trid);
+                Ok(())
             }
             Err(e) => {
                 warn!("Failed to spawn AI session: {}", e);
+                Err(e)
             }
         }
-    });
-
-    // 3. Return immediately with task_run_id
-    Ok(CommandResponse {
-        success: true,
-        message: Some("AI session creating".to_string()),
-        data: Some(serde_json::json!({
-            "task_run_id": task_run_id,
-            "state": "initializing",
-        })),
     })
+    .await;
+
+    // 3. Return result
+    match spawn_result {
+        Ok(Ok(())) => Ok(CommandResponse {
+            success: true,
+            message: Some("AI session ready".to_string()),
+            data: Some(serde_json::json!({
+                "task_run_id": task_run_id,
+                "state": "ready",
+            })),
+        }),
+        Ok(Err(e)) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to create AI session: {}", e)),
+            data: None,
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Task failed: {}", e)),
+            data: None,
+        }),
+    }
 }
 
 /// Close an AI session.

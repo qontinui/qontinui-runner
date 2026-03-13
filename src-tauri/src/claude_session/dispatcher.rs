@@ -99,6 +99,16 @@ pub fn dispatch_line(
         }));
     }
 
+    // Also extract tool activity from content_block_start messages.
+    // In stream-json mode, tool_use blocks arrive as content_block_start events
+    // before (or instead of) full assistant messages with tool_use content blocks.
+    if let Some((tool_name, data)) = msg.extract_tool_use_from_block_start() {
+        let activity = format_tool_activity(&tool_name, &data);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            emit_ai_output(app_handle, &activity, "tool_activity", None, session_ctx);
+        }));
+    }
+
     // Handle control requests from CLI (auto-approve tool use in bypass mode)
     if let Some(ctrl_req) = msg.as_control_request() {
         // Emit tool activity event so the frontend can show what the AI is doing

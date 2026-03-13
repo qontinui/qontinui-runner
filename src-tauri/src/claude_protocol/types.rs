@@ -434,4 +434,31 @@ impl ClaudeOutputMessage {
             _ => None,
         }
     }
+
+    /// Extract tool_use info from a content_block_start message.
+    /// In stream-json mode, tool use is signaled via content_block_start
+    /// before the full assistant message arrives.
+    /// Returns (tool_name, input_object) if this is a tool_use block start.
+    pub fn extract_tool_use_from_block_start(
+        &self,
+    ) -> Option<(String, serde_json::Map<String, serde_json::Value>)> {
+        match self {
+            ClaudeOutputMessage::ContentBlockStart(msg) => {
+                let block = msg.content_block.as_ref()?;
+                let obj = block.as_object()?;
+                let block_type = obj.get("type")?.as_str()?;
+                if block_type != "tool_use" {
+                    return None;
+                }
+                let name = obj.get("name")?.as_str()?.to_string();
+                let input = obj
+                    .get("input")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                Some((name, input))
+            }
+            _ => None,
+        }
+    }
 }

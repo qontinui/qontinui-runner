@@ -329,8 +329,9 @@ export function useAiSession() {
         const newId = response.data.task_run_id as string;
         setTaskRunId(newId);
         taskRunIdRef.current = newId; // Sync ref immediately so sendMessage works right after
-        setSessionState("initializing");
-        sessionStateRef.current = "initializing";
+        const state = (response.data.state as AiSessionState) || "ready";
+        setSessionState(state);
+        sessionStateRef.current = state;
         setMessages([]);
         streamingBufferRef.current = "";
         setStreamingContent("");
