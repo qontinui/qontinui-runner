@@ -12,10 +12,14 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Json},
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        IntoResponse, Json,
+    },
     routing::{get, post},
     Router,
 };
+use futures_util::{stream::Stream, StreamExt};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -98,6 +102,8 @@ struct SdkStatusResponse {
     connected_at: Option<i64>,
     /// All active connections (not just the active one)
     all_connections: Vec<ConnectionInfo>,
+    /// Whether the active SDK app is responsive (based on heartbeat freshness)
+    healthy: Option<bool>,
 }
 
 /// Information about a single connection in the manager
@@ -478,6 +484,23 @@ async fn handle_status(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<S
         })
         .collect();
 
+    // Check health via the SDK app's /health endpoint (quick, non-blocking)
+    let healthy = if let Some(conn) = manager.active_connection() {
+        let health_url = format!("{}{}/health", conn.app_url, conn.base_path);
+        match conn.client.get(&health_url).timeout(std::time::Duration::from_secs(2)).send().await {
+            Ok(resp) => {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    json.get("healthy").and_then(|v| v.as_bool())
+                } else {
+                    Some(true) // Health endpoint responded but no "healthy" field — assume ok
+                }
+            }
+            Err(_) => Some(false),
+        }
+    } else {
+        None
+    };
+
     match manager.active_connection() {
         Some(conn) => Json(ApiResponse::success(SdkStatusResponse {
             connected: true,
@@ -485,6 +508,7 @@ async fn handle_status(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<S
             url: Some(conn.app_url.clone()),
             connected_at: Some(conn.connected_at),
             all_connections,
+            healthy,
         })),
         None => Json(ApiResponse::success(SdkStatusResponse {
             connected: false,
@@ -492,6 +516,7 @@ async fn handle_status(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<S
             url: None,
             connected_at: None,
             all_connections,
+            healthy: None,
         })),
     }
 }
@@ -499,6 +524,33 @@ async fn handle_status(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<S
 /// GET /ui-bridge/sdk/health — Proxy health check to SDK app
 async fn handle_health(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/health", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/capabilities — Get SDK app capabilities
+async fn handle_capabilities(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/capabilities", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/heartbeat — Forward heartbeat to SDK app
+async fn handle_heartbeat(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/heartbeat",
+        Some(serde_json::json!({ "timestamp": now })),
+    )
+    .await
+    {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -2043,6 +2095,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/check-health", get(handle_check_health))
         // Health
         .route("/ui-bridge/sdk/health", get(handle_health))
+        .route("/ui-bridge/sdk/capabilities", get(handle_capabilities))
         // Elements
         .route("/ui-bridge/sdk/elements", get(handle_elements))
         .route("/ui-bridge/sdk/element/:id", get(handle_element))
@@ -2269,6 +2322,287 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/undo-state", get(handle_undo_state))
         .route("/ui-bridge/sdk/undo", post(handle_undo))
         .route("/ui-bridge/sdk/redo", post(handle_redo))
+        // SSE event stream
+        .route(
+            "/ui-bridge/sdk/events/stream",
+            get(handle_sse_event_stream),
+        )
+        // =====================================================================
+        // /control/-prefixed aliases (canonical SDK paths for path consistency)
+        // =====================================================================
+        .route("/ui-bridge/sdk/control/elements", get(handle_elements))
+        .route("/ui-bridge/sdk/control/element/:id", get(handle_element))
+        .route(
+            "/ui-bridge/sdk/control/element/:id/action",
+            post(handle_element_action),
+        )
+        .route("/ui-bridge/sdk/control/components", get(handle_components))
+        .route("/ui-bridge/sdk/control/component/:id", get(handle_component))
+        .route("/ui-bridge/sdk/control/find", post(handle_discover))
+        .route("/ui-bridge/sdk/control/discover", post(handle_discover))
+        .route("/ui-bridge/sdk/control/snapshot", get(handle_snapshot))
+        .route(
+            "/ui-bridge/sdk/control/console-errors",
+            get(handle_console_errors),
+        )
+        .route(
+            "/ui-bridge/sdk/control/console-errors/clear",
+            post(handle_clear_console_errors),
+        )
+        .route("/ui-bridge/sdk/control/forms", get(handle_forms))
+        .route("/ui-bridge/sdk/control/fill", post(handle_fill_form))
+        .route(
+            "/ui-bridge/sdk/control/forms/snapshot",
+            post(handle_snapshot_forms),
+        )
+        .route("/ui-bridge/sdk/control/forms/diff", post(handle_diff_forms))
+        .route(
+            "/ui-bridge/sdk/control/clipboard",
+            get(handle_clipboard_read).post(handle_clipboard_write),
+        )
+        .route(
+            "/ui-bridge/sdk/control/network-requests",
+            get(handle_network_requests),
+        )
+        .route(
+            "/ui-bridge/sdk/control/network-requests/in-flight",
+            get(handle_network_requests_in_flight),
+        )
+        .route(
+            "/ui-bridge/sdk/control/network-requests/wait",
+            post(handle_wait_for_network_request),
+        )
+        .route(
+            "/ui-bridge/sdk/control/network-request/:id",
+            get(handle_network_request),
+        )
+        .route(
+            "/ui-bridge/sdk/control/idle-status",
+            get(handle_idle_status),
+        )
+        .route(
+            "/ui-bridge/sdk/control/idle-status/:signal",
+            get(handle_idle_status_signal),
+        )
+        .route(
+            "/ui-bridge/sdk/control/wait-for-idle",
+            post(handle_wait_for_idle),
+        )
+        .route(
+            "/ui-bridge/sdk/control/wait-for-idle/:signal",
+            post(handle_wait_for_signal),
+        )
+        .route(
+            "/ui-bridge/sdk/control/wait-for-targets",
+            post(handle_wait_for_targets),
+        )
+        .route(
+            "/ui-bridge/sdk/control/page/refresh",
+            post(handle_page_refresh),
+        )
+        .route(
+            "/ui-bridge/sdk/control/page/navigate",
+            post(handle_page_navigate),
+        )
+        .route(
+            "/ui-bridge/sdk/control/page/back",
+            post(handle_page_go_back),
+        )
+        .route(
+            "/ui-bridge/sdk/control/page/forward",
+            post(handle_page_go_forward),
+        )
+        .route(
+            "/ui-bridge/sdk/control/browser-events",
+            get(handle_console_browser_events),
+        )
+        .route(
+            "/ui-bridge/sdk/control/timeline",
+            get(handle_console_timeline),
+        )
+        .route("/ui-bridge/sdk/control/health", get(handle_console_health))
+        .route(
+            "/ui-bridge/sdk/control/network-chains",
+            get(handle_console_network_chains),
+        )
+        .route(
+            "/ui-bridge/sdk/control/error-sessions/start",
+            post(handle_console_error_session_start),
+        )
+        .route(
+            "/ui-bridge/sdk/control/error-sessions/end",
+            post(handle_console_error_session_end),
+        )
+        .route(
+            "/ui-bridge/sdk/control/error-sessions",
+            get(handle_console_error_sessions_list),
+        )
+        .route(
+            "/ui-bridge/sdk/control/error-baselines/capture",
+            post(handle_console_error_baseline_capture),
+        )
+        .route(
+            "/ui-bridge/sdk/control/error-baselines/compare",
+            post(handle_console_error_baseline_compare),
+        )
+        .route(
+            "/ui-bridge/sdk/control/undo-state",
+            get(handle_undo_state),
+        )
+        .route("/ui-bridge/sdk/control/undo", post(handle_undo))
+        .route("/ui-bridge/sdk/control/redo", post(handle_redo))
+        .route(
+            "/ui-bridge/sdk/control/events/stream",
+            get(handle_sse_event_stream),
+        )
+        // Heartbeat
+        .route("/ui-bridge/sdk/heartbeat", post(handle_heartbeat))
+}
+
+// =============================================================================
+// SSE Event Stream Proxy
+// =============================================================================
+
+/// Query params for SSE stream
+#[derive(Debug, Deserialize)]
+struct SseStreamQuery {
+    /// Comma-separated event types to filter
+    #[serde(default)]
+    types: Option<String>,
+    /// Comma-separated element IDs to filter
+    #[serde(default)]
+    elements: Option<String>,
+}
+
+/// GET /ui-bridge/sdk/events/stream — SSE proxy to the SDK app's event stream
+///
+/// Connects to the SDK app's SSE endpoint and forwards events to the caller.
+async fn handle_sse_event_stream(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<SseStreamQuery>,
+) -> Sse<impl Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
+    let stream = async_stream::stream! {
+        // Build the SSE URL for the SDK app
+        let sdk_url = {
+            let conn_guard = state.sdk_connection.lock().await;
+            conn_guard.active_connection().map(|conn| {
+                let mut url = format!("{}{}/control/events/stream", conn.app_url, conn.base_path);
+                let mut sep = '?';
+                if let Some(ref types) = query.types {
+                    url.push_str(&format!("{}types={}", sep, types));
+                    sep = '&';
+                }
+                if let Some(ref elements) = query.elements {
+                    url.push_str(&format!("{}elements={}", sep, elements));
+                }
+                (url, conn.client.clone())
+            })
+        };
+
+        match sdk_url {
+            Some((url, client)) => {
+                debug!(url = %url, "Connecting to SDK SSE stream");
+
+                match client.get(&url).send().await {
+                    Ok(response) => {
+                        let mut byte_stream = response.bytes_stream();
+                        let mut buffer = String::new();
+
+                        while let Some(chunk_result) = byte_stream.next().await {
+                            match chunk_result {
+                                Ok(bytes) => {
+                                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                                    // Parse complete SSE events from buffer
+                                    while let Some(end) = buffer.find("\n\n") {
+                                        let event_block = buffer[..end].to_string();
+                                        buffer = buffer[end + 2..].to_string();
+
+                                        // Parse SSE fields
+                                        let mut event_type = String::new();
+                                        let mut data = String::new();
+                                        let mut id = String::new();
+
+                                        for line in event_block.lines() {
+                                            if let Some(val) = line.strip_prefix("event: ") {
+                                                event_type = val.to_string();
+                                            } else if let Some(val) = line.strip_prefix("data: ") {
+                                                data = val.to_string();
+                                            } else if let Some(val) = line.strip_prefix("id: ") {
+                                                id = val.to_string();
+                                            }
+                                        }
+
+                                        if !data.is_empty() {
+                                            let mut event = SseEvent::default().data(data);
+                                            if !event_type.is_empty() {
+                                                event = event.event(event_type);
+                                            }
+                                            if !id.is_empty() {
+                                                event = event.id(id);
+                                            }
+                                            yield Ok(event);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("SSE stream error: {}", e);
+                                    yield Ok(SseEvent::default()
+                                        .event("error")
+                                        .data(format!(r#"{{"error":"Stream error: {}"}}"#, e)));
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Flush any remaining complete events in the buffer
+                        while let Some(end) = buffer.find("\n\n") {
+                            let event_block = buffer[..end].to_string();
+                            buffer = buffer[end + 2..].to_string();
+
+                            let mut event_type = String::new();
+                            let mut data = String::new();
+                            let mut id = String::new();
+
+                            for line in event_block.lines() {
+                                if let Some(val) = line.strip_prefix("event: ") {
+                                    event_type = val.to_string();
+                                } else if let Some(val) = line.strip_prefix("data: ") {
+                                    data = val.to_string();
+                                } else if let Some(val) = line.strip_prefix("id: ") {
+                                    id = val.to_string();
+                                }
+                            }
+
+                            if !data.is_empty() {
+                                let mut event = SseEvent::default().data(data);
+                                if !event_type.is_empty() {
+                                    event = event.event(event_type);
+                                }
+                                if !id.is_empty() {
+                                    event = event.id(id);
+                                }
+                                yield Ok(event);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to connect to SDK SSE: {}", e);
+                        yield Ok(SseEvent::default()
+                            .event("error")
+                            .data(format!(r#"{{"error":"Failed to connect: {}"}}"#, e)));
+                    }
+                }
+            }
+            None => {
+                yield Ok(SseEvent::default()
+                    .event("error")
+                    .data(r#"{"error":"No active SDK app connection"}"#));
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 #[cfg(test)]
