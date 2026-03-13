@@ -1148,9 +1148,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Load configs from settings and register them
                 let mut configs = settings::get_managed_process_configs();
 
-                // In dev-mode, inject default dev services for missing ports
+                // In dev-mode, upgrade legacy configs and inject missing dev services
                 if dev_services::is_dev_mode() {
                     if let Some(workspace) = dev_services::find_workspace_root() {
+                        // Upgrade existing configs that match dev service ports but lack auto_start
+                        dev_services::upgrade_legacy_configs(&mut configs, &workspace);
+
+                        // Inject any dev services not yet covered
                         let missing = dev_services::get_missing_dev_services(&workspace, &configs);
                         if !missing.is_empty() {
                             info!(

@@ -186,11 +186,12 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
     services
 }
 
-/// Check if any existing managed processes already cover a given health port.
-pub fn port_already_configured(existing: &[ProcessConfig], port: u16) -> bool {
+/// Check if any existing managed processes already cover a given health port
+/// with auto_start enabled (i.e., they will actually start).
+fn port_has_auto_start(existing: &[ProcessConfig], port: u16) -> bool {
     existing
         .iter()
-        .any(|p| p.health_port == Some(port) && p.enabled)
+        .any(|p| p.health_port == Some(port) && p.enabled && p.auto_start)
 }
 
 /// Get dev services that are not already covered by user-configured processes.
@@ -204,13 +205,41 @@ pub fn get_missing_dev_services(
         .into_iter()
         .filter(|svc| {
             if let Some(port) = svc.health_port {
-                !port_already_configured(existing, port)
+                // Only skip if an existing config for this port already has auto_start
+                !port_has_auto_start(existing, port)
             } else {
                 // No health port — check by dev service ID
                 !existing.iter().any(|p| p.id == svc.id)
             }
         })
         .collect()
+}
+
+/// Upgrade existing configs that match dev service ports but lack auto_start.
+///
+/// When a user has a legacy config for a dev service port (e.g., port 8000)
+/// with `auto_start: false`, upgrade it to enable auto-start with proper
+/// `start_group` and `dev_only` fields. This preserves the user's custom
+/// command/args/env while enabling the auto-start behavior.
+pub fn upgrade_legacy_configs(configs: &mut [ProcessConfig], workspace: &Path) {
+    let defaults = get_default_dev_services(workspace);
+
+    for config in configs.iter_mut() {
+        if !config.auto_start && config.enabled {
+            if let Some(port) = config.health_port {
+                // Find matching dev service default by port
+                if let Some(dev_default) = defaults.iter().find(|d| d.health_port == Some(port)) {
+                    info!(
+                        "Dev-mode: upgrading legacy config '{}' (port {}) with auto_start, start_group={}, dev_only=true",
+                        config.name, port, dev_default.start_group
+                    );
+                    config.auto_start = true;
+                    config.start_group = dev_default.start_group;
+                    config.dev_only = true;
+                }
+            }
+        }
+    }
 }
 
 /// Check if the current environment is development mode.
