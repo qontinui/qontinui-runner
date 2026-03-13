@@ -84,6 +84,7 @@ function MessageBubble({
             {specActions.map((action, i) => (
               <button
                 key={i}
+                data-ui-id={`spec-chat-apply-${action.kind}`}
                 onClick={action.onApply}
                 className="w-full flex items-center gap-1.5 px-2 py-1 text-[10px] font-medium rounded
                   bg-green-500/10 text-green-400 border border-green-500/20
@@ -451,6 +452,7 @@ export function SpecChatPanel({
               }`}
             />
             <button
+              data-ui-id="spec-chat-new-session"
               onClick={() => {
                 session.close();
                 session.resetSession();
@@ -480,12 +482,14 @@ export function SpecChatPanel({
             {/* Mode toggle: review vs create */}
             <div className="flex items-center gap-1 text-[10px]">
               <button
+                data-ui-id="spec-chat-mode-review"
                 onClick={() => setShowCreateActions(false)}
                 className={`px-2 py-0.5 rounded ${!showCreateActions ? "bg-purple-500/20 text-purple-400" : "text-muted-foreground/50 hover:text-muted-foreground"}`}
               >
                 Review
               </button>
               <button
+                data-ui-id="spec-chat-mode-create"
                 onClick={() => setShowCreateActions(true)}
                 className={`px-2 py-0.5 rounded ${showCreateActions ? "bg-green-500/20 text-green-400" : "text-muted-foreground/50 hover:text-muted-foreground"}`}
               >
@@ -515,6 +519,7 @@ export function SpecChatPanel({
                 {/* Regenerate & merge for page specs */}
                 {selectedSpec.kind === "page-spec" && (
                   <button
+                    data-ui-id="spec-chat-regenerate"
                     onClick={() => {
                       setPendingCreateType("page-spec");
                       setTargetSpecId(selectedSpec.specId);
@@ -536,6 +541,7 @@ export function SpecChatPanel({
                 {/* Build workflow button for page specs */}
                 {selectedSpec.kind === "page-spec" && (
                   <button
+                    data-ui-id="spec-chat-build-workflow"
                     onClick={handleBuildWorkflow}
                     className="w-full flex items-center gap-1.5 px-2 py-1.5 text-[10px] text-orange-400/70 rounded
                       bg-orange-500/5 border border-orange-500/10 hover:bg-orange-500/10 hover:text-orange-400
@@ -636,6 +642,7 @@ export function SpecChatPanel({
       <div className="px-3 py-2 border-t border-border">
         <div className="flex gap-1.5">
           <textarea
+            data-ui-id="spec-chat-input"
             ref={textareaRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -661,6 +668,7 @@ export function SpecChatPanel({
             onInput={resizeTextarea}
           />
           <button
+            data-ui-id="spec-chat-send"
             onClick={isProcessing ? session.interrupt : handleSend}
             disabled={!isProcessing && (!input.trim() || !canSend)}
             className="shrink-0 w-7 h-7 flex items-center justify-center rounded

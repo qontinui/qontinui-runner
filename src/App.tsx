@@ -113,6 +113,7 @@ import {
   useBackgroundActivities,
   UIBridgeEventHandler,
   SpecExecutionHandler,
+  useRenderPerformance,
 } from "./hooks";
 import { useGlobalLogSources } from "./hooks/useGlobalLogSources";
 
@@ -175,7 +176,7 @@ import { GeneratorEvalPage } from "./pages/GeneratorEvalPage";
 import { SpecsPage } from "./pages/specs/SpecsPage";
 import { UIBridgeIntegrationPage } from "./pages/ui-bridge-integration/UIBridgeIntegrationPage";
 import { TerminalPage } from "./components/terminal";
-import { StateMachineBuilderPage } from "./pages/state-machine";
+import { UIBridgeStateMachinePage } from "./pages/state-machine";
 
 // Development tools
 import { PerformanceOverlay } from "./components/dev";
@@ -502,9 +503,9 @@ function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
       terminal: { name: "Terminal", section: "tools", breadcrumb: ["Tools", "Terminal"] },
       specs: { name: "Specs", section: "tools", breadcrumb: ["Tools", "Specs"] },
       "state-machine": {
-        name: "State Machine Builder",
+        name: "UI Bridge State Machine",
         section: "tools",
-        breadcrumb: ["Tools", "State Machine Builder"],
+        breadcrumb: ["Tools", "UI Bridge State Machine"],
       },
       "generator-eval": {
         name: "Generator Eval",
@@ -547,6 +548,9 @@ function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
  * Main app content (inside providers)
  */
 function AppContent() {
+  // Performance profiling (dev mode only)
+  const { ProfilerWrapper } = useRenderPerformance({ componentName: 'AppContent' });
+
   // Auth state from context
   const auth = useAuth();
 
@@ -1450,7 +1454,7 @@ function AppContent() {
       case "state-machine":
         return (
           <div className="h-full overflow-hidden">
-            <StateMachineBuilderPage />
+            <UIBridgeStateMachinePage />
           </div>
         );
 
@@ -1720,7 +1724,8 @@ function AppContent() {
   };
 
   return (
-    <RenderLogWrapper
+    <ProfilerWrapper>
+      <RenderLogWrapper
       activeTab={activeTab}
       taskRunId={lastRunId}
       enableOnMount={true}
@@ -1833,7 +1838,8 @@ function AppContent() {
         {/* Performance Overlay (dev mode only, toggle with Ctrl+Shift+P) */}
         <PerformanceOverlay position="bottom-right" />
       </div>
-    </RenderLogWrapper>
+      </RenderLogWrapper>
+    </ProfilerWrapper>
   );
 }
 

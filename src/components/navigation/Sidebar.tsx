@@ -88,6 +88,7 @@ import {
   Workflow,
   Cpu,
   Plug,
+  Network,
 } from "lucide-react";
 
 // Import shared navigation structure and state management
@@ -171,6 +172,7 @@ const ICON_MAP: Record<IconName, LucideIcon> = {
   Server,
   Workflow,
   Cpu,
+  Network,
 };
 
 function getIconComponent(iconName: IconName): LucideIcon {

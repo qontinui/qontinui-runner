@@ -6,12 +6,13 @@
  * Uses virtual scrolling for large action lists (100+ items) to maintain performance.
  */
 
-import { useCallback, type CSSProperties } from "react";
+import { useCallback, useEffect, type CSSProperties } from "react";
 import { CheckCircle2, XCircle, Loader2, ChevronRight } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { Badge, ScrollArea, FixedVirtualList } from "../ui";
 import type { ActionStreamProps, ActionItem, ActionType, ActionStatus } from "./types";
 import { getStatusColors, getAccentColors } from "@/design-system";
+import { useVirtualScrollMetrics } from "../../hooks";
 
 /** Threshold for switching to virtual scrolling */
 const VIRTUAL_SCROLL_THRESHOLD = 100;
@@ -100,8 +101,19 @@ function ActionRow({ action, isActive }: { action: ActionItem; isActive: boolean
 }
 
 export function ActionStream({ actions, currentAction: _currentAction }: ActionStreamProps) {
+  // Virtual scroll metrics tracking (dev mode only)
+  const { updateItemCounts, recordScrollFrame } = useVirtualScrollMetrics();
+
   // Use virtual scrolling for large lists
   const useVirtualScroll = actions.length > VIRTUAL_SCROLL_THRESHOLD;
+
+  // Report item counts when action list changes
+  useEffect(() => {
+    const visibleItems = useVirtualScroll
+      ? Math.min(actions.length, Math.ceil(400 / ACTION_ROW_HEIGHT))
+      : actions.length;
+    updateItemCounts(visibleItems, actions.length);
+  }, [actions.length, useVirtualScroll, updateItemCounts]);
 
   // Render function for virtualized items
   const renderVirtualItem = useCallback(

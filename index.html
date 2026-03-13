@@ -34,5 +34,29 @@
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      // Auto-reload if React fails to mount (e.g., webview loads before assets are ready).
+      // Only retry once to avoid infinite reload loops.
+      (function () {
+        var key = "__qontinui_boot_retry";
+        var alreadyRetried = sessionStorage.getItem(key);
+
+        setTimeout(function () {
+          var root = document.getElementById("root");
+          if (root && root.childElementCount === 0) {
+            if (!alreadyRetried) {
+              console.warn("[BOOT] React did not mount within 4s — reloading page");
+              sessionStorage.setItem(key, "1");
+              window.location.reload();
+            } else {
+              console.error("[BOOT] React failed to mount after retry — check console for errors");
+            }
+          } else {
+            // Mounted successfully — clear the retry flag for next cold start
+            sessionStorage.removeItem(key);
+          }
+        }, 4000);
+      })();
+    </script>
   </body>
 </html>

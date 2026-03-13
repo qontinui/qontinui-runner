@@ -87,6 +87,7 @@ function TreeNode({
   return (
     <div>
       <button
+        data-ui-id={`spec-tree-${node.specId || node.id}`}
         onClick={() => {
           if (hasChildren) onToggle(node.id);
           onSelect(node);

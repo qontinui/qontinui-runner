@@ -6,6 +6,7 @@ import { CanvasAddon } from "@xterm/addon-canvas";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { useUIBridgeOptional } from "ui-bridge";
 import "@xterm/xterm/css/xterm.css";
 
 export interface TerminalInstanceHandle {
@@ -91,6 +92,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     },
     ref,
   ) {
+    const uiBridge = useUIBridgeOptional();
     const containerRef = useRef<HTMLDivElement>(null);
     const termRef = useRef<Terminal | null>(null);
     const fitAddonRef = useRef<FitAddon | null>(null);
@@ -301,6 +303,78 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         return true;
       });
 
+      // Block native paste events from reaching xterm.js — we handle paste
+      // manually in the custom key handler above.  Without this, WebView2
+      // fires a native "paste" event that xterm processes via onData(),
+      // causing the pasted text to be written to the PTY a second time.
+      const xtermTextarea = containerRef.current.querySelector(
+        ".xterm-helper-textarea",
+      ) as HTMLTextAreaElement | null;
+      const blockNativePaste = (e: Event) => {
+        e.preventDefault();
+        e.stopPropagation();
+      };
+      xtermTextarea?.addEventListener("paste", blockNativePaste, true);
+
+      // Register xterm textarea with UI Bridge for external automation.
+      // This gives the element a stable ID (terminal-input-{terminalId}) and
+      // custom actions for writing to the PTY and reading the scrollback.
+      const bridgeRegistry = uiBridge?.registry;
+      if (bridgeRegistry && xtermTextarea) {
+        const termId = terminalId; // capture for closures
+        bridgeRegistry.registerElement(`terminal-input-${termId}`, xtermTextarea, {
+          type: "textarea",
+          label: `Terminal input (${termId.slice(0, 8)})`,
+          actions: ["focus", "blur", "sendKeys"],
+          customActions: {
+            writeToTerminal: {
+              id: "writeToTerminal",
+              description: "Write text directly to the PTY (no keyboard events)",
+              handler: (params?: unknown) => {
+                const { text } = (params || {}) as { text?: string };
+                if (!text) return;
+                const bytes = encoder.encode(text);
+                invoke("terminal_write", { terminalId: termId, data: uint8ToBase64(bytes) }).catch(
+                  () => {},
+                );
+              },
+            },
+            paste: {
+              id: "paste",
+              description: "Read clipboard and write to PTY (same as Ctrl+V)",
+              handler: async () => {
+                const text = await navigator.clipboard.readText().catch(() => "");
+                if (text) {
+                  const bytes = encoder.encode(text);
+                  invoke("terminal_write", {
+                    terminalId: termId,
+                    data: uint8ToBase64(bytes),
+                  }).catch(() => {});
+                }
+              },
+            },
+            getScrollback: {
+              id: "getScrollback",
+              description: "Read the terminal scrollback buffer as plain text",
+              handler: (params?: unknown) => {
+                const { maxLines = 500 } = (params || {}) as { maxLines?: number };
+                const t = termRef.current;
+                if (!t) return "";
+                const buffer = t.buffer.active;
+                const totalLines = buffer.length;
+                const startLine = Math.max(0, totalLines - maxLines);
+                const lines: string[] = [];
+                for (let i = startLine; i < totalLines; i++) {
+                  const line = buffer.getLine(i);
+                  if (line) lines.push(line.translateToString(true));
+                }
+                return lines.join("\n");
+              },
+            },
+          },
+        });
+      }
+
       // Forward user input to PTY + track first input line for auto-naming
       const inputDisposable = term.onData((data) => {
         // Track first input line for auto-naming
@@ -476,12 +550,15 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         inputDisposable.dispose();
         binaryDisposable.dispose();
         oscDisposable.dispose();
+        xtermTextarea?.removeEventListener("paste", blockNativePaste, true);
+        bridgeRegistry?.unregisterElement(`terminal-input-${terminalId}`);
         outputUnsub?.();
         exitUnsub?.();
         term.dispose();
         termRef.current = null;
         fitAddonRef.current = null;
       };
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- uiBridge is stable context
     }, [terminalId, fitTerminal]);
 
     // Re-fit and focus when visibility changes

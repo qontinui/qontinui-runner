@@ -276,7 +276,7 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
         </div>
 
         {/* Right: AI Chat panel */}
-        <div className="w-80 shrink-0 border-l border-border flex flex-col">
+        <div className="flex-[0.5] min-w-[280px] border-l border-border flex flex-col">
           <SpecChatPanel
             selectedSpec={state.selectedSpec}
             onAddSpec={state.addSpec}
