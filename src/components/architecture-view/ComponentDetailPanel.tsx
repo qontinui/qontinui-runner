@@ -89,11 +89,11 @@ export function ComponentDetailPanel({ details, loading }: Props) {
           ) : (
             <ChevronRight className="w-3 h-3" />
           )}
-          Recent Fixes ({details.recent_fixes.length})
+          Recent Fixes ({details.recent_fixes?.length ?? 0})
         </button>
-        {fixesExpanded && details.recent_fixes.length > 0 && (
+        {fixesExpanded && (details.recent_fixes?.length ?? 0) > 0 && (
           <div className="mt-1 space-y-1">
-            {details.recent_fixes.map((fix: FixSummary) => (
+            {details.recent_fixes?.map((fix: FixSummary) => (
               <div
                 key={fix.id}
                 className="px-2 py-1.5 bg-muted/30 rounded text-xs border border-border/30"
@@ -111,7 +111,7 @@ export function ComponentDetailPanel({ details, loading }: Props) {
             ))}
           </div>
         )}
-        {fixesExpanded && details.recent_fixes.length === 0 && (
+        {fixesExpanded && (details.recent_fixes?.length ?? 0) === 0 && (
           <div className="text-xs text-muted-foreground mt-1">No recent fixes</div>
         )}
       </div>

@@ -46,7 +46,7 @@ export function ArchitectureView() {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only fetch workflow list on mount
   }, []);
 
   const { graph, loading, error, refresh, rebuild } = useArchitectureGraph(workflowName);
