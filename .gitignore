@@ -108,5 +108,8 @@ web-extraction*.png
 # SQLite databases
 *.db
 
+# Claude Code temp directories
+tmpclaude-*
+
 # Template artifact directories
 src-tauri/{{artifact_dir}}/
