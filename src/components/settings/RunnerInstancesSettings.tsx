@@ -7,6 +7,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Monitor, Plus, Trash2, Play, Square } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { getApiPort } from "@/lib/runner-api";
@@ -50,7 +51,14 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
     loadInstances();
     // Poll for status updates
     const interval = setInterval(loadInstances, 3000);
-    return () => clearInterval(interval);
+    // Refresh immediately when instances are restored after a rebuild
+    const unlisten = listen("runner-instances-restored", () => {
+      loadInstances();
+    });
+    return () => {
+      clearInterval(interval);
+      unlisten.then((fn) => fn());
+    };
   }, [loadInstances]);
 
   // Auto-suggest next available port (skip primary runner port and all instance ports)

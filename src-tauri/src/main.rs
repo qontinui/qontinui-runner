@@ -924,6 +924,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ui_bridge::ui_bridge_discover_states_from_fingerprints,
             commands::ui_bridge::ui_bridge_run_exploration,
             commands::ui_bridge::ui_bridge_stop_exploration,
+            commands::ui_bridge::ui_bridge_reload_webview,
             // Error Monitor commands (application log error detection)
             // Note: Log source CRUD is now managed through global_log_sources commands
             error_monitor::commands::query_error_events,
@@ -1255,6 +1256,83 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
+            // Restore previously-running instances (primary instance only).
+            // The session file only exists if the previous process was killed
+            // (e.g. by a rebuild) rather than closed intentionally by the user.
+            if std::env::var("QONTINUI_INSTANCE_NAME").is_err() {
+                let restore_ids = instance_manager::load_and_clear_active_instances();
+                if !restore_ids.is_empty() {
+                    info!(
+                        "Restoring {} previously-active instance(s): {:?}",
+                        restore_ids.len(),
+                        restore_ids
+                    );
+                    let im = app.state::<Arc<instance_manager::InstanceManager>>().inner().clone();
+                    let app_handle_for_restore = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        // Brief delay to let the primary instance finish initializing
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        let configs = settings::get_runner_instances();
+                        let mut restored = 0u32;
+                        for id in &restore_ids {
+                            let Some(config) = configs.iter().find(|c| &c.id == id) else {
+                                tracing::warn!(
+                                    "Instance '{}' was active but no longer in settings — skipping",
+                                    id
+                                );
+                                continue;
+                            };
+
+                            // Wait for the port to become free (previous process may still be dying)
+                            if crate::process_capture::health::is_port_in_use(config.port) {
+                                info!(
+                                    "Port {} still in use, waiting up to 5 s for instance '{}'",
+                                    config.port, config.name
+                                );
+                                let free = tokio::task::spawn_blocking({
+                                    let port = config.port;
+                                    move || instance_manager::wait_for_port_free(
+                                        port,
+                                        std::time::Duration::from_secs(5),
+                                    )
+                                })
+                                .await
+                                .unwrap_or(false);
+                                if !free {
+                                    error!(
+                                        "Port {} still occupied — skipping restore of instance '{}'",
+                                        config.port, config.name
+                                    );
+                                    continue;
+                                }
+                            }
+
+                            match im.launch_instance(config).await {
+                                Ok(pid) => {
+                                    info!(
+                                        "Restored instance '{}' (PID: {}, port: {})",
+                                        config.name, pid, config.port
+                                    );
+                                    restored += 1;
+                                }
+                                Err(e) => {
+                                    error!("Failed to restore instance '{}': {}", config.name, e);
+                                }
+                            }
+                        }
+
+                        // Notify the frontend so the instances panel refreshes immediately
+                        if restored > 0 {
+                            let _ = tauri::Emitter::emit(
+                                &app_handle_for_restore,
+                                "runner-instances-restored",
+                                &serde_json::json!({ "count": restored }),
+                            );
+                        }
+                    });
+                }
+            }
+
             info!("Tauri application setup complete");
             Ok(())
         })
@@ -1262,6 +1340,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 info!("Window close requested");
                 let app_state = window.state::<Arc<AppState>>();
+
+                // Intentional close — clear the session file so instances are NOT
+                // restored on the next normal startup.  (If the process is killed
+                // by a rebuild, this handler doesn't run and the file persists,
+                // which is exactly what we want.)
+                instance_manager::clear_active_instances();
 
                 // Stop all bridges via bridge manager
                 let app_state_clone = app_state.inner().clone();

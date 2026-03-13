@@ -3,6 +3,11 @@
 //! Each instance runs on its own port (via `QONTINUI_PORT` env var) and gets
 //! its own Tauri window. The shared SQLite database (WAL mode) handles
 //! concurrent access from multiple instances.
+//!
+//! Active instance IDs are persisted to `active_instances.json` so that
+//! instances can be restored after a rebuild / restart.  The file is written
+//! on every launch/stop and **deleted** on intentional close so that a normal
+//! shutdown does not trigger restoration on the next start.
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -38,6 +43,25 @@ impl InstanceManager {
         Self {
             instances: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Get the IDs of all currently running instances.
+    pub async fn get_running_ids(&self) -> Vec<String> {
+        let mut instances = self.instances.lock().await;
+        let mut running = Vec::new();
+        let mut dead = Vec::new();
+        for (id, handle) in instances.iter_mut() {
+            if is_process_alive(&mut handle.child) {
+                running.push(id.clone());
+            } else {
+                dead.push(id.clone());
+            }
+        }
+        // Clean up dead entries
+        for id in dead {
+            instances.remove(&id);
+        }
+        running
     }
 
     /// Launch a new runner instance with the given configuration.
@@ -112,6 +136,11 @@ impl InstanceManager {
             },
         );
 
+        // Persist the running set so a rebuild can restore it
+        let running: Vec<String> = instances.keys().cloned().collect();
+        drop(instances); // release lock before file I/O
+        save_active_instances(&running);
+
         Ok(pid)
     }
 
@@ -130,6 +159,12 @@ impl InstanceManager {
                 .map_err(|e| format!("Failed to kill instance '{}': {}", handle.config.name, e))?;
             let _ = handle.child.wait(); // Reap the process
             info!("Instance '{}' stopped", handle.config.name);
+
+            // Update the persisted running set
+            let running: Vec<String> = instances.keys().cloned().collect();
+            drop(instances);
+            save_active_instances(&running);
+
             Ok(())
         } else {
             Err(format!("Instance '{}' is not running", id))
@@ -175,6 +210,81 @@ impl InstanceManager {
             result.push(self.get_instance_status(config).await);
         }
         result
+    }
+}
+
+// ============================================================================
+// Active-instance session persistence
+// ============================================================================
+
+/// Path to the session file that tracks which instances were running.
+fn session_file_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("active_instances.json"))
+}
+
+/// Persist the set of running instance IDs.
+/// Called automatically by `launch_instance` / `stop_instance`.
+fn save_active_instances(ids: &[String]) {
+    let Some(path) = session_file_path() else {
+        return;
+    };
+    if ids.is_empty() {
+        // No instances running — remove the file so a clean start doesn't restore anything
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    match serde_json::to_string(ids) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!("Failed to save active instances: {}", e);
+            }
+        }
+        Err(e) => tracing::warn!("Failed to serialize active instances: {}", e),
+    }
+}
+
+/// Delete the session file.  Called on intentional (user-initiated) close so
+/// that the next normal startup does **not** restore instances.
+pub fn clear_active_instances() {
+    if let Some(path) = session_file_path() {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Load the list of instance IDs that were active before the last shutdown.
+/// Clears the file after reading so instances aren't re-launched on every restart.
+pub fn load_and_clear_active_instances() -> Vec<String> {
+    let Some(path) = session_file_path() else {
+        return Vec::new();
+    };
+    if !path.exists() {
+        return Vec::new();
+    }
+
+    let ids: Vec<String> = match std::fs::read_to_string(&path) {
+        Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+
+    // Clear the file so we don't re-launch on every start
+    let _ = std::fs::remove_file(&path);
+
+    ids
+}
+
+/// Wait (synchronously) for a port to become free, with a timeout.
+/// Returns `true` if the port is free, `false` if still occupied after timeout.
+pub fn wait_for_port_free(port: u16, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    let check_interval = std::time::Duration::from_millis(250);
+    loop {
+        if !crate::process_capture::health::is_port_in_use(port) {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(check_interval);
     }
 }
 
