@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Errors that can occur during embedding generation
 #[derive(Debug, Error)]

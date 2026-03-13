@@ -23,7 +23,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Errors that can occur during RAG storage operations
 #[derive(Debug, Error)]
