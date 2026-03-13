@@ -62,6 +62,7 @@ pub mod state_machine;
 pub mod step_type_knowledge_api;
 pub mod step_type_metadata_api;
 pub mod task_runs;
+pub mod terminals;
 pub mod testing;
 pub mod triggers;
 pub mod types;
