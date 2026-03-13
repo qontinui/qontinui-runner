@@ -1,1 +1,1 @@
-export { StateMachineBuilderPage } from "./StateMachineBuilderPage";
+export { UIBridgeStateMachinePage } from "./UIBridgeStateMachinePage";
