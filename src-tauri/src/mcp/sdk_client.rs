@@ -2081,6 +2081,571 @@ async fn handle_redo(State(state): State<Arc<ApiState>>) -> Json<serde_json::Val
 }
 
 // =============================================================================
+// Render Log Handlers
+// =============================================================================
+
+/// GET /ui-bridge/sdk/render-log — Get render log entries
+async fn handle_render_log(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/render-log", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// DELETE /ui-bridge/sdk/render-log — Clear render log
+async fn handle_clear_render_log(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::DELETE, "/render-log", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/render-log/snapshot — Capture render log snapshot
+async fn handle_render_log_snapshot(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/render-log/snapshot", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/render-log/path — Get render log path
+async fn handle_render_log_path(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/render-log/path", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
+// Element/Component State Handlers
+// =============================================================================
+
+/// GET /ui-bridge/sdk/element/:id/state — Get element state
+async fn handle_element_state(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/element/{}/state", id);
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/component/:id/state — Get component state
+async fn handle_component_state(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/component/{}/state", id);
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/component/:id/action/:actionId — Execute component action
+async fn handle_component_action(
+    State(state): State<Arc<ApiState>>,
+    Path((id, action_id)): Path<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/component/{}/action/{}", id, action_id);
+    match sdk_request(&state, Method::POST, &path, Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
+// Workflow Handlers
+// =============================================================================
+
+/// GET /ui-bridge/sdk/workflows — List workflows
+async fn handle_workflows(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/workflows", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/workflow/:id/run — Run a workflow
+async fn handle_workflow_run(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/workflow/{}/run", id);
+    match sdk_request(&state, Method::POST, &path, body.map(|b| b.0)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/workflow/:runId/status — Get workflow run status
+async fn handle_workflow_status(
+    State(state): State<Arc<ApiState>>,
+    Path(run_id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/workflow/{}/status", run_id);
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
+// Debug Handlers (additional)
+// =============================================================================
+
+/// GET /ui-bridge/sdk/debug/action-history — Get action history
+async fn handle_action_history(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/debug/action-history", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/debug/element-tree — Get element tree
+async fn handle_element_tree(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/debug/element-tree", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
+// AI Handlers (additional)
+// =============================================================================
+
+/// POST /ui-bridge/sdk/ai/find — AI-powered element finding
+async fn handle_ai_find(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/find", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/assert/batch — Batch AI assertions
+async fn handle_ai_assert_batch(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/assert/batch", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/ai/diff — Get semantic diff
+async fn handle_ai_diff(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/ai/diff", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/semantic-search — Semantic search
+async fn handle_ai_semantic_search(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/semantic-search", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
+// State Management Handlers
+// =============================================================================
+
+/// GET /ui-bridge/sdk/states — Get all states
+async fn handle_states(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/states", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/states/active — Get active states
+async fn handle_active_states(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/states/active", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/states/snapshot — Get state snapshot
+async fn handle_state_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/states/snapshot", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/states/find-path — Find path between states
+async fn handle_find_path(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/states/find-path", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/states/navigate — Navigate to a state
+async fn handle_navigate_to(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/states/navigate", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/state/:id — Get a specific state
+async fn handle_get_state(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/state/{}", id);
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/state/:id/activate — Activate a state
+async fn handle_activate_state(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/state/{}/activate", id);
+    match sdk_request(&state, Method::POST, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/state/:id/deactivate — Deactivate a state
+async fn handle_deactivate_state(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/state/{}/deactivate", id);
+    match sdk_request(&state, Method::POST, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/state-groups — Get all state groups
+async fn handle_state_groups(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/state-groups", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/state-group/:id/activate — Activate a state group
+async fn handle_activate_state_group(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/state-group/{}/activate", id);
+    match sdk_request(&state, Method::POST, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/state-group/:id/deactivate — Deactivate a state group
+async fn handle_deactivate_state_group(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/state-group/{}/deactivate", id);
+    match sdk_request(&state, Method::POST, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/transitions — Get all transitions
+async fn handle_transitions(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/transitions", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/transition/:id/can-execute — Check if transition can execute
+async fn handle_can_execute_transition(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/transition/{}/can-execute", id);
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/transition/:id/execute — Execute a transition
+async fn handle_execute_transition(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/control/transition/{}/execute", id);
+    match sdk_request(&state, Method::POST, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
+// Intent Handlers
+// =============================================================================
+
+/// GET /ui-bridge/sdk/ai/intents — List all intents
+async fn handle_list_intents(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/ai/intents", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/intents/execute — Execute an intent
+async fn handle_execute_intent(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/intents/execute", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/intents/find — Find matching intents
+async fn handle_find_intent(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/intents/find", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/intents/register — Register an intent
+async fn handle_register_intent(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/intents/register", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/intents/execute-from-query — Execute intent from natural language
+async fn handle_execute_intent_from_query(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/intents/execute-from-query", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
+// Recovery Handler
+// =============================================================================
+
+/// POST /ui-bridge/sdk/ai/recovery/attempt — Attempt error recovery
+async fn handle_recovery_attempt(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/recovery/attempt", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
+// Annotation Handlers
+// =============================================================================
+
+/// GET /ui-bridge/sdk/annotations — Get all annotations
+async fn handle_annotations(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/annotations", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/annotations/export — Export annotations
+async fn handle_annotations_export(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/annotations/export", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/annotations/coverage — Get annotation coverage
+async fn handle_annotations_coverage(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/annotations/coverage", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/annotations/import — Import annotations
+async fn handle_annotations_import(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/annotations/import", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/annotations/:id — Get a specific annotation
+async fn handle_annotation_get(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/annotations/{}", id);
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// PUT /ui-bridge/sdk/annotations/:id — Set/update an annotation
+async fn handle_annotation_set(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let path = format!("/annotations/{}", id);
+    match sdk_request(&state, Method::PUT, &path, Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// DELETE /ui-bridge/sdk/annotations/:id — Delete an annotation
+async fn handle_annotation_delete(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/annotations/{}", id);
+    match sdk_request(&state, Method::DELETE, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
+// Performance & Error Handlers (additional)
+// =============================================================================
+
+/// GET /ui-bridge/sdk/performance-entries — Get performance entries
+async fn handle_performance_entries(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/performance-entries", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/performance-entries/clear — Clear performance entries
+async fn handle_clear_performance_entries(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/performance-entries/clear", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/error-snapshots — Get error snapshots
+async fn handle_error_snapshots(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/error-snapshots", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/error-report — Get error report
+async fn handle_error_report(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/error-report", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
+// Quality Evaluation Handlers
+// =============================================================================
+
+/// POST /ui-bridge/sdk/design/evaluate — Evaluate quality
+async fn handle_evaluate_quality(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/design/evaluate", body.map(|b| b.0)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/design/evaluate/contexts — Get quality evaluation contexts
+async fn handle_quality_contexts(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/design/evaluate/contexts", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/design/evaluate/baseline — Save quality baseline
+async fn handle_save_baseline(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/design/evaluate/baseline", body.map(|b| b.0)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/design/evaluate/diff — Diff quality baseline
+async fn handle_diff_baseline(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/design/evaluate/diff", body.map(|b| b.0)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
 // Router
 // =============================================================================
 
@@ -2106,6 +2671,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // Snapshot & discovery
         .route("/ui-bridge/sdk/snapshot", get(handle_snapshot))
         .route("/ui-bridge/sdk/discover", post(handle_discover))
+        .route("/ui-bridge/sdk/find", post(handle_discover))
         // Console errors
         .route("/ui-bridge/sdk/console-errors", get(handle_console_errors))
         .route(
@@ -2322,6 +2888,170 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/undo-state", get(handle_undo_state))
         .route("/ui-bridge/sdk/undo", post(handle_undo))
         .route("/ui-bridge/sdk/redo", post(handle_redo))
+        // Render log
+        .route(
+            "/ui-bridge/sdk/render-log",
+            get(handle_render_log).delete(handle_clear_render_log),
+        )
+        .route(
+            "/ui-bridge/sdk/render-log/snapshot",
+            post(handle_render_log_snapshot),
+        )
+        .route("/ui-bridge/sdk/render-log/path", get(handle_render_log_path))
+        // Element/Component state
+        .route(
+            "/ui-bridge/sdk/element/:id/state",
+            get(handle_element_state),
+        )
+        .route(
+            "/ui-bridge/sdk/component/:id/state",
+            get(handle_component_state),
+        )
+        .route(
+            "/ui-bridge/sdk/component/:id/action/:actionId",
+            post(handle_component_action),
+        )
+        // Workflows
+        .route("/ui-bridge/sdk/workflows", get(handle_workflows))
+        .route(
+            "/ui-bridge/sdk/workflow/:id/run",
+            post(handle_workflow_run),
+        )
+        .route(
+            "/ui-bridge/sdk/workflow/:runId/status",
+            get(handle_workflow_status),
+        )
+        // Debug (additional)
+        .route(
+            "/ui-bridge/sdk/debug/action-history",
+            get(handle_action_history),
+        )
+        .route(
+            "/ui-bridge/sdk/debug/element-tree",
+            get(handle_element_tree),
+        )
+        // AI (additional)
+        .route("/ui-bridge/sdk/ai/find", post(handle_ai_find))
+        .route(
+            "/ui-bridge/sdk/ai/assert/batch",
+            post(handle_ai_assert_batch),
+        )
+        .route("/ui-bridge/sdk/ai/diff", get(handle_ai_diff))
+        .route(
+            "/ui-bridge/sdk/ai/semantic-search",
+            post(handle_ai_semantic_search),
+        )
+        // State management
+        .route("/ui-bridge/sdk/states", get(handle_states))
+        .route("/ui-bridge/sdk/states/active", get(handle_active_states))
+        .route(
+            "/ui-bridge/sdk/states/snapshot",
+            get(handle_state_snapshot),
+        )
+        .route("/ui-bridge/sdk/states/find-path", post(handle_find_path))
+        .route("/ui-bridge/sdk/states/navigate", post(handle_navigate_to))
+        .route("/ui-bridge/sdk/state/:id", get(handle_get_state))
+        .route(
+            "/ui-bridge/sdk/state/:id/activate",
+            post(handle_activate_state),
+        )
+        .route(
+            "/ui-bridge/sdk/state/:id/deactivate",
+            post(handle_deactivate_state),
+        )
+        .route("/ui-bridge/sdk/state-groups", get(handle_state_groups))
+        .route(
+            "/ui-bridge/sdk/state-group/:id/activate",
+            post(handle_activate_state_group),
+        )
+        .route(
+            "/ui-bridge/sdk/state-group/:id/deactivate",
+            post(handle_deactivate_state_group),
+        )
+        .route("/ui-bridge/sdk/transitions", get(handle_transitions))
+        .route(
+            "/ui-bridge/sdk/transition/:id/can-execute",
+            get(handle_can_execute_transition),
+        )
+        .route(
+            "/ui-bridge/sdk/transition/:id/execute",
+            post(handle_execute_transition),
+        )
+        // Intents
+        .route("/ui-bridge/sdk/ai/intents", get(handle_list_intents))
+        .route(
+            "/ui-bridge/sdk/ai/intents/execute",
+            post(handle_execute_intent),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/intents/find",
+            post(handle_find_intent),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/intents/register",
+            post(handle_register_intent),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/intents/execute-from-query",
+            post(handle_execute_intent_from_query),
+        )
+        // Recovery
+        .route(
+            "/ui-bridge/sdk/ai/recovery/attempt",
+            post(handle_recovery_attempt),
+        )
+        // Annotations
+        .route("/ui-bridge/sdk/annotations", get(handle_annotations))
+        .route(
+            "/ui-bridge/sdk/annotations/export",
+            get(handle_annotations_export),
+        )
+        .route(
+            "/ui-bridge/sdk/annotations/coverage",
+            get(handle_annotations_coverage),
+        )
+        .route(
+            "/ui-bridge/sdk/annotations/import",
+            post(handle_annotations_import),
+        )
+        .route(
+            "/ui-bridge/sdk/annotations/:id",
+            get(handle_annotation_get)
+                .put(handle_annotation_set)
+                .delete(handle_annotation_delete),
+        )
+        // Performance entries
+        .route(
+            "/ui-bridge/sdk/performance-entries",
+            get(handle_performance_entries),
+        )
+        .route(
+            "/ui-bridge/sdk/performance-entries/clear",
+            post(handle_clear_performance_entries),
+        )
+        // Error snapshots & report
+        .route(
+            "/ui-bridge/sdk/error-snapshots",
+            get(handle_error_snapshots),
+        )
+        .route("/ui-bridge/sdk/error-report", get(handle_error_report))
+        // Quality evaluation
+        .route(
+            "/ui-bridge/sdk/design/evaluate",
+            post(handle_evaluate_quality),
+        )
+        .route(
+            "/ui-bridge/sdk/design/evaluate/contexts",
+            get(handle_quality_contexts),
+        )
+        .route(
+            "/ui-bridge/sdk/design/evaluate/baseline",
+            post(handle_save_baseline),
+        )
+        .route(
+            "/ui-bridge/sdk/design/evaluate/diff",
+            post(handle_diff_baseline),
+        )
         // SSE event stream
         .route(
             "/ui-bridge/sdk/events/stream",
@@ -2454,6 +3184,100 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/sdk/control/events/stream",
             get(handle_sse_event_stream),
+        )
+        // Element/Component state aliases
+        .route(
+            "/ui-bridge/sdk/control/element/:id/state",
+            get(handle_element_state),
+        )
+        .route(
+            "/ui-bridge/sdk/control/component/:id/state",
+            get(handle_component_state),
+        )
+        .route(
+            "/ui-bridge/sdk/control/component/:id/action/:actionId",
+            post(handle_component_action),
+        )
+        // Workflow aliases
+        .route(
+            "/ui-bridge/sdk/control/workflows",
+            get(handle_workflows),
+        )
+        .route(
+            "/ui-bridge/sdk/control/workflow/:id/run",
+            post(handle_workflow_run),
+        )
+        .route(
+            "/ui-bridge/sdk/control/workflow/:runId/status",
+            get(handle_workflow_status),
+        )
+        // State management aliases
+        .route("/ui-bridge/sdk/control/states", get(handle_states))
+        .route(
+            "/ui-bridge/sdk/control/states/active",
+            get(handle_active_states),
+        )
+        .route(
+            "/ui-bridge/sdk/control/states/snapshot",
+            get(handle_state_snapshot),
+        )
+        .route(
+            "/ui-bridge/sdk/control/states/find-path",
+            post(handle_find_path),
+        )
+        .route(
+            "/ui-bridge/sdk/control/states/navigate",
+            post(handle_navigate_to),
+        )
+        .route("/ui-bridge/sdk/control/state/:id", get(handle_get_state))
+        .route(
+            "/ui-bridge/sdk/control/state/:id/activate",
+            post(handle_activate_state),
+        )
+        .route(
+            "/ui-bridge/sdk/control/state/:id/deactivate",
+            post(handle_deactivate_state),
+        )
+        .route(
+            "/ui-bridge/sdk/control/state-groups",
+            get(handle_state_groups),
+        )
+        .route(
+            "/ui-bridge/sdk/control/state-group/:id/activate",
+            post(handle_activate_state_group),
+        )
+        .route(
+            "/ui-bridge/sdk/control/state-group/:id/deactivate",
+            post(handle_deactivate_state_group),
+        )
+        .route(
+            "/ui-bridge/sdk/control/transitions",
+            get(handle_transitions),
+        )
+        .route(
+            "/ui-bridge/sdk/control/transition/:id/can-execute",
+            get(handle_can_execute_transition),
+        )
+        .route(
+            "/ui-bridge/sdk/control/transition/:id/execute",
+            post(handle_execute_transition),
+        )
+        // Performance & error aliases
+        .route(
+            "/ui-bridge/sdk/control/performance-entries",
+            get(handle_performance_entries),
+        )
+        .route(
+            "/ui-bridge/sdk/control/performance-entries/clear",
+            post(handle_clear_performance_entries),
+        )
+        .route(
+            "/ui-bridge/sdk/control/error-snapshots",
+            get(handle_error_snapshots),
+        )
+        .route(
+            "/ui-bridge/sdk/control/error-report",
+            get(handle_error_report),
         )
         // Heartbeat
         .route("/ui-bridge/sdk/heartbeat", post(handle_heartbeat))
