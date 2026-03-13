@@ -25,12 +25,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// Exploration depth presets
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ExplorationDepth {
     /// Quick scan - critical path only, stop on first failure
     /// Best for: CI/CD pipelines, quick smoke tests
     QuickScan,
     /// Standard exploration - balanced coverage
     /// Best for: Regular testing, development
+    #[default]
     Standard,
     /// Deep exploration - thorough coverage
     /// Best for: Release testing, finding edge cases
@@ -40,11 +42,6 @@ pub enum ExplorationDepth {
     Exhaustive,
 }
 
-impl Default for ExplorationDepth {
-    fn default() -> Self {
-        Self::Standard
-    }
-}
 
 impl ExplorationDepth {
     /// Get human-readable name

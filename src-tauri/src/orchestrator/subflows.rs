@@ -35,6 +35,7 @@ use std::collections::HashMap;
 /// Type of data a port accepts or produces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PortType {
     /// String value.
     String,
@@ -51,16 +52,12 @@ pub enum PortType {
     /// File path.
     FilePath,
     /// Any type (no validation).
+    #[default]
     Any,
     /// Custom type with validation.
     Custom { name: String },
 }
 
-impl Default for PortType {
-    fn default() -> Self {
-        Self::Any
-    }
-}
 
 impl PortType {
     /// Validate a value against this type.

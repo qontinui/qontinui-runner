@@ -36,6 +36,7 @@ use std::collections::HashMap;
 /// Type of a tool input or output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ToolInputType {
     /// String value.
     String,
@@ -54,14 +55,10 @@ pub enum ToolInputType {
     /// Code snippet.
     Code,
     /// Any type.
+    #[default]
     Any,
 }
 
-impl Default for ToolInputType {
-    fn default() -> Self {
-        Self::Any
-    }
-}
 
 /// Definition of a tool input parameter.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -384,9 +384,7 @@ impl CheckpointManager {
     pub fn get_latest_checkpoint(&self, run_id: &str) -> Option<&ExplorationCheckpoint> {
         self.checkpoints.get(run_id).and_then(|checkpoints| {
             checkpoints
-                .iter()
-                .filter(|c| c.status == CheckpointStatus::Active)
-                .next_back()
+                .iter().rfind(|c| c.status == CheckpointStatus::Active)
         })
     }
 

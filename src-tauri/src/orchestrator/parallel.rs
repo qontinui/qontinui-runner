@@ -266,8 +266,10 @@ impl BranchResult {
 /// Strategy for merging parallel branch results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum MergeStrategy {
     /// Wait for all branches to complete.
+    #[default]
     WaitAll,
     /// Continue when any branch completes successfully.
     WaitAny,
@@ -283,11 +285,6 @@ pub enum MergeStrategy {
     Custom { handler: String },
 }
 
-impl Default for MergeStrategy {
-    fn default() -> Self {
-        Self::WaitAll
-    }
-}
 
 impl MergeStrategy {
     /// Check if merge condition is satisfied.

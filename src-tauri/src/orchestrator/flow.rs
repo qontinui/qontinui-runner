@@ -292,17 +292,14 @@ pub enum StepType {
 /// Merge strategy for parallel steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ParallelMerge {
+    #[default]
     WaitAll,
     WaitAny,
     WaitN(usize),
 }
 
-impl Default for ParallelMerge {
-    fn default() -> Self {
-        Self::WaitAll
-    }
-}
 
 impl FlowStep {
     /// Create an agent step.

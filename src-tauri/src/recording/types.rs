@@ -5,18 +5,15 @@ use serde::{Deserialize, Serialize};
 /// Recording status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RecordingStatus {
+    #[default]
     Recording,
     Completed,
     Failed,
     Cancelled,
 }
 
-impl Default for RecordingStatus {
-    fn default() -> Self {
-        Self::Recording
-    }
-}
 
 impl std::fmt::Display for RecordingStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

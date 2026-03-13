@@ -14,8 +14,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// Exploration strategy for state machine exploration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ExplorationStrategy {
     /// Visit every state and transition - complete but slow
+    #[default]
     Exhaustive,
     /// Quick path through critical states marked with high priority
     SmokeTest,
@@ -27,11 +29,6 @@ pub enum ExplorationStrategy {
     Targeted,
 }
 
-impl Default for ExplorationStrategy {
-    fn default() -> Self {
-        Self::Exhaustive
-    }
-}
 
 impl ExplorationStrategy {
     /// Parse a strategy from a string

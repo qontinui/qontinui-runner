@@ -7,28 +7,27 @@ use serde::{Deserialize, Serialize};
 /// Priority level for exploration - determines order of state exploration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ExplorationPriority {
     /// Critical states - must be explored first
     Critical,
     /// High priority states - explored after critical
     High,
     /// Normal priority - default
+    #[default]
     Normal,
     /// Low priority - explored last if time permits
     Low,
 }
 
-impl Default for ExplorationPriority {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
 
 /// Status of an exploration check
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ExplorationStatus {
     /// Not yet explored
+    #[default]
     Pending,
     /// Currently being explored
     InProgress,
@@ -44,11 +43,6 @@ pub enum ExplorationStatus {
     Paused,
 }
 
-impl Default for ExplorationStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 /// Configuration for an exploration task
 #[derive(Debug, Clone, Serialize, Deserialize)]

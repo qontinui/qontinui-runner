@@ -15,8 +15,10 @@ use std::collections::HashMap;
 /// Format of the log file
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum LogFormat {
     /// Line-based text logs
+    #[default]
     Plaintext,
     /// Structured JSON (one object per line or array)
     Json,
@@ -43,15 +45,11 @@ impl LogFormat {
     }
 }
 
-impl Default for LogFormat {
-    fn default() -> Self {
-        Self::Plaintext
-    }
-}
 
 /// Parser type for extracting errors from logs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ParserType {
     /// Python tracebacks and exceptions
     Python,
@@ -61,6 +59,7 @@ pub enum ParserType {
     /// Rust panics and errors
     Rust,
     /// Generic regex-based pattern matching
+    #[default]
     Generic,
 }
 
@@ -85,17 +84,14 @@ impl ParserType {
     }
 }
 
-impl Default for ParserType {
-    fn default() -> Self {
-        Self::Generic
-    }
-}
 
 /// Path type for log source location
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PathType {
     /// Single file path
+    #[default]
     File,
     /// Glob pattern (e.g., "logs/*.log")
     Glob,
@@ -122,11 +118,6 @@ impl PathType {
     }
 }
 
-impl Default for PathType {
-    fn default() -> Self {
-        Self::File
-    }
-}
 
 /// Configuration for a log source to monitor
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,10 +185,12 @@ fn default_poll_interval() -> u32 {
 /// Re-exported from `crate::error` for convenience.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ErrorSeverity {
     /// Application crash, data loss risk
     Critical,
     /// Operation failed
+    #[default]
     Error,
     /// Potential issue
     Warning,
@@ -226,17 +219,14 @@ impl ErrorSeverity {
     }
 }
 
-impl Default for ErrorSeverity {
-    fn default() -> Self {
-        Self::Error
-    }
-}
 
 /// Status of an error event
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ErrorStatus {
     /// Newly detected, not yet reviewed
+    #[default]
     New,
     /// Acknowledged by user/system
     Acknowledged,
@@ -292,11 +282,6 @@ impl ErrorStatus {
     }
 }
 
-impl Default for ErrorStatus {
-    fn default() -> Self {
-        Self::New
-    }
-}
 
 /// Location information for an error
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

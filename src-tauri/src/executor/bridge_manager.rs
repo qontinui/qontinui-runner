@@ -14,20 +14,17 @@ use tracing::{error, info, warn};
 /// Mode of operation for a bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum BridgeMode {
     /// Full GUI mode with screen capture and input control.
     /// Requires exclusive GUI lock.
+    #[default]
     Gui,
     /// Headless mode without GUI interaction.
     /// Can run in parallel with other headless bridges.
     Headless,
 }
 
-impl Default for BridgeMode {
-    fn default() -> Self {
-        Self::Gui
-    }
-}
 
 /// Information about a managed bridge.
 #[derive(Debug, Clone, Serialize)]

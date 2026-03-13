@@ -7,16 +7,13 @@ use serde::{Deserialize, Serialize};
 /// Transport type for MCP server connections
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum McpTransport {
+    #[default]
     Stdio,
     Http,
 }
 
-impl Default for McpTransport {
-    fn default() -> Self {
-        Self::Stdio
-    }
-}
 
 /// Stdio transport configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

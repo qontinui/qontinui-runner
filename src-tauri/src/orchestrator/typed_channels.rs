@@ -45,8 +45,10 @@ use std::sync::{Arc, RwLock};
 /// Strategies for merging channel updates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Reducer {
     /// Last value wins (default).
+    #[default]
     LastValue,
     /// Concatenate vectors/strings.
     Concat,
@@ -62,11 +64,6 @@ pub enum Reducer {
     Custom { name: String },
 }
 
-impl Default for Reducer {
-    fn default() -> Self {
-        Self::LastValue
-    }
-}
 
 // ============================================================================
 // Channel Value Wrapper
