@@ -218,9 +218,8 @@ pub fn get_missing_dev_services(
 /// Upgrade existing configs that match dev service ports but lack auto_start.
 ///
 /// When a user has a legacy config for a dev service port (e.g., port 8000)
-/// with `auto_start: false`, upgrade it to enable auto-start with proper
-/// `start_group` and `dev_only` fields. This preserves the user's custom
-/// command/args/env while enabling the auto-start behavior.
+/// with `auto_start: false`, upgrade it with the dev service defaults:
+/// auto_start, start_group, dev_only, and the correct command/args/cwd/env.
 pub fn upgrade_legacy_configs(configs: &mut [ProcessConfig], workspace: &Path) {
     let defaults = get_default_dev_services(workspace);
 
@@ -230,12 +229,18 @@ pub fn upgrade_legacy_configs(configs: &mut [ProcessConfig], workspace: &Path) {
                 // Find matching dev service default by port
                 if let Some(dev_default) = defaults.iter().find(|d| d.health_port == Some(port)) {
                     info!(
-                        "Dev-mode: upgrading legacy config '{}' (port {}) with auto_start, start_group={}, dev_only=true",
-                        config.name, port, dev_default.start_group
+                        "Dev-mode: upgrading legacy config '{}' (port {}) → command='{}', start_group={}, dev_only=true",
+                        config.name, port, dev_default.command, dev_default.start_group
                     );
                     config.auto_start = true;
                     config.start_group = dev_default.start_group;
                     config.dev_only = true;
+                    // Replace command/args/cwd/env with dev defaults
+                    // (legacy configs often have wrong commands, e.g., bare `python` instead of `poetry run`)
+                    config.command = dev_default.command.clone();
+                    config.args = dev_default.args.clone();
+                    config.cwd = dev_default.cwd.clone();
+                    config.env = dev_default.env.clone();
                 }
             }
         }
