@@ -615,7 +615,6 @@ function AppContent() {
         task_run_id?: number;
         select_run?: number;
       }>("test-navigation", (event) => {
-        console.log("[APP] Received test-navigation event:", event.payload);
         const { page, task_run_id, select_run } = event.payload;
 
         // Map page names to tab IDs (same mapping as tutorials)
@@ -636,19 +635,13 @@ function AppContent() {
 
         const tabId = pageToTab[page];
         if (tabId) {
-          console.log(`[APP] Navigating to tab: ${tabId}`);
           setActiveTab(tabId);
 
           // If select_run is provided and we're going to a run-related page,
           // we might need to select the run (this would require RunSelectionContext)
           // For now, just log it - the run selection will need to be done via
           // the RunSelectionContext or a separate mechanism
-          if (select_run) {
-            console.log(`[APP] Run selection requested: ${select_run}`);
-          }
-          if (task_run_id) {
-            console.log(`[APP] Task run ID provided: ${task_run_id}`);
-          }
+          // select_run and task_run_id are available for future run selection via RunSelectionContext
         } else {
           console.warn(`[APP] Unknown page for navigation: ${page}`);
         }
@@ -667,7 +660,6 @@ function AppContent() {
   // Listen for error badge click to navigate to error monitor tab
   useEffect(() => {
     const handleNavigateToErrorMonitor = () => {
-      console.log("[APP] Navigating to error-monitor tab from ErrorBadge click");
       setActiveTab("error-monitor");
     };
 
@@ -681,7 +673,6 @@ function AppContent() {
   // Listen for Quick Fix to navigate to active dashboard
   useEffect(() => {
     const handleNavigateToActive = () => {
-      console.log("[APP] Navigating to active tab from Quick Fix");
       setActiveTab("active");
     };
 
@@ -703,7 +694,6 @@ function AppContent() {
         message: string;
       }>("stale-task-detected", (event) => {
         const { task_name, message } = event.payload;
-        console.log("[APP] Stale task detected:", event.payload);
         setStaleTaskMessage(`${task_name}: ${message}`);
         // Auto-dismiss after 10 seconds
         setTimeout(() => setStaleTaskMessage(null), 10000);
@@ -781,7 +771,6 @@ function AppContent() {
           console.error("[APP] Failed to run workflow:", error);
         });
 
-        console.log("[APP] Started saved workflow:", workflow.name);
         setActiveTab("active");
       } else {
         // Not found in DB — try re-executing as an inline workflow.
@@ -816,7 +805,6 @@ function AppContent() {
             console.error("[APP] Failed to re-execute inline workflow:", error);
           });
 
-          console.log("[APP] Re-executing inline workflow:", lastRun.workflow_name);
           setActiveTab("active");
         } else {
           console.warn("[APP] Workflow not found in DB or inline cache:", lastRun.workflow_name);
@@ -946,7 +934,6 @@ function AppContent() {
   // Auto-load projects when authenticated
   useEffect(() => {
     if (auth.authStatus?.authenticated && !auth.loading) {
-      console.log("[APP] User authenticated, loading projects");
       projectSelection.loadProjects();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -955,7 +942,6 @@ function AppContent() {
   // Load project logs config when a project is selected or on mount if already selected
   useEffect(() => {
     if (projectSelection.selectedProjectId && projectSelection.selectedProjectName) {
-      console.log("[APP] Loading project logs for:", projectSelection.selectedProjectName);
       projectLogs.loadConfig(
         projectSelection.selectedProjectId,
         projectSelection.selectedProjectName,
@@ -966,7 +952,6 @@ function AppContent() {
 
   // Setup event handlers on mount (ONCE only)
   useEffect(() => {
-    console.log("[APP] Setting up event handlers");
     const cleanup = setupEventHandlers(eventRouter, {
       setPythonStatus: execution.setPythonStatus,
       setConfigLoaded: execution.setConfigLoaded,
@@ -980,7 +965,6 @@ function AppContent() {
   // Refresh action log when switching to Actions sub-tab
   useEffect(() => {
     if (activeTab === "logs" && activeLogSubTab === "actions") {
-      console.log("[TAB_SWITCH] Switched to Actions tab, refreshing action log");
       refreshActionLog();
     }
   }, [activeTab, activeLogSubTab, refreshActionLog]);
@@ -1064,23 +1048,12 @@ function AppContent() {
   // Show loading state while checking auth, during dev auto-login, or while API server starts
   const isAuthLoading = auth.loading || auth.devAutoLoginPending;
   const isInitializing = isAuthLoading || !isApiReady;
-  console.log(
-    "[APP] Render - auth.loading:",
-    auth.loading,
-    "auth.devAutoLoginPending:",
-    auth.devAutoLoginPending,
-    "auth.authStatus:",
-    auth.authStatus,
-    "isApiReady:",
-    isApiReady,
-  );
   if (isInitializing) {
     const loadingMessage = auth.devAutoLoginPending
       ? "Signing in..."
       : isAuthLoading
         ? "Checking authentication..."
         : "Starting API server...";
-    console.log("[APP] Rendering loading state:", loadingMessage);
     return (
       <div className="min-h-screen bg-background grid-dots flex items-center justify-center">
         <div className="card p-8 text-center space-y-4">
@@ -1093,7 +1066,6 @@ function AppContent() {
 
   // Show login screen if not authenticated
   if (!auth.authStatus?.authenticated) {
-    console.log("[APP] Rendering LoginScreen (not authenticated)");
     return <LoginScreen onLogin={auth.login} />;
   }
 
@@ -1102,7 +1074,6 @@ function AppContent() {
     return <SetupWizard onComplete={() => setSetupCompleted(true)} />;
   }
 
-  console.log("[APP] Rendering main app (authenticated)");
 
   // Get last run task_run_id for render logging context
   const lastRunId = lastRun?.id;
@@ -1877,9 +1848,8 @@ export default function App() {
           <NavigationProvider>
             <EventManagerProvider>
               <ExecutionProvider
-                onLog={(level, message) => {
-                  // Logs are now handled by LogManager through event handlers
-                  console.log(`[LOG] ${level}: ${message}`);
+                onLog={(_level, _message) => {
+                  // Logs are handled by LogManager through event handlers
                 }}
               >
                 <AutoContinueProvider>
