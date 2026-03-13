@@ -6484,6 +6484,32 @@ impl CheckpointDb {
             info!("Successfully migrated to version 107 (causal events dedup index)");
         }
 
+        // Repair migration: is_favorite column may be missing on databases created from
+        // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
+        // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,
+        // so we check for it first via PRAGMA table_info.
+        {
+            let has_is_favorite: bool = conn
+                .prepare("PRAGMA table_info(unified_workflows)")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(1))
+                        .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == "is_favorite"))
+                })
+                .unwrap_or(false);
+
+            if !has_is_favorite {
+                info!("Repair: adding missing is_favorite column to unified_workflows");
+                conn.execute_batch(
+                    r#"
+                    ALTER TABLE unified_workflows ADD COLUMN is_favorite INTEGER DEFAULT 0;
+                    CREATE INDEX IF NOT EXISTS idx_unified_workflows_is_favorite ON unified_workflows(is_favorite);
+                    "#,
+                )
+                .map_err(|e| format!("Failed to repair unified_workflows.is_favorite: {}", e))?;
+                info!("Repair: successfully added is_favorite column");
+            }
+        }
+
         Ok(())
     }
 

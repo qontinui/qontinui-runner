@@ -909,6 +909,9 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     -- Sync status
     sync_pending INTEGER DEFAULT 0,  -- Whether workflow needs to be synced to backend
 
+    -- Favorites
+    is_favorite INTEGER DEFAULT 0,
+
     -- Quality improvements (generation metadata)
     dependency_graph TEXT DEFAULT NULL,
     cost_annotations TEXT DEFAULT NULL,
@@ -926,6 +929,7 @@ CREATE INDEX IF NOT EXISTS idx_unified_workflows_updated_at ON unified_workflows
 CREATE INDEX IF NOT EXISTS idx_unified_workflows_name ON unified_workflows(name);
 CREATE INDEX IF NOT EXISTS idx_unified_workflows_example_status ON unified_workflows(example_status);
 CREATE INDEX IF NOT EXISTS idx_unified_workflows_sync_pending ON unified_workflows(sync_pending);
+CREATE INDEX IF NOT EXISTS idx_unified_workflows_is_favorite ON unified_workflows(is_favorite);
 
 -- =============================================================================
 -- Task Run Event Logs (Phase 10: Hybrid Event Logging)
