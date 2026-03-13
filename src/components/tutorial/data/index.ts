@@ -64,7 +64,7 @@ export function getFirstTimeTutorial(): Tutorial {
  * These are highlighted in the UI for easy discovery
  */
 export function getFeaturedTutorials(): Tutorial[] {
-  return tutorials.filter((t) => t.tags.includes("featured"));
+  return tutorials.filter((t) => t.tags?.includes("featured"));
 }
 
 /**

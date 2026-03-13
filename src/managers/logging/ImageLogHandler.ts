@@ -115,8 +115,8 @@ export class ImageLogHandler {
     // Fallback: calculate from debug data if not provided
     if (!data.found && !gap && data.debug?.top_matches && data.debug.top_matches.length > 0) {
       const bestMatch = data.debug.top_matches[0];
-      gap = data.threshold - bestMatch.confidence;
-      percentOff = (gap / data.threshold) * 100;
+      gap = (data.threshold ?? 0) - bestMatch.confidence;
+      percentOff = data.threshold ? (gap / data.threshold) * 100 : 0;
       bestMatchLocation = `(${bestMatch.location.x}, ${bestMatch.location.y})`;
     }
 

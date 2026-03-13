@@ -155,7 +155,7 @@ const CATEGORY_CONFIG: Record<
 
 interface LibraryDashboardProps {
   onNavigateToBuilder?: (builderTab: string, itemId: string, itemType: ItemType) => void;
-  onLog?: (level: string, message: string) => void;
+  onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
 }
 
 export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboardProps) {
@@ -208,8 +208,8 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
             description: item.description,
             category: item.category,
             tags: normalizeTags(item.tags),
-            modifiedAt: item.modified_at || item.modifiedAt || item.created_at,
-            createdAt: item.created_at || item.createdAt,
+            modifiedAt: item.modified_at || item.modifiedAt || item.created_at || "",
+            createdAt: item.created_at || item.createdAt || "",
           });
         });
       }
@@ -226,8 +226,8 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
             description: item.content?.slice(0, 100),
             category: item.category,
             tags: normalizeTags(item.tags),
-            modifiedAt: item.modified_at || item.modifiedAt || item.created_at,
-            createdAt: item.created_at || item.createdAt,
+            modifiedAt: item.modified_at || item.modifiedAt || item.created_at || "",
+            createdAt: item.created_at || item.createdAt || "",
           });
         });
       }
@@ -244,8 +244,8 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
             description: item.content?.slice(0, 100),
             category: item.category,
             tags: normalizeTags(item.tags),
-            modifiedAt: item.modifiedAt || item.modified_at || item.createdAt,
-            createdAt: item.createdAt || item.created_at,
+            modifiedAt: item.modifiedAt || item.modified_at || item.createdAt || "",
+            createdAt: item.createdAt || item.created_at || "",
           });
         });
       }
@@ -261,8 +261,8 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
             name: item.name,
             description: item.description,
             tags: normalizeTags(item.tags),
-            modifiedAt: item.updated_at || item.modified_at || item.created_at,
-            createdAt: item.created_at,
+            modifiedAt: item.updated_at || item.modified_at || item.created_at || "",
+            createdAt: item.created_at || "",
           });
         });
       }
@@ -279,8 +279,8 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
             description: `${item.method} ${item.url}`,
             category: item.category,
             tags: normalizeTags(item.tags),
-            modifiedAt: item.updated_at || item.modified_at || item.created_at,
-            createdAt: item.created_at,
+            modifiedAt: item.updated_at || item.modified_at || item.created_at || "",
+            createdAt: item.created_at || "",
           });
         });
       }
@@ -295,8 +295,8 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
             type: "script",
             name: item.name,
             description: item.description || item.target_url,
-            modifiedAt: item.modified_at || item.created_at,
-            createdAt: item.created_at,
+            modifiedAt: item.modified_at || item.created_at || "",
+            createdAt: item.created_at || "",
           });
         });
       }
@@ -313,8 +313,8 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
             description: item.description,
             category: item.category,
             tags: normalizeTags(item.tags),
-            modifiedAt: item.modified_at || item.updated_at || item.created_at,
-            createdAt: item.created_at,
+            modifiedAt: item.modified_at || item.updated_at || item.created_at || "",
+            createdAt: item.created_at || "",
             isFavorite: item.is_favorite,
           });
         });
@@ -330,8 +330,8 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
             type: "macro",
             name: item.name,
             description: item.description,
-            modifiedAt: item.modified_at || item.updated_at || item.created_at,
-            createdAt: item.created_at,
+            modifiedAt: item.modified_at || item.updated_at || item.created_at || "",
+            createdAt: item.created_at || "",
           });
         });
       }
@@ -347,8 +347,8 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
             name: item.name,
             description: item.description || `${item.check_type} - ${item.tool}`,
             tags: normalizeTags(item.tags),
-            modifiedAt: item.updated_at || item.created_at,
-            createdAt: item.created_at,
+            modifiedAt: item.updated_at || item.created_at || "",
+            createdAt: item.created_at || "",
           });
         });
       }

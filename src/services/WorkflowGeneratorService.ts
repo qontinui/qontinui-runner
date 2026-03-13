@@ -689,7 +689,7 @@ ${additionalContext}
    * Check if a state has interactive elements.
    */
   private hasInteractiveElements(state: GeneratorState): boolean {
-    return (
+    return !!(
       (state.locations && state.locations.length > 0) ||
       (state.strings && state.strings.some((s) => s.inputText)) ||
       (state.regions && state.regions.some((r) => !r.isSearchRegion))

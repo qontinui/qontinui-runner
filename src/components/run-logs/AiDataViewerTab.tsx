@@ -1026,7 +1026,7 @@ function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
                       {request.resolved_url || request.url}
                     </span>
                   </div>
-                  {requestHeaders && Object.keys(requestHeaders as object).length > 0 && (
+                  {requestHeaders != null && Object.keys(requestHeaders as object).length > 0 && (
                     <CollapsibleSection title="Request Headers">
                       <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-32 overflow-y-auto">
                         {formatJson(requestHeaders)}
@@ -1046,7 +1046,7 @@ function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
                       </pre>
                     </CollapsibleSection>
                   )}
-                  {responseHeaders && Object.keys(responseHeaders as object).length > 0 && (
+                  {responseHeaders != null && Object.keys(responseHeaders as object).length > 0 && (
                     <CollapsibleSection title="Response Headers">
                       <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-32 overflow-y-auto">
                         {formatJson(responseHeaders)}
@@ -2386,14 +2386,14 @@ function AwasStepsSection() {
                       <span className="font-mono">{step.action_id}</span>
                     </div>
                   )}
-                  {parameters && (
+                  {parameters != null && (
                     <CollapsibleSection title="Parameters">
                       <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">
                         {formatJson(parameters)}
                       </pre>
                     </CollapsibleSection>
                   )}
-                  {responseData && (
+                  {responseData != null && (
                     <CollapsibleSection title="Response Data" defaultOpen={!step.error_message}>
                       <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap">
                         {formatJson(responseData)}
@@ -2570,7 +2570,7 @@ function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
               {isExpanded && (
                 <div className="border-t border-border p-3 space-y-3 bg-muted/30">
                   {/* Arguments */}
-                  {args && (
+                  {Boolean(args) && (
                     <div>
                       <p className="text-xs font-medium text-muted-foreground mb-1">Arguments</p>
                       <pre className="text-xs font-mono bg-background p-2 rounded overflow-auto max-h-32 text-foreground">
@@ -2580,7 +2580,7 @@ function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
                   )}
 
                   {/* Resolved arguments (if different) */}
-                  {resolvedArgs && JSON.stringify(resolvedArgs) !== JSON.stringify(args) && (
+                  {Boolean(resolvedArgs) && JSON.stringify(resolvedArgs) !== JSON.stringify(args) && (
                     <div>
                       <p className="text-xs font-medium text-muted-foreground mb-1">
                         Resolved Arguments
@@ -2592,7 +2592,7 @@ function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
                   )}
 
                   {/* Response */}
-                  {response && (
+                  {response != null && (
                     <div>
                       <p className="text-xs font-medium text-muted-foreground mb-1">
                         Response ({call.response_type})

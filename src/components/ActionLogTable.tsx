@@ -540,7 +540,7 @@ function getTreePrefix(
   let current: ActionLogEntry | undefined = action;
 
   while (current && current.parent_action_id) {
-    const parent = actions.find((a) => a.id === current.parent_action_id);
+    const parent = actions.find((a) => a.id === current!.parent_action_id);
     if (parent) {
       ancestors.unshift(parent);
     }

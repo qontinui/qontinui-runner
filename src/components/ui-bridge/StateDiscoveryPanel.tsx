@@ -509,7 +509,7 @@ function DiscoveredStateCard({
   /** Whether this state is highlighted (from navigation) */
   isHighlighted?: boolean;
   /** Ref for scrolling into view */
-  cardRef?: React.RefObject<HTMLDivElement>;
+  cardRef?: React.RefObject<HTMLDivElement | null>;
 }) {
   const stateTypeColors: Record<string, string> = {
     global: "bg-blue-500/20 text-blue-400",

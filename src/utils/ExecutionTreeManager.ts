@@ -125,11 +125,11 @@ export class ExecutionTreeManager {
     node_type: NodeType;
     name: string;
     timestamp: number;
-    end_timestamp?: number;
-    duration?: number;
+    end_timestamp?: number | null;
+    duration?: number | null;
     status: NodeStatus;
     metadata?: ExtendedNodeMetadata | NodeMetadata | Record<string, unknown>;
-    error?: string;
+    error?: string | null;
   }): DisplayNode {
     // Flatten execution_record metadata into top-level metadata
     // Backend sends: metadata.execution_record.metadata.runtime
@@ -178,7 +178,7 @@ export class ExecutionTreeManager {
    * @param node - The node to link
    * @param parentId - ID of the parent node, or null if this is a root
    */
-  private linkNodeToParent(node: DisplayNode, parentId: string | null): void {
+  private linkNodeToParent(node: DisplayNode, parentId: string | null | undefined): void {
     // Check for self-parent bug (node trying to be its own parent)
     if (parentId && parentId === node.id) {
       console.warn(
@@ -231,9 +231,9 @@ export class ExecutionTreeManager {
     node: DisplayNode,
     nodeData: {
       status: NodeStatus;
-      end_timestamp?: number;
-      duration?: number;
-      error?: string;
+      end_timestamp?: number | null;
+      duration?: number | null;
+      error?: string | null;
       metadata?: ExtendedNodeMetadata | NodeMetadata | Record<string, unknown>;
     },
   ): void {

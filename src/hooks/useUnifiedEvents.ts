@@ -31,6 +31,7 @@ import {
   type TaskRunUpdateCallback,
   type ExecutorEventCallback,
 } from "./useWebSocketEvents";
+import { useWebSocketLatency } from "./useWebSocketLatency";
 
 // Re-export types for convenience
 export type {
@@ -100,6 +101,53 @@ export function useUnifiedEvents(options: UseUnifiedEventsOptions = {}): UseUnif
 
   const isTauri = isTauriEnvironment();
 
+  // Latency tracking (dev mode only)
+  const { recordMessage, setConnected: setLatencyConnected } = useWebSocketLatency();
+
+  // Wrap callbacks to record latency from server timestamps
+  const wrappedOnOrchestratorStateChange = useCallback(
+    (payload: OrchestratorStateChangePayload) => {
+      // OrchestratorStateChangePayload has no timestamp field — record without latency
+      recordMessage();
+      onOrchestratorStateChange?.(payload);
+    },
+    [onOrchestratorStateChange, recordMessage],
+  );
+
+  const wrappedOnStepProgress = useCallback(
+    (payload: StepProgressPayload) => {
+      recordMessage(payload.data.timestamp);
+      onStepProgress?.(payload);
+    },
+    [onStepProgress, recordMessage],
+  );
+
+  const wrappedOnTaskRunUpdate = useCallback(
+    (payload: TaskRunUpdatePayload) => {
+      recordMessage(payload.data.timestamp);
+      onTaskRunUpdate?.(payload);
+    },
+    [onTaskRunUpdate, recordMessage],
+  );
+
+  const wrappedOnExecutorEvent = useCallback(
+    (payload: ExecutorEventPayload) => {
+      recordMessage(payload.data.timestamp);
+      onExecutorEvent?.(payload);
+    },
+    [onExecutorEvent, recordMessage],
+  );
+
+  const wrappedOnConnected = useCallback(() => {
+    setLatencyConnected(true);
+    onConnected?.();
+  }, [onConnected, setLatencyConnected]);
+
+  const wrappedOnDisconnected = useCallback(() => {
+    setLatencyConnected(false);
+    onDisconnected?.();
+  }, [onDisconnected, setLatencyConnected]);
+
   // State for Tauri events
   const [tauriConnected, setTauriConnected] = useState(false);
   const [lastOrchestratorStateTauri, setLastOrchestratorStateTauri] =
@@ -130,7 +178,7 @@ export function useUnifiedEvents(options: UseUnifiedEventsOptions = {}): UseUnif
           (event) => {
             if (!mounted) return;
             setLastOrchestratorStateTauri(event.payload);
-            onOrchestratorStateChange?.(event.payload);
+            wrappedOnOrchestratorStateChange(event.payload);
           },
         );
         unlistenFns.push(unlistenOrchestrator);
@@ -139,7 +187,7 @@ export function useUnifiedEvents(options: UseUnifiedEventsOptions = {}): UseUnif
         const unlistenStepProgress = await listen<StepProgressPayload>("step-progress", (event) => {
           if (!mounted) return;
           setLastStepProgressTauri(event.payload);
-          onStepProgress?.(event.payload);
+          wrappedOnStepProgress(event.payload);
         });
         unlistenFns.push(unlistenStepProgress);
 
@@ -149,7 +197,7 @@ export function useUnifiedEvents(options: UseUnifiedEventsOptions = {}): UseUnif
           (event) => {
             if (!mounted) return;
             setLastTaskRunUpdateTauri(event.payload);
-            onTaskRunUpdate?.(event.payload);
+            wrappedOnTaskRunUpdate(event.payload);
           },
         );
         unlistenFns.push(unlistenTaskRunUpdate);
@@ -159,7 +207,7 @@ export function useUnifiedEvents(options: UseUnifiedEventsOptions = {}): UseUnif
           "executor-event",
           (event) => {
             if (!mounted) return;
-            onExecutorEvent?.(event.payload);
+            wrappedOnExecutorEvent(event.payload);
           },
         );
         unlistenFns.push(unlistenExecutorEvent);
@@ -167,7 +215,7 @@ export function useUnifiedEvents(options: UseUnifiedEventsOptions = {}): UseUnif
         if (mounted) {
           unlistenRefs.current = unlistenFns;
           setTauriConnected(true);
-          onConnected?.();
+          wrappedOnConnected();
           console.log("[useUnifiedEvents] Tauri event listeners connected");
         } else {
           // Cleanup if unmounted during setup
@@ -188,17 +236,17 @@ export function useUnifiedEvents(options: UseUnifiedEventsOptions = {}): UseUnif
       unlistenRefs.current.forEach((fn) => fn());
       unlistenRefs.current = [];
       setTauriConnected(false);
-      onDisconnected?.();
+      wrappedOnDisconnected();
     };
   }, [
     isTauri,
     enabled,
-    onOrchestratorStateChange,
-    onStepProgress,
-    onTaskRunUpdate,
-    onExecutorEvent,
-    onConnected,
-    onDisconnected,
+    wrappedOnOrchestratorStateChange,
+    wrappedOnStepProgress,
+    wrappedOnTaskRunUpdate,
+    wrappedOnExecutorEvent,
+    wrappedOnConnected,
+    wrappedOnDisconnected,
   ]);
 
   // Use WebSocket events when not in Tauri
@@ -209,12 +257,12 @@ export function useUnifiedEvents(options: UseUnifiedEventsOptions = {}): UseUnif
     lastTaskRunUpdate: lastTaskRunUpdateWs,
   } = useWebSocketEvents({
     enabled: enabled && !isTauri,
-    onOrchestratorStateChange,
-    onStepProgress,
-    onTaskRunUpdate,
-    onExecutorEvent,
-    onConnected,
-    onDisconnected,
+    onOrchestratorStateChange: wrappedOnOrchestratorStateChange,
+    onStepProgress: wrappedOnStepProgress,
+    onTaskRunUpdate: wrappedOnTaskRunUpdate,
+    onExecutorEvent: wrappedOnExecutorEvent,
+    onConnected: wrappedOnConnected,
+    onDisconnected: wrappedOnDisconnected,
   });
 
   // Return appropriate values based on environment

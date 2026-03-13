@@ -8,6 +8,7 @@
 import { useEffect } from "react";
 import { eventRouter, configManager } from "../../managers";
 import type { Config, Workflow, ConfigLoadedEventPayload, Category, LogFunction } from "./types";
+import type { EventPayload } from "../../types/eventPayloads";
 import { createConfigFromData, deriveProjectId } from "./utils";
 import { useConfigFiltering } from "./useConfigFiltering";
 
@@ -29,11 +30,12 @@ export function useConfigEvents(options: UseConfigEventsOptions = {}): void {
   const { filterWorkflows } = useConfigFiltering({ onLog });
 
   useEffect(() => {
-    const handleConfigLoaded = (payload: ConfigLoadedEventPayload) => {
-      console.log("[CONFIG] Received config_loaded event from MCP API:", payload);
+    const handleConfigLoaded = (payload: EventPayload) => {
+      const configPayload = payload as ConfigLoadedEventPayload;
+      console.log("[CONFIG] Received config_loaded event from MCP API:", configPayload);
 
-      const configPath = payload.data?.path;
-      const configData = payload.data?.config;
+      const configPath = configPayload.data?.path;
+      const configData = configPayload.data?.config;
 
       if (!configPath || !configData) {
         console.warn("[CONFIG] config_loaded event missing path or config data");

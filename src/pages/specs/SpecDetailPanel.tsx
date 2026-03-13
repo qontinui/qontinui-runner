@@ -976,7 +976,7 @@ function PageSpecOverview({
           >
             {source}
           </span>
-          {config.metadata?.specType && (
+          {!!config.metadata?.specType && (
             <span
               className={`text-[10px] px-1.5 py-0.5 rounded border ${
                 config.metadata.specType === "semantic"

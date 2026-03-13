@@ -256,7 +256,7 @@ export function ExecutionSummaryTab() {
 
   // Calculate duration for selected run
   const duration = selectedRun
-    ? calculateDuration(selectedRun.created_at, selectedRun.completed_at)
+    ? calculateDuration(selectedRun.created_at, selectedRun.completed_at ?? undefined)
     : undefined;
 
   // Empty state

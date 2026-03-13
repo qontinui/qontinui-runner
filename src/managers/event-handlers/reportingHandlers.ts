@@ -183,7 +183,7 @@ function reportToExecutionService(
     to_state: stateContext?.active_after?.[0],
     active_states: stateContext?.active_after,
     confidence_score: confidenceScore,
-    error_message: node.error,
+    error_message: node.error ?? undefined,
     error_type: node.error ? ErrorType.OTHER : undefined,
     screenshot_id: metadata.screenshot_reference as string | undefined,
     metadata: {

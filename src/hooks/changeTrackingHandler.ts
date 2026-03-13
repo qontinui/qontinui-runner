@@ -135,7 +135,7 @@ export async function handleChangeTrackingCommand(
         const mgr = deps.createSnapshotManager({});
         const currentSemantic = mgr.createSnapshot({
           timestamp: Date.now(),
-          elements: snap.elements.map((e) => ({
+          elements: snap.elements.map((e: any) => ({
             id: e.id,
             type: e.type,
             label: e.label ?? "",

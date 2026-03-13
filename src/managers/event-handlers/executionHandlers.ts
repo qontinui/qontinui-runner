@@ -12,6 +12,7 @@
 import { logManager, windowManager, configManager } from "../index";
 import { APP_VERSION } from "../../lib/appInfo";
 import type { HandlerSetupFunction } from "./types";
+import type { EventPayload } from "../../types/eventPayloads";
 import { findingsTracker } from "../../services/FindingsTracker";
 import { executionReportingService } from "../../services/ExecutionReportingService";
 import { RunType, RunStatus } from "../../types/execution";
@@ -46,24 +47,23 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
   unsubscribers.push(
     eventRouter.subscribe(
       "execution_started",
-      async (payload: {
-        data?: {
-          workflow_id?: string;
-          workflow_name?: string;
-          run_type?: string;
-          initial_state_ids?: string[];
-        };
-      }) => {
+      async (payload: EventPayload) => {
         console.log("[EXECUTION_HANDLER] execution_started event received");
         setExecutionActive(true);
 
         // Start execution run reporting using the new unified service
         const projectId = configManager.getProjectId();
         if (projectId) {
-          const workflowId = payload?.data?.workflow_id || `workflow-${Date.now()}`;
-          const workflowName = payload?.data?.workflow_name || "Workflow Execution";
-          const runTypeStr = payload?.data?.run_type || "live_automation";
-          const initialStateIds = payload?.data?.initial_state_ids || [];
+          const data = payload?.data as {
+            workflow_id?: string;
+            workflow_name?: string;
+            run_type?: string;
+            initial_state_ids?: string[];
+          } | undefined;
+          const workflowId = data?.workflow_id || `workflow-${Date.now()}`;
+          const workflowName = data?.workflow_name || "Workflow Execution";
+          const runTypeStr = data?.run_type || "live_automation";
+          const initialStateIds = data?.initial_state_ids || [];
 
           // Map run type string to enum
           let runType: RunType;
@@ -154,11 +154,12 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
   unsubscribers.push(
     eventRouter.subscribe(
       "execution_failed",
-      async (payload: { data?: { error_message?: string } }) => {
+      async (payload: EventPayload) => {
         console.log("[EXECUTION_HANDLER] execution_failed event received");
         setExecutionActive(false);
 
-        const errorMessage = payload?.data?.error_message;
+        const data = payload?.data as { error_message?: string } | undefined;
+        const errorMessage = data?.error_message;
 
         // Complete execution run (failure)
         if (executionReportingService.isActive) {

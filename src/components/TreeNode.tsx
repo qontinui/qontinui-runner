@@ -319,7 +319,7 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
   /**
    * Format duration for display
    */
-  const formatDuration = (duration: number | undefined) => {
+  const formatDuration = (duration: number | null | undefined) => {
     if (duration === undefined || duration === null) {
       return null;
     }

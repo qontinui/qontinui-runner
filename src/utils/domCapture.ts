@@ -363,7 +363,7 @@ function captureElement(
     innerText: visible ? (element as HTMLElement).innerText?.slice(0, 500) || null : null,
 
     attributes: {},
-    dataset: { ...(element as HTMLElement).dataset },
+    dataset: { ...(element as HTMLElement).dataset } as Record<string, string>,
 
     rect: {
       x: rect.x,

@@ -11,6 +11,7 @@
 
 import { logManager } from "../index";
 import type { HandlerSetupFunction } from "./types";
+import type { EventPayload } from "../../types/eventPayloads";
 
 /**
  * Setup constraint-related event handlers
@@ -23,16 +24,14 @@ export const setupConstraintHandlers: HandlerSetupFunction = (context) => {
   unsubscribers.push(
     eventRouter.subscribe(
       "constraint-results",
-      (payload: {
-        data?: {
+      (payload: EventPayload) => {
+        const data = payload.data as {
           task_run_id?: string;
           iteration?: number;
           summary?: string;
           has_blocking?: boolean;
           results?: unknown[];
-        };
-      }) => {
-        const data = payload.data;
+        } | undefined;
         const summary = data?.summary || "Constraint evaluation completed";
         const hasBlocking = data?.has_blocking || false;
         const iteration = data?.iteration;

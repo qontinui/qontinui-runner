@@ -10,6 +10,7 @@ import { Event } from "@tauri-apps/api/event";
 import { eventRouter, logManager } from "../managers";
 import { verificationService } from "../services";
 import { executeAiTask } from "../hooks";
+import type { EventPayload } from "../types/eventPayloads";
 
 interface EventManagerContextValue {
   isConnected: boolean;
@@ -112,7 +113,7 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
           const data = event.payload;
 
           // Route event through EventRouter
-          eventRouter.route(data);
+          eventRouter.route(data as EventPayload);
         });
 
         // Listen for AI output events

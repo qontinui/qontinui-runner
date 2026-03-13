@@ -341,7 +341,7 @@ export function PlaywrightTestBuilderTab({
       const textarea = descriptionTextareaRef.current;
       if (!textarea) {
         // Fallback: append to end
-        setFormDescription((prev) => prev + (prev ? "\n\n" : "") + content);
+        setFormDescription((prev: string) => prev + (prev ? "\n\n" : "") + content);
         descriptionChangedByUser.current = true;
         return;
       }
@@ -696,7 +696,7 @@ export function PlaywrightTestBuilderTab({
           category: formCategory,
           tags: formTags
             .split(",")
-            .map((t) => t.trim())
+            .map((t: string) => t.trim())
             .filter(Boolean),
           timeout_seconds: formTimeoutSeconds,
           display_mode: formDisplayMode,
@@ -1437,7 +1437,7 @@ OR
           category: formCategory,
           tags: formTags
             .split(",")
-            .map((t) => t.trim())
+            .map((t: string) => t.trim())
             .filter(Boolean),
           timeout_seconds: formTimeoutSeconds,
           display_mode: formDisplayMode,
@@ -1839,7 +1839,7 @@ import { test, expect } from '@playwright/test';
           category: formCategory,
           tags: formTags
             .split(",")
-            .map((t) => t.trim())
+            .map((t: string) => t.trim())
             .filter(Boolean),
           timeout_seconds: formTimeoutSeconds,
           display_mode: formDisplayMode,
@@ -2529,7 +2529,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                                   // Re-generate with emphasis on missing requirements
                                   const missingItems = coverageWarnings.join(", ");
                                   setFormAiInstructions(
-                                    (prev) =>
+                                    (prev: string) =>
                                       prev +
                                       (prev ? "\n\n" : "") +
                                       `IMPORTANT: Make sure to implement these missing requirements: ${missingItems}`,

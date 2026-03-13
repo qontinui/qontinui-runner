@@ -9,7 +9,7 @@ import { useEffect, RefObject } from "react";
 
 export interface UseAutoScrollOptions {
   enabled: boolean;
-  containerRef: RefObject<HTMLDivElement>;
+  containerRef: RefObject<HTMLDivElement | null>;
   dependencies: unknown[];
 }
 

@@ -138,7 +138,7 @@ function RunItem({
   const config = getStatusConfig(run.status);
   const StatusIcon = config.icon;
   const isRunning = run.status === "running";
-  const duration = calculateDuration(run.created_at, run.completed_at);
+  const duration = calculateDuration(run.created_at, run.completed_at ?? undefined);
   const errorBadge = useErrorBadge(run.id);
 
   return (
@@ -269,7 +269,7 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
   const config = displayRun ? getStatusConfig(displayRun.status) : null;
   const StatusIcon = config?.icon || Activity;
   const duration = displayRun
-    ? calculateDuration(displayRun.created_at, displayRun.completed_at)
+    ? calculateDuration(displayRun.created_at, displayRun.completed_at ?? undefined)
     : undefined;
 
   return (

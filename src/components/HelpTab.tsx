@@ -603,7 +603,7 @@ function TutorialsPage() {
   const { isCompleted, isInProgress } = useTutorialProgress();
 
   const featuredTutorials = getFeaturedTutorials();
-  const regularTutorials = tutorials.filter((t) => !t.tags.includes("featured"));
+  const regularTutorials = tutorials.filter((t) => !t.tags?.includes("featured"));
 
   return (
     <div className="space-y-6">

@@ -240,7 +240,7 @@ export function PipelineInspectorTab() {
             </StageCard>
 
             <StageCard title="6. Final Output">
-              {selected.validation_errors && (
+              {!!selected.validation_errors && (
                 <div className="mb-2">
                   <div className="text-xs text-muted-foreground mb-1">Validation errors:</div>
                   <JsonBlock data={selected.validation_errors} />

@@ -357,7 +357,7 @@ export function PromptSnippetSelector({
  * Hook to manage @-mention style prompt snippet insertion
  */
 export function usePromptSnippetMention(
-  textareaRef: React.RefObject<HTMLTextAreaElement>,
+  textareaRef: React.RefObject<HTMLTextAreaElement | null>,
   onInsert: (text: string, triggerStart: number, triggerEnd: number) => void,
 ) {
   const [isActive, setIsActive] = useState(false);

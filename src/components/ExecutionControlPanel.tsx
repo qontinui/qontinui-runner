@@ -286,7 +286,7 @@ export function ExecutionControlPanel({
                 <span className="text-xs font-medium">Initial States</span>
                 {resolvedInitialStates.stateIds.length > 0 && (
                   <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-                    {initialStatesOverride !== null
+                    {initialStatesOverride != null
                       ? `${initialStatesOverride.length} override`
                       : `${resolvedInitialStates.stateIds.length}`}
                   </span>
