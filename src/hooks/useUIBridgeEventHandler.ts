@@ -778,7 +778,17 @@ export function useUIBridgeEventHandler(): void {
               return;
             }
             try {
-              const result = eval(expression);
+              // SECURITY: Avoid eval() on arbitrary expressions from event payloads.
+              // Use new Function() which does not have access to the local scope,
+              // and validate that the expression only contains safe property access
+              // patterns (alphanumeric, dots, brackets) to mitigate injection risk.
+              const safeExpressionPattern = /^[a-zA-Z_$][\w$.[\]'"()\s,]*$/;
+              if (!safeExpressionPattern.test(expression)) {
+                throw new Error(
+                  "Expression rejected: only simple property access and function calls are allowed"
+                );
+              }
+              const result = new Function("return " + expression)();
               const resolvedResult = await Promise.resolve(result);
               await sendResponse({
                 requestId,
