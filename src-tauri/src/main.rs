@@ -28,6 +28,7 @@ mod context;
 mod database;
 mod debug_lifecycle;
 mod demo_workflows;
+mod dev_services;
 mod discoveries;
 mod display;
 mod doctor;
@@ -894,6 +895,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::setup_wizard::save_log_sources_from_setup,
             commands::setup_wizard::save_ai_provider_from_setup,
             commands::setup_wizard::suggest_process_configs_for_setup,
+            commands::setup_wizard::suggest_dev_services_for_setup,
+            commands::setup_wizard::save_dev_services_from_setup,
             commands::setup_wizard::discover_claude_config_dirs,
             // Test Orchestrator commands (AI-driven multi-step API test creation)
             commands::test_orchestrator::plan_test_orchestration,
@@ -1143,9 +1146,30 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 ));
 
                 // Load configs from settings and register them
-                let configs = settings::get_managed_process_configs();
+                let mut configs = settings::get_managed_process_configs();
+
+                // In dev-mode, inject default dev services for missing ports
+                if dev_services::is_dev_mode() {
+                    if let Some(workspace) = dev_services::find_workspace_root() {
+                        let missing = dev_services::get_missing_dev_services(&workspace, &configs);
+                        if !missing.is_empty() {
+                            info!(
+                                "Dev-mode: injecting {} default dev services for workspace {}",
+                                missing.len(),
+                                workspace.display()
+                            );
+                            for svc in &missing {
+                                info!("  → {} (group {}, port {:?})", svc.name, svc.start_group, svc.health_port);
+                            }
+                            configs.extend(missing);
+                        }
+                    }
+                }
+
+                // Filter out dev_only services in production
+                let is_dev = dev_services::is_dev_mode();
                 for config in configs {
-                    if config.enabled {
+                    if config.enabled && (is_dev || !config.dev_only) {
                         manager.register(config).await;
                     }
                 }

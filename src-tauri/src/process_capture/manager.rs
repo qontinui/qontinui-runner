@@ -164,20 +164,69 @@ impl ProcessCaptureManager {
         Ok(process.get_output(tail).await)
     }
 
-    /// Start all processes marked as auto_start.
+    /// Start all processes marked as auto_start, respecting start_group ordering.
+    ///
+    /// Processes are started in order of their `start_group` (lower first).
+    /// Within a group, all processes start together. Between groups, the runner
+    /// waits for all health ports in the current group to become ready before
+    /// starting the next group.
     pub async fn start_auto_processes(&self) {
-        let ids: Vec<String> = {
+        // Collect auto-start processes grouped by start_group
+        let groups: std::collections::BTreeMap<u32, Vec<(String, Option<u16>)>> = {
             let processes = self.processes.read().await;
-            processes
-                .values()
-                .filter(|p| p.config.auto_start && p.config.enabled)
-                .map(|p| p.config.id.clone())
-                .collect()
+            let mut map: std::collections::BTreeMap<u32, Vec<(String, Option<u16>)>> =
+                std::collections::BTreeMap::new();
+            for p in processes.values() {
+                if p.config.auto_start && p.config.enabled {
+                    map.entry(p.config.start_group)
+                        .or_default()
+                        .push((p.config.id.clone(), p.config.health_port));
+                }
+            }
+            map
         };
 
-        for id in ids {
-            if let Err(e) = self.start_process(&id).await {
-                error!("Failed to auto-start process '{}': {}", id, e);
+        if groups.is_empty() {
+            return;
+        }
+
+        let total_groups = groups.len();
+        for (group_idx, (group, entries)) in groups.into_iter().enumerate() {
+            info!(
+                "Starting auto-start group {} ({} processes)",
+                group,
+                entries.len()
+            );
+
+            let mut health_ports: Vec<u16> = Vec::new();
+
+            for (id, health_port) in &entries {
+                if let Err(e) = self.start_process(id).await {
+                    error!("Failed to auto-start process '{}': {}", id, e);
+                }
+                if let Some(port) = health_port {
+                    health_ports.push(*port);
+                }
+            }
+
+            // Wait for health ports before starting next group (skip for last group)
+            if group_idx + 1 < total_groups && !health_ports.is_empty() {
+                info!(
+                    "Waiting for health ports {:?} in group {} before starting next group",
+                    health_ports, group
+                );
+                let timeout = Duration::from_secs(60);
+                for port in health_ports {
+                    if !health::wait_for_port_ready(port, timeout).await {
+                        warn!(
+                            "Health port {} did not become ready within {}s, proceeding anyway",
+                            port,
+                            timeout.as_secs()
+                        );
+                    } else {
+                        info!("Health port {} is ready", port);
+                    }
+                }
             }
         }
     }

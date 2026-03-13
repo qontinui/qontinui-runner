@@ -44,6 +44,14 @@ pub struct ProcessConfig {
     /// Regex patterns for errors to ignore (matched against error message and raw entry)
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
+    /// Startup group for ordered startup (lower groups start first, default 0).
+    /// Processes in the same group start together. The runner waits for health ports
+    /// in each group to be ready before starting the next group.
+    #[serde(default)]
+    pub start_group: u32,
+    /// Whether this is a dev-mode-only service (not started in production builds)
+    #[serde(default)]
+    pub dev_only: bool,
 }
 
 fn default_category() -> String {

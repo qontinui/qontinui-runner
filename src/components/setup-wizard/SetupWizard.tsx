@@ -4,10 +4,11 @@ import { StepIndicator } from "./StepIndicator";
 import { WelcomeStep } from "./WelcomeStep";
 import { ProjectStep } from "./ProjectStep";
 import { ProcessStep } from "./ProcessStep";
+import { DevServicesStep } from "./DevServicesStep";
 import { AiProviderStep } from "./AiProviderStep";
 import { ClaudeConfigStep } from "./ClaudeConfigStep";
 
-const STEPS = ["Welcome", "Projects", "Processes", "AI Provider", "Claude Sessions"];
+const STEPS = ["Welcome", "Projects", "Processes", "Dev Services", "AI Provider", "Claude Sessions"];
 
 interface Project {
   path: string;
@@ -29,6 +30,8 @@ interface ProcessConfig {
   enabled: boolean;
   buffer_size: number;
   env?: Record<string, string>;
+  start_group?: number;
+  dev_only?: boolean;
 }
 
 interface SetupWizardProps {
@@ -106,11 +109,13 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
           />
         )}
 
-        {currentStep === 3 && (
+        {currentStep === 3 && <DevServicesStep onNext={goNext} onBack={goBack} />}
+
+        {currentStep === 4 && (
           <AiProviderStep onComplete={handleAiProviderComplete} onBack={goBack} />
         )}
 
-        {currentStep === 4 && <ClaudeConfigStep onComplete={finishSetup} onBack={goBack} />}
+        {currentStep === 5 && <ClaudeConfigStep onComplete={finishSetup} onBack={goBack} />}
       </div>
     </div>
   );

@@ -372,6 +372,8 @@ fn build_process_config(
         "auto_start": false,
         "enabled": true,
         "buffer_size": 2000,
+        "start_group": 0,
+        "dev_only": false,
     });
     if let Some(port) = health_port {
         config["health_port"] = serde_json::json!(port);
@@ -780,4 +782,82 @@ pub async fn suggest_process_configs_for_setup(projects: Vec<Value>) -> Result<V
     }
 
     Ok(suggestions)
+}
+
+// ============================================================================
+// Dev Services (Runner-managed services for dev-mode)
+// ============================================================================
+
+/// Suggest dev-mode services that the runner should manage.
+///
+/// Detects the qontinui workspace and returns ProcessConfig-compatible JSON
+/// for services like Docker, Backend, and Frontend that should auto-start
+/// with the runner in development mode.
+///
+/// Each suggested config includes `start_group` for ordered startup and
+/// `dev_only: true` to ensure they're only active in dev builds.
+#[tauri::command]
+pub async fn suggest_dev_services_for_setup() -> Result<Vec<Value>, String> {
+    info!("Setup wizard: suggesting dev services");
+
+    let workspace = crate::dev_services::find_workspace_root()
+        .ok_or_else(|| "Could not find qontinui workspace root".to_string())?;
+
+    let existing = settings::get_managed_process_configs();
+    let services = crate::dev_services::get_missing_dev_services(&workspace, &existing);
+
+    let result: Vec<Value> = services
+        .into_iter()
+        .map(|svc| {
+            serde_json::json!({
+                "id": svc.id,
+                "name": svc.name,
+                "command": svc.command,
+                "args": svc.args,
+                "cwd": svc.cwd,
+                "env": svc.env,
+                "health_port": svc.health_port,
+                "parser": svc.parser,
+                "category": svc.category,
+                "auto_start": svc.auto_start,
+                "enabled": svc.enabled,
+                "buffer_size": svc.buffer_size,
+                "start_group": svc.start_group,
+                "dev_only": svc.dev_only,
+            })
+        })
+        .collect();
+
+    info!("Suggested {} dev services", result.len());
+    Ok(result)
+}
+
+/// Save selected dev services from the setup wizard.
+///
+/// Saves the selected services as managed process configs with `auto_start: true`
+/// and `dev_only: true`. Services not selected are saved with `auto_start: false`.
+#[tauri::command]
+pub fn save_dev_services_from_setup(
+    services: Vec<Value>,
+    selected_ids: Vec<String>,
+) -> Result<(), String> {
+    info!(
+        "Setup wizard: saving {} dev services ({} selected)",
+        services.len(),
+        selected_ids.len()
+    );
+
+    for service_value in services {
+        let mut config: crate::process_capture::ProcessConfig =
+            serde_json::from_value(service_value)
+                .map_err(|e| format!("Invalid process config: {}", e))?;
+
+        // Set auto_start based on whether the user selected this service
+        config.auto_start = selected_ids.contains(&config.id);
+        config.dev_only = true;
+
+        settings::save_managed_process_config(config)?;
+    }
+
+    Ok(())
 }

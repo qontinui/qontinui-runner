@@ -17,6 +17,8 @@ interface ProcessConfig {
   category: string;
   buffer_size: number;
   enabled: boolean;
+  start_group?: number;
+  dev_only?: boolean;
 }
 
 interface ProcessConfigEditorProps {
@@ -33,7 +35,15 @@ const PARSER_OPTIONS = [
   { value: "rust", label: "Rust" },
 ];
 
-const CATEGORY_OPTIONS = ["backend", "frontend", "database", "build", "testing", "general"];
+const CATEGORY_OPTIONS = [
+  "backend",
+  "frontend",
+  "infrastructure",
+  "database",
+  "build",
+  "testing",
+  "general",
+];
 
 export function ProcessConfigEditor({
   config,
@@ -50,6 +60,8 @@ export function ProcessConfigEditor({
   const [parser, setParser] = useState(config?.parser || "generic");
   const [autoStart, setAutoStart] = useState(config?.auto_start || false);
   const [category, setCategory] = useState(config?.category || "general");
+  const [startGroup, setStartGroup] = useState(config?.start_group?.toString() || "0");
+  const [devOnly, setDevOnly] = useState(config?.dev_only || false);
   const [saving, setSaving] = useState(false);
 
   const browseCwd = useCallback(async () => {
@@ -84,6 +96,8 @@ export function ProcessConfigEditor({
         category,
         buffer_size: config?.buffer_size || 2000,
         enabled: true,
+        start_group: parseInt(startGroup) || 0,
+        dev_only: devOnly,
       };
 
       await invoke("save_process_config", { config: newConfig });
@@ -93,7 +107,7 @@ export function ProcessConfigEditor({
     } finally {
       setSaving(false);
     }
-  }, [name, command, argsStr, cwd, healthPort, parser, autoStart, category, config, onSave]);
+  }, [name, command, argsStr, cwd, healthPort, parser, autoStart, category, startGroup, devOnly, config, onSave]);
 
   return (
     <div className={cn("bg-zinc-900 border border-white/10 rounded-lg p-4", className)}>
@@ -205,18 +219,42 @@ export function ProcessConfigEditor({
           </div>
         </div>
 
-        {/* Auto-start toggle */}
-        <div className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            id="auto-start"
-            checked={autoStart}
-            onChange={(e) => setAutoStart(e.target.checked)}
-            className="w-4 h-4 rounded border-white/10 bg-zinc-800 text-cyan-500 focus:ring-cyan-500"
-          />
-          <label htmlFor="auto-start" className="text-xs text-zinc-400">
-            Auto-start when runner launches
-          </label>
+        {/* Start group + Auto-start + Dev-only */}
+        <div className="grid grid-cols-3 gap-3 items-end">
+          <div>
+            <label className="block text-xs text-zinc-400 mb-1">Start Group</label>
+            <input
+              type="number"
+              min="0"
+              value={startGroup}
+              onChange={(e) => setStartGroup(e.target.value)}
+              className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 focus:outline-none focus:border-cyan-500/50"
+            />
+          </div>
+          <div className="flex items-center gap-2 pb-1">
+            <input
+              type="checkbox"
+              id="auto-start"
+              checked={autoStart}
+              onChange={(e) => setAutoStart(e.target.checked)}
+              className="w-4 h-4 rounded border-white/10 bg-zinc-800 text-cyan-500 focus:ring-cyan-500"
+            />
+            <label htmlFor="auto-start" className="text-xs text-zinc-400">
+              Auto-start
+            </label>
+          </div>
+          <div className="flex items-center gap-2 pb-1">
+            <input
+              type="checkbox"
+              id="dev-only"
+              checked={devOnly}
+              onChange={(e) => setDevOnly(e.target.checked)}
+              className="w-4 h-4 rounded border-white/10 bg-zinc-800 text-cyan-500 focus:ring-cyan-500"
+            />
+            <label htmlFor="dev-only" className="text-xs text-zinc-400">
+              Dev-mode only
+            </label>
+          </div>
         </div>
 
         {/* Actions */}
