@@ -301,6 +301,24 @@ impl EventBroadcaster {
         ));
     }
 
+    /// Broadcast a constraint results event after constraint engine evaluation.
+    pub fn constraint_results(
+        &self,
+        task_run_id: &str,
+        iteration: u32,
+        summary: &str,
+        has_blocking: bool,
+        results: serde_json::Value,
+    ) {
+        self.broadcast_or_warn(AppEvent::constraint_results(
+            task_run_id,
+            iteration,
+            summary,
+            has_blocking,
+            results,
+        ));
+    }
+
     /// Broadcast a generic error event.
     pub fn error(&self, message: impl Into<String>) {
         self.broadcast_or_warn(AppEvent::error(message));

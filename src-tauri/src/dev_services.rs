@@ -56,10 +56,7 @@ pub fn find_workspace_root() -> Option<PathBuf> {
     // A valid workspace has qontinui-web with backend and frontend
     for candidate in candidates {
         if is_qontinui_workspace(&candidate) {
-            info!(
-                "Found qontinui workspace root: {}",
-                candidate.display()
-            );
+            info!("Found qontinui workspace root: {}", candidate.display());
             return Some(candidate);
         }
     }
@@ -106,11 +103,7 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
             id: dev_service_id(workspace, DOCKER_SERVICE_ID_SUFFIX),
             name: "Docker Services (PostgreSQL, Redis, MinIO)".to_string(),
             command: "docker".to_string(),
-            args: vec![
-                "compose".to_string(),
-                "up".to_string(),
-                "-d".to_string(),
-            ],
+            args: vec!["compose".to_string(), "up".to_string(), "-d".to_string()],
             cwd: web_dir.to_string_lossy().to_string(),
             env: HashMap::new(),
             health_port: Some(5432),
@@ -155,14 +148,8 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
         let mut env = HashMap::new();
         // Set TEMP/TMP to workspace .temp to avoid C drive issues on Windows
         let temp_dir = workspace.join(".temp");
-        env.insert(
-            "TEMP".to_string(),
-            temp_dir.to_string_lossy().to_string(),
-        );
-        env.insert(
-            "TMP".to_string(),
-            temp_dir.to_string_lossy().to_string(),
-        );
+        env.insert("TEMP".to_string(), temp_dir.to_string_lossy().to_string());
+        env.insert("TMP".to_string(), temp_dir.to_string_lossy().to_string());
 
         services.push(ProcessConfig {
             id: dev_service_id(workspace, FRONTEND_SERVICE_ID_SUFFIX),

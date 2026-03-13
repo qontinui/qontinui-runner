@@ -11,7 +11,11 @@ export type FixType =
   | "selector_fix"
   | "tool_config_update"
   | "context_addition"
-  | "instruction_clarification";
+  | "instruction_clarification"
+  | "project_environment"
+  | "project_architecture"
+  | "project_test_pattern"
+  | "project_recurring_issue";
 
 /** Status of a reflection fix */
 export type FixStatus = "applied" | "reverted" | "superseded";
@@ -41,6 +45,11 @@ export interface ReflectionFix {
   applied_at: string;
   evaluated_at?: string;
   created_at: string;
+  reasoning?: string;
+  alternatives_considered?: string;
+  reflection_scope?: "workflow" | "project" | "universal";
+  project_path?: string;
+  applicability_context?: string;
 }
 
 /** Input for creating a new reflection fix */
@@ -55,6 +64,8 @@ export interface CreateReflectionFixInput {
   old_value?: string;
   new_value?: string;
   confidence?: FixConfidence;
+  reasoning?: string;
+  alternatives_considered?: string;
 }
 
 /** Input for updating fix effectiveness */

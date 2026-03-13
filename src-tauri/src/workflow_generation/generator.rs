@@ -968,6 +968,22 @@ pub fn generate_workflow(
             Ok(_) => {}
             Err(e) => warn!("Failed to analyze insights for rule promotion: {}", e),
         }
+
+        // Record which generation rules were applied to this workflow
+        let active_rules = rules::list_rules(
+            c,
+            &rules::ListRulesQuery {
+                agent: None,
+                section: None,
+                status: Some("active".to_string()),
+                provenance: None,
+            },
+        );
+        if let Ok(active) = active_rules {
+            if !active.is_empty() {
+                rules::record_rule_applications(c, &active, Some(&workflow.id), None);
+            }
+        }
     }
 
     let artifact = artifact_builder.build(pipeline_start.elapsed().as_millis() as u64);

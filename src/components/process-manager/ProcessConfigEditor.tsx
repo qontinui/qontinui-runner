@@ -107,7 +107,20 @@ export function ProcessConfigEditor({
     } finally {
       setSaving(false);
     }
-  }, [name, command, argsStr, cwd, healthPort, parser, autoStart, category, startGroup, devOnly, config, onSave]);
+  }, [
+    name,
+    command,
+    argsStr,
+    cwd,
+    healthPort,
+    parser,
+    autoStart,
+    category,
+    startGroup,
+    devOnly,
+    config,
+    onSave,
+  ]);
 
   return (
     <div className={cn("bg-zinc-900 border border-white/10 rounded-lg p-4", className)}>

@@ -58,7 +58,6 @@ pub enum PortType {
     Custom { name: String },
 }
 
-
 impl PortType {
     /// Validate a value against this type.
     pub fn validate(&self, value: &serde_json::Value) -> bool {

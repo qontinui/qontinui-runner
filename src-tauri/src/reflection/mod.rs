@@ -11,9 +11,14 @@
 //! - `trigger` - Post-workflow trigger with recursion prevention
 //! - `workflow` - Programmatic reflection workflow definition
 
+pub mod architecture;
+pub mod causal;
+pub mod causal_parser;
 pub mod effectiveness;
 pub mod parser;
+pub mod prediction;
 pub mod storage;
+pub mod trends;
 pub mod trigger;
 pub mod types;
 pub mod workflow;

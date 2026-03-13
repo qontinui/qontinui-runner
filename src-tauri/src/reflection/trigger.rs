@@ -161,53 +161,56 @@ fn has_converged(conn: &Connection, source_task_run_id: &str) -> Result<bool, St
         None => return Ok(false), // No workflow name → can't check convergence
     };
 
-    // Get the last CONVERGENCE_THRESHOLD non-reflection completed runs of this workflow,
-    // ordered by most recent first
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT tr.id, tr.status,
-                   (SELECT COUNT(*) FROM task_run_findings WHERE task_run_id = tr.id) as finding_count
-            FROM task_runs tr
-            WHERE tr.workflow_name = ?1
-              AND tr.is_reflection = 0
-              AND tr.status IN ('complete', 'completed')
-            ORDER BY tr.completed_at DESC
-            LIMIT ?2
-            "#,
-        )
-        .map_err(|e| format!("Failed to prepare convergence query: {}", e))?;
+    // Use the gradient convergence score instead of binary threshold
+    let metrics = super::prediction::compute_convergence_score(conn, &workflow_name, "workflow")?;
 
-    let rows: Vec<(String, u32)> = stmt
-        .query_map(
-            rusqlite::params![workflow_name, CONVERGENCE_THRESHOLD],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(2)?)),
+    // Store snapshot for time-series analysis
+    let project_path: Option<String> = conn
+        .query_row(
+            r#"SELECT COALESCE(
+                json_extract(s.value, '$.shell_command_working_directory'),
+                json_extract(s.value, '$.working_directory')
+            )
+            FROM unified_workflows uw, json_each(uw.setup_steps) s
+            WHERE uw.name = ?1
+              AND COALESCE(
+                json_extract(s.value, '$.shell_command_working_directory'),
+                json_extract(s.value, '$.working_directory')
+              ) IS NOT NULL
+            LIMIT 1"#,
+            rusqlite::params![workflow_name],
+            |row| row.get(0),
         )
-        .map_err(|e| format!("Failed to query convergence: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .ok()
+        .flatten();
 
-    // Need at least CONVERGENCE_THRESHOLD runs to declare convergence
-    if rows.len() < CONVERGENCE_THRESHOLD as usize {
-        return Ok(false);
+    if let Err(e) = super::prediction::store_convergence_snapshot(
+        conn,
+        &workflow_name,
+        project_path.as_deref(),
+        "workflow",
+        &metrics,
+    ) {
+        debug!("Could not store convergence snapshot: {}", e);
     }
 
-    // All runs must have zero findings
-    let all_clean = rows.iter().all(|(_, count)| *count == 0);
-    if all_clean {
+    // Suppress reflection when convergence score >= 0.85
+    if metrics.score >= 0.85 {
         debug!(
-            "Workflow '{}' has {} consecutive clean runs — converged (zero findings)",
+            "Workflow '{}' has converged (score={:.3} >= 0.85, clean_runs={}, eff_rate={:.2})",
             workflow_name,
-            rows.len()
+            metrics.score,
+            metrics.consecutive_clean_runs,
+            metrics.effective_fix_rate
         );
         return Ok(true);
     }
 
-    // Check for repeated identical findings across reflection runs
+    // Also check for stalled reflection (repeated identical findings)
     if has_repeated_findings(conn, source_task_run_id, &workflow_name)? {
         info!(
-            "Workflow '{}' has converged — last {} reflection runs found identical issues",
-            workflow_name, REPEAT_THRESHOLD
+            "Workflow '{}' has converged — last {} reflection runs found identical issues (score={:.3})",
+            workflow_name, REPEAT_THRESHOLD, metrics.score
         );
         return Ok(true);
     }
@@ -355,7 +358,8 @@ pub fn launch_reflection(
 
     let setup_steps = super::workflow::build_setup_steps(&source_task_run_id, &workflow_name);
     let verification_steps = super::workflow::build_verification_steps(&source_task_run_id);
-    let mut completion_steps = super::workflow::build_completion_steps(&workflow_name);
+    let mut completion_steps =
+        super::workflow::build_completion_steps(&workflow_name, &source_task_run_id);
     // Split completion steps: first is automation (api_request), rest are prompt steps
     let completion_prompt_steps = completion_steps.split_off(1);
     let completion_automation_steps = completion_steps;
@@ -551,7 +555,8 @@ fn has_project_converged(conn: &Connection, source_task_run_id: &str) -> Result<
         None => return Ok(false),
     };
 
-    // Get last CONVERGENCE_THRESHOLD project reflection runs for this workflow
+    // Project convergence checks project reflection runs with zero fixes
+    // (different semantics from workflow convergence which checks non-reflection runs)
     let mut stmt = conn
         .prepare(
             r#"
@@ -586,6 +591,29 @@ fn has_project_converged(conn: &Connection, source_task_run_id: &str) -> Result<
     }
 
     let all_empty = rows.iter().all(|count| *count == 0);
+
+    // Store convergence snapshot for monitoring
+    let consecutive_clean = rows.iter().take_while(|&&c| c == 0).count() as u32;
+    let clean_ratio = (consecutive_clean as f64 / CONVERGENCE_THRESHOLD as f64).min(1.0);
+    let metrics = super::prediction::ConvergenceMetrics {
+        score: clean_ratio,
+        consecutive_clean_runs: consecutive_clean,
+        novelty_score: 0.0,
+        effective_fix_rate: if all_empty { 1.0 } else { 0.0 },
+        change_velocity: 0.0,
+        total_fixes: 0,
+        effective_fixes: 0,
+    };
+    if let Err(e) = super::prediction::store_convergence_snapshot(
+        conn,
+        &workflow_name,
+        None,
+        "project",
+        &metrics,
+    ) {
+        debug!("Could not store project convergence snapshot: {}", e);
+    }
+
     if all_empty {
         debug!(
             "Project reflection for '{}' has {} consecutive runs with zero fixes — converged",
@@ -800,10 +828,39 @@ mod tests {
                 fix_type TEXT NOT NULL,
                 fix_description TEXT NOT NULL,
                 confidence TEXT NOT NULL DEFAULT 'medium',
+                content_hash TEXT,
                 status TEXT DEFAULT 'applied',
+                effectiveness TEXT,
+                reasoning TEXT,
+                alternatives_considered TEXT,
                 reflection_scope TEXT DEFAULT 'workflow',
                 project_path TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                target_component TEXT,
+                reuse_count INTEGER DEFAULT 0,
+                applied_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                applicability_context TEXT,
+                fix_description_embedding BLOB
+            );
+            CREATE TABLE convergence_snapshots (
+                id TEXT PRIMARY KEY,
+                workflow_name TEXT NOT NULL,
+                project_path TEXT,
+                scope TEXT NOT NULL DEFAULT 'workflow',
+                convergence_score REAL NOT NULL,
+                consecutive_clean_runs INTEGER NOT NULL,
+                novelty_score REAL NOT NULL,
+                effective_fix_rate REAL NOT NULL,
+                change_velocity REAL NOT NULL,
+                total_fixes INTEGER NOT NULL,
+                effective_fixes INTEGER NOT NULL,
+                snapshot_at TEXT NOT NULL
+            );
+            CREATE TABLE unified_workflows (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                setup_steps TEXT DEFAULT '[]',
+                agentic_steps TEXT DEFAULT '[]'
             );
             "#,
         )

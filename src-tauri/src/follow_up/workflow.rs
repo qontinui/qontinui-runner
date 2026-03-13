@@ -31,6 +31,7 @@ pub fn build_follow_up_config(
         max_sweep_iterations: 5,
         stages: Vec::new(),
         stop_on_failure: false,
+        constraint_overrides: std::collections::HashMap::new(),
         reflection_mode: false,
         provider_override: None,
         model_override: None,

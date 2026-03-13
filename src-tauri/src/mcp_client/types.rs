@@ -14,7 +14,6 @@ pub enum McpTransport {
     Http,
 }
 
-
 /// Stdio transport configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StdioConfig {

@@ -21,7 +21,7 @@ pub fn build_schema_context() -> String {
     let type_refs: Vec<&StepTypeMetadata> = all_types.iter().collect();
     let step_types_doc = generate_step_types_documentation(&type_refs);
     let phase_table = generate_phase_constraint_table(&type_refs);
-    assemble_prompt(&step_types_doc, &phase_table, "", "", None)
+    assemble_prompt(&step_types_doc, &phase_table, "", "", "", None)
 }
 
 /// Build schema context filtered by description keywords.
@@ -33,7 +33,7 @@ pub fn build_schema_context_for_description(description: &str) -> String {
     let filtered = filter_relevant_step_types(description, all_types);
     let step_types_doc = generate_step_types_documentation(&filtered);
     let phase_table = generate_phase_constraint_table(&filtered);
-    assemble_prompt(&step_types_doc, &phase_table, "", "", None)
+    assemble_prompt(&step_types_doc, &phase_table, "", "", "", None)
 }
 
 /// Build full schema context with filtered types + RAG examples from DB.
@@ -75,11 +75,19 @@ pub fn build_schema_context_full(
         String::new()
     };
 
+    // Compute generation confidence from convergence + effectiveness data
+    let confidence_section = if let Some(conn) = conn {
+        build_generation_confidence(conn)
+    } else {
+        String::new()
+    };
+
     assemble_prompt(
         &step_types_doc,
         &phase_table,
         &examples_section,
         &knowledge_section,
+        &confidence_section,
         conn,
     )
 }
@@ -189,6 +197,7 @@ fn assemble_prompt(
     phase_table: &str,
     examples: &str,
     knowledge: &str,
+    confidence: &str,
     conn: Option<&Connection>,
 ) -> String {
     let examples_section = if examples.is_empty() {
@@ -204,6 +213,12 @@ fn assemble_prompt(
         String::new()
     } else {
         knowledge.to_string()
+    };
+
+    let confidence_section = if confidence.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", confidence)
     };
 
     format!(
@@ -320,7 +335,7 @@ Steps can pass data to each other using `inputs` and `extract`:
 {examples_section}
 
 {rules_section}
-
+{confidence_section}
 ## Environment Aliases
 When the user mentions these terms, map them to the correct endpoints:
 - "runner" / "desktop app" → Qontinui Runner at http://localhost:1420 (UI) / http://localhost:9876 (API)
@@ -609,6 +624,68 @@ pub fn format_skills_for_generator(registry: &SkillRegistry) -> String {
 ///
 /// Loads from `generation_rules` DB table if a connection is available,
 /// otherwise falls back to the hardcoded text.
+/// Build a generation confidence section from convergence and effectiveness data.
+///
+/// Uses the prediction engine's convergence score and effective fix rate to
+/// provide the AI generator with calibrated guidance about the project's maturity.
+fn build_generation_confidence(conn: &Connection) -> String {
+    // Try to get a recent convergence snapshot for any workflow in this project
+    let snapshot: Option<(f64, u32, u32)> = conn
+        .query_row(
+            r#"SELECT convergence_score, total_fixes, effective_fixes
+               FROM convergence_snapshots
+               ORDER BY snapshot_at DESC
+               LIMIT 1"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok();
+
+    if let Some((score, total, effective)) = snapshot {
+        let mut section = format!(
+            "## Generation Confidence\n\n// Generation confidence: {:.2} (based on {} effective fixes out of {}, convergence {:.2})\n",
+            score, effective, total, score
+        );
+
+        if score > 0.8 {
+            section.push_str(
+                "This project has well-established patterns. Prefer proven approaches and lean on existing verification patterns.\n",
+            );
+        } else if score < 0.3 {
+            section.push_str(
+                "This project has limited history. Be thorough with verification steps and include extra safety checks.\n",
+            );
+        }
+
+        return section;
+    }
+
+    // If no snapshots exist, try computing from effectiveness data
+    let report = conn
+        .query_row(
+            r#"SELECT
+                 COUNT(*) as total,
+                 SUM(CASE WHEN effectiveness = 'effective' THEN 1 ELSE 0 END) as effective
+               FROM reflection_fixes
+               WHERE effectiveness IS NOT NULL"#,
+            [],
+            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
+        )
+        .ok();
+
+    if let Some((total, effective)) = report {
+        if total > 0 {
+            let rate = effective as f64 / total as f64;
+            return format!(
+                "## Generation Confidence\n\n// Effectiveness rate: {:.0}% ({} effective out of {} evaluated fixes)\n",
+                rate * 100.0, effective, total
+            );
+        }
+    }
+
+    String::new()
+}
+
 fn build_rules_section(conn: Option<&Connection>) -> String {
     if let Some(conn) = conn {
         let important = rules::load_rules(conn, "schema_context", "important_rules");

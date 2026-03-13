@@ -96,6 +96,8 @@ import { AiGeneratePanel } from "./AiGeneratePanel";
 import { StageSelector } from "./StageSelector";
 import { PromptTemplateEditor } from "./PromptTemplateEditor";
 import { ContextManagement } from "./ContextManagement";
+import { ConstraintOverridesEditor } from "./ConstraintOverridesEditor";
+import { ConstraintsPanel } from "./constraints";
 import { PageTutorialMenu } from "../tutorial";
 import { getAccentColors } from "@/design-system";
 import { BatchDeleteDialog, ConfirmDialog } from "../ui";
@@ -434,6 +436,9 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
 
       case "context_management":
         return <ContextManagement key={def.key} />;
+
+      case "constraint_overrides":
+        return <ConstraintOverridesEditor key={def.key} />;
 
       case "per_phase_model_select":
         return <PerPhaseModelSelect key={def.key} />;
@@ -1051,6 +1056,7 @@ function WorkflowBuilderContent({
   const selectedStep = getSelectedStep();
 
   const [showSettings, setShowSettings] = useState(false);
+  const [showConstraints, setShowConstraints] = useState(false);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [dropdownPhase, setDropdownPhase] = useState<WorkflowPhase | null>(null);
 
@@ -1994,6 +2000,7 @@ function WorkflowBuilderContent({
         log_source_selection: workflow.log_source_selection,
       });
       setShowSettings(true);
+      setShowConstraints(false);
       console.log("[WorkflowBuilder] Loaded AI-generated workflow:", workflow.name);
     },
     [resetToNew, updateWorkflow],
@@ -2295,7 +2302,10 @@ function WorkflowBuilderContent({
             </button>
             <button
               data-tutorial-id="workflow-settings"
-              onClick={() => setShowSettings(!showSettings)}
+              onClick={() => {
+                setShowSettings(!showSettings);
+                if (!showSettings) setShowConstraints(false);
+              }}
               className={`p-1.5 rounded-md transition-colors ${
                 showSettings
                   ? "bg-zinc-700 text-zinc-200"
@@ -2304,6 +2314,20 @@ function WorkflowBuilderContent({
               title="Settings"
             >
               <Settings className="w-4 h-4" />
+            </button>
+            <button
+              onClick={() => {
+                setShowConstraints(!showConstraints);
+                if (!showConstraints) setShowSettings(false);
+              }}
+              className={`p-1.5 rounded-md transition-colors ${
+                showConstraints
+                  ? "bg-zinc-700 text-zinc-200"
+                  : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800"
+              }`}
+              title="Constraints"
+            >
+              <ShieldCheck className="w-4 h-4" />
             </button>
             <h1 className="text-lg font-semibold text-zinc-100">
               {state.workflow.name || "New Workflow"}
@@ -2477,6 +2501,9 @@ function WorkflowBuilderContent({
 
         {/* Settings Panel (collapsible) */}
         {showSettings && <SettingsPanel nameInputRef={nameInputRef} />}
+
+        {/* Constraints Panel (collapsible) */}
+        {showConstraints && <ConstraintsPanel onClose={() => setShowConstraints(false)} />}
 
         {/* Main Content with Split Layout */}
         <div className="flex-1 flex overflow-hidden">

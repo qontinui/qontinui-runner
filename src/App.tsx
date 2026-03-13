@@ -170,6 +170,7 @@ import { HooksManagerPanel } from "./components/hooks";
 import { ErrorMonitorTab } from "./components/error-monitor";
 import { ProcessManagerTab } from "./components/process-manager";
 import { ReflectionDashboard } from "./components/reflection-dashboard/ReflectionDashboard";
+import { ArchitectureView } from "./components/architecture-view/ArchitectureView";
 import { GeneratorEvalPage } from "./pages/GeneratorEvalPage";
 import { SpecsPage } from "./pages/specs/SpecsPage";
 import { UIBridgeIntegrationPage } from "./pages/ui-bridge-integration/UIBridgeIntegrationPage";
@@ -196,6 +197,7 @@ type MainTabId =
   | "error-monitor"
   | "processes"
   | "reflection"
+  | "architecture"
   | "generator-eval"
   // Observe group - new structure
   | "run-recap"
@@ -266,6 +268,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "error-monitor",
   "processes",
   "reflection",
+  "architecture",
   "generator-eval",
   // New observe tabs
   "run-recap",
@@ -521,6 +524,11 @@ function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
         breadcrumb: ["System", "Process Manager"],
       },
       reflection: { name: "Reflection", section: "system", breadcrumb: ["System", "Reflection"] },
+      architecture: {
+        name: "Architecture",
+        section: "system",
+        breadcrumb: ["System", "Architecture"],
+      },
       logs: { name: "Logs", section: "system", breadcrumb: ["System", "Logs"] },
       help: { name: "Help", section: "system", breadcrumb: ["Help"] },
 
@@ -1154,6 +1162,13 @@ function AppContent() {
         return (
           <div className="h-full overflow-hidden">
             <ReflectionDashboard />
+          </div>
+        );
+
+      case "architecture":
+        return (
+          <div className="h-full overflow-hidden">
+            <ArchitectureView />
           </div>
         );
 

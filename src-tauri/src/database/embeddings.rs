@@ -126,6 +126,21 @@ pub fn store_knowledge_embedding(
     Ok(())
 }
 
+/// Store an embedding for a reflection fix description.
+pub fn store_reflection_fix_embedding(
+    conn: &Connection,
+    fix_id: &str,
+    embedding: &[f32],
+) -> Result<(), String> {
+    let blob = vector_to_blob(embedding);
+    conn.execute(
+        "UPDATE reflection_fixes SET fix_description_embedding = ?1 WHERE id = ?2",
+        params![blob, fix_id],
+    )
+    .map_err(|e| format!("Failed to store reflection fix embedding: {}", e))?;
+    Ok(())
+}
+
 /// Store an embedding for a unified_workflow description.
 pub fn store_workflow_embedding(
     conn: &Connection,
@@ -243,6 +258,7 @@ fn is_valid_embedding_table(table: &str) -> bool {
             | "learning_outcomes"
             | "learning_patterns"
             | "error_events"
+            | "reflection_fixes"
     )
 }
 

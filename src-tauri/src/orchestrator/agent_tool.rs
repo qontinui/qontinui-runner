@@ -59,7 +59,6 @@ pub enum ToolInputType {
     Any,
 }
 
-
 /// Definition of a tool input parameter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInput {

@@ -326,6 +326,7 @@ pub async fn generate_workflow_standalone(
                             Some(workflow.stages.clone())
                         },
                         stop_on_failure: Some(workflow.stop_on_failure),
+                        constraint_overrides: Some(workflow.constraint_overrides.clone()),
                         approval_gate: Some(workflow.approval_gate),
                         reflection_mode: Some(workflow.reflection_mode),
                         completion_prompts_first: Some(workflow.completion_prompts_first),

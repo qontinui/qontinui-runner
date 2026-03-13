@@ -409,6 +409,11 @@ pub struct UnifiedWorkflow {
     #[serde(default)]
     pub stop_on_failure: bool,
 
+    /// Per-constraint overrides: map of constraint_id to enabled (true) / disabled (false).
+    /// Applied to the constraint engine at execution time, after loading builtins and config.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub constraint_overrides: HashMap<String, bool>,
+
     /// Whether to pause for human approval after each agentic phase.
     #[serde(default)]
     pub approval_gate: bool,
@@ -597,6 +602,9 @@ pub struct CreateUnifiedWorkflowRequest {
     /// Whether to stop execution if a stage fails verification
     #[serde(default)]
     pub stop_on_failure: Option<bool>,
+    /// Per-constraint overrides: map of constraint_id to enabled/disabled
+    #[serde(default)]
+    pub constraint_overrides: Option<HashMap<String, bool>>,
     /// Whether to pause for human approval after each agentic phase
     #[serde(default)]
     pub approval_gate: Option<bool>,
@@ -660,6 +668,8 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub stages: Option<Vec<WorkflowStage>>,
     /// Whether to stop execution if a stage fails verification
     pub stop_on_failure: Option<bool>,
+    /// Per-constraint overrides: map of constraint_id to enabled/disabled
+    pub constraint_overrides: Option<HashMap<String, bool>>,
     /// Whether to pause for human approval after each agentic phase
     pub approval_gate: Option<bool>,
     /// Whether to enable reflection mode during agentic iterations

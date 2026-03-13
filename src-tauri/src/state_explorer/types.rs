@@ -20,7 +20,6 @@ pub enum ExplorationPriority {
     Low,
 }
 
-
 /// Status of an exploration check
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,7 +41,6 @@ pub enum ExplorationStatus {
     /// Exploration paused at checkpoint for agentic work
     Paused,
 }
-
 
 /// Configuration for an exploration task
 #[derive(Debug, Clone, Serialize, Deserialize)]

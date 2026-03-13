@@ -435,6 +435,70 @@ pub fn hybrid_search_workflows(
 }
 
 // ============================================================================
+// Universal fix search
+// ============================================================================
+
+/// A universal fix result from hybrid search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UniversalFixResult {
+    pub id: String,
+    pub fix_type: String,
+    pub fix_description: String,
+    pub applicability_context: Option<String>,
+    pub reuse_count: i32,
+    pub confidence: String,
+    pub created_at: String,
+}
+
+/// Search universal reflection fixes using hybrid SQL + vector approach.
+///
+/// SQL pre-filter: scope='universal', status='applied'
+/// Vector re-rank: cosine similarity between query_embedding and fix_description_embedding
+pub fn hybrid_search_universal_fixes(
+    conn: &Connection,
+    query_embedding: &[f32],
+    config: &HybridSearchConfig,
+) -> Result<Vec<SearchResult<UniversalFixResult>>, String> {
+    let candidate_limit = config.limit * 3;
+    let sql = format!(
+        "SELECT id, fix_type, fix_description, applicability_context, reuse_count, confidence, \
+         created_at, fix_description_embedding \
+         FROM reflection_fixes \
+         WHERE reflection_scope = 'universal' AND status = 'applied' \
+         AND fix_description_embedding IS NOT NULL \
+         ORDER BY reuse_count DESC, created_at DESC \
+         LIMIT {}",
+        candidate_limit
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Failed to prepare universal fix search: {}", e))?;
+
+    let candidates: Vec<(UniversalFixResult, Option<Vec<f32>>)> = stmt
+        .query_map([], |row| {
+            let embedding_blob: Option<Vec<u8>> = row.get(7)?;
+            Ok((
+                UniversalFixResult {
+                    id: row.get(0)?,
+                    fix_type: row.get(1)?,
+                    fix_description: row.get(2)?,
+                    applicability_context: row.get(3)?,
+                    reuse_count: row.get(4)?,
+                    confidence: row.get(5)?,
+                    created_at: row.get(6)?,
+                },
+                embedding_blob.and_then(|b| blob_to_vector(&b)),
+            ))
+        })
+        .map_err(|e| format!("Failed to query universal fixes: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(rank_results(candidates, query_embedding, config))
+}
+
+// ============================================================================
 // Re-ranking logic
 // ============================================================================
 

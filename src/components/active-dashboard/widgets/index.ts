@@ -115,6 +115,13 @@ export {
 // Convergence (standalone widget - not registry-based)
 export { ConvergenceWidget } from "./convergence";
 
+// Constraint Results (standalone widget - not registry-based)
+export {
+  ConstraintResultsWidget,
+  useConstraintResults,
+  type ConstraintResultsData,
+} from "./constraints";
+
 // AI Stream (standalone widget - not registry-based)
 export { AiStreamWidget } from "./ai-stream";
 

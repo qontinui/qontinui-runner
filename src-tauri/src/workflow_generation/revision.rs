@@ -818,6 +818,7 @@ mod tests {
             generated_by_task_run_id: None,
             stages: vec![],
             stop_on_failure: false,
+            constraint_overrides: std::collections::HashMap::new(),
             approval_gate: false,
             reflection_mode: true,
             completion_prompts_first: false,

@@ -23,6 +23,7 @@ pub mod canvas;
 pub mod checkpoints;
 pub mod checks;
 pub mod configs;
+pub mod constraints_api;
 pub mod contexts;
 pub mod dom_capture;
 pub mod error_monitor;

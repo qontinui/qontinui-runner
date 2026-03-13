@@ -398,6 +398,32 @@ pub fn delete_rule(conn: &Connection, id: &str) -> Result<bool, String> {
 }
 
 // ============================================================================
+// Rule Application Tracking
+// ============================================================================
+
+/// Record which generation rules were applied during a workflow generation run.
+/// Creates a `rule_applications` row for each active rule, linking it to the
+/// generated workflow and (optionally) the task run that triggered generation.
+pub fn record_rule_applications(
+    conn: &Connection,
+    rules: &[GenerationRule],
+    workflow_id: Option<&str>,
+    task_run_id: Option<&str>,
+) {
+    let now = Utc::now().to_rfc3339();
+    for rule in rules {
+        let id = format!("ruleapp-{}", Uuid::new_v4());
+        if let Err(e) = conn.execute(
+            r#"INSERT INTO rule_applications (id, rule_id, workflow_id, task_run_id, agent, section, applied_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+            params![id, rule.id, workflow_id, task_run_id, rule.agent, rule.section, now],
+        ) {
+            warn!("Failed to record rule application for {}: {}", rule.id, e);
+        }
+    }
+}
+
+// ============================================================================
 // Helper Functions for Auto-Apply
 // ============================================================================
 

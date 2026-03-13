@@ -576,7 +576,11 @@ mod tests {
                 status TEXT NOT NULL DEFAULT 'applied',
                 effectiveness TEXT,
                 source_agent TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                reflection_scope TEXT DEFAULT 'workflow',
+                project_path TEXT,
+                applicability_context TEXT,
+                fix_description_embedding BLOB
             );
             CREATE TABLE unified_workflows (
                 id TEXT PRIMARY KEY,

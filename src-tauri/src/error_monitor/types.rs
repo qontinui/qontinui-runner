@@ -45,7 +45,6 @@ impl LogFormat {
     }
 }
 
-
 /// Parser type for extracting errors from logs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -84,7 +83,6 @@ impl ParserType {
     }
 }
 
-
 /// Path type for log source location
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -117,7 +115,6 @@ impl PathType {
         }
     }
 }
-
 
 /// Configuration for a log source to monitor
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,7 +216,6 @@ impl ErrorSeverity {
     }
 }
 
-
 /// Status of an error event
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -281,7 +277,6 @@ impl ErrorStatus {
         )
     }
 }
-
 
 /// Location information for an error
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

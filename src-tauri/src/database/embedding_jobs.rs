@@ -13,8 +13,9 @@ use tracing::{debug, info, warn};
 use super::embedding_client::EmbeddingClient;
 use super::embeddings::{
     self, store_error_event_embedding, store_finding_embedding, store_knowledge_embedding,
-    store_learning_outcome_embedding, store_learning_pattern_embedding, store_task_run_embedding,
-    store_workflow_embedding, FindingEmbeddingColumn, TaskRunEmbeddingColumn,
+    store_learning_outcome_embedding, store_learning_pattern_embedding,
+    store_reflection_fix_embedding, store_task_run_embedding, store_workflow_embedding,
+    FindingEmbeddingColumn, TaskRunEmbeddingColumn,
 };
 use crate::database::CheckpointDb;
 
@@ -100,6 +101,12 @@ const EMBEDDING_TARGETS: &[EmbeddingTarget] = &[
         id_column: "id",
         text_column: "message",
         embedding_column: "message_embedding",
+    },
+    EmbeddingTarget {
+        table: "reflection_fixes",
+        id_column: "id",
+        text_column: "fix_description",
+        embedding_column: "fix_description_embedding",
     },
 ];
 
@@ -273,6 +280,9 @@ fn store_embedding_by_target(
                 .parse()
                 .map_err(|e| format!("Invalid error_event id: {}", e))?;
             store_error_event_embedding(conn, int_id, embedding)
+        }
+        ("reflection_fixes", "fix_description_embedding") => {
+            store_reflection_fix_embedding(conn, id, embedding)
         }
         _ => Err(format!(
             "Unknown embedding target: {}.{}",

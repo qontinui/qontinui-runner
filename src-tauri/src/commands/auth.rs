@@ -402,16 +402,33 @@ pub async fn check_auth_status() -> Result<AuthStatus, String> {
     })?;
 
     // Validate token by calling /users/me endpoint
-    let client = reqwest::Client::new();
-    let response = client
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let response = match client
         .get(format!("{}/api/v1/auth/users/me", get_api_base_url()))
         .bearer_auth(&access_token)
         .send()
         .await
-        .map_err(|e| {
-            error!("Failed to validate token: {}", e);
-            format!("Network error: {}", e)
-        })?;
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            // Backend unreachable — tokens exist, assume authenticated.
+            // The runner should work offline; token validity will be checked
+            // when the backend becomes available again.
+            warn!(
+                "Backend unreachable during auth check ({}), assuming authenticated with stored tokens",
+                e
+            );
+            let device_id = auth_manager.get_device_id().ok();
+            return Ok(AuthStatus {
+                authenticated: true,
+                user: None,
+                device_id,
+            });
+        }
+    };
 
     if !response.status().is_success() {
         let status = response.status();

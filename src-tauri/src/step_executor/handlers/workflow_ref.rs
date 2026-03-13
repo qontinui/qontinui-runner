@@ -205,6 +205,7 @@ impl StepHandler for WorkflowRefHandler {
             max_sweep_iterations: 0,
             stages: vec![stage],
             stop_on_failure: true,
+            constraint_overrides: std::collections::HashMap::new(),
             reflection_mode: false,
             provider_override,
             model_override,

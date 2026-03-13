@@ -6191,6 +6191,299 @@ impl CheckpointDb {
             info!("Successfully migrated to version 97 (project reflection columns)");
         }
 
+        // Migration to version 98: Add workflow_constraint_results table
+        // Stores constraint engine evaluation results per-iteration for post-run review
+        if current_version < 98 {
+            info!("Migrating to version 98 (workflow_constraint_results table)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS workflow_constraint_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_run_id TEXT NOT NULL,
+                    iteration INTEGER NOT NULL,
+                    constraint_id TEXT NOT NULL,
+                    constraint_name TEXT NOT NULL,
+                    passed INTEGER NOT NULL,
+                    severity TEXT NOT NULL,
+                    violations_json TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_wf_constraint_task_run ON workflow_constraint_results(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_wf_constraint_iteration ON workflow_constraint_results(iteration);
+                CREATE INDEX IF NOT EXISTS idx_wf_constraint_passed ON workflow_constraint_results(passed);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (98, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 98: {}", e))?;
+
+            info!("Successfully migrated to version 98 (workflow_constraint_results table)");
+        }
+
+        // Migration to version 99: Cognitive System Model
+        // Adds knowledge properties (accumulation monotonicity, convergence gradient,
+        // relevance decay) and prediction capabilities to the reflection system.
+        if current_version < 99 {
+            info!("Migrating to version 99 (cognitive system model)...");
+
+            conn.execute_batch(
+                r#"
+                -- New columns on reflection_fixes
+                ALTER TABLE reflection_fixes ADD COLUMN target_component TEXT;
+                ALTER TABLE reflection_fixes ADD COLUMN reuse_count INTEGER DEFAULT 0;
+
+                -- New columns on task_knowledge
+                ALTER TABLE task_knowledge ADD COLUMN last_validated_at TEXT;
+                ALTER TABLE task_knowledge ADD COLUMN validation_count INTEGER DEFAULT 0;
+
+                -- New column on error_events
+                ALTER TABLE error_events ADD COLUMN resolved_by_fix_id TEXT;
+
+                -- Fix applications: tracks each time a fix is reused
+                CREATE TABLE IF NOT EXISTS fix_applications (
+                    id TEXT PRIMARY KEY,
+                    fix_id TEXT NOT NULL,
+                    task_run_id TEXT NOT NULL,
+                    error_signature_hash TEXT,
+                    outcome TEXT DEFAULT 'pending',
+                    applied_at TEXT NOT NULL,
+                    evaluated_at TEXT,
+                    FOREIGN KEY (fix_id) REFERENCES reflection_fixes(id) ON DELETE CASCADE,
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_fix_applications_fix ON fix_applications(fix_id);
+                CREATE INDEX IF NOT EXISTS idx_fix_applications_task ON fix_applications(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_fix_applications_sig ON fix_applications(error_signature_hash);
+
+                -- Convergence snapshots: time-series convergence metrics
+                CREATE TABLE IF NOT EXISTS convergence_snapshots (
+                    id TEXT PRIMARY KEY,
+                    workflow_name TEXT NOT NULL,
+                    project_path TEXT,
+                    scope TEXT NOT NULL DEFAULT 'workflow',
+                    convergence_score REAL NOT NULL,
+                    consecutive_clean_runs INTEGER NOT NULL,
+                    novelty_score REAL NOT NULL,
+                    effective_fix_rate REAL NOT NULL,
+                    change_velocity REAL NOT NULL,
+                    total_fixes INTEGER NOT NULL,
+                    effective_fixes INTEGER NOT NULL,
+                    snapshot_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_convergence_workflow ON convergence_snapshots(workflow_name);
+                CREATE INDEX IF NOT EXISTS idx_convergence_project ON convergence_snapshots(project_path);
+                CREATE INDEX IF NOT EXISTS idx_convergence_scope ON convergence_snapshots(scope);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (99, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 99: {}", e))?;
+
+            info!("Successfully migrated to version 99 (cognitive system model)");
+        }
+
+        // Migration to version 100: Causal Chain Tracking
+        // Adds directed cause→effect graph for tracking causal relationships between
+        // events (findings, errors, fixes, verifications).
+        if current_version < 100 {
+            info!("Migrating to version 100 (causal chain tracking)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS causal_events (
+                    id TEXT PRIMARY KEY,
+                    cause_event_type TEXT NOT NULL,
+                    cause_event_id TEXT NOT NULL,
+                    effect_event_type TEXT NOT NULL,
+                    effect_event_id TEXT NOT NULL,
+                    relationship TEXT NOT NULL,
+                    confidence TEXT NOT NULL DEFAULT 'high',
+                    source TEXT NOT NULL DEFAULT 'automated',
+                    task_run_id TEXT,
+                    workflow_name TEXT,
+                    description TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_causal_cause ON causal_events(cause_event_type, cause_event_id);
+                CREATE INDEX IF NOT EXISTS idx_causal_effect ON causal_events(effect_event_type, effect_event_id);
+                CREATE INDEX IF NOT EXISTS idx_causal_workflow ON causal_events(workflow_name);
+                CREATE INDEX IF NOT EXISTS idx_causal_task_run ON causal_events(task_run_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (100, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 100: {}", e))?;
+
+            info!("Successfully migrated to version 100 (causal chain tracking)");
+        }
+
+        // Migration to version 101: Architecture Model
+        // Aggregated component-level data from reflection fixes, causal events,
+        // and knowledge into a queryable graph of components and relationships.
+        if current_version < 101 {
+            info!("Migrating to version 101 (architecture model)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS architecture_components (
+                    id TEXT PRIMARY KEY,
+                    workflow_name TEXT NOT NULL,
+                    component_path TEXT NOT NULL,
+                    component_type TEXT NOT NULL DEFAULT 'file',
+                    fix_count INTEGER NOT NULL DEFAULT 0,
+                    error_count INTEGER NOT NULL DEFAULT 0,
+                    causal_involvement_count INTEGER NOT NULL DEFAULT 0,
+                    effective_fix_count INTEGER NOT NULL DEFAULT 0,
+                    ineffective_fix_count INTEGER NOT NULL DEFAULT 0,
+                    health_score REAL NOT NULL DEFAULT 1.0,
+                    change_velocity REAL NOT NULL DEFAULT 0.0,
+                    last_activity_at TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(workflow_name, component_path)
+                );
+                CREATE INDEX IF NOT EXISTS idx_arch_comp_workflow ON architecture_components(workflow_name);
+                CREATE INDEX IF NOT EXISTS idx_arch_comp_health ON architecture_components(health_score);
+
+                CREATE TABLE IF NOT EXISTS component_relationships (
+                    id TEXT PRIMARY KEY,
+                    workflow_name TEXT NOT NULL,
+                    source_component TEXT NOT NULL,
+                    target_component TEXT NOT NULL,
+                    relationship_type TEXT NOT NULL,
+                    strength INTEGER NOT NULL DEFAULT 1,
+                    last_seen_at TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(workflow_name, source_component, target_component, relationship_type)
+                );
+                CREATE INDEX IF NOT EXISTS idx_comp_rel_workflow ON component_relationships(workflow_name);
+                CREATE INDEX IF NOT EXISTS idx_comp_rel_source ON component_relationships(source_component);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (101, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 101: {}", e))?;
+
+            info!("Successfully migrated to version 101 (architecture model)");
+        }
+
+        // Migration to version 102: Add constraint_overrides to unified_workflows
+        if current_version < 102 {
+            info!("Migrating to version 102 (add constraint_overrides to unified_workflows)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN constraint_overrides TEXT DEFAULT '{}';
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (102, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 102: {}", e))?;
+
+            info!("Successfully migrated to version 102 (constraint_overrides)");
+        }
+
+        // Migration to version 103: Component health snapshots for temporal trends
+        if current_version < 103 {
+            info!("Migrating to version 103 (component health snapshots)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS component_health_snapshots (
+                    id TEXT PRIMARY KEY,
+                    workflow_name TEXT NOT NULL,
+                    component_path TEXT NOT NULL,
+                    health_score REAL NOT NULL,
+                    fix_count INTEGER NOT NULL DEFAULT 0,
+                    effective_fix_count INTEGER NOT NULL DEFAULT 0,
+                    change_velocity REAL NOT NULL DEFAULT 0.0,
+                    snapshot_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_comp_health_snap_wf ON component_health_snapshots(workflow_name);
+                CREATE INDEX IF NOT EXISTS idx_comp_health_snap_comp ON component_health_snapshots(workflow_name, component_path);
+                CREATE INDEX IF NOT EXISTS idx_comp_health_snap_at ON component_health_snapshots(snapshot_at);
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (103, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 103: {}", e))?;
+
+            info!("Successfully migrated to version 103 (component health snapshots)");
+        }
+
+        // Migration to version 104: Decision context capture
+        if current_version < 104 {
+            info!("Migrating to version 104 (decision context capture)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE reflection_fixes ADD COLUMN reasoning TEXT;
+                ALTER TABLE reflection_fixes ADD COLUMN alternatives_considered TEXT;
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (104, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 104: {}", e))?;
+
+            info!("Successfully migrated to version 104 (decision context capture)");
+        }
+
+        // Migration to version 105: Cross-project patterns (hybrid RAG)
+        if current_version < 105 {
+            info!("Migrating to version 105 (cross-project patterns)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE reflection_fixes ADD COLUMN applicability_context TEXT;
+                ALTER TABLE reflection_fixes ADD COLUMN fix_description_embedding BLOB;
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (105, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 105: {}", e))?;
+
+            info!("Successfully migrated to version 105 (cross-project patterns)");
+        }
+
+        if current_version < 106 {
+            info!("Migrating to version 106 (generation rule application tracking)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS rule_applications (
+                    id TEXT PRIMARY KEY,
+                    rule_id TEXT NOT NULL,
+                    workflow_id TEXT,
+                    task_run_id TEXT,
+                    agent TEXT NOT NULL,
+                    section TEXT NOT NULL,
+                    applied_at TEXT NOT NULL,
+                    FOREIGN KEY (rule_id) REFERENCES generation_rules(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_rule_apps_rule ON rule_applications(rule_id);
+                CREATE INDEX IF NOT EXISTS idx_rule_apps_workflow ON rule_applications(workflow_id);
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (106, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 106: {}", e))?;
+
+            info!("Successfully migrated to version 106 (generation rule application tracking)");
+        }
+
+        if current_version < 107 {
+            info!("Migrating to version 107 (causal events dedup index)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_causal_dedup ON causal_events(cause_event_type, cause_event_id, effect_event_type, effect_event_id);
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (107, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 107: {}", e))?;
+
+            info!("Successfully migrated to version 107 (causal events dedup index)");
+        }
+
         Ok(())
     }
 
@@ -12228,6 +12521,169 @@ impl CheckpointDb {
     }
 
     // ========================================================================
+    // Workflow Constraint Results
+    // ========================================================================
+
+    /// Store constraint evaluation results for a given iteration.
+    ///
+    /// Each `ConstraintResult` is stored as a separate row, enabling per-constraint
+    /// queries. Violations are serialized as a JSON array.
+    pub fn store_constraint_results(
+        &self,
+        task_run_id: &str,
+        iteration: u32,
+        results: &[crate::constraint_engine::ConstraintResult],
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Delete any existing results for this (task_run_id, iteration) to support upsert semantics
+        conn.execute(
+            "DELETE FROM workflow_constraint_results WHERE task_run_id = ?1 AND iteration = ?2",
+            params![task_run_id, iteration as i64],
+        )
+        .map_err(|e| format!("Failed to delete old constraint results: {}", e))?;
+
+        for result in results {
+            let severity_str = serde_json::to_value(result.severity)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| format!("{:?}", result.severity).to_lowercase());
+
+            let violations_json = if result.violations.is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::to_string(&result.violations)
+                        .map_err(|e| format!("Failed to serialize constraint violations: {}", e))?,
+                )
+            };
+
+            conn.execute(
+                r#"
+                INSERT INTO workflow_constraint_results (
+                    task_run_id, iteration, constraint_id, constraint_name,
+                    passed, severity, violations_json, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    task_run_id,
+                    iteration as i64,
+                    result.constraint_id,
+                    result.constraint_name,
+                    result.passed as i32,
+                    severity_str,
+                    violations_json,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("Failed to store constraint result: {}", e))?;
+        }
+
+        let failed_count = results.iter().filter(|r| !r.passed).count();
+        info!(
+            "Stored {} constraint results for task {} iteration {} ({} failed)",
+            results.len(),
+            task_run_id,
+            iteration,
+            failed_count
+        );
+
+        Ok(())
+    }
+
+    /// Delete all constraint results for a task run.
+    /// Used when starting a fresh run to clear stale data from previous interrupted runs.
+    pub fn delete_constraint_results(&self, task_run_id: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+
+        conn.execute(
+            "DELETE FROM workflow_constraint_results WHERE task_run_id = ?1",
+            params![task_run_id],
+        )
+        .map_err(|e| format!("Failed to delete constraint results: {}", e))?;
+
+        info!("Deleted constraint results for task {}", task_run_id);
+        Ok(())
+    }
+
+    /// Get constraint results for a task run, optionally filtered by iteration.
+    /// Returns results as JSON values for flexibility.
+    pub fn get_constraint_results(
+        &self,
+        task_run_id: &str,
+        iteration: Option<u32>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.get_conn()?;
+
+        // Row mapper shared by both query branches
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<serde_json::Value> {
+            let constraint_id: String = row.get(0)?;
+            let constraint_name: String = row.get(1)?;
+            let passed: i32 = row.get(2)?;
+            let severity: String = row.get(3)?;
+            let violations_json: Option<String> = row.get(4)?;
+            let iteration: i64 = row.get(5)?;
+            let created_at: String = row.get(6)?;
+
+            let violations: serde_json::Value = violations_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::Value::Array(vec![]));
+
+            Ok(serde_json::json!({
+                "constraint_id": constraint_id,
+                "constraint_name": constraint_name,
+                "passed": passed != 0,
+                "severity": severity,
+                "violations": violations,
+                "iteration": iteration,
+                "created_at": created_at,
+            }))
+        };
+
+        let rows: Vec<serde_json::Value> = if let Some(iter) = iteration {
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    SELECT constraint_id, constraint_name, passed, severity, violations_json, iteration, created_at
+                    FROM workflow_constraint_results
+                    WHERE task_run_id = ?1 AND iteration = ?2
+                    ORDER BY id ASC
+                    "#,
+                )
+                .map_err(|e| format!("Failed to prepare constraint results query: {}", e))?;
+
+            let results = stmt
+                .query_map(params![task_run_id, iter as i64], &map_row)
+                .map_err(|e| format!("Failed to query constraint results: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+            results
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    SELECT constraint_id, constraint_name, passed, severity, violations_json, iteration, created_at
+                    FROM workflow_constraint_results
+                    WHERE task_run_id = ?1
+                    ORDER BY iteration ASC, id ASC
+                    "#,
+                )
+                .map_err(|e| format!("Failed to prepare constraint results query: {}", e))?;
+
+            let results = stmt
+                .query_map(params![task_run_id], &map_row)
+                .map_err(|e| format!("Failed to query constraint results: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+            results
+        };
+
+        Ok(rows)
+    }
+
+    // ========================================================================
     // Saved API Requests Operations
     // ========================================================================
 
@@ -12711,7 +13167,7 @@ impl CheckpointDb {
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                        stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                        completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
-                       quality_report
+                       quality_report, constraint_overrides
                 FROM unified_workflows
                 ORDER BY is_favorite DESC, updated_at DESC
                 "#,
@@ -12802,6 +13258,10 @@ impl CheckpointDb {
                     quality_report: row
                         .get::<_, Option<String>>(37)?
                         .and_then(|s| serde_json::from_str(&s).ok()),
+                    constraint_overrides: row
+                        .get::<_, Option<String>>(38)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -12910,6 +13370,7 @@ impl CheckpointDb {
                     dependency_graph: row.get::<_, Option<String>>(35)?.and_then(|s| serde_json::from_str(&s).ok()),
                     cost_annotations: row.get::<_, Option<String>>(36)?.and_then(|s| serde_json::from_str(&s).ok()),
                     quality_report: row.get::<_, Option<String>>(37)?.and_then(|s| serde_json::from_str(&s).ok()),
+                    constraint_overrides: row.get::<_, Option<String>>(38)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -13022,6 +13483,7 @@ impl CheckpointDb {
                     dependency_graph: row.get::<_, Option<String>>(35)?.and_then(|s| serde_json::from_str(&s).ok()),
                     cost_annotations: row.get::<_, Option<String>>(36)?.and_then(|s| serde_json::from_str(&s).ok()),
                     quality_report: row.get::<_, Option<String>>(37)?.and_then(|s| serde_json::from_str(&s).ok()),
+                    constraint_overrides: row.get::<_, Option<String>>(38)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -13088,8 +13550,9 @@ impl CheckpointDb {
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                 stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
-                completion_prompts_first, dependency_graph, cost_annotations, quality_report
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)
+                completion_prompts_first, dependency_graph, cost_annotations, quality_report,
+                constraint_overrides
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)
             "#,
             params![
                 id,
@@ -13129,6 +13592,7 @@ impl CheckpointDb {
                 request.dependency_graph.as_ref().map(|v| v.to_string()),
                 request.cost_annotations.as_ref().map(|v| v.to_string()),
                 request.quality_report.as_ref().map(|v| v.to_string()),
+                serde_json::to_string(&request.constraint_overrides.clone().unwrap_or_default()).unwrap_or_else(|_| "{}".to_string()),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -13190,8 +13654,9 @@ impl CheckpointDb {
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                 stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
-                completion_prompts_first, dependency_graph, cost_annotations, quality_report
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)
+                completion_prompts_first, dependency_graph, cost_annotations, quality_report,
+                constraint_overrides
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)
             "#,
             params![
                 id,
@@ -13231,6 +13696,7 @@ impl CheckpointDb {
                 request.dependency_graph.as_ref().map(|v| v.to_string()),
                 request.cost_annotations.as_ref().map(|v| v.to_string()),
                 request.quality_report.as_ref().map(|v| v.to_string()),
+                serde_json::to_string(&request.constraint_overrides.clone().unwrap_or_default()).unwrap_or_else(|_| "{}".to_string()),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -13330,6 +13796,10 @@ impl CheckpointDb {
             .unwrap_or(existing.max_sweep_iterations);
         let stages = request.stages.as_ref().unwrap_or(&existing.stages);
         let stop_on_failure = request.stop_on_failure.unwrap_or(existing.stop_on_failure);
+        let constraint_overrides = request
+            .constraint_overrides
+            .as_ref()
+            .unwrap_or(&existing.constraint_overrides);
         let approval_gate = request.approval_gate.unwrap_or(existing.approval_gate);
         let reflection_mode = request.reflection_mode.unwrap_or(existing.reflection_mode);
         let completion_prompts_first = request
@@ -13409,8 +13879,9 @@ impl CheckpointDb {
                 completion_prompts_first = ?31,
                 dependency_graph = ?32,
                 cost_annotations = ?33,
-                quality_report = ?34
-            WHERE id = ?35
+                quality_report = ?34,
+                constraint_overrides = ?35
+            WHERE id = ?36
             "#,
             params![
                 name,
@@ -13447,6 +13918,7 @@ impl CheckpointDb {
                 dependency_graph.map(|v| v.to_string()),
                 cost_annotations.map(|v| v.to_string()),
                 quality_report.map(|v| v.to_string()),
+                serde_json::to_string(constraint_overrides).unwrap_or_else(|_| "{}".to_string()),
                 id,
             ],
         )
@@ -13604,6 +14076,10 @@ impl CheckpointDb {
                     quality_report: row
                         .get::<_, Option<String>>(37)?
                         .and_then(|s| serde_json::from_str(&s).ok()),
+                    constraint_overrides: row
+                        .get::<_, Option<String>>(38)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -13653,6 +14129,7 @@ impl CheckpointDb {
             max_sweep_iterations: Some(original.max_sweep_iterations),
             stages: Some(original.stages),
             stop_on_failure: Some(original.stop_on_failure),
+            constraint_overrides: Some(original.constraint_overrides),
             approval_gate: Some(original.approval_gate),
             reflection_mode: Some(original.reflection_mode),
             completion_prompts_first: Some(original.completion_prompts_first),
@@ -13713,7 +14190,7 @@ impl CheckpointDb {
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep,
                        max_sweep_iterations, stages, stop_on_failure, reflection_mode, model_overrides,
                        approval_gate, completion_prompts_first, is_favorite, dependency_graph,
-                       cost_annotations, quality_report
+                       cost_annotations, quality_report, constraint_overrides
                 FROM unified_workflows
                 WHERE sync_pending = 1
                 "#,
@@ -13804,6 +14281,10 @@ impl CheckpointDb {
                     quality_report: row
                         .get::<_, Option<String>>(37)?
                         .and_then(|s| serde_json::from_str(&s).ok()),
+                    constraint_overrides: row
+                        .get::<_, Option<String>>(38)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
                     targeted_error_ids: vec![],
                 })
             })
@@ -16411,7 +16892,7 @@ impl CheckpointDb {
                        generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                        stages, stop_on_failure, reflection_mode, sync_pending, example_status,
                        model_overrides, approval_gate, completion_prompts_first, is_favorite,
-                       dependency_graph, cost_annotations, quality_report
+                       dependency_graph, cost_annotations, quality_report, constraint_overrides
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -16505,6 +16986,7 @@ impl CheckpointDb {
                     "dependency_graph": row.get::<_, Option<String>>(37)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     "cost_annotations": row.get::<_, Option<String>>(38)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     "quality_report": row.get::<_, Option<String>>(39)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "constraint_overrides": row.get::<_, Option<String>>(40)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).unwrap_or(serde_json::json!({})),
                 }))
             })
             .map_err(|e| format!("Failed to export unified workflows: {}", e))?
@@ -17011,6 +17493,8 @@ impl CheckpointDb {
             let is_favorite = workflow["is_favorite"].as_i64().unwrap_or(0);
             let sync_pending = workflow["sync_pending"].as_i64().unwrap_or(0);
             let example_status = workflow["example_status"].as_str().unwrap_or("pending");
+            let constraint_overrides = serde_json::to_string(&workflow["constraint_overrides"])
+                .unwrap_or_else(|_| "{}".to_string());
 
             let result = conn.execute(
                 r#"
@@ -17023,12 +17507,12 @@ impl CheckpointDb {
                     disabled_context_ids, auto_include_contexts, prompt_template,
                     generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                     stages, stop_on_failure, approval_gate, reflection_mode, completion_prompts_first,
-                    is_favorite, sync_pending, example_status
+                    is_favorite, sync_pending, example_status, constraint_overrides
                 )
                 VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                    ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36
+                    ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37
                 )
                 "#,
                 params![
@@ -17067,7 +17551,8 @@ impl CheckpointDb {
                     completion_prompts_first,
                     is_favorite,
                     sync_pending,
-                    example_status
+                    example_status,
+                    constraint_overrides
                 ],
             );
 

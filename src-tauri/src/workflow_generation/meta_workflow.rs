@@ -338,6 +338,7 @@ pub fn build_meta_workflow_template(
         generated_by_task_run_id: None,
         stages: Vec::new(),
         stop_on_failure: false,
+        constraint_overrides: std::collections::HashMap::new(),
         approval_gate: false,
         reflection_mode: false,
         completion_prompts_first: true, // AI hardener must run BEFORE save_workflow_artifact

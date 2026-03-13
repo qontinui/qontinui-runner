@@ -261,6 +261,23 @@ pub enum AppEvent {
     },
 
     // ========================================================================
+    // Constraint Engine Events
+    // ========================================================================
+    /// Constraint evaluation results after an agentic phase.
+    ConstraintResults {
+        /// Task run ID
+        task_run_id: String,
+        /// Current iteration number (1-indexed)
+        iteration: u32,
+        /// Human-readable summary of results
+        summary: String,
+        /// Whether any blocking violations exist
+        has_blocking: bool,
+        /// Serialized constraint results
+        results: serde_json::Value,
+    },
+
+    // ========================================================================
     // Queue Events
     // ========================================================================
     /// Workflow has been added to the execution queue.
@@ -346,6 +363,9 @@ impl AppEvent {
 
             // Convergence tracking events
             AppEvent::IterationMetrics { .. } => "iteration-metrics",
+
+            // Constraint engine events
+            AppEvent::ConstraintResults { .. } => "constraint-results",
 
             // Queue events
             AppEvent::WorkflowQueued { .. } => "workflow-queued",
@@ -586,6 +606,23 @@ impl AppEvent {
             new_failures,
             repeated_failures,
             is_stalled,
+        }
+    }
+
+    /// Create a constraint results event.
+    pub fn constraint_results(
+        task_run_id: impl Into<String>,
+        iteration: u32,
+        summary: impl Into<String>,
+        has_blocking: bool,
+        results: serde_json::Value,
+    ) -> Self {
+        AppEvent::ConstraintResults {
+            task_run_id: task_run_id.into(),
+            iteration,
+            summary: summary.into(),
+            has_blocking,
+            results,
         }
     }
 

@@ -153,6 +153,7 @@ pub fn execute_triggered_workflow(
         max_sweep_iterations: workflow.max_sweep_iterations,
         stages,
         stop_on_failure,
+        constraint_overrides: workflow.constraint_overrides.clone(),
         reflection_mode,
         provider_override,
         model_override,

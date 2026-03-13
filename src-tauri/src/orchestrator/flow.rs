@@ -300,7 +300,6 @@ pub enum ParallelMerge {
     WaitN(usize),
 }
 
-
 impl FlowStep {
     /// Create an agent step.
     pub fn agent(

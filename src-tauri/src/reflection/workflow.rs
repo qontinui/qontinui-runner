@@ -32,6 +32,7 @@ pub fn build_reflection_config(
         max_sweep_iterations: 5,
         stages: Vec::new(),
         stop_on_failure: false,
+        constraint_overrides: std::collections::HashMap::new(),
         reflection_mode: true,
         provider_override: None,
         model_override: None,
@@ -156,7 +157,10 @@ If any issues are found, report them. Otherwise, confirm the reflection is safe.
 }
 
 /// Build completion steps for the reflection workflow.
-pub fn build_completion_steps(source_workflow_name: &str) -> Vec<ExecutionStepConfig> {
+pub fn build_completion_steps(
+    source_workflow_name: &str,
+    source_task_run_id: &str,
+) -> Vec<ExecutionStepConfig> {
     let base_url = crate::mcp::types::get_self_base_url_from_env();
 
     vec![
@@ -173,7 +177,34 @@ pub fn build_completion_steps(source_workflow_name: &str) -> Vec<ExecutionStepCo
             Some("evaluation_results"),
             false,
         ),
-        // Step 2: AI summary and pattern recording (prompt step)
+        // Step 2: Build automated causal links from this run's data
+        build_api_step(
+            "Build causal links",
+            "POST",
+            &format!(
+                "{}/reflection/build-causal-links?task_run_id={}&workflow_name={}",
+                base_url,
+                source_task_run_id,
+                urlencoding::encode(source_workflow_name)
+            ),
+            None,
+            Some("causal_link_results"),
+            false,
+        ),
+        // Step 3: Rebuild architecture model
+        build_api_step(
+            "Rebuild architecture model",
+            "POST",
+            &format!(
+                "{}/reflection/architecture/rebuild?workflow_name={}",
+                base_url,
+                urlencoding::encode(source_workflow_name)
+            ),
+            None,
+            Some("architecture_rebuild_results"),
+            false,
+        ),
+        // Step 4: AI summary and pattern recording (prompt step)
         {
             let mut step = build_prompt_step(
                 "Record patterns and summarize",
@@ -181,10 +212,14 @@ pub fn build_completion_steps(source_workflow_name: &str) -> Vec<ExecutionStepCo
 
 1. Record any recurring patterns as knowledge entries using the standard [KNOWLEDGE:recurring_pattern] markers
 2. The batch effectiveness evaluation has already been run. Results: {{evaluation_results}}
-3. Generate a brief summary of:
+3. Causal links built: {{causal_link_results}}
+4. Architecture model rebuilt: {{architecture_rebuild_results}}
+5. Generate a brief summary of:
    - Issues identified (count by category)
    - Fixes applied (count by type)
    - Previous fix effectiveness results
+   - Causal relationships identified
+   - Architecture model status (components & relationships)
    - Recommendations for the next run"#,
             );
             step.phase = Some("completion".to_string());
@@ -245,6 +280,10 @@ from your output — no HTTP calls needed.
 ```
 [REFLECTION_FIX:fix_type:confidence]
 Description: What was changed and why
+Reasoning: Root cause diagnosis and evidence (optional but recommended)
+Alternatives: Other approaches considered and why they were rejected (optional)
+Scope: optional scope — 'universal' for patterns that apply across all projects (default: auto-detected)
+Applicability: context for when this pattern applies (required when Scope is universal)
 File: optional/path/to/file.ext
 Old: optional previous value
 New: optional new value
@@ -255,13 +294,67 @@ Finding: optional-source-finding-id
 **fix_type** must be one of: `knowledge_base_update`, `workflow_step_rewrite`, `selector_fix`, `tool_config_update`, `context_addition`, `instruction_clarification`
 (shortcuts: `kb_update`, `step_rewrite`, `selector`, `tool_config`, `context`, `clarification`)
 
-**confidence** must be one of: `high`, `medium`, `low`"#;
+**confidence** must be one of: `high`, `medium`, `low`
+
+**Decision Context:** For each fix, explain WHY in the `Reasoning:` field (root cause diagnosis, evidence from the conversation output, how you identified the issue). Use `Alternatives:` when you considered multiple approaches — document what you weighed and why you chose this approach over others. This structured reasoning is surfaced during effectiveness evaluation when a fix later proves ineffective.
+
+### Universal Patterns
+
+When you identify a pattern that is NOT specific to this project's code or structure,
+mark it with `Scope: universal`. Examples:
+- "Always use data-testid selectors instead of CSS classes for test automation"
+- "Wait for network idle before asserting page content"
+- "Set explicit timeouts for CI environments vs local"
+
+Do NOT mark as universal:
+- Project-specific file paths or directory structures
+- Patterns that depend on a specific codebase's conventions
+
+When marking a fix as universal, always include `Applicability:` describing
+when this pattern is relevant for other projects."#;
 
     let analysis_steps = if is_generation {
         build_generation_analysis_steps()
     } else {
         build_execution_analysis_steps()
     };
+
+    let causal_section = r#"
+## Causal Chain Analysis
+
+In addition to recording fixes, identify causal relationships between events.
+Use `[CAUSAL_CHAIN:...]` markers to record cause→effect links you observe.
+
+### Marker Format
+
+```
+[CAUSAL_CHAIN:relationship]
+Cause: event_type:reference
+Effect: event_type:reference
+Description: What caused what and why
+[/CAUSAL_CHAIN]
+```
+
+**relationship** must be one of: `caused`, `triggered`, `resolved`, `prevented`
+
+**event_type** must be one of: `code_change`, `finding_detected`, `error_occurred`, `fix_applied`, `verification_passed`, `verification_failed`
+
+### What to look for
+- Code changes that caused test failures or errors
+- Errors that triggered specific findings
+- Fixes that resolved specific errors
+- Changes that prevented previously-recurring issues
+
+### Example
+```
+[CAUSAL_CHAIN:caused]
+Cause: code_change:src/api/routes.ts
+Effect: finding_detected:API endpoint returns 404
+Description: Route handler was moved to a new file but the import path wasn't updated
+[/CAUSAL_CHAIN]
+```
+
+Focus on the most significant causal relationships (max 5). Don't record trivial ones."#;
 
     let evaluation_section = r#"
 ### Step 5: Evaluate Previous Fixes
@@ -275,8 +368,8 @@ Focus your analysis on qualitative observations about which fixes helped and whi
 and record any new fixes needed using `[REFLECTION_FIX:...]` markers."#;
 
     format!(
-        "{}\n{}\n{}\n{}\n{}",
-        preamble, data_section, marker_section, analysis_steps, evaluation_section
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        preamble, data_section, marker_section, causal_section, analysis_steps, evaluation_section
     )
 }
 
@@ -291,6 +384,8 @@ fn build_execution_analysis_steps() -> String {
 ```
 [REFLECTION_FIX:context_addition:high]
 Description: Added missing workspace root path to the setup context so the AI knows where project files are located
+Reasoning: The AI spent 3 iterations searching for project files because it didn't know the workspace root. The conversation output shows repeated 'find' commands across different directories before eventually locating the project at /home/user/project.
+Alternatives: Considered adding a file listing step instead, but providing the root path is simpler and lets the AI explore as needed rather than pre-loading a potentially stale file list.
 File: workflows/my-workflow.json
 Old: No workspace context provided
 New: Added workspace_root variable to setup phase
@@ -331,7 +426,11 @@ The source and reflection task run IDs are filled in automatically — just prov
 Example:
 ```
 [REFLECTION_FIX:selector_fix:high]
-Description: Updated login button selector from #btn-login to button[data-testid="login"] because the old ID was removed in a recent refactor
+Description: Updated login button selector from #btn-login to button[data-testid="login"]
+Reasoning: The old #btn-login ID was removed in a recent frontend refactor (commit abc1234). The conversation output shows the AI tried this selector 3 times with timeouts before falling back to a text-based search.
+Alternatives: Considered using button.login-btn class selector, but data-testid attributes are explicitly maintained for testing and are more stable across CSS changes.
+Scope: universal
+Applicability: Web apps with test automation — prefer data-testid attributes over CSS selectors
 File: workflows/login-flow.json
 Old: #btn-login
 New: button[data-testid="login"]
@@ -372,7 +471,9 @@ fn build_generation_analysis_steps() -> String {
 
 ```
 [REFLECTION_FIX:instruction_clarification:high]
-Description: Builder agent consistently generates command steps with shell_command instead of using the prompt step type for AI-driven analysis tasks. The builder prompt should clarify when to use prompt vs command steps.
+Description: Builder agent generates command steps instead of prompt steps for AI-driven analysis tasks
+Reasoning: In 3 of 5 generated workflows, the builder used shell_command steps for tasks requiring AI reasoning (e.g., "analyze code quality"). The conversation shows the verifier flagged this twice but the fixer only corrected one instance, suggesting the builder prompt lacks clear guidance.
+Alternatives: Considered adding a post-generation validation rule to auto-convert mistyped steps, but fixing the builder prompt at the source is more efficient and prevents the issue entirely.
 Old: No guidance on prompt vs command step selection
 New: Added rule: use prompt steps when the task requires AI reasoning/analysis; use command steps only for deterministic shell operations
 [/REFLECTION_FIX]
@@ -469,6 +570,7 @@ pub fn build_project_reflection_config(
         max_sweep_iterations: 5,
         stages: Vec::new(),
         stop_on_failure: false,
+        constraint_overrides: std::collections::HashMap::new(),
         reflection_mode: true,
         provider_override: None,
         model_override: None,

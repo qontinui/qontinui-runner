@@ -48,6 +48,10 @@ const FIX_TYPE_LABELS: Record<FixType, string> = {
   tool_config_update: "Tool Config",
   context_addition: "Context Addition",
   instruction_clarification: "Instruction Fix",
+  project_environment: "Environment",
+  project_architecture: "Architecture",
+  project_test_pattern: "Test Pattern",
+  project_recurring_issue: "Recurring Issue",
 };
 
 // ============================================================================
@@ -303,6 +307,11 @@ export function ReflectionDashboard() {
                         <span className="px-1.5 py-0.5 text-xs bg-purple-500/20 text-purple-300 rounded">
                           {FIX_TYPE_LABELS[fix.fix_type] || fix.fix_type}
                         </span>
+                        {fix.reflection_scope === "universal" && (
+                          <span className="px-1.5 py-0.5 text-xs bg-blue-500/20 text-blue-300 rounded">
+                            Universal
+                          </span>
+                        )}
                         <span className="flex-1 text-sm truncate">{fix.fix_description}</span>
                         <span
                           className={`px-1.5 py-0.5 text-xs rounded ${
@@ -338,10 +347,30 @@ export function ReflectionDashboard() {
                             <span className="font-medium">Applied:</span>{" "}
                             {formatDate(fix.applied_at)}
                           </div>
+                          {fix.applicability_context && (
+                            <div>
+                              <span className="font-medium">Applies to:</span>{" "}
+                              {fix.applicability_context}
+                            </div>
+                          )}
                           {fix.effectiveness_evidence && (
                             <div>
                               <span className="font-medium">Evidence:</span>{" "}
                               {fix.effectiveness_evidence}
+                            </div>
+                          )}
+                          {fix.reasoning && (
+                            <div className="mt-1">
+                              <span className="font-medium">Reasoning:</span>
+                              <p className="mt-0.5 text-xs leading-relaxed">{fix.reasoning}</p>
+                            </div>
+                          )}
+                          {fix.alternatives_considered && (
+                            <div className="mt-1">
+                              <span className="font-medium">Alternatives considered:</span>
+                              <p className="mt-0.5 text-xs leading-relaxed">
+                                {fix.alternatives_considered}
+                              </p>
                             </div>
                           )}
                           {fix.old_value && (

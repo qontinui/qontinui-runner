@@ -42,7 +42,6 @@ pub enum ExplorationDepth {
     Exhaustive,
 }
 
-
 impl ExplorationDepth {
     /// Get human-readable name
     pub fn display_name(&self) -> &'static str {

@@ -14,7 +14,6 @@ pub enum RecordingStatus {
     Cancelled,
 }
 
-
 impl std::fmt::Display for RecordingStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

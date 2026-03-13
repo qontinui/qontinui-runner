@@ -35,6 +35,7 @@ import { useCanvasData } from "./widgets/canvas";
 
 // Standalone widgets (not registry-based — they auto-show when events arrive)
 import { ConvergenceWidget } from "./widgets/convergence";
+import { ConstraintResultsWidget } from "./widgets/constraints";
 import { AiStreamWidget } from "./widgets/ai-stream";
 
 /**
@@ -1446,8 +1447,9 @@ export function DashboardLayout({
           </button>
         )}
 
-        {/* Standalone widgets: convergence tracking and AI output stream */}
+        {/* Standalone widgets: convergence tracking, constraint results, and AI output stream */}
         <ConvergenceWidget />
+        <ConstraintResultsWidget />
         <AiStreamWidget />
 
         {summaryWidgets.map((type) => (

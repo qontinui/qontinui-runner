@@ -79,11 +79,25 @@ impl ConstraintEngine {
         self
     }
 
+    /// Get a reference to all registered constraints.
+    pub fn constraints(&self) -> &[Constraint] {
+        &self.constraints
+    }
+
     /// Disable a constraint by ID.
     pub fn disable_constraint(&mut self, id: &str) {
         for c in &mut self.constraints {
             if c.id == id {
                 c.enabled = false;
+            }
+        }
+    }
+
+    /// Enable a constraint by ID.
+    pub fn enable_constraint(&mut self, id: &str) {
+        for c in &mut self.constraints {
+            if c.id == id {
+                c.enabled = true;
             }
         }
     }
@@ -518,6 +532,46 @@ impl ConstraintEngine {
         }
     }
 
+    /// Generate a prompt section describing active constraints.
+    ///
+    /// This is injected into the AI's context so it knows what constraints
+    /// are enforced before making changes (proactive, not reactive).
+    /// Returns empty string if no constraints are enabled.
+    pub fn constraints_prompt(&self) -> String {
+        let enabled: Vec<&Constraint> = self.constraints.iter().filter(|c| c.enabled).collect();
+
+        if enabled.is_empty() {
+            return String::new();
+        }
+
+        let mut lines = vec![
+            "## Active Constraints".to_string(),
+            String::new(),
+            "The following constraints are enforced on your changes:".to_string(),
+            String::new(),
+        ];
+
+        for c in &enabled {
+            let severity_label = match c.severity {
+                ConstraintSeverity::Block => "BLOCK",
+                ConstraintSeverity::Warn => "WARN",
+                ConstraintSeverity::Log => "LOG",
+            };
+            lines.push(format!(
+                "- **{}** (`{}`, {}): {}",
+                c.name, c.id, severity_label, c.description,
+            ));
+        }
+
+        lines.push(String::new());
+        lines.push(
+            "BLOCK constraints will reject your changes. Fix violations before proceeding."
+                .to_string(),
+        );
+
+        lines.join("\n")
+    }
+
     /// Convert constraint results into convergence actions for the loop controller.
     ///
     /// This bridges the constraint engine with the convergence system — violations
@@ -939,5 +993,80 @@ fn main() {
 
         let summary = ConstraintEngine::summarize_results(&results);
         assert_eq!(summary, "1/3 passed, 1 blocking, 1 warnings");
+    }
+
+    #[test]
+    fn test_constraints_prompt_with_enabled() {
+        let engine = ConstraintEngine::new();
+        let prompt = engine.constraints_prompt();
+        // Default engine has builtins enabled — should produce a non-empty prompt
+        assert!(
+            !prompt.is_empty(),
+            "Should produce prompt for enabled builtins"
+        );
+        assert!(prompt.contains("## Active Constraints"));
+        assert!(prompt.contains("BLOCK"));
+    }
+
+    #[test]
+    fn test_constraints_prompt_empty_when_all_disabled() {
+        let engine = ConstraintEngine {
+            constraints: vec![Constraint {
+                id: "test:disabled".to_string(),
+                name: "Disabled".to_string(),
+                description: "A disabled constraint".to_string(),
+                check: ConstraintCheck::GrepForbidden {
+                    pattern: "TODO".to_string(),
+                    file_glob: None,
+                },
+                severity: ConstraintSeverity::Warn,
+                enabled: false,
+            }],
+            project_root: None,
+        };
+        let prompt = engine.constraints_prompt();
+        assert!(
+            prompt.is_empty(),
+            "Should be empty when all constraints are disabled"
+        );
+    }
+
+    #[test]
+    fn test_constraints_prompt_includes_severity_and_id() {
+        let engine = ConstraintEngine {
+            constraints: vec![
+                Constraint {
+                    id: "builtin:no-secrets".to_string(),
+                    name: "No Secrets".to_string(),
+                    description: "Do not introduce API keys".to_string(),
+                    check: ConstraintCheck::GrepForbidden {
+                        pattern: "sk-".to_string(),
+                        file_glob: None,
+                    },
+                    severity: ConstraintSeverity::Block,
+                    enabled: true,
+                },
+                Constraint {
+                    id: "project:no-todos".to_string(),
+                    name: "No TODOs".to_string(),
+                    description: "Remove TODO markers".to_string(),
+                    check: ConstraintCheck::GrepForbidden {
+                        pattern: "TODO".to_string(),
+                        file_glob: None,
+                    },
+                    severity: ConstraintSeverity::Warn,
+                    enabled: true,
+                },
+            ],
+            project_root: None,
+        };
+        let prompt = engine.constraints_prompt();
+        assert!(prompt.contains("No Secrets"));
+        assert!(prompt.contains("`builtin:no-secrets`"));
+        assert!(prompt.contains("BLOCK"));
+        assert!(prompt.contains("No TODOs"));
+        assert!(prompt.contains("`project:no-todos`"));
+        assert!(prompt.contains("WARN"));
+        assert!(prompt.contains("BLOCK constraints will reject"));
     }
 }

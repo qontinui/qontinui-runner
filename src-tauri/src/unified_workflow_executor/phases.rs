@@ -727,6 +727,52 @@ fn estimate_tokens(text: &str) -> usize {
     text.len() / 4
 }
 
+/// Compute a text embedding synchronously using reqwest::blocking.
+///
+/// Used in sync contexts (like build_compressed_iteration_history) where the async
+/// EmbeddingClient cannot be used (block_on panics inside a tokio runtime thread).
+fn compute_embedding_sync(text: &str) -> Result<Vec<f32>, String> {
+    #[derive(serde::Serialize)]
+    struct Req {
+        text: String,
+        model: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        embedding: Vec<f32>,
+    }
+
+    let truncated = if text.len() > 2000 {
+        &text[..2000]
+    } else {
+        text
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let response = client
+        .post("http://127.0.0.1:8001/api/embeddings/compute-text")
+        .json(&Req {
+            text: truncated.to_string(),
+            model: "minilm".to_string(),
+        })
+        .send()
+        .map_err(|e| format!("Embedding API request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Embedding API returned {}", response.status()));
+    }
+
+    let result: Resp = response
+        .json()
+        .map_err(|e| format!("Failed to parse embedding response: {}", e))?;
+
+    Ok(result.embedding)
+}
+
 // =============================================================================
 // Iteration Context Builder
 // =============================================================================
@@ -1158,26 +1204,26 @@ fn build_compressed_iteration_history(
     }
 
     // 4b. Cross-run historical knowledge (from previous runs of the same workflow)
-    // Priority: MEDIUM
+    // Priority: MEDIUM — scored by relevance instead of chronological order
     if budget_remaining > 200 {
         if let Some(wf_name) = workflow_name {
-            if let Ok(historical) = checkpoint_db.list_workflow_knowledge(
-                wf_name,
-                execution_id,
-                &["recurring_pattern", "context"],
-                10,
-            ) {
-                if !historical.is_empty() {
-                    let mut lines =
-                        vec!["### Historical Knowledge (from previous runs)".to_string()];
+            // Try relevance-scored knowledge first (v99 cognitive system model)
+            let scored_knowledge = checkpoint_db.with_conn(|conn| {
+                crate::reflection::prediction::score_knowledge_relevance(conn, wf_name, 10)
+            });
+
+            if let Ok(scored) = scored_knowledge {
+                if !scored.is_empty() {
+                    let mut lines = vec!["### Historical Knowledge (relevance-ranked)".to_string()];
                     lines.push(
-                        "These patterns were identified by reflection across previous runs of this workflow:".to_string(),
+                        "These patterns were identified by reflection, ordered by relevance:"
+                            .to_string(),
                     );
-                    for entry in &historical {
+                    for entry in &scored {
                         lines.push(format!(
-                            "- **[{}]** ({}): {}",
+                            "- **[{}, relevance: {:.2}]** {}",
                             entry.category.to_uppercase(),
-                            entry.confidence,
+                            entry.relevance_score,
                             truncate_str(&entry.content, 300),
                         ));
                     }
@@ -1189,6 +1235,39 @@ fn build_compressed_iteration_history(
                         sections_included += 1;
                     } else {
                         sections_skipped += 1;
+                    }
+                }
+            } else {
+                // Fallback: chronological ordering (pre-v99 databases)
+                if let Ok(historical) = checkpoint_db.list_workflow_knowledge(
+                    wf_name,
+                    execution_id,
+                    &["recurring_pattern", "context"],
+                    10,
+                ) {
+                    if !historical.is_empty() {
+                        let mut lines =
+                            vec!["### Historical Knowledge (from previous runs)".to_string()];
+                        lines.push(
+                            "These patterns were identified by reflection across previous runs of this workflow:".to_string(),
+                        );
+                        for entry in &historical {
+                            lines.push(format!(
+                                "- **[{}]** ({}): {}",
+                                entry.category.to_uppercase(),
+                                entry.confidence,
+                                truncate_str(&entry.content, 300),
+                            ));
+                        }
+                        let section = lines.join("\n");
+                        let tokens = estimate_tokens(&section);
+                        if tokens <= budget_remaining {
+                            budget_remaining -= tokens;
+                            sections.push(section);
+                            sections_included += 1;
+                        } else {
+                            sections_skipped += 1;
+                        }
                     }
                 }
             }
@@ -1258,6 +1337,236 @@ fn build_compressed_iteration_history(
                     } else {
                         sections_skipped += 1;
                     }
+                }
+            }
+        }
+    }
+
+    // 4e. Fix predictions (suggest known fixes for unresolved findings)
+    // Priority: MEDIUM -- only on iteration 1, max 3 predictions
+    if current_iteration <= 1 && budget_remaining > 200 {
+        if let Ok(findings) = checkpoint_db.get_findings_for_task(execution_id) {
+            let unresolved_findings: Vec<_> = findings
+                .iter()
+                .filter(|f| !f.status.is_terminal())
+                .take(5)
+                .collect();
+
+            if !unresolved_findings.is_empty() {
+                let mut prediction_lines = Vec::new();
+                let mut prediction_count = 0;
+
+                for finding in &unresolved_findings {
+                    if prediction_count >= 3 {
+                        break;
+                    }
+                    // Use the finding's actual signature_hash for fix prediction lookup
+                    let sig = &finding.signature_hash;
+                    if let Ok(Some(predicted)) = checkpoint_db.with_conn(|conn| {
+                        crate::reflection::prediction::predict_fix_for_error(conn, sig)
+                    }) {
+                        if predicted.confidence >= 0.3 {
+                            prediction_lines.push(format!(
+                                "- **[Predicted Fix, confidence: {:.0}%]** Based on {} previous successful application(s): {}",
+                                predicted.confidence * 100.0,
+                                predicted.reuse_count,
+                                truncate_str(&predicted.fix_description, 300),
+                            ));
+                            prediction_count += 1;
+
+                            // Record that this fix was shown to the AI (outcome="shown" won't increment reuse_count)
+                            let _ = checkpoint_db.with_conn(|conn| {
+                                crate::reflection::prediction::record_fix_application(
+                                    conn,
+                                    &predicted.fix_id,
+                                    execution_id,
+                                    Some(sig),
+                                    "shown",
+                                )
+                            });
+                        }
+                    }
+                }
+
+                if !prediction_lines.is_empty() {
+                    let mut lines = vec!["### Predicted Fixes (from historical data)".to_string()];
+                    lines.extend(prediction_lines);
+                    let section = lines.join("\n");
+                    let tokens = estimate_tokens(&section);
+                    if tokens <= budget_remaining {
+                        budget_remaining -= tokens;
+                        sections.push(section);
+                        sections_included += 1;
+                    } else {
+                        sections_skipped += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4f. Causal history (known cause→effect patterns from previous runs)
+    // Priority: LOW -- only when causal data exists, max 500 tokens
+    if budget_remaining > 200 {
+        if let Some(wf_name) = workflow_name {
+            let causal_events = checkpoint_db.with_conn(|conn| {
+                crate::reflection::causal::get_causal_events_for_workflow(conn, wf_name, 10)
+            });
+
+            if let Ok(events) = causal_events {
+                if !events.is_empty() {
+                    let mut lines =
+                        vec!["### Causal History (known cause→effect patterns)".to_string()];
+                    // Group by relationship type for compact display
+                    let mut by_relationship: std::collections::HashMap<String, Vec<String>> =
+                        std::collections::HashMap::new();
+                    for event in &events {
+                        let desc = event.description.as_deref().unwrap_or("(no description)");
+                        let entry = format!(
+                            "{} → {} ({})",
+                            event.cause_event_type, event.effect_event_type, desc
+                        );
+                        by_relationship
+                            .entry(event.relationship.clone())
+                            .or_default()
+                            .push(entry);
+                    }
+                    for (rel, entries) in &by_relationship {
+                        lines.push(format!("**{}:** {} occurrence(s)", rel, entries.len()));
+                        for entry in entries.iter().take(3) {
+                            lines.push(format!(
+                                "  - {}",
+                                crate::str_utils::truncate_str(entry, 200)
+                            ));
+                        }
+                    }
+                    let section = lines.join("\n");
+                    let tokens = estimate_tokens(&section);
+                    if tokens <= budget_remaining && tokens <= 500 {
+                        budget_remaining -= tokens;
+                        sections.push(section);
+                        sections_included += 1;
+                    } else {
+                        sections_skipped += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4g. Universal patterns (cross-project knowledge via hybrid semantic search)
+    // Priority: LOW -- only on first iteration, after all project-specific knowledge
+    if current_iteration <= 1 && budget_remaining > 200 {
+        // Build query text from workflow name for semantic matching
+        let query_text = workflow_name.unwrap_or("").to_string();
+
+        // Try hybrid search (semantic), fall back to SQL-only
+        // Note: this is a sync function called from async context, so we use
+        // reqwest::blocking directly instead of the async EmbeddingClient.
+        let universal_fixes = if !query_text.trim().is_empty() {
+            let query_embedding = compute_embedding_sync(&query_text);
+
+            match query_embedding {
+                Ok(emb) => {
+                    let search_config = crate::database::hybrid_search::HybridSearchConfig {
+                        sql_weight: 0.3,
+                        vector_weight: 0.7,
+                        limit: 5,
+                        min_similarity: 0.3,
+                    };
+                    checkpoint_db
+                        .with_conn(|conn| {
+                            crate::database::hybrid_search::hybrid_search_universal_fixes(
+                                conn,
+                                &emb,
+                                &search_config,
+                            )
+                        })
+                        .ok()
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        // Fall back to SQL-only retrieval if hybrid search failed
+        let fixes_to_inject: Vec<(String, String, Option<String>)> = match universal_fixes {
+            Some(results) if !results.is_empty() => results
+                .iter()
+                .map(|r| {
+                    (
+                        r.item.fix_type.clone(),
+                        r.item.fix_description.clone(),
+                        r.item.applicability_context.clone(),
+                    )
+                })
+                .collect(),
+            _ => {
+                // SQL-only fallback: get universal fixes by reuse_count
+                checkpoint_db
+                    .with_conn(|conn| crate::reflection::storage::get_universal_fixes(conn, 5))
+                    .ok()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|f| (f.fix_type, f.fix_description, f.applicability_context))
+                    .collect()
+            }
+        };
+
+        if !fixes_to_inject.is_empty() {
+            let mut lines = vec!["## Universal Patterns".to_string()];
+            lines.push(
+                "(Proven effective across multiple projects — retrieved by semantic relevance)"
+                    .to_string(),
+            );
+            lines.push(String::new());
+            for (fix_type, description, ctx) in &fixes_to_inject {
+                let ctx_str = ctx.as_deref().unwrap_or("general");
+                lines.push(format!(
+                    "- **[{}]** (applies to: {}) {}",
+                    fix_type,
+                    ctx_str,
+                    truncate_str(description, 300),
+                ));
+                lines.push(String::new());
+            }
+            let section = lines.join("\n");
+            let tokens = estimate_tokens(&section);
+            if tokens <= budget_remaining {
+                budget_remaining -= tokens;
+                sections.push(section);
+                sections_included += 1;
+            } else {
+                sections_skipped += 1;
+            }
+        }
+    }
+
+    // 4h. Component impact analysis (iteration 2+ only)
+    // Priority: LOW -- provides architectural awareness of changed files
+    if current_iteration > 1 && budget_remaining > 200 {
+        let changed: Vec<String> = all_observations
+            .iter()
+            .filter(|o| o.iteration == current_iteration - 1)
+            .flat_map(|o| extract_changed_files_from_observation(&o.content))
+            .collect();
+        if let Some(wf_name) = workflow_name {
+            if let Some(section) = build_impact_context(checkpoint_db, wf_name, &changed) {
+                let tokens = estimate_tokens(&section);
+                let capped_tokens = tokens.min(600);
+                if capped_tokens <= budget_remaining {
+                    let capped_section = if tokens > 600 {
+                        let max_chars = 600 * 4;
+                        truncate_str(&section, max_chars)
+                    } else {
+                        section
+                    };
+                    budget_remaining -= estimate_tokens(&capped_section);
+                    sections.push(capped_section);
+                    sections_included += 1;
+                } else {
+                    sections_skipped += 1;
                 }
             }
         }
@@ -1478,6 +1787,92 @@ fn extract_diff_stat_from_observation(content: &str) -> Option<String> {
     }
     // The last stat line is the summary (e.g., "3 files changed, 12 insertions(+), 5 deletions(-)")
     Some(stat_lines.last().unwrap().to_string())
+}
+
+/// Extract changed file paths from a git diff stat observation.
+///
+/// Parses lines like ` src/foo/bar.rs | 12 +++---` into `["src/foo/bar.rs"]`.
+fn extract_changed_files_from_observation(content: &str) -> Vec<String> {
+    if !content.starts_with("Git changes after iteration") {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    for line in content.lines().skip(1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        // diff stat lines have the form: " path/to/file | N +++---"
+        if let Some(pipe_pos) = trimmed.find(" | ") {
+            let path = trimmed[..pipe_pos].trim();
+            if !path.is_empty() {
+                files.push(path.to_string());
+            }
+        }
+    }
+    files
+}
+
+/// Build a component impact analysis context section from changed files.
+///
+/// For each changed file, looks up the architecture model for impact data.
+/// Returns None if no architecture data exists or no impacts found.
+fn build_impact_context(
+    checkpoint_db: &crate::database::CheckpointDb,
+    workflow_name: &str,
+    changed_files: &[String],
+) -> Option<String> {
+    if changed_files.is_empty() {
+        return None;
+    }
+
+    let mut impact_lines = Vec::new();
+
+    for file_path in changed_files.iter().take(5) {
+        let impact = checkpoint_db
+            .with_conn(|conn| {
+                crate::reflection::architecture::get_impact_analysis(conn, workflow_name, file_path)
+            })
+            .ok();
+
+        if let Some(analysis) = impact {
+            if analysis.total_impact_radius == 0 {
+                continue;
+            }
+            let mut line = format!(
+                "- **{}** (impact radius: {})",
+                file_path, analysis.total_impact_radius
+            );
+            if !analysis.direct_impacts.is_empty() {
+                let direct: Vec<String> = analysis
+                    .direct_impacts
+                    .iter()
+                    .take(3)
+                    .map(|e| format!("{} [{}]", e.component_path, e.relationship_type))
+                    .collect();
+                line.push_str(&format!("\n  Direct: {}", direct.join(", ")));
+            }
+            if !analysis.transitive_impacts.is_empty() {
+                let count = analysis.transitive_impacts.len();
+                line.push_str(&format!(
+                    "\n  Transitive: {} additional component(s)",
+                    count
+                ));
+            }
+            impact_lines.push(line);
+        }
+    }
+
+    if impact_lines.is_empty() {
+        return None;
+    }
+
+    let mut section = String::from("## Component Impact Analysis\n");
+    section.push_str(
+        "The following components are affected by your changes from the previous iteration:\n\n",
+    );
+    section.push_str(&impact_lines.join("\n\n"));
+    Some(section)
 }
 
 /// Truncate a string to max_len characters, appending "..." if truncated.
@@ -4474,6 +4869,7 @@ impl Executor for AgenticExecutor {
             max_sweep_iterations: 5,
             stages: Vec::new(),
             stop_on_failure: false,
+            constraint_overrides: std::collections::HashMap::new(),
             reflection_mode: false,
             provider_override: None,
             model_override: None,

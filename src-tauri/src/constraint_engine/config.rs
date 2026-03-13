@@ -137,10 +137,12 @@ pub struct LoadedConfig {
     pub custom_constraints: Vec<Constraint>,
     /// Resource limits from the config file.
     pub resource_limits: Option<ResourceLimits>,
+    /// Non-fatal warnings encountered during parsing (e.g., skipped constraints).
+    pub warnings: Vec<String>,
 }
 
 /// The config file name to search for.
-const CONFIG_FILENAME: &str = "constraints.toml";
+pub const CONFIG_FILENAME: &str = "constraints.toml";
 
 /// Search for and load a constraints config file.
 ///
@@ -223,6 +225,7 @@ fn parse_config(content: &str, source_path: &Path) -> Option<LoadedConfig> {
         builtin_overrides,
         custom_constraints,
         resource_limits,
+        warnings: vec![],
     })
 }
 
@@ -287,8 +290,59 @@ fn convert_constraint(cc: ConstraintConfig, source: &Path) -> Option<Constraint>
     })
 }
 
+/// Parse a TOML config string, returning structured validation results.
+///
+/// Unlike `parse_config` (internal), this returns errors as strings instead of
+/// logging them, making it suitable for the HTTP validation endpoint.
+pub fn parse_config_str(content: &str) -> Result<LoadedConfig, Vec<String>> {
+    let config: ConfigFile = match toml::from_str(content) {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(vec![format!("TOML parse error: {}", e)]);
+        }
+    };
+
+    let mut errors = Vec::new();
+
+    // Convert builtin overrides
+    let builtin_overrides = config.builtins;
+
+    // Convert custom constraints, collecting errors
+    let mut custom_constraints = Vec::new();
+    for cc in config.constraint {
+        let source = Path::new("<input>");
+        match convert_constraint(cc, source) {
+            Some(c) => custom_constraints.push(c),
+            None => {
+                errors.push(
+                    "A constraint was skipped due to invalid configuration (e.g., bad regex)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    // Convert resource limits
+    let resource_limits = config.resources.map(|rc| ResourceLimits {
+        max_wall_time_secs: rc.max_wall_time_secs,
+        max_files_modified: rc.max_files_modified,
+        max_agentic_time_ms: rc.max_agentic_time_ms,
+        warning_threshold: rc.warning_threshold.unwrap_or(0.75),
+    });
+
+    Ok(LoadedConfig {
+        builtin_overrides,
+        custom_constraints,
+        resource_limits,
+        warnings: errors,
+    })
+}
+
 /// Search for a config file starting from `dir` and walking up.
-fn find_config_file(dir: &Path) -> Option<PathBuf> {
+///
+/// Checks for `constraints.toml` at each level, first in the directory
+/// itself, then inside `.qontinui/`. Returns the first match found.
+pub fn find_config_file(dir: &Path) -> Option<PathBuf> {
     let mut current = dir.to_path_buf();
     loop {
         let candidate = current.join(CONFIG_FILENAME);

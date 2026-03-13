@@ -285,7 +285,6 @@ pub enum MergeStrategy {
     Custom { handler: String },
 }
 
-
 impl MergeStrategy {
     /// Check if merge condition is satisfied.
     pub fn is_satisfied(&self, results: &[&BranchResult], total_branches: usize) -> bool {

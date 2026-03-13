@@ -30,6 +30,11 @@ fn row_to_fix(row: &rusqlite::Row) -> rusqlite::Result<ReflectionFix> {
         evaluated_at: row.get("evaluated_at")?,
         created_at: row.get("created_at")?,
         source_agent: row.get("source_agent").unwrap_or(None),
+        reasoning: row.get("reasoning").unwrap_or(None),
+        alternatives_considered: row.get("alternatives_considered").unwrap_or(None),
+        reflection_scope: row.get("reflection_scope").unwrap_or(None),
+        project_path: row.get("project_path").unwrap_or(None),
+        applicability_context: row.get("applicability_context").unwrap_or(None),
     })
 }
 
@@ -39,7 +44,9 @@ const SELECT_ALL_COLUMNS: &str = r#"
     fix_type, fix_description, file_changed,
     old_value, new_value, confidence, content_hash,
     status, effectiveness, effectiveness_evidence,
-    applied_at, evaluated_at, created_at, source_agent
+    applied_at, evaluated_at, created_at, source_agent,
+    reasoning, alternatives_considered,
+    reflection_scope, project_path, applicability_context
 "#;
 
 /// Normalize text for semantic deduplication.
@@ -134,8 +141,9 @@ pub fn insert_fix(
             source_finding_id, source_knowledge_id,
             fix_type, fix_description, file_changed,
             old_value, new_value, confidence, content_hash,
-            status, applied_at, created_at, source_agent
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'applied', ?13, ?13, ?14)
+            status, applied_at, created_at, source_agent,
+            reasoning, alternatives_considered
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'applied', ?13, ?13, ?14, ?15, ?16)
         "#,
         params![
             id,
@@ -152,6 +160,8 @@ pub fn insert_fix(
             content_hash,
             now,
             input.source_agent,
+            input.reasoning,
+            input.alternatives_considered,
         ],
     )
     .map_err(|e| format!("Failed to insert reflection fix: {}", e))?;
@@ -300,6 +310,42 @@ pub fn get_fixes_by_project_path(
         fixes.push(row.map_err(|e| format!("Failed to read fix row: {}", e))?);
     }
     Ok(fixes)
+}
+
+/// Get universal-scoped fixes ordered by reuse_count (SQL-only fallback when embeddings unavailable).
+pub fn get_universal_fixes(conn: &Connection, limit: usize) -> Result<Vec<ReflectionFix>, String> {
+    let sql = format!(
+        "SELECT {} FROM reflection_fixes WHERE reflection_scope = 'universal' AND status = 'applied' ORDER BY reuse_count DESC, created_at DESC LIMIT ?1",
+        SELECT_ALL_COLUMNS
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Failed to prepare universal fixes query: {}", e))?;
+
+    let rows = stmt
+        .query_map(params![limit as i64], row_to_fix)
+        .map_err(|e| format!("Failed to query universal fixes: {}", e))?;
+
+    let mut fixes = Vec::new();
+    for row in rows {
+        fixes.push(row.map_err(|e| format!("Failed to read fix row: {}", e))?);
+    }
+    Ok(fixes)
+}
+
+/// Promote a fix to universal scope with optional applicability context.
+pub fn promote_to_universal(
+    conn: &Connection,
+    fix_id: &str,
+    applicability_context: Option<&str>,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE reflection_fixes SET reflection_scope = 'universal', applicability_context = COALESCE(?1, applicability_context) WHERE id = ?2",
+        params![applicability_context, fix_id],
+    )
+    .map_err(|e| format!("Failed to promote fix to universal: {}", e))?;
+    Ok(())
 }
 
 /// Update the status of a reflection fix (applied/reverted/superseded).
@@ -500,6 +546,12 @@ mod tests {
                 evaluated_at TEXT,
                 created_at TEXT NOT NULL,
                 source_agent TEXT,
+                reasoning TEXT,
+                alternatives_considered TEXT,
+                reflection_scope TEXT DEFAULT 'workflow',
+                project_path TEXT,
+                applicability_context TEXT,
+                fix_description_embedding BLOB,
                 FOREIGN KEY (source_task_run_id) REFERENCES task_runs(id),
                 FOREIGN KEY (reflection_task_run_id) REFERENCES task_runs(id)
             );
@@ -535,6 +587,8 @@ mod tests {
             new_value: Some("New docs content".to_string()),
             confidence: "high".to_string(),
             source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
         };
 
         let fix = insert_fix(&conn, &input).unwrap();
@@ -575,6 +629,8 @@ mod tests {
                 new_value: None,
                 confidence: "medium".to_string(),
                 source_agent: None,
+                reasoning: None,
+                alternatives_considered: None,
             };
             insert_fix(&conn, &input).unwrap();
         }
@@ -608,6 +664,8 @@ mod tests {
             new_value: Some("15000".to_string()),
             confidence: "high".to_string(),
             source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
         };
 
         let fix = insert_fix(&conn, &input).unwrap();
@@ -654,6 +712,8 @@ mod tests {
             new_value: Some("New API docs".to_string()),
             confidence: "high".to_string(),
             source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
         };
 
         let fix1 = insert_fix(&conn, &input).unwrap();
@@ -672,6 +732,8 @@ mod tests {
             new_value: Some("New API docs".to_string()),
             confidence: "high".to_string(),
             source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
         };
 
         let fix2 = insert_fix(&conn, &input2).unwrap();
@@ -709,6 +771,8 @@ mod tests {
             new_value: None,
             confidence: "high".to_string(),
             source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
         };
 
         let input2 = CreateReflectionFixInput {
@@ -723,6 +787,8 @@ mod tests {
             new_value: None,
             confidence: "high".to_string(),
             source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
         };
 
         let fix1 = insert_fix(&conn, &input1).unwrap();

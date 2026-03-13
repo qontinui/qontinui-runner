@@ -29,7 +29,6 @@ pub enum ExplorationStrategy {
     Targeted,
 }
 
-
 impl ExplorationStrategy {
     /// Parse a strategy from a string
     pub fn from_str(s: &str) -> Self {

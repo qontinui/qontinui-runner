@@ -363,6 +363,17 @@ impl LoopController {
                 );
             }
 
+            // Clear constraint results
+            if let Err(e) = self
+                .checkpoint_db
+                .delete_constraint_results(&config.execution_id)
+            {
+                warn!(
+                    "Failed to clear constraint results: {} - continuing anyway",
+                    e
+                );
+            }
+
             // Clear workflow execution state
             if let Err(e) = self
                 .checkpoint_db
@@ -842,6 +853,7 @@ impl LoopController {
                     max_sweep_iterations: 0,
                     stages: Vec::new(), // No nested stages
                     stop_on_failure: config.stop_on_failure,
+                    constraint_overrides: config.constraint_overrides.clone(),
                     reflection_mode: config.reflection_mode,
                     provider_override: stage.provider.clone(),
                     model_override: stage.model.clone(),
@@ -1547,9 +1559,35 @@ impl LoopController {
             constraint_engine = constraint_engine.with_project_root(std::path::PathBuf::from(p));
         }
 
+        // Apply per-workflow constraint overrides (enable/disable specific constraints)
+        for (constraint_id, enabled) in &config.constraint_overrides {
+            if *enabled {
+                constraint_engine.enable_constraint(constraint_id);
+            } else {
+                constraint_engine.disable_constraint(constraint_id);
+            }
+        }
+
         // Pending constraint violations from the previous agentic phase, to be
         // injected into the next iteration's failure context.
         let mut pending_constraint_context: Option<String> = None;
+
+        // Pre-build the proactive constraints prompt so the AI knows about
+        // active constraints upfront (before it violates them). Only injected
+        // once — on the first agentic iteration — to avoid wasting tokens.
+        let proactive_constraints_prompt = {
+            let prompt = constraint_engine.constraints_prompt();
+            if !prompt.is_empty() {
+                info!(
+                    "CONSTRAINT-ENGINE: Generated proactive constraints prompt ({} chars)",
+                    prompt.len(),
+                );
+                Some(prompt)
+            } else {
+                None
+            }
+        };
+        let mut constraints_prompt_injected = false;
 
         // Track cumulative verification failures for conditional routing context
         let mut verification_failures: u32 = 0;
@@ -2213,6 +2251,28 @@ impl LoopController {
                 failure_context
             };
 
+            // Inject proactive constraints prompt on the first agentic iteration only.
+            // This tells the AI about active constraints upfront so it can avoid
+            // violations rather than learning about them reactively.
+            let failure_context = if !constraints_prompt_injected {
+                if let Some(ref prompt) = proactive_constraints_prompt {
+                    constraints_prompt_injected = true;
+                    info!(
+                            "CONSTRAINT-ENGINE: Injecting proactive constraints prompt into iteration {}",
+                            iteration,
+                        );
+                    if failure_context.is_empty() {
+                        prompt.clone()
+                    } else {
+                        format!("{}\n\n{}", failure_context, prompt)
+                    }
+                } else {
+                    failure_context
+                }
+            } else {
+                failure_context
+            };
+
             // Enrich failure context with structured build errors from managed processes.
             // Parses stderr from dev servers to extract actionable errors (file, line, message)
             // instead of dumping raw stderr output.
@@ -2356,10 +2416,45 @@ impl LoopController {
             {
                 if !iteration_files.is_empty() {
                     let constraint_results = constraint_engine.evaluate(&iteration_files);
-                    if !constraint_results.iter().all(|r| r.passed) {
-                        let summary = crate::constraint_engine::ConstraintEngine::summarize_results(
+                    let all_passed = constraint_results.iter().all(|r| r.passed);
+                    let has_blocking = constraint_results.iter().any(|r| {
+                        !r.passed
+                            && r.severity == crate::constraint_engine::ConstraintSeverity::Block
+                    });
+                    let summary = if all_passed {
+                        format!("all {} constraints passed", constraint_results.len())
+                    } else {
+                        crate::constraint_engine::ConstraintEngine::summarize_results(
                             &constraint_results,
+                        )
+                    };
+
+                    // Persist constraint results to database for post-run review
+                    let parent_id = get_parent_task_id(&config.execution_id);
+                    if let Err(e) = self.checkpoint_db.store_constraint_results(
+                        &parent_id,
+                        iteration,
+                        &constraint_results,
+                    ) {
+                        warn!(
+                            "Failed to store constraint results: {} - continuing anyway",
+                            e
                         );
+                    }
+
+                    // Emit constraint results to the frontend
+                    let broadcaster = EventBroadcaster::new(self.app_handle.clone());
+                    let serialized_results = serde_json::to_value(&constraint_results)
+                        .unwrap_or_else(|_| serde_json::json!([]));
+                    broadcaster.constraint_results(
+                        &config.execution_id,
+                        iteration,
+                        &summary,
+                        has_blocking,
+                        serialized_results,
+                    );
+
+                    if !all_passed {
                         info!("CONSTRAINT-ENGINE: iteration {} — {}", iteration, summary);
                         let actions =
                             crate::constraint_engine::ConstraintEngine::results_to_actions(
@@ -3049,6 +3144,33 @@ impl LoopController {
                     Ok(())
                 });
             }
+
+            // Auto-store convergence snapshot on completion
+            let db2 = self.checkpoint_db.clone();
+            let exec_id2 = execution_id.to_string();
+            tokio::spawn(async move {
+                let _ = db2.with_conn(|conn| {
+                    let wf_name: Option<String> = conn
+                        .query_row(
+                            "SELECT workflow_name FROM task_runs WHERE id = ?1",
+                            rusqlite::params![exec_id2],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if let Some(wf_name) = wf_name {
+                        if let Ok(metrics) =
+                            crate::reflection::prediction::compute_convergence_score(
+                                conn, &wf_name, "workflow",
+                            )
+                        {
+                            let _ = crate::reflection::prediction::store_convergence_snapshot(
+                                conn, &wf_name, None, "workflow", &metrics,
+                            );
+                        }
+                    }
+                    Ok(())
+                });
+            });
 
             // Check workflow chain triggers
             if let Some(wf_id) = workflow_id {
@@ -3788,6 +3910,7 @@ pub async fn resume_interrupted_workflows(
                                 max_sweep_iterations: workflow.max_sweep_iterations,
                                 stages,
                                 stop_on_failure: workflow.stop_on_failure,
+                                constraint_overrides: workflow.constraint_overrides.clone(),
                                 reflection_mode: workflow.reflection_mode,
                                 provider_override: None,
                                 model_override: None,
@@ -3930,6 +4053,7 @@ pub async fn resume_interrupted_workflows(
                                 max_sweep_iterations: workflow.max_sweep_iterations,
                                 stages,
                                 stop_on_failure: workflow.stop_on_failure,
+                                constraint_overrides: workflow.constraint_overrides.clone(),
                                 reflection_mode: workflow.reflection_mode,
                                 provider_override: None,
                                 model_override: None,

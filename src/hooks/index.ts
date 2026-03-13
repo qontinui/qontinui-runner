@@ -246,3 +246,6 @@ export { useKnownIssues } from "./useKnownIssues";
 
 export { useStateMachineConfig } from "./useStateMachineConfig";
 export type { UseStateMachineConfigReturn } from "./useStateMachineConfig";
+
+export { useConstraints } from "./useConstraints";
+export type { UseConstraintsOptions, UseConstraintsReturn } from "./useConstraints";

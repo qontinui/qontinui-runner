@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 90
+-- Version: 99
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -658,6 +658,10 @@ CREATE TABLE IF NOT EXISTS task_knowledge (
     -- Project scoping (v97)
     project_path TEXT,  -- Project/workspace path for project-scoped knowledge
 
+    -- Relevance tracking (v99)
+    last_validated_at TEXT,              -- When this knowledge was last confirmed still-relevant
+    validation_count INTEGER DEFAULT 0,  -- How many times this knowledge has been validated
+
     created_at TEXT NOT NULL,
 
     FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
@@ -884,6 +888,7 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     -- Multi-stage workflow configuration
     stages TEXT DEFAULT '[]',  -- JSON array of WorkflowStage objects
     stop_on_failure INTEGER DEFAULT 0,  -- 0 = continue on failure (default), 1 = stop
+    constraint_overrides TEXT DEFAULT '{}',  -- JSON map of constraint_id → enabled (true/false)
     approval_gate INTEGER DEFAULT 0,  -- 0 = disabled (default), 1 = pause for human approval
     reflection_mode INTEGER DEFAULT 1,  -- 0 = disabled, 1 = enabled (default)
     completion_prompts_first INTEGER NOT NULL DEFAULT 0,  -- 0 = automation first (default), 1 = prompts first
@@ -1834,6 +1839,7 @@ CREATE TABLE IF NOT EXISTS error_events (
     -- Debug agent integration
     finding_id INTEGER REFERENCES task_run_findings(id) ON DELETE SET NULL,  -- Linked finding (if promoted)
     resolved_by_task_run_id TEXT,           -- Which workflow fixed this error
+    resolved_by_fix_id TEXT,               -- FK to reflection_fixes — links error resolution to specific fix (v99)
     resolution_notes TEXT,
 
     -- Embedding vector for hybrid RAG search (384-dim MiniLM as f32 BLOB)
@@ -2183,8 +2189,14 @@ CREATE TABLE IF NOT EXISTS reflection_fixes (
     evaluated_at TEXT,
     created_at TEXT NOT NULL,
     source_agent TEXT,                        -- Which generation agent caused this (specification, builder, verification, hardener)
+    reasoning TEXT,                           -- Root cause diagnosis and reasoning behind the fix (v104)
+    alternatives_considered TEXT,             -- Other approaches considered and why they were rejected (v104)
     reflection_scope TEXT DEFAULT 'workflow',  -- 'workflow' (existing) or 'project' (project reflection) (v97)
     project_path TEXT,                        -- Project/workspace path for project-scoped fixes (v97)
+    target_component TEXT,                    -- File path or module the fix targets (v99)
+    reuse_count INTEGER DEFAULT 0,            -- How many times this fix has been successfully reused (v99)
+    applicability_context TEXT,               -- When this universal pattern applies (v105)
+    fix_description_embedding BLOB,           -- 384-dim MiniLM embedding for semantic retrieval (v105)
     FOREIGN KEY (source_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
     FOREIGN KEY (reflection_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
     FOREIGN KEY (source_finding_id) REFERENCES task_run_findings(id) ON DELETE SET NULL,
@@ -2679,3 +2691,220 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_wf_ai_sessions_unique
     ON workflow_ai_sessions(task_run_id, iteration, phase, COALESCE(stage_index, -1));
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (94, datetime('now'));
+
+-- =============================================================================
+-- Workflow Constraint Results (Version 98)
+-- =============================================================================
+-- Stores constraint engine evaluation results per-iteration for post-run review.
+-- Similar to workflow_verification_phase_results but for constraint checks
+-- (secrets, scope violations, forbidden patterns, etc.)
+
+CREATE TABLE IF NOT EXISTS workflow_constraint_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_run_id TEXT NOT NULL,
+    iteration INTEGER NOT NULL,
+    constraint_id TEXT NOT NULL,
+    constraint_name TEXT NOT NULL,
+    passed INTEGER NOT NULL,              -- 0/1 boolean
+    severity TEXT NOT NULL,               -- 'block', 'warn', 'log'
+    violations_json TEXT,                 -- JSON array of ConstraintViolation objects
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_wf_constraint_task_run ON workflow_constraint_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_wf_constraint_iteration ON workflow_constraint_results(iteration);
+CREATE INDEX IF NOT EXISTS idx_wf_constraint_passed ON workflow_constraint_results(passed);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (98, datetime('now'));
+
+-- =============================================================================
+-- Cognitive System Model (Version 99)
+-- =============================================================================
+-- Adds knowledge properties (accumulation monotonicity, convergence gradient,
+-- relevance decay) and prediction capabilities to the reflection system.
+
+-- Fix Applications: tracks each time a fix is reused for similar errors
+CREATE TABLE IF NOT EXISTS fix_applications (
+    id TEXT PRIMARY KEY,
+    fix_id TEXT NOT NULL,                    -- FK to reflection_fixes
+    task_run_id TEXT NOT NULL,               -- The run where the fix was applied
+    error_signature_hash TEXT,               -- The error that triggered this application
+    outcome TEXT DEFAULT 'pending',          -- 'resolved', 'ineffective', 'pending'
+    applied_at TEXT NOT NULL,
+    evaluated_at TEXT,
+    FOREIGN KEY (fix_id) REFERENCES reflection_fixes(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_fix_applications_fix ON fix_applications(fix_id);
+CREATE INDEX IF NOT EXISTS idx_fix_applications_task ON fix_applications(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_fix_applications_sig ON fix_applications(error_signature_hash);
+
+-- Convergence Snapshots: time-series convergence metrics
+CREATE TABLE IF NOT EXISTS convergence_snapshots (
+    id TEXT PRIMARY KEY,
+    workflow_name TEXT NOT NULL,
+    project_path TEXT,
+    scope TEXT NOT NULL DEFAULT 'workflow',  -- 'workflow' or 'project'
+    convergence_score REAL NOT NULL,         -- 0.0 to 1.0
+    consecutive_clean_runs INTEGER NOT NULL,
+    novelty_score REAL NOT NULL,             -- 0.0 to 1.0 (how much new stuff was learned)
+    effective_fix_rate REAL NOT NULL,        -- 0.0 to 1.0
+    change_velocity REAL NOT NULL,           -- fixes per run over sliding window
+    total_fixes INTEGER NOT NULL,
+    effective_fixes INTEGER NOT NULL,
+    snapshot_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_convergence_workflow ON convergence_snapshots(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_convergence_project ON convergence_snapshots(project_path);
+CREATE INDEX IF NOT EXISTS idx_convergence_scope ON convergence_snapshots(scope);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (99, datetime('now'));
+
+-- =============================================================================
+-- Version 100: Causal Chain Tracking
+-- =============================================================================
+-- Adds directed cause→effect graph for tracking causal relationships between
+-- events (findings, errors, fixes, verifications).
+
+CREATE TABLE IF NOT EXISTS causal_events (
+    id TEXT PRIMARY KEY,
+    -- Cause side
+    cause_event_type TEXT NOT NULL,       -- 'finding_detected', 'error_occurred', 'code_change', etc.
+    cause_event_id TEXT NOT NULL,         -- FK to the source table (polymorphic)
+    -- Effect side
+    effect_event_type TEXT NOT NULL,      -- same enum as cause_event_type
+    effect_event_id TEXT NOT NULL,        -- FK to the target table (polymorphic)
+    -- Relationship metadata
+    relationship TEXT NOT NULL,           -- 'caused', 'triggered', 'resolved', 'prevented'
+    confidence TEXT NOT NULL DEFAULT 'high', -- 'high', 'medium', 'low'
+    source TEXT NOT NULL DEFAULT 'automated', -- 'automated' or 'ai_identified'
+    -- Context
+    task_run_id TEXT,                     -- Which run this relationship was identified in
+    workflow_name TEXT,
+    description TEXT,                     -- Human-readable explanation of the link
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_causal_cause ON causal_events(cause_event_type, cause_event_id);
+CREATE INDEX IF NOT EXISTS idx_causal_effect ON causal_events(effect_event_type, effect_event_id);
+CREATE INDEX IF NOT EXISTS idx_causal_workflow ON causal_events(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_causal_task_run ON causal_events(task_run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_causal_dedup ON causal_events(cause_event_type, cause_event_id, effect_event_type, effect_event_id);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (100, datetime('now'));
+
+-- =============================================================================
+-- Version 101: Architecture Model
+-- =============================================================================
+-- Aggregated component-level data from reflection fixes, causal events, and
+-- knowledge into a queryable graph of components and their relationships.
+
+CREATE TABLE IF NOT EXISTS architecture_components (
+    id TEXT PRIMARY KEY,
+    workflow_name TEXT NOT NULL,
+    component_path TEXT NOT NULL,
+    component_type TEXT NOT NULL DEFAULT 'file',  -- 'file', 'module', 'service'
+    fix_count INTEGER NOT NULL DEFAULT 0,
+    error_count INTEGER NOT NULL DEFAULT 0,
+    causal_involvement_count INTEGER NOT NULL DEFAULT 0,
+    effective_fix_count INTEGER NOT NULL DEFAULT 0,
+    ineffective_fix_count INTEGER NOT NULL DEFAULT 0,
+    health_score REAL NOT NULL DEFAULT 1.0,
+    change_velocity REAL NOT NULL DEFAULT 0.0,
+    last_activity_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(workflow_name, component_path)
+);
+CREATE INDEX IF NOT EXISTS idx_arch_comp_workflow ON architecture_components(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_arch_comp_health ON architecture_components(health_score);
+
+CREATE TABLE IF NOT EXISTS component_relationships (
+    id TEXT PRIMARY KEY,
+    workflow_name TEXT NOT NULL,
+    source_component TEXT NOT NULL,
+    target_component TEXT NOT NULL,
+    relationship_type TEXT NOT NULL,  -- 'impacts', 'co_changes_with'
+    strength INTEGER NOT NULL DEFAULT 1,
+    last_seen_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(workflow_name, source_component, target_component, relationship_type)
+);
+CREATE INDEX IF NOT EXISTS idx_comp_rel_workflow ON component_relationships(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_comp_rel_source ON component_relationships(source_component);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (101, datetime('now'));
+
+-- =============================================================================
+-- Version 102: Constraint Overrides
+-- =============================================================================
+-- Adds constraint_overrides column to unified_workflows table.
+-- Column is already in the canonical CREATE TABLE above; this migration
+-- adds it to existing databases via ALTER TABLE.
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (102, datetime('now'));
+
+-- =============================================================================
+-- Version 103: Component Health Snapshots (temporal trends)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS component_health_snapshots (
+    id TEXT PRIMARY KEY,
+    workflow_name TEXT NOT NULL,
+    component_path TEXT NOT NULL,
+    health_score REAL NOT NULL,
+    fix_count INTEGER NOT NULL DEFAULT 0,
+    effective_fix_count INTEGER NOT NULL DEFAULT 0,
+    change_velocity REAL NOT NULL DEFAULT 0.0,
+    snapshot_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_comp_health_snap_wf ON component_health_snapshots(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_comp_health_snap_comp ON component_health_snapshots(workflow_name, component_path);
+CREATE INDEX IF NOT EXISTS idx_comp_health_snap_at ON component_health_snapshots(snapshot_at);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (103, datetime('now'));
+
+-- =============================================================================
+-- Version 104: Decision Context Capture
+-- =============================================================================
+-- Adds reasoning and alternatives_considered to reflection_fixes for structured
+-- decision context capture. Separates "why" from "what" in fix descriptions.
+
+ALTER TABLE reflection_fixes ADD COLUMN reasoning TEXT;
+ALTER TABLE reflection_fixes ADD COLUMN alternatives_considered TEXT;
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (104, datetime('now'));
+
+-- =============================================================================
+-- Version 105: Cross-Project Patterns (Hybrid RAG)
+-- =============================================================================
+-- Adds applicability_context and fix_description_embedding to reflection_fixes
+-- for universal cross-project pattern retrieval via hybrid semantic search.
+
+ALTER TABLE reflection_fixes ADD COLUMN applicability_context TEXT;
+ALTER TABLE reflection_fixes ADD COLUMN fix_description_embedding BLOB;
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (105, datetime('now'));
+
+-- =============================================================================
+-- Version 106: Generation Rule Application Tracking
+-- =============================================================================
+-- Tracks which generation rules were used in each workflow generation run,
+-- enabling effectiveness analysis of rules over time.
+
+CREATE TABLE IF NOT EXISTS rule_applications (
+    id TEXT PRIMARY KEY,
+    rule_id TEXT NOT NULL,
+    workflow_id TEXT,
+    task_run_id TEXT,
+    agent TEXT NOT NULL,
+    section TEXT NOT NULL,
+    applied_at TEXT NOT NULL,
+    FOREIGN KEY (rule_id) REFERENCES generation_rules(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rule_apps_rule ON rule_applications(rule_id);
+CREATE INDEX IF NOT EXISTS idx_rule_apps_workflow ON rule_applications(workflow_id);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (106, datetime('now'));

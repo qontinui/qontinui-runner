@@ -55,7 +55,7 @@ export function DevServicesStep({ onNext, onBack }: DevServicesStepProps) {
         setServices(result);
         // Auto-select all by default
         setSelectedIds(new Set(result.map((s) => s.id)));
-      } catch (err) {
+      } catch (_err) {
         if (cancelled) return;
         // Not an error if workspace not found — just means no dev services to suggest
         setServices([]);
@@ -115,9 +115,7 @@ export function DevServicesStep({ onNext, onBack }: DevServicesStepProps) {
       <div className="tutorial-fade-in flex flex-col items-center py-8 px-4">
         <div className="empty-state py-8">
           <Cog className="w-10 h-10 text-muted-foreground mb-2 mx-auto" />
-          <p className="text-muted-foreground mb-2">
-            No dev services detected for this workspace.
-          </p>
+          <p className="text-muted-foreground mb-2">No dev services detected for this workspace.</p>
           <p className="text-xs text-muted-foreground">
             You can configure dev services later from the Process Manager.
           </p>

@@ -25,7 +25,6 @@ pub enum BridgeMode {
     Headless,
 }
 
-
 /// Information about a managed bridge.
 #[derive(Debug, Clone, Serialize)]
 pub struct BridgeInfo {

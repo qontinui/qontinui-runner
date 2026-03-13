@@ -19,6 +19,8 @@ use crate::mcp::shared::{
 };
 use crate::orchestrator::status_events::StatusEventEmitter;
 use crate::orchestrator::{RetryConfig, RetryService, RetryState};
+use crate::reflection::causal;
+use crate::reflection::causal_parser::{CausalChainParser, ParsedCausalLink};
 use crate::reflection::parser::{ParsedReflectionFix, ReflectionFixParser};
 use crate::reflection::storage as reflection_storage;
 use crate::reflection::types::CreateReflectionFixInput;
@@ -430,6 +432,9 @@ fn run_claude_session_inline(
     // Channel for parsed reflection fixes (sent from stdout thread to reflection fix processor thread)
     let (reflection_fix_tx, reflection_fix_rx) = mpsc::channel::<ParsedReflectionFix>();
 
+    // Channel for parsed causal chain links (sent from stdout thread, stored post-session)
+    let (causal_chain_tx, causal_chain_rx) = mpsc::channel::<ParsedCausalLink>();
+
     // Channel for injected steps (sent from stdout thread, collected in main)
     let (injected_step_tx, injected_step_rx) = mpsc::channel::<ExecutionStepConfig>();
 
@@ -526,6 +531,13 @@ fn run_claude_session_inline(
             None
         };
 
+        // Create causal chain parser (active when reflection fix parser is active)
+        let mut causal_chain_parser = if reflection_fix_ctx_for_stdout.is_some() {
+            Some(CausalChainParser::new())
+        } else {
+            None
+        };
+
         // Create step injection parser if we have a step injection context
         let mut step_injection_parser = if step_injection_ctx_for_stdout.is_some() {
             Some(InjectedStepParser::new())
@@ -608,6 +620,13 @@ fn run_claude_session_inline(
                                 }
                             }
 
+                            // Parse for causal chain markers
+                            if let Some(ref mut parser) = causal_chain_parser {
+                                if let Some(parsed_link) = parser.process_line(&complete_line) {
+                                    let _ = causal_chain_tx.send(parsed_link);
+                                }
+                            }
+
                             // Parse for step injection markers
                             if let Some(ref mut parser) = step_injection_parser {
                                 if let Some(injected_step) = parser.process_line(&complete_line) {
@@ -643,6 +662,11 @@ fn run_claude_session_inline(
             if let Some(ref mut parser) = reflection_fix_parser {
                 if let Some(parsed_fix) = parser.process_line(&line_buffer) {
                     let _ = reflection_fix_tx.send(parsed_fix);
+                }
+            }
+            if let Some(ref mut parser) = causal_chain_parser {
+                if let Some(parsed_link) = parser.process_line(&line_buffer) {
+                    let _ = causal_chain_tx.send(parsed_link);
                 }
             }
             if let Some(ref mut parser) = step_injection_parser {
@@ -1033,24 +1057,45 @@ fn run_claude_session_inline(
                         new_value: parsed_fix.new_value,
                         confidence: parsed_fix.confidence.clone(),
                         source_agent: parsed_fix.source_agent,
+                        reasoning: parsed_fix.reasoning,
+                        alternatives_considered: parsed_fix.alternatives_considered,
                     };
 
                     match reflection_storage::insert_fix(&conn, &input) {
                         Ok(fix) => {
                             fix_count += 1;
 
-                            // Mark project-scoped fix types with reflection_scope and project_path
-                            let is_project_fix = matches!(
-                                fix.fix_type.as_str(),
-                                "project_environment"
-                                    | "project_architecture"
-                                    | "project_test_pattern"
-                                    | "project_recurring_issue"
-                            );
-                            if is_project_fix {
+                            // Set reflection_scope: AI-explicit universal takes priority,
+                            // then auto-detect project scope from fix type
+                            if parsed_fix.scope.as_deref() == Some("universal") {
                                 let _ = conn.execute(
-                                    "UPDATE reflection_fixes SET reflection_scope = 'project', project_path = ?1 WHERE id = ?2",
-                                    rusqlite::params![ctx.project_path, fix.id],
+                                    "UPDATE reflection_fixes SET reflection_scope = 'universal', applicability_context = ?1 WHERE id = ?2",
+                                    rusqlite::params![parsed_fix.applicability, fix.id],
+                                );
+                            } else {
+                                let is_project_fix = matches!(
+                                    fix.fix_type.as_str(),
+                                    "project_environment"
+                                        | "project_architecture"
+                                        | "project_test_pattern"
+                                        | "project_recurring_issue"
+                                );
+                                if is_project_fix {
+                                    let _ = conn.execute(
+                                        "UPDATE reflection_fixes SET reflection_scope = 'project', project_path = ?1 WHERE id = ?2",
+                                        rusqlite::params![ctx.project_path, fix.id],
+                                    );
+                                }
+                            }
+
+                            // Eagerly link matching error_events to this fix via resolved_by_fix_id
+                            if let Some(ref finding_id) = fix.source_finding_id {
+                                let _ = conn.execute(
+                                    r#"UPDATE error_events SET resolved_by_fix_id = ?1
+                                       WHERE signature_hash = (
+                                           SELECT signature_hash FROM task_run_findings WHERE id = ?2
+                                       ) AND resolved_by_fix_id IS NULL"#,
+                                    rusqlite::params![fix.id, finding_id],
                                 );
                             }
 
@@ -1400,6 +1445,58 @@ fn run_claude_session_inline(
     while let Ok(step) = injected_step_rx.try_recv() {
         injected_steps.push(step);
     }
+
+    // Store parsed causal chain links in the database
+    let mut causal_link_count = 0u32;
+    {
+        let causal_links: Vec<ParsedCausalLink> = {
+            let mut links = Vec::new();
+            while let Ok(link) = causal_chain_rx.try_recv() {
+                links.push(link);
+            }
+            links
+        };
+
+        if !causal_links.is_empty() {
+            if let Ok(db) = CheckpointDb::new() {
+                if let Ok(conn) = db.connection() {
+                    let rfx_ctx = reflection_fix_ctx.as_ref();
+                    let task_run_id = rfx_ctx.map(|c| c.source_task_run_id.as_str());
+
+                    // Resolve workflow_name from task_runs table
+                    let workflow_name: Option<String> = task_run_id.and_then(|id| {
+                        conn.query_row(
+                            "SELECT workflow_name FROM task_runs WHERE id = ?1",
+                            rusqlite::params![id],
+                            |row| row.get(0),
+                        )
+                        .ok()
+                        .flatten()
+                    });
+
+                    for link in &causal_links {
+                        match causal::insert_causal_event(
+                            &conn,
+                            &link.cause_type,
+                            &link.cause_ref,
+                            &link.effect_type,
+                            &link.effect_ref,
+                            &link.relationship,
+                            "medium", // AI-identified links are medium confidence
+                            "ai_identified",
+                            task_run_id,
+                            workflow_name.as_deref(),
+                            Some(&link.description),
+                        ) {
+                            Ok(_) => causal_link_count += 1,
+                            Err(e) => warn!("Failed to store causal link: {}", e),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let _ = std::fs::remove_file(&prompt_file);
 
     // Log summary of detected findings
@@ -1424,6 +1521,14 @@ fn run_claude_session_inline(
         info!(
             "Session {} recorded {} reflection fixes",
             session_id, reflection_fix_count
+        );
+    }
+
+    // Log summary of causal chain links
+    if causal_link_count > 0 {
+        info!(
+            "Session {} recorded {} causal chain links",
+            session_id, causal_link_count
         );
     }
 

@@ -7,6 +7,8 @@
 use rusqlite::{params, Connection};
 use tracing::{debug, info, warn};
 
+use super::causal;
+use super::prediction;
 use super::storage;
 use super::types::{FixEffectiveness, ReflectionFix};
 use crate::str_utils::truncate_str;
@@ -151,6 +153,7 @@ fn evaluate_by_finding_signature(
         // Check for regression — new findings not seen before the fix
         let has_regression = check_for_regression(conn, fix, subsequent_run_ids)?;
         if has_regression {
+            link_regression_fix(conn, fix);
             return Ok(EvaluationResult {
                 fix_id: fix.id.clone(),
                 effectiveness: FixEffectiveness::CausedRegression,
@@ -161,17 +164,26 @@ fn evaluate_by_finding_signature(
             });
         }
 
+        let reasoning_ctx = fix
+            .reasoning
+            .as_ref()
+            .map(|r| format!(" Original reasoning: {}", truncate_str(r, 200)))
+            .unwrap_or_default();
         return Ok(EvaluationResult {
             fix_id: fix.id.clone(),
             effectiveness: FixEffectiveness::Ineffective,
             evidence: format!(
-                "Same finding (signature: {}) recurred in {}/{} subsequent runs",
+                "Same finding (signature: {}) recurred in {}/{} subsequent runs.{}",
                 truncate_str(&signature_hash, 8),
                 recurrence_count,
-                checked_runs
+                checked_runs,
+                reasoning_ctx,
             ),
         });
     }
+
+    // Link this effective fix to the error event (if any) and record fix application
+    link_effective_fix_to_error(conn, fix, &signature_hash);
 
     Ok(EvaluationResult {
         fix_id: fix.id.clone(),
@@ -181,6 +193,73 @@ fn evaluate_by_finding_signature(
             checked_runs
         ),
     })
+}
+
+/// When a fix is evaluated as Effective, link it to any matching error events
+/// and record a fix application for accumulation monotonicity tracking.
+fn link_effective_fix_to_error(conn: &Connection, fix: &ReflectionFix, signature_hash: &str) {
+    // Update error_events that match this signature hash
+    if let Err(e) = conn.execute(
+        r#"UPDATE error_events SET resolved_by_fix_id = ?1
+           WHERE signature_hash = ?2 AND resolved_by_fix_id IS NULL"#,
+        params![fix.id, signature_hash],
+    ) {
+        debug!(
+            "Could not link fix to error_events (table may not exist): {}",
+            e
+        );
+    }
+
+    // Record a fix application with 'resolved' outcome
+    if let Err(e) = prediction::record_fix_application(
+        conn,
+        &fix.id,
+        &fix.source_task_run_id,
+        Some(signature_hash),
+        "resolved",
+    ) {
+        debug!("Could not record fix application: {}", e);
+    }
+
+    // Create automated causal link: fix_applied → finding_detected (resolved)
+    if let Some(ref finding_id) = fix.source_finding_id {
+        if let Err(e) = causal::insert_causal_event(
+            conn,
+            "fix_applied",
+            &fix.id,
+            "finding_detected",
+            finding_id,
+            "resolved",
+            "high",
+            "automated",
+            Some(&fix.source_task_run_id),
+            None,
+            Some("Fix evaluated as effective — finding did not recur"),
+        ) {
+            debug!("Could not create causal link for effective fix: {}", e);
+        }
+    }
+}
+
+/// When a fix causes a regression, create a causal link recording the relationship.
+fn link_regression_fix(conn: &Connection, fix: &ReflectionFix) {
+    if let Some(ref finding_id) = fix.source_finding_id {
+        if let Err(e) = causal::insert_causal_event(
+            conn,
+            "fix_applied",
+            &fix.id,
+            "finding_detected",
+            finding_id,
+            "caused",
+            "high",
+            "automated",
+            Some(&fix.source_task_run_id),
+            None,
+            Some("Fix evaluated as causing regression — new issues appeared"),
+        ) {
+            debug!("Could not create causal link for regression fix: {}", e);
+        }
+    }
 }
 
 /// Check if any new findings appeared in subsequent runs that weren't present before the fix.
@@ -255,7 +334,7 @@ fn evaluate_by_workflow_outcome(
     let avg_subsequent = total_subsequent_findings as f64 / subsequent_run_ids.len() as f64;
 
     // For knowledge/context fixes: if subsequent runs are cleaner, mark effective
-    match fix.fix_type.as_str() {
+    let result = match fix.fix_type.as_str() {
         "knowledge_base_update"
         | "context_addition"
         | "instruction_clarification"
@@ -266,7 +345,7 @@ fn evaluate_by_workflow_outcome(
             if source_findings == 0 && total_subsequent_findings == 0 {
                 // Source had no findings either — fix may be preventive, mark effective
                 // if subsequent runs succeeded
-                Ok(EvaluationResult {
+                EvaluationResult {
                     fix_id: fix.id.clone(),
                     effectiveness: FixEffectiveness::Effective,
                     evidence: format!(
@@ -274,9 +353,9 @@ fn evaluate_by_workflow_outcome(
                          no findings in source or subsequent runs",
                         subsequent_run_ids.len()
                     ),
-                })
+                }
             } else if avg_subsequent < source_findings as f64 {
-                Ok(EvaluationResult {
+                EvaluationResult {
                     fix_id: fix.id.clone(),
                     effectiveness: FixEffectiveness::Effective,
                     evidence: format!(
@@ -285,9 +364,9 @@ fn evaluate_by_workflow_outcome(
                         avg_subsequent,
                         subsequent_run_ids.len()
                     ),
-                })
+                }
             } else {
-                Ok(EvaluationResult {
+                EvaluationResult {
                     fix_id: fix.id.clone(),
                     effectiveness: FixEffectiveness::Inconclusive,
                     evidence: format!(
@@ -295,7 +374,7 @@ fn evaluate_by_workflow_outcome(
                          No source finding linked for precise tracking.",
                         source_findings, avg_subsequent, subsequent_run_ids.len()
                     ),
-                })
+                }
             }
         }
         // For other fix types without source findings: if both source and
@@ -303,7 +382,7 @@ fn evaluate_by_workflow_outcome(
         // Otherwise remain inconclusive without signature-based tracking.
         _ => {
             if source_findings == 0 && total_subsequent_findings == 0 {
-                Ok(EvaluationResult {
+                EvaluationResult {
                     fix_id: fix.id.clone(),
                     effectiveness: FixEffectiveness::Effective,
                     evidence: format!(
@@ -312,18 +391,18 @@ fn evaluate_by_workflow_outcome(
                         fix.fix_type,
                         subsequent_run_ids.len()
                     ),
-                })
+                }
             } else if avg_subsequent < source_findings as f64 {
-                Ok(EvaluationResult {
+                EvaluationResult {
                     fix_id: fix.id.clone(),
                     effectiveness: FixEffectiveness::Effective,
                     evidence: format!(
                         "Fix type '{}': findings decreased {} → {:.1} avg across {} subsequent run(s)",
                         fix.fix_type, source_findings, avg_subsequent, subsequent_run_ids.len()
                     ),
-                })
+                }
             } else {
-                Ok(EvaluationResult {
+                EvaluationResult {
                     fix_id: fix.id.clone(),
                     effectiveness: FixEffectiveness::Inconclusive,
                     evidence: format!(
@@ -332,10 +411,26 @@ fn evaluate_by_workflow_outcome(
                         fix.fix_type,
                         subsequent_run_ids.len()
                     ),
-                })
+                }
             }
         }
+    };
+
+    // Record fix application for accumulation monotonicity tracking
+    // (outcome-based path has no signature_hash, so pass None)
+    if result.effectiveness == FixEffectiveness::Effective {
+        if let Err(e) = prediction::record_fix_application(
+            conn,
+            &fix.id,
+            &fix.source_task_run_id,
+            None,
+            "resolved",
+        ) {
+            debug!("Could not record outcome-based fix application: {}", e);
+        }
     }
+
+    Ok(result)
 }
 
 /// Batch evaluate all unevaluated fixes for a workflow.
@@ -437,7 +532,67 @@ pub fn evaluate_pending_fixes(
         inconclusive_count,
     );
 
+    // Check for fixes that should be auto-promoted to universal scope
+    if let Ok(promoted) = check_cross_project_promotion(conn) {
+        if !promoted.is_empty() {
+            info!("Auto-promoted {} fixes to universal scope", promoted.len());
+        }
+    }
+
     Ok(results)
+}
+
+/// Auto-promote fixes that are effective across 2+ different project_paths.
+///
+/// When the same fix (by content_hash) independently proves effective in
+/// multiple projects, it's a strong signal that the pattern is universal.
+pub fn check_cross_project_promotion(conn: &Connection) -> Result<Vec<String>, String> {
+    let sql = r#"
+        SELECT content_hash, GROUP_CONCAT(DISTINCT project_path) as paths, MIN(id) as canonical_id
+        FROM reflection_fixes
+        WHERE reflection_scope IN ('workflow', 'project')
+          AND effectiveness = 'effective'
+          AND status = 'applied'
+          AND content_hash IS NOT NULL
+          AND project_path IS NOT NULL
+        GROUP BY content_hash
+        HAVING COUNT(DISTINCT project_path) >= 2
+    "#;
+
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| format!("Failed to prepare cross-project promotion query: {}", e))?;
+
+    let candidates: Vec<(String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| format!("Failed to query cross-project candidates: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut promoted = Vec::new();
+    for (content_hash, paths, canonical_id) in &candidates {
+        let applicability = format!("Proven effective across: {}", paths);
+        if let Err(e) = storage::promote_to_universal(conn, canonical_id, Some(&applicability)) {
+            warn!(
+                "Failed to promote fix {} (hash: {}): {}",
+                canonical_id, content_hash, e
+            );
+        } else {
+            info!(
+                "Auto-promoted fix {} to universal (hash: {}, projects: {})",
+                canonical_id, content_hash, paths
+            );
+            promoted.push(canonical_id.clone());
+        }
+    }
+
+    Ok(promoted)
 }
 
 #[cfg(test)]
@@ -486,12 +641,34 @@ mod tests {
                 old_value TEXT,
                 new_value TEXT,
                 confidence TEXT NOT NULL DEFAULT 'medium',
+                content_hash TEXT,
                 status TEXT NOT NULL DEFAULT 'applied',
                 effectiveness TEXT,
                 effectiveness_evidence TEXT,
                 applied_at TEXT NOT NULL,
                 evaluated_at TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                reuse_count INTEGER DEFAULT 0,
+                reasoning TEXT,
+                alternatives_considered TEXT,
+                reflection_scope TEXT DEFAULT 'workflow',
+                project_path TEXT,
+                applicability_context TEXT,
+                fix_description_embedding BLOB
+            );
+            CREATE TABLE error_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signature_hash TEXT,
+                resolved_by_fix_id TEXT
+            );
+            CREATE TABLE fix_applications (
+                id TEXT PRIMARY KEY,
+                fix_id TEXT NOT NULL,
+                task_run_id TEXT NOT NULL,
+                error_signature_hash TEXT,
+                outcome TEXT DEFAULT 'pending',
+                applied_at TEXT NOT NULL,
+                evaluated_at TEXT
             );
             "#,
         )
@@ -528,6 +705,11 @@ mod tests {
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
             source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
+            reflection_scope: None,
+            project_path: None,
+            applicability_context: None,
         };
 
         let result = evaluate_fix(&conn, &fix).unwrap();
@@ -576,6 +758,11 @@ mod tests {
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
             source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
+            reflection_scope: None,
+            project_path: None,
+            applicability_context: None,
         };
 
         let result = evaluate_fix(&conn, &fix).unwrap();
@@ -627,6 +814,11 @@ mod tests {
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
             source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
+            reflection_scope: None,
+            project_path: None,
+            applicability_context: None,
         };
 
         let result = evaluate_fix(&conn, &fix).unwrap();
@@ -680,6 +872,11 @@ mod tests {
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
             source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
+            reflection_scope: None,
+            project_path: None,
+            applicability_context: None,
         };
 
         let result = evaluate_fix(&conn, &fix).unwrap();
@@ -723,6 +920,11 @@ mod tests {
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
             source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
+            reflection_scope: None,
+            project_path: None,
+            applicability_context: None,
         };
 
         let result = evaluate_fix(&conn, &fix).unwrap();
@@ -766,6 +968,11 @@ mod tests {
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
             source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
+            reflection_scope: None,
+            project_path: None,
+            applicability_context: None,
         };
 
         // Now marks effective since both source and subsequent have zero findings
@@ -822,6 +1029,11 @@ mod tests {
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
             source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
+            reflection_scope: None,
+            project_path: None,
+            applicability_context: None,
         };
 
         let result = evaluate_fix(&conn, &fix).unwrap();

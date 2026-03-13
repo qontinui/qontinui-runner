@@ -8,7 +8,14 @@ import { DevServicesStep } from "./DevServicesStep";
 import { AiProviderStep } from "./AiProviderStep";
 import { ClaudeConfigStep } from "./ClaudeConfigStep";
 
-const STEPS = ["Welcome", "Projects", "Processes", "Dev Services", "AI Provider", "Claude Sessions"];
+const STEPS = [
+  "Welcome",
+  "Projects",
+  "Processes",
+  "Dev Services",
+  "AI Provider",
+  "Claude Sessions",
+];
 
 interface Project {
   path: string;

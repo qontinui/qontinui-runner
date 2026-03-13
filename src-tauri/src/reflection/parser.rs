@@ -30,6 +30,14 @@ pub struct ParsedReflectionFix {
     pub source_finding_id: Option<String>,
     /// Which generation agent's output likely caused this issue
     pub source_agent: Option<String>,
+    /// Root cause diagnosis and reasoning behind the fix
+    pub reasoning: Option<String>,
+    /// Other approaches considered and why they were rejected
+    pub alternatives_considered: Option<String>,
+    /// Scope: 'workflow', 'project', or 'universal'
+    pub scope: Option<String>,
+    /// When this universal pattern applies
+    pub applicability: Option<String>,
 }
 
 static REFLECTION_FIX_START: OnceLock<Regex> = OnceLock::new();
@@ -81,6 +89,16 @@ fn normalize_agent(s: &str) -> Option<String> {
         "fixer" | "fix" => Some("fixer".to_string()),
         "hardener" | "harden" => Some("hardener".to_string()),
         _ => Some(s.to_lowercase()),
+    }
+}
+
+/// Normalize scope string to canonical form.
+fn normalize_scope(s: &str) -> Option<String> {
+    match s.trim().to_lowercase().as_str() {
+        "universal" | "cross-project" | "global" => Some("universal".to_string()),
+        "project" | "proj" => Some("project".to_string()),
+        "workflow" | "wf" => Some("workflow".to_string()),
+        _ => None,
     }
 }
 
@@ -178,6 +196,10 @@ fn parse_content(
     let mut new_value = None;
     let mut source_finding_id = None;
     let mut content_agent = None;
+    let mut reasoning = None;
+    let mut alternatives_considered = None;
+    let mut scope = None;
+    let mut applicability = None;
 
     let mut current_field: Option<&str> = None;
     let mut current_value = String::new();
@@ -193,6 +215,10 @@ fn parse_content(
                 &mut new_value,
                 &mut source_finding_id,
                 &mut content_agent,
+                &mut reasoning,
+                &mut alternatives_considered,
+                &mut scope,
+                &mut applicability,
                 current_field,
                 &current_value,
             );
@@ -206,6 +232,10 @@ fn parse_content(
                 &mut new_value,
                 &mut source_finding_id,
                 &mut content_agent,
+                &mut reasoning,
+                &mut alternatives_considered,
+                &mut scope,
+                &mut applicability,
                 current_field,
                 &current_value,
             );
@@ -219,6 +249,10 @@ fn parse_content(
                 &mut new_value,
                 &mut source_finding_id,
                 &mut content_agent,
+                &mut reasoning,
+                &mut alternatives_considered,
+                &mut scope,
+                &mut applicability,
                 current_field,
                 &current_value,
             );
@@ -232,6 +266,10 @@ fn parse_content(
                 &mut new_value,
                 &mut source_finding_id,
                 &mut content_agent,
+                &mut reasoning,
+                &mut alternatives_considered,
+                &mut scope,
+                &mut applicability,
                 current_field,
                 &current_value,
             );
@@ -245,6 +283,10 @@ fn parse_content(
                 &mut new_value,
                 &mut source_finding_id,
                 &mut content_agent,
+                &mut reasoning,
+                &mut alternatives_considered,
+                &mut scope,
+                &mut applicability,
                 current_field,
                 &current_value,
             );
@@ -258,10 +300,82 @@ fn parse_content(
                 &mut new_value,
                 &mut source_finding_id,
                 &mut content_agent,
+                &mut reasoning,
+                &mut alternatives_considered,
+                &mut scope,
+                &mut applicability,
                 current_field,
                 &current_value,
             );
             current_field = Some("agent");
+            current_value = rest.trim().to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("Reasoning:") {
+            save_field(
+                &mut description,
+                &mut file_changed,
+                &mut old_value,
+                &mut new_value,
+                &mut source_finding_id,
+                &mut content_agent,
+                &mut reasoning,
+                &mut alternatives_considered,
+                &mut scope,
+                &mut applicability,
+                current_field,
+                &current_value,
+            );
+            current_field = Some("reasoning");
+            current_value = rest.trim().to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("Alternatives:") {
+            save_field(
+                &mut description,
+                &mut file_changed,
+                &mut old_value,
+                &mut new_value,
+                &mut source_finding_id,
+                &mut content_agent,
+                &mut reasoning,
+                &mut alternatives_considered,
+                &mut scope,
+                &mut applicability,
+                current_field,
+                &current_value,
+            );
+            current_field = Some("alternatives");
+            current_value = rest.trim().to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("Scope:") {
+            save_field(
+                &mut description,
+                &mut file_changed,
+                &mut old_value,
+                &mut new_value,
+                &mut source_finding_id,
+                &mut content_agent,
+                &mut reasoning,
+                &mut alternatives_considered,
+                &mut scope,
+                &mut applicability,
+                current_field,
+                &current_value,
+            );
+            current_field = Some("scope");
+            current_value = rest.trim().to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("Applicability:") {
+            save_field(
+                &mut description,
+                &mut file_changed,
+                &mut old_value,
+                &mut new_value,
+                &mut source_finding_id,
+                &mut content_agent,
+                &mut reasoning,
+                &mut alternatives_considered,
+                &mut scope,
+                &mut applicability,
+                current_field,
+                &current_value,
+            );
+            current_field = Some("applicability");
             current_value = rest.trim().to_string();
         } else if current_field.is_some() && !trimmed.is_empty() {
             if !current_value.is_empty() {
@@ -279,6 +393,10 @@ fn parse_content(
         &mut new_value,
         &mut source_finding_id,
         &mut content_agent,
+        &mut reasoning,
+        &mut alternatives_considered,
+        &mut scope,
+        &mut applicability,
         current_field,
         &current_value,
     );
@@ -300,6 +418,10 @@ fn parse_content(
         new_value,
         source_finding_id,
         source_agent,
+        reasoning,
+        alternatives_considered,
+        scope,
+        applicability,
     }
 }
 
@@ -310,6 +432,10 @@ fn save_field(
     new_value: &mut Option<String>,
     source_finding_id: &mut Option<String>,
     source_agent: &mut Option<String>,
+    reasoning: &mut Option<String>,
+    alternatives_considered: &mut Option<String>,
+    scope: &mut Option<String>,
+    applicability: &mut Option<String>,
     field: Option<&str>,
     value: &str,
 ) {
@@ -323,6 +449,10 @@ fn save_field(
         Some("new") => *new_value = Some(value.to_string()),
         Some("finding") => *source_finding_id = Some(value.to_string()),
         Some("agent") => *source_agent = normalize_agent(value),
+        Some("reasoning") => *reasoning = Some(value.to_string()),
+        Some("alternatives") => *alternatives_considered = Some(value.to_string()),
+        Some("scope") => *scope = normalize_scope(value),
+        Some("applicability") => *applicability = Some(value.to_string()),
         _ => {}
     }
 }
@@ -415,6 +545,63 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_with_reasoning_and_alternatives() {
+        let mut parser = ReflectionFixParser::new();
+
+        parser.process_line("[REFLECTION_FIX:selector_fix:high]");
+        parser.process_line("Description: Updated login button selector from #btn-login to button[data-testid='login']");
+        parser.process_line("Reasoning: The old #btn-login ID was removed in a recent refactor. The data-testid attribute is more stable as it's explicitly maintained for testing purposes.");
+        parser.process_line("Alternatives: Considered using button.login-btn class selector, but class names are more likely to change during CSS refactoring. Also considered XPath but it's fragile against DOM restructuring.");
+        parser.process_line("File: workflows/login-flow.json");
+        parser.process_line("Old: #btn-login");
+        parser.process_line("New: button[data-testid='login']");
+
+        let fix = parser
+            .process_line("[/REFLECTION_FIX]")
+            .expect("Should parse fix");
+
+        assert_eq!(fix.fix_type, "selector_fix");
+        assert_eq!(fix.confidence, "high");
+        assert!(fix.description.contains("Updated login button selector"));
+        assert!(fix
+            .reasoning
+            .unwrap()
+            .contains("old #btn-login ID was removed"));
+        assert!(fix
+            .alternatives_considered
+            .unwrap()
+            .contains("Considered using button.login-btn"));
+        assert_eq!(
+            fix.file_changed,
+            Some("workflows/login-flow.json".to_string())
+        );
+        assert_eq!(fix.old_value, Some("#btn-login".to_string()));
+        assert_eq!(
+            fix.new_value,
+            Some("button[data-testid='login']".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_backward_compat_without_reasoning() {
+        let mut parser = ReflectionFixParser::new();
+
+        parser.process_line("[REFLECTION_FIX:context_addition:medium]");
+        parser.process_line("Description: Added workspace path to context");
+        parser.process_line("File: .claude/settings.json");
+
+        let fix = parser
+            .process_line("[/REFLECTION_FIX]")
+            .expect("Should parse fix");
+
+        assert_eq!(fix.fix_type, "context_addition");
+        assert_eq!(fix.confidence, "medium");
+        assert_eq!(fix.description, "Added workspace path to context");
+        assert!(fix.reasoning.is_none());
+        assert!(fix.alternatives_considered.is_none());
+    }
+
+    #[test]
     fn test_unstructured_content() {
         let mut parser = ReflectionFixParser::new();
 
@@ -431,5 +618,63 @@ mod tests {
             fix.description,
             "This is just a plain description without field markers"
         );
+    }
+
+    #[test]
+    fn test_parse_with_scope_universal_and_applicability() {
+        let mut parser = ReflectionFixParser::new();
+
+        parser.process_line("[REFLECTION_FIX:context_addition:high]");
+        parser.process_line("Description: Always use data-testid selectors instead of CSS classes for test automation");
+        parser.process_line("Scope: universal");
+        parser.process_line(
+            "Applicability: Web apps using React or any framework with data-testid support",
+        );
+        parser.process_line("Reasoning: CSS classes change frequently during styling refactors, while data-testid attributes are explicitly maintained for testing.");
+
+        let fix = parser
+            .process_line("[/REFLECTION_FIX]")
+            .expect("Should parse fix");
+
+        assert_eq!(fix.fix_type, "context_addition");
+        assert_eq!(fix.confidence, "high");
+        assert!(fix.description.contains("data-testid selectors"));
+        assert_eq!(fix.scope, Some("universal".to_string()));
+        assert!(fix.applicability.unwrap().contains("React"));
+        assert!(fix.reasoning.unwrap().contains("CSS classes change"));
+    }
+
+    #[test]
+    fn test_parse_backward_compat_without_scope() {
+        let mut parser = ReflectionFixParser::new();
+
+        parser.process_line("[REFLECTION_FIX:selector_fix:medium]");
+        parser.process_line("Description: Fixed login button selector");
+        parser.process_line("File: workflows/login.json");
+
+        let fix = parser
+            .process_line("[/REFLECTION_FIX]")
+            .expect("Should parse fix");
+
+        assert_eq!(fix.fix_type, "selector_fix");
+        assert!(fix.scope.is_none());
+        assert!(fix.applicability.is_none());
+    }
+
+    #[test]
+    fn test_normalize_scope_variants() {
+        assert_eq!(normalize_scope("universal"), Some("universal".to_string()));
+        assert_eq!(
+            normalize_scope("cross-project"),
+            Some("universal".to_string())
+        );
+        assert_eq!(normalize_scope("global"), Some("universal".to_string()));
+        assert_eq!(normalize_scope("project"), Some("project".to_string()));
+        assert_eq!(normalize_scope("workflow"), Some("workflow".to_string()));
+        assert_eq!(
+            normalize_scope("  Universal  "),
+            Some("universal".to_string())
+        );
+        assert_eq!(normalize_scope("unknown"), None);
     }
 }

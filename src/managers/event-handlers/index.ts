@@ -10,6 +10,7 @@ import { setupExecutionHandlers } from "./executionHandlers";
 import { setupImageHandlers } from "./imageHandlers";
 import { setupAiOutputHandlers } from "./aiOutputHandlers";
 import { setupReportingHandlers } from "./reportingHandlers";
+import { setupConstraintHandlers } from "./constraintHandlers";
 
 // Re-export types
 export type { ExecutionContextActions, HandlerContext, HandlerSetupFunction } from "./types";
@@ -23,6 +24,7 @@ export {
   resetAiSessionState,
 } from "./aiOutputHandlers";
 export { setupReportingHandlers } from "./reportingHandlers";
+export { setupConstraintHandlers } from "./constraintHandlers";
 
 /**
  * All handler setup functions in order
@@ -32,6 +34,7 @@ const allHandlerSetups: HandlerSetupFunction[] = [
   setupImageHandlers,
   setupAiOutputHandlers,
   setupReportingHandlers,
+  setupConstraintHandlers,
 ];
 
 /**

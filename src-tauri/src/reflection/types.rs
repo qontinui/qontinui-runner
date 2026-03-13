@@ -57,6 +57,21 @@ pub struct ReflectionFix {
     /// (e.g. "specification", "builder", "verification", "hardener")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_agent: Option<String>,
+    /// Root cause diagnosis and reasoning behind the fix
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Other approaches considered and why they were rejected
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alternatives_considered: Option<String>,
+    /// Scope of this fix: 'workflow', 'project', or 'universal'
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reflection_scope: Option<String>,
+    /// Project path for project/workflow scoped fixes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
+    /// When this universal pattern applies (e.g., "web apps using React")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applicability_context: Option<String>,
 }
 
 /// Types of fixes that a reflection workflow can apply.
@@ -248,6 +263,12 @@ pub struct CreateReflectionFixInput {
     /// Which generation agent's output likely caused this issue
     #[serde(default)]
     pub source_agent: Option<String>,
+    /// Root cause diagnosis and reasoning behind the fix
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    /// Other approaches considered and why they were rejected
+    #[serde(default)]
+    pub alternatives_considered: Option<String>,
 }
 
 fn default_confidence() -> String {

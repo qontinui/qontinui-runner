@@ -183,6 +183,9 @@ pub struct LoopConfig {
     pub stages: Vec<StageConfig>,
     /// Whether to stop execution if a stage fails verification (default: false).
     pub stop_on_failure: bool,
+    /// Per-constraint overrides: map of constraint_id to enabled (true) / disabled (false).
+    /// Applied to the constraint engine at the start of execution.
+    pub constraint_overrides: HashMap<String, bool>,
     /// Whether to enable reflection mode during agentic iterations.
     /// When true, the AI investigates root causes before fixing failures.
     pub reflection_mode: bool,
