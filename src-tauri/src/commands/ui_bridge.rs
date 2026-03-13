@@ -31,7 +31,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use tracing::{error, info};
 
 use super::CommandResponse;
@@ -547,10 +547,10 @@ pub async fn ui_bridge_discover_states_from_fingerprints(
 ) -> Result<CommandResponse, String> {
     info!("UI Bridge: Discovering states from fingerprints");
 
-    let mut executor_lock = state
-        .extraction_executor
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+    let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
+        &state.extraction_executor,
+        "extraction_executor",
+    );
 
     if let Some(ref mut executor) = *executor_lock {
         // Start executor on-demand if not running
@@ -595,6 +595,33 @@ pub async fn ui_bridge_discover_states_from_fingerprints(
         }
     } else {
         Err("Extraction executor not initialized".to_string())
+    }
+}
+
+/// Reload the runner's webview.
+///
+/// Calls `location.reload()` on the webview to recover from frozen states
+/// (e.g., loading screen stuck after Vite fails to mount).
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success if reload was triggered
+/// * `Err(String)` - Error if reload could not be initiated
+#[tauri::command]
+pub async fn ui_bridge_reload_webview(app: tauri::AppHandle) -> Result<CommandResponse, String> {
+    info!("UI Bridge: Reloading webview");
+
+    // Get all webview windows and reload the main one
+    if let Some(window) = app.get_webview_window("main") {
+        window
+            .eval("location.reload()")
+            .map_err(|e| format!("Failed to reload webview: {}", e))?;
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Webview reload triggered".to_string()),
+            data: None,
+        })
+    } else {
+        Err("Main webview window not found".to_string())
     }
 }
 
@@ -665,10 +692,10 @@ pub async fn ui_bridge_run_exploration(
 ) -> Result<CommandResponse, String> {
     info!("UI Bridge: Running automatic exploration");
 
-    let mut executor_lock = state
-        .extraction_executor
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+    let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
+        &state.extraction_executor,
+        "extraction_executor",
+    );
 
     if let Some(ref mut executor) = *executor_lock {
         // Start executor on-demand if not running
@@ -733,10 +760,10 @@ pub async fn ui_bridge_stop_exploration(
 ) -> Result<CommandResponse, String> {
     info!("UI Bridge: Stopping exploration");
 
-    let mut executor_lock = state
-        .extraction_executor
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+    let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
+        &state.extraction_executor,
+        "extraction_executor",
+    );
 
     if let Some(ref mut executor) = *executor_lock {
         if !executor.is_running() {
