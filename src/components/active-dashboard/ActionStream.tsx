@@ -128,6 +128,11 @@ export function ActionStream({ actions, currentAction: _currentAction }: ActionS
   // Key extractor for virtual list
   const getItemKey = useCallback((action: ActionItem) => action.id, []);
 
+  // Scroll handler to record scroll frames for virtual scroll metrics
+  const handleScroll = useCallback(() => {
+    recordScrollFrame();
+  }, [recordScrollFrame]);
+
   return (
     <div className="flex h-[40%] flex-col bg-card">
       <div className="flex items-center justify-between border-b border-border px-4 py-2">
@@ -149,6 +154,7 @@ export function ActionStream({ actions, currentAction: _currentAction }: ActionS
           getItemKey={getItemKey}
           reverseOrder={true}
           overscanCount={10}
+          onScroll={handleScroll}
         />
       ) : (
         /* Regular scrolling for small lists */

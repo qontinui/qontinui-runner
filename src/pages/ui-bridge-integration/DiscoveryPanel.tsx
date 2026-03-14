@@ -1,13 +1,13 @@
-import { RefreshCw, Wifi, WifiOff, Zap, Search } from "lucide-react";
+import { RefreshCw, Wifi, WifiOff, FileCode, Search } from "lucide-react";
 import { useState, useCallback } from "react";
 import type { DiscoveredApp, ApiResponse } from "./types";
 import { getApiBase } from "@/lib/runner-api";
 
 interface DiscoveryPanelProps {
-  onInject?: (url: string) => void;
+  onIntegrate?: (projectPath: string) => void;
 }
 
-export function DiscoveryPanel({ onInject }: DiscoveryPanelProps) {
+export function DiscoveryPanel({ onIntegrate }: DiscoveryPanelProps) {
   const [apps, setApps] = useState<DiscoveredApp[]>([]);
   const [scanning, setScanning] = useState(false);
   const [lastScan, setLastScan] = useState<number | null>(null);
@@ -70,7 +70,7 @@ export function DiscoveryPanel({ onInject }: DiscoveryPanelProps) {
       {apps.length > 0 && (
         <div className="grid gap-3">
           {apps.map((app) => (
-            <AppCard key={app.app_id} app={app} onInject={onInject} />
+            <AppCard key={app.app_id} app={app} onIntegrate={onIntegrate} />
           ))}
         </div>
       )}
@@ -86,7 +86,7 @@ export function DiscoveryPanel({ onInject }: DiscoveryPanelProps) {
   );
 }
 
-function AppCard({ app, onInject }: { app: DiscoveredApp; onInject?: (url: string) => void }) {
+function AppCard({ app, onIntegrate }: { app: DiscoveredApp; onIntegrate?: (projectPath: string) => void }) {
   const hasUiBridge = app.capabilities.length > 0;
 
   return (
@@ -134,13 +134,13 @@ function AppCard({ app, onInject }: { app: DiscoveredApp; onInject?: (url: strin
       </div>
 
       {/* Quick actions */}
-      {!hasUiBridge && (
+      {!hasUiBridge && onIntegrate && (
         <button
-          onClick={() => onInject?.(app.url)}
-          className="flex items-center gap-1 px-2 py-1 text-[10px] font-medium rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 hover:bg-cyan-500/20 transition-colors shrink-0"
+          onClick={() => onIntegrate(app.base_path)}
+          className="flex items-center gap-1 px-2 py-1 text-[10px] font-medium rounded bg-purple-500/10 text-purple-400 border border-purple-500/20 hover:bg-purple-500/20 transition-colors shrink-0"
         >
-          <Zap className="w-3 h-3" />
-          Inject
+          <FileCode className="w-3 h-3" />
+          Integrate
         </button>
       )}
     </div>

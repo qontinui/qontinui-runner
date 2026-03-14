@@ -1,25 +1,18 @@
 //! UI Bridge Integration Module
 //!
-//! Provides project analysis, runtime injection proxy, source code integration,
+//! Provides project analysis, source code integration,
 //! and integration status tracking for the UI Bridge SDK.
 
 use axum::{
-    body::Body,
     extract::{Path, State},
-    http::{Response, StatusCode},
-    response::{IntoResponse, Json},
+    response::Json,
     routing::{delete, get, post},
     Router,
 };
-use flate2::read::GzDecoder;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::io::Read;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::Mutex;
-use tracing::{info, warn};
+use std::sync::Arc;
 
 use super::types::{ApiResponse, ApiState};
 
@@ -81,446 +74,6 @@ pub struct ProjectAnalysis {
 #[derive(Debug, Deserialize)]
 pub struct AnalyzeRequest {
     pub project_path: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct InjectRequest {
-    pub target_url: String,
-    pub label: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct InjectResponse {
-    pub proxy_url: String,
-    pub proxy_port: u16,
-    pub target_url: String,
-    pub status: String,
-}
-
-#[derive(Debug)]
-pub struct ProxyInstance {
-    pub proxy_url: String,
-    pub proxy_port: u16,
-    pub target_url: String,
-    pub label: String,
-    pub status: String,
-    pub element_count: Option<u32>,
-    pub started_at: i64,
-    pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ProxyInfo {
-    pub proxy_url: String,
-    pub proxy_port: u16,
-    pub target_url: String,
-    pub label: String,
-    pub status: String,
-    pub element_count: Option<u32>,
-    pub started_at: i64,
-}
-
-#[derive(Debug, Default)]
-pub struct ProxyManager {
-    pub proxies: HashMap<u16, ProxyInstance>,
-    next_port: u16,
-}
-
-impl ProxyManager {
-    pub fn new() -> Self {
-        Self {
-            proxies: HashMap::new(),
-            next_port: 19000,
-        }
-    }
-
-    fn allocate_port(&mut self) -> u16 {
-        let port = self.next_port;
-        // Wrap around to avoid exceeding valid port range
-        if self.next_port >= 65500 {
-            self.next_port = 19000;
-        } else {
-            self.next_port += 1;
-        }
-        // Skip ports already in use
-        while self.proxies.contains_key(&self.next_port) {
-            self.next_port += 1;
-            if self.next_port >= 65500 {
-                self.next_port = 19000;
-            }
-        }
-        port
-    }
-}
-
-// ============================================================================
-// Proxy Control State (bridges HTTP control API <-> injected script)
-// ============================================================================
-
-#[derive(Debug, Serialize, Clone)]
-struct PendingCommand {
-    id: String,
-    method: String,
-    args: Vec<serde_json::Value>,
-}
-
-/// A network event captured at the proxy layer (not visible to the inject script).
-#[derive(Debug, Clone, Serialize)]
-struct ProxyNetworkEvent {
-    #[serde(rename = "type")]
-    event_type: String,
-    timestamp: u64,
-    method: String,
-    url: String,
-    status: u16,
-    #[serde(rename = "durationMs")]
-    duration_ms: u64,
-    source: String,
-}
-
-const MAX_PROXY_NETWORK_EVENTS: usize = 200;
-const MAX_BROWSER_EVENTS: usize = 500;
-const MAX_ERROR_SESSIONS: usize = 50;
-const MAX_ERROR_SNAPSHOTS: usize = 20;
-
-// ---------------------------------------------------------------------------
-// Error Session (lightweight in-proxy tracking, mirrors ErrorSessionManager)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize)]
-struct ProxyErrorSession {
-    id: String,
-    label: Option<String>,
-    started_at: u64,
-    ended_at: Option<u64>,
-    events: Vec<serde_json::Value>,
-    unique_fingerprints: Vec<String>,
-}
-
-impl ProxyErrorSession {
-    fn new(label: Option<String>) -> Self {
-        let id = format!("session-{}-{}", now_ms(), rand_hex(4));
-        Self {
-            id,
-            label,
-            started_at: now_ms(),
-            ended_at: None,
-            events: Vec::new(),
-            unique_fingerprints: Vec::new(),
-        }
-    }
-
-    fn record_event(&mut self, event: &serde_json::Value) {
-        if self.ended_at.is_some() {
-            return;
-        }
-        self.events.push(event.clone());
-        if let Some(fp) = event_fingerprint(event) {
-            if !self.unique_fingerprints.contains(&fp) {
-                self.unique_fingerprints.push(fp);
-            }
-        }
-    }
-
-    fn end(&mut self) {
-        if self.ended_at.is_none() {
-            self.ended_at = Some(now_ms());
-        }
-    }
-
-    fn summary(&self) -> serde_json::Value {
-        let mut by_severity = serde_json::Map::new();
-        by_severity.insert("crash".into(), serde_json::json!(0));
-        by_severity.insert("error".into(), serde_json::json!(0));
-        by_severity.insert("warning".into(), serde_json::json!(0));
-        by_severity.insert("noise".into(), serde_json::json!(0));
-
-        for event in &self.events {
-            let severity = classify_event_severity(event);
-            if let Some(count) = by_severity.get_mut(&severity) {
-                if let Some(n) = count.as_u64() {
-                    *count = serde_json::json!(n + 1);
-                }
-            }
-        }
-
-        let has_crashes = by_severity
-            .get("crash")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-            > 0;
-
-        serde_json::json!({
-            "id": self.id,
-            "label": self.label,
-            "startedAt": self.started_at,
-            "endedAt": self.ended_at,
-            "uniqueErrorCount": self.unique_fingerprints.len(),
-            "totalEventCount": self.events.len(),
-            "bySeverity": by_severity,
-            "hasCrashes": has_crashes,
-        })
-    }
-}
-
-/// Simple fingerprint: type + first 80 chars of message
-fn event_fingerprint(event: &serde_json::Value) -> Option<String> {
-    let etype = event
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let message = event
-        .get("message")
-        .and_then(|v| v.as_str())
-        .or_else(|| event.get("errorMessage").and_then(|v| v.as_str()))
-        .unwrap_or("");
-    let truncated: String = message.chars().take(80).collect();
-    Some(format!("{}:{}", etype, truncated))
-}
-
-/// Classify an event into a severity bucket (mirrors classifyEvent in error-severity.ts)
-fn classify_event_severity(event: &serde_json::Value) -> String {
-    let etype = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    let level = event.get("level").and_then(|v| v.as_str()).unwrap_or("");
-
-    match etype {
-        "console" => match level {
-            "error" | "unhandledrejection" => "error".to_string(),
-            "warn" => "warning".to_string(),
-            _ => "noise".to_string(),
-        },
-        "network" => {
-            let status = event.get("status").and_then(|v| v.as_u64()).unwrap_or(0);
-            if status >= 500 {
-                "error".to_string()
-            } else if status >= 400 {
-                "warning".to_string()
-            } else {
-                "noise".to_string()
-            }
-        }
-        "react-error" => "error".to_string(),
-        "resource-error" => "warning".to_string(),
-        _ => "noise".to_string(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Error Snapshot
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize)]
-struct ProxyErrorSnapshot {
-    id: String,
-    error: serde_json::Value,
-    captured_at: u64,
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn rand_hex(bytes: usize) -> String {
-    use rand::Rng;
-    let mut buf = vec![0u8; bytes];
-    rand::thread_rng().fill(&mut buf[..]);
-    buf.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-// ---------------------------------------------------------------------------
-// ProxyControlState
-// ---------------------------------------------------------------------------
-
-struct ProxyControlState {
-    pending: Vec<PendingCommand>,
-    waiters: HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
-    /// Network errors captured at the proxy layer (4xx/5xx responses).
-    network_events: Vec<ProxyNetworkEvent>,
-    /// Browser events pushed from the inject script (AnyCapturedEvent format).
-    browser_events: Vec<serde_json::Value>,
-    /// Error sessions for tracking errors over time intervals.
-    error_sessions: Vec<ProxyErrorSession>,
-    /// Currently active error session (index into error_sessions).
-    active_session_idx: Option<usize>,
-    /// Error snapshots triggered by significant events.
-    error_snapshots: Vec<ProxyErrorSnapshot>,
-    /// Set of fingerprints already snapshotted (for dedup).
-    snapshot_fingerprints: Vec<String>,
-}
-
-impl ProxyControlState {
-    fn new() -> Self {
-        Self {
-            pending: Vec::new(),
-            waiters: HashMap::new(),
-            network_events: Vec::new(),
-            browser_events: Vec::new(),
-            error_sessions: Vec::new(),
-            active_session_idx: None,
-            error_snapshots: Vec::new(),
-            snapshot_fingerprints: Vec::new(),
-        }
-    }
-
-    fn record_network_event(&mut self, event: ProxyNetworkEvent) {
-        self.network_events.push(event);
-        if self.network_events.len() > MAX_PROXY_NETWORK_EVENTS {
-            let excess = self.network_events.len() - MAX_PROXY_NETWORK_EVENTS;
-            self.network_events.drain(..excess);
-        }
-    }
-
-    /// Ingest a batch of browser events from the inject script.
-    /// Feeds them to the active error session and snapshot buffer.
-    fn ingest_browser_events(&mut self, events: Vec<serde_json::Value>) {
-        for event in events {
-            // Feed active error session
-            if let Some(idx) = self.active_session_idx {
-                if let Some(session) = self.error_sessions.get_mut(idx) {
-                    session.record_event(&event);
-                }
-            }
-
-            // Error snapshot: capture on significant events (error/crash severity)
-            let severity = classify_event_severity(&event);
-            if severity == "error" || severity == "crash" {
-                if let Some(fp) = event_fingerprint(&event) {
-                    if !self.snapshot_fingerprints.contains(&fp) {
-                        self.snapshot_fingerprints.push(fp.clone());
-                        let message = event
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| event.get("errorMessage").and_then(|v| v.as_str()))
-                            .unwrap_or("Unknown error")
-                            .to_string();
-                        let snapshot = ProxyErrorSnapshot {
-                            id: format!("snap-{}-{}", now_ms(), rand_hex(3)),
-                            error: serde_json::json!({
-                                "message": message,
-                                "severity": severity,
-                                "fingerprint": fp,
-                                "sourceLocation": event.get("stack").and_then(|v| v.as_str()).and_then(|s| {
-                                    s.lines().nth(1).map(|line| line.trim().to_string())
-                                }),
-                                "stack": event.get("stack"),
-                                "timestamp": event.get("timestamp"),
-                            }),
-                            captured_at: now_ms(),
-                        };
-                        self.error_snapshots.push(snapshot);
-                        // Trim snapshots
-                        if self.error_snapshots.len() > MAX_ERROR_SNAPSHOTS {
-                            let excess = self.error_snapshots.len() - MAX_ERROR_SNAPSHOTS;
-                            self.error_snapshots.drain(..excess);
-                            // Rebuild fingerprints from remaining snapshots
-                            self.snapshot_fingerprints.clear();
-                            for snap in &self.error_snapshots {
-                                if let Some(fp_val) =
-                                    snap.error.get("fingerprint").and_then(|v| v.as_str())
-                                {
-                                    self.snapshot_fingerprints.push(fp_val.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Store in the ring buffer
-            self.browser_events.push(event);
-            if self.browser_events.len() > MAX_BROWSER_EVENTS {
-                let excess = self.browser_events.len() - MAX_BROWSER_EVENTS;
-                self.browser_events.drain(..excess);
-            }
-        }
-    }
-
-    /// Start a new error session, ending the active one if any.
-    fn start_error_session(&mut self, label: Option<String>) -> serde_json::Value {
-        // End active session
-        if let Some(idx) = self.active_session_idx.take() {
-            if let Some(session) = self.error_sessions.get_mut(idx) {
-                session.end();
-            }
-        }
-
-        let session = ProxyErrorSession::new(label);
-        let summary = session.summary();
-        self.error_sessions.push(session);
-        self.active_session_idx = Some(self.error_sessions.len() - 1);
-
-        // Trim old sessions
-        if self.error_sessions.len() > MAX_ERROR_SESSIONS {
-            let excess = self.error_sessions.len() - MAX_ERROR_SESSIONS;
-            self.error_sessions.drain(..excess);
-            if let Some(idx) = self.active_session_idx.as_mut() {
-                if *idx >= excess {
-                    *idx -= excess;
-                } else {
-                    self.active_session_idx = None;
-                }
-            }
-        }
-
-        summary
-    }
-
-    /// End the active error session and return its summary.
-    fn end_error_session(&mut self) -> Option<serde_json::Value> {
-        if let Some(idx) = self.active_session_idx.take() {
-            if let Some(session) = self.error_sessions.get_mut(idx) {
-                session.end();
-                return Some(session.summary());
-            }
-        }
-        None
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ControlResult {
-    id: String,
-    success: bool,
-    #[serde(default)]
-    data: Option<serde_json::Value>,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ActionRequest {
-    action: String,
-    #[serde(default)]
-    params: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NavigateRequest {
-    url: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct WaitForElementRequest {
-    selector: String,
-    #[serde(default)]
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QuerySelectorRequest {
-    selector: String,
-}
-
-/// Module-level proxy manager (shared across all requests)
-static PROXY_MANAGER: OnceLock<Arc<Mutex<ProxyManager>>> = OnceLock::new();
-
-fn get_proxy_manager() -> Arc<Mutex<ProxyManager>> {
-    PROXY_MANAGER
-        .get_or_init(|| Arc::new(Mutex::new(ProxyManager::new())))
-        .clone()
 }
 
 #[derive(Debug, Deserialize)]
@@ -586,7 +139,6 @@ pub struct TrackedIntegration {
     pub integration_type: String,
     pub sdk_version: Option<String>,
     pub status: String,
-    pub proxy_port: Option<u16>,
     pub target_url: Option<String>,
     pub last_health_check: Option<i64>,
     pub element_count: Option<u32>,
@@ -883,866 +435,6 @@ async fn scan_for_pattern(
 }
 
 // ============================================================================
-// Runtime Injection Proxy
-// ============================================================================
-
-const INJECT_SCRIPT: &str = include_str!("../../resources/ui-bridge-inject.js");
-
-/// Enqueue a command for the inject script and wait for its result (5s timeout).
-async fn enqueue_and_wait(
-    control_state: &Arc<Mutex<ProxyControlState>>,
-    method: &str,
-    args: Vec<serde_json::Value>,
-) -> Response<Body> {
-    let cmd_id = format!("cmd-{}", uuid::Uuid::new_v4());
-    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
-
-    {
-        let mut state = control_state.lock().await;
-        state.pending.push(PendingCommand {
-            id: cmd_id.clone(),
-            method: method.to_string(),
-            args,
-        });
-        state.waiters.insert(cmd_id.clone(), tx);
-    }
-
-    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
-        Ok(Ok(value)) => Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_string(&value).unwrap_or_default(),
-            ))
-            .unwrap(),
-        Ok(Err(_)) => Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"error":"Command channel closed unexpectedly"}"#,
-            ))
-            .unwrap(),
-        Err(_) => {
-            // Timeout — clean up the waiter
-            let mut state = control_state.lock().await;
-            state.waiters.remove(&cmd_id);
-            Response::builder()
-                .status(StatusCode::GATEWAY_TIMEOUT)
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"error":"Timed out waiting for inject script response (5s). Is the proxied page open in a browser?"}"#,
-                ))
-                .unwrap()
-        }
-    }
-}
-
-/// Like `enqueue_and_wait` but with a configurable timeout (for long-running ops like waitForElement).
-async fn enqueue_and_wait_with_timeout(
-    control_state: &Arc<Mutex<ProxyControlState>>,
-    method: &str,
-    args: Vec<serde_json::Value>,
-    timeout_secs: u64,
-) -> Response<Body> {
-    let cmd_id = format!("cmd-{}", uuid::Uuid::new_v4());
-    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
-
-    {
-        let mut state = control_state.lock().await;
-        state.pending.push(PendingCommand {
-            id: cmd_id.clone(),
-            method: method.to_string(),
-            args,
-        });
-        state.waiters.insert(cmd_id.clone(), tx);
-    }
-
-    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
-        Ok(Ok(value)) => Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_string(&value).unwrap_or_default(),
-            ))
-            .unwrap(),
-        Ok(Err(_)) => Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"error":"Command channel closed unexpectedly"}"#,
-            ))
-            .unwrap(),
-        Err(_) => {
-            let mut state = control_state.lock().await;
-            state.waiters.remove(&cmd_id);
-            let msg = format!(
-                r#"{{"error":"Timed out waiting for inject script response ({}s). Is the proxied page open in a browser?"}}"#,
-                timeout_secs
-            );
-            Response::builder()
-                .status(StatusCode::GATEWAY_TIMEOUT)
-                .header("content-type", "application/json")
-                .body(Body::from(msg))
-                .unwrap()
-        }
-    }
-}
-
-async fn start_proxy(
-    target_url: String,
-    port: u16,
-) -> Result<tokio::sync::oneshot::Sender<()>, String> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let client = Client::new();
-    let control_state = Arc::new(Mutex::new(ProxyControlState::new()));
-
-    let ws_target = target_url.clone();
-    let target = target_url.clone();
-
-    // Build control routes
-    let cs = control_state.clone();
-    let pending_handler = move || {
-        let cs = cs.clone();
-        async move {
-            let mut state = cs.lock().await;
-            let cmds: Vec<PendingCommand> = state.pending.drain(..).collect();
-            Json(cmds)
-        }
-    };
-
-    let cs = control_state.clone();
-    let results_handler = move |Json(results): Json<Vec<ControlResult>>| {
-        let cs = cs.clone();
-        async move {
-            let mut state = cs.lock().await;
-            for result in results {
-                if let Some(tx) = state.waiters.remove(&result.id) {
-                    let value = if result.success {
-                        result.data.unwrap_or(serde_json::Value::Null)
-                    } else {
-                        serde_json::json!({
-                            "error": result.error.unwrap_or_else(|| "Unknown error".to_string())
-                        })
-                    };
-                    let _ = tx.send(value);
-                }
-            }
-            Json(serde_json::json!({"ok": true}))
-        }
-    };
-
-    let cs = control_state.clone();
-    let snapshot_handler = move || {
-        let cs = cs.clone();
-        async move { enqueue_and_wait(&cs, "getSnapshot", vec![]).await }
-    };
-
-    let cs = control_state.clone();
-    let elements_handler = move || {
-        let cs = cs.clone();
-        async move { enqueue_and_wait(&cs, "getElements", vec![]).await }
-    };
-
-    let cs = control_state.clone();
-    let element_handler = move |Path(id): Path<String>| {
-        let cs = cs.clone();
-        async move { enqueue_and_wait(&cs, "getElement", vec![serde_json::Value::String(id)]).await }
-    };
-
-    let cs = control_state.clone();
-    let action_handler = move |Path(id): Path<String>, Json(body): Json<ActionRequest>| {
-        let cs = cs.clone();
-        async move {
-            let params = body.params.unwrap_or(serde_json::Value::Null);
-            enqueue_and_wait(
-                &cs,
-                "executeAction",
-                vec![
-                    serde_json::Value::String(id),
-                    serde_json::Value::String(body.action),
-                    params,
-                ],
-            )
-            .await
-        }
-    };
-
-    let cs = control_state.clone();
-    let discover_handler = move || {
-        let cs = cs.clone();
-        async move { enqueue_and_wait(&cs, "discover", vec![]).await }
-    };
-
-    let cs = control_state.clone();
-    let console_errors_handler = move || {
-        let cs = cs.clone();
-        async move { enqueue_and_wait(&cs, "getConsoleErrors", vec![]).await }
-    };
-
-    let cs = control_state.clone();
-    let clear_console_errors_handler = move || {
-        let cs = cs.clone();
-        async move { enqueue_and_wait(&cs, "clearConsoleErrors", vec![]).await }
-    };
-
-    // Browser events: returns all captured events (proxy network + inject script).
-    let cs = control_state.clone();
-    let browser_events_handler = move || {
-        let cs = cs.clone();
-        async move {
-            let state = cs.lock().await;
-            // Merge proxy network events and inject-script browser events
-            let mut all_events: Vec<serde_json::Value> = state
-                .network_events
-                .iter()
-                .map(|e| serde_json::to_value(e).unwrap_or_default())
-                .collect();
-            all_events.extend(state.browser_events.clone());
-            // Sort by timestamp
-            all_events.sort_by(|a, b| {
-                let ts_a = a.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
-                let ts_b = b.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
-                ts_a.cmp(&ts_b)
-            });
-            let count = all_events.len();
-            drop(state);
-            Json(serde_json::json!({
-                "success": true,
-                "data": {
-                    "events": all_events,
-                    "count": count,
-                    "source": "proxy+inject",
-                }
-            }))
-        }
-    };
-
-    // Browser events push: receives events from the inject script
-    let cs = control_state.clone();
-    let browser_events_push_handler = move |Json(events): Json<Vec<serde_json::Value>>| {
-        let cs = cs.clone();
-        async move {
-            let mut state = cs.lock().await;
-            state.ingest_browser_events(events);
-            Json(serde_json::json!({"ok": true}))
-        }
-    };
-
-    // Error sessions
-    let cs = control_state.clone();
-    let error_session_start_handler = move |body: Option<Json<serde_json::Value>>| {
-        let cs = cs.clone();
-        async move {
-            let label = body.and_then(|b| {
-                b.get("label")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            });
-            let mut state = cs.lock().await;
-            let summary = state.start_error_session(label);
-            Json(serde_json::json!({ "success": true, "data": summary }))
-        }
-    };
-
-    let cs = control_state.clone();
-    let error_session_end_handler = move || {
-        let cs = cs.clone();
-        async move {
-            let mut state = cs.lock().await;
-            match state.end_error_session() {
-                Some(summary) => Json(serde_json::json!({ "success": true, "data": summary })),
-                None => Json(serde_json::json!({ "success": false, "error": "No active session" })),
-            }
-        }
-    };
-
-    let cs = control_state.clone();
-    let error_sessions_list_handler = move || {
-        let cs = cs.clone();
-        async move {
-            let state = cs.lock().await;
-            let summaries: Vec<serde_json::Value> =
-                state.error_sessions.iter().map(|s| s.summary()).collect();
-            Json(serde_json::json!({ "success": true, "data": summaries }))
-        }
-    };
-
-    // Error snapshots
-    let cs = control_state.clone();
-    let error_snapshots_handler = move || {
-        let cs = cs.clone();
-        async move {
-            let state = cs.lock().await;
-            let snapshots: Vec<serde_json::Value> = state
-                .error_snapshots
-                .iter()
-                .rev()
-                .take(10)
-                .map(|s| {
-                    serde_json::json!({
-                        "id": s.id,
-                        "error": s.error,
-                        "pageState": { "url": "", "title": "", "elementCount": 0, "visibleErrors": [] },
-                        "recentActions": [],
-                        "capturedAt": s.captured_at,
-                    })
-                })
-                .collect();
-            Json(serde_json::json!({ "success": true, "data": snapshots }))
-        }
-    };
-
-    // Error report: combined view of active session + recent snapshots
-    let cs = control_state.clone();
-    let error_report_handler = move || {
-        let cs = cs.clone();
-        async move {
-            let state = cs.lock().await;
-            let active_session = state
-                .active_session_idx
-                .and_then(|idx| state.error_sessions.get(idx))
-                .map(|s| s.summary());
-            let snapshots: Vec<serde_json::Value> = state
-                .error_snapshots
-                .iter()
-                .rev()
-                .take(5)
-                .map(|s| {
-                    serde_json::json!({
-                        "id": s.id,
-                        "error": s.error,
-                        "capturedAt": s.captured_at,
-                    })
-                })
-                .collect();
-            let total_events = state.browser_events.len() + state.network_events.len();
-            let error_count = state
-                .browser_events
-                .iter()
-                .filter(|e| {
-                    let sev = classify_event_severity(e);
-                    sev == "error" || sev == "crash"
-                })
-                .count();
-            let warning_count = state
-                .browser_events
-                .iter()
-                .filter(|e| classify_event_severity(e) == "warning")
-                .count();
-            drop(state);
-            Json(serde_json::json!({
-                "success": true,
-                "data": {
-                    "activeSession": active_session,
-                    "recentSnapshots": snapshots,
-                    "summary": {
-                        "totalEvents": total_events,
-                        "errors": error_count,
-                        "warnings": warning_count,
-                    }
-                }
-            }))
-        }
-    };
-
-    let cs = control_state.clone();
-    let navigate_handler = move |Json(body): Json<NavigateRequest>| {
-        let cs = cs.clone();
-        async move { enqueue_and_wait(&cs, "navigate", vec![serde_json::Value::String(body.url)]).await }
-    };
-
-    let cs = control_state.clone();
-    let refresh_handler = move || {
-        let cs = cs.clone();
-        async move { enqueue_and_wait(&cs, "refresh", vec![]).await }
-    };
-
-    let cs = control_state.clone();
-    let back_handler = move || {
-        let cs = cs.clone();
-        async move { enqueue_and_wait(&cs, "back", vec![]).await }
-    };
-
-    let cs = control_state.clone();
-    let forward_handler = move || {
-        let cs = cs.clone();
-        async move { enqueue_and_wait(&cs, "forward", vec![]).await }
-    };
-
-    let cs = control_state.clone();
-    let styles_handler = move |Path(id): Path<String>| {
-        let cs = cs.clone();
-        async move {
-            enqueue_and_wait(
-                &cs,
-                "getComputedStyles",
-                vec![serde_json::Value::String(id)],
-            )
-            .await
-        }
-    };
-
-    let cs = control_state.clone();
-    let accessibility_handler = move |Path(id): Path<String>| {
-        let cs = cs.clone();
-        async move {
-            enqueue_and_wait(
-                &cs,
-                "getAccessibilityInfo",
-                vec![serde_json::Value::String(id)],
-            )
-            .await
-        }
-    };
-
-    let cs = control_state.clone();
-    let wait_for_element_handler = move |Json(body): Json<WaitForElementRequest>| {
-        let cs = cs.clone();
-        async move {
-            let timeout_ms = body.timeout_ms.unwrap_or(5000);
-            // HTTP timeout = inject timeout + 2s buffer
-            let http_timeout_secs = (timeout_ms / 1000) + 2;
-            enqueue_and_wait_with_timeout(
-                &cs,
-                "waitForElement",
-                vec![
-                    serde_json::Value::String(body.selector),
-                    serde_json::json!(timeout_ms),
-                ],
-                http_timeout_secs.max(5),
-            )
-            .await
-        }
-    };
-
-    let cs = control_state.clone();
-    let query_selector_handler = move |Json(body): Json<QuerySelectorRequest>| {
-        let cs = cs.clone();
-        async move {
-            enqueue_and_wait(
-                &cs,
-                "querySelectorAll",
-                vec![serde_json::Value::String(body.selector)],
-            )
-            .await
-        }
-    };
-
-    let cs = control_state.clone();
-    let design_snapshot_handler = move || {
-        let cs = cs.clone();
-        async move { enqueue_and_wait(&cs, "getDesignSnapshot", vec![]).await }
-    };
-
-    let cs = control_state.clone();
-    let forms_handler = move || {
-        let cs = cs.clone();
-        async move { enqueue_and_wait(&cs, "getForms", vec![]).await }
-    };
-
-    let proxy_router = Router::new()
-        .route(
-            "/__ui-bridge/inject.js",
-            get(|| async {
-                Response::builder()
-                    .header("content-type", "application/javascript")
-                    .header("cache-control", "no-cache")
-                    .body(Body::from(INJECT_SCRIPT))
-                    .unwrap()
-            }),
-        )
-        .route(
-            "/__ui-bridge/health",
-            get(|| async {
-                Json(serde_json::json!({
-                    "status": "ok",
-                    "injected": true,
-                    "version": "1.0.0"
-                }))
-            }),
-        )
-        // Control API: polled by inject script
-        .route("/__ui-bridge/control/pending", get(pending_handler))
-        .route("/__ui-bridge/control/results", post(results_handler))
-        // Control API: called by external tools (MCP, workflows, CLI)
-        .route("/__ui-bridge/control/snapshot", get(snapshot_handler))
-        .route("/__ui-bridge/control/elements", get(elements_handler))
-        .route("/__ui-bridge/control/element/:id", get(element_handler))
-        .route(
-            "/__ui-bridge/control/element/:id/action",
-            post(action_handler),
-        )
-        .route("/__ui-bridge/control/discover", post(discover_handler))
-        .route(
-            "/__ui-bridge/control/console-errors",
-            get(console_errors_handler),
-        )
-        .route(
-            "/__ui-bridge/control/console-errors/clear",
-            post(clear_console_errors_handler),
-        )
-        .route(
-            "/__ui-bridge/control/browser-events",
-            get(browser_events_handler),
-        )
-        .route(
-            "/__ui-bridge/control/browser-events/push",
-            post(browser_events_push_handler),
-        )
-        // Error session management (mirrors ErrorSessionManager API)
-        .route(
-            "/__ui-bridge/control/error-sessions/start",
-            post(error_session_start_handler),
-        )
-        .route(
-            "/__ui-bridge/control/error-sessions/end",
-            post(error_session_end_handler),
-        )
-        .route(
-            "/__ui-bridge/control/error-sessions",
-            get(error_sessions_list_handler),
-        )
-        // Error snapshots
-        .route(
-            "/__ui-bridge/control/error-snapshots",
-            get(error_snapshots_handler),
-        )
-        // Error report (combined view)
-        .route(
-            "/__ui-bridge/control/error-report",
-            get(error_report_handler),
-        )
-        .route("/__ui-bridge/control/page/navigate", post(navigate_handler))
-        .route("/__ui-bridge/control/page/refresh", post(refresh_handler))
-        .route("/__ui-bridge/control/page/back", post(back_handler))
-        .route("/__ui-bridge/control/page/forward", post(forward_handler))
-        // Enriched control routes
-        .route(
-            "/__ui-bridge/control/element/:id/styles",
-            get(styles_handler),
-        )
-        .route(
-            "/__ui-bridge/control/element/:id/accessibility",
-            get(accessibility_handler),
-        )
-        .route(
-            "/__ui-bridge/control/wait-for-element",
-            post(wait_for_element_handler),
-        )
-        .route(
-            "/__ui-bridge/control/query-selector",
-            post(query_selector_handler),
-        )
-        .route(
-            "/__ui-bridge/control/design-snapshot",
-            get(design_snapshot_handler),
-        )
-        .route("/__ui-bridge/control/forms", get(forms_handler))
-        .fallback({
-            let fallback_cs = control_state.clone();
-            move |req: axum::http::Request<Body>| {
-                let client = client.clone();
-                let target = target.clone();
-                let ws_target = ws_target.clone();
-                let cs = fallback_cs.clone();
-                async move {
-                    // Check for WebSocket upgrade requests (e.g., HMR)
-                    let is_ws_upgrade = req
-                        .headers()
-                        .get("upgrade")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|v| v.eq_ignore_ascii_case("websocket"))
-                        .unwrap_or(false);
-
-                    if is_ws_upgrade {
-                        proxy_websocket(ws_target, req).await
-                    } else {
-                        proxy_request(client, target, req, Some(cs)).await
-                    }
-                }
-            }
-        });
-
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| format!("Failed to bind proxy on port {}: {}", port, e))?;
-
-    info!(
-        "UI Bridge injection proxy started: http://localhost:{} -> {}",
-        port, target_url
-    );
-
-    tokio::spawn(async move {
-        let server = axum::serve(listener, proxy_router);
-        tokio::select! {
-            result = server => {
-                if let Err(e) = result {
-                    warn!("Proxy server error on port {}: {}", port, e);
-                }
-            }
-            _ = shutdown_rx => {
-                info!("Proxy on port {} shutting down", port);
-            }
-        }
-    });
-
-    Ok(shutdown_tx)
-}
-
-/// Handle WebSocket upgrade requests by proxying them bidirectionally to the target app.
-/// Used for HMR/hot reload connections from dev servers (Vite, webpack, Next.js, etc.).
-async fn proxy_websocket(target_base: String, req: axum::http::Request<Body>) -> Response<Body> {
-    use axum::extract::FromRequestParts;
-    use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
-
-    let uri = req.uri().clone();
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-    // Convert http:// to ws://
-    let ws_url = format!(
-        "ws{}",
-        target_base
-            .trim_end_matches('/')
-            .strip_prefix("http")
-            .unwrap_or(&target_base)
-    );
-    let target_ws_url = format!("{}{}", ws_url, path_and_query);
-
-    // Split the request into parts and body so we can extract the WebSocketUpgrade
-    let (mut parts, _body) = req.into_parts();
-
-    // Extract WebSocketUpgrade from request parts
-    let ws = match axum::extract::ws::WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            warn!("WebSocket upgrade failed: {}", e);
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from(format!("WebSocket upgrade error: {}", e)))
-                .unwrap();
-        }
-    };
-
-    ws.on_upgrade(move |mut client_ws| async move {
-        // Connect to the upstream WebSocket
-        let upstream = match tokio_tungstenite::connect_async(&target_ws_url).await {
-            Ok((stream, _)) => stream,
-            Err(e) => {
-                warn!("WebSocket upstream connection failed to {}: {}", target_ws_url, e);
-                return;
-            }
-        };
-
-        let (mut upstream_write, mut upstream_read) = upstream.split();
-
-        // Bidirectional relay between client and upstream
-        loop {
-            tokio::select! {
-                msg = client_ws.recv() => {
-                    match msg {
-                        Some(Ok(axum::extract::ws::Message::Text(text))) => {
-                            if upstream_write.send(Message::Text(text.to_string())).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(axum::extract::ws::Message::Binary(data))) => {
-                            if upstream_write.send(Message::Binary(data.to_vec())).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
-                        _ => {}
-                    }
-                }
-                msg = upstream_read.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            if client_ws.send(axum::extract::ws::Message::Text(text)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(Message::Binary(data))) => {
-                            if client_ws.send(axum::extract::ws::Message::Binary(data)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(Message::Close(_))) | None => break,
-                        _ => {}
-                    }
-                }
-            }
-        }
-        let _ = upstream_write.close().await;
-    })
-    .into_response()
-}
-
-async fn proxy_request(
-    client: Client,
-    target_base: String,
-    req: axum::http::Request<Body>,
-    control_state: Option<Arc<Mutex<ProxyControlState>>>,
-) -> Response<Body> {
-    let uri = req.uri().clone();
-    let method = req.method().clone();
-    let headers = req.headers().clone();
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-    let target_url = format!("{}{}", target_base.trim_end_matches('/'), path_and_query);
-    let request_start = std::time::Instant::now();
-
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from(format!("Failed to read request body: {}", e)))
-                .unwrap();
-        }
-    };
-
-    let mut proxy_req = client.request(method.clone(), &target_url);
-    for (key, value) in headers.iter() {
-        let key_str = key.as_str();
-        if key_str == "host"
-            || key_str == "connection"
-            || key_str == "transfer-encoding"
-            || key_str == "keep-alive"
-        {
-            continue;
-        }
-        proxy_req = proxy_req.header(key, value);
-    }
-    if !body_bytes.is_empty() {
-        proxy_req = proxy_req.body(body_bytes.to_vec());
-    }
-
-    let proxy_resp = match proxy_req.send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("Proxy error: {}", e)))
-                .unwrap();
-        }
-    };
-
-    let status = proxy_resp.status();
-    let resp_headers = proxy_resp.headers().clone();
-    let content_type = resp_headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let is_html = content_type.contains("text/html");
-
-    // Check if response is gzip-encoded
-    let is_gzip = resp_headers
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.contains("gzip"))
-        .unwrap_or(false);
-
-    let resp_bytes = match proxy_resp.bytes().await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("Failed to read proxy response: {}", e)))
-                .unwrap();
-        }
-    };
-
-    // Check if the charset is something we can't safely inject into
-    let is_utf8_compatible = {
-        let charset = content_type
-            .split(';')
-            .find_map(|part| {
-                let part = part.trim();
-                part.strip_prefix("charset=")
-                    .map(|charset| charset.trim().to_lowercase())
-            })
-            .unwrap_or_else(|| "utf-8".to_string());
-        charset == "utf-8" || charset == "us-ascii" || charset == "ascii" || charset == "iso-8859-1"
-    };
-
-    let final_body = if is_html && is_utf8_compatible {
-        // For HTML responses, decompress if gzipped before injecting
-        let html_bytes = if is_gzip {
-            let mut decoder = GzDecoder::new(&resp_bytes[..]);
-            let mut decompressed = Vec::new();
-            match decoder.read_to_end(&mut decompressed) {
-                Ok(_) => decompressed,
-                Err(_) => resp_bytes.to_vec(), // Fallback to raw bytes if decompression fails
-            }
-        } else {
-            resp_bytes.to_vec()
-        };
-
-        let html = String::from_utf8_lossy(&html_bytes);
-        let inject_tag = r#"<script src="/__ui-bridge/inject.js"></script>"#;
-        let injected = if let Some(pos) = html.find("</head>") {
-            format!("{}{}\n{}", &html[..pos], inject_tag, &html[pos..])
-        } else if let Some(pos) = html.find("<body") {
-            if let Some(close) = html[pos..].find('>') {
-                let insert_pos = pos + close + 1;
-                format!(
-                    "{}\n{}\n{}",
-                    &html[..insert_pos],
-                    inject_tag,
-                    &html[insert_pos..]
-                )
-            } else {
-                format!("{}\n{}", inject_tag, html)
-            }
-        } else {
-            format!("{}\n{}", inject_tag, html)
-        };
-        Body::from(injected)
-    } else {
-        Body::from(resp_bytes)
-    };
-
-    // Record proxy-level network events for 4xx/5xx responses
-    let status_code = status.as_u16();
-    if status_code >= 400 {
-        if let Some(cs) = &control_state {
-            let event = ProxyNetworkEvent {
-                event_type: "network".to_string(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-                method: method.to_string(),
-                url: target_url.clone(),
-                status: status_code,
-                duration_ms: request_start.elapsed().as_millis() as u64,
-                source: "proxy".to_string(),
-            };
-            let mut state = cs.lock().await;
-            state.record_network_event(event);
-        }
-    }
-
-    let injected_html = is_html && is_utf8_compatible;
-    let mut response = Response::builder().status(status);
-    for (key, value) in resp_headers.iter() {
-        let key_str = key.as_str();
-        if key_str == "connection"
-            || key_str == "transfer-encoding"
-            || key_str == "keep-alive"
-            || (injected_html && key_str == "content-length")
-            || (injected_html && key_str == "content-encoding")
-        {
-            continue;
-        }
-        response = response.header(key, value);
-    }
-    response.body(final_body).unwrap()
-}
-
-// ============================================================================
 // Package Manager Execution
 // ============================================================================
 
@@ -1829,7 +521,7 @@ async fn integrate_source(
                 "Enabled features: element auto-registration, render logging, control API, debug tools, idle detection, browser event capture, modal/toast detection, navigation tracking, keyboard shortcut discovery, drag-drop detection, undo/redo awareness".to_string()
             );
             next_steps.push(
-                "Use the runner's runtime injection proxy for HTTP control API access (live snapshots, actions, AI search)".to_string()
+                "The CommandRelayListener component handles browser-server communication automatically".to_string()
             );
             next_steps.push(
                 "Optional: Add useUIRelationship() for element relationships, useUIComponent() for component-level actions, usePageContext() for route metadata, useKeyboardShortcuts() for shortcut registration".to_string()
@@ -1852,7 +544,7 @@ async fn integrate_source(
                 "Enabled features: element auto-registration, render logging, control API, debug tools, idle detection, browser event capture, modal/toast detection, navigation tracking, keyboard shortcut discovery, drag-drop detection, undo/redo awareness".to_string()
             );
             next_steps.push(
-                "Use the runner's runtime injection proxy for HTTP control API access (live snapshots, actions, AI search)".to_string()
+                "The CommandRelayListener component and relay setup handle browser-server communication automatically".to_string()
             );
             next_steps.push(
                 "Optional: Add <RenderLogWrapper> inside <AutoRegisterProvider> in your root layout for automatic DOM snapshot capture".to_string()
@@ -1865,16 +557,14 @@ async fn integrate_source(
             );
         }
         Framework::Vue | Framework::Angular | Framework::Svelte => {
-            integrate_generic_html(&project, &mut modifications, &mut warnings).await;
-            next_steps.push("Restart your dev server to apply changes".to_string());
             warnings.push(format!(
-                "{:?} integration uses script injection. Full SDK integration is only available for React/Next.js.",
+                "{:?} detected. Full SDK integration is currently only available for React/Next.js. Manual integration is required for other frameworks.",
                 analysis.framework
             ));
+            next_steps.push("Install @qontinui/ui-bridge and integrate manually following the SDK documentation".to_string());
         }
         Framework::PlainHtml => {
-            integrate_plain_html(&project, &mut modifications).await;
-            next_steps.push("Refresh your browser to see changes".to_string());
+            warnings.push("Plain HTML detected. Full SDK integration requires a React or Next.js project. Consider using @qontinui/ui-bridge with a bundler setup.".to_string());
         }
         Framework::Unknown => {
             warnings.push("Could not detect framework. Please integrate manually.".to_string());
@@ -2021,6 +711,25 @@ async fn integrate_nextjs(
         );
     }
 
+    // Create relay setup file (CommandRelay + handlers instantiation)
+    let relay_path = if project.join("src/lib").exists() || project.join("src/app").exists() {
+        "src/lib/ui-bridge.ts"
+    } else if project.join("lib").exists() {
+        "lib/ui-bridge.ts"
+    } else {
+        "src/lib/ui-bridge.ts"
+    };
+
+    if !project.join(relay_path).exists() {
+        modifications.push(FileModification {
+            file_path: relay_path.to_string(),
+            modification_type: ModificationType::CreateNew,
+            description: "Create CommandRelay + handlers setup for UI Bridge".to_string(),
+            original_content: None,
+            new_content: NEXTJS_RELAY_SETUP_TEMPLATE.to_string(),
+        });
+    }
+
     // Create API route for UI Bridge endpoints
     let api_route_path = if project.join("src/app").exists() {
         "src/app/api/ui-bridge/[...path]/route.ts"
@@ -2032,7 +741,7 @@ async fn integrate_nextjs(
         modifications.push(FileModification {
             file_path: api_route_path.to_string(),
             modification_type: ModificationType::CreateNew,
-            description: "Create Next.js API route for UI Bridge server endpoints".to_string(),
+            description: "Create Next.js API route for UI Bridge with command relay".to_string(),
             original_content: None,
             new_content: NEXTJS_API_ROUTE_TEMPLATE.to_string(),
         });
@@ -2064,70 +773,6 @@ async fn integrate_nextjs(
     }
 }
 
-async fn integrate_generic_html(
-    project: &std::path::Path,
-    modifications: &mut Vec<FileModification>,
-    warnings: &mut Vec<String>,
-) {
-    let candidates = [
-        project.join("index.html"),
-        project.join("src/index.html"),
-        project.join("public/index.html"),
-    ];
-    let html_path = candidates.iter().find(|p| p.exists());
-
-    if let Some(path) = html_path {
-        if let Ok(content) = tokio::fs::read_to_string(path).await {
-            if !content.contains("ui-bridge-inject.js") && !content.contains("@qontinui/ui-bridge")
-            {
-                let inject_tag = "<script src=\"/__ui-bridge/inject.js\"></script>";
-                let new_content = if let Some(pos) = content.find("</head>") {
-                    format!("{}    {}\n{}", &content[..pos], inject_tag, &content[pos..])
-                } else {
-                    format!("{}\n{}", inject_tag, content)
-                };
-                let rel_path = path
-                    .strip_prefix(project)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                modifications.push(FileModification {
-                    file_path: rel_path,
-                    modification_type: ModificationType::Replace,
-                    description: "Inject UI Bridge script into HTML".to_string(),
-                    original_content: Some(content),
-                    new_content,
-                });
-            }
-        }
-    } else {
-        warnings.push("No index.html found for script injection.".to_string());
-    }
-}
-
-async fn integrate_plain_html(
-    project: &std::path::Path,
-    modifications: &mut Vec<FileModification>,
-) {
-    let index_path = project.join("index.html");
-    if let Ok(content) = tokio::fs::read_to_string(&index_path).await {
-        if !content.contains("ui-bridge-inject.js") {
-            let inject_tag = r#"<script src="/__ui-bridge/inject.js"></script>"#;
-            let new_content = if let Some(pos) = content.find("</head>") {
-                format!("{}    {}\n{}", &content[..pos], inject_tag, &content[pos..])
-            } else {
-                format!("{}\n{}", inject_tag, content)
-            };
-            modifications.push(FileModification {
-                file_path: "index.html".to_string(),
-                modification_type: ModificationType::Replace,
-                description: "Inject UI Bridge script into index.html".to_string(),
-                original_content: Some(content),
-                new_content,
-            });
-        }
-    }
-}
 
 async fn add_sdk_to_package_json(
     project: &std::path::Path,
@@ -2166,7 +811,7 @@ async fn add_sdk_to_package_json(
 
 fn wrap_with_provider_react(content: &str, file_path: &str) -> String {
     let import_line =
-        "import { UIBridgeProvider, AutoRegisterProvider } from '@qontinui/ui-bridge/react';\n";
+        "import { UIBridgeProvider, AutoRegisterProvider, CommandRelayListener } from '@qontinui/ui-bridge/react';\n";
     let insert_pos = find_last_import_pos(content);
 
     let provider_open = "<UIBridgeProvider\n          features={{ renderLog: true, control: true, debug: process.env.NODE_ENV === 'development' }}\n        >";
@@ -2181,11 +826,11 @@ fn wrap_with_provider_react(content: &str, file_path: &str) -> String {
         let wrapped = rest
             .replace(
                 "<App />",
-                &format!("{}\n          <AutoRegisterProvider>\n            <App />\n          </AutoRegisterProvider>\n        {}", provider_open, provider_close),
+                &format!("{}\n          <AutoRegisterProvider>\n            <CommandRelayListener />\n            <App />\n          </AutoRegisterProvider>\n        {}", provider_open, provider_close),
             )
             .replace(
                 "<App/>",
-                &format!("{}\n          <AutoRegisterProvider>\n            <App />\n          </AutoRegisterProvider>\n        {}", provider_open, provider_close),
+                &format!("{}\n          <AutoRegisterProvider>\n            <CommandRelayListener />\n            <App />\n          </AutoRegisterProvider>\n        {}", provider_open, provider_close),
             );
         result.push_str(&wrapped);
         result
@@ -2200,7 +845,7 @@ fn wrap_with_provider_react(content: &str, file_path: &str) -> String {
 
 fn wrap_with_provider_nextjs(content: &str) -> String {
     let import_line =
-        "import { UIBridgeProvider, AutoRegisterProvider } from '@qontinui/ui-bridge/react';\n";
+        "import { UIBridgeProvider, AutoRegisterProvider, CommandRelayListener } from '@qontinui/ui-bridge/react';\n";
     let insert_pos = find_last_import_pos(content);
 
     let mut result = String::new();
@@ -2209,7 +854,7 @@ fn wrap_with_provider_nextjs(content: &str) -> String {
     let rest = &content[insert_pos..];
     let wrapped = rest.replace(
         "{children}",
-        "{/* UI Bridge Integration */}\n          <UIBridgeProvider\n            features={{ renderLog: true, control: true, debug: process.env.NODE_ENV === 'development' }}\n          >\n            <AutoRegisterProvider>\n              {children}\n            </AutoRegisterProvider>\n          </UIBridgeProvider>",
+        "{/* UI Bridge Integration */}\n          <UIBridgeProvider\n            features={{ renderLog: true, control: true, debug: process.env.NODE_ENV === 'development' }}\n          >\n            <AutoRegisterProvider>\n              <CommandRelayListener />\n              {children}\n            </AutoRegisterProvider>\n          </UIBridgeProvider>",
     );
     result.push_str(&wrapped);
     result
@@ -2233,19 +878,24 @@ fn find_last_import_pos(content: &str) -> usize {
     last_import_end
 }
 
-const NEXTJS_API_ROUTE_TEMPLATE: &str = r#"import { createUIBridgeHandler } from '@qontinui/ui-bridge/server';
+const NEXTJS_API_ROUTE_TEMPLATE: &str = r#"import { createNextRouteHandlers, SSEManager } from '@qontinui/ui-bridge/server';
+import { handlers, relay } from '@/lib/ui-bridge';
 
-// UI Bridge API route — zero-config setup.
-// Read operations return empty data; write operations (actions) return errors.
-// For full control API access (live snapshots, actions, AI search),
-// use the runtime injection proxy or implement a custom client-server relay.
-const handler = createUIBridgeHandler();
+const sseManager = new SSEManager();
 
-export const GET = handler;
-export const POST = handler;
-export const DELETE = handler;
+export const { GET, POST, PUT, DELETE } = createNextRouteHandlers(handlers, {
+  relay,
+  sseManager,
+});
 
 export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
+"#;
+
+const NEXTJS_RELAY_SETUP_TEMPLATE: &str = r#"import { CommandRelay, createRelayHandlers } from '@qontinui/ui-bridge/server';
+
+export const relay = new CommandRelay();
+export const handlers = createRelayHandlers(relay);
 "#;
 
 const NEXTJS_RENDER_LOG_WRAPPER_TEMPLATE: &str = r#"'use client';
@@ -2369,9 +1019,9 @@ fn save_integration(
     conn.execute(
         r#"INSERT OR REPLACE INTO ui_bridge_integrations
             (id, project_path, label, framework, integration_type, sdk_version,
-             status, proxy_port, target_url, last_health_check, element_count,
+             status, target_url, last_health_check, element_count,
              created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
         rusqlite::params![
             integration.id,
             integration.project_path,
@@ -2380,7 +1030,6 @@ fn save_integration(
             integration.integration_type,
             integration.sdk_version,
             integration.status,
-            integration.proxy_port,
             integration.target_url,
             integration.last_health_check,
             integration.element_count,
@@ -2399,7 +1048,7 @@ fn list_integrations(
     let mut stmt = conn
         .prepare(
             r#"SELECT id, project_path, label, framework, integration_type, sdk_version,
-                      status, proxy_port, target_url, last_health_check, element_count,
+                      status, target_url, last_health_check, element_count,
                       created_at, updated_at
                FROM ui_bridge_integrations
                ORDER BY updated_at DESC"#,
@@ -2416,12 +1065,11 @@ fn list_integrations(
                 integration_type: row.get(4)?,
                 sdk_version: row.get(5)?,
                 status: row.get(6)?,
-                proxy_port: row.get(7)?,
-                target_url: row.get(8)?,
-                last_health_check: row.get(9)?,
-                element_count: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
+                target_url: row.get(7)?,
+                last_health_check: row.get(8)?,
+                element_count: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             })
         })
         .map_err(|e| format!("Failed to read integrations: {}", e))?
@@ -2456,130 +1104,6 @@ async fn handle_analyze(
     }
 }
 
-async fn handle_inject(
-    State(state): State<Arc<ApiState>>,
-    Json(req): Json<InjectRequest>,
-) -> Json<ApiResponse<InjectResponse>> {
-    let proxy_manager = get_proxy_manager();
-    let mut manager = proxy_manager.lock().await;
-    let port = manager.allocate_port();
-    let label = req
-        .label
-        .unwrap_or_else(|| format!("Proxy for {}", req.target_url));
-
-    match start_proxy(req.target_url.clone(), port).await {
-        Ok(shutdown_tx) => {
-            let now = chrono::Utc::now().timestamp();
-            let instance = ProxyInstance {
-                proxy_url: format!("http://localhost:{}", port),
-                proxy_port: port,
-                target_url: req.target_url.clone(),
-                label: label.clone(),
-                status: "active".to_string(),
-                element_count: None,
-                started_at: now,
-                shutdown_tx: Some(shutdown_tx),
-            };
-
-            let response = InjectResponse {
-                proxy_url: instance.proxy_url.clone(),
-                proxy_port: port,
-                target_url: req.target_url.clone(),
-                status: "active".to_string(),
-            };
-
-            manager.proxies.insert(port, instance);
-
-            // Track in database
-            let integration = TrackedIntegration {
-                id: format!("proxy-{}", port),
-                project_path: String::new(),
-                label: Some(label),
-                framework: None,
-                integration_type: "runtime".to_string(),
-                sdk_version: Some("injected".to_string()),
-                status: "active".to_string(),
-                proxy_port: Some(port),
-                target_url: Some(req.target_url),
-                last_health_check: Some(now),
-                element_count: None,
-                created_at: now,
-                updated_at: now,
-            };
-            let _ = save_integration(&state.app_state.checkpoint_db, &integration);
-
-            // Auto-connect SDK client to the new proxy
-            let proxy_url_for_sdk = format!("http://127.0.0.1:{}", port);
-            let sdk_conn = state.sdk_connection.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                match crate::mcp::sdk_client::connect_sdk_app(
-                    &sdk_conn,
-                    &proxy_url_for_sdk,
-                    Some(port),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                {
-                    Ok(_) => info!("Auto-connected SDK to proxy at {}", proxy_url_for_sdk),
-                    Err(e) => warn!("Auto-connect to proxy {} failed: {}", proxy_url_for_sdk, e),
-                }
-            });
-
-            Json(ApiResponse::success(response))
-        }
-        Err(e) => Json(ApiResponse::error(e)),
-    }
-}
-
-async fn handle_list_proxies(
-    State(_state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<Vec<ProxyInfo>>> {
-    let proxy_manager = get_proxy_manager();
-    let manager = proxy_manager.lock().await;
-    let proxies: Vec<ProxyInfo> = manager
-        .proxies
-        .values()
-        .map(|p| ProxyInfo {
-            proxy_url: p.proxy_url.clone(),
-            proxy_port: p.proxy_port,
-            target_url: p.target_url.clone(),
-            label: p.label.clone(),
-            status: p.status.clone(),
-            element_count: p.element_count,
-            started_at: p.started_at,
-        })
-        .collect();
-    Json(ApiResponse::success(proxies))
-}
-
-async fn handle_stop_proxy(
-    State(state): State<Arc<ApiState>>,
-    Path(port): Path<u16>,
-) -> Json<ApiResponse<String>> {
-    let proxy_manager = get_proxy_manager();
-    let mut manager = proxy_manager.lock().await;
-    if let Some(mut instance) = manager.proxies.remove(&port) {
-        if let Some(tx) = instance.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-        let _ = delete_integration(&state.app_state.checkpoint_db, &format!("proxy-{}", port));
-        info!("Stopped proxy on port {}", port);
-        Json(ApiResponse::success(format!(
-            "Proxy on port {} stopped",
-            port
-        )))
-    } else {
-        Json(ApiResponse::error(format!(
-            "No proxy found on port {}",
-            port
-        )))
-    }
-}
-
 async fn handle_integrate(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<IntegrateRequest>,
@@ -2601,7 +1125,6 @@ async fn handle_integrate(
                     integration_type: "source".to_string(),
                     sdk_version: req.options.sdk_version.or(Some("latest".to_string())),
                     status: "active".to_string(),
-                    proxy_port: None,
                     target_url: analysis
                         .dev_server_port
                         .map(|p| format!("http://localhost:{}", p)),
@@ -2697,17 +1220,11 @@ async fn handle_health_check(
 
     let mut updated = Vec::new();
     for mut integration in integrations {
-        // Determine the URL to check
-        let check_url = if integration.integration_type == "runtime" {
-            integration
-                .proxy_port
-                .map(|p| format!("http://localhost:{}/__ui-bridge/health", p))
-        } else {
-            integration
-                .target_url
-                .as_ref()
-                .map(|u| format!("{}/api/ui-bridge/health", u.trim_end_matches('/')))
-        };
+        // Determine the URL to check (integration_type is always "source")
+        let check_url = integration
+            .target_url
+            .as_ref()
+            .map(|u| format!("{}/api/ui-bridge/health", u.trim_end_matches('/')));
 
         if let Some(url) = check_url {
             match client.get(&url).send().await {
@@ -2909,12 +1426,6 @@ async fn handle_update(
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/ui-bridge/integration/analyze", post(handle_analyze))
-        .route("/ui-bridge/integration/inject", post(handle_inject))
-        .route("/ui-bridge/integration/proxies", get(handle_list_proxies))
-        .route(
-            "/ui-bridge/integration/inject/{port}",
-            delete(handle_stop_proxy),
-        )
         .route("/ui-bridge/integration/integrate", post(handle_integrate))
         .route("/ui-bridge/integration/update", post(handle_update))
         .route("/ui-bridge/integration/preview", post(handle_preview))

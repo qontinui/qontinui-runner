@@ -2515,16 +2515,15 @@ CREATE INDEX IF NOT EXISTS idx_user_skills_category ON user_skills(category);
 CREATE INDEX IF NOT EXISTS idx_user_skills_updated_at ON user_skills(updated_at);
 CREATE INDEX IF NOT EXISTS idx_user_skills_source ON user_skills(source);
 
--- UI Bridge integration tracking (projects with runtime injection or source integration)
+-- UI Bridge integration tracking (projects with source integration)
 CREATE TABLE IF NOT EXISTS ui_bridge_integrations (
     id TEXT PRIMARY KEY,
     project_path TEXT NOT NULL,
     label TEXT,
     framework TEXT,
-    integration_type TEXT NOT NULL,  -- 'runtime' | 'source' | 'both'
+    integration_type TEXT NOT NULL,  -- 'source'
     sdk_version TEXT,
     status TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'disconnected' | 'outdated'
-    proxy_port INTEGER,
     target_url TEXT,
     last_health_check INTEGER,
     element_count INTEGER,

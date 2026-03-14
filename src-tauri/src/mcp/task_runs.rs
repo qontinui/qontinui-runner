@@ -3213,6 +3213,7 @@ pub async fn generate_workflow_from_session(
                 discovery_calls: vec![],
                 acceptance_criteria: None,
                 quality_report: None,
+                confidence_score: None,
             },
         }
     })

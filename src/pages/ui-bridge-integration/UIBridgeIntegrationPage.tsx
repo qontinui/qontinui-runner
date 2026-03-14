@@ -1,27 +1,22 @@
 import * as Tabs from "@radix-ui/react-tabs";
-import { Plug, Radar, Syringe, FileCode, Activity, Fingerprint } from "lucide-react";
+import { Plug, Radar, Fingerprint } from "lucide-react";
 import { useState, useCallback } from "react";
 import { DiscoveryPanel } from "./DiscoveryPanel";
-import { RuntimeInjectionPanel } from "./RuntimeInjectionPanel";
 import { SourceIntegrationPanel } from "./SourceIntegrationPanel";
-import { HealthMonitorPanel } from "./HealthMonitorPanel";
 import { StateExplorerPanel } from "./StateExplorerPanel";
 
 const TABS = [
-  { id: "discovery", label: "Discovery", icon: Radar },
-  { id: "injection", label: "Runtime Injection", icon: Syringe },
-  { id: "source", label: "Source Integration", icon: FileCode },
-  { id: "health", label: "Health Monitor", icon: Activity },
+  { id: "applications", label: "Applications", icon: Radar },
   { id: "state-explorer", label: "State Explorer", icon: Fingerprint },
 ] as const;
 
 export function UIBridgeIntegrationPage() {
-  const [activeTab, setActiveTab] = useState<string>("discovery");
-  const [prefillUrl, setPrefillUrl] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<string>("applications");
+  const [integratePath, setIntegratePath] = useState<string | null>(null);
 
-  const handleInjectFromDiscovery = useCallback((url: string) => {
-    setPrefillUrl(url);
-    setActiveTab("injection");
+  const handleIntegrateFromDiscovery = useCallback((projectPath: string) => {
+    setIntegratePath(projectPath);
+    setActiveTab("applications");
   }, []);
 
   return (
@@ -60,23 +55,18 @@ export function UIBridgeIntegrationPage() {
           })}
         </Tabs.List>
 
-        <Tabs.Content value="discovery" className="flex-1 min-h-0 pt-4 overflow-auto">
-          <DiscoveryPanel onInject={handleInjectFromDiscovery} />
-        </Tabs.Content>
-
-        <Tabs.Content value="injection" className="flex-1 min-h-0 pt-4 overflow-auto">
-          <RuntimeInjectionPanel
-            prefillUrl={prefillUrl}
-            onPrefillConsumed={() => setPrefillUrl(null)}
-          />
-        </Tabs.Content>
-
-        <Tabs.Content value="source" className="flex-1 min-h-0 pt-4 overflow-auto">
-          <SourceIntegrationPanel />
-        </Tabs.Content>
-
-        <Tabs.Content value="health" className="flex-1 min-h-0 pt-4 overflow-auto">
-          <HealthMonitorPanel />
+        <Tabs.Content value="applications" className="flex-1 min-h-0 pt-4 overflow-auto">
+          <div className="flex flex-col gap-6">
+            <DiscoveryPanel onIntegrate={handleIntegrateFromDiscovery} />
+            {integratePath && (
+              <div className="border-t border-border pt-4">
+                <SourceIntegrationPanel
+                  prefillPath={integratePath}
+                  onPrefillConsumed={() => setIntegratePath(null)}
+                />
+              </div>
+            )}
+          </div>
         </Tabs.Content>
 
         <Tabs.Content value="state-explorer" className="flex-1 min-h-0 pt-4 overflow-auto">

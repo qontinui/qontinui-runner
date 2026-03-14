@@ -205,6 +205,84 @@ pub struct GenerateWorkflowResponse {
     /// Quality report from the revision phase
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quality_report: Option<revision::QualityReport>,
+    /// Confidence score (0.0–1.0) reflecting overall generation quality
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence_score: Option<f32>,
+}
+
+// ============================================================================
+// Discovery Feedback Helpers
+// ============================================================================
+
+/// Scan workflow steps for references (commands, URLs, file paths) that were
+/// not mentioned in the original discovery context. Returns a deduplicated
+/// list of undiscovered references.
+fn find_undiscovered_references(
+    workflow: &UnifiedWorkflow,
+    discovery_context: &str,
+) -> Vec<String> {
+    let dc_lower = discovery_context.to_lowercase();
+    let mut refs: Vec<String> = Vec::new();
+
+    // Collect all step JSON values from the workflow
+    let all_steps = workflow
+        .setup_steps
+        .iter()
+        .chain(workflow.verification_steps.iter())
+        .chain(workflow.agentic_steps.iter())
+        .chain(workflow.completion_steps.iter())
+        .chain(
+            workflow
+                .stages
+                .iter()
+                .flat_map(|s| {
+                    s.setup_steps
+                        .iter()
+                        .chain(s.verification_steps.iter())
+                        .chain(s.agentic_steps.iter())
+                        .chain(s.completion_steps.iter())
+                }),
+        );
+
+    for step in all_steps {
+        // Extract command field
+        if let Some(cmd) = step.get("command").and_then(|v| v.as_str()) {
+            // Extract the base command/tool name (first word)
+            if let Some(base_cmd) = cmd.split_whitespace().next() {
+                let clean = base_cmd.trim_start_matches("./");
+                if !clean.is_empty()
+                    && clean.len() > 2
+                    && !dc_lower.contains(&clean.to_lowercase())
+                {
+                    refs.push(clean.to_string());
+                }
+            }
+
+            // Extract file paths from command (tokens starting with / or ./)
+            for token in cmd.split_whitespace() {
+                if (token.starts_with('/') || token.starts_with("./"))
+                    && token.len() > 3
+                    && !dc_lower.contains(&token.to_lowercase())
+                {
+                    refs.push(token.to_string());
+                }
+            }
+        }
+
+        // Extract URL fields
+        for field in &["url", "health_check_url"] {
+            if let Some(url) = step.get(*field).and_then(|v| v.as_str()) {
+                if !url.is_empty() && !dc_lower.contains(&url.to_lowercase()) {
+                    refs.push(url.to_string());
+                }
+            }
+        }
+    }
+
+    // Deduplicate
+    refs.sort();
+    refs.dedup();
+    refs
 }
 
 // ============================================================================
@@ -326,7 +404,7 @@ pub fn generate_workflow(
     // ── Discovery Phase ──────────────────────────────────────────────────
     let discovery_start = Instant::now();
     let discovery_mode = request.discovery_mode.as_deref().unwrap_or("auto");
-    let (discovery_context, discovery_calls) = if discovery_mode != "disabled" {
+    let (mut discovery_context, discovery_calls) = if discovery_mode != "disabled" {
         let config = super::discovery_tools::DiscoveryConfig::default();
         let result =
             super::discovery_tools::run_discovery(&request.description, &config, discovery_mode);
@@ -652,6 +730,33 @@ pub fn generate_workflow(
         }
     };
 
+    // ── Discovery Feedback Pass ──────────────────────────────────────────
+    if discovery_mode != "disabled" {
+        let undiscovered = find_undiscovered_references(&workflow, &discovery_context);
+        if !undiscovered.is_empty() {
+            info!(
+                "Found {} references not in discovery context, running targeted re-discovery",
+                undiscovered.len()
+            );
+            let feedback_description = format!(
+                "Gather information about: {}",
+                undiscovered.join(", ")
+            );
+            let config = super::discovery_tools::DiscoveryConfig::default();
+            let feedback_result =
+                super::discovery_tools::run_discovery(&feedback_description, &config, "enabled");
+            if !feedback_result.context.is_empty() {
+                discovery_context.push_str("\n\n## Re-discovery (feedback pass)\n");
+                discovery_context.push_str(&feedback_result.context);
+                info!(
+                    "Re-discovery added {} chars of context ({} tool calls)",
+                    feedback_result.context.len(),
+                    feedback_result.calls.len()
+                );
+            }
+        }
+    }
+
     // Apply request overrides
     apply_request_options(&mut workflow, &request);
 
@@ -678,6 +783,8 @@ pub fn generate_workflow(
     let mut iterations: Vec<VerificationIteration> = Vec::new();
 
     if max_fix_iters > 0 {
+        let mut previous_issue_count: Option<usize> = None;
+
         for iter_num in 1..=max_fix_iters {
             info!("Verification iteration {}/{}", iter_num, max_fix_iters);
 
@@ -716,6 +823,33 @@ pub fn generate_workflow(
                 info!("Workflow passed verification on iteration {}", iter_num);
                 break;
             }
+
+            // Convergence detection: compare to previous iteration
+            if let Some(prev) = previous_issue_count {
+                if issue_count >= prev {
+                    info!(
+                        "Fix convergence: {} -> {} issues (stopping — not improving)",
+                        prev, issue_count
+                    );
+                    warn!(
+                        "Fix loop not converging: {} -> {} issues",
+                        prev, issue_count
+                    );
+                    iterations.push(VerificationIteration {
+                        iteration: iter_num,
+                        issues,
+                        fix_applied: false,
+                        fix_error: None,
+                    });
+                    break;
+                } else {
+                    info!(
+                        "Fix convergence: {} -> {} issues (continuing)",
+                        prev, issue_count
+                    );
+                }
+            }
+            previous_issue_count = Some(issue_count);
 
             // Log issues
             for issue in &issues {
@@ -849,6 +983,99 @@ pub fn generate_workflow(
     artifact_builder.revision_duration_ms = Some(revision_start.elapsed().as_millis() as u64);
     artifact_builder.quality_report = serde_json::to_value(&quality_report).ok();
     workflow.quality_report = serde_json::to_value(&quality_report).ok();
+
+    // ── Quality Gate: Confidence Scoring ────────────────────────────────
+    let confidence_score = {
+        let mut score: f32 = 1.0;
+
+        // Factor 1: Remaining validation errors reduce confidence
+        let current_validation_errors = validate_workflow(&workflow);
+        let error_count = current_validation_errors.len();
+        if error_count > 0 {
+            // Each error reduces score; 5+ errors drops this factor to 0
+            score *= (1.0 - (error_count as f32 / 5.0).min(1.0)).max(0.0);
+        }
+
+        // Factor 2: Quality report pass/fail and finding counts
+        if !quality_report.pass {
+            score *= 0.6;
+        }
+        let critical_findings = quality_report
+            .findings
+            .iter()
+            .filter(|f| f.severity == revision::FindingSeverity::Critical)
+            .count();
+        let warning_findings = quality_report
+            .findings
+            .iter()
+            .filter(|f| f.severity == revision::FindingSeverity::Warning)
+            .count();
+        if critical_findings > 0 {
+            score *= (1.0 - (critical_findings as f32 * 0.15).min(0.6)).max(0.0);
+        }
+        if warning_findings > 0 {
+            score *= (1.0 - (warning_findings as f32 * 0.05).min(0.3)).max(0.0);
+        }
+
+        // Factor 3: Verification iterations used vs max (more needed = lower confidence)
+        if max_fix_iters > 0 {
+            let iters_used = iterations.len() as f32;
+            let ratio = iters_used / max_fix_iters as f32;
+            // Using all iterations means something was hard to fix
+            score *= 1.0 - (ratio * 0.3);
+        }
+
+        // Factor 4: Hardening conversion count (more conversions = builder produced more prompt steps)
+        if let Some(ref summary) = hardening_summary {
+            if summary.converted_count > 0 {
+                let hardening_penalty =
+                    (summary.converted_count as f32 * 0.03).min(0.25);
+                score *= 1.0 - hardening_penalty;
+            }
+        }
+
+        score.clamp(0.0, 1.0)
+    };
+
+    info!("Quality gate confidence score: {:.3}", confidence_score);
+    artifact_builder.confidence_score = Some(confidence_score);
+
+    if confidence_score < 0.3 {
+        let issues_summary = quality_report
+            .findings
+            .iter()
+            .map(|f| format!("[{:?}] {}", f.severity, f.description))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let error_msg = format!(
+            "Low confidence score ({:.2}): quality gate rejected workflow. Issues: {}",
+            confidence_score, issues_summary
+        );
+        warn!("{}", error_msg);
+        artifact_builder.success = false;
+        artifact_builder.error_message = Some(error_msg.clone());
+        let artifact = artifact_builder.build(pipeline_start.elapsed().as_millis() as u64);
+        let response = GenerateWorkflowResponse {
+            workflow: None,
+            validation_errors: validate_workflow(&workflow),
+            success: false,
+            error: Some(error_msg),
+            model_used: None,
+            verification_iterations: iterations,
+            hardening_summary,
+            discovery_calls,
+            acceptance_criteria,
+            quality_report: Some(quality_report),
+            confidence_score: Some(confidence_score),
+        };
+        return (response, artifact);
+    } else if confidence_score < 0.6 {
+        warn!(
+            "Moderate confidence score ({:.2}): proceeding with caution. {} findings remain.",
+            confidence_score,
+            quality_report.findings.len()
+        );
+    }
 
     // ── Inject deterministic known-issue regression steps (post-hardener) ──
     if !relevant_issues.is_empty() {
@@ -999,6 +1226,7 @@ pub fn generate_workflow(
         discovery_calls,
         acceptance_criteria,
         quality_report: Some(quality_report),
+        confidence_score: Some(confidence_score),
     };
 
     (response, artifact)
@@ -1158,6 +1386,7 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
             discovery_calls: vec![],
             acceptance_criteria: None,
             quality_report: None,
+            confidence_score: None,
         }));
     }
 
@@ -1183,6 +1412,7 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
                 discovery_calls: vec![],
                 acceptance_criteria: None,
                 quality_report: None,
+                confidence_score: None,
             })
         })
 }

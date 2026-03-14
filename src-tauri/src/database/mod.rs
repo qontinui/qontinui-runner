@@ -6484,6 +6484,35 @@ impl CheckpointDb {
             info!("Successfully migrated to version 107 (causal events dedup index)");
         }
 
+        if current_version < 108 {
+            info!("Migrating to version 108 (remove proxy_port from ui_bridge_integrations)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE ui_bridge_integrations DROP COLUMN proxy_port;
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (108, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 108: {}", e))?;
+
+            info!("Successfully migrated to version 108 (remove proxy_port)");
+        }
+
+        if current_version < 109 {
+            info!("Migrating to version 109 (add confidence_score to pipeline artifacts)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE generation_pipeline_artifacts ADD COLUMN confidence_score REAL DEFAULT NULL;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (109, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 109: {}", e))?;
+
+            info!("Successfully migrated to version 109 (confidence_score)");
+        }
+
         // Repair migration: is_favorite column may be missing on databases created from
         // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
         // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,
@@ -19490,10 +19519,11 @@ impl CheckpointDb {
                  verification_iterations, fixer_snapshots, hardening_summary,
                  hardened_json, final_json, validation_errors,
                  success, error_message, model_used,
-                 revision_duration_ms, quality_report, revision_cycles)
+                 revision_duration_ms, quality_report, revision_cycles,
+                 confidence_score)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
-                    ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)"#,
+                    ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)"#,
             params![
                 artifact.id,
                 artifact.workflow_id,
@@ -19543,6 +19573,7 @@ impl CheckpointDb {
                 artifact.revision_duration_ms.map(|v| v as i64),
                 artifact.quality_report.as_ref().map(|v| v.to_string()),
                 artifact.revision_cycles.map(|v| v as i32),
+                artifact.confidence_score.map(|v| v as f64),
             ],
         )
         .map_err(|e| format!("Failed to save pipeline artifact: {}", e))?;
@@ -19567,7 +19598,8 @@ impl CheckpointDb {
                       verification_iterations, fixer_snapshots, hardening_summary,
                       hardened_json, final_json, validation_errors,
                       success, error_message, model_used,
-                      revision_duration_ms, quality_report, revision_cycles
+                      revision_duration_ms, quality_report, revision_cycles,
+                      confidence_score
                FROM generation_pipeline_artifacts WHERE id = ?1"#,
             params![id],
             |row| Ok(Self::row_to_pipeline_artifact(row)),
@@ -19655,7 +19687,8 @@ impl CheckpointDb {
                       verification_iterations, fixer_snapshots, hardening_summary,
                       hardened_json, final_json, validation_errors,
                       success, error_message, model_used,
-                      revision_duration_ms, quality_report, revision_cycles
+                      revision_duration_ms, quality_report, revision_cycles,
+                      confidence_score
                FROM generation_pipeline_artifacts
                WHERE workflow_id = ?1
                ORDER BY created_at DESC LIMIT 1"#,
@@ -19758,6 +19791,10 @@ impl CheckpointDb {
                 .get::<_, Option<i32>>(35)
                 .unwrap_or(None)
                 .map(|v| v as u32),
+            confidence_score: row
+                .get::<_, Option<f64>>(36)
+                .unwrap_or(None)
+                .map(|v| v as f32),
         }
     }
 

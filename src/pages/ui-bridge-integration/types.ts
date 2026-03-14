@@ -13,7 +13,7 @@ export type PackageManager = "npm" | "yarn" | "pnpm" | "bun" | "unknown";
 
 export type IntegrationStatus = "none" | "partial" | "full";
 
-export type IntegrationType = "runtime" | "source" | "both";
+export type IntegrationType = "source";
 
 export type IntegrationHealthStatus = "active" | "disconnected" | "outdated";
 
@@ -36,30 +36,6 @@ export interface ProjectAnalysis {
   server_adapter: string | null;
   dev_server_port: number | null;
   issues: string[];
-}
-
-// --- Runtime Injection ---
-
-export interface ProxyInstance {
-  proxy_url: string;
-  proxy_port: number;
-  target_url: string;
-  label: string;
-  status: string;
-  element_count: number | null;
-  started_at: number;
-}
-
-export interface InjectRequest {
-  target_url: string;
-  label?: string;
-}
-
-export interface InjectResponse {
-  proxy_url: string;
-  proxy_port: number;
-  target_url: string;
-  status: string;
 }
 
 // --- Source Integration ---
@@ -100,7 +76,6 @@ export interface TrackedIntegration {
   integration_type: IntegrationType;
   sdk_version: string | null;
   status: IntegrationHealthStatus;
-  proxy_port: number | null;
   target_url: string | null;
   last_health_check: number | null;
   element_count: number | null;

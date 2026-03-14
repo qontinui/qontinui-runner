@@ -6,7 +6,7 @@
  */
 
 import { useRef, useCallback, type CSSProperties } from "react";
-import { FixedSizeList, VariableSizeList, type ListChildComponentProps } from "react-window";
+import { FixedSizeList, VariableSizeList, type ListChildComponentProps, type ListOnScrollProps } from "react-window";
 import AutoSizer from "react-virtualized-auto-sizer";
 import { cn } from "../../lib/utils";
 
@@ -29,6 +29,8 @@ interface FixedVirtualListProps<T> {
   reverseOrder?: boolean;
   /** Overscan count (items to render outside viewport) */
   overscanCount?: number;
+  /** Optional scroll event handler */
+  onScroll?: (event: React.UIEvent<HTMLDivElement>) => void;
 }
 
 /**
@@ -43,10 +45,20 @@ export function FixedVirtualList<T>({
   getItemKey,
   reverseOrder = false,
   overscanCount = 5,
+  onScroll,
 }: FixedVirtualListProps<T>) {
   const listRef = useRef<FixedSizeList>(null);
 
   const displayItems = reverseOrder ? [...items].reverse() : items;
+
+  const handleScroll = useCallback(
+    (_props: ListOnScrollProps) => {
+      if (onScroll) {
+        onScroll({} as React.UIEvent<HTMLDivElement>);
+      }
+    },
+    [onScroll],
+  );
 
   const Row = useCallback(
     ({ index, style }: ListChildComponentProps) => {
@@ -76,6 +88,7 @@ export function FixedVirtualList<T>({
             itemCount={displayItems.length}
             itemSize={itemHeight}
             overscanCount={overscanCount}
+            onScroll={handleScroll}
           >
             {Row}
           </FixedSizeList>

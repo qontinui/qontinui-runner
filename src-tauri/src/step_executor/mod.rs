@@ -36,8 +36,10 @@
 mod executor;
 
 // New modular components (Phase 1-3 of refactoring)
+pub mod dry_run;
 pub mod events;
 pub mod handlers;
+pub mod step_cache;
 
 // Re-export everything from the original executor module for backward compatibility
 // This ensures existing code continues to work without changes

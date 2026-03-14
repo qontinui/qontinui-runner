@@ -9,12 +9,17 @@ import {
   Eye,
   ArrowUpCircle,
 } from "lucide-react";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import type { ProjectAnalysis, IntegrationResult, FileModification, ApiResponse } from "./types";
 import { getApiBase } from "@/lib/runner-api";
 
-export function SourceIntegrationPanel() {
-  const [projectPath, setProjectPath] = useState("");
+interface SourceIntegrationPanelProps {
+  prefillPath?: string | null;
+  onPrefillConsumed?: () => void;
+}
+
+export function SourceIntegrationPanel({ prefillPath, onPrefillConsumed }: SourceIntegrationPanelProps = {}) {
+  const [projectPath, setProjectPath] = useState(prefillPath || "");
   const [analysis, setAnalysis] = useState<ProjectAnalysis | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [integrating, setIntegrating] = useState(false);
@@ -22,6 +27,13 @@ export function SourceIntegrationPanel() {
   const [preview, setPreview] = useState<FileModification[] | null>(null);
   const [updating, setUpdating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (prefillPath) {
+      setProjectPath(prefillPath);
+      onPrefillConsumed?.();
+    }
+  }, [prefillPath, onPrefillConsumed]);
 
   const analyze = useCallback(async () => {
     if (!projectPath.trim()) return;
