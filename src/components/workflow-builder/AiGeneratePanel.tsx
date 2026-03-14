@@ -285,8 +285,6 @@ export function AiGeneratePanel({
   /** Build a single request (non-batch or fallback). */
   const buildGenerateRequest = useCallback(() => {
     const base = buildBaseRequest({ selectedContextIds, inlineContext });
-    return { ...base, description: description.trim() };
-  }, [buildBaseRequest, description, selectedContextIds, inlineContext]);
 
     let fullDescription = "";
     if (specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0) {
