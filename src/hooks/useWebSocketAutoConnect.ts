@@ -13,6 +13,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ConnectionInfo } from "../types/auth";
+import { instanceStorage } from "@/lib/instance-storage";
 
 interface TauriResult<T> {
   success: boolean;
@@ -64,7 +65,7 @@ export function useWebSocketAutoConnect({
   const [error, setError] = useState<string | null>(null);
 
   // Get runner name from prop or localStorage
-  const runnerName = runnerNameProp ?? localStorage.getItem(RUNNER_NAME_STORAGE_KEY) ?? "";
+  const runnerName = runnerNameProp ?? instanceStorage.getItem(RUNNER_NAME_STORAGE_KEY) ?? "";
 
   // Track if user manually disconnected
   const userDisconnectedRef = useRef(false);

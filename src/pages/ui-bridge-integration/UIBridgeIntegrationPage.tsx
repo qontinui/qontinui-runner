@@ -1,26 +1,19 @@
-import * as Tabs from "@radix-ui/react-tabs";
-import { Plug, Radar, Fingerprint } from "lucide-react";
 import { useState, useCallback } from "react";
-import { DiscoveryPanel } from "./DiscoveryPanel";
+import { Plug } from "lucide-react";
 import { SourceIntegrationPanel } from "./SourceIntegrationPanel";
-import { StateExplorerPanel } from "./StateExplorerPanel";
-
-const TABS = [
-  { id: "applications", label: "Applications", icon: Radar },
-  { id: "state-explorer", label: "State Explorer", icon: Fingerprint },
-] as const;
+import { DiscoveryPanel } from "./DiscoveryPanel";
 
 export function UIBridgeIntegrationPage() {
-  const [activeTab, setActiveTab] = useState<string>("applications");
-  const [integratePath, setIntegratePath] = useState<string | null>(null);
+  const [selectedProjectPath, setSelectedProjectPath] = useState<string | undefined>();
 
-  const handleIntegrateFromDiscovery = useCallback((projectPath: string) => {
-    setIntegratePath(projectPath);
-    setActiveTab("applications");
+  const handleSelectApp = useCallback((basePath: string) => {
+    setSelectedProjectPath(basePath);
+    // Scroll to the integration panel at the top
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }, []);
 
   return (
-    <div className="h-full flex flex-col p-4 gap-4">
+    <div className="h-full flex flex-col p-4 gap-6 overflow-auto">
       {/* Header */}
       <div className="flex items-center gap-3">
         <Plug className="w-5 h-5 text-cyan-400" />
@@ -30,49 +23,11 @@ export function UIBridgeIntegrationPage() {
         </span>
       </div>
 
-      {/* Tabs */}
-      <Tabs.Root
-        value={activeTab}
-        onValueChange={setActiveTab}
-        className="flex-1 flex flex-col min-h-0"
-      >
-        <Tabs.List className="flex gap-1 border-b border-border pb-px shrink-0">
-          {TABS.map((tab) => {
-            const Icon = tab.icon;
-            return (
-              <Tabs.Trigger
-                key={tab.id}
-                value={tab.id}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-muted-foreground
-                           hover:text-foreground border-b-2 border-transparent
-                           data-[state=active]:text-foreground data-[state=active]:border-cyan-500
-                           transition-colors"
-              >
-                <Icon className="w-3.5 h-3.5" />
-                {tab.label}
-              </Tabs.Trigger>
-            );
-          })}
-        </Tabs.List>
+      {/* Source Integration — primary action */}
+      <SourceIntegrationPanel initialProjectPath={selectedProjectPath} />
 
-        <Tabs.Content value="applications" className="flex-1 min-h-0 pt-4 overflow-auto">
-          <div className="flex flex-col gap-6">
-            <DiscoveryPanel onIntegrate={handleIntegrateFromDiscovery} />
-            {integratePath && (
-              <div className="border-t border-border pt-4">
-                <SourceIntegrationPanel
-                  prefillPath={integratePath}
-                  onPrefillConsumed={() => setIntegratePath(null)}
-                />
-              </div>
-            )}
-          </div>
-        </Tabs.Content>
-
-        <Tabs.Content value="state-explorer" className="flex-1 min-h-0 pt-4 overflow-auto">
-          <StateExplorerPanel />
-        </Tabs.Content>
-      </Tabs.Root>
+      {/* Discovery — scan for running apps */}
+      <DiscoveryPanel onSelectApp={handleSelectApp} />
     </div>
   );
 }

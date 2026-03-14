@@ -1,6 +1,7 @@
 import { useEffect, useCallback, useRef, useState, useMemo, createRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { instanceStorage } from "@/lib/instance-storage";
 import { type TerminalInstanceHandle } from "./TerminalInstance";
 import { TerminalTabBar } from "./TerminalTabBar";
 
@@ -314,7 +315,7 @@ export function TerminalPage({
   const [showCommandPalette, setShowCommandPalette] = useState(false);
   const [showTimeline, setShowTimeline] = useState(false);
   const [showControlPanel, setShowControlPanel] = useState(
-    () => localStorage.getItem("zone-control-panel") === "true",
+    () => instanceStorage.getItem("zone-control-panel") === "true",
   );
   const [controlPanelCollapsed, setControlPanelCollapsed] = useState(false);
   const [selectedZones, setSelectedZones] = useState<Set<number>>(new Set());
@@ -323,10 +324,10 @@ export function TerminalPage({
   const [swapSource, setSwapSource] = useState<number | null>(null);
   const [resetRatiosKey, setResetRatiosKey] = useState(0);
   const [autoLayout, setAutoLayout] = useState(
-    () => localStorage.getItem("zone-auto-layout") !== "false",
+    () => instanceStorage.getItem("zone-auto-layout") !== "false",
   );
   const [focusMode, setFocusMode] = useState(
-    () => localStorage.getItem("zone-focus-mode") === "true",
+    () => instanceStorage.getItem("zone-focus-mode") === "true",
   );
 
   // ══════════════════════════════════════════════════════════════════════════════
@@ -1037,7 +1038,7 @@ export function TerminalPage({
         e.preventDefault();
         setFocusMode((prev) => {
           const next = !prev;
-          localStorage.setItem("zone-focus-mode", String(next));
+          instanceStorage.setItem("zone-focus-mode", String(next));
           return next;
         });
         return;
@@ -1073,7 +1074,7 @@ export function TerminalPage({
         e.preventDefault();
         setShowControlPanel((prev) => {
           const next = !prev;
-          localStorage.setItem("zone-control-panel", String(next));
+          instanceStorage.setItem("zone-control-panel", String(next));
           return next;
         });
         return;
@@ -1203,7 +1204,7 @@ export function TerminalPage({
               onClick={() => {
                 setAutoLayout((prev) => {
                   const next = !prev;
-                  localStorage.setItem("zone-auto-layout", String(next));
+                  instanceStorage.setItem("zone-auto-layout", String(next));
                   return next;
                 });
               }}
@@ -1277,7 +1278,7 @@ export function TerminalPage({
         onToggleDesktopNotify={() => {
           transitionEffects.setDesktopNotify((prev) => {
             const next = !prev;
-            localStorage.setItem("zone-desktop-notify", String(next));
+            instanceStorage.setItem("zone-desktop-notify", String(next));
             return next;
           });
         }}
@@ -1306,7 +1307,7 @@ export function TerminalPage({
         onToggleAutoRestart={() => {
           transitionEffects.setAutoRestart((prev) => {
             const next = !prev;
-            localStorage.setItem("zone-auto-restart", String(next));
+            instanceStorage.setItem("zone-auto-restart", String(next));
             return next;
           });
         }}
@@ -1314,7 +1315,7 @@ export function TerminalPage({
         onToggleFocusMode={() => {
           setFocusMode((prev) => {
             const next = !prev;
-            localStorage.setItem("zone-focus-mode", String(next));
+            instanceStorage.setItem("zone-focus-mode", String(next));
             return next;
           });
         }}
@@ -1534,7 +1535,7 @@ export function TerminalPage({
             onSetZoneNotes={labelsAndTags.setZoneNote}
             onClose={() => {
               setShowControlPanel(false);
-              localStorage.setItem("zone-control-panel", "false");
+              instanceStorage.setItem("zone-control-panel", "false");
             }}
             collapsed={controlPanelCollapsed}
             onToggleCollapsed={() => setControlPanelCollapsed((v) => !v)}
@@ -1687,7 +1688,7 @@ export function TerminalPage({
           onToggleFocusMode={() => {
             setFocusMode((prev) => {
               const next = !prev;
-              localStorage.setItem("zone-focus-mode", String(next));
+              instanceStorage.setItem("zone-focus-mode", String(next));
               return next;
             });
           }}

@@ -19,13 +19,10 @@ import React, {
   useState,
 } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { CurrentExecutionStepsResponse } from "@/components/active-dashboard/widgets/shared/utils";
-import type { StepStats } from "@/components/active-dashboard/widgets/shared/types";
+import type { CurrentExecutionStepsResponse } from "@/components/widgets/shared/utils";
+import type { StepStats } from "@/components/widgets/shared/types";
 import type { WorkflowStage } from "@/types/dashboard/activity-types";
-import {
-  calculateStepStats,
-  detectStartTime,
-} from "@/components/active-dashboard/widgets/shared/utils";
+import { calculateStepStats, detectStartTime } from "@/components/widgets/shared/utils";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // =============================================================================

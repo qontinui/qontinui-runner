@@ -9,7 +9,7 @@
 import { useEffect, useCallback, useRef } from "react";
 import { cn } from "../../lib/utils";
 import type { DashboardStatus } from "../../hooks/dashboard/useDashboardState";
-import type { StepStats } from "./widgets/shared/types";
+import type { StepStats } from "@/components/widgets/shared/types";
 
 /**
  * Props for CompletionSummary.

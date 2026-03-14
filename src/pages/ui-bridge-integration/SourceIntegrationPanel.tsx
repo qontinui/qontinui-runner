@@ -9,20 +9,18 @@ import {
   Eye,
   ArrowUpCircle,
 } from "lucide-react";
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import type { ProjectAnalysis, IntegrationResult, FileModification, ApiResponse } from "./types";
 import { getApiBase } from "@/lib/runner-api";
+import { HookGenerationPanel } from "./HookGenerationPanel";
 
 interface SourceIntegrationPanelProps {
-  prefillPath?: string | null;
-  onPrefillConsumed?: () => void;
+  /** When set externally (e.g. from a discovered app card), pre-fills the path and auto-analyzes */
+  initialProjectPath?: string;
 }
 
-export function SourceIntegrationPanel({
-  prefillPath,
-  onPrefillConsumed,
-}: SourceIntegrationPanelProps = {}) {
-  const [projectPath, setProjectPath] = useState(prefillPath || "");
+export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegrationPanelProps = {}) {
+  const [projectPath, setProjectPath] = useState(initialProjectPath || "");
   const [analysis, setAnalysis] = useState<ProjectAnalysis | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [integrating, setIntegrating] = useState(false);
@@ -30,13 +28,6 @@ export function SourceIntegrationPanel({
   const [preview, setPreview] = useState<FileModification[] | null>(null);
   const [updating, setUpdating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (prefillPath) {
-      setProjectPath(prefillPath);
-      onPrefillConsumed?.();
-    }
-  }, [prefillPath, onPrefillConsumed]);
 
   const analyze = useCallback(async () => {
     if (!projectPath.trim()) return;
@@ -63,6 +54,23 @@ export function SourceIntegrationPanel({
       setAnalyzing(false);
     }
   }, [projectPath]);
+
+  // When initialProjectPath changes externally, update path and auto-analyze
+  const prevInitialPath = useRef(initialProjectPath);
+  useEffect(() => {
+    if (initialProjectPath && initialProjectPath !== prevInitialPath.current) {
+      prevInitialPath.current = initialProjectPath;
+      setProjectPath(initialProjectPath);
+    }
+  }, [initialProjectPath]);
+
+  // Auto-analyze when path is set from outside (initialProjectPath)
+  useEffect(() => {
+    if (initialProjectPath && projectPath === initialProjectPath && !analysis && !analyzing) {
+      analyze();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectPath, initialProjectPath]);
 
   const previewChanges = useCallback(async () => {
     if (!projectPath.trim()) return;
@@ -143,11 +151,10 @@ export function SourceIntegrationPanel({
     <div className="flex flex-col gap-4">
       {/* Path input */}
       <div className="p-4 rounded-lg border border-border bg-card/50">
-        <h3 className="text-sm font-medium mb-1">Project Directory</h3>
+        <h3 className="text-sm font-medium mb-1">Integrate Project</h3>
         <p className="text-xs text-muted-foreground mb-3">
-          Enter the path to a web application project to analyze and integrate the UI Bridge SDK.
-          The SDK automatically discovers and registers interactive elements with stable semantic
-          IDs at runtime via the bridge registry.
+          Enter the path to your project to analyze and integrate the UI Bridge SDK. Works with web
+          apps (React, Next.js), desktop apps (Tauri), and mobile projects (React Native).
         </p>
         <div className="flex gap-2">
           <div className="flex-1 relative">
@@ -346,6 +353,15 @@ export function SourceIntegrationPanel({
             </div>
           )}
         </div>
+      )}
+
+      {/* Hook generation panel — shown when SDK is at least partially integrated */}
+      {analysis && analysis.ui_bridge_status !== "none" && (
+        <HookGenerationPanel
+          projectPath={projectPath}
+          analysis={analysis}
+          onRefreshAnalysis={analyze}
+        />
       )}
     </div>
   );

@@ -719,7 +719,7 @@ These rules are NON-NEGOTIABLE. Workflows that violate them will be rejected.
 
 6. **Deterministic verification step required**: verification_steps MUST include at least one deterministic, automated step — one of: `command` (with check_type or a command), `test`, or `ui_bridge` (assert action). Do NOT use only `prompt` type steps for verification.
 7. **Code modification requires typecheck**: When the workflow creates or modifies source code files, verification MUST include a `command` step with `check_type` set to the appropriate type checker.
-8. **Web app verification requires SDK or Playwright**: When the workflow targets a web application, verification MUST include `ui_bridge` steps or Playwright-based checks.
+8. **Web app verification requires SDK or Playwright for interactive checks**: When the workflow verifies interactive UI behavior of a web application, verification MUST include `ui_bridge` steps or Playwright-based checks. For simple health checks or content verification (page loads, contains text), `command` steps with `curl` are sufficient.
 9. **Data flow references must be valid**: All step IDs referenced in `inputs`, `depends_on`, and `extract` must correspond to existing step IDs within the same workflow. Circular dependencies in `depends_on` are invalid.
 10. **Prompts are supplementary**: `prompt` type steps in verification must NEVER be the sole verification mechanism.
 11. **Test steps with inline commands use repository**: When a `test` step runs a shell command, set `test_type: "repository"`.
@@ -733,7 +733,10 @@ These rules are NON-NEGOTIABLE. Workflows that violate them will be rejected.
 19. **Retry format**: Use flat `retry_count` and `retry_delay_ms` fields directly on step objects. Do NOT use a nested `retry` object (e.g., `\"retry\": {\"count\": 5}` is WRONG, use `\"retry_count\": 5`).
 20. **No bash negation prefix in shell commands**: NEVER use `!` as a command prefix to invert exit codes (e.g., `! grep -qE 'pattern' file`). The `!` operator is bash-specific and may not be detected by the shell router on Windows, causing false negatives. Instead, use explicit exit code handling: `grep -qE 'pattern' file && exit 1 || exit 0` to assert something is NOT present.
 21. **Removal tasks require runtime verification**: When a workflow involves removing pages/routes/components from a web app, verification MUST include runtime checks (UI Bridge navigate + assertion, or HTTP request to the removed URL), not just static file-existence checks (`test ! -f`). Build caches and routing config may still serve removed content after source file deletion.
-22. **Per-stage UI verification in multi-stage workflows**: In multi-stage workflows, each stage that modifies UI must have its own UI Bridge verification steps. A UI Bridge check in one stage does NOT cover UI changes made in another stage."#;
+22. **Per-stage UI verification in multi-stage workflows**: In multi-stage workflows, each stage that modifies UI must have its own UI Bridge verification steps. A UI Bridge check in one stage does NOT cover UI changes made in another stage.
+23. **No echo EXIT pattern**: NEVER use `echo EXIT:$?`, `echo $?`, or similar patterns to capture exit codes. Let the command's natural exit code propagate. Use `command && echo PASS || echo FAIL` only when explicit text output is needed for parsing.
+24. **Safe grep pipeline**: When using grep to count occurrences, always use `grep -c PATTERN || true` to handle the zero-match case (grep returns exit code 1 when no matches are found). For distinguishing 'not found' from 'error', use `command 2>&1 | grep PATTERN; test $? -ne 2`.
+25. **Declare Python dependency**: If ANY step uses `python` or `python3` commands, a prior setup step MUST verify Python availability (`python3 --version || python --version`). Do not assume Python is installed."#;
 
 // ============================================================================
 

@@ -35,6 +35,7 @@ use crate::workflow_generation::schema_context::{
     build_schema_context, build_schema_context_full, format_skills_for_generator,
 };
 use crate::workflow_generation::self_improve;
+use crate::workflow_generation::spec_synthesis;
 use crate::workflow_generation::specification;
 use crate::workflow_generation::validation::{fix_workflow, validate_workflow};
 use rusqlite::Connection;
@@ -135,6 +136,11 @@ pub struct GenerateWorkflowRequest {
     /// Default: None (auto — included when WebApp keywords are detected)
     #[serde(default)]
     pub discover_ui_bridge_specs: Option<bool>,
+
+    /// Simple mode: skip investigation and specification phases, use lightweight pipeline.
+    /// Auto-detected when complexity score < 0.3, or can be explicitly set.
+    #[serde(default)]
+    pub simple_mode: Option<bool>,
 }
 
 fn default_true() -> Option<bool> {
@@ -167,6 +173,7 @@ impl Default for GenerateWorkflowRequest {
             generate_specification: Some(true),
             verification_depth: None,
             discover_ui_bridge_specs: None,
+            simple_mode: None,
         }
     }
 }
@@ -400,7 +407,19 @@ pub fn generate_workflow(
     let mut artifact_builder =
         PipelineArtifactBuilder::new(&request.description, request.category.as_deref());
 
-    let max_fix_iters = request.max_fix_iterations.unwrap_or(3);
+    // Simple mode: override request settings for lightweight pipeline
+    let effective_simple = request.simple_mode == Some(true);
+    // Note: We also auto-detect simple mode after complexity analysis,
+    // but for skipping phases we need to decide upfront based on explicit flag
+    if effective_simple {
+        info!("Simple mode enabled: skipping investigation and specification phases");
+    }
+
+    let max_fix_iters = if effective_simple {
+        std::cmp::min(request.max_fix_iterations.unwrap_or(3), 1)
+    } else {
+        request.max_fix_iterations.unwrap_or(3)
+    };
 
     // ── Discovery Phase ──────────────────────────────────────────────────
     let discovery_start = Instant::now();
@@ -530,81 +549,83 @@ pub fn generate_workflow(
         ctx
     };
 
-    let effective_request =
-        if request.investigate_codebase.unwrap_or(true) && !discovery_context.is_empty() {
-            info!("Running pre-generation investigation step...");
-            let investigation = investigator::run_investigation(
-                &request.description,
-                &discovery_context,
-                &resolved_contexts,
-                doctor_handle,
-                investigation_model,
-                investigation_provider,
-            );
-            artifact_builder.investigation_duration_ms = Some(investigation.duration_ms);
+    let effective_request = if !effective_simple
+        && request.investigate_codebase.unwrap_or(true)
+        && !discovery_context.is_empty()
+    {
+        info!("Running pre-generation investigation step...");
+        let investigation = investigator::run_investigation(
+            &request.description,
+            &discovery_context,
+            &resolved_contexts,
+            doctor_handle,
+            investigation_model,
+            investigation_provider,
+        );
+        artifact_builder.investigation_duration_ms = Some(investigation.duration_ms);
 
-            // Persist investigation output to ai-output.jsonl for debugging visibility
-            {
-                let status = if investigation.success {
-                    "success"
+        // Persist investigation output to ai-output.jsonl for debugging visibility
+        {
+            let status = if investigation.success {
+                "success"
+            } else {
+                "failed"
+            };
+            let log_line = format!(
+                "[Investigation {} in {}ms] {}",
+                status,
+                investigation.duration_ms,
+                if investigation.success {
+                    &investigation.enriched_description
                 } else {
-                    "failed"
-                };
-                let log_line = format!(
-                    "[Investigation {} in {}ms] {}",
-                    status,
-                    investigation.duration_ms,
-                    if investigation.success {
-                        &investigation.enriched_description
-                    } else {
-                        "(fell back to original description)"
-                    }
-                );
-                let entry = AiOutputEntry {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: chrono::Utc::now().timestamp_millis(),
-                    line: log_line,
-                    source: "workflow-generator".to_string(),
-                    action_id: None,
-                    task_run_id: None,
-                    session_id: None,
-                    session_name: Some(format!(
-                        "Generate: {}",
-                        &request.description[..request.description.len().min(60)]
-                    )),
-                    phase: Some("investigation".to_string()),
-                    phase_iteration: None,
-                    screenshot_path: None,
-                    screenshot_width: None,
-                    screenshot_height: None,
-                };
-                let log_response = crate::commands::logging::append_ai_output_log(entry);
-                if !log_response.success {
-                    warn!(
-                        "Failed to persist investigation AI output log: {}",
-                        log_response.message.unwrap_or_default()
-                    );
+                    "(fell back to original description)"
                 }
+            );
+            let entry = AiOutputEntry {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                line: log_line,
+                source: "workflow-generator".to_string(),
+                action_id: None,
+                task_run_id: None,
+                session_id: None,
+                session_name: Some(format!(
+                    "Generate: {}",
+                    &request.description[..request.description.len().min(60)]
+                )),
+                phase: Some("investigation".to_string()),
+                phase_iteration: None,
+                screenshot_path: None,
+                screenshot_width: None,
+                screenshot_height: None,
+            };
+            let log_response = crate::commands::logging::append_ai_output_log(entry);
+            if !log_response.success {
+                warn!(
+                    "Failed to persist investigation AI output log: {}",
+                    log_response.message.unwrap_or_default()
+                );
             }
+        }
 
-            if investigation.success {
-                artifact_builder.investigation_enriched_description =
-                    Some(investigation.enriched_description.clone());
-                let mut enriched_request = request.clone();
-                enriched_request.description = investigation.enriched_description;
-                enriched_request
-            } else {
-                info!("Investigation failed, falling back to original description");
-                request.clone()
-            }
+        if investigation.success {
+            artifact_builder.investigation_enriched_description =
+                Some(investigation.enriched_description.clone());
+            let mut enriched_request = request.clone();
+            enriched_request.description = investigation.enriched_description;
+            enriched_request
         } else {
-            if request.investigate_codebase.unwrap_or(true) {
-                debug!("Investigation skipped: no discovery context available");
-            } else {
-                debug!("Investigation disabled by request");
-            }
+            info!("Investigation failed, falling back to original description");
             request.clone()
-        };
+        }
+    } else {
+        if request.investigate_codebase.unwrap_or(true) {
+            debug!("Investigation skipped: no discovery context available");
+        } else {
+            debug!("Investigation disabled by request");
+        }
+        request.clone()
+    };
 
     // ── Load self-improvement insights for prompt injection ─────────────
     let self_improve_ctx = conn.and_then(|c| match self_improve::analyze_generation_patterns(c) {
@@ -651,7 +672,8 @@ pub fn generate_workflow(
     };
 
     // ── Specification Phase ─────────────────────────────────────────────
-    let acceptance_criteria = if request.generate_specification.unwrap_or(true) {
+    let acceptance_criteria = if !effective_simple && request.generate_specification.unwrap_or(true)
+    {
         info!("Running specification agent...");
         let spec_insights = self_improve_ctx
             .as_ref()
@@ -733,11 +755,110 @@ pub fn generate_workflow(
         None
     };
 
+    // ── Complexity Analysis: Check if decomposition is recommended ─────
+    let complexity = super::decomposition::analyze_complexity(
+        &effective_request.description,
+        &discovery_context,
+        doctor_handle,
+        generation_model,
+        generation_provider,
+    );
+    if complexity.should_decompose && !complexity.sub_tasks.is_empty() {
+        info!(
+            "Complexity analysis: score={:.2}, {} sub-tasks identified (decomposition available)",
+            complexity.score,
+            complexity.sub_tasks.len()
+        );
+        // Note: Full decomposition (generate sub-workflows + compose) is available
+        // but we currently use this as advisory context for the builder agent.
+        // The sub-task breakdown enriches the builder's understanding of the task.
+    } else {
+        debug!(
+            "Complexity analysis: score={:.2}, decomposition not needed",
+            complexity.score
+        );
+    }
+
+    // ── Simple Mode: log if complexity confirms lightweight prompt ──────
+    if effective_simple || complexity.score < 0.3 {
+        info!(
+            "Simple/lightweight prompt detected (explicit={}, complexity={:.2})",
+            effective_simple, complexity.score
+        );
+    }
+
+    // ── Pattern Mining & Template Promotion: Enrich builder context ─────
+    let pattern_context = conn.and_then(|c| {
+        match super::pattern_mining::mine_patterns(c) {
+            Ok(report) if !report.patterns.is_empty() => {
+                info!(
+                    "Pattern mining: found {} patterns from {} workflows",
+                    report.patterns.len(),
+                    report.workflows_analyzed
+                );
+                // Also promote patterns to rules opportunistically
+                if let Err(e) = super::pattern_mining::patterns_to_rules(c, &report.patterns, 3) {
+                    warn!("Failed to promote patterns to rules: {}", e);
+                }
+                let formatted = super::pattern_mining::format_patterns_for_prompt(&report.patterns);
+                if formatted.is_empty() {
+                    None
+                } else {
+                    Some(formatted)
+                }
+            }
+            Ok(_) => None,
+            Err(e) => {
+                debug!("Pattern mining skipped: {}", e);
+                None
+            }
+        }
+    });
+
+    let template_context = conn.and_then(|c| {
+        // Run template promotion opportunistically
+        if let Err(e) = super::template_promotion::evaluate_and_promote(c) {
+            debug!("Template promotion skipped: {}", e);
+        }
+        match super::template_promotion::find_relevant_templates(c, &effective_request.description)
+        {
+            Ok(templates) if !templates.is_empty() => {
+                info!("Found {} relevant promoted templates", templates.len());
+                let formatted = super::template_promotion::format_templates_for_prompt(&templates);
+                if formatted.is_empty() {
+                    None
+                } else {
+                    Some(formatted)
+                }
+            }
+            Ok(_) => None,
+            Err(e) => {
+                debug!("Template lookup skipped: {}", e);
+                None
+            }
+        }
+    });
+
     // ── Step 1: Builder Agent ──────────────────────────────────────────────
     let builder_start = Instant::now();
-    let builder_insights_section = self_improve_ctx
+    let mut builder_insights_parts: Vec<String> = Vec::new();
+    if let Some(insights) = self_improve_ctx
         .as_ref()
-        .map(self_improve::format_builder_insights);
+        .map(self_improve::format_builder_insights)
+    {
+        builder_insights_parts.push(insights);
+    }
+    if let Some(ref patterns) = pattern_context {
+        builder_insights_parts.push(patterns.clone());
+    }
+    if let Some(ref templates) = template_context {
+        builder_insights_parts.push(templates.clone());
+    }
+    let builder_insights_section = if builder_insights_parts.is_empty() {
+        None
+    } else {
+        Some(builder_insights_parts.join("\n\n"))
+    };
     let mut workflow = match run_builder_agent(
         &effective_request,
         &discovery_context,
@@ -970,6 +1091,26 @@ pub fn generate_workflow(
     // ── Enforce required-flag discipline (Feature 7) ──────────────────────
     hardener::enforce_required_flag_discipline(&mut workflow, acceptance_criteria.as_ref());
 
+    // ── Spec Synthesis: Fill coverage gaps from acceptance criteria ──────
+    if let Some(ref criteria) = acceptance_criteria {
+        let synthesis = spec_synthesis::synthesize_verification_steps(criteria, &discovery_context);
+        if synthesis.success && !synthesis.steps.is_empty() {
+            let mut workflow_json = serde_json::to_value(&workflow).unwrap_or_default();
+            spec_synthesis::merge_synthesized_steps(&mut workflow_json, &synthesis);
+            if let Ok(updated) = serde_json::from_value::<UnifiedWorkflow>(workflow_json) {
+                let merged_count = synthesis.steps.len() - synthesis.unmapped_criteria.len();
+                if merged_count > 0 {
+                    info!(
+                        "Spec synthesis: merged {} verification steps, {} unmapped criteria",
+                        merged_count,
+                        synthesis.unmapped_criteria.len()
+                    );
+                }
+                workflow = updated;
+            }
+        }
+    }
+
     // ── Revision Phase (Feature 1) ───────────────────────────────────────
     let revision_start = Instant::now();
     let max_revision_cycles: u32 = 2;
@@ -1185,6 +1326,16 @@ pub fn generate_workflow(
             "Generated workflow has {} structural validation errors",
             validation_errors.len()
         );
+    }
+
+    // ── Dry Run Simulation ──────────────────────────────────────────────
+    if let Ok(workflow_json) = serde_json::to_value(&workflow) {
+        let dry_run = crate::step_executor::dry_run::simulate_workflow(&workflow_json);
+        if !dry_run.all_passed {
+            warn!("Dry run found issues: {}", dry_run.summary);
+        } else {
+            debug!("Dry run passed: {}", dry_run.summary);
+        }
     }
 
     let stage_step_count: usize = workflow
@@ -1837,7 +1988,7 @@ Has either `command` (for repository/custom_command) or `code` (for playwright/p
 Content is substantive — at least 2 sentences with specific instructions. Agentic prompts reference verification results and describe what to fix. Not a generic placeholder like "Fix the errors" or "Do the task".
 
 ### UI Bridge SDK usage
-If the workflow targets a web app but does NOT include a setup step to connect via UI Bridge SDK (POST to /ui-bridge/sdk/connect), flag it. If the workflow uses Playwright for simple element inspection when SDK endpoints could be used instead, flag it. If agentic prompt steps mention web UI interaction but don't reference SDK tools, flag it.
+ONLY flag missing UI Bridge SDK when the workflow contains `ui_bridge` type steps that lack a setup step to connect via UI Bridge SDK (POST to /ui-bridge/sdk/connect), OR when the description explicitly requests UI interaction or visual verification. Do NOT flag for workflows that only use `command` steps with curl for API health checks or simple HTTP endpoint verification. If the workflow uses Playwright for simple element inspection when SDK endpoints could be used instead, flag it. If agentic prompt steps mention web UI interaction but don't reference SDK tools, flag it.
 
 ### Agentic-verification correspondence
 For EACH prompt step in agentic_steps, there MUST be at least one corresponding deterministic verification step that can detect whether that agentic step's work succeeded. Tab/section existence checks do NOT count as adequate verification for the tab's CONTENT or FUNCTIONALITY.

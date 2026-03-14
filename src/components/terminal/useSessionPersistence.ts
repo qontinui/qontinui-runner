@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { instanceStorage } from "@/lib/instance-storage";
 import type { CommandResponse } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -149,9 +150,9 @@ export function useSessionPersistence() {
       };
 
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(layout));
+        instanceStorage.setJSON(STORAGE_KEY, layout);
       } catch {
-        // localStorage may be full or unavailable — silently ignore
+        // storage may be full or unavailable — silently ignore
       }
     }, DEBOUNCE_MS);
   }, []);
@@ -202,10 +203,8 @@ export function useSessionPersistence() {
   const updateScrollbackPaths = useCallback(
     (pathMap: Record<string, string>, tabIdToSessionIndex: Record<string, number>) => {
       try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (!raw) return;
-
-        const layout = JSON.parse(raw) as SavedSessionLayout;
+        const layout = instanceStorage.getJSON<SavedSessionLayout | null>(STORAGE_KEY, null);
+        if (!layout) return;
 
         for (const [tabId, path] of Object.entries(pathMap)) {
           const sessionIndex = tabIdToSessionIndex[tabId];
@@ -214,7 +213,7 @@ export function useSessionPersistence() {
           }
         }
 
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(layout));
+        instanceStorage.setJSON(STORAGE_KEY, layout);
       } catch {
         // Best-effort
       }
@@ -223,17 +222,11 @@ export function useSessionPersistence() {
   );
 
   const getSavedLayout = useCallback((): SavedSessionLayout | null => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return null;
-      return JSON.parse(raw) as SavedSessionLayout;
-    } catch {
-      return null;
-    }
+    return instanceStorage.getJSON<SavedSessionLayout | null>(STORAGE_KEY, null);
   }, []);
 
   const clearSavedLayout = useCallback(() => {
-    localStorage.removeItem(STORAGE_KEY);
+    instanceStorage.removeItem(STORAGE_KEY);
   }, []);
 
   const hasSavedLayout = useCallback((): boolean => {

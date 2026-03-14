@@ -1,208 +1,78 @@
 {
   "version": "1.0.0",
   "id": "runner:state-machine",
-  "description": "State Machine Builder page -- design and manage state machine configs with states, transitions, graph visualization, pathfinding, discovery exploration, live testing, and import/export. Users select or create configs from a header dropdown, then work across seven tabs: Graph (visual node-edge layout via dagre), States (list + spatial view), Transitions (list with action playback), Pathfinding (find optimal paths between states), Discovery (automated state exploration with strategies), Live Test (manual transition execution and navigation), and Export/Import (JSON file operations).",
+  "description": "UI Bridge State Machine page — discover, design, and manage state machine configs with states, transitions, graph visualization, pathfinding, and export. Users connect to SDK-enabled apps to discover states via fingerprint-based co-occurrence analysis, then work across six tabs: Discovery (SDK app connection, explore/record data collection, fingerprint-based state discovery, and save), Graph Editor (visual node-edge layout via dagre with drag-and-drop element reassignment), State View (list + detail panel via shared StateViewPanel), Transitions (list with detail panel via shared TransitionsPanel), Pathfinding (find optimal paths between states via shared PathfindingPanel), and Export (save to JSON file or load into runtime).",
   "metadata": {
-    "component": "StateMachineBuilderPage",
+    "component": "UIBridgeStateMachinePage",
     "pageId": "state-machine",
     "pageUrl": "/state-machine",
-    "tags": ["runner", "state-machine", "builder", "graph", "config"]
+    "tags": ["runner", "state-machine", "builder", "graph", "config", "ui-bridge", "discovery"]
   },
   "groups": [
     {
       "id": "sm-page-header",
       "name": "Page Header and Config Selector",
-      "description": "The page header shows a GitBranch icon, the title 'State Machine', and a config selector dropdown. Users pick an existing config to load it, or click 'New' to create one. A trash icon deletes the active config with a confirmation dialog. A loading spinner appears during async operations.",
+      "description": "The page header shows a Network icon and a dynamic title (the active config name, or 'UI Bridge States' when no config is selected). A config selector dropdown lets users pick an existing config (showing name and render count). A Refresh button reloads configs and active data, showing a spinning animation during loading.",
       "category": "semantic",
       "assertions": [
         {
           "id": "sm-page-title",
-          "description": "The page displays a clear 'State Machine' title in the header so users know they are on the state machine builder",
+          "description": "The page displays 'UI Bridge States' in the header when no config is selected, or the active config's name when one is loaded",
           "category": "semantic",
           "severity": "critical",
-          "assertionType": "hasText",
+          "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "State Machine" },
-            "label": "State Machine page title"
+            "criteria": { "role": "heading", "textContent": "UI Bridge States" },
+            "label": "Page title"
           },
+          "expected": "When no config is selected, the h1 heading shows 'UI Bridge States'. When a config is loaded, it shows the config's name instead.",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "sm-config-selector",
-          "description": "Users see a config selector dropdown with a 'Select config...' placeholder option to choose which state machine config to work with",
+          "description": "A config selector dropdown with a 'Select configuration...' placeholder option lists all saved configs with name and render count",
           "category": "semantic",
           "severity": "critical",
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Select config..." },
-            "label": "Config selector dropdown placeholder"
+            "criteria": { "textContent": "Select configuration..." },
+            "label": "Config selector dropdown"
           },
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "sm-new-config-button",
-          "description": "Users can click the 'New' button to begin creating a new state machine config",
-          "category": "semantic",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "New" },
-            "label": "New config button"
-          },
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-delete-config-button",
-          "description": "When a config is active, a trash icon button allows users to delete it after confirmation",
+          "id": "sm-refresh-button",
+          "description": "A 'Refresh' button reloads configs and the active config data, with a spinning RefreshCw icon during loading and disabled state",
           "category": "semantic",
           "severity": "warning",
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "name": "Delete config" },
-            "label": "Delete config trash button"
+            "criteria": { "textContent": "Refresh" },
+            "label": "Refresh button"
           },
-          "preconditions": ["An active config must be selected"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "sm-empty-state",
-      "name": "Empty State (No Config Selected)",
-      "description": "When no config is selected, the page shows a centered empty state with a GitBranch icon and instructional text prompting the user to select or create a config.",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "sm-empty-message",
-          "description": "When no config is selected, users see instructional text guiding them to select or create a config",
-          "category": "semantic",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Select a config or create a new one to get started." },
-            "label": "Empty state message"
-          },
-          "preconditions": ["No config is currently selected"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "sm-empty-config-selector-still-visible",
-          "description": "Even in the empty state, the config selector dropdown is present so users can select an existing config",
-          "category": "semantic",
-          "severity": "warning",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Select config..." },
-            "label": "Config selector in empty state"
-          },
-          "preconditions": ["No config is currently selected"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-empty-no-tabs",
-          "description": "When no config is selected, the tab bar should not be visible since there is no config data to work with",
-          "category": "semantic",
-          "severity": "warning",
-          "assertionType": "notExists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Pathfinding" },
-            "label": "Tab bar absent in empty state"
-          },
-          "preconditions": ["No config is currently selected"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "sm-create-config-flow",
-      "name": "Create Config Flow",
-      "description": "Clicking 'New' reveals an inline input with a text field for the config name, a 'Create' button, and a 'Cancel' button. Users type a name and press Enter or click Create to persist the config via the sm_create_config IPC command.",
-      "category": "behavior",
-      "assertions": [
-        {
-          "id": "sm-create-input-placeholder",
-          "description": "The new config input field shows a 'Config name...' placeholder to indicate what to type",
+          "id": "sm-config-selector-behavior",
+          "description": "Selecting a config from the dropdown loads it and resets the discovery state. Each option shows the config name and render count (e.g., 'My Config (12 renders)'). Selecting the empty option clears the active config.",
           "category": "behavior",
           "severity": "critical",
-          "assertionType": "exists",
+          "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "role": "textbox", "name": "Config name..." },
-            "label": "Config name input"
+            "criteria": { "textContent": "Select configuration..." },
+            "label": "Config selector dropdown"
           },
-          "preconditions": ["User has clicked the 'New' button"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-create-button",
-          "description": "A 'Create' button submits the new config name to the backend",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Create" },
-            "label": "Create config button"
-          },
-          "preconditions": ["User has clicked the 'New' button"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-cancel-create",
-          "description": "A 'Cancel' button dismisses the new config input without creating anything",
-          "category": "behavior",
-          "severity": "warning",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Cancel" },
-            "label": "Cancel create button"
-          },
-          "preconditions": ["User has clicked the 'New' button"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-create-button-disabled-empty",
-          "description": "The Create button is disabled when the name input is empty, preventing submission of blank config names",
-          "category": "behavior",
-          "severity": "warning",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Create" },
-            "label": "Create button disabled state"
-          },
-          "expected": "The Create button should be visually disabled (opacity-50) when the name field is empty or whitespace-only",
-          "preconditions": ["User has clicked 'New' button", "Name input is empty"],
+          "expected": "Selecting a config option loads that config via loadConfig(), resets discovery state, and the page title updates to show the config name. Selecting the empty option clears the active config.",
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -213,44 +83,57 @@
     {
       "id": "sm-tab-bar",
       "name": "Tab Navigation Bar",
-      "description": "Seven tabs appear below the header when a config is active: Graph, States, Transitions, Pathfinding, Discovery, Live Test, and Export / Import. The active tab is highlighted with a brand-primary bottom border. Each tab has an icon and label.",
+      "description": "Six tabs appear below the header: Discovery (Search icon), Graph Editor (GitBranch icon), State View (Layers icon), Transitions (ArrowRightLeft icon), Pathfinding (Route icon), and Export (Download icon). The active tab is highlighted with background and shadow styling. All tab panels stay in the DOM but are hidden when inactive.",
       "category": "element-presence",
       "assertions": [
         {
-          "id": "sm-tab-graph",
-          "description": "The Graph tab provides access to the interactive dagre-based node-edge visualization of states and transitions",
+          "id": "sm-tab-discovery",
+          "description": "The Discovery tab provides access to the SDK app connection and state discovery workflow",
           "category": "element-presence",
           "severity": "critical",
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Graph" },
-            "label": "Graph tab"
+            "criteria": { "textContent": "Discovery" },
+            "label": "Discovery tab"
           },
-          "preconditions": ["A config is selected"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-tab-graph",
+          "description": "The Graph Editor tab provides access to the interactive dagre-based node-edge visualization with drag-and-drop element reassignment",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Graph Editor" },
+            "label": "Graph Editor tab"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "sm-tab-states",
-          "description": "The States tab shows a tabular view of all states in the config with selection support",
+          "description": "The State View tab shows a list view of all states with detail panel",
           "category": "element-presence",
           "severity": "critical",
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "States" },
-            "label": "States tab"
+            "criteria": { "textContent": "State View" },
+            "label": "State View tab"
           },
-          "preconditions": ["A config is selected"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "sm-tab-transitions",
-          "description": "The Transitions tab lists all transitions between states with selection and editing support",
+          "description": "The Transitions tab lists all transitions between states with editing support",
           "category": "element-presence",
           "severity": "critical",
           "assertionType": "exists",
@@ -259,14 +142,13 @@
             "criteria": { "textContent": "Transitions" },
             "label": "Transitions tab"
           },
-          "preconditions": ["A config is selected"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "sm-tab-pathfinding",
-          "description": "The Pathfinding tab enables users to find optimal paths between states in the config graph",
+          "description": "The Pathfinding tab enables users to find optimal paths between states",
           "category": "element-presence",
           "severity": "warning",
           "assertionType": "exists",
@@ -275,62 +157,28 @@
             "criteria": { "textContent": "Pathfinding" },
             "label": "Pathfinding tab"
           },
-          "preconditions": ["A config is selected"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "sm-tab-discovery",
-          "description": "The Discovery tab provides automated state exploration with configurable strategies",
+          "id": "sm-tab-export",
+          "description": "The Export tab provides JSON file export and runtime loading operations",
           "category": "element-presence",
           "severity": "warning",
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Discovery" },
-            "label": "Discovery tab"
+            "criteria": { "textContent": "Export" },
+            "label": "Export tab"
           },
-          "preconditions": ["A config is selected"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-tab-live-test",
-          "description": "The Live Test tab provides manual controls to execute transitions and navigate to states",
-          "category": "element-presence",
-          "severity": "warning",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Live Test" },
-            "label": "Live Test tab"
-          },
-          "preconditions": ["A config is selected"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-tab-export-import",
-          "description": "The Export / Import tab provides JSON file export and import operations for state machine configs",
-          "category": "element-presence",
-          "severity": "warning",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Export / Import" },
-            "label": "Export / Import tab"
-          },
-          "preconditions": ["A config is selected"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "sm-tab-count",
-          "description": "Exactly 7 tabs are rendered in the tab bar when a config is active",
+          "description": "Exactly 6 tabs are rendered in the tab bar",
           "category": "element-presence",
           "severity": "critical",
           "assertionType": "semantic",
@@ -339,8 +187,446 @@
             "criteria": { "role": "button" },
             "label": "Tab bar buttons"
           },
-          "expected": "The tab bar section below the header should contain exactly 7 tab buttons: Graph, States, Transitions, Pathfinding, Discovery, Live Test, Export / Import",
-          "preconditions": ["A config is selected"],
+          "expected": "The tab bar below the header should contain exactly 6 tab buttons: Discovery, Graph Editor, State View, Transitions, Pathfinding, Export",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "sm-tab-empty-states",
+      "name": "Per-Tab Empty States (No Config Selected)",
+      "description": "When no config is selected, each content tab (except Discovery) shows a centered instructional message. The Graph Editor also shows a loading spinner when data is being fetched. Discovery works independently of config selection since it creates configs.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "sm-graph-no-config-message",
+          "description": "When no config is selected and not loading, the Graph Editor tab shows 'Select a configuration to view the state graph'",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "hasText",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a configuration to view the state graph" },
+            "label": "Graph empty state message"
+          },
+          "preconditions": ["No config is selected", "Graph Editor tab is active"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-states-no-config-message",
+          "description": "When no config is selected, the State View tab shows 'Select a configuration to view states'",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "hasText",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a configuration to view states" },
+            "label": "States empty state message"
+          },
+          "preconditions": ["No config is selected", "State View tab is active"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-transitions-no-config-message",
+          "description": "When no config is selected, the Transitions tab shows 'Select a configuration to view transitions'",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "hasText",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a configuration to view transitions" },
+            "label": "Transitions empty state message"
+          },
+          "preconditions": ["No config is selected", "Transitions tab is active"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-pathfinding-no-config-message",
+          "description": "When no config is selected, the Pathfinding tab shows 'Select a configuration to use pathfinding'",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "hasText",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a configuration to use pathfinding" },
+            "label": "Pathfinding empty state message"
+          },
+          "preconditions": ["No config is selected", "Pathfinding tab is active"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-export-no-config-message",
+          "description": "When no config is selected, the Export tab shows 'Select a configuration to export'",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "hasText",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a configuration to export" },
+            "label": "Export empty state message"
+          },
+          "preconditions": ["No config is selected", "Export tab is active"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "sm-discovery-connect",
+      "name": "Discovery Tab: Connect to SDK App",
+      "description": "Phase 1 of discovery. A 'Connect to SDK App' card with a Plug icon lets users scan for SDK-enabled apps. A 'Scan for Apps' button triggers web and desktop app scanning via useAppDiscovery. Discovered apps are listed with name, URL, framework, and a 'Connect' button. Once connected, a green banner shows the connected app name and the app list is hidden.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "sm-discovery-connect-heading",
+          "description": "The connection card shows a 'Connect to SDK App' label with a Plug icon",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "hasText",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Connect to SDK App" },
+            "label": "Connect to SDK App heading"
+          },
+          "preconditions": ["Discovery tab is active", "No co-occurrence data has been collected"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-scan-button",
+          "description": "A 'Scan for Apps' button triggers discovery of SDK-enabled web and desktop apps, showing a Loader2 spinner while scanning",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Scan for Apps" },
+            "label": "Scan for Apps button"
+          },
+          "preconditions": ["Discovery tab is active", "No co-occurrence data has been collected"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-scan-results",
+          "description": "After scanning, discovered apps are listed with app name, URL, framework info, and a 'Connect' button per app. A count label shows 'N app(s) found'.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Connect" },
+            "label": "App list with Connect buttons"
+          },
+          "expected": "Each discovered app card shows: app name (font-medium), URL and framework in text-muted, and a 'Connect' button (brand-primary background). After connecting, the app list is hidden and replaced by a connected banner.",
+          "preconditions": ["Discovery tab is active", "Scan has completed with results", "Not yet connected"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-connected-banner",
+          "description": "Once connected to an app, a green banner shows 'Connected: <app name>' with a CheckCircle2 icon, and the app list is hidden",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Connected:" },
+            "label": "Connected app banner"
+          },
+          "expected": "A green-tinted banner (bg-green-500/10, border-green-500/20) should appear with a CheckCircle2 icon and text 'Connected: <bold app name>'. The discovered apps list should be hidden.",
+          "preconditions": ["Discovery tab is active", "Connected to an SDK app"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-no-apps-hint",
+          "description": "When no apps are found and not scanning, instructional text says 'Click Scan to find apps with the UI Bridge SDK installed.'",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "hasText",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Click Scan to find apps with the UI Bridge SDK installed." },
+            "label": "No apps hint text"
+          },
+          "preconditions": ["Discovery tab is active", "Not connected", "No apps found", "Not scanning"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "sm-discovery-collect",
+      "name": "Discovery Tab: Data Collection (Explore/Record)",
+      "description": "Phase 2 of discovery, shown only when connected to an SDK app. Two sub-tabs: 'Explore' (automated exploration via sdk.exploreStates) and 'Record' (manual capture session via sdk.startCaptureSession/stopCaptureSession). Explore shows a 'Start Exploration' button with progress indicators. Record shows 'Start Recording'/'Stop Recording' buttons with capture count and unique fingerprint count.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "sm-discovery-explore-tab",
+          "description": "An 'Explore' sub-tab with a Compass icon is available for automated state exploration",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Explore" },
+            "label": "Explore sub-tab"
+          },
+          "preconditions": ["Discovery tab is active", "Connected to an SDK app", "No co-occurrence data collected"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-record-tab",
+          "description": "A 'Record' sub-tab with a Camera icon is available for manual capture sessions",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Record" },
+            "label": "Record sub-tab"
+          },
+          "preconditions": ["Discovery tab is active", "Connected to an SDK app", "No co-occurrence data collected"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-start-exploration",
+          "description": "The Explore sub-tab has a 'Start Exploration' button that triggers automated exploration. While exploring, it shows 'Exploring...' with a spinner and a 'Cancel' button appears. Progress is shown as 'current / total interactions' with the current element being explored.",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Start Exploration" },
+            "label": "Start Exploration button"
+          },
+          "expected": "Clicking 'Start Exploration' begins automated exploration. The button text changes to 'Exploring...' with a Loader2 spinner and becomes disabled. A 'Cancel' button appears alongside. Progress text shows 'Progress: X / Y interactions' and 'Current: <element name>'. When exploration completes, co-occurrence data is stored and the view advances to Phase 3.",
+          "preconditions": ["Discovery tab is active", "Connected to an SDK app", "Explore sub-tab selected"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-recording-controls",
+          "description": "The Record sub-tab has 'Start Recording' and 'Stop Recording' buttons, plus capture count and unique fingerprint count displayed during/after recording",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Start Recording" },
+            "label": "Start Recording button"
+          },
+          "expected": "Initially shows 'Start Recording' button with a red Circle icon. When recording, the button changes to 'Stop Recording' (red background, Square icon). A recording status area shows: a red pulsing dot with 'N captures' badge, and 'N unique fingerprints' text. Stopping recording generates co-occurrence export data and advances to Phase 3.",
+          "preconditions": ["Discovery tab is active", "Connected to an SDK app", "Record sub-tab selected"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-collect-description",
+          "description": "The Explore sub-tab shows explanatory text about automatic exploration by interacting with UI elements",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "containsText",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Automatically explore" },
+            "label": "Explore description text"
+          },
+          "expected": "Automatically explore",
+          "preconditions": ["Discovery tab is active", "Connected to an SDK app", "Explore sub-tab selected"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "sm-discovery-discover",
+      "name": "Discovery Tab: State Discovery and Save",
+      "description": "Phases 3 and 4 of discovery, shown after co-occurrence data is collected. First shows a data summary card ('Co-occurrence Data Collected') with capture count, fingerprint count, and data source. A 'Discover States' button runs fingerprint-based discovery. After discovery, results show state count, fingerprint count, capture count, a state preview list with names and confidence percentages, and a save form with a 'Configuration Name' input and 'Save Configuration' button.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "sm-discovery-data-summary",
+          "description": "A 'Co-occurrence Data Collected' card shows capture count, fingerprint count, and data source (explore/record) with a 'Start Over' reset button",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "hasText",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Co-occurrence Data Collected" },
+            "label": "Co-occurrence data summary card"
+          },
+          "preconditions": ["Discovery tab is active", "Co-occurrence data has been collected"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-start-over",
+          "description": "A 'Start Over' button with a RotateCcw icon resets the discovery workflow back to the connect phase",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Start Over" },
+            "label": "Start Over button"
+          },
+          "preconditions": ["Discovery tab is active", "Co-occurrence data has been collected"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-discover-button",
+          "description": "A 'Discover States' button with a Sparkles icon runs fingerprint-based state discovery on the collected co-occurrence data",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Discover States" },
+            "label": "Discover States button"
+          },
+          "preconditions": ["Discovery tab is active", "Co-occurrence data collected", "Discovery has not been run yet"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-results-display",
+          "description": "After discovery completes, a 'Discovery Complete' section shows state count, fingerprint count, and capture count badges. A scrollable state preview list shows each discovered state name with its confidence percentage.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Discovery Complete" },
+            "label": "Discovery results section"
+          },
+          "expected": "A card with green CheckCircle2 icon and 'Discovery Complete' heading should display: three badges showing 'N states', 'N fingerprints', 'N captures'. Below, a scrollable list (max-h-40) shows each state with its name on the left and 'X% confidence' on the right.",
+          "preconditions": ["Discovery tab is active", "State discovery has completed"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-config-name-input",
+          "description": "A 'Configuration Name' labeled input with placeholder 'e.g., My App States' allows naming the config before saving",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "textbox" },
+            "label": "Configuration name input"
+          },
+          "preconditions": ["Discovery tab is active", "State discovery has completed"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-save-button",
+          "description": "A 'Save Configuration' button saves the discovered states as a new config. Disabled when the name is empty or saving is in progress. On success, switches to Graph Editor tab with the new config loaded.",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Save Configuration" },
+            "label": "Save Configuration button"
+          },
+          "expected": "Clicking 'Save Configuration' calls discovery.saveConfig() which creates a new state machine config from the discovered states. The button is disabled (opacity-50) when the config name is empty or while saving. On success, the page switches to the Graph Editor tab with the newly created config loaded and selected.",
+          "preconditions": ["Discovery tab is active", "State discovery has completed", "Config name is not empty"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "sm-discovery-algorithm",
+      "name": "Discovery Algorithm Correctness",
+      "description": "The fingerprint-based state discovery algorithm processes co-occurrence data (presence matrix of element fingerprints across captures) to identify distinct UI states. Each discovered state has a unique fingerprint set and a confidence score. The correctness of the algorithm is verifiable by examining the state preview list in the discovery results.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "sm-discovery-states-have-elements",
+          "description": "Every discovered state in the preview list should have at least one element (non-empty elementIds). A state with zero elements indicates a grouping error in the discovery algorithm.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Discovery Complete" },
+            "label": "Discovery results"
+          },
+          "expected": "Each state in the preview list should have a non-zero confidence value, indicating it was derived from at least one fingerprint. States with 0% confidence would indicate empty or invalid groupings.",
+          "preconditions": ["State discovery has completed", "At least one state exists"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-states-distinct",
+          "description": "No two discovered states should represent the same element configuration. Each state in the preview list should have a unique name and distinct confidence value, reflecting different fingerprint groupings.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Discovery Complete" },
+            "label": "Discovery results"
+          },
+          "expected": "All state names in the preview list should be distinct. If two states have identical names and confidence values, it indicates the discovery algorithm failed to merge duplicate states.",
+          "preconditions": ["State discovery has completed", "At least two states exist"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-discovery-statistics-consistency",
+          "description": "The displayed statistics (state count, fingerprint count, capture count) should be internally consistent. The fingerprint count should be >= the state count (since multiple fingerprints can map to one state). The capture count should be >= the fingerprint count.",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Discovery Complete" },
+            "label": "Discovery statistics"
+          },
+          "expected": "The three badge values should satisfy: capture count >= fingerprint count >= state count. The state count badge should match the number of items in the state preview list.",
+          "preconditions": ["State discovery has completed"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -350,62 +636,46 @@
     },
     {
       "id": "sm-graph-tab",
-      "name": "Graph Tab Content",
-      "description": "The Graph tab renders an interactive node-edge graph using @xyflow/react with dagre layout. States are nodes and transitions are edges. Floating action buttons allow adding new states and transitions. Clicking a node selects that state; clicking an edge selects the transition. An empty graph shows an instructional message.",
+      "name": "Graph Editor Tab Content",
+      "description": "The Graph Editor tab renders an interactive node-edge graph using @xyflow/react with dagre layout (via the shared StateMachineGraphView component). States are nodes and transitions are directed edges. A floating 'Add Transition' button in the top-left allows creating new transitions. Clicking a node selects a state; clicking an edge selects a transition. An empty graph shows a message guiding users to the Discovery tab. Elements can be dragged between nodes.",
       "category": "semantic",
       "assertions": [
         {
-          "id": "sm-graph-add-state-btn",
-          "description": "A floating 'Add State' button on the graph tab allows users to create a new state, opening the new-state form in the sidebar",
-          "category": "semantic",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Add State" },
-            "label": "Add State button on graph"
-          },
-          "preconditions": ["A config is selected", "Graph tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
           "id": "sm-graph-add-transition-btn",
-          "description": "A floating 'Add Transition' button on the graph tab allows users to create a new transition between states",
+          "description": "A floating 'Add Transition' button in the top-left of the graph tab allows users to create a new transition, opening the transition editor in the side panel",
           "category": "semantic",
           "severity": "critical",
           "assertionType": "exists",
           "target": {
             "type": "search",
             "criteria": { "textContent": "Add Transition" },
-            "label": "Add Transition button on graph"
+            "label": "Add Transition FAB"
           },
-          "preconditions": ["A config is selected", "Graph tab is active"],
+          "preconditions": ["A config is selected", "Graph Editor tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "sm-graph-empty-message",
-          "description": "When no states exist, the graph shows an instructional empty message guiding users to import or use Discovery",
+          "description": "When no states exist, the graph shows 'No states discovered yet. Use the Discovery tab to discover states.' guiding users to the Discovery tab",
           "category": "semantic",
           "severity": "info",
           "assertionType": "containsText",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "No states in this config" },
+            "criteria": { "textContent": "No states discovered yet" },
             "label": "Empty graph message"
           },
-          "expected": "No states in this config",
-          "preconditions": ["A config is selected with zero states", "Graph tab is active"],
+          "expected": "No states discovered yet",
+          "preconditions": ["A config is selected with zero states", "Graph Editor tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "sm-graph-node-selection",
-          "description": "Clicking a state node in the graph selects it and opens the state detail sidebar, deselecting any previously selected transition",
+          "description": "Clicking a state node in the graph selects it and opens the state detail side panel, deselecting any previously selected transition",
           "category": "semantic",
           "severity": "critical",
           "assertionType": "behavior",
@@ -414,8 +684,59 @@
             "criteria": { "role": "generic" },
             "label": "Graph state node"
           },
-          "expected": "Clicking a state node should: (1) highlight the node with brand-primary ring, (2) open the right sidebar showing 'State Detail' header, (3) deselect any previously selected transition",
-          "preconditions": ["A config is selected with at least one state", "Graph tab is active"],
+          "expected": "Clicking a state node should: (1) highlight the node, (2) open the StateDetailPanel in the right side panel showing 'State Details' header, (3) deselect any previously selected transition and close the transition editor",
+          "preconditions": ["A config is selected with at least one state", "Graph Editor tab is active"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-graph-edge-selection",
+          "description": "Clicking a transition edge in the graph selects it and opens the transition editor side panel",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "Graph transition edge"
+          },
+          "expected": "Clicking a transition edge should: (1) select the edge, (2) open the TransitionEditor in the right side panel in edit mode showing 'Edit Transition' header, (3) deselect any previously selected state",
+          "preconditions": ["A config is selected with at least one transition", "Graph Editor tab is active"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-graph-element-drag",
+          "description": "Elements can be dragged between state nodes on the graph. Normal drag creates a transition between source and target states. Alt+drag moves the element from source to target state.",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "Graph canvas"
+          },
+          "expected": "Dragging an element tile from one state node to another should: without Alt key, create a new transition between the two states; with Alt key held, move the element from the source state to the target state. Drop targets are highlighted during drag.",
+          "preconditions": ["A config is selected with at least two states", "Graph Editor tab is active"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-graph-loading-spinner",
+          "description": "A loading spinner appears in the graph area during async operations (config loading)",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "Graph loading spinner"
+          },
+          "expected": "When sm.isLoading is true, a centered Loader2 spinner (brand-primary color) should be displayed in the graph area instead of the graph canvas or empty message.",
+          "preconditions": ["Graph Editor tab is active", "Config is being loaded"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -426,46 +747,46 @@
     {
       "id": "sm-graph-controls",
       "name": "Graph Visualization Controls",
-      "description": "The graph canvas has control buttons in the top-right (Fit, keyboard shortcut toggle, Re-layout), a stats panel in the bottom-left (state count, transition count, initial state), a MiniMap, and keyboard shortcuts. Nodes display element grids, badges (START, outgoing/incoming counts), and confidence indicators.",
+      "description": "The graph canvas has control buttons in the top-right (Fit, keyboard shortcut toggle, Re-layout), a stats panel in the bottom-left (state count, transition count, initial state name), a MiniMap, and keyboard shortcuts. Nodes display element grids, badges (START for initial, outgoing/incoming counts), and confidence indicators.",
       "category": "interaction",
       "assertions": [
         {
           "id": "sm-graph-fit-button",
-          "description": "A 'Fit' button in the graph controls panel adjusts the viewport to show all nodes",
+          "description": "A 'Fit' button in the top-right controls panel adjusts the viewport to show all nodes",
           "category": "interaction",
           "severity": "warning",
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": { "textContent": "Fit" },
             "label": "Fit to view button"
           },
-          "expected": "The graph canvas should have a 'Fit' button (with Maximize icon) in the top-right controls panel that fits all nodes into view when clicked",
-          "preconditions": ["A config is selected with states", "Graph tab is active"],
+          "expected": "The graph canvas should have a 'Fit' button (with Maximize icon) in the top-right Panel that fits all nodes into view when clicked. Keyboard shortcut 'F' also triggers this.",
+          "preconditions": ["A config is selected with states", "Graph Editor tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "sm-graph-relayout-button",
-          "description": "A 'Re-layout' button in the graph controls re-runs the dagre automatic layout algorithm",
+          "description": "A 'Re-layout' button in the top-right controls re-runs the dagre automatic layout algorithm",
           "category": "interaction",
           "severity": "warning",
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
+            "criteria": { "textContent": "Re-layout" },
             "label": "Re-layout button"
           },
-          "expected": "The graph controls panel should include a Re-layout button (with LayoutGrid icon) that recalculates node positions using dagre layout",
-          "preconditions": ["A config is selected with states", "Graph tab is active"],
+          "expected": "The graph controls panel should include a 'Re-layout' button (with LayoutGrid icon) that recalculates node positions using dagre layout and fits the view. Keyboard shortcut 'L' also triggers this.",
+          "preconditions": ["A config is selected with states", "Graph Editor tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "sm-graph-keyboard-shortcuts",
-          "description": "A '?' button toggles a keyboard shortcuts overlay showing Escape (deselect), F (fit), L (re-layout), Tab (cycle states), I (jump to initial), Delete (delete transition), and +/- (zoom)",
+          "description": "A keyboard icon button toggles a 'Keyboard Shortcuts' overlay listing all available shortcuts including app-specific ones for drag-and-drop",
           "category": "interaction",
           "severity": "info",
           "assertionType": "semantic",
@@ -474,15 +795,32 @@
             "criteria": { "textContent": "Keyboard Shortcuts" },
             "label": "Keyboard shortcuts overlay"
           },
-          "expected": "After clicking the '?' button, a 'Keyboard Shortcuts' overlay should appear listing all available shortcuts: Esc, ?, F, L, +/-, Tab, I, and Delete",
-          "preconditions": ["Graph tab is active", "User pressed '?' button"],
+          "expected": "After clicking the keyboard icon button (or pressing '?'), a 'Keyboard Shortcuts' overlay should appear listing: Deselect all (Esc), Toggle shortcuts (?), Fit to view (F), Re-layout (L), Zoom in/out (+ / -), Cycle states (Tab), Jump to initial (I), Delete transition (Del), Create transition (Drag element), Move element (Alt+Drag)",
+          "preconditions": ["Graph Editor tab is active"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-graph-stats-panel",
+          "description": "A stats panel in the bottom-left shows state count, transition count, and the initial state name (in yellow with a Play icon)",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "Graph stats panel"
+          },
+          "expected": "A semi-transparent panel in the bottom-left should show: 'N states | N transitions' and optionally '| <initial state name>' with a yellow Play icon if an initial state is set.",
+          "preconditions": ["A config is selected with states", "Graph Editor tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "sm-graph-node-badges",
-          "description": "State nodes in the graph display contextual badges: 'START' for initial states, outgoing transition count (top-right), incoming transition count (bottom-right), and a 'no links' badge for disconnected states",
+          "description": "State nodes display contextual badges: 'START' for the initial state (gold), outgoing transition count, incoming transition count, and 'no links' for disconnected states. Each node shows element count and confidence percentage.",
           "category": "data-display",
           "severity": "warning",
           "assertionType": "semantic",
@@ -491,25 +829,212 @@
             "criteria": { "role": "generic" },
             "label": "Graph node badges"
           },
-          "expected": "State nodes should show a gold 'START' badge on initial states, an outgoing count badge (top-right), an incoming count badge (bottom-right), and a 'no links' badge on disconnected states. Each node also shows element count and confidence percentage.",
-          "preconditions": ["A config is selected with states", "Graph tab is active"],
+          "expected": "State nodes should show: a gold 'START' badge on the initial state, outgoing count badge, incoming count badge, and a 'no links' badge on disconnected states. Each node also shows element count and confidence percentage.",
+          "preconditions": ["A config is selected with states", "Graph Editor tab is active"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "sm-graph-state-detail",
+      "name": "Graph Editor: State Detail Side Panel",
+      "description": "When a state is selected on the graph, a right side panel (w-80) opens with the shared StateDetailPanel component. It displays: 'State Details' header with a Close button, editable Name and Description fields, a 2x2 metadata grid (State ID, Confidence percentage, Elements count, Renders count), an editable Elements list with type-colored badges and add/remove capability, Acceptance Criteria (add/edit/remove), Domain Knowledge cards (add/remove), and Save Changes/Delete State buttons.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "sm-state-detail-header",
+          "description": "The state detail panel shows a 'State Details' header with a 'Close' button",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "hasText",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "State Details" },
+            "label": "State Details header"
+          },
+          "preconditions": ["Graph Editor tab is active", "A state is selected"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "sm-graph-edge-labels",
-          "description": "Transition edges display inline labels with the transition name, action type icons, action count, and path cost when not 1.0",
+          "id": "sm-state-detail-name",
+          "description": "The state detail panel shows an editable Name input field pre-filled with the selected state's name",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Name" },
+            "label": "State name edit field"
+          },
+          "expected": "An editable Name text input should be pre-filled with the current state's name, allowing the user to rename the state. A 'Name' label appears above the input.",
+          "preconditions": ["A state is selected", "Side panel is open"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-state-detail-metadata",
+          "description": "The state detail panel displays a 2x2 metadata grid showing State ID, Confidence percentage (color-coded), Elements count, and Renders count",
           "category": "data-display",
           "severity": "warning",
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "role": "generic" },
-            "label": "Graph edge labels"
+            "criteria": { "textContent": "State ID" },
+            "label": "State metadata grid"
           },
-          "expected": "Each transition edge should render a pill-shaped label showing: action type icons (first 3 unique types, color-coded), transition name (truncated), path cost (if != 1.0), action count badge (if > 1), and a green Eye icon if the transition stays visible",
-          "preconditions": ["A config is selected with transitions", "Graph tab is active"],
+          "expected": "A 2-column grid should display: State ID (monospace code block), Confidence (color-coded percentage: green >= 80%, amber 50-79%, red < 50%), Elements count, and Renders count.",
+          "preconditions": ["A state is selected", "Side panel is open"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-state-detail-elements",
+          "description": "The state detail panel shows an Elements list with type-colored badges and the ability to add/remove elements via a 'type:element-id' input",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Elements" },
+            "label": "Elements list section"
+          },
+          "expected": "An 'Elements (N)' section lists each element with a type-colored badge (colored border and background based on element type). Each element has a hover-visible remove button. An 'Add' button and 'type:element-id' input allow adding new elements.",
+          "preconditions": ["A state is selected with elements", "Side panel is open"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-state-detail-acceptance-criteria",
+          "description": "The state detail panel shows Acceptance Criteria with inline editing, add, and remove capabilities",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Acceptance Criteria" },
+            "label": "Acceptance Criteria section"
+          },
+          "expected": "An 'Acceptance Criteria (N)' section lists each criterion as clickable text (click to edit inline). Each has a hover-visible remove button. An input with placeholder 'Add acceptance criterion...' and an 'Add' button allow adding new criteria.",
+          "preconditions": ["A state is selected", "Side panel is open"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-state-detail-save-delete",
+          "description": "The state detail panel provides 'Save Changes' and 'Delete State' buttons for persisting edits or removing the state",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "State save and delete buttons"
+          },
+          "expected": "A 'Save Changes' button (brand-primary, shown only when hasChanges is true) persists edits via onSave. A 'Delete State' button (red text/border) removes the state via onDelete. Both are disabled while saving.",
+          "preconditions": ["A state is selected", "Side panel is open"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "sm-graph-transition-editor",
+      "name": "Graph Editor: Transition Editor Side Panel",
+      "description": "When a transition is selected or 'Add Transition' is clicked, a right side panel (w-80) opens with the shared TransitionEditor component. It shows 'Edit Transition' (editing) or 'New Transition' (creating) header with a Close button. The editor provides: name input, three state toggle groups (From States blue, Activate States green, Exit States red), action list with type-specific parameter fields, path cost, stays-visible checkbox, and Create/Update/Delete buttons.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "sm-transition-editor-header",
+          "description": "The transition editor shows 'Edit Transition' when editing an existing transition or 'New Transition' when creating a new one, with a Close button",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading" },
+            "label": "Transition editor header"
+          },
+          "expected": "The heading shows 'Edit Transition' when a transition is selected, or 'New Transition' when 'Add Transition' was clicked. A 'Close' text button dismisses the panel.",
+          "preconditions": ["Graph Editor tab is active", "Transition editor side panel is open"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-transition-editor-state-toggles",
+          "description": "The transition editor shows three state toggle groups: 'From States' (blue), 'Activate States' (green), and 'Exit States' (red), each rendering toggleable buttons for available states",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "From States" },
+            "label": "State toggle groups"
+          },
+          "expected": "Three labeled toggle groups should be visible: 'From States' (blue-500 accent when active), 'Activate States' (green-500 accent when active), and 'Exit States' (red-500 accent when active). Each group shows state names as toggleable buttons. When no states exist, shows 'No states' italic text.",
+          "preconditions": ["Transition editor is open"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-transition-editor-actions",
+          "description": "The transition editor has an Actions section with '+ Add Action' button and action fields with type dropdown and type-specific parameter fields",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Actions" },
+            "label": "Transition actions section"
+          },
+          "expected": "An 'Actions' label with '+ Add Action' button. Each action has: a type dropdown (Click, Double Click, Right Click, Type, Clear, Select, Focus, Blur, Hover, Scroll, Check, Uncheck, Toggle, Set Value, Drag, Submit, Reset, Wait, Navigate) with conditional fields: target element ID for click-like actions, target + text + 'Clear first' checkbox for type actions, URL for navigate, delay_ms for wait, direction + amount for scroll, source + target for drag.",
+          "preconditions": ["Transition editor is open"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-transition-editor-options",
+          "description": "The transition editor has 'Path Cost' number input and 'Stays Visible' checkbox options",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Path Cost" },
+            "label": "Transition options"
+          },
+          "expected": "A 'Path Cost' number input (min 0, step 0.1, default 1.0) and a 'Stays Visible' checkbox should be present below the actions section.",
+          "preconditions": ["Transition editor is open"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-transition-editor-submit",
+          "description": "The transition editor has a 'Create' button (new mode) or 'Update' button (edit mode) and a 'Delete' button (edit mode only)",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Transition submit buttons"
+          },
+          "expected": "In create mode: a 'Create' button (brand-primary). In edit mode: an 'Update' button (brand-primary) and a 'Delete' button (red text/border). The Create/Update button is disabled when the transition name is empty or while saving.",
+          "preconditions": ["Transition editor is open"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -519,105 +1044,40 @@
     },
     {
       "id": "sm-states-tab",
-      "name": "States Tab Content",
-      "description": "The States tab shows all states using the shared StateViewPanel component with a 2-pane layout: left sidebar (state list with search/filter and view toggle) and right detail panel. It supports List and Spatial view modes. An 'Add State' button floats in the top-right corner.",
+      "name": "State View Tab Content",
+      "description": "The State View tab renders the shared StateViewPanel component (from @qontinui/workflow-ui/state-machine) which displays states in a list view with a detail panel. When no config is selected, shows an empty message.",
       "category": "semantic",
       "assertions": [
         {
-          "id": "sm-states-tab-add-button",
-          "description": "The States tab has its own 'Add State' button in the top-right corner for creating new states while viewing the state list",
+          "id": "sm-states-panel-renders",
+          "description": "The StateViewPanel component renders with the current config's states and transitions when a config is selected",
           "category": "semantic",
           "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Add State" },
-            "label": "Add State button on states tab"
-          },
-          "preconditions": ["A config is selected", "States tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-states-heading",
-          "description": "The states panel shows a 'States' heading with a count badge showing the total number of states",
-          "category": "semantic",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "States" },
-            "label": "States panel heading"
-          },
-          "preconditions": ["A config is selected", "States tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-states-search-filter",
-          "description": "A search input with 'Filter states...' placeholder allows users to filter the state list by name",
-          "category": "semantic",
-          "severity": "warning",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "role": "textbox", "name": "Filter states..." },
-            "label": "State filter search input"
-          },
-          "preconditions": ["A config is selected", "States tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-states-view-toggle",
-          "description": "A List/Spatial view mode toggle allows switching between a text list view and a force-directed spatial canvas view of states",
-          "category": "interaction",
-          "severity": "warning",
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "role": "button" },
-            "label": "View mode toggle buttons"
+            "criteria": { "role": "generic" },
+            "label": "State View panel"
           },
-          "expected": "The states panel should have two toggle buttons (List and Spatial/BarChart3 icons) that switch between a collapsible text list and a force-directed canvas view of state nodes",
-          "preconditions": ["A config is selected", "States tab is active"],
+          "expected": "The StateViewPanel should render showing the list of states from the active config. Each state should be clickable to view details.",
+          "preconditions": ["A config is selected", "State View tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "sm-states-tab-selection",
-          "description": "Clicking a state in the states tab selects it and opens the state detail sidebar for editing",
-          "category": "semantic",
-          "severity": "critical",
+          "id": "sm-states-selection-sync",
+          "description": "State selection in the State View tab syncs with the page-level state, so selecting a state here also deselects any transition",
+          "category": "behavior",
+          "severity": "warning",
           "assertionType": "behavior",
           "target": {
             "type": "search",
             "criteria": { "role": "generic" },
-            "label": "State list row"
+            "label": "State list"
           },
-          "expected": "Clicking a state row should select the state, open the right sidebar with 'State Detail' header, and allow editing the state's properties",
-          "preconditions": ["A config is selected with at least one state", "States tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-states-empty-detail",
-          "description": "When no state is selected, the detail area shows 'Select a state to view its details' placeholder message",
-          "category": "semantic",
-          "severity": "info",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Select a state" },
-            "label": "State detail placeholder"
-          },
-          "expected": "The right pane of the states tab should show instructional text like 'Select a state to view its details' when no state is selected",
-          "preconditions": ["A config is selected", "States tab is active", "No state is selected"],
+          "expected": "Clicking a state in the StateViewPanel calls onSelectState, which sets the page-level selectedStateId and clears selectedTransitionId. This means switching to the Graph Editor tab would show the same state selected.",
+          "preconditions": ["A config is selected with states", "State View tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -628,111 +1088,39 @@
     {
       "id": "sm-transitions-tab",
       "name": "Transitions Tab Content",
-      "description": "The Transitions tab shows all transitions using the shared TransitionsPanel component with a left sidebar (searchable transition list with state filters) and a right detail panel with action playback controls. An 'Add Transition' button floats in the top-right corner.",
+      "description": "The Transitions tab renders the shared TransitionsPanel component (from @qontinui/workflow-ui/state-machine) which displays transitions with editing support. When no config is selected, shows an empty message.",
       "category": "semantic",
       "assertions": [
         {
-          "id": "sm-transitions-tab-add-button",
-          "description": "The Transitions tab has its own 'Add Transition' button in the top-right corner for creating new transitions",
+          "id": "sm-transitions-panel-renders",
+          "description": "The TransitionsPanel component renders with the current config's states and transitions when a config is selected",
           "category": "semantic",
           "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Add Transition" },
-            "label": "Add Transition button on transitions tab"
-          },
-          "preconditions": ["A config is selected", "Transitions tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-transitions-heading",
-          "description": "The transitions panel shows a 'Transitions' heading with a count badge showing the total number of transitions",
-          "category": "semantic",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Transitions" },
-            "label": "Transitions panel heading"
-          },
-          "preconditions": ["A config is selected", "Transitions tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-transitions-search",
-          "description": "A search input with 'Search transitions...' placeholder allows users to filter the transition list",
-          "category": "semantic",
-          "severity": "warning",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "role": "textbox", "name": "Search transitions..." },
-            "label": "Transition search input"
-          },
-          "preconditions": ["A config is selected", "Transitions tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-transitions-state-filters",
-          "description": "Two state filter dropdowns ('All from states' and 'All target states') allow filtering transitions by source and destination states",
-          "category": "interaction",
-          "severity": "warning",
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "All from states" },
-            "label": "From states filter dropdown"
+            "criteria": { "role": "generic" },
+            "label": "Transitions panel"
           },
-          "expected": "The transitions panel should have two dropdown filters: 'All from states' and 'All target states' that filter the transition list by source and destination states respectively",
+          "expected": "The TransitionsPanel should render showing the list of transitions from the active config. Each transition should be clickable to select it.",
           "preconditions": ["A config is selected", "Transitions tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "sm-transitions-action-playback",
-          "description": "When a transition is selected, the detail panel shows 'Action Playback' controls with play/pause, step forward/back, reset, speed selector, progress bar, and timeline dots",
+          "id": "sm-transitions-selection-sync",
+          "description": "Transition selection in the Transitions tab syncs with the page-level state, so selecting a transition here also deselects any state",
           "category": "behavior",
           "severity": "warning",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Action Playback" },
-            "label": "Action Playback controls"
-          },
-          "expected": "Selecting a transition should reveal an 'Action Playback' section with: speed dropdown (0.5x-4x), progress bar, control buttons (Reset, Step Back, Play/Pause, Step Forward), timeline dots for each action, and 'Action X of N' progress text",
-          "preconditions": [
-            "A config is selected with transitions",
-            "Transitions tab is active",
-            "A transition is selected"
-          ],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-transitions-tab-selection",
-          "description": "Clicking a transition in the list selects it and opens the transition detail panel with action playback",
-          "category": "semantic",
-          "severity": "critical",
           "assertionType": "behavior",
           "target": {
             "type": "search",
             "criteria": { "role": "generic" },
-            "label": "Transition list row"
+            "label": "Transition list"
           },
-          "expected": "Clicking a transition row should select the transition, show its name and metadata in the detail panel, and enable action playback controls",
-          "preconditions": [
-            "A config is selected with at least one transition",
-            "Transitions tab is active"
-          ],
+          "expected": "Clicking a transition in the TransitionsPanel calls onSelectTransition, which sets the page-level selectedTransitionId and clears selectedStateId.",
+          "preconditions": ["A config is selected with transitions", "Transitions tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -743,107 +1131,56 @@
     {
       "id": "sm-pathfinding-tab",
       "name": "Pathfinding Tab Content",
-      "description": "The Pathfinding tab provides graph pathfinding between states. Users select a 'From' and 'To' state from dropdowns, choose an algorithm (Dijkstra or BFS), and click 'Find Path'. Results show the path steps with transition names and costs, or a 'No path found' error. A 'Clear' button resets the results.",
+      "description": "The Pathfinding tab renders the shared PathfindingPanel component (from @qontinui/workflow-ui/state-machine). Users select from/to states and an algorithm, then find paths. Successful paths are also highlighted on the Graph Editor tab via the highlightedPath prop.",
       "category": "interaction",
       "assertions": [
         {
-          "id": "sm-pathfinding-heading",
-          "description": "The pathfinding panel shows a 'Pathfinding' heading",
-          "category": "element-presence",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Pathfinding" },
-            "label": "Pathfinding heading"
-          },
-          "preconditions": ["A config is selected", "Pathfinding tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-pathfinding-from-selector",
-          "description": "A 'From' dropdown allows users to select the starting state for pathfinding with a 'Select state...' placeholder",
+          "id": "sm-pathfinding-panel-renders",
+          "description": "The PathfindingPanel component renders with the current config's states and transitions when a config is selected",
           "category": "interaction",
           "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "From" },
-            "label": "From state label"
-          },
-          "preconditions": ["A config is selected", "Pathfinding tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-pathfinding-to-selector",
-          "description": "A 'To' dropdown allows users to select the destination state for pathfinding with a 'Select state...' placeholder",
-          "category": "interaction",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "To" },
-            "label": "To state label"
-          },
-          "preconditions": ["A config is selected", "Pathfinding tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-pathfinding-find-button",
-          "description": "A 'Find Path' button triggers the pathfinding algorithm between the selected from and to states",
-          "category": "interaction",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Find Path" },
-            "label": "Find Path button"
-          },
-          "preconditions": ["A config is selected", "Pathfinding tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-pathfinding-algorithm-selector",
-          "description": "An algorithm dropdown allows choosing between Dijkstra (cheapest path) and BFS (shortest path) algorithms",
-          "category": "interaction",
-          "severity": "info",
           "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Dijkstra" },
-            "label": "Algorithm selector"
+            "criteria": { "role": "generic" },
+            "label": "Pathfinding panel"
           },
-          "expected": "A dropdown should offer at least two pathfinding algorithms: 'Dijkstra (cheapest)' and 'BFS (shortest)', defaulting to Dijkstra",
+          "expected": "The PathfindingPanel should render with from/to state selectors, algorithm choice, and a 'Find Path' button.",
           "preconditions": ["A config is selected", "Pathfinding tab is active"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-pathfinding-graph-highlight",
+          "description": "When a path is found, it is highlighted on the Graph Editor tab via the highlightedPath prop, showing the path edges in a distinct color",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "Pathfinding result and graph"
+          },
+          "expected": "After finding a path with result.found === true, switching to the Graph Editor tab should show the path edges highlighted. If no path is found, highlightedPath is cleared.",
+          "preconditions": ["A config is selected with states and transitions", "Pathfinding tab is active", "A path has been found"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "sm-pathfinding-results",
-          "description": "After finding a path, results show 'Path found (X steps)' with total cost, and a list of steps with transition name, cost, from/to states. If same state, shows 'Already at target state'. If no path, shows 'No path found'.",
+          "description": "After finding a path, the PathfindingPanel shows the result including step count, total cost, and step-by-step navigation through states via transitions",
           "category": "data-display",
           "severity": "critical",
           "assertionType": "semantic",
           "target": {
             "type": "search",
             "criteria": { "role": "generic" },
-            "label": "Pathfinding results area"
+            "label": "Pathfinding results"
           },
-          "expected": "After clicking 'Find Path': (1) Success: 'Path found (X step(s))' in green with 'Total cost: N.N', step list showing transition name and from→to states. (2) Same state: 'Already at target state'. (3) No path: 'No path found between specified states' in red.",
-          "preconditions": [
-            "A config is selected with states",
-            "Pathfinding tab is active",
-            "User has clicked Find Path"
-          ],
+          "expected": "After clicking 'Find Path': (1) Success: shows path found with step count and total cost, listing each step with transition name and from-to states. (2) Same state: indicates already at target. (3) No path: shows no path found message.",
+          "preconditions": ["A config is selected with states", "Pathfinding tab is active", "User has clicked Find Path"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -852,395 +1189,106 @@
       "source": "manual"
     },
     {
-      "id": "sm-sidebar-new-state",
-      "name": "Sidebar: New State Form",
-      "description": "When 'Add State' is clicked, a right sidebar (w-80) opens with a 'New State' header, a Name input, a Description textarea, and a 'Create State' submit button. The sidebar has a close (X) button. The name field has placeholder 'e.g., Login Page' and description has 'Optional description'. Enter key in the name field submits if non-empty. The button is disabled when the name is empty or creation is in progress.",
-      "category": "behavior",
-      "assertions": [
-        {
-          "id": "sm-sidebar-new-state-header",
-          "description": "The sidebar shows a 'NEW STATE' header label so users know they are creating a new state",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "New State" },
-            "label": "New State sidebar header"
-          },
-          "preconditions": ["User clicked 'Add State'"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-state-name-input",
-          "description": "Users see a Name input field with placeholder 'e.g., Login Page' for entering the new state's name",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "role": "textbox", "name": "e.g., Login Page" },
-            "label": "State name input"
-          },
-          "preconditions": ["User clicked 'Add State'"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-state-description",
-          "description": "Users see a Description textarea with placeholder 'Optional description' for entering a description of the state",
-          "category": "behavior",
-          "severity": "warning",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Optional description" },
-            "label": "State description textarea placeholder"
-          },
-          "preconditions": ["User clicked 'Add State'"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-create-state-btn",
-          "description": "A 'Create State' button submits the new state to the backend via the sm_create_state IPC command",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Create State" },
-            "label": "Create State submit button"
-          },
-          "preconditions": ["User clicked 'Add State'"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-close-button",
-          "description": "The sidebar has a close button (X icon) with aria-label 'Close sidebar' to dismiss the sidebar panel",
-          "category": "behavior",
-          "severity": "warning",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "role": "button", "name": "Close sidebar" },
-            "label": "Close sidebar button"
-          },
-          "preconditions": ["Sidebar is open"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-name-label",
-          "description": "A 'Name' label identifies the state name input field",
-          "category": "behavior",
-          "severity": "info",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Name" },
-            "label": "Name field label"
-          },
-          "preconditions": ["User clicked 'Add State'"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "sm-sidebar-state-detail",
-      "name": "Sidebar: State Detail Panel",
-      "description": "When a state is selected, the sidebar shows a 'State Detail' header and renders the shared StateDetailPanel component with editable name, description, metadata grid (state ID, confidence, element count, render count), element list with type-colored badges, acceptance criteria list, domain knowledge cards, and save/delete actions.",
-      "category": "behavior",
-      "assertions": [
-        {
-          "id": "sm-sidebar-state-detail-header",
-          "description": "The sidebar shows a 'STATE DETAIL' header label when an existing state is selected for editing",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "State Detail" },
-            "label": "State Detail sidebar header"
-          },
-          "preconditions": ["A state is selected"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-state-detail-name",
-          "description": "The state detail panel shows an editable Name input field pre-filled with the selected state's name",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Name" },
-            "label": "State name edit field"
-          },
-          "expected": "An editable Name text input should be pre-filled with the current state's name, allowing the user to rename the state",
-          "preconditions": ["A state is selected", "Sidebar is open"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-state-detail-metadata",
-          "description": "The state detail panel displays a 2x2 metadata grid showing State ID, Confidence percentage, Elements count, and Renders count",
-          "category": "data-display",
-          "severity": "warning",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "State ID" },
-            "label": "State metadata grid"
-          },
-          "expected": "A metadata grid should display: State ID (monospace), Confidence (color-coded: green >= 80%, amber 50-79%, red < 50%), Elements count, and Renders count",
-          "preconditions": ["A state is selected", "Sidebar is open"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-state-detail-elements",
-          "description": "The state detail panel shows an Elements list with type-colored badges (testid: blue, role: green, text: amber, ui: purple, url/nav: cyan) and the ability to add/remove elements",
-          "category": "data-display",
-          "severity": "warning",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Elements" },
-            "label": "Elements list section"
-          },
-          "expected": "An Elements section should list each element with a type-colored badge. Users can remove elements (x button) and add new elements using a 'type:element-id' input with an Add button.",
-          "preconditions": ["A state is selected with elements", "Sidebar is open"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-state-detail-save-delete",
-          "description": "The state detail panel provides 'Save Changes' and 'Delete State' buttons for persisting edits or removing the state",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "role": "button" },
-            "label": "State save and delete buttons"
-          },
-          "expected": "A 'Save Changes' button (brand-primary, shown only when changes exist) persists edits via sm_update_state. A 'Delete State' button (red border) removes the state via sm_delete_state.",
-          "preconditions": ["A state is selected", "Sidebar is open"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "sm-sidebar-transition-detail",
-      "name": "Sidebar: Transition Editor",
-      "description": "When a transition is selected, the sidebar shows a 'Transition Detail' header and renders the shared TransitionEditor component. When 'Add Transition' is clicked, the same TransitionEditor appears in create mode with a 'New Transition' header. The editor provides state toggle groups (From, Activate, Exit), name input, action list with type-specific fields, path cost, and stays-visible checkbox.",
-      "category": "behavior",
-      "assertions": [
-        {
-          "id": "sm-sidebar-new-transition-header",
-          "description": "The sidebar shows a 'NEW TRANSITION' header label when creating a new transition",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "New Transition" },
-            "label": "New Transition sidebar header"
-          },
-          "preconditions": ["User clicked 'Add Transition'"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-transition-detail-header",
-          "description": "The sidebar shows a 'TRANSITION DETAIL' header label when an existing transition is selected",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Transition Detail" },
-            "label": "Transition Detail sidebar header"
-          },
-          "preconditions": ["A transition is selected"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-transition-state-toggles",
-          "description": "The transition editor shows three state toggle groups: 'From States' (blue), 'Activate States' (green), and 'Exit States' (red), each rendering toggleable buttons for available states",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "From States" },
-            "label": "State toggle groups"
-          },
-          "expected": "Three labeled toggle groups should be visible: 'From States' (blue accent), 'Activate States' (green accent), and 'Exit States' (red accent). Each group shows state names as toggleable buttons that highlight when selected.",
-          "preconditions": ["Transition editor is open (new or existing)"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-transition-actions",
-          "description": "The transition editor has an Actions section with '+ Add Action' button and action fields with type dropdown (click, type, navigate, wait, etc.) and type-specific parameter fields",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Actions" },
-            "label": "Transition actions section"
-          },
-          "expected": "An 'Actions' section should show: '+ Add Action' button, and for each action: a type dropdown (click, doubleClick, type, navigate, wait, select, scroll, drag, etc.) with conditional fields (target element ID for click actions, text field for type actions, URL for navigate, delay for wait, etc.)",
-          "preconditions": ["Transition editor is open"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-transition-options",
-          "description": "The transition editor has 'Path Cost' number input and 'Stays Visible' checkbox options",
-          "category": "behavior",
-          "severity": "warning",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Path Cost" },
-            "label": "Transition options"
-          },
-          "expected": "A 'Path Cost' number input (min 0, step 0.1) and a 'Stays Visible' checkbox should be present at the bottom of the transition editor",
-          "preconditions": ["Transition editor is open"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-sidebar-transition-create-update",
-          "description": "The transition editor has a 'Create' button (new mode) or 'Update' button (edit mode) and a 'Delete' button (edit mode only)",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "role": "button" },
-            "label": "Transition submit buttons"
-          },
-          "expected": "In create mode: a 'Create' button (brand-primary). In edit mode: an 'Update' button (brand-primary) and a 'Delete' button (red border). The Create/Update button is disabled when the transition name is empty.",
-          "preconditions": ["Transition editor is open"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "sm-export-import-tab",
-      "name": "Export / Import Tab",
-      "description": "The Export/Import tab provides buttons to export the current config to a JSON file and import a config from a JSON file. It shows the current config summary (name, state count, transition count). Import errors are displayed in a red error banner. Export uses Tauri's save dialog; import uses Tauri's open dialog.",
+      "id": "sm-export-tab",
+      "name": "Export Tab",
+      "description": "The Export tab provides two operations: 'Save to File' (exports the config as JSON compatible with UIBridgeRuntime.from_dict() via Tauri's save dialog) and 'Load into Runtime' (POSTs the export data to /state-machine/load API endpoint). Shows config name, state count, and transition count. Uses toast notifications for success/error feedback.",
       "category": "semantic",
       "assertions": [
         {
-          "id": "sm-export-header",
-          "description": "The export tab shows an 'Export / Import' section heading",
+          "id": "sm-export-heading",
+          "description": "The export panel shows an 'Export' heading with a FileJson icon",
           "category": "semantic",
           "severity": "critical",
           "assertionType": "hasText",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Export / Import" },
-            "label": "Export / Import heading"
+            "criteria": { "textContent": "Export" },
+            "label": "Export heading"
           },
-          "preconditions": ["A config is selected", "Export / Import tab is active"],
+          "preconditions": ["A config is selected", "Export tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "sm-export-button",
-          "description": "An 'Export Config' button saves the active config as a JSON file through Tauri's save dialog",
+          "id": "sm-export-save-to-file",
+          "description": "A 'Save to File' button exports the config as a JSON file through Tauri's save dialog, with a Download icon",
           "category": "semantic",
           "severity": "critical",
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Export Config" },
-            "label": "Export Config button"
+            "criteria": { "textContent": "Save to File" },
+            "label": "Save to File button"
           },
-          "preconditions": ["A config is selected", "Export / Import tab is active"],
+          "preconditions": ["A config is selected", "Export tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "sm-import-button",
-          "description": "An 'Import Config' button opens Tauri's file picker to select a JSON config file for import",
+          "id": "sm-export-load-into-runtime",
+          "description": "A 'Load into Runtime' button POSTs the exported config to the /state-machine/load API endpoint, with an Upload icon",
           "category": "semantic",
           "severity": "critical",
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Import Config" },
-            "label": "Import Config button"
+            "criteria": { "textContent": "Load into Runtime" },
+            "label": "Load into Runtime button"
           },
-          "preconditions": ["A config is selected", "Export / Import tab is active"],
+          "preconditions": ["A config is selected", "Export tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "sm-export-config-summary",
-          "description": "The export tab displays a summary of the current config showing its name and counts of states and transitions",
+          "description": "The export panel displays the current config name, state count, and transition count",
           "category": "semantic",
           "severity": "warning",
-          "assertionType": "hasText",
+          "assertionType": "semantic",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Current config" },
-            "label": "Current config summary label"
+            "criteria": { "textContent": "Config:" },
+            "label": "Config summary"
           },
-          "preconditions": ["A config is selected", "Export / Import tab is active"],
+          "expected": "The export panel should show: 'Config: <config name>' in bold, 'N states' on one line, 'N transitions' on another line.",
+          "preconditions": ["A config is selected", "Export tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "sm-export-config-counts",
-          "description": "The config summary shows the number of states and transitions (e.g., '5 states, 8 transitions')",
-          "category": "semantic",
-          "severity": "info",
-          "assertionType": "containsText",
+          "id": "sm-export-save-behavior",
+          "description": "Clicking 'Save to File' opens Tauri's save dialog with a default filename based on the config name, and shows a success/error toast after completion",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "states" },
-            "label": "State and transition counts"
+            "criteria": { "textContent": "Save to File" },
+            "label": "Save to File button"
           },
-          "expected": "states",
-          "preconditions": ["A config is selected", "Export / Import tab is active"],
+          "expected": "Clicking 'Save to File' calls buildExportConfig to create JSON compatible with UIBridgeRuntime.from_dict(), then opens Tauri's save dialog with default filename '<config_name>_state_machine.json'. On success, shows 'Exported to <path>' toast. On failure, shows 'Export failed: <error>' toast. Button is disabled during export.",
+          "preconditions": ["A config is selected", "Export tab is active"],
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-export-runtime-load-behavior",
+          "description": "Clicking 'Load into Runtime' POSTs the export data to the API and shows a success/error toast",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Load into Runtime" },
+            "label": "Load into Runtime button"
+          },
+          "expected": "Clicking 'Load into Runtime' POSTs the buildExportConfig result to /state-machine/load. On success, shows 'State machine loaded into runtime' toast. On failure, shows 'Load failed: <error>' toast. Button is disabled during load and while export is in progress.",
+          "preconditions": ["A config is selected", "Export tab is active"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -1249,703 +1297,40 @@
       "source": "manual"
     },
     {
-      "id": "sm-discovery-tab",
-      "name": "Discovery Tab: State Explorer Configure",
-      "description": "The Discovery tab is a multi-view panel (configure, history, report) for automated state exploration. In the configure view, users select an exploration strategy (smoke_test, exhaustive, regression, random_walk, targeted), configure advanced options (max states, state delay, screenshots, stop on failure), preview the exploration plan, and start an exploration run. The panel shows the config name and state/transition counts.",
+      "id": "sm-toast-notifications",
+      "name": "Toast Notifications",
+      "description": "The page uses a toast notification system (useToast + ToastContainer) for user feedback throughout all operations. Toasts appear for export success/failure, runtime load success/failure, discovery save success, and other operations.",
       "category": "semantic",
       "assertions": [
         {
-          "id": "sm-discovery-title",
-          "description": "The discovery panel shows a 'State Explorer' heading in the configure view",
-          "category": "semantic",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "State Explorer" },
-            "label": "State Explorer heading"
-          },
-          "preconditions": ["A config is selected", "Discovery tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-strategy-label",
-          "description": "A 'Strategy' label identifies the exploration strategy selector",
-          "category": "semantic",
-          "severity": "warning",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Strategy" },
-            "label": "Strategy label"
-          },
-          "preconditions": ["A config is selected", "Discovery tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-strategy-selector",
-          "description": "Users can select an exploration strategy from a dropdown with options including Smoke Test, Exhaustive, Regression, Random Walk, and Targeted",
-          "category": "semantic",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Smoke Test" },
-            "label": "Strategy selector with Smoke Test option"
-          },
-          "preconditions": ["A config is selected", "Discovery tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-preview-button",
-          "description": "A 'Preview Plan' button generates and shows a preview of the exploration plan without running it",
-          "category": "semantic",
-          "severity": "warning",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Preview Plan" },
-            "label": "Preview Plan button"
-          },
-          "preconditions": ["A config is selected", "Discovery tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-start-button",
-          "description": "A 'Start Exploration' button begins the automated exploration run against the active config",
-          "category": "semantic",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Start Exploration" },
-            "label": "Start Exploration button"
-          },
-          "preconditions": ["A config is selected", "Discovery tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-advanced-toggle",
-          "description": "An 'Advanced Options' toggle expands additional configuration fields for max states, state delay, screenshots, and stop-on-failure",
-          "category": "semantic",
-          "severity": "info",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Advanced Options" },
-            "label": "Advanced Options toggle"
-          },
-          "preconditions": ["A config is selected", "Discovery tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-history-button",
-          "description": "A 'History' button navigates to the exploration history view showing past runs",
-          "category": "semantic",
-          "severity": "warning",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "History" },
-            "label": "History navigation button"
-          },
-          "preconditions": ["A config is selected", "Discovery tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "sm-discovery-advanced-options",
-      "name": "Discovery Tab: Advanced Options",
-      "description": "When the 'Advanced Options' toggle is expanded, it reveals configuration fields: Max states (number input, 0 = unlimited), State delay in ms (number input, default 500), Capture screenshots (checkbox, default on), Stop on first failure (checkbox, default off). These are shown in a left-bordered section.",
-      "category": "behavior",
-      "assertions": [
-        {
-          "id": "sm-discovery-max-states-label",
-          "description": "A 'Max states (0 = unlimited)' label identifies the maximum states input",
-          "category": "behavior",
-          "severity": "warning",
-          "assertionType": "containsText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Max states" },
-            "label": "Max states label"
-          },
-          "expected": "Max states",
-          "preconditions": ["Discovery tab is active", "Advanced Options is expanded"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-state-delay-label",
-          "description": "A 'State delay (ms)' label identifies the delay between state exploration steps",
-          "category": "behavior",
-          "severity": "warning",
-          "assertionType": "containsText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "State delay" },
-            "label": "State delay label"
-          },
-          "expected": "State delay",
-          "preconditions": ["Discovery tab is active", "Advanced Options is expanded"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-capture-screenshots",
-          "description": "A 'Capture screenshots' checkbox allows toggling screenshot capture during exploration",
-          "category": "behavior",
-          "severity": "info",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Capture screenshots" },
-            "label": "Capture screenshots checkbox"
-          },
-          "preconditions": ["Discovery tab is active", "Advanced Options is expanded"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-stop-on-failure",
-          "description": "A 'Stop on first failure' checkbox allows halting exploration when a failure is encountered",
-          "category": "behavior",
-          "severity": "info",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Stop on first failure" },
-            "label": "Stop on first failure checkbox"
-          },
-          "preconditions": ["Discovery tab is active", "Advanced Options is expanded"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "sm-discovery-history",
-      "name": "Discovery Tab: Exploration History",
-      "description": "The history view shows a list of past exploration runs with config name, strategy, start timestamp, and summary. Each run has a 'View Report' link. A refresh button reloads the history, and a 'Clear runs older than 30 days' button purges old entries. When no runs exist, an empty state message is shown.",
-      "category": "behavior",
-      "assertions": [
-        {
-          "id": "sm-discovery-history-title",
-          "description": "The history view shows an 'Exploration History' heading",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Exploration History" },
-            "label": "Exploration History heading"
-          },
-          "preconditions": ["Discovery tab is active", "User navigated to history view"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-history-empty",
-          "description": "When no exploration runs exist, the history shows 'No exploration runs yet' as an empty state",
-          "category": "behavior",
-          "severity": "warning",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "No exploration runs yet" },
-            "label": "Empty history message"
-          },
-          "preconditions": ["Discovery tab is active", "History view with no runs"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-back-to-configure",
-          "description": "A 'Configure' back button returns to the configure view from the history view",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Configure" },
-            "label": "Configure back button"
-          },
-          "preconditions": ["Discovery tab is active", "User is on history view"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-clear-old-runs",
-          "description": "A 'Clear runs older than 30 days' button purges stale exploration history entries",
-          "category": "behavior",
-          "severity": "info",
-          "assertionType": "containsText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Clear runs older than 30 days" },
-            "label": "Clear old runs button"
-          },
-          "expected": "Clear runs older than 30 days",
-          "preconditions": ["Discovery tab is active", "History view with at least one run"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "sm-discovery-report",
-      "name": "Discovery Tab: Exploration Report",
-      "description": "The report view shows detailed results of a single exploration run: summary stats (states passed/visited, transitions passed/verified, duration, strategy), per-state results with status icons, per-transition results with from/to labels, and an optional summary text. A 'Back' button returns to the history view.",
-      "category": "behavior",
-      "assertions": [
-        {
-          "id": "sm-discovery-report-title",
-          "description": "The report view shows an 'Exploration Report' heading",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Exploration Report" },
-            "label": "Exploration Report heading"
-          },
-          "preconditions": ["Discovery tab is active", "User is viewing a report"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-report-states-passed",
-          "description": "The report shows a 'States Passed' stat card with the count of passed vs visited states",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "States Passed" },
-            "label": "States Passed stat"
-          },
-          "preconditions": ["Discovery tab is active", "User is viewing a report"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-report-transitions-passed",
-          "description": "The report shows a 'Transitions Passed' stat card with the count of passed vs verified transitions",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Transitions Passed" },
-            "label": "Transitions Passed stat"
-          },
-          "preconditions": ["Discovery tab is active", "User is viewing a report"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-report-duration",
-          "description": "The report shows a 'Duration' stat card with the total exploration time",
-          "category": "behavior",
-          "severity": "warning",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Duration" },
-            "label": "Duration stat"
-          },
-          "preconditions": ["Discovery tab is active", "User is viewing a report"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-discovery-report-back",
-          "description": "A 'Back' button returns from the report view to the history view",
-          "category": "behavior",
-          "severity": "warning",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Back" },
-            "label": "Back button from report"
-          },
-          "preconditions": ["Discovery tab is active", "User is viewing a report"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "sm-live-test-tab",
-      "name": "Live Test Tab: Main Controls",
-      "description": "The Live Test tab provides interactive state machine testing. It has three sections: Execute Transition (with a searchable transition list and quick-execute buttons), Navigate to State (dropdown + navigate button), and an Activity Log. The tab requires a running Python executor.",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "sm-live-test-title",
-          "description": "The Live Test panel shows a 'Live Test' heading",
-          "category": "semantic",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Live Test" },
-            "label": "Live Test heading"
-          },
-          "preconditions": ["A config is selected", "Live Test tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-live-test-executor-note",
-          "description": "A note reminds users that the Live Test requires a running executor process",
-          "category": "semantic",
-          "severity": "warning",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Requires running executor" },
-            "label": "Executor requirement note"
-          },
-          "preconditions": ["A config is selected", "Live Test tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-live-test-execute-label",
-          "description": "An 'Execute Transition' section label identifies the transition execution area",
-          "category": "semantic",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Execute Transition" },
-            "label": "Execute Transition section label"
-          },
-          "preconditions": ["A config is selected", "Live Test tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-live-test-filter-input",
-          "description": "Users can filter the transition list with a 'Filter transitions...' search input",
-          "category": "semantic",
-          "severity": "warning",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "role": "textbox", "name": "Filter transitions..." },
-            "label": "Transition filter input"
-          },
-          "preconditions": ["A config is selected", "Live Test tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-live-test-navigate-label",
-          "description": "A 'Navigate to State' section label identifies the state navigation area",
-          "category": "semantic",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Navigate to State" },
-            "label": "Navigate to State section label"
-          },
-          "preconditions": ["A config is selected", "Live Test tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-live-test-navigate-button",
-          "description": "A 'Navigate' button triggers navigation to the selected state via the navigate_to_state IPC command",
-          "category": "semantic",
-          "severity": "critical",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Navigate" },
-            "label": "Navigate button"
-          },
-          "preconditions": ["A config is selected", "Live Test tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "sm-live-test-transitions-list",
-      "name": "Live Test: Transition List and Quick Execute",
-      "description": "The transition list shows each transition with name, from/to state labels, and a quick-execute play button. Clicking a row selects it; clicking the play icon immediately executes the transition. The selected transition shows an 'Execute: <name>' button with action count and cost info. Filtering by name or state names is supported.",
-      "category": "interaction",
-      "assertions": [
-        {
-          "id": "sm-live-test-transition-rows",
-          "description": "Each transition in the list shows the transition name, from-state names (blue), a chevron arrow, and to-state names (green)",
-          "category": "data-display",
-          "severity": "critical",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "role": "generic" },
-            "label": "Transition list rows"
-          },
-          "expected": "Each transition row should display: transition name (truncated), from-states in blue text, a chevron arrow, and activate-states in green text. Each row should also have a play icon button for quick execution.",
-          "preconditions": ["A config is selected with transitions", "Live Test tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-live-test-quick-execute",
-          "description": "Each transition row has a play icon button that immediately executes that transition via the execute_transition IPC command without requiring selection first",
-          "category": "interaction",
-          "severity": "warning",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "role": "button" },
-            "label": "Quick execute play buttons"
-          },
-          "expected": "Each transition row should have a small play (triangle) icon button on the right side that executes the transition when clicked. The button should be disabled during execution.",
-          "preconditions": ["A config is selected with transitions", "Live Test tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-live-test-selected-execute",
-          "description": "When a transition is selected, an 'Execute: <name>' button appears below the list showing the action count and path cost",
-          "category": "interaction",
-          "severity": "warning",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Execute:" },
-            "label": "Selected transition execute button"
-          },
-          "expected": "After clicking a transition row, an 'Execute: <transition name>' button should appear below the list, alongside text showing 'N action(s) · cost: X.X'",
-          "preconditions": [
-            "A config is selected with transitions",
-            "Live Test tab is active",
-            "A transition is selected"
-          ],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-live-test-empty-transitions",
-          "description": "When no transitions exist or match the filter, the transition list shows an appropriate empty state message",
-          "category": "data-display",
-          "severity": "info",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "No transitions" },
-            "label": "Empty transitions message"
-          },
-          "expected": "When the config has no transitions: 'No transitions'. When filter has no matches: 'No matching transitions'.",
-          "preconditions": ["A config is selected", "Live Test tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "sm-live-test-activity-log",
-      "name": "Live Test: Activity Log",
-      "description": "The activity log shows timestamped entries for transitions executed, navigations performed, info messages, and errors. Each entry is color-coded by type (blue for transitions, cyan for navigate, gray for info, red for errors). Refresh and clear buttons are provided. When empty, a placeholder message is shown.",
-      "category": "behavior",
-      "assertions": [
-        {
-          "id": "sm-live-test-activity-label",
-          "description": "An 'Activity Log' section label identifies the log area",
-          "category": "behavior",
-          "severity": "critical",
-          "assertionType": "hasText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Activity Log" },
-            "label": "Activity Log section label"
-          },
-          "preconditions": ["A config is selected", "Live Test tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-live-test-empty-log",
-          "description": "When no activity has occurred, the log shows an instructional empty state message",
-          "category": "behavior",
-          "severity": "warning",
-          "assertionType": "containsText",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "No activity yet" },
-            "label": "Empty activity log message"
-          },
-          "expected": "No activity yet",
-          "preconditions": [
-            "A config is selected",
-            "Live Test tab is active",
-            "No operations executed yet"
-          ],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-live-test-state-selector",
-          "description": "A state selector dropdown with 'Select a state...' placeholder allows choosing a target state for navigation",
-          "category": "behavior",
-          "severity": "warning",
-          "assertionType": "exists",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "Select a state..." },
-            "label": "State selection placeholder"
-          },
-          "preconditions": ["A config is selected", "Live Test tab is active"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-live-test-log-color-coding",
-          "description": "Activity log entries are color-coded by type: blue for transition executions, cyan for navigations, gray for info, red for errors, with monospace timestamps",
-          "category": "behavior",
-          "severity": "info",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "role": "generic" },
-            "label": "Activity log entries"
-          },
-          "expected": "After executing a transition or navigating, log entries should appear with: a monospace timestamp, color-coded message text (blue-400 for transitions, cyan-400 for navigate, text-secondary for info, red-400 for errors). Most recent entries appear at the top.",
-          "preconditions": [
-            "A config is selected",
-            "Live Test tab is active",
-            "At least one operation has been executed"
-          ],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "sm-error-handling",
-      "name": "Error Display and Loading States",
-      "description": "The page displays errors from the useStateMachineConfig hook in a red banner at the bottom of the page. Import errors appear in the export tab. The Live Test panel has its own error banner. Loading states are indicated by Loader2 spinner icons throughout the page.",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "sm-error-banner-behavior",
-          "description": "When the useStateMachineConfig hook encounters an error, a red error banner appears at the bottom of the page displaying the error message",
-          "category": "semantic",
-          "severity": "critical",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "role": "generic" },
-            "label": "Error banner area"
-          },
-          "expected": "When an IPC command fails (e.g., sm_list_configs, sm_create_config), a red-tinted banner should appear at the bottom of the page with the error message text. The banner has bg-red-500/10 background and red-500/20 border styling.",
-          "preconditions": ["An IPC command has failed"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-loading-spinner",
-          "description": "During async operations (loading configs, creating states/transitions), a loading spinner is displayed in the header area",
+          "id": "sm-toast-container-present",
+          "description": "A ToastContainer component is rendered at the page level to display toast notifications from all operations",
           "category": "semantic",
           "severity": "warning",
           "assertionType": "semantic",
           "target": {
             "type": "search",
             "criteria": { "role": "generic" },
-            "label": "Loading spinner"
+            "label": "Toast notification container"
           },
-          "expected": "A spinning Loader2 icon should appear in the header (ml-auto position) when isLoading is true, indicating an async operation is in progress",
-          "preconditions": ["An async operation is in progress"],
+          "expected": "A ToastContainer should be present at the bottom of the page layout, receiving toasts from the useToast hook and rendering them with dismiss capability.",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "sm-import-error-display",
-          "description": "When a config import fails (invalid JSON or missing states/transitions fields), a red error message appears in the Export/Import tab",
-          "category": "semantic",
+          "id": "sm-toast-export-feedback",
+          "description": "Export operations show success or error toasts with descriptive messages",
+          "category": "behavior",
           "severity": "warning",
-          "assertionType": "semantic",
+          "assertionType": "behavior",
           "target": {
             "type": "search",
             "criteria": { "role": "generic" },
-            "label": "Import error display"
+            "label": "Toast notifications"
           },
-          "expected": "After a failed import, a red error message should appear in the Export/Import tab showing the error reason (e.g., 'Invalid config format: missing states or transitions')",
-          "preconditions": ["Export / Import tab is active", "An import operation has failed"],
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "sm-live-test-error-banner",
-          "description": "When a Live Test operation fails, a dedicated error banner appears in the Live Test panel with a dismiss button",
-          "category": "semantic",
-          "severity": "warning",
-          "assertionType": "semantic",
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "dismiss" },
-            "label": "Live Test error banner with dismiss"
-          },
-          "expected": "When a transition execution or state navigation fails in the Live Test tab, a red error banner should appear showing the error message with a 'dismiss' underlined link to clear it",
-          "preconditions": ["Live Test tab is active", "A transition or navigation has failed"],
+          "expected": "After a successful export: a success toast with 'Exported to <path>'. After a failed export: an error toast with 'Export failed: <error>'. After successful runtime load: 'State machine loaded into runtime'. After failed load: 'Load failed: <error>'.",
+          "preconditions": ["An export or load operation has completed"],
           "source": "manual",
           "reviewed": true,
           "enabled": true

@@ -33,6 +33,8 @@ import {
   Save,
   AlertCircle,
   CheckCircle2,
+  Grid,
+  Trash2,
   type LucideIcon,
 } from "lucide-react";
 import { getAccentColors } from "@/design-system";
@@ -49,6 +51,7 @@ import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { useGenerateData, type SavedPrompt } from "./useGenerateData";
 import { useAdvancedOptions, PROVIDERS } from "./useAdvancedOptions";
 import { useTemplatePopover } from "./useTemplatePopover";
+import { instanceStorage } from "@/lib/instance-storage";
 
 // Icon lookup map for template icons
 const TEMPLATE_ICONS: Record<string, LucideIcon> = {
@@ -167,6 +170,32 @@ export function AiGeneratePanel({
     templatePopoverRef,
   } = useTemplatePopover();
 
+  // --- Batch mode state ---
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchEntries, setBatchEntries] = useState<
+    { id: string; title: string; prompt: string }[]
+  >(() => Array.from({ length: 12 }, () => ({ id: crypto.randomUUID(), title: "", prompt: "" })));
+
+  const addBatchEntry = useCallback(() => {
+    setBatchEntries((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), title: "", prompt: "" },
+    ]);
+  }, []);
+
+  const removeBatchEntry = useCallback((id: string) => {
+    setBatchEntries((prev) => (prev.length <= 1 ? prev : prev.filter((e) => e.id !== id)));
+  }, []);
+
+  const updateBatchEntry = useCallback(
+    (id: string, field: "title" | "prompt", value: string) => {
+      setBatchEntries((prev) =>
+        prev.map((e) => (e.id === id ? { ...e, [field]: value } : e)),
+      );
+    },
+    [],
+  );
+
   // --- Remaining local state ---
   const [description, setDescription] = useState("");
   const [selectedContextIds, setSelectedContextIds] = useState<string[]>([]);
@@ -184,15 +213,15 @@ export function AiGeneratePanel({
   const [showContext, setShowContext] = useState(false);
   const [contextTab, setContextTab] = useState<"saved" | "custom" | "file">("saved");
 
-  // Hydrate description from localStorage after mount
+  // Hydrate description from storage after mount
   useEffect(() => {
-    const saved = localStorage.getItem("generate-workflow-prompt");
+    const saved = instanceStorage.getItem("generate-workflow-prompt");
     if (saved) setDescription(saved);
   }, []);
 
-  // Persist prompt to localStorage on change
+  // Persist prompt to storage on change
   useEffect(() => {
-    localStorage.setItem("generate-workflow-prompt", description);
+    instanceStorage.setItem("generate-workflow-prompt", description);
   }, [description]);
 
   const handleContextToggle = useCallback((contextId: string) => {
@@ -259,7 +288,26 @@ export function AiGeneratePanel({
     return { ...base, description: description.trim() };
   }, [buildBaseRequest, description, selectedContextIds, inlineContext]);
 
-  const canGenerate = !!description.trim();
+    let fullDescription = "";
+    if (specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0) {
+      const specResult = buildSpecPrompt({
+        discoveredSpecs: specState.discoveredSpecs,
+        selectedGroupIds: specState.selectedGroupIds,
+      });
+      fullDescription = specResult.prompt;
+      if (description.trim()) {
+        fullDescription += `\n\n## Additional Instructions\n${description.trim()}`;
+      }
+    } else {
+      fullDescription = description.trim();
+    }
+
+    return { ...base, description: fullDescription };
+  }, [buildBaseRequest, description, specState, selectedContextIds, inlineContext, hasSpecs]);
+
+  const canGenerate = batchMode
+    ? batchEntries.some((e) => e.prompt.trim())
+    : description.trim() || hasSpecs;
 
   /** Fire a single generate-async request and return the task_run_id. */
   const fireGenerateRequest = async (request: Record<string, unknown>): Promise<string> => {
@@ -276,11 +324,74 @@ export function AiGeneratePanel({
     return data.task_run_id as string;
   };
 
+  /** Build a generate request for a single batch entry. */
+  const buildBatchEntryRequest = useCallback(
+    (entry: { title: string; prompt: string }) => {
+      const base = buildBaseRequest({ selectedContextIds, inlineContext, hasSpecs });
+      const fullDescription = entry.title.trim()
+        ? `## ${entry.title.trim()}\n\n${entry.prompt.trim()}`
+        : entry.prompt.trim();
+      return { ...base, description: fullDescription };
+    },
+    [buildBaseRequest, selectedContextIds, inlineContext, hasSpecs],
+  );
+
   const handleGenerate = async () => {
     if (!canGenerate) return;
     setSubmittingAction("generate");
     setError(null);
     try {
+      if (batchMode) {
+        // Batch mode: fire all non-empty prompts in parallel
+        const validEntries = batchEntries.filter((e) => e.prompt.trim());
+        const results = await Promise.allSettled(
+          validEntries.map((entry) => fireGenerateRequest(buildBatchEntryRequest(entry))),
+        );
+        const succeeded = results.filter((r) => r.status === "fulfilled");
+        const failed = results.filter((r) => r.status === "rejected");
+        console.log(
+          "[AiGeneratePanel] Batch generation:",
+          succeeded.length,
+          "started,",
+          failed.length,
+          "failed",
+        );
+        if (failed.length > 0 && succeeded.length === 0) {
+          const reason =
+            failed[0].status === "rejected"
+              ? (failed[0] as PromiseRejectedResult).reason
+              : "Unknown error";
+          throw reason instanceof Error ? reason : new Error(String(reason));
+        }
+        if (failed.length > 0) {
+          setError(
+            `${succeeded.length} of ${validEntries.length} workflows started. ${failed.length} failed.`,
+          );
+        }
+        for (const entry of validEntries) {
+          autoSaveGenerationPrompt(entry.prompt); // fire-and-forget
+        }
+        if (generationModelOverrides && Object.keys(generationModelOverrides).length > 0) {
+          instanceStorage.setJSON("last-generation-model-overrides", generationModelOverrides);
+        }
+        onNavigateToActiveRuns();
+        return;
+      }
+      // Specs selected → deterministic builder (instant, loads into builder)
+      if (hasSpecs && onLoadWorkflow) {
+        const workflow = buildDeterministicSpecWorkflow();
+        if (workflow) {
+          onLoadWorkflow(workflow);
+          console.log(
+            "[AiGeneratePanel] Deterministic spec workflow built:",
+            workflow.stages?.length ?? 0,
+            "stages",
+          );
+          setSubmittingAction(null);
+          return;
+        }
+      }
+      // No specs → AI generation
       const taskRunId = await fireGenerateRequest(buildGenerateRequest());
       console.log("[AiGeneratePanel] Generation started:", taskRunId);
       if (description.trim()) {
@@ -288,10 +399,7 @@ export function AiGeneratePanel({
       }
       // Persist generation overrides for "Copy from Last Generation" in workflow builder
       if (generationModelOverrides && Object.keys(generationModelOverrides).length > 0) {
-        localStorage.setItem(
-          "last-generation-model-overrides",
-          JSON.stringify(generationModelOverrides),
-        );
+        instanceStorage.setJSON("last-generation-model-overrides", generationModelOverrides);
       }
       onNavigateToActiveRuns();
     } catch (err) {
@@ -308,6 +416,64 @@ export function AiGeneratePanel({
     setSubmittingAction("generate-and-run");
     setError(null);
     try {
+      if (batchMode) {
+        // Batch mode: fire all non-empty prompts with auto_run in parallel
+        const validEntries = batchEntries.filter((e) => e.prompt.trim());
+        const results = await Promise.allSettled(
+          validEntries.map((entry) =>
+            fireGenerateRequest({ ...buildBatchEntryRequest(entry), auto_run: true }),
+          ),
+        );
+        const succeeded = results.filter((r) => r.status === "fulfilled");
+        const failed = results.filter((r) => r.status === "rejected");
+        console.log(
+          "[AiGeneratePanel] Batch Generate & Run:",
+          succeeded.length,
+          "started,",
+          failed.length,
+          "failed",
+        );
+        if (failed.length > 0 && succeeded.length === 0) {
+          const reason =
+            failed[0].status === "rejected"
+              ? (failed[0] as PromiseRejectedResult).reason
+              : "Unknown error";
+          throw reason instanceof Error ? reason : new Error(String(reason));
+        }
+        if (failed.length > 0) {
+          setError(
+            `${succeeded.length} of ${validEntries.length} workflows started. ${failed.length} failed.`,
+          );
+        }
+        for (const entry of validEntries) {
+          autoSaveGenerationPrompt(entry.prompt);
+        }
+        if (generationModelOverrides && Object.keys(generationModelOverrides).length > 0) {
+          instanceStorage.setJSON("last-generation-model-overrides", generationModelOverrides);
+        }
+        onNavigateToActiveRuns();
+        return;
+      }
+      // Specs selected → deterministic builder + execute inline
+      if (hasSpecs) {
+        const workflow = buildDeterministicSpecWorkflow();
+        if (workflow) {
+          const resp = await tracedFetch(`${getApiBase()}/unified-workflows/execute-inline`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(workflow),
+          });
+          if (!resp.ok) {
+            const json = await resp.json();
+            throw new Error(json.error || `HTTP ${resp.status}`);
+          }
+          console.log("[AiGeneratePanel] Deterministic spec workflow built and executed");
+          onNavigateToActiveRuns();
+          setSubmittingAction(null);
+          return;
+        }
+      }
+      // No specs → AI generation + auto_run
       const request = { ...buildGenerateRequest(), auto_run: true };
       const taskRunId = await fireGenerateRequest(request);
       console.log("[AiGeneratePanel] Generate & Run started:", taskRunId);
@@ -316,10 +482,7 @@ export function AiGeneratePanel({
       }
       // Persist generation overrides for "Copy from Last Generation" in workflow builder
       if (generationModelOverrides && Object.keys(generationModelOverrides).length > 0) {
-        localStorage.setItem(
-          "last-generation-model-overrides",
-          JSON.stringify(generationModelOverrides),
-        );
+        instanceStorage.setJSON("last-generation-model-overrides", generationModelOverrides);
       }
       onNavigateToActiveRuns();
     } catch (err) {
@@ -339,14 +502,29 @@ export function AiGeneratePanel({
           <Sparkles className="w-4 h-4 text-amber-400" />
           <h2 className="text-sm font-semibold text-zinc-200">Generate Workflow with AI</h2>
         </div>
-        <button
-          onClick={onCreateManually}
-          disabled={submittingAction !== null}
-          className="flex items-center gap-1 h-7 px-2 text-xs text-zinc-400 hover:text-zinc-200 rounded hover:bg-zinc-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          <Plus className="w-3 h-3" />
-          Create Manually
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setBatchMode(!batchMode)}
+            disabled={submittingAction !== null}
+            className={`flex items-center gap-1 h-7 px-2 text-xs rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+              batchMode
+                ? "text-blue-400 bg-blue-500/10 hover:bg-blue-500/20"
+                : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800"
+            }`}
+            title="Toggle batch mode to create multiple workflows at once"
+          >
+            <Grid className="w-3 h-3" />
+            Batch
+          </button>
+          <button
+            onClick={onCreateManually}
+            disabled={submittingAction !== null}
+            className="flex items-center gap-1 h-7 px-2 text-xs text-zinc-400 hover:text-zinc-200 rounded hover:bg-zinc-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Plus className="w-3 h-3" />
+            Create Manually
+          </button>
+        </div>
       </div>
 
       {/* Content - Two column layout */}
@@ -354,120 +532,191 @@ export function AiGeneratePanel({
         <div className="flex gap-6 px-6 py-6 h-full">
           {/* Left column - Prompt */}
           <div className="flex-1 flex flex-col min-w-0 space-y-2">
-            <div className="flex items-center justify-between">
-              <label htmlFor="generate-description" className="text-sm text-zinc-300">
-                What should the workflow do?
-              </label>
-              {/* Template Picker */}
-              <div className="relative" ref={templatePopoverRef}>
-                <button
-                  onClick={() => setShowTemplates(!showTemplates)}
-                  className="flex items-center gap-1 h-6 px-2 text-xs text-zinc-400 hover:text-zinc-200 rounded hover:bg-zinc-800 transition-colors"
-                >
-                  <Layers className="w-3 h-3" />
-                  Templates
-                </button>
-                {showTemplates && (
-                  <div className="absolute right-0 top-full mt-1 z-50 w-80 bg-zinc-800 border border-zinc-700 rounded-lg shadow-xl overflow-hidden">
-                    <div className="max-h-[400px] overflow-y-auto">
-                      {/* Built-in templates */}
-                      <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500 bg-zinc-900/50 border-b border-zinc-700">
-                        Built-in
-                      </div>
-                      {GENERATION_TEMPLATES.map((template) => {
-                        const IconComponent = TEMPLATE_ICONS[template.icon] || Layers;
-                        return (
-                          <button
-                            key={template.id}
-                            className="w-full text-left px-3 py-2 text-sm hover:bg-zinc-700/50 border-b border-zinc-700/50 last:border-0"
-                            onClick={() => handleApplyTemplate(template)}
-                          >
-                            <div className="flex items-center gap-1.5 font-medium text-xs text-zinc-200">
-                              <IconComponent className="w-3 h-3 text-zinc-400 shrink-0" />
-                              {template.name}
-                            </div>
-                            <div className="text-xs text-zinc-500 mt-0.5 line-clamp-2">
-                              {template.description}
-                            </div>
-                          </button>
-                        );
-                      })}
-
-                      {/* Saved templates */}
-                      {generationPrompts.length > 0 && (
-                        <>
-                          <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500 bg-zinc-900/50 border-b border-zinc-700">
-                            My Templates ({generationPrompts.length})
-                          </div>
-                          {generationPrompts.map((prompt) => (
-                            <button
-                              key={prompt.id}
-                              className="w-full text-left px-3 py-2 text-sm hover:bg-zinc-700/50 border-b border-zinc-700/50 last:border-0 group"
-                              onClick={() => {
-                                setDescription(prompt.content);
-                                setShowTemplates(false);
-                              }}
-                            >
-                              <div className="flex items-center justify-between gap-2">
-                                <div className="font-medium text-xs text-zinc-200 truncate min-w-0">
-                                  {prompt.name}
-                                </div>
-                                <button
-                                  className="shrink-0 p-0.5 rounded hover:bg-red-500/20 text-zinc-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
-                                  onClick={(e) => handleDeleteSavedTemplate(prompt.id, e)}
-                                  title="Delete template"
-                                >
-                                  <X className="w-3 h-3" />
-                                </button>
-                              </div>
-                              <div className="text-xs text-zinc-500 mt-0.5 line-clamp-2">
-                                {prompt.content.substring(0, 120)}
-                                {prompt.content.length > 120 && "..."}
-                              </div>
-                            </button>
-                          ))}
-                        </>
-                      )}
-
-                      {/* Save current as template */}
-                      <div className="border-t border-zinc-700">
+            {batchMode ? (
+              /* ---- Batch mode: grid of title+prompt cards ---- */
+              <>
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-zinc-300">
+                    Batch Generate — {batchEntries.filter((e) => e.prompt.trim()).length} of{" "}
+                    {batchEntries.length} prompts filled
+                  </label>
+                  <button
+                    onClick={addBatchEntry}
+                    className="flex items-center gap-1 h-6 px-2 text-xs text-zinc-400 hover:text-zinc-200 rounded hover:bg-zinc-800 transition-colors"
+                  >
+                    <Plus className="w-3 h-3" />
+                    Add
+                  </button>
+                </div>
+                <div className="flex-1 overflow-y-auto grid grid-cols-2 gap-3 auto-rows-min content-start pr-1">
+                  {batchEntries.map((entry, idx) => (
+                    <div
+                      key={entry.id}
+                      className="flex flex-col gap-1.5 p-3 bg-zinc-800/60 border border-zinc-700 rounded-lg group"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] font-semibold text-zinc-500 uppercase shrink-0">
+                          #{idx + 1}
+                        </span>
+                        <input
+                          type="text"
+                          placeholder="Workflow title (optional)"
+                          value={entry.title}
+                          onChange={(e) => updateBatchEntry(entry.id, "title", e.target.value)}
+                          className="flex-1 min-w-0 px-2 py-1 bg-zinc-900/50 border border-zinc-700/50 rounded text-zinc-200 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                        />
                         <button
-                          className="w-full text-left px-3 py-2 text-xs hover:bg-zinc-700/50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5 text-zinc-400 hover:text-zinc-200"
-                          disabled={!description.trim() || isSavingTemplate}
-                          onClick={async () => {
-                            setIsSavingTemplate(true);
-                            try {
-                              await handleSaveAsTemplate(description);
-                            } finally {
-                              setIsSavingTemplate(false);
-                            }
-                          }}
+                          onClick={() => removeBatchEntry(entry.id)}
+                          disabled={batchEntries.length <= 1}
+                          className="shrink-0 p-0.5 rounded text-zinc-600 hover:text-red-400 hover:bg-red-500/10 opacity-0 group-hover:opacity-100 transition-all disabled:opacity-0 disabled:cursor-not-allowed"
+                          title="Remove entry"
                         >
-                          {isSavingTemplate ? (
-                            <Loader2 className="w-3 h-3 animate-spin shrink-0" />
-                          ) : (
-                            <Save className="w-3 h-3 shrink-0" />
-                          )}
-                          Save Current as Template
+                          <Trash2 className="w-3 h-3" />
                         </button>
                       </div>
+                      <textarea
+                        placeholder="Describe what this workflow should do..."
+                        value={entry.prompt}
+                        onChange={(e) => updateBatchEntry(entry.id, "prompt", e.target.value)}
+                        rows={6}
+                        className="w-full px-2 py-1.5 bg-zinc-900/50 border border-zinc-700/50 rounded text-zinc-200 text-xs resize-none focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                      />
                     </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              /* ---- Single mode: original textarea ---- */
+              <>
+                <div className="flex items-center justify-between">
+                  <label htmlFor="generate-description" className="text-sm text-zinc-300">
+                    What should the workflow do?
+                  </label>
+                  {/* Template Picker */}
+                  <div className="relative" ref={templatePopoverRef}>
+                    <button
+                      onClick={() => setShowTemplates(!showTemplates)}
+                      className="flex items-center gap-1 h-6 px-2 text-xs text-zinc-400 hover:text-zinc-200 rounded hover:bg-zinc-800 transition-colors"
+                    >
+                      <Layers className="w-3 h-3" />
+                      Templates
+                    </button>
+                    {showTemplates && (
+                      <div className="absolute right-0 top-full mt-1 z-50 w-80 bg-zinc-800 border border-zinc-700 rounded-lg shadow-xl overflow-hidden">
+                        <div className="max-h-[400px] overflow-y-auto">
+                          {/* Built-in templates */}
+                          <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500 bg-zinc-900/50 border-b border-zinc-700">
+                            Built-in
+                          </div>
+                          {GENERATION_TEMPLATES.map((template) => {
+                            const IconComponent = TEMPLATE_ICONS[template.icon] || Layers;
+                            return (
+                              <button
+                                key={template.id}
+                                className="w-full text-left px-3 py-2 text-sm hover:bg-zinc-700/50 border-b border-zinc-700/50 last:border-0"
+                                onClick={() => handleApplyTemplate(template)}
+                              >
+                                <div className="flex items-center gap-1.5 font-medium text-xs text-zinc-200">
+                                  <IconComponent className="w-3 h-3 text-zinc-400 shrink-0" />
+                                  {template.name}
+                                </div>
+                                <div className="text-xs text-zinc-500 mt-0.5 line-clamp-2">
+                                  {template.description}
+                                </div>
+                              </button>
+                            );
+                          })}
+
+                          {/* Saved templates */}
+                          {generationPrompts.length > 0 && (
+                            <>
+                              <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500 bg-zinc-900/50 border-b border-zinc-700">
+                                My Templates ({generationPrompts.length})
+                              </div>
+                              {generationPrompts.map((prompt) => (
+                                <button
+                                  key={prompt.id}
+                                  className="w-full text-left px-3 py-2 text-sm hover:bg-zinc-700/50 border-b border-zinc-700/50 last:border-0 group"
+                                  onClick={() => {
+                                    setDescription(prompt.content);
+                                    setShowTemplates(false);
+                                  }}
+                                >
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="font-medium text-xs text-zinc-200 truncate min-w-0">
+                                      {prompt.name}
+                                    </div>
+                                    <button
+                                      className="shrink-0 p-0.5 rounded hover:bg-red-500/20 text-zinc-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                                      onClick={(e) => handleDeleteSavedTemplate(prompt.id, e)}
+                                      title="Delete template"
+                                    >
+                                      <X className="w-3 h-3" />
+                                    </button>
+                                  </div>
+                                  <div className="text-xs text-zinc-500 mt-0.5 line-clamp-2">
+                                    {prompt.content.substring(0, 120)}
+                                    {prompt.content.length > 120 && "..."}
+                                  </div>
+                                </button>
+                              ))}
+                            </>
+                          )}
+
+                          {/* Save current as template */}
+                          <div className="border-t border-zinc-700">
+                            <button
+                              className="w-full text-left px-3 py-2 text-xs hover:bg-zinc-700/50 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5 text-zinc-400 hover:text-zinc-200"
+                              disabled={!description.trim() || isSavingTemplate}
+                              onClick={async () => {
+                                setIsSavingTemplate(true);
+                                try {
+                                  await handleSaveAsTemplate(description);
+                                } finally {
+                                  setIsSavingTemplate(false);
+                                }
+                              }}
+                            >
+                              {isSavingTemplate ? (
+                                <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                              ) : (
+                                <Save className="w-3 h-3 shrink-0" />
+                              )}
+                              Save Current as Template
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
-            </div>
-            <textarea
-              id="generate-description"
-              className="w-full flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 text-sm min-h-[200px] resize-none focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-              placeholder="e.g., Run TypeScript type checking on the web frontend and fix any errors&#10;e.g., Check the runner API health, then verify UI Bridge elements are registered&#10;e.g., Run pytest with coverage and fix failing tests"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              autoFocus
-            />
+                </div>
+                <textarea
+                  id="generate-description"
+                  className="w-full flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 text-sm min-h-[200px] resize-none focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                  placeholder={
+                    hasSpecs
+                      ? "Optional: add additional instructions for the AI..."
+                      : "e.g., Run TypeScript type checking on the web frontend and fix any errors\ne.g., Check the runner API health, then verify UI Bridge elements are registered\ne.g., Run pytest with coverage and fix failing tests"
+                  }
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                  autoFocus
+                />
+              </>
+            )}
           </div>
 
           {/* Right column - Context, Advanced Options */}
           <div className="w-96 shrink-0 space-y-5 overflow-y-auto">
+            {batchMode && (
+              <div className="flex items-center gap-2 px-3 py-2 bg-blue-500/10 border border-blue-500/20 rounded-md text-xs text-blue-400">
+                <Info className="w-3.5 h-3.5 shrink-0" />
+                These settings apply to all {batchEntries.length} workflows
+              </div>
+            )}
+            {/* Page Specs Section */}
+            <SpecSourceSection onSpecsChanged={setSpecState} />
+
             {/* Context Section */}
             <div className="space-y-1">
               <button
@@ -986,7 +1235,11 @@ export function AiGeneratePanel({
             ) : (
               <Sparkles className="w-4 h-4" />
             )}
-            {submittingAction === "generate" ? "Starting..." : "Generate"}
+            {submittingAction === "generate"
+              ? "Starting..."
+              : batchMode
+                ? `Generate All (${batchEntries.filter((e) => e.prompt.trim()).length})`
+                : "Generate"}
           </button>
           <button
             onClick={handleGenerateAndRun}
@@ -998,7 +1251,11 @@ export function AiGeneratePanel({
             ) : (
               <Play className="w-4 h-4" />
             )}
-            {submittingAction === "generate-and-run" ? "Starting..." : "Generate & Run"}
+            {submittingAction === "generate-and-run"
+              ? "Starting..."
+              : batchMode
+                ? `Generate & Run All (${batchEntries.filter((e) => e.prompt.trim()).length})`
+                : "Generate & Run"}
           </button>
         </div>
       </div>

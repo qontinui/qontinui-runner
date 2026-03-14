@@ -109,6 +109,8 @@ pub struct StepHandlerResult {
     pub screenshot_path: Option<String>,
     /// Additional output data (step-type specific)
     pub output_data: Option<serde_json::Value>,
+    /// Whether this step was interrupted (runner restart detected)
+    pub interrupted: bool,
 }
 
 impl StepHandlerResult {
@@ -119,6 +121,18 @@ impl StepHandlerResult {
             error: None,
             screenshot_path: None,
             output_data: None,
+            interrupted: false,
+        }
+    }
+
+    /// Create an interrupted result (runner restart detected).
+    pub fn interrupted() -> Self {
+        Self {
+            success: false,
+            error: Some("Step interrupted (runner restart detected)".to_string()),
+            screenshot_path: None,
+            output_data: None,
+            interrupted: true,
         }
     }
 
@@ -129,6 +143,7 @@ impl StepHandlerResult {
             error: None,
             screenshot_path: Some(path),
             output_data: None,
+            interrupted: false,
         }
     }
 
@@ -139,6 +154,7 @@ impl StepHandlerResult {
             error: None,
             screenshot_path: None,
             output_data: Some(data),
+            interrupted: false,
         }
     }
 
@@ -149,6 +165,7 @@ impl StepHandlerResult {
             error: Some(error.into()),
             screenshot_path: None,
             output_data: None,
+            interrupted: false,
         }
     }
 
@@ -159,6 +176,7 @@ impl StepHandlerResult {
             error: Some(error.into()),
             screenshot_path: None,
             output_data: Some(data),
+            interrupted: false,
         }
     }
 
@@ -520,6 +538,7 @@ impl PromptStepHandler {
         let app_handle_clone = app_handle.clone();
 
         // Run Claude CLI session with full tool access via spawn_blocking (sync function)
+        let start = std::time::Instant::now();
         let ai_result = tokio::task::spawn_blocking(move || {
             crate::claude_session::runner::run_claude_session_with_retry(
                 &workspace_root,
@@ -546,12 +565,19 @@ impl PromptStepHandler {
         let (success, output) = match ai_result {
             Ok(Ok((success, output, _retry_state, _injected_steps))) => (success, output),
             Ok(Err(e)) => {
+                let duration = start.elapsed();
+                if duration.as_secs() < 5 {
+                    return StepHandlerResult::interrupted();
+                }
                 return StepHandlerResult::failure(format!(
                     "AI verification session failed: {}",
                     e
                 ));
             }
             Err(e) => {
+                if e.is_cancelled() {
+                    return StepHandlerResult::interrupted();
+                }
                 return StepHandlerResult::failure(format!("AI verification task panicked: {}", e));
             }
         };
@@ -626,6 +652,7 @@ impl PromptStepHandler {
         let task_context = crate::ai_router::TaskContext::from_prompt(&eval_prompt);
         let prompt_clone = eval_prompt.clone();
         let doctor_handle = context.app_state.doctor_handle.lock().await.clone();
+        let start = std::time::Instant::now();
         let ai_result = tokio::task::spawn_blocking(move || {
             crate::ai_provider::run_prompt_with_routing(
                 &prompt_clone,
@@ -638,6 +665,9 @@ impl PromptStepHandler {
         let ai_response = match ai_result {
             Ok(resp) => resp,
             Err(e) => {
+                if e.is_cancelled() {
+                    return StepHandlerResult::interrupted();
+                }
                 return StepHandlerResult::failure(format!(
                     "Prompt evaluation task panicked: {}",
                     e
@@ -646,6 +676,10 @@ impl PromptStepHandler {
         };
 
         if !ai_response.success {
+            let duration = start.elapsed();
+            if duration.as_secs() < 5 && ai_response.error.is_none() {
+                return StepHandlerResult::interrupted();
+            }
             return StepHandlerResult::failure(format!(
                 "AI evaluation failed: {}",
                 ai_response.error.unwrap_or_else(|| "unknown".to_string())

@@ -145,7 +145,12 @@ pub fn build_meta_workflow_template(
     historical_context: Option<&HistoricalContext>,
 ) -> UnifiedWorkflow {
     let now = chrono::Utc::now().to_rfc3339();
-    let max_fix_iterations = request.max_fix_iterations.unwrap_or(3);
+    let is_simple = request.simple_mode == Some(true);
+    let max_fix_iterations = if is_simple {
+        std::cmp::min(request.max_fix_iterations.unwrap_or(3), 1)
+    } else {
+        request.max_fix_iterations.unwrap_or(3)
+    };
 
     // Extract a clean, descriptive name from the description.
     // Strip markdown formatting and grab the first meaningful line.
@@ -197,7 +202,9 @@ pub fn build_meta_workflow_template(
             }
 
             // Step 2: Specification — generates acceptance criteria from task description
-            {
+            // Non-required: specification enriches quality but the builder can proceed without it.
+            // This matches the sync path's graceful degradation (generator.rs uses criteria.unwrap_or(None)).
+            if !is_simple {
                 let mut spec_step = json!({
                     "id": Uuid::new_v4().to_string(),
                     "name": "Define acceptance criteria",
@@ -205,7 +212,10 @@ pub fn build_meta_workflow_template(
                     "phase": "setup",
                     "prompt_mode": "response",
                     "content": specification_prompt,
-                    "output_path": "{{artifact_dir}}/criteria.json"
+                    "output_path": "{{artifact_dir}}/criteria.json",
+                    "required": false,
+                    "retry_count": 2,
+                    "retry_delay_ms": 3000
                 });
                 if request.investigate_codebase.unwrap_or(true) {
                     spec_step["input_path"] = json!("{{artifact_dir}}/investigation.md");
@@ -318,7 +328,7 @@ pub fn build_meta_workflow_template(
             }),
         ],
 
-        max_iterations: max_fix_iterations,
+        max_iterations: if is_simple { 1 } else { max_fix_iterations },
         timeout_seconds: None,
         provider: request.provider.clone(),
         model: request.model.clone(),
@@ -583,7 +593,7 @@ These criteria define the observable success conditions for this workflow.
 - verification_steps MUST include at least one automated step (`command` or `ui_bridge` with assert action). NEVER create a workflow where ALL verification steps are `prompt` type — this is the #1 most common generation mistake.
 - If the workflow creates/modifies TypeScript files, ALWAYS include: `{{"type": "command", "check_type": "typecheck", "command": "npx tsc --noEmit", "working_directory": "<project_dir>"}}`
 - If the workflow creates/modifies Python files, ALWAYS include: `{{"type": "command", "check_type": "typecheck", "command": "mypy .", "working_directory": "<project_dir>"}}`
-- If the workflow targets a web app (localhost:3001 or localhost:1420), ALWAYS include a `ui_bridge` step in verification to verify UI state. Add SDK connect in setup first.
+- If the workflow targets a web app (localhost:3001 or localhost:1420) AND verifies interactive UI behavior (element presence, state, interactions), include a `ui_bridge` step in verification with SDK connect in setup. For simple health checks or content verification (page loads, contains specific text), a `command` step with `curl` is sufficient and preferred.
 - `prompt` steps in verification are fine as SUPPLEMENTARY checks but must not be the only verification
 
 ### Data Flow Between Steps
@@ -667,7 +677,7 @@ Check for these issues:
 1. **Structural**: Valid JSON, all required fields present, correct types
 2. **Step IDs**: All steps have unique UUID v4 IDs
 3. **Phase consistency**: Each step's `phase` field matches the array it's in
-4. **Step type validity**: Step types must be one of the 4 core types (command, test, ui_bridge, prompt) and appropriate for their phase
+4. **Step type validity**: Step types must be one of the 3 core types (command, ui_bridge, prompt) and appropriate for their phase. Tests are run via `command` steps with `test_type` set — there is no separate `test` step type.
 5. **Logical flow**: Steps make logical sense in sequence
 6. **Completeness**: The workflow achieves what its description says
 7. **Timeouts**: Reasonable timeout values for each step type
@@ -676,9 +686,9 @@ Check for these issues:
 10. **Check consistency**: check_type and command match (lint -> linter, typecheck -> type checker)
 11. **Prompt quality**: Agentic prompts are substantive with specific instructions
 12. **Data flow validity**: All `inputs` and `depends_on` references point to existing step IDs. No circular dependencies in `depends_on` chains. `extract` expressions are valid.
-13. **CRITICAL — Automated verification required**: verification_steps MUST include at least one deterministic automated step (command, test, or ui_bridge with assert action). A workflow with ONLY prompt-type verification steps is INVALID — this MUST be flagged as a failure.
+13. **CRITICAL — Automated verification required**: verification_steps MUST include at least one deterministic automated step (command or ui_bridge with assert action). A workflow with ONLY prompt-type verification steps is INVALID — this MUST be flagged as a failure.
 14. **Code change typecheck**: If the workflow creates or modifies code files (TypeScript, Python, Rust), there MUST be a `command` step with `check_type: "typecheck"` and appropriate command (npx tsc --noEmit, mypy, cargo check). Missing typecheck for code-modifying workflows MUST be flagged.
-15. **Web app SDK verification**: If the workflow targets a web app (localhost:3001, localhost:1420), there SHOULD be a `ui_bridge` step in verification to verify UI state programmatically. Flag as a warning if missing.
+15. **Web app SDK verification**: If the workflow targets a web app (localhost:3001, localhost:1420) AND verifies interactive UI behavior, there SHOULD be a `ui_bridge` step in verification. For simple health checks or content verification (page loads, contains text), `command` steps with `curl` are sufficient — do NOT flag missing UI Bridge for these.
 16. **Agentic-verification coverage**: Every agentic step MUST have at least one verification step that would FAIL if that agentic step's work was NOT done. A tab-existence check does NOT count as coverage for an agentic step that adds content within that tab. Flag as a failure if any agentic step has no corresponding verification.
 17. **Out-of-scope enforcement**: If the task description contains "out of scope", "do not change", "do not modify", or similar boundary constraints, there SHOULD be at least one verification step that checks those boundaries were respected. Flag as a warning if missing.
 18. **Removal runtime verification**: If any stage removes a page/route/component from a web app, does it include a runtime verification (UI Bridge or curl) that the removed entity is no longer accessible? File-existence checks (test ! -f) alone are insufficient for web apps. Flag as a failure if missing.
@@ -764,7 +774,7 @@ If the input contains a JSON workflow object, fix it:
 8. All `phase` fields must match the array they are in
 9. Ensure all `inputs` and `depends_on` references point to valid step IDs
 10. Ensure no circular dependencies exist in `depends_on` chains
-11. Only use the 4 core step types: command, test, ui_bridge, prompt
+11. Only use the 3 core step types: command, ui_bridge, prompt. Tests are run via command steps with test_type set — there is no separate test step type.
 
 ### Mode 2 — Generate from scratch (input is empty or not valid JSON)
 

@@ -40,10 +40,10 @@ export { ActionStream } from "./ActionStream";
 export { StatusPanel } from "./StatusPanel";
 
 // Widget registration
-export { registerAllWidgets, areWidgetsRegistered } from "./widgets";
+export { registerAllWidgets, areWidgetsRegistered } from "@/components/widgets";
 
 // Widgets
-export * from "./widgets";
+export * from "@/components/widgets";
 
 // New dashboard hooks
 export {

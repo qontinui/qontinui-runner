@@ -791,6 +791,7 @@ async fn handle_relay_command(
                 generate_specification: Some(true),
                 verification_depth: None,
                 discover_ui_bridge_specs: None,
+                simple_mode: None,
             };
 
             let doctor_handle = api_state.doctor_handle.clone();

@@ -39,6 +39,7 @@ mod event_system;
 mod execution_context;
 mod execution_core;
 mod executor;
+mod exploration;
 mod findings;
 mod follow_up;
 mod health_monitor;
@@ -232,6 +233,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Ensure seed quality rules are present in the generation_rules table
+    if let Ok(conn) = checkpoint_db.get_conn_string() {
+        workflow_generation::rules::ensure_seed_rules(&conn);
+    }
+
     // Repair check-group associations based on naming convention
     // This ensures checks named "project - tool" are properly linked to groups named "project"
     match checkpoint_db.repair_check_group_associations() {
@@ -287,9 +293,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let terminal_manager = Arc::new(terminal::TerminalManager::new());
 
     // Create shared AppState for both Tauri and MCP API
+    // Create shared SDK connection for UI Bridge (shared between AppState and ApiState)
+    let shared_sdk_connection = Arc::new(TokioMutex::new(
+        crate::mcp::sdk_client::SdkConnectionManager::new(),
+    ));
+
     let shared_app_state = Arc::new(AppState {
         bridge_manager: TokioMutex::new(None), // Initialized in setup() when app_handle is available
         extraction_executor: Mutex::new(None), // Initialized on-demand
+        sdk_connection: shared_sdk_connection.clone(),
+        exploration_cancel: Arc::new(TokioMutex::new(None)),
         current_config: Mutex::new(None),
         display_processor,
         local_storage,
@@ -925,6 +938,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ui_bridge::ui_bridge_run_exploration,
             commands::ui_bridge::ui_bridge_stop_exploration,
             commands::ui_bridge::ui_bridge_reload_webview,
+            commands::ui_bridge::ui_bridge_run_exploration_native,
+            commands::ui_bridge::ui_bridge_stop_exploration_native,
+            commands::ui_bridge::ui_bridge_discover_states_native,
             // Error Monitor commands (application log error detection)
             // Note: Log source CRUD is now managed through global_log_sources commands
             error_monitor::commands::query_error_events,

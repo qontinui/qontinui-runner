@@ -1,5 +1,5 @@
 import React from "react";
-import { TraceViewerWidget } from "../active-dashboard/widgets/trace-viewer";
+import { TraceViewerWidget } from "../widgets/trace-viewer";
 import { useRunSelection } from "../../contexts/RunSelectionContext";
 
 export const TraceViewerPage: React.FC = () => {

@@ -8,7 +8,7 @@
  * - Main sidebar with collapsible groups
  * - Secondary flyout sidebar that slides out for items with children
  * - Matches the qontinui-web navigation pattern
- * - Persistent expanded/collapsed state in localStorage
+ * - Persistent expanded/collapsed state in instanceStorage
  * - Keyboard navigation support
  * - Tooltips on hover when collapsed
  * - Workflow Queue for sequencing workflows
@@ -23,6 +23,7 @@ import {
   useMemo,
   KeyboardEvent,
 } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import {
   Play,
   Bot,
@@ -668,7 +669,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
   // Use shared navigation state management
   const [navState, dispatch] = useReducer(navigationReducer, undefined, () => {
     try {
-      const stored = localStorage.getItem(STORAGE_KEYS.state);
+      const stored = instanceStorage.getItem(STORAGE_KEYS.state);
       if (stored) {
         const parsed = deserializeState(stored);
         if (parsed) {
@@ -708,7 +709,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
 
   // Persist state changes
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.state, serializeState(navState));
+    instanceStorage.setItem(STORAGE_KEYS.state, serializeState(navState));
   }, [navState]);
 
   // Auto-expand the group containing the active tab (accordion-aware).
@@ -958,14 +959,13 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
 }
 
 // ============================================================================
-// Hook for managing sidebar state with localStorage persistence
+// Hook for managing sidebar state with instanceStorage persistence
 // ============================================================================
 
 export function useSidebarState() {
   const [collapsed, setCollapsed] = useState<boolean>(() => {
     try {
-      const stored = localStorage.getItem(STORAGE_KEYS.collapsed);
-      return stored ? JSON.parse(stored) : false;
+      return instanceStorage.getJSON(STORAGE_KEYS.collapsed, false);
     } catch {
       return false;
     }
@@ -973,7 +973,7 @@ export function useSidebarState() {
 
   const handleCollapsedChange = useCallback((value: boolean) => {
     setCollapsed(value);
-    localStorage.setItem(STORAGE_KEYS.collapsed, JSON.stringify(value));
+    instanceStorage.setJSON(STORAGE_KEYS.collapsed, value);
   }, []);
 
   return {

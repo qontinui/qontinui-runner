@@ -16,6 +16,7 @@
  */
 
 import { useState, useEffect, useMemo, useCallback, type CSSProperties } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import { invoke } from "@tauri-apps/api/core";
 import {
   History,
@@ -83,28 +84,18 @@ interface HistoryTabProps {
 export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps) {
   // Filter state
   const [filterType, setFilterType] = useState<FilterType>(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY_FILTER);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        return parsed.type || "all";
-      }
-    } catch {
-      // ignore
-    }
-    return "all";
+    const parsed = instanceStorage.getJSON<{ type?: FilterType; status?: FilterStatus } | null>(
+      STORAGE_KEY_FILTER,
+      null,
+    );
+    return parsed?.type || "all";
   });
   const [filterStatus, setFilterStatus] = useState<FilterStatus>(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY_FILTER);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        return parsed.status || "all";
-      }
-    } catch {
-      // ignore
-    }
-    return "all";
+    const parsed = instanceStorage.getJSON<{ type?: FilterType; status?: FilterStatus } | null>(
+      STORAGE_KEY_FILTER,
+      null,
+    );
+    return parsed?.status || "all";
   });
   const [searchQuery, setSearchQuery] = useState("");
 
@@ -120,10 +111,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
 
   // Persist filter preferences
   useEffect(() => {
-    localStorage.setItem(
-      STORAGE_KEY_FILTER,
-      JSON.stringify({ type: filterType, status: filterStatus }),
-    );
+    instanceStorage.setJSON(STORAGE_KEY_FILTER, { type: filterType, status: filterStatus });
   }, [filterType, filterStatus]);
 
   // Fetch GUI runs

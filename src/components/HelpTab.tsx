@@ -11,6 +11,7 @@
 
 import { useState, useEffect } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
+import { instanceStorage } from "@/lib/instance-storage";
 import {
   Keyboard,
   HelpCircle,
@@ -831,7 +832,7 @@ function AboutPage() {
 export function HelpTab() {
   const [activeSubPage, setActiveSubPage] = useState<HelpSubPage>(() => {
     // Load persisted tab on mount
-    const stored = localStorage.getItem(STORAGE_KEY);
+    const stored = instanceStorage.getItem(STORAGE_KEY);
     if (
       stored &&
       [
@@ -850,7 +851,7 @@ export function HelpTab() {
 
   // Persist active tab
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, activeSubPage);
+    instanceStorage.setItem(STORAGE_KEY, activeSubPage);
   }, [activeSubPage]);
 
   const subPages = [

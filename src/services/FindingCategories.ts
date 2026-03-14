@@ -6,6 +6,7 @@
  */
 
 import type { FindingCategory, CategoryStore, BuiltInCategoryId } from "../types/findings";
+import { instanceStorage } from "@/lib/instance-storage";
 
 // Storage key for custom categories
 const CATEGORY_STORE_KEY = "qontinui_finding_categories";
@@ -155,30 +156,18 @@ const DEFAULT_CATEGORY_ORDER = BUILT_IN_CATEGORIES.map((c) => c.id);
  * Get the category store from localStorage
  */
 function getCategoryStore(): CategoryStore {
-  try {
-    const stored = localStorage.getItem(CATEGORY_STORE_KEY);
-    if (stored) {
-      return JSON.parse(stored);
-    }
-  } catch (error) {
-    console.error("Failed to load category store:", error);
-  }
-  return {
+  return instanceStorage.getJSON<CategoryStore>(CATEGORY_STORE_KEY, {
     customCategories: [],
     categoryOrder: DEFAULT_CATEGORY_ORDER,
     hiddenCategories: [],
-  };
+  });
 }
 
 /**
  * Save the category store to localStorage
  */
 function saveCategoryStore(store: CategoryStore): void {
-  try {
-    localStorage.setItem(CATEGORY_STORE_KEY, JSON.stringify(store));
-  } catch (error) {
-    console.error("Failed to save category store:", error);
-  }
+  instanceStorage.setJSON(CATEGORY_STORE_KEY, store);
 }
 
 /**
@@ -321,7 +310,7 @@ export function setCategoryOrder(orderedIds: string[]): void {
  * Reset to default configuration
  */
 export function resetCategories(): void {
-  localStorage.removeItem(CATEGORY_STORE_KEY);
+  instanceStorage.removeItem(CATEGORY_STORE_KEY);
 }
 
 /**

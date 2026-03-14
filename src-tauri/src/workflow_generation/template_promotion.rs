@@ -452,7 +452,7 @@ fn extract_parameters(workflow_json: &serde_json::Value) -> Vec<TemplateParamete
                 name: "project_name".to_string(),
                 description: "Project-specific name that appears across the workflow".to_string(),
                 default_value: value.clone(),
-                extraction_pattern: format!(r"\b{}\b", regex::escape(value)),
+                extraction_pattern: format!(r"\b{}\b", regex_escape(value)),
             });
         }
     }

@@ -8,7 +8,7 @@
 import type { Meta, StoryObj } from "@storybook/react";
 import { useEffect, useState } from "react";
 import { ProgressBar, InlineProgressBar, type ProgressType } from "../ui/ProgressBar";
-import { StepProgressIndicator } from "../active-dashboard/widgets/shared/StepProgressMarker";
+import { StepProgressIndicator } from "../widgets/shared/StepProgressMarker";
 
 // Wrapper component for stories
 const ProgressShowcase = () => <div />;

@@ -6,7 +6,7 @@
  */
 
 import { X } from "lucide-react";
-import { CanvasWidget } from "@/components/active-dashboard/widgets/canvas/CanvasWidget";
+import { CanvasWidget } from "@/components/widgets/canvas/CanvasWidget";
 import type { CanvasPanel } from "@qontinui/shared-types";
 
 // ============================================================================

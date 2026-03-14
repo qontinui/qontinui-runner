@@ -41,6 +41,7 @@ import {
   ExternalLink,
   PanelLeft,
   Star,
+  Pencil,
 } from "lucide-react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import type {
@@ -103,6 +104,7 @@ import { getAccentColors } from "@/design-system";
 import { BatchDeleteDialog, ConfirmDialog } from "../ui";
 import { registerUserSkills } from "@qontinui/workflow-utils";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { instanceStorage } from "@/lib/instance-storage";
 import { CompositionBuilderDialog } from "./CompositionBuilderDialog";
 import { SkillExportDialog } from "./SkillExportDialog";
 import { SkillImportDialog } from "./SkillImportDialog";
@@ -130,6 +132,90 @@ function resolveSkillIcon(iconId: string): React.ComponentType<{ className?: str
 }
 
 // EmptyState removed — replaced by AiGeneratePanel as the default empty view
+
+// =============================================================================
+// Editable Workflow Title
+// =============================================================================
+
+function EditableWorkflowTitle({
+  name,
+  onChange,
+  hasUnsavedChanges,
+}: {
+  name: string;
+  onChange: (name: string) => void;
+  hasUnsavedChanges: boolean;
+}) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [editValue, setEditValue] = useState(name);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const displayName = name || "New Workflow";
+
+  const startEditing = useCallback(() => {
+    setEditValue(name);
+    setIsEditing(true);
+  }, [name]);
+
+  useEffect(() => {
+    if (isEditing && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [isEditing]);
+
+  const commitEdit = useCallback(() => {
+    setIsEditing(false);
+    const trimmed = editValue.trim();
+    if (trimmed !== name) {
+      onChange(trimmed);
+    }
+  }, [editValue, name, onChange]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === "Enter") {
+        commitEdit();
+      } else if (e.key === "Escape") {
+        setIsEditing(false);
+        setEditValue(name);
+      }
+    },
+    [commitEdit, name],
+  );
+
+  if (isEditing) {
+    return (
+      <div className="flex items-center gap-1">
+        <input
+          ref={inputRef}
+          type="text"
+          value={editValue}
+          onChange={(e) => setEditValue(e.target.value)}
+          onBlur={commitEdit}
+          onKeyDown={handleKeyDown}
+          placeholder="Workflow name..."
+          className="text-lg font-semibold text-zinc-100 bg-transparent border-b border-zinc-500 focus:border-blue-500 outline-none px-0 py-0 min-w-[120px]"
+        />
+        {hasUnsavedChanges && <span className="text-zinc-500 ml-1">*</span>}
+      </div>
+    );
+  }
+
+  return (
+    <button
+      onClick={startEditing}
+      className="flex items-center gap-2 group cursor-text text-left"
+      title="Click to rename workflow"
+    >
+      <h1 className="text-lg font-semibold text-zinc-100">
+        {displayName}
+        {hasUnsavedChanges && <span className="text-zinc-500 ml-2">*</span>}
+      </h1>
+      <Pencil className="w-3.5 h-3.5 text-zinc-500 opacity-0 group-hover:opacity-100 transition-opacity" />
+    </button>
+  );
+}
 
 // =============================================================================
 // Settings Panel Component (config-driven via @qontinui/workflow-utils)
@@ -722,26 +808,21 @@ function PerPhaseModelSelect() {
   };
 
   const copyFromLastGeneration = () => {
-    try {
-      const stored = localStorage.getItem("last-generation-model-overrides");
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (parsed && typeof parsed === "object") {
-          updateWorkflow({ model_overrides: parsed });
-        }
-      }
-    } catch {
-      // Ignore invalid localStorage data
+    const parsed = instanceStorage.getJSON<Record<string, unknown> | null>(
+      "last-generation-model-overrides",
+      null,
+    );
+    if (parsed && typeof parsed === "object") {
+      updateWorkflow({ model_overrides: parsed });
     }
   };
 
   const hasLastGeneration = (() => {
-    try {
-      const stored = localStorage.getItem("last-generation-model-overrides");
-      return stored && Object.keys(JSON.parse(stored)).length > 0;
-    } catch {
-      return false;
-    }
+    const parsed = instanceStorage.getJSON<Record<string, unknown> | null>(
+      "last-generation-model-overrides",
+      null,
+    );
+    return parsed && Object.keys(parsed).length > 0;
   })();
 
   const selectClass =
@@ -1090,23 +1171,14 @@ function WorkflowBuilderContent({
   // AI generate workflow modal state
   const [aiGenerateModalOpen, setAiGenerateModalOpen] = useState(false);
 
-  // Library panel visibility (persisted to localStorage, default hidden)
+  // Library panel visibility (persisted to storage, default hidden)
   const [showLibrary, setShowLibrary] = useState(() => {
-    try {
-      const stored = localStorage.getItem("qontinui-workflow-library-visible");
-      return stored === "true";
-    } catch {
-      return false;
-    }
+    return instanceStorage.getItem("qontinui-workflow-library-visible") === "true";
   });
   const toggleLibrary = useCallback(() => {
     setShowLibrary((prev) => {
       const next = !prev;
-      try {
-        localStorage.setItem("qontinui-workflow-library-visible", String(next));
-      } catch {
-        // ignore
-      }
+      instanceStorage.setItem("qontinui-workflow-library-visible", String(next));
       return next;
     });
   }, []);
@@ -2328,10 +2400,11 @@ function WorkflowBuilderContent({
             >
               <ShieldCheck className="w-4 h-4" />
             </button>
-            <h1 className="text-lg font-semibold text-zinc-100">
-              {state.workflow.name || "New Workflow"}
-              {hasUnsavedChanges && <span className="text-zinc-500 ml-2">*</span>}
-            </h1>
+            <EditableWorkflowTitle
+              name={state.workflow.name}
+              onChange={(name) => updateWorkflow({ name })}
+              hasUnsavedChanges={hasUnsavedChanges}
+            />
           </div>
 
           <div className="flex items-center gap-2">

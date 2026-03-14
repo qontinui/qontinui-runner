@@ -68,6 +68,8 @@ pub struct ProjectAnalysis {
     pub has_swc_plugin: bool,
     pub server_adapter: Option<String>,
     pub dev_server_port: Option<u16>,
+    pub has_generated_hooks: bool,
+    pub has_architecture_spec: bool,
     pub issues: Vec<String>,
 }
 
@@ -99,12 +101,38 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct WriteHooksRequest {
+    pub project_path: String,
+    pub files: Vec<WriteHooksFileEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WriteHooksFileEntry {
+    pub file_path: String,
+    pub modification_type: ModificationType,
+    pub new_content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WriteHooksResult {
+    pub success: bool,
+    pub files_written: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReadFileRequest {
+    pub project_path: String,
+    pub file_path: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UpdateRequest {
     pub project_path: String,
     pub sdk_version: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModificationType {
     Insert,
@@ -353,6 +381,15 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
         }
     }
 
+    // Check if generated hooks file exists
+    let has_generated_hooks = project_path
+        .join("src/lib/ui-bridge/UIBridgeHooks.tsx")
+        .exists();
+
+    // Check if architecture spec exists
+    let has_architecture_spec =
+        scan_for_file_pattern(&project_path, ".architecture.uibridge.json").await;
+
     Ok(ProjectAnalysis {
         project_path: path.to_string(),
         framework,
@@ -364,6 +401,8 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
         has_swc_plugin,
         server_adapter,
         dev_server_port,
+        has_generated_hooks,
+        has_architecture_spec,
         issues,
     })
 }
@@ -434,6 +473,32 @@ async fn scan_for_pattern(
     false
 }
 
+/// Check if any file matching a filename suffix exists in the project root or src/.
+async fn scan_for_file_pattern(project_path: &std::path::Path, suffix: &str) -> bool {
+    // Check project root
+    if let Ok(mut read_dir) = tokio::fs::read_dir(project_path).await {
+        while let Ok(Some(entry)) = read_dir.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(suffix) {
+                return true;
+            }
+        }
+    }
+    // Check src/ and src/specs/ and src/lib/
+    for sub in &["src", "src/specs", "src/lib"] {
+        let dir = project_path.join(sub);
+        if let Ok(mut read_dir) = tokio::fs::read_dir(&dir).await {
+            while let Ok(Some(entry)) = read_dir.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(suffix) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 // ============================================================================
 // Package Manager Execution
 // ============================================================================
@@ -495,6 +560,42 @@ async fn run_package_install(project_path: &str, command: &str) -> Result<String
 // ============================================================================
 // Source Code Integrator
 // ============================================================================
+
+/// Shared file-writing utility for applying FileModification sets to disk.
+/// Returns (success, warnings).
+async fn write_file_modifications(
+    project: &std::path::Path,
+    modifications: &[FileModification],
+) -> (bool, Vec<String>) {
+    let mut success = true;
+    let mut warnings = Vec::new();
+
+    for modification in modifications {
+        let file_path = project.join(&modification.file_path);
+        match &modification.modification_type {
+            ModificationType::CreateNew => {
+                if let Some(parent) = file_path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                if let Err(e) = tokio::fs::write(&file_path, &modification.new_content).await {
+                    warnings.push(format!(
+                        "Failed to create {}: {}",
+                        modification.file_path, e
+                    ));
+                    success = false;
+                }
+            }
+            ModificationType::Insert | ModificationType::Replace => {
+                if let Err(e) = tokio::fs::write(&file_path, &modification.new_content).await {
+                    warnings.push(format!("Failed to write {}: {}", modification.file_path, e));
+                    success = false;
+                }
+            }
+        }
+    }
+
+    (success, warnings)
+}
 
 async fn integrate_source(
     project_path: &str,
@@ -572,30 +673,8 @@ async fn integrate_source(
     }
 
     // Apply file modifications first (so package.json is written before install)
-    let mut success = true;
-    for modification in &modifications {
-        let file_path = project.join(&modification.file_path);
-        match &modification.modification_type {
-            ModificationType::CreateNew => {
-                if let Some(parent) = file_path.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-                if let Err(e) = tokio::fs::write(&file_path, &modification.new_content).await {
-                    warnings.push(format!(
-                        "Failed to create {}: {}",
-                        modification.file_path, e
-                    ));
-                    success = false;
-                }
-            }
-            ModificationType::Insert | ModificationType::Replace => {
-                if let Err(e) = tokio::fs::write(&file_path, &modification.new_content).await {
-                    warnings.push(format!("Failed to write {}: {}", modification.file_path, e));
-                    success = false;
-                }
-            }
-        }
-    }
+    let (success, write_warnings) = write_file_modifications(&project, &modifications).await;
+    warnings.extend(write_warnings);
 
     // Auto-run package install after files are written
     let install_output =
@@ -857,6 +936,101 @@ fn wrap_with_provider_nextjs(content: &str) -> String {
     );
     result.push_str(&wrapped);
     result
+}
+
+/// For projects that already have UIBridgeProvider but are missing CommandRelayListener,
+/// add the import and component. This handles the "upgrade" case where a project was
+/// integrated before CommandRelayListener existed.
+async fn add_missing_command_relay_listener(
+    project: &std::path::Path,
+    analysis: &ProjectAnalysis,
+    modifications: &mut Vec<FileModification>,
+    warnings: &mut Vec<String>,
+) {
+    // Find the layout/entry file
+    let entry = match analysis.framework {
+        Framework::NextJs => analysis
+            .entry_points
+            .iter()
+            .find(|e| e.entry_type == "layout"),
+        Framework::React => analysis
+            .entry_points
+            .iter()
+            .find(|e| e.entry_type == "app_root"),
+        _ => None,
+    };
+
+    let entry = match entry {
+        Some(e) => e,
+        None => return,
+    };
+
+    let entry_path = project.join(&entry.path);
+    let content = match tokio::fs::read_to_string(&entry_path).await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Only proceed if UIBridgeProvider is present but CommandRelayListener is not
+    if !content.contains("UIBridgeProvider") || content.contains("CommandRelayListener") {
+        return;
+    }
+
+    // Check if this file is already being modified by another step (avoid double-modify)
+    if modifications.iter().any(|m| m.file_path == entry.path) {
+        return;
+    }
+
+    // Add CommandRelayListener import and component
+    let mut new_content = content.clone();
+
+    // Add CommandRelayListener to existing import if possible
+    if new_content.contains("import { UIBridgeProvider")
+        && !new_content.contains("CommandRelayListener")
+    {
+        // Try to add to existing import line
+        new_content = new_content.replace(
+            "} from '@qontinui/ui-bridge/react'",
+            ", CommandRelayListener } from '@qontinui/ui-bridge/react'",
+        );
+        // Also handle double-quotes
+        new_content = new_content.replace(
+            "} from \"@qontinui/ui-bridge/react\"",
+            ", CommandRelayListener } from \"@qontinui/ui-bridge/react\"",
+        );
+    }
+
+    // Add <CommandRelayListener /> inside the provider tree
+    // Try common patterns: after <AutoRegisterProvider>, or after <UIBridgeProvider...>
+    if new_content.contains("<AutoRegisterProvider>")
+        && !new_content.contains("<CommandRelayListener")
+    {
+        new_content = new_content.replace(
+            "<AutoRegisterProvider>",
+            "<AutoRegisterProvider>\n              <CommandRelayListener />",
+        );
+    } else if new_content.contains("<UIBridgeProvider")
+        && !new_content.contains("<CommandRelayListener")
+    {
+        // Find the closing > of UIBridgeProvider and add after it
+        if let Some(pos) = new_content.find("<UIBridgeProvider") {
+            if let Some(close) = new_content[pos..].find('>') {
+                let insert_at = pos + close + 1;
+                new_content.insert_str(insert_at, "\n              <CommandRelayListener />");
+            }
+        }
+    }
+
+    if new_content != content {
+        modifications.push(FileModification {
+            file_path: entry.path.clone(),
+            modification_type: ModificationType::Replace,
+            description: "Add CommandRelayListener for relay-based command handling".to_string(),
+            original_content: Some(content),
+            new_content,
+        });
+        warnings.push("Added CommandRelayListener to your layout — this enables relay-based command handling between the server and browser.".to_string());
+    }
 }
 
 fn find_last_import_pos(content: &str) -> usize {
@@ -1346,10 +1520,60 @@ async fn handle_update(
         }
     }
 
+    // Also add any missing features (relay setup, CommandRelayListener, etc.)
+    // This allows updating older integrations to include new SDK features.
+    let options = IntegrationOptions {
+        install_deps: false, // We handle install separately below
+        auto_instrument: false,
+        sdk_version: Some(new_version.to_string()),
+    };
+    match analysis.framework {
+        Framework::NextJs => {
+            integrate_nextjs(
+                &project,
+                &analysis,
+                &options,
+                &mut modifications,
+                &mut warnings,
+            )
+            .await;
+            // Also check if layout needs CommandRelayListener added
+            add_missing_command_relay_listener(
+                &project,
+                &analysis,
+                &mut modifications,
+                &mut warnings,
+            )
+            .await;
+        }
+        Framework::React => {
+            integrate_react(
+                &project,
+                &analysis,
+                &options,
+                &mut modifications,
+                &mut warnings,
+            )
+            .await;
+            add_missing_command_relay_listener(
+                &project,
+                &analysis,
+                &mut modifications,
+                &mut warnings,
+            )
+            .await;
+        }
+        _ => {}
+    }
+
     // Apply modifications
     let mut success = true;
     for modification in &modifications {
         let file_path = project.join(&modification.file_path);
+        // Ensure parent directory exists for new files
+        if let Some(parent) = file_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
         if let Err(e) = tokio::fs::write(&file_path, &modification.new_content).await {
             warnings.push(format!("Failed to write {}: {}", modification.file_path, e));
             success = false;
@@ -1381,8 +1605,21 @@ async fn handle_update(
         _ => "npm install",
     };
 
-    let mut next_steps = vec!["Restart your dev server".to_string()];
-    let pkg_modified = !modifications.is_empty();
+    let mut next_steps = vec![];
+    if modifications
+        .iter()
+        .any(|m| m.modification_type == ModificationType::CreateNew)
+    {
+        next_steps.push(
+            "New files were added — review them to ensure they match your project structure."
+                .to_string(),
+        );
+    }
+    next_steps.push("Restart your dev server".to_string());
+
+    let pkg_modified = modifications
+        .iter()
+        .any(|m| m.file_path.ends_with("package.json"));
 
     let install_output = if success && pkg_modified {
         match run_package_install(&req.project_path, install_cmd).await {
@@ -1419,6 +1656,207 @@ async fn handle_update(
 }
 
 // ============================================================================
+// Write Hooks Handler
+// ============================================================================
+
+async fn handle_write_hooks(
+    State(_state): State<Arc<ApiState>>,
+    Json(req): Json<WriteHooksRequest>,
+) -> Json<ApiResponse<WriteHooksResult>> {
+    let project = PathBuf::from(&req.project_path);
+    if !project.exists() {
+        return Json(ApiResponse::error(format!(
+            "Project path does not exist: {}",
+            req.project_path
+        )));
+    }
+
+    // Convert WriteHooksFileEntry to FileModification for the shared helper
+    let modifications: Vec<FileModification> = req
+        .files
+        .iter()
+        .map(|f| FileModification {
+            file_path: f.file_path.clone(),
+            modification_type: f.modification_type.clone(),
+            description: format!("Generated UI Bridge hook file: {}", f.file_path),
+            original_content: None,
+            new_content: f.new_content.clone(),
+        })
+        .collect();
+
+    let (success, warnings) = write_file_modifications(&project, &modifications).await;
+
+    let files_written: Vec<String> = if success {
+        modifications.iter().map(|m| m.file_path.clone()).collect()
+    } else {
+        // Only include files that weren't warned about
+        modifications
+            .iter()
+            .filter(|m| !warnings.iter().any(|w| w.contains(&m.file_path)))
+            .map(|m| m.file_path.clone())
+            .collect()
+    };
+
+    // After writing hook files, also modify the root layout to import and render <UIBridgeHooks />
+    let mut all_warnings = warnings;
+    if success {
+        if let Ok(analysis) = analyze_project(&req.project_path).await {
+            let layout_warnings = add_hooks_to_layout(&project, &analysis, &files_written).await;
+            all_warnings.extend(layout_warnings);
+        }
+    }
+
+    Json(ApiResponse::success(WriteHooksResult {
+        success,
+        files_written,
+        warnings: all_warnings,
+    }))
+}
+
+/// After writing hook files, modify the root layout to import and render <UIBridgeHooks />.
+/// Follows the same pattern as `add_missing_command_relay_listener`.
+async fn add_hooks_to_layout(
+    project: &std::path::Path,
+    analysis: &ProjectAnalysis,
+    written_files: &[String],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // Only modify layout if UIBridgeHooks.tsx was written
+    let hooks_written = written_files.iter().any(|f| f.contains("UIBridgeHooks"));
+    if !hooks_written {
+        return warnings;
+    }
+
+    // Find the layout/entry file
+    let entry = match analysis.framework {
+        Framework::NextJs => analysis
+            .entry_points
+            .iter()
+            .find(|e| e.entry_type == "layout"),
+        Framework::React => analysis
+            .entry_points
+            .iter()
+            .find(|e| e.entry_type == "app_root"),
+        _ => None,
+    };
+
+    let entry = match entry {
+        Some(e) => e,
+        None => return warnings,
+    };
+
+    let entry_path = project.join(&entry.path);
+    let content = match tokio::fs::read_to_string(&entry_path).await {
+        Ok(c) => c,
+        Err(_) => return warnings,
+    };
+
+    // Skip if UIBridgeHooks is already imported
+    if content.contains("UIBridgeHooks") {
+        return warnings;
+    }
+
+    // Skip if UIBridgeProvider is not present (hooks need to be inside the provider)
+    if !content.contains("UIBridgeProvider") {
+        return warnings;
+    }
+
+    let mut new_content = content.clone();
+
+    // Add import for UIBridgeHooks
+    let import_line = "import { UIBridgeHooks } from '@/lib/ui-bridge/UIBridgeHooks';\n";
+    let import_pos = find_last_import_pos(&new_content);
+    new_content.insert_str(import_pos, import_line);
+
+    // Add <UIBridgeHooks /> inside the provider tree
+    // Try common patterns: after <AutoRegisterProvider>, after <CommandRelayListener />,
+    // or after <UIBridgeProvider...>
+    if new_content.contains("<CommandRelayListener") && !new_content.contains("<UIBridgeHooks") {
+        new_content = new_content.replace(
+            "<CommandRelayListener />",
+            "<CommandRelayListener />\n              <UIBridgeHooks />",
+        );
+    } else if new_content.contains("<AutoRegisterProvider>")
+        && !new_content.contains("<UIBridgeHooks")
+    {
+        new_content = new_content.replace(
+            "<AutoRegisterProvider>",
+            "<AutoRegisterProvider>\n              <UIBridgeHooks />",
+        );
+    } else if new_content.contains("<UIBridgeProvider") && !new_content.contains("<UIBridgeHooks") {
+        if let Some(pos) = new_content.find("<UIBridgeProvider") {
+            if let Some(close) = new_content[pos..].find('>') {
+                let insert_at = pos + close + 1;
+                new_content.insert_str(insert_at, "\n              <UIBridgeHooks />");
+            }
+        }
+    }
+
+    if new_content != content {
+        if let Err(e) = tokio::fs::write(&entry_path, &new_content).await {
+            warnings.push(format!(
+                "Failed to add UIBridgeHooks to layout {}: {}",
+                entry.path, e
+            ));
+        } else {
+            warnings.push(format!(
+                "Added UIBridgeHooks import and component to {}",
+                entry.path
+            ));
+        }
+    }
+
+    warnings
+}
+
+// ============================================================================
+// Read File Handler
+// ============================================================================
+
+async fn handle_read_file(
+    State(_state): State<Arc<ApiState>>,
+    Json(req): Json<ReadFileRequest>,
+) -> Json<ApiResponse<String>> {
+    let project = PathBuf::from(&req.project_path);
+    let file_path = project.join(&req.file_path);
+
+    if !file_path.exists() {
+        return Json(ApiResponse::error(format!(
+            "File does not exist: {}",
+            req.file_path
+        )));
+    }
+
+    match tokio::fs::read_to_string(&file_path).await {
+        Ok(content) => Json(ApiResponse::success(content)),
+        Err(e) => Json(ApiResponse::error(format!(
+            "Failed to read {}: {}",
+            req.file_path, e
+        ))),
+    }
+}
+
+// ============================================================================
+// Runner Project Path
+// ============================================================================
+
+/// Returns the runner's own project directory (dev mode only).
+async fn handle_runner_project_path() -> Json<ApiResponse<Option<String>>> {
+    let path = std::env::current_exe().ok().and_then(|exe| {
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        while let Some(d) = dir {
+            if d.join("package.json").exists() && d.join("src-tauri").exists() {
+                return Some(d.to_string_lossy().to_string());
+            }
+            dir = d.parent().map(|p| p.to_path_buf());
+        }
+        None
+    });
+    Json(ApiResponse::success(path))
+}
+
+// ============================================================================
 // Router
 // ============================================================================
 
@@ -1428,6 +1866,15 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/integration/integrate", post(handle_integrate))
         .route("/ui-bridge/integration/update", post(handle_update))
         .route("/ui-bridge/integration/preview", post(handle_preview))
+        .route(
+            "/ui-bridge/integration/write-hooks",
+            post(handle_write_hooks),
+        )
+        .route("/ui-bridge/integration/read-file", post(handle_read_file))
+        .route(
+            "/ui-bridge/integration/runner-project",
+            get(handle_runner_project_path),
+        )
         .route("/ui-bridge/integration/status", get(handle_status))
         .route(
             "/ui-bridge/integration/health-check",

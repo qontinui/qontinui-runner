@@ -1,5 +1,6 @@
 import { useState, useEffect, ReactNode } from "react";
 import { ChevronDown } from "lucide-react";
+import { instanceStorage } from "@/lib/instance-storage";
 
 interface CollapsiblePanelProps {
   title: string;
@@ -34,10 +35,9 @@ const CollapsiblePanel = ({
     // If controlled, use controlled value
     if (controlledCollapsed !== undefined) return controlledCollapsed;
 
-    // Otherwise check localStorage
+    // Otherwise check instanceStorage
     if (storageKey) {
-      const saved = localStorage.getItem(storageKey);
-      return saved ? JSON.parse(saved) : defaultCollapsed;
+      return instanceStorage.getJSON(storageKey, defaultCollapsed);
     }
 
     // Default to defaultCollapsed
@@ -55,9 +55,9 @@ const CollapsiblePanel = ({
     const newState = !isCollapsed;
     setIsCollapsed(newState);
 
-    // Save to localStorage if key provided
+    // Save to instanceStorage if key provided
     if (storageKey) {
-      localStorage.setItem(storageKey, JSON.stringify(newState));
+      instanceStorage.setJSON(storageKey, newState);
     }
 
     // Call onToggle callback if provided

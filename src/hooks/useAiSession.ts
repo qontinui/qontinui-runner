@@ -10,6 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AiMessage, AiSessionState } from "@qontinui/shared-types";
 import { parseOutputLog } from "@qontinui/workflow-utils";
+import { instanceStorage } from "@/lib/instance-storage";
 
 /** Payload from the "ai-output" Tauri event. */
 interface AiOutputEvent {
@@ -63,7 +64,7 @@ export function useAiSession() {
     if (restoredRef.current) return;
     restoredRef.current = true;
 
-    const savedId = localStorage.getItem(STORAGE_KEY);
+    const savedId = instanceStorage.getItem(STORAGE_KEY);
     if (!savedId) return;
 
     // Check if the session is still alive in the SessionManager
@@ -98,7 +99,7 @@ export function useAiSession() {
               !(outputResponse.data.output_log as string).trim()
             ) {
               // No output in DB either — session is truly gone
-              localStorage.removeItem(STORAGE_KEY);
+              instanceStorage.removeItem(STORAGE_KEY);
               return;
             }
 
@@ -131,7 +132,7 @@ export function useAiSession() {
                     clearInterval(pollInterval);
                     restorePollRef.current = null;
                     setSessionState("disconnected");
-                    localStorage.removeItem(STORAGE_KEY);
+                    instanceStorage.removeItem(STORAGE_KEY);
                   }
                 })
                 .catch(() => {
@@ -139,18 +140,18 @@ export function useAiSession() {
                     clearInterval(pollInterval);
                     restorePollRef.current = null;
                     setSessionState("disconnected");
-                    localStorage.removeItem(STORAGE_KEY);
+                    instanceStorage.removeItem(STORAGE_KEY);
                   }
                 });
             }, 500);
             restorePollRef.current = pollInterval;
           })
           .catch(() => {
-            localStorage.removeItem(STORAGE_KEY);
+            instanceStorage.removeItem(STORAGE_KEY);
           });
       })
       .catch(() => {
-        localStorage.removeItem(STORAGE_KEY);
+        instanceStorage.removeItem(STORAGE_KEY);
       });
 
     // Cleanup polling interval on unmount
@@ -284,7 +285,7 @@ export function useAiSession() {
     setTaskRunId(newTaskRunId);
     taskRunIdRef.current = newTaskRunId; // Sync ref immediately
     try {
-      localStorage.setItem(STORAGE_KEY, newTaskRunId);
+      instanceStorage.setItem(STORAGE_KEY, newTaskRunId);
     } catch {
       // Ignore storage errors
     }
@@ -336,7 +337,7 @@ export function useAiSession() {
         streamingBufferRef.current = "";
         setStreamingContent("");
         try {
-          localStorage.setItem(STORAGE_KEY, newId);
+          instanceStorage.setItem(STORAGE_KEY, newId);
         } catch {
           // Ignore storage errors
         }
@@ -393,7 +394,7 @@ export function useAiSession() {
     try {
       await invoke<CommandResponse>("close_ai_session", { taskRunId });
       setSessionState("closed");
-      localStorage.removeItem(STORAGE_KEY);
+      instanceStorage.removeItem(STORAGE_KEY);
     } catch (e) {
       console.error("[useAiSession] Failed to close:", e);
     }
@@ -462,7 +463,7 @@ export function useAiSession() {
     setStreamingContent("");
     setIsGeneratingWorkflow(false);
     setToolActivity(null);
-    localStorage.removeItem(STORAGE_KEY);
+    instanceStorage.removeItem(STORAGE_KEY);
   }, []);
 
   return {

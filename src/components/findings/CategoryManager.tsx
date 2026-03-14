@@ -10,6 +10,7 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import {
   Bug,
   CheckSquare,
@@ -121,14 +122,12 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
     setCategories(allCategories);
 
     // Check which categories are hidden by comparing with stored data
-    const store = localStorage.getItem("qontinui_finding_categories");
-    if (store) {
-      try {
-        const parsed = JSON.parse(store);
-        setHiddenCategories(new Set(parsed.hiddenCategories || []));
-      } catch {
-        setHiddenCategories(new Set());
-      }
+    const parsed = instanceStorage.getJSON<{ hiddenCategories?: string[] } | null>(
+      "qontinui_finding_categories",
+      null,
+    );
+    if (parsed) {
+      setHiddenCategories(new Set(parsed.hiddenCategories || []));
     }
   }, []);
 

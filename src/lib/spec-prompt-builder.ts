@@ -684,3 +684,255 @@ export function buildSpecCreationWithMergeContext(
     pageDescription,
   ].join("\n");
 }
+
+// =============================================================================
+// Architecture spec creation & merge
+// =============================================================================
+
+/**
+ * Comprehensive instructions for AI-driven architecture spec creation.
+ * Teaches the AI the ArchitectureConfig JSON schema and how to explore
+ * a project to produce a thorough architecture spec.
+ */
+export const ARCHITECTURE_SPEC_CREATION_INSTRUCTIONS = `
+# Architecture Spec Creation Guide
+
+You are creating an architecture specification in the UI Bridge architecture spec format.
+Architecture specs describe a project's tech stack, directory structure, architectural patterns,
+constraints, features, and feature dependencies. They serve two purposes:
+1. **AI context** — gives AI agents a deep understanding of the project's purpose, structure, and goals
+2. **Workflow generation** — enables accurate, spec-driven workflow creation
+
+## CRITICAL: Read the Source Code First
+
+Explore the project thoroughly before writing the spec:
+
+1. **Read package.json / Cargo.toml / build files** — dependencies, scripts, tooling, version numbers
+2. **Read the directory structure** — how the project is organized, what goes where
+3. **Read entry points** — main files, app roots, layouts, index files
+4. **Read key configuration** — tsconfig, eslint, tailwind, next.config, vite.config, etc.
+5. **Read 3-5 representative components/modules** — understand the code patterns actually used
+6. **Check for API routes / backend code** — understand the data and service layer
+7. **Check for state management** — Redux, Zustand, Context, MobX, stores
+8. **Check for testing setup** — test framework, test directory structure, test utilities
+9. **Read README or docs** — project purpose, setup instructions, contributor guidelines
+
+## CRITICAL: Communicate Progress During Exploration
+
+**Output brief progress notes as you work.** After each major exploration step, write 1-3 sentences:
+- "Found 24 dependencies in package.json. Framework: Next.js 14. Key libs: Tailwind, Prisma, NextAuth."
+- "Directory structure: src/app (pages), src/components (UI), src/lib (utilities), src/server (API)."
+- "Detected 8 page routes. Main features: dashboard, settings, user management, reporting."
+
+## JSON Schema
+
+Output a single JSON code block with this structure:
+
+\`\`\`json
+{
+  "version": "1.0.0",
+  "projectName": "Human-readable project name",
+  "description": "1-3 sentence description of what the project does and its purpose",
+  "techStack": [
+    {
+      "name": "React",
+      "category": "framework | language | library | database | service | tool | other",
+      "version": "18.2.0",
+      "purpose": "Why this technology is used in the project"
+    }
+  ],
+  "directories": [
+    {
+      "path": "src/components",
+      "purpose": "What this directory contains and why",
+      "required": true
+    }
+  ],
+  "patterns": [
+    {
+      "id": "unique-pattern-id",
+      "name": "Pattern Name",
+      "description": "What this pattern is and how it's used in the project",
+      "scope": "frontend | backend | fullstack | infrastructure | data"
+    }
+  ],
+  "constraints": [
+    {
+      "id": "unique-constraint-id",
+      "description": "What must be true about the project",
+      "category": "performance | security | accessibility | compatibility | convention | other",
+      "severity": "critical | warning | info",
+      "verificationHint": "How to check if this constraint holds"
+    }
+  ],
+  "features": [
+    {
+      "id": "unique-feature-id",
+      "name": "Feature Name",
+      "description": "What this feature does and its purpose",
+      "pageSpecId": "optional-page-spec-id",
+      "priority": "critical | high | medium | low",
+      "status": "planned | in-progress | completed | blocked"
+    }
+  ],
+  "dependencies": [
+    {
+      "featureId": "feature-id",
+      "dependsOn": "other-feature-id",
+      "type": "requires | extends | uses",
+      "description": "Why this dependency exists"
+    }
+  ],
+  "metadata": {
+    "author": "ai-generated",
+    "createdAt": "ISO date string"
+  }
+}
+\`\`\`
+
+## Quality Standards
+
+### Tech Stack
+- Include ALL significant dependencies — frameworks, libraries, databases, tools
+- Use **real version numbers** from package.json or lock files
+- The \`purpose\` field should explain WHY this tech is used, not just what it is
+- Include dev dependencies that affect architecture (linters, bundlers, test frameworks)
+
+### Directories
+- Map the actual directory structure, not a generic template
+- \`required: true\` means the app breaks without this directory
+- Include directories down to the second level for important areas (e.g., \`src/components/ui\`)
+
+### Patterns
+- Describe patterns actually observed in the code, not aspirational ones
+- Use specific examples from the codebase in descriptions
+- Scope should accurately reflect where the pattern applies
+
+### Constraints
+- Ground constraints in actual config or code conventions:
+  - TypeScript strict mode from tsconfig → convention constraint
+  - ESLint rules → convention constraints
+  - Security headers in middleware → security constraints
+  - Performance budgets in build config → performance constraints
+- \`verificationHint\` tells AI how to check the constraint holds
+
+### Features
+- Map to real pages, routes, or modules found in the codebase
+- \`status\` should be "completed" for features that exist in code
+- \`pageSpecId\` should reference the spec ID format used in the project
+- \`priority\` reflects importance to the product, not code complexity
+
+### Dependencies
+- Reflect real import/usage relationships between features
+- \`requires\` = won't work without it (auth → protected pages)
+- \`extends\` = adds capability to another feature
+- \`uses\` = consumes data/services from another feature
+
+## Output
+
+Output the spec as a **single JSON code block** wrapped in \`\`\`json ... \`\`\` fences.
+`.trim();
+
+/**
+ * Merge instructions for updating an existing architecture spec.
+ */
+export const ARCHITECTURE_SPEC_MERGE_INSTRUCTIONS = `
+## Merge Mode — Updating an Existing Architecture Spec
+
+You are UPDATING an existing architecture spec, not creating from scratch.
+
+### Merge Rules (CRITICAL)
+
+1. **Read the source code first** (same exploration as creation)
+2. **Compare each section against what you find:**
+   - **techStack**: Update versions, add new deps, remove uninstalled ones
+   - **directories**: Add new dirs, remove deleted ones, update purposes
+   - **patterns**: Keep patterns still in use, add newly observed ones, remove deprecated
+   - **constraints**: Keep valid constraints, add new ones from config changes
+   - **features**: Update status, add new features, remove deleted ones, preserve IDs
+   - **dependencies**: Update based on current feature relationships
+3. **NEVER reduce detail** — enhanced descriptions must be at least as detailed
+4. **Preserve feature IDs** for features that still exist
+5. **Update metadata.updatedAt** to current timestamp
+
+### Output
+
+Output a SINGLE complete JSON spec (the merged result). After the JSON block, add:
+
+\`\`\`
+### Merge Summary
+- **Kept**: X entries unchanged
+- **Updated**: X entries modified (list what changed)
+- **Added**: X new entries
+- **Removed**: X entries (list reasons)
+\`\`\`
+`.trim();
+
+/**
+ * Build context string for an existing architecture spec.
+ */
+export function buildArchitectureSpecContext(spec: {
+  specId: string;
+  config: {
+    projectName: string;
+    description?: string;
+    techStack: unknown[];
+    directories?: unknown[];
+    patterns: unknown[];
+    constraints: unknown[];
+    features: unknown[];
+    dependencies?: unknown[];
+  };
+  appName?: string;
+}): string {
+  const { config } = spec;
+  const lines: string[] = [];
+  lines.push(`# Architecture Spec: ${config.projectName}`);
+  if (spec.appName) lines.push(`Application: ${spec.appName}`);
+  if (config.description) lines.push(`Description: ${config.description}`);
+  lines.push(`Tech stack: ${config.techStack.length} entries`);
+  lines.push(`Directories: ${config.directories?.length || 0} entries`);
+  lines.push(`Patterns: ${config.patterns.length}`);
+  lines.push(`Constraints: ${config.constraints.length}`);
+  lines.push(`Features: ${config.features.length}`);
+  lines.push(`Dependencies: ${config.dependencies?.length || 0}`);
+  return lines.join("\n");
+}
+
+/**
+ * Build a creation prompt for architecture specs with merge context.
+ */
+export function buildArchitectureSpecCreationWithMergeContext(
+  existingSpec: {
+    specId: string;
+    config: Record<string, unknown>;
+    appName?: string;
+  },
+  projectDescription: string,
+): string {
+  const existingJson = JSON.stringify(existingSpec.config, null, 2);
+
+  return [
+    ARCHITECTURE_SPEC_CREATION_INSTRUCTIONS,
+    "",
+    "---",
+    "",
+    ARCHITECTURE_SPEC_MERGE_INSTRUCTIONS,
+    "",
+    "---",
+    "",
+    "## Current Architecture Spec to Merge With",
+    "",
+    "### Raw JSON (preserve feature IDs and enhance detail)",
+    "",
+    "```json",
+    existingJson,
+    "```",
+    "",
+    "---",
+    "",
+    `Update this architecture spec by reading the current source code and merging improvements.`,
+    "",
+    projectDescription,
+  ].join("\n");
+}

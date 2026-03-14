@@ -12,6 +12,7 @@ import {
   Play,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
+import { instanceStorage } from "@/lib/instance-storage";
 import type { BackgroundActivity, ActivityType } from "../hooks/useBackgroundActivities";
 import { getSeverityColors, getAccentColors } from "@/design-system";
 import { DoctorHealthBadge } from "./doctor";
@@ -68,19 +69,14 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
   const [showError, setShowError] = useState(false);
   const [isBeta] = useState(true);
   const [runnerName, setRunnerName] = useState<string>(() => {
-    return localStorage.getItem(RUNNER_NAME_STORAGE_KEY) || "";
+    return instanceStorage.getItem(RUNNER_NAME_STORAGE_KEY) || "";
   });
   const [projectName, setProjectName] = useState<string | null>(() => {
-    const stored = localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY);
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored);
-        return parsed.selectedProjectName || null;
-      } catch {
-        return null;
-      }
-    }
-    return null;
+    const parsed = instanceStorage.getJSON<{ selectedProjectName?: string } | null>(
+      SELECTED_PROJECT_STORAGE_KEY,
+      null,
+    );
+    return parsed?.selectedProjectName || null;
   });
 
   useEffect(() => {

@@ -257,6 +257,7 @@ pub mod result_builder {
             resolved_inputs: None,
             extracted_values: None,
             failure_category: None,
+            interrupted: None,
         }
     }
 
@@ -291,6 +292,7 @@ pub mod result_builder {
             resolved_inputs: None,
             extracted_values: None,
             failure_category: None,
+            interrupted: None,
         }
     }
 
@@ -319,6 +321,7 @@ pub mod result_builder {
             resolved_inputs: None,
             extracted_values: None,
             failure_category: None,
+            interrupted: None,
         }
     }
 
@@ -355,6 +358,7 @@ pub mod result_builder {
             resolved_inputs: None,
             extracted_values: None,
             failure_category: None,
+            interrupted: None,
         }
     }
 }

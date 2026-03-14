@@ -15,6 +15,7 @@
  */
 
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
 import {
@@ -592,21 +593,13 @@ export function NaturalLanguagePanel({
 
   // Command history
   const [commandHistory, setCommandHistory] = useState<CommandHistoryEntry[]>(() => {
-    try {
-      const stored = localStorage.getItem(COMMAND_HISTORY_KEY);
-      if (stored) {
-        return JSON.parse(stored) as CommandHistoryEntry[];
-      }
-    } catch {
-      // Ignore
-    }
-    return [];
+    return instanceStorage.getJSON<CommandHistoryEntry[]>(COMMAND_HISTORY_KEY, []);
   });
 
   // AI Matching state
   const [aiMatchingEnabled, setAiMatchingEnabled] = useState(() => {
-    // Load preference from localStorage
-    const stored = localStorage.getItem("nlp-ai-matching-enabled");
+    // Load preference from instanceStorage
+    const stored = instanceStorage.getItem("nlp-ai-matching-enabled");
     return stored === "true";
   });
   const [aiAvailable, setAiAvailable] = useState(false);
@@ -620,9 +613,9 @@ export function NaturalLanguagePanel({
     isLLMAvailable().then(setAiAvailable);
   }, []);
 
-  // Save AI matching preference to localStorage
+  // Save AI matching preference to instanceStorage
   useEffect(() => {
-    localStorage.setItem("nlp-ai-matching-enabled", String(aiMatchingEnabled));
+    instanceStorage.setItem("nlp-ai-matching-enabled", String(aiMatchingEnabled));
   }, [aiMatchingEnabled]);
 
   // Load persisted descriptions when page context changes
@@ -643,9 +636,9 @@ export function NaturalLanguagePanel({
     console.log(`[NaturalLanguagePanel] Loaded ${loaded.size} descriptions for enhanced matching`);
   }, [pageContext?.url]);
 
-  // Save command history to localStorage
+  // Save command history to instanceStorage
   useEffect(() => {
-    localStorage.setItem(COMMAND_HISTORY_KEY, JSON.stringify(commandHistory));
+    instanceStorage.setJSON(COMMAND_HISTORY_KEY, commandHistory);
   }, [commandHistory]);
 
   // Add command to history
@@ -671,7 +664,7 @@ export function NaturalLanguagePanel({
   // Clear command history
   const clearHistory = useCallback(() => {
     setCommandHistory([]);
-    localStorage.removeItem(COMMAND_HISTORY_KEY);
+    instanceStorage.removeItem(COMMAND_HISTORY_KEY);
   }, []);
 
   // Generate query suggestions based on page elements

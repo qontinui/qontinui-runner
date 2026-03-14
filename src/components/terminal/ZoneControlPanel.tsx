@@ -12,6 +12,7 @@
  */
 
 import React, { useMemo, useState, useCallback, useRef, useEffect } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import {
   LayoutGrid,
   ChevronLeft,
@@ -137,22 +138,16 @@ function getState(raw: string | undefined): SessionState {
 }
 
 function loadWorkspaces(): SavedWorkspace[] {
-  try {
-    const raw = localStorage.getItem(WORKSPACES_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed as SavedWorkspace[];
-  } catch {
-    return [];
-  }
+  const parsed = instanceStorage.getJSON<unknown>(WORKSPACES_STORAGE_KEY, []);
+  if (!Array.isArray(parsed)) return [];
+  return parsed as SavedWorkspace[];
 }
 
 function saveWorkspacesToStorage(workspaces: SavedWorkspace[]): void {
   try {
-    localStorage.setItem(WORKSPACES_STORAGE_KEY, JSON.stringify(workspaces));
+    instanceStorage.setJSON(WORKSPACES_STORAGE_KEY, workspaces);
   } catch {
-    // localStorage full or unavailable — silently ignore
+    // storage full or unavailable — silently ignore
   }
 }
 

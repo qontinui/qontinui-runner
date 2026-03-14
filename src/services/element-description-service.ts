@@ -11,6 +11,8 @@
  * - Export/import for sharing descriptions
  */
 
+import { instanceStorage } from "@/lib/instance-storage";
+
 const STORAGE_KEY = "qontinui-element-descriptions";
 const MAX_ENTRIES = 1000; // Limit to prevent localStorage overflow
 
@@ -67,24 +69,18 @@ function getPageKey(url: string): string {
  * Load the description store from localStorage
  */
 function loadStore(): DescriptionStore {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      const parsed = JSON.parse(stored) as DescriptionStore;
-      // Validate structure
-      if (parsed.version && parsed.pages) {
-        return parsed;
-      }
-    }
-  } catch (e) {
-    console.warn("[ElementDescriptionService] Failed to load store:", e);
-  }
-
-  // Return empty store
-  return {
+  const defaultStore: DescriptionStore = {
     version: 1,
     pages: {},
   };
+
+  const parsed = instanceStorage.getJSON<DescriptionStore>(STORAGE_KEY, defaultStore);
+  // Validate structure
+  if (parsed.version && parsed.pages) {
+    return parsed;
+  }
+
+  return defaultStore;
 }
 
 /**
@@ -103,7 +99,7 @@ function saveStore(store: DescriptionStore): void {
       toRemove.forEach((key) => delete store.pages[key]);
     }
 
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+    instanceStorage.setJSON(STORAGE_KEY, store);
   } catch (e) {
     console.error("[ElementDescriptionService] Failed to save store:", e);
   }
@@ -226,7 +222,7 @@ export const ElementDescriptionService = {
    * Clear all stored descriptions
    */
   clearAll(): void {
-    localStorage.removeItem(STORAGE_KEY);
+    instanceStorage.removeItem(STORAGE_KEY);
     console.log("[ElementDescriptionService] Cleared all descriptions");
   },
 

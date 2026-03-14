@@ -3788,6 +3788,27 @@ pub async fn resume_interrupted_workflows(
     let mut processed_count = 0;
 
     for task_run in &running_workflows {
+        // Check if the workflow state is actually complete but the task_run status
+        // wasn't updated (e.g., runner crashed after workflow finished but before
+        // the status was persisted).
+        if let Ok(Some(wf_state)) = db.get_workflow_execution_state(&task_run.id) {
+            if wf_state.state_name.contains("complete") || wf_state.state_name.contains("finished")
+            {
+                info!(
+                    "Workflow '{}' (id: {}) state is '{}' — marking task_run as completed (stale running status)",
+                    task_run.task_name, task_run.id, wf_state.state_name
+                );
+                if let Err(e) = db.complete_task_run(&task_run.id) {
+                    error!(
+                        "Failed to mark completed workflow {} as completed: {}",
+                        task_run.id, e
+                    );
+                }
+                processed_count += 1;
+                continue;
+            }
+        }
+
         // Check per-task auto_continue setting - this determines whether to resume on startup
         // (auto_continue does NOT affect continuation after steps, only startup resume)
         let should_resume = config.resume_enabled && task_run.auto_continue;
@@ -3955,14 +3976,33 @@ pub async fn resume_interrupted_workflows(
                 }
             }
         } else if let Some(ref wf_name) = task_run.workflow_name {
-            // New format: composed-run-{timestamp} or composed-run-{timestamp}-workflow-{n}
-            // Look up workflow by name instead
+            // Look up workflow by name — try exact match first, then strip
+            // reflection prefixes ("Reflection: ", "Project Reflection: ") since
+            // reflection task runs store a prefixed name while the workflow
+            // definition keeps the original name.
             info!(
                 "Looking up workflow by name '{}' for task_id: {}",
                 wf_name, task_run.id
             );
 
-            match db.get_unified_workflow_by_name(wf_name) {
+            let workflow_result = db.get_unified_workflow_by_name(wf_name).and_then(|opt| {
+                if opt.is_some() {
+                    Ok(opt)
+                } else {
+                    // Try stripping reflection prefixes
+                    let stripped = wf_name
+                        .strip_prefix("Project Reflection: ")
+                        .or_else(|| wf_name.strip_prefix("Reflection: "));
+                    if let Some(name) = stripped {
+                        info!("Retrying workflow lookup with stripped name: '{}'", name);
+                        db.get_unified_workflow_by_name(name)
+                    } else {
+                        Ok(None)
+                    }
+                }
+            });
+
+            match workflow_result {
                 Ok(Some(workflow)) => {
                     // Spawn the workflow resume in a background task with panic protection
                     let task_id = task_run.id.clone();

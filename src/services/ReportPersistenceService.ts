@@ -15,6 +15,7 @@ import {
   type BackendSyncOptions,
 } from "../findings/FindingsSync";
 import { persistFindingsData, loadFindingsData } from "../findings/FindingsPersistence";
+import { instanceStorage } from "@/lib/instance-storage";
 
 // ============================================================================
 // Types
@@ -106,12 +107,12 @@ export class ReportPersistenceService {
 
     // Persist to localStorage
     if (config) {
-      localStorage.setItem(BACKEND_CONFIG_STORAGE_KEY, JSON.stringify(config));
+      instanceStorage.setJSON(BACKEND_CONFIG_STORAGE_KEY, config);
       console.log(
         `[ReportPersistence] Backend configured: ${config.baseUrl} (project: ${config.projectId})`,
       );
     } else {
-      localStorage.removeItem(BACKEND_CONFIG_STORAGE_KEY);
+      instanceStorage.removeItem(BACKEND_CONFIG_STORAGE_KEY);
       console.log("[ReportPersistence] Backend sync disabled (offline mode)");
     }
 
@@ -516,7 +517,7 @@ export class ReportPersistenceService {
    */
   private persistPendingSyncs(): void {
     try {
-      localStorage.setItem(PENDING_SYNCS_STORAGE_KEY, JSON.stringify(this.pendingSyncs));
+      instanceStorage.setJSON(PENDING_SYNCS_STORAGE_KEY, this.pendingSyncs);
     } catch (error) {
       console.error("[ReportPersistence] Failed to persist pending syncs:", error);
     }
@@ -527,26 +528,16 @@ export class ReportPersistenceService {
    */
   private loadPersistedState(): void {
     // Load backend config
-    try {
-      const configJson = localStorage.getItem(BACKEND_CONFIG_STORAGE_KEY);
-      if (configJson) {
-        this.backendConfig = JSON.parse(configJson);
-        console.log(`[ReportPersistence] Loaded backend config: ${this.backendConfig?.baseUrl}`);
-      }
-    } catch (error) {
-      console.error("[ReportPersistence] Failed to load backend config:", error);
+    const config = instanceStorage.getJSON<BackendConfig | null>(BACKEND_CONFIG_STORAGE_KEY, null);
+    if (config) {
+      this.backendConfig = config;
+      console.log(`[ReportPersistence] Loaded backend config: ${this.backendConfig?.baseUrl}`);
     }
 
     // Load pending syncs
-    try {
-      const syncsJson = localStorage.getItem(PENDING_SYNCS_STORAGE_KEY);
-      if (syncsJson) {
-        this.pendingSyncs = JSON.parse(syncsJson);
-        console.log(`[ReportPersistence] Loaded ${this.pendingSyncs.length} pending syncs`);
-      }
-    } catch (error) {
-      console.error("[ReportPersistence] Failed to load pending syncs:", error);
-      this.pendingSyncs = [];
+    this.pendingSyncs = instanceStorage.getJSON<PendingSyncItem[]>(PENDING_SYNCS_STORAGE_KEY, []);
+    if (this.pendingSyncs.length > 0) {
+      console.log(`[ReportPersistence] Loaded ${this.pendingSyncs.length} pending syncs`);
     }
   }
 

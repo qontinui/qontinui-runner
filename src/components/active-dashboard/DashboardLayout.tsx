@@ -6,6 +6,7 @@
  */
 
 import { useCallback, useMemo, memo, useState, useRef, useEffect } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import { cn } from "../../lib/utils";
 import { Pin, EyeOff } from "lucide-react";
 import type { ActivityType, ActivityStatus } from "../../types/dashboard/activity-types";
@@ -18,25 +19,25 @@ import { IdleState } from "./IdleState";
 import { useSessionState } from "../../hooks/useSessionState";
 
 // Import hooks directly to call them statically (avoids dynamic hook issues)
-import { useGuiAutomationData } from "./widgets/gui-automation";
-import { usePlaywrightData } from "./widgets/playwright";
-import { useAiConversationData } from "./widgets/ai-conversation";
-import { useVerificationData } from "./widgets/verification";
-import { useFindingsData } from "./widgets/findings";
-import { useExecutionStatusWidgetData } from "./widgets/execution-status";
-import { useShellCommandData } from "./widgets/shell-command";
-import { useApiRequestData } from "./widgets/api-request";
-import { usePlaywrightTestData } from "./widgets/playwright-test";
-import { useWorkflowRefData } from "./widgets/workflow-ref";
-import { useMcpCallData } from "./widgets/mcp-call";
-import { useExecutionTimelineData } from "./widgets/execution-timeline";
-import { useFlowExecutionData } from "./widgets/flow-execution";
-import { useCanvasData } from "./widgets/canvas";
+import { useGuiAutomationData } from "@/components/widgets/gui-automation";
+import { usePlaywrightData } from "@/components/widgets/playwright";
+import { useAiConversationData } from "@/components/widgets/ai-conversation";
+import { useVerificationData } from "@/components/widgets/verification";
+import { useFindingsData } from "@/components/widgets/findings";
+import { useExecutionStatusWidgetData } from "@/components/widgets/execution-status";
+import { useShellCommandData } from "@/components/widgets/shell-command";
+import { useApiRequestData } from "@/components/widgets/api-request";
+import { usePlaywrightTestData } from "@/components/widgets/playwright-test";
+import { useWorkflowRefData } from "@/components/widgets/workflow-ref";
+import { useMcpCallData } from "@/components/widgets/mcp-call";
+import { useExecutionTimelineData } from "@/components/widgets/execution-timeline";
+import { useFlowExecutionData } from "@/components/widgets/flow-execution";
+import { useCanvasData } from "@/components/widgets/canvas";
 
 // Standalone widgets (not registry-based — they auto-show when events arrive)
-import { ConvergenceWidget } from "./widgets/convergence";
-import { ConstraintResultsWidget } from "./widgets/constraints";
-import { AiStreamWidget } from "./widgets/ai-stream";
+import { ConvergenceWidget } from "@/components/widgets/convergence";
+import { ConstraintResultsWidget } from "@/components/widgets/constraints";
+import { AiStreamWidget } from "@/components/widgets/ai-stream";
 
 /**
  * Props for DashboardLayout.
@@ -1277,14 +1278,10 @@ export function DashboardLayout({
   const HANDLE_WIDTH = 8;
 
   const [leftWidthPercent, setLeftWidthPercent] = useState<number>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsed = parseFloat(saved);
-        if (!isNaN(parsed) && parsed >= MIN_WIDTH && parsed <= MAX_WIDTH) return parsed;
-      }
-    } catch {
-      // localStorage may be unavailable
+    const saved = instanceStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      const parsed = parseFloat(saved);
+      if (!isNaN(parsed) && parsed >= MIN_WIDTH && parsed <= MAX_WIDTH) return parsed;
     }
     return 65;
   });
@@ -1324,13 +1321,9 @@ export function DashboardLayout({
     };
   }, []);
 
-  // Persist width to localStorage
+  // Persist width to instanceStorage
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, String(leftWidthPercent));
-    } catch {
-      // localStorage may be unavailable
-    }
+    instanceStorage.setItem(STORAGE_KEY, String(leftWidthPercent));
   }, [leftWidthPercent]);
 
   // Show idle state if no widgets detected

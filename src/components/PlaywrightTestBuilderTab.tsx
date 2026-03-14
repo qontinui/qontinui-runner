@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import { invoke } from "@tauri-apps/api/core";
 import {
   TestTube,
@@ -80,15 +81,8 @@ export function PlaywrightTestBuilderTab({
 
   // Load persisted create form state
   const loadPersistedCreateForm = useCallback(() => {
-    try {
-      const saved = localStorage.getItem(CREATE_FORM_STORAGE_KEY);
-      if (saved) {
-        return JSON.parse(saved);
-      }
-    } catch {
-      // Ignore parse errors
-    }
-    return null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return instanceStorage.getJSON<any>(CREATE_FORM_STORAGE_KEY, null);
   }, []);
 
   // Edit modal state
@@ -104,7 +98,7 @@ export function PlaywrightTestBuilderTab({
     return saved?.viewMode ?? "natural_language";
   });
 
-  // Form state - restore from localStorage if available
+  // Form state - restore from instanceStorage if available
   const [formName, setFormName] = useState(() => {
     const saved = loadPersistedCreateForm();
     return saved?.formName ?? "";
@@ -175,7 +169,7 @@ export function PlaywrightTestBuilderTab({
   const [_isAutoRefining, setIsAutoRefining] = useState(false);
   const [_autoRefineIteration, setAutoRefineIteration] = useState(0);
   const [autoRefineMaxIterations, setAutoRefineMaxIterations] = useState(() => {
-    const saved = localStorage.getItem("qontinui-autorefine-max-iterations");
+    const saved = instanceStorage.getItem("qontinui-autorefine-max-iterations");
     return saved !== null ? parseInt(saved, 10) : 10;
   });
   const [_autoRefineLog, setAutoRefineLog] = useState<string[]>([]);
@@ -194,32 +188,32 @@ export function PlaywrightTestBuilderTab({
   const [autoRefineUserHint, setAutoRefineUserHint] = useState("");
   const [_hintQueued, setHintQueued] = useState(false);
 
-  // Visual context settings for auto-refine (persisted to localStorage)
+  // Visual context settings for auto-refine (persisted to instanceStorage)
   const [includeScreenshot, setIncludeScreenshot] = useState(() => {
-    const saved = localStorage.getItem("qontinui-autorefine-include-screenshot");
+    const saved = instanceStorage.getItem("qontinui-autorefine-include-screenshot");
     return saved !== null ? saved === "true" : true; // Default: true
   });
   const [includeTraceData, setIncludeTraceData] = useState(() => {
-    const saved = localStorage.getItem("qontinui-autorefine-include-trace");
+    const saved = instanceStorage.getItem("qontinui-autorefine-include-trace");
     return saved !== null ? saved === "true" : true; // Default: true
   });
   // Video settings - checkbox to enable + iteration threshold
   const [includeVideo, setIncludeVideo] = useState(() => {
-    const saved = localStorage.getItem("qontinui-autorefine-include-video");
+    const saved = instanceStorage.getItem("qontinui-autorefine-include-video");
     return saved !== null ? saved === "true" : true; // Default: enabled
   });
   const [includeVideoAfterIterations, setIncludeVideoAfterIterations] = useState(() => {
-    const saved = localStorage.getItem("qontinui-autorefine-video-after-iterations");
+    const saved = instanceStorage.getItem("qontinui-autorefine-video-after-iterations");
     return saved !== null ? parseInt(saved, 10) : 3; // Temporary default, will be updated from AI settings
   });
   const [videoSettingsLoaded, setVideoSettingsLoaded] = useState(false);
 
-  // Load default video threshold from AI settings on mount (only if no localStorage override)
+  // Load default video threshold from AI settings on mount (only if no instanceStorage override)
   useEffect(() => {
     const loadAiSettingsDefault = async () => {
-      // Only load from AI settings if localStorage doesn't have a value
-      const localStorageValue = localStorage.getItem("qontinui-autorefine-video-after-iterations");
-      if (localStorageValue !== null) {
+      // Only load from AI settings if instanceStorage doesn't have a value
+      const storedValue = instanceStorage.getItem("qontinui-autorefine-video-after-iterations");
+      if (storedValue !== null) {
         setVideoSettingsLoaded(true);
         return;
       }
@@ -244,21 +238,21 @@ export function PlaywrightTestBuilderTab({
 
   // Persist visual context settings
   useEffect(() => {
-    localStorage.setItem("qontinui-autorefine-include-screenshot", String(includeScreenshot));
+    instanceStorage.setItem("qontinui-autorefine-include-screenshot", String(includeScreenshot));
   }, [includeScreenshot]);
   useEffect(() => {
-    localStorage.setItem("qontinui-autorefine-include-trace", String(includeTraceData));
+    instanceStorage.setItem("qontinui-autorefine-include-trace", String(includeTraceData));
   }, [includeTraceData]);
   useEffect(() => {
-    localStorage.setItem("qontinui-autorefine-include-video", String(includeVideo));
+    instanceStorage.setItem("qontinui-autorefine-include-video", String(includeVideo));
   }, [includeVideo]);
   useEffect(() => {
-    localStorage.setItem("qontinui-autorefine-max-iterations", String(autoRefineMaxIterations));
+    instanceStorage.setItem("qontinui-autorefine-max-iterations", String(autoRefineMaxIterations));
   }, [autoRefineMaxIterations]);
   // Only persist video threshold after settings have been loaded (to avoid overwriting with default)
   useEffect(() => {
     if (videoSettingsLoaded) {
-      localStorage.setItem(
+      instanceStorage.setItem(
         "qontinui-autorefine-video-after-iterations",
         String(includeVideoAfterIterations),
       );
@@ -285,10 +279,10 @@ export function PlaywrightTestBuilderTab({
         formSuccessCriteria,
         formIsWorkflowAutomation,
       };
-      localStorage.setItem(CREATE_FORM_STORAGE_KEY, JSON.stringify(formState));
+      instanceStorage.setJSON(CREATE_FORM_STORAGE_KEY, formState);
     } else {
       // Clear persisted state when not creating
-      localStorage.removeItem(CREATE_FORM_STORAGE_KEY);
+      instanceStorage.removeItem(CREATE_FORM_STORAGE_KEY);
     }
   }, [
     isCreating,

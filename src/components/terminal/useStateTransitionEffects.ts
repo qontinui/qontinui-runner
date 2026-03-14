@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import type { SessionState } from "./useZoneLayout";
 import { playNeedsInputChime, playCompletionChime, playErrorAlert } from "./notificationSound";
 
@@ -61,19 +62,13 @@ export function useStateTransitionEffects(
   const [unseenNeedsInput, setUnseenNeedsInput] = useState<Set<string>>(new Set());
   const [batchBarDismissed, setBatchBarDismissed] = useState(false);
 
-  const [autoApprovePatterns, setAutoApprovePatternsState] = useState<string[]>(() => {
-    try {
-      const stored = localStorage.getItem("zone-auto-approve-patterns");
-      if (stored) return JSON.parse(stored) as string[];
-    } catch {
-      // intentionally empty
-    }
-    return [];
-  });
+  const [autoApprovePatterns, setAutoApprovePatternsState] = useState<string[]>(() =>
+    instanceStorage.getJSON<string[]>("zone-auto-approve-patterns", []),
+  );
   const autoApproveCountRef = useRef(0);
 
   const [autoRestart, setAutoRestart] = useState(
-    () => localStorage.getItem("zone-auto-restart") === "true",
+    () => instanceStorage.getItem("zone-auto-restart") === "true",
   );
   const autoRestartCountRef = useRef(0);
   const handleRestartInZoneRef = useRef<(zoneIdx: number) => void>(() => {});
@@ -83,15 +78,15 @@ export function useStateTransitionEffects(
   const pendingRestartTimersRef = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
 
   const [autoFocusNeedsInput, setAutoFocusNeedsInput] = useState(
-    () => localStorage.getItem("zone-auto-focus") === "true",
+    () => instanceStorage.getItem("zone-auto-focus") === "true",
   );
 
   const [soundEnabled, setSoundEnabled] = useState(
-    () => localStorage.getItem("zone-sound-notify") === "true",
+    () => instanceStorage.getItem("zone-sound-notify") === "true",
   );
 
   const [desktopNotify, setDesktopNotify] = useState(
-    () => localStorage.getItem("zone-desktop-notify") === "true",
+    () => instanceStorage.getItem("zone-desktop-notify") === "true",
   );
 
   const prevNeedsInputCountRef = useRef(0);
@@ -118,7 +113,7 @@ export function useStateTransitionEffects(
   const toggleAutoFocus = useCallback(() => {
     setAutoFocusNeedsInput((prev) => {
       const next = !prev;
-      localStorage.setItem("zone-auto-focus", String(next));
+      instanceStorage.setItem("zone-auto-focus", String(next));
       return next;
     });
   }, []);
@@ -126,7 +121,7 @@ export function useStateTransitionEffects(
   const toggleSound = useCallback(() => {
     setSoundEnabled((prev) => {
       const next = !prev;
-      localStorage.setItem("zone-sound-notify", String(next));
+      instanceStorage.setItem("zone-sound-notify", String(next));
       // Play a test chime when enabling
       if (next) playNeedsInputChime();
       return next;
@@ -144,7 +139,7 @@ export function useStateTransitionEffects(
 
   // Persist autoApprovePatterns
   useEffect(() => {
-    localStorage.setItem("zone-auto-approve-patterns", JSON.stringify(autoApprovePatterns));
+    instanceStorage.setJSON("zone-auto-approve-patterns", autoApprovePatterns);
   }, [autoApprovePatterns]);
 
   // Un-dismiss batch bar when needs-input count increases

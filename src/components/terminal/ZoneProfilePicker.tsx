@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import { Save, FolderOpen, Trash2, ChevronDown } from "lucide-react";
 
 interface ZoneProfile {
@@ -22,17 +23,11 @@ const STORAGE_KEY = "zone-profiles";
 const MAX_PROFILES = 10;
 
 function loadProfiles(): Record<string, ZoneProfile> {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) return JSON.parse(stored) as Record<string, ZoneProfile>;
-  } catch {
-    // intentionally empty
-  }
-  return {};
+  return instanceStorage.getJSON<Record<string, ZoneProfile>>(STORAGE_KEY, {});
 }
 
 function saveProfiles(profiles: Record<string, ZoneProfile>) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(profiles));
+  instanceStorage.setJSON(STORAGE_KEY, profiles);
 }
 
 export function ZoneProfilePicker({

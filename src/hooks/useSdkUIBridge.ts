@@ -1082,7 +1082,8 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
     }
 
     try {
-      // Step 2: Capture initial state
+      // Step 2: Capture initial state via snapshot (triggers DOM scan, unlike
+      // /elements which only returns pre-registered SDK elements)
       await fetchElements();
       await new Promise((r) => setTimeout(r, EXPLORATION_SETTLE_DELAY));
 
@@ -1103,10 +1104,17 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
       // from the fetch response directly. Let's create a helper.
       const fetchLatestElements = async (): Promise<ExternalElement[]> => {
         try {
-          const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/elements`);
-          const json = await resp.json();
+          // Use snapshot endpoint which triggers a full DOM scan, unlike /elements
+          // which only returns pre-registered SDK elements (may be 0 for self-connections)
+          let resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/snapshot`);
+          let json = await resp.json();
 
-          if (json.success === false) return [];
+          if (json.success === false) {
+            // Fall back to elements endpoint
+            resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/elements`);
+            json = await resp.json();
+            if (json.success === false) return [];
+          }
 
           const rawElements: unknown[] = json.data?.elements || json.elements || json.data || [];
           const mapped = (rawElements as Record<string, unknown>[]).map(mapSdkElement);
@@ -1384,6 +1392,55 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
       setExplorationProgress(null);
     }
   }, [isExploring, connectedApp, fetchElements, generateCooccurrenceExport]);
+
+  // =========================================================================
+  // Mount-time hydration — sync from backend if already connected
+  // =========================================================================
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/status`);
+        const json = await resp.json();
+        if (cancelled || !json.success || !json.data) return;
+
+        const data = json.data as {
+          connected: boolean;
+          app?: SdkAppInfo;
+          url?: string;
+          allConnections?: Array<{
+            url: string;
+            app: SdkAppInfo;
+            connectedAt: number;
+            isActive: boolean;
+          }>;
+        };
+
+        if (data.connected && data.app) {
+          setConnectionStatus("connected");
+          setConnectedApp(data.app);
+
+          // Hydrate connections map
+          if (data.allConnections) {
+            setConnections(() => {
+              const map = new Map<string, SdkAppInfo>();
+              for (const conn of data.allConnections!) {
+                map.set(conn.url.replace(/\/+$/, ""), conn.app);
+              }
+              return map;
+            });
+          }
+        }
+      } catch {
+        // Runner may not be available yet — leave state as disconnected
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- hydrate once on mount
+  }, []);
 
   // =========================================================================
   // Periodic Health Check (reconnection / stale cleanup)

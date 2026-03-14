@@ -18,12 +18,12 @@ import { ActiveRunsBar } from "./ActiveRunsBar";
 import { ShortcutsModal } from "./ShortcutsModal";
 import { CompletionSummary } from "./CompletionSummary";
 import { ApprovalDialog } from "./ApprovalDialog";
-import { registerAllWidgets } from "./widgets";
-import { useFlowExecutionData } from "./widgets/flow-execution";
+import { registerAllWidgets } from "@/components/widgets";
+import { useFlowExecutionData } from "@/components/widgets/flow-execution";
 import { windowManager } from "../../managers";
 import type { ActivityType } from "../../types/dashboard/activity-types";
 import type { DashboardStatus } from "../../hooks/dashboard/useDashboardState";
-import type { StepStats } from "./widgets/shared/types";
+import type { StepStats } from "@/components/widgets/shared/types";
 import type { CommandResponse } from "../../types/displayProfile";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 

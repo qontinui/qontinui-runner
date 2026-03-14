@@ -243,6 +243,7 @@ pub async fn generate_workflow_standalone(
         generate_specification: Some(true),
         verification_depth: None,
         discover_ui_bridge_specs: None,
+        simple_mode: None,
     };
 
     // Get doctor handle for health monitoring

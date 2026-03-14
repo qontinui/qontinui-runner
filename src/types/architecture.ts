@@ -108,3 +108,39 @@ export interface EffectivenessOverTime {
   bucket_type: string;
   buckets: EffectivenessBucket[];
 }
+
+// SDK-sourced architecture types (from UI Bridge SDK cached specs)
+
+export interface SdkArchitectureSpec {
+  id: string;
+  app_url: string;
+  app_name: string;
+  spec_id: string;
+  spec_json: string;
+  discovered_at: string;
+  page_url: string | null;
+}
+
+export interface SdkArchitectureNode {
+  id: string;
+  label: string;
+  type: "feature" | "tech" | "directory" | "pattern";
+  status?: string;
+  priority?: string;
+}
+
+export interface SdkArchitectureEdge {
+  source: string;
+  target: string;
+  type: "requires" | "extends" | "uses";
+  label?: string;
+}
+
+export interface SdkArchitectureGraph {
+  projectName: string;
+  appUrl: string;
+  nodes: SdkArchitectureNode[];
+  edges: SdkArchitectureEdge[];
+  techStack: Array<{ name: string; category: string; version?: string; purpose: string }>;
+  directories: Array<{ path: string; purpose: string; required: boolean }>;
+}

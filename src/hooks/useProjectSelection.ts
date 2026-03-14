@@ -9,6 +9,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Project } from "../types/auth";
+import { instanceStorage } from "@/lib/instance-storage";
 
 const SELECTED_PROJECT_STORAGE_KEY = "qontinui-selected-project";
 
@@ -34,29 +35,19 @@ interface UseProjectSelectionReturn {
 export function useProjectSelection(): UseProjectSelectionReturn {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectIdState] = useState<string | null>(() => {
-    // Load from localStorage on mount
-    const stored = localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY);
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored) as ProjectSelectionState;
-        return parsed.selectedProjectId;
-      } catch {
-        return null;
-      }
-    }
-    return null;
+    // Load from instanceStorage on mount
+    const parsed = instanceStorage.getJSON<ProjectSelectionState | null>(
+      SELECTED_PROJECT_STORAGE_KEY,
+      null,
+    );
+    return parsed?.selectedProjectId ?? null;
   });
   const [selectedProjectName, setSelectedProjectName] = useState<string | null>(() => {
-    const stored = localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY);
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored) as ProjectSelectionState;
-        return parsed.selectedProjectName;
-      } catch {
-        return null;
-      }
-    }
-    return null;
+    const parsed = instanceStorage.getJSON<ProjectSelectionState | null>(
+      SELECTED_PROJECT_STORAGE_KEY,
+      null,
+    );
+    return parsed?.selectedProjectName ?? null;
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -132,7 +123,7 @@ export function useProjectSelection(): UseProjectSelectionReturn {
         selectedProjectId: projectId,
         selectedProjectName: projectName,
       };
-      localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, JSON.stringify(state));
+      instanceStorage.setJSON(SELECTED_PROJECT_STORAGE_KEY, state);
 
       // Dispatch event for StatusIndicator
       window.dispatchEvent(
@@ -157,7 +148,7 @@ export function useProjectSelection(): UseProjectSelectionReturn {
           selectedProjectId,
           selectedProjectName: project.name,
         };
-        localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, JSON.stringify(state));
+        instanceStorage.setJSON(SELECTED_PROJECT_STORAGE_KEY, state);
       }
     }
   }, [projects, selectedProjectId, selectedProjectName]);

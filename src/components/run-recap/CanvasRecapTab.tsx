@@ -8,7 +8,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { LayoutDashboard, Loader2 } from "lucide-react";
 import { Badge } from "../ui";
-import { PanelCard } from "../active-dashboard/widgets/canvas/components/PanelCard";
+import { PanelCard } from "../widgets/canvas/components/PanelCard";
 import type { CanvasPanel } from "@qontinui/shared-types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 

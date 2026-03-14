@@ -25,3 +25,5 @@ export { ElementTreeView } from "./ElementTreeView";
 export { EventTimelineView } from "./EventTimelineView";
 export { ActionExecutorView } from "./ActionExecutorView";
 export { LazyThumbnail } from "./LazyThumbnail";
+export { SdkAppConnector } from "./SdkAppConnector";
+export type { SdkAppConnectorProps, SdkAppConnection } from "./SdkAppConnector";

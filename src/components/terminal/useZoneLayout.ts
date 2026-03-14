@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 
 // ── Layout Definitions ─────────────────────────────────────────────────────
 
@@ -149,18 +150,12 @@ interface PersistedState {
 }
 
 function loadPersistedState(): PersistedState | null {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
+  return instanceStorage.getJSON<PersistedState | null>(STORAGE_KEY, null);
 }
 
 function persistState(state: PersistedState) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    instanceStorage.setJSON(STORAGE_KEY, state);
   } catch {
     // ignore storage errors
   }

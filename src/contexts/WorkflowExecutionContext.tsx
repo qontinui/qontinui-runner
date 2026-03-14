@@ -31,11 +31,8 @@ import type {
   PhaseGroup,
   TimelineStats,
   StepType,
-} from "../components/active-dashboard/widgets/execution-timeline/types";
-import type {
-  StepStats,
-  StepExecutionStatus,
-} from "../components/active-dashboard/widgets/shared/types";
+} from "@/components/widgets/execution-timeline/types";
+import type { StepStats, StepExecutionStatus } from "@/components/widgets/shared/types";
 import {
   useUnifiedEvents,
   type OrchestratorStateChangePayload,

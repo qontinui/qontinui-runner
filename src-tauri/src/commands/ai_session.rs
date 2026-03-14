@@ -652,6 +652,7 @@ pub async fn generate_workflow_from_session(
         generate_specification: Some(true),
         verification_depth: None,
         discover_ui_bridge_specs: None,
+        simple_mode: None,
     };
 
     // Emit a UI-only note that generation is starting (not sent to AI session --

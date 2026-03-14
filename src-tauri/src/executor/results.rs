@@ -776,6 +776,7 @@ mod tests {
             resolved_inputs: None,
             extracted_values: None,
             failure_category: None,
+            interrupted: None,
         };
 
         let wrapped = StepExecutionOutcome::from(step_result);
@@ -819,6 +820,7 @@ mod tests {
             resolved_inputs: None,
             extracted_values: None,
             failure_category: None,
+            interrupted: None,
         };
 
         let outcome = step_result.into_outcome(5000);
@@ -858,6 +860,7 @@ mod tests {
                 resolved_inputs: None,
                 extracted_values: None,
                 failure_category: None,
+                interrupted: None,
             }],
         };
 
@@ -895,6 +898,7 @@ mod tests {
                 resolved_inputs: None,
                 extracted_values: None,
                 failure_category: None,
+                interrupted: None,
             }],
         };
 

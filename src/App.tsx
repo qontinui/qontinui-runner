@@ -52,13 +52,18 @@ import {
   EventManagerProvider,
   AutoContinueProvider,
 } from "./contexts";
-import { RenderLogWrapper } from "./lib/ui-bridge";
+import { RenderLogWrapper, UIBridgeHooks } from "./lib/ui-bridge";
 import { AuthProvider, useAuth } from "./components/AuthProvider";
 import { TutorialProvider } from "./contexts/TutorialContext";
 import { ContextualTutorial } from "./components/tutorial";
 
 // UI Bridge for AI-driven UI automation
-import { UIBridgeProvider, AutoRegisterProvider, usePageContext } from "ui-bridge";
+import {
+  UIBridgeProvider,
+  AutoRegisterProvider,
+  usePageContext,
+  CommandRelayListener,
+} from "ui-bridge";
 
 // Navigation context for tutorials to navigate to pages
 interface NavigationContextValue {
@@ -178,7 +183,8 @@ import { UIBridgeStateMachinePage } from "./pages/state-machine";
 // Development tools
 import { PerformanceOverlay } from "./components/dev";
 
-import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { getApiBase, getApiPort, tracedFetch } from "@/lib/runner-api";
+import { instanceStorage } from "@/lib/instance-storage";
 
 // Styles
 import "./index.css";
@@ -329,7 +335,6 @@ const VALID_TAB_IDS: MainTabId[] = [
   "help",
 ];
 
-const MAIN_TAB_STORAGE_KEY = "qontinui-main-active-tab";
 const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";
 
 /**
@@ -575,9 +580,20 @@ function AppContent() {
 
   // Main tab state
   const [activeTab, setActiveTab] = useState<MainTabId>(() => {
-    const stored = localStorage.getItem(MAIN_TAB_STORAGE_KEY);
+    const stored = instanceStorage.getItem("qontinui-main-active-tab");
     return migrateTabId(stored);
   });
+
+  // Re-read the correct tab once the API port is known (secondary instances
+  // start with the default port 9876 and get their real port asynchronously,
+  // so the initial read may have used the wrong localStorage key).
+  useEffect(() => {
+    if (isApiReady && getApiPort() !== 9876) {
+      const stored = instanceStorage.getItem("qontinui-main-active-tab");
+      const correct = migrateTabId(stored);
+      setActiveTab(correct);
+    }
+  }, [isApiReady]);
 
   // Register navigation function for tutorials
   useEffect(() => {
@@ -826,7 +842,7 @@ function AppContent() {
 
   // Sidebar collapsed state
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
-    return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
+    return instanceStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
   });
 
   // Auto-collapse sidebar when multiple terminal sessions are open
@@ -837,7 +853,7 @@ function AppContent() {
     // Manual toggle clears auto-collapse tracking
     autoCollapsedRef.current = false;
     setSidebarCollapsed(value);
-    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, JSON.stringify(value));
+    instanceStorage.setItem(SIDEBAR_COLLAPSED_KEY, JSON.stringify(value));
   }, []);
 
   useEffect(() => {
@@ -856,9 +872,9 @@ function AppContent() {
   // Log sub-tab state
   const [activeLogSubTab, setActiveLogSubTab] = useState<LogSubTab>("general");
 
-  // Persist main tab
+  // Persist main tab (instance-specific key so each runner restores its own page)
   useEffect(() => {
-    localStorage.setItem(MAIN_TAB_STORAGE_KEY, activeTab);
+    instanceStorage.setItem("qontinui-main-active-tab", activeTab);
   }, [activeTab]);
 
   // Logs from LogManager
@@ -1015,13 +1031,9 @@ function AppContent() {
    * NOTE: This hook must be defined before conditional returns to satisfy React's rules of hooks
    */
   const handleGoToRecap = useCallback(() => {
-    // Set the last run ID in localStorage so RunSelectionContext picks it up
+    // Set the last run ID so RunSelectionContext picks it up
     if (lastRun?.id) {
-      try {
-        localStorage.setItem("qontinui-selected-task-run-id", JSON.stringify(lastRun.id));
-      } catch {
-        // Ignore storage errors
-      }
+      instanceStorage.setJSON("qontinui-selected-task-run-id", lastRun.id);
     }
     // If we have a last run with a workflow name, try to select it
     if (lastRun?.workflow_name && execution.workflows.length > 0) {
@@ -1100,11 +1112,7 @@ function AppContent() {
           <HistoryTab
             onNavigateToRun={() => setActiveTab("gui-automation")}
             onNavigateToAi={(runId) => {
-              try {
-                localStorage.setItem("qontinui-selected-task-run-id", JSON.stringify(runId));
-              } catch {
-                // Ignore storage errors
-              }
+              instanceStorage.setJSON("qontinui-selected-task-run-id", runId);
               setActiveTab("run-recap");
             }}
           />
@@ -1157,14 +1165,10 @@ function AppContent() {
               <div className="h-full overflow-hidden">
                 <RunRecapTab
                   onNavigateToAiOutput={(phase, iteration) => {
-                    try {
-                      localStorage.setItem(
-                        "qontinui-ai-output-navigate",
-                        JSON.stringify({ phase, phaseIteration: iteration }),
-                      );
-                    } catch {
-                      // Ignore storage errors
-                    }
+                    instanceStorage.setJSON("qontinui-ai-output-navigate", {
+                      phase,
+                      phaseIteration: iteration,
+                    });
                     setActiveTab("run-ai-output");
                   }}
                 />
@@ -1695,6 +1699,14 @@ function AppContent() {
         mutationDebounceMs={500}
       >
         <RunnerPageContext activeTab={activeTab} />
+        <UIBridgeHooks
+          activeTab={activeTab}
+          sidebarCollapsed={sidebarCollapsed}
+          isActionModalOpen={modalState.isActionModalOpen}
+          isImageModalOpen={modalState.isImageModalOpen}
+          showLogSourcePicker={showLogSourcePicker}
+          executionActive={execution.executionActive}
+        />
         <div className="h-screen w-screen bg-background grid-dots flex flex-col overflow-hidden min-w-[1200px] min-h-[700px]">
           {/* Status Bar - Sticky Top */}
           <StatusIndicator
@@ -1825,6 +1837,7 @@ function AppWithTutorials() {
 export default function App() {
   return (
     <UIBridgeProvider features={{ renderLog: true, control: true, debug: true }}>
+      <CommandRelayListener />
       <UIBridgeEventHandler />
       <SpecExecutionHandler />
       {/* AutoRegisterProvider enables automatic UI Bridge element registration */}

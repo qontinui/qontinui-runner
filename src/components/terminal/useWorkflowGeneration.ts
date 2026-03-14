@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { instanceStorage } from "@/lib/instance-storage";
 import type { UnifiedWorkflow } from "@qontinui/shared-types";
 import type { TranscriptMessage } from "./useTranscriptSessions";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
@@ -318,7 +319,7 @@ export function useWorkflowGeneration({
   const handleEditInBuilder = useCallback(() => {
     if (!generatedWorkflow) return;
     try {
-      localStorage.setItem("qontinui-generated-workflow", JSON.stringify(generatedWorkflow));
+      instanceStorage.setJSON("qontinui-generated-workflow", generatedWorkflow);
     } catch {
       // ignore storage errors
     }

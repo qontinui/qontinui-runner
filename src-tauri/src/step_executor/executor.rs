@@ -753,6 +753,9 @@ pub struct StepExecutionResult {
     /// Categories: "infrastructure", "setup_issue", "test_failure", "unknown"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_category: Option<String>,
+    /// Whether this step was interrupted (runner restart detected)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted: Option<bool>,
 }
 
 /// Verification-specific details for test and check steps
@@ -2237,6 +2240,7 @@ impl StepExecutor {
                 resolved_inputs: None,
                 extracted_values: None,
                 failure_category: None,
+                interrupted: None,
             });
         }
 
@@ -3293,6 +3297,7 @@ impl StepExecutor {
                     resolved_inputs: None,
                     extracted_values: None,
                     failure_category: None,
+                    interrupted: None,
                 };
                 step_results.push(result);
                 skipped_steps += 1;
@@ -3732,6 +3737,7 @@ impl StepExecutor {
                 resolved_inputs: None,
                 extracted_values: None,
                 failure_category,
+                interrupted: None,
             };
 
             // Emit completion event for this step (real-time UI update)
@@ -5786,6 +5792,7 @@ mod tests {
                     resolved_inputs: None,
                     extracted_values: None,
                     failure_category: None,
+                    interrupted: None,
                 },
                 StepExecutionResult {
                     step_index: 1,
@@ -5805,6 +5812,7 @@ mod tests {
                     resolved_inputs: None,
                     extracted_values: None,
                     failure_category: None,
+                    interrupted: None,
                 },
             ],
             captured_logs: None,

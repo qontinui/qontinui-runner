@@ -35,6 +35,8 @@ export interface ProjectAnalysis {
   has_swc_plugin: boolean;
   server_adapter: string | null;
   dev_server_port: number | null;
+  has_generated_hooks: boolean;
+  has_architecture_spec: boolean;
   issues: string[];
 }
 
@@ -98,6 +100,45 @@ export interface DiscoveredApp {
   element_count: number | null;
   component_count: number | null;
   discovered_at: number;
+}
+
+export interface MobileDevice {
+  device_id: string;
+  device_type: string;
+  model: string | null;
+  status: string;
+  ui_bridge: DiscoveredApp | null;
+}
+
+export interface DiscoveryResult {
+  web: DiscoveredApp[];
+  desktop: DiscoveredApp[];
+  mobile: MobileDevice[];
+  scanned_at: number;
+  duration_ms: number;
+}
+
+// --- Hook Generation ---
+
+export type HookCategory =
+  | "route-awareness"
+  | "page-context"
+  | "state-machine"
+  | "components"
+  | "keyboard-shortcuts"
+  | "undo-redo"
+  | "annotations"
+  | "intents";
+
+export interface WriteHooksRequest {
+  project_path: string;
+  files: FileModification[];
+}
+
+export interface WriteHooksResult {
+  success: boolean;
+  files_written: string[];
+  warnings: string[];
 }
 
 // --- API Response wrapper ---

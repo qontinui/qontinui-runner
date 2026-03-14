@@ -2131,26 +2131,49 @@ impl SetupExecutor {
                         warn!("Failed to log setup AI step start event: {}", e);
                     }
 
-                    let doctor_handle = self.app_state.doctor_handle.lock().await.clone();
-                    let start = std::time::Instant::now();
                     // Step-level overrides take precedence over phase-level
                     let step_model = step.model.clone().or_else(|| model_override.clone());
                     let step_provider = step.provider.clone().or_else(|| provider_override.clone());
-                    match execute_prompt_response_mode(
-                        step,
-                        &self.checkpoint_db,
-                        Some(execution_id),
-                        doctor_handle,
-                        step_model.clone(),
-                        step_provider.clone(),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                    {
-                        Ok(resp) => {
+
+                    // Retry loop for interruption resilience
+                    let mut retry_count = 0u32;
+                    const MAX_INTERRUPTION_RETRIES: u32 = 2;
+                    let resp_result = loop {
+                        let doctor_handle = self.app_state.doctor_handle.lock().await.clone();
+                        let start = std::time::Instant::now();
+                        match execute_prompt_response_mode(
+                            step,
+                            &self.checkpoint_db,
+                            Some(execution_id),
+                            doctor_handle,
+                            step_model.clone(),
+                            step_provider.clone(),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(resp) => break Ok((resp, start)),
+                            Err(e) => {
+                                let duration_ms = start.elapsed().as_millis() as u64;
+                                if duration_ms < 5000 && retry_count < MAX_INTERRUPTION_RETRIES {
+                                    retry_count += 1;
+                                    warn!(
+                                        "SETUP-PHASE: Step '{}' appears interrupted ({}ms < 5s), retry {}/{} after 10s delay",
+                                        step_name, duration_ms, retry_count, MAX_INTERRUPTION_RETRIES
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                                    continue;
+                                }
+                                break Err(e);
+                            }
+                        }
+                    };
+
+                    match resp_result {
+                        Ok((resp, start)) => {
                             let duration_ms = start.elapsed().as_millis() as u64;
                             record_phase_token_usage(
                                 &self.checkpoint_db,
@@ -2235,10 +2258,11 @@ impl SetupExecutor {
                                 resolved_inputs: None,
                                 extracted_values: None,
                                 failure_category: None,
+                                interrupted: None,
                             });
                         }
                         Err(e) => {
-                            let duration_ms = start.elapsed().as_millis() as u64;
+                            let duration_ms = 0u64; // Duration already elapsed during retries
                             warn!(
                                 "SETUP-PHASE: Response-mode step '{}' failed: {}",
                                 step_name, e
@@ -2294,6 +2318,7 @@ impl SetupExecutor {
                                 resolved_inputs: None,
                                 extracted_values: None,
                                 failure_category: None,
+                                interrupted: Some(true),
                             });
                             return (false, all_results);
                         }
@@ -4228,6 +4253,7 @@ impl CompletionExecutor {
                                 resolved_inputs: None,
                                 extracted_values: None,
                                 failure_category: None,
+                                interrupted: None,
                             });
                         }
                         Err(e) => {
@@ -4288,6 +4314,7 @@ impl CompletionExecutor {
                                 resolved_inputs: None,
                                 extracted_values: None,
                                 failure_category: None,
+                                interrupted: None,
                             });
                             // Completion failures are non-fatal - don't return early
                             overall_success = false;

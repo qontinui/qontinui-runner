@@ -1058,13 +1058,28 @@ pub async fn resume_task_run(
             })?;
         (wf_id, wf)
     } else if let Some(ref wf_name) = task_run.workflow_name {
-        // New format: composed-run-{timestamp}-workflow-{n}
-        // Look up workflow by name instead
+        // Look up workflow by name — try exact match first, then strip
+        // reflection prefixes ("Reflection: ", "Project Reflection: ") since
+        // reflection task runs store a prefixed name while the workflow
+        // definition keeps the original name.
         let wf = state
             .app_state
             .checkpoint_db
             .get_unified_workflow_by_name(wf_name)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .or_else(|| {
+                let stripped = wf_name
+                    .strip_prefix("Project Reflection: ")
+                    .or_else(|| wf_name.strip_prefix("Reflection: "));
+                stripped.and_then(|name| {
+                    state
+                        .app_state
+                        .checkpoint_db
+                        .get_unified_workflow_by_name(name)
+                        .ok()
+                        .flatten()
+                })
+            })
             .ok_or_else(|| {
                 (
                     StatusCode::NOT_FOUND,
@@ -3181,6 +3196,7 @@ pub async fn generate_workflow_from_session(
         generate_specification: Some(true),
         verification_depth: None,
         discover_ui_bridge_specs: None,
+        simple_mode: None,
     };
 
     let doctor_handle = state.doctor_handle.clone();

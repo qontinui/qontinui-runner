@@ -8,6 +8,8 @@
  * This ensures the config's projectId is always available when execution starts.
  */
 
+import { instanceStorage } from "@/lib/instance-storage";
+
 // Key for storing the config's projectId in localStorage
 // This is SEPARATE from "qontinui-selected-project" which stores the runner's UI selection
 const CONFIG_PROJECT_ID_KEY = "qontinui-config-projectId";
@@ -23,7 +25,7 @@ class ConfigManagerClass {
     console.log(`[CONFIG_MANAGER] Instance #${this.instanceId} created`);
 
     // Restore projectId from localStorage if this is a new instance (e.g., after HMR)
-    const stored = localStorage.getItem(CONFIG_PROJECT_ID_KEY);
+    const stored = instanceStorage.getItem(CONFIG_PROJECT_ID_KEY);
     if (stored) {
       this.currentProjectId = stored;
       console.log(
@@ -44,10 +46,10 @@ class ConfigManagerClass {
 
     // Persist to localStorage for robustness against HMR/module reloads
     if (projectId) {
-      localStorage.setItem(CONFIG_PROJECT_ID_KEY, projectId);
+      instanceStorage.setItem(CONFIG_PROJECT_ID_KEY, projectId);
       console.log(`[CONFIG_MANAGER #${this.instanceId}] Project ID set and persisted:`, projectId);
     } else {
-      localStorage.removeItem(CONFIG_PROJECT_ID_KEY);
+      instanceStorage.removeItem(CONFIG_PROJECT_ID_KEY);
       console.log(`[CONFIG_MANAGER #${this.instanceId}] Project ID cleared`);
     }
   }
@@ -70,7 +72,7 @@ class ConfigManagerClass {
     }
 
     // 2. Check localStorage for persisted config projectId
-    const configProjectId = localStorage.getItem(CONFIG_PROJECT_ID_KEY);
+    const configProjectId = instanceStorage.getItem(CONFIG_PROJECT_ID_KEY);
     if (configProjectId) {
       console.log(
         `[CONFIG_MANAGER #${this.instanceId}] getProjectId returning localStorage config projectId:`,
@@ -85,22 +87,17 @@ class ConfigManagerClass {
     console.log(
       `[CONFIG_MANAGER #${this.instanceId}] getProjectId: no config projectId, checking selected-project fallback`,
     );
-    const stored = localStorage.getItem("qontinui-selected-project");
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored);
-        const fallbackId = parsed.selectedProjectId || null;
-        console.log(
-          `[CONFIG_MANAGER #${this.instanceId}] getProjectId returning selected-project fallback:`,
-          fallbackId,
-        );
-        return fallbackId;
-      } catch {
-        console.log(
-          `[CONFIG_MANAGER #${this.instanceId}] getProjectId: selected-project parse failed`,
-        );
-        return null;
-      }
+    const parsed = instanceStorage.getJSON<{ selectedProjectId?: string } | null>(
+      "qontinui-selected-project",
+      null,
+    );
+    if (parsed) {
+      const fallbackId = parsed.selectedProjectId || null;
+      console.log(
+        `[CONFIG_MANAGER #${this.instanceId}] getProjectId returning selected-project fallback:`,
+        fallbackId,
+      );
+      return fallbackId;
     }
     console.log(
       `[CONFIG_MANAGER #${this.instanceId}] getProjectId returning null (no projectId found)`,
@@ -114,7 +111,7 @@ class ConfigManagerClass {
    */
   clear(): void {
     this.currentProjectId = null;
-    localStorage.removeItem(CONFIG_PROJECT_ID_KEY);
+    instanceStorage.removeItem(CONFIG_PROJECT_ID_KEY);
     console.log(`[CONFIG_MANAGER #${this.instanceId}] State cleared`);
   }
 }

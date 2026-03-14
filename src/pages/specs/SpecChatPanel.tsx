@@ -27,9 +27,11 @@ import { useAiSession } from "@/hooks/useAiSession";
 import { MarkdownViewer } from "@/components/MarkdownViewer";
 import {
   SPEC_CREATION_INSTRUCTIONS,
+  ARCHITECTURE_SPEC_CREATION_INSTRUCTIONS,
   buildDetailedSpecContext,
   buildSpecReviewPrompt,
   buildSpecCreationWithMergeContext,
+  buildArchitectureSpecCreationWithMergeContext,
 } from "@/lib/spec-prompt-builder";
 import type { LoadedSpec, SpecKind } from "./types";
 
@@ -373,6 +375,25 @@ export function SpecChatPanel({
         }
         setPendingCreateType(null);
         await session.sendMessage(message);
+      } else if (pendingCreateType === "architecture") {
+        let message: string;
+        if (selectedSpec && selectedSpec.kind === "architecture") {
+          // Merge mode: existing architecture spec selected
+          message = buildArchitectureSpecCreationWithMergeContext(
+            {
+              specId: selectedSpec.specId,
+              config: selectedSpec.config as unknown as Record<string, unknown>,
+              appName: selectedSpec.appName,
+            },
+            text,
+          );
+          setTargetSpecId(selectedSpec.specId);
+        } else {
+          // Fresh creation
+          message = `${ARCHITECTURE_SPEC_CREATION_INSTRUCTIONS}\n\n---\n\nCreate a comprehensive architecture spec for the following project. Read the source code first, then generate a complete JSON spec.\n\n${text}`;
+        }
+        setPendingCreateType(null);
+        await session.sendMessage(message);
       } else if (selectedSpec) {
         const context = buildSpecContext(selectedSpec);
         await session.sendMessage(`${context}\n\n---\n\n${text}`);
@@ -526,6 +547,28 @@ export function SpecChatPanel({
                       setShowCreateActions(true);
                       setInput(
                         `Page: ${selectedSpec.config.description || selectedSpec.specId}\nSpec ID: ${selectedSpec.specId}`,
+                      );
+                      textareaRef.current?.focus();
+                    }}
+                    className="w-full flex items-center gap-1.5 px-2 py-1.5 text-[10px] text-green-400/70 rounded
+                      bg-green-500/5 border border-green-500/10 hover:bg-green-500/10 hover:text-green-400
+                      transition-colors"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    Regenerate & merge spec
+                  </button>
+                )}
+
+                {/* Regenerate & merge for architecture specs */}
+                {selectedSpec.kind === "architecture" && (
+                  <button
+                    data-ui-id="spec-chat-regenerate-arch"
+                    onClick={() => {
+                      setPendingCreateType("architecture");
+                      setTargetSpecId(selectedSpec.specId);
+                      setShowCreateActions(true);
+                      setInput(
+                        `Project: ${selectedSpec.config.projectName || selectedSpec.specId}\nDescription: ${selectedSpec.config.description || ""}`,
                       );
                       textareaRef.current?.focus();
                     }}

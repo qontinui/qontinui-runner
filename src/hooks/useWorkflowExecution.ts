@@ -18,8 +18,8 @@ import type { WorkflowStage } from "../types/dashboard/activity-types";
 import type {
   TimelineStep,
   ExecutionTimelineData,
-} from "../components/active-dashboard/widgets/execution-timeline/types";
-import type { StepStats } from "../components/active-dashboard/widgets/shared/types";
+} from "@/components/widgets/execution-timeline/types";
+import type { StepStats } from "@/components/widgets/shared/types";
 
 // Re-export context hooks
 export { useWorkflowExecution, useWorkflowExecutionOptional };

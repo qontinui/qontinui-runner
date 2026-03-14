@@ -13,6 +13,7 @@ import type { CooccurrenceExport } from "../types/ui-bridge-types";
 import type { StateMachineState, StateMachineStateCreate } from "@qontinui/shared-types";
 import type { UseStateMachineConfigReturn } from "./useStateMachineConfig";
 import type { ShowToastFn } from "./useToast";
+import { instanceStorage } from "@/lib/instance-storage";
 
 // Discovery result from the fingerprint-based discovery Tauri command.
 // Must match the Rust structs serialized with #[serde(rename_all = "camelCase")].
@@ -58,29 +59,15 @@ interface PersistedDiscoveryState {
 }
 
 function loadPersistedState(): PersistedDiscoveryState | null {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) return JSON.parse(stored) as PersistedDiscoveryState;
-  } catch {
-    // ignore parse errors
-  }
-  return null;
+  return instanceStorage.getJSON<PersistedDiscoveryState | null>(STORAGE_KEY, null);
 }
 
 function savePersistedState(state: PersistedDiscoveryState): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  } catch {
-    // ignore quota errors
-  }
+  instanceStorage.setJSON(STORAGE_KEY, state);
 }
 
 function clearPersistedState(): void {
-  try {
-    localStorage.removeItem(STORAGE_KEY);
-  } catch {
-    // ignore
-  }
+  instanceStorage.removeItem(STORAGE_KEY);
 }
 
 // Tauri IPC response shape
@@ -136,18 +123,29 @@ export function useUIBridgeDiscovery(
 
     setIsDiscovering(true);
     try {
-      const response = await invoke<CommandResponse>(
-        "ui_bridge_discover_states_from_fingerprints",
-        {
-          cooccurrenceExport: cooccurrenceData,
-        },
-      );
+      // Try Tauri IPC first (Python-based discovery)
+      let result: FingerprintDiscoveryResult;
+      try {
+        const response = await invoke<CommandResponse>(
+          "ui_bridge_discover_states_from_fingerprints",
+          {
+            cooccurrenceExport: cooccurrenceData,
+          },
+        );
 
-      if (!response.success) {
-        throw new Error(response.message || "Discovery failed");
+        if (!response.success) {
+          throw new Error(response.message || "Discovery failed");
+        }
+        result = response.data as FingerprintDiscoveryResult;
+      } catch (ipcErr) {
+        // Fallback: run discovery in JS when extraction executor is unavailable
+        console.warn(
+          "[useUIBridgeDiscovery] Tauri IPC failed, running JS-based discovery:",
+          ipcErr,
+        );
+        result = discoverStatesFromFingerprints(cooccurrenceData);
       }
 
-      const result = response.data as FingerprintDiscoveryResult;
       setDiscoveryResult(result);
       showToast?.(`Discovered ${result.states.length} states`, "success");
       console.log(`[useUIBridgeDiscovery] Discovered ${result.states.length} states`);
@@ -183,7 +181,7 @@ export function useUIBridgeDiscovery(
     try {
       const config = await smConfig.createConfig({
         name: configName.trim(),
-        description: `Discovered from ${cooccurrenceData.presenceMatrix.length} captures via ${dataSource || "unknown"}`,
+        description: `Discovered from ${cooccurrenceData.presenceMatrix?.length ?? 0} captures via ${dataSource || "unknown"}`,
       });
 
       // Create states via direct Tauri IPC to avoid React state batching issue.
@@ -252,5 +250,214 @@ export function useUIBridgeDiscovery(
     runDiscovery,
     saveConfig,
     reset,
+  };
+}
+
+/**
+ * JS-based fallback for fingerprint state discovery.
+ * Groups fingerprints into states by position zone and structural similarity,
+ * using co-occurrence data for confidence scoring.
+ */
+function discoverStatesFromFingerprints(data: CooccurrenceExport): FingerprintDiscoveryResult {
+  const allFingerprints = data.allFingerprints ?? [];
+  const presenceMatrix = data.presenceMatrix ?? [];
+  const fingerprintDetails = data.fingerprintDetails ?? {};
+  const transitions = data.transitions ?? [];
+  const totalCaptures = presenceMatrix.length;
+  if (totalCaptures === 0 || allFingerprints.length === 0) {
+    return {
+      states: [],
+      transitions: [],
+      statistics: {
+        totalCaptures: 0,
+        totalTransitions: 0,
+        uniqueFingerprints: 0,
+        discoveredStates: 0,
+        globalStates: 0,
+        modalStates: 0,
+        discoveredTransitions: 0,
+      },
+    };
+  }
+
+  // Build fingerprint appearance counts
+  const fpAppearances = new Map<string, number>();
+  for (const fp of allFingerprints) fpAppearances.set(fp, 0);
+  for (const capture of presenceMatrix) {
+    for (const fp of capture.fingerprints) {
+      fpAppearances.set(fp, (fpAppearances.get(fp) ?? 0) + 1);
+    }
+  }
+
+  // Identify global fingerprints (appear in >80% of captures)
+  const globalThreshold = totalCaptures * 0.8;
+  const globalFps = new Set<string>();
+  for (const [fp, count] of fpAppearances) {
+    if (count >= globalThreshold) globalFps.add(fp);
+  }
+
+  // Group non-global fingerprints by position zone and landmark context
+  // This creates meaningful states based on UI regions
+  const zoneGroups = new Map<string, string[]>();
+  const nonGlobalFps = allFingerprints.filter((fp) => !globalFps.has(fp));
+
+  for (const fp of nonGlobalFps) {
+    const detail = fingerprintDetails[fp];
+    if (!detail) continue;
+
+    // Create a group key from zone + landmark + structural path prefix
+    const zone = detail.positionZone || "main";
+    const landmark = detail.landmarkContext || "none";
+    const structPrefix = detail.structuralPath?.split(" > ").slice(0, 3).join(" > ") || "";
+    const groupKey = `${zone}|${landmark}|${structPrefix}`;
+
+    if (!zoneGroups.has(groupKey)) {
+      zoneGroups.set(groupKey, []);
+    }
+    zoneGroups.get(groupKey)!.push(fp);
+  }
+
+  // If zone grouping produced only 1 group (e.g., everything is "main"),
+  // split further by structural path and role
+  if (zoneGroups.size <= 1 && nonGlobalFps.length > 5) {
+    zoneGroups.clear();
+    for (const fp of nonGlobalFps) {
+      const detail = fingerprintDetails[fp];
+      if (!detail) continue;
+      const zone = detail.positionZone || "main";
+      const role = detail.role || detail.tagName || "unknown";
+      const size = detail.sizeCategory || "medium";
+      const groupKey = `${zone}|${role}|${size}`;
+
+      if (!zoneGroups.has(groupKey)) {
+        zoneGroups.set(groupKey, []);
+      }
+      zoneGroups.get(groupKey)!.push(fp);
+    }
+  }
+
+  // Build states from groups
+  const states: FingerprintDiscoveryResult["states"] = [];
+  let stateIndex = 0;
+
+  // Global state
+  if (globalFps.size > 0) {
+    states.push({
+      stateId: "state-global",
+      name: "Global (persistent UI)",
+      fingerprintHashes: [...globalFps],
+      elementIds: [...globalFps],
+      positionZone: "global",
+      isGlobal: true,
+      isModal: false,
+      confidence: 1.0,
+      observationCount: totalCaptures,
+    });
+  }
+
+  // Named zone states
+  const zoneNames: Record<string, string> = {
+    header: "Header",
+    footer: "Footer",
+    "sidebar-left": "Left Sidebar",
+    "sidebar-right": "Right Sidebar",
+    main: "Main Content",
+    modal: "Modal Dialog",
+    "fixed-top": "Top Bar",
+    "fixed-bottom": "Bottom Bar",
+  };
+
+  for (const [groupKey, fps] of zoneGroups) {
+    if (fps.length === 0) continue;
+    const [zone, landmark, structOrRole] = groupKey.split("|");
+
+    // Compute a human-readable name
+    let name = zoneNames[zone] || zone;
+    if (landmark && landmark !== "none") {
+      name = landmark.charAt(0).toUpperCase() + landmark.slice(1);
+    }
+    if (structOrRole && structOrRole !== "none" && structOrRole !== "unknown") {
+      // Use last part of structural path or role for disambiguation
+      const suffix = structOrRole.includes(" > ") ? structOrRole.split(" > ").pop() : structOrRole;
+      if (suffix && suffix !== name.toLowerCase()) {
+        name = `${name} — ${suffix}`;
+      }
+    }
+
+    // Compute confidence from appearance rate
+    const avgAppearance =
+      fps.reduce((sum, fp) => sum + (fpAppearances.get(fp) ?? 0), 0) / fps.length;
+    const confidence = Math.min(1.0, avgAppearance / totalCaptures);
+
+    stateIndex++;
+    states.push({
+      stateId: `state-${stateIndex}`,
+      name: `${name} (${fps.length} elements)`,
+      fingerprintHashes: fps,
+      elementIds: fps,
+      positionZone: zone,
+      isGlobal: false,
+      isModal: zone === "modal",
+      confidence,
+      observationCount: Math.round(avgAppearance),
+    });
+  }
+
+  // Map transitions between captures to state transitions
+  const discoveredTransitions: FingerprintDiscoveryResult["transitions"] = [];
+  if (transitions && transitions.length > 0) {
+    // Build capture→state mapping based on which state's fingerprints are present
+    const captureToStates = new Map<string, Set<string>>();
+    for (const capture of presenceMatrix) {
+      const presentStates = new Set<string>();
+      for (const st of states) {
+        if (st.isGlobal) continue;
+        const overlap = st.fingerprintHashes.filter((fp) =>
+          capture.fingerprints.includes(fp),
+        ).length;
+        if (overlap > 0) presentStates.add(st.stateId);
+      }
+      captureToStates.set(capture.captureId, presentStates);
+    }
+
+    const transitionCounts = new Map<string, { count: number; actionType: string }>();
+    for (const t of transitions) {
+      const beforeStates = captureToStates.get(t.beforeCaptureId);
+      const afterStates = captureToStates.get(t.afterCaptureId);
+      if (!beforeStates || !afterStates) continue;
+
+      // Find states that appeared or disappeared
+      for (const toId of afterStates) {
+        if (!beforeStates.has(toId)) {
+          for (const fromId of beforeStates) {
+            if (!afterStates.has(fromId)) {
+              const key = `${fromId}->${toId}`;
+              const existing = transitionCounts.get(key);
+              if (existing) existing.count++;
+              else transitionCounts.set(key, { count: 1, actionType: t.actionType });
+            }
+          }
+        }
+      }
+    }
+
+    for (const [key, { count, actionType }] of transitionCounts) {
+      const [fromStateId, toStateId] = key.split("->");
+      discoveredTransitions.push({ fromStateId, toStateId, actionType, count });
+    }
+  }
+
+  return {
+    states,
+    transitions: discoveredTransitions,
+    statistics: {
+      totalCaptures,
+      totalTransitions: discoveredTransitions.length,
+      uniqueFingerprints: allFingerprints.length,
+      discoveredStates: states.length,
+      globalStates: states.filter((s) => s.isGlobal).length,
+      modalStates: states.filter((s) => s.isModal).length,
+      discoveredTransitions: discoveredTransitions.length,
+    },
   };
 }

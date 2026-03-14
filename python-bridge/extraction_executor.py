@@ -76,10 +76,21 @@ logger = logging.getLogger(__name__)
 qontinui_src_path = Path(__file__).parent.parent.parent / "qontinui" / "src"
 sys.path.insert(0, str(qontinui_src_path))
 
-# Import our specialized modules
+# Import our specialized modules (lazy imports for services that may have missing deps)
 from event_manager import EventManager, EventType  # noqa: E402
-from services.vision_extraction_service import VisionExtractionService  # noqa: E402
-from services.web_extraction_service import WebExtractionService  # noqa: E402
+
+try:
+    from services.vision_extraction_service import VisionExtractionService  # noqa: E402
+except ImportError as _vision_import_err:
+    VisionExtractionService = None  # type: ignore[assignment,misc]
+    logger.warning(f"VisionExtractionService unavailable: {_vision_import_err}")
+
+try:
+    from services.web_extraction_service import WebExtractionService  # noqa: E402
+except ImportError as _web_import_err:
+    WebExtractionService = None  # type: ignore[assignment,misc]
+    logger.warning(f"WebExtractionService unavailable: {_web_import_err}")
+
 from websocket_handler import WebSocketHandler  # noqa: E402
 
 
@@ -206,6 +217,8 @@ class ExtractionExecutor:
                 return self._handle_ws_connect()
             elif cmd_name == "ws_disconnect":
                 return self._handle_ws_disconnect()
+            elif cmd_name == "discover_states_from_fingerprints":
+                return self._handle_discover_states_from_fingerprints(params)
             else:
                 return {
                     "success": False,
@@ -447,6 +460,136 @@ class ExtractionExecutor:
         except Exception as e:
             logger.error(f"Failed to disconnect WebSocket: {e}")
             return {"success": False, "error": str(e)}
+
+    def _handle_discover_states_from_fingerprints(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Discover states from fingerprint co-occurrence data using the qontinui library."""
+        logger.info("Starting fingerprint state discovery")
+
+        try:
+            # Import using importlib to bypass qontinui root __init__ (which pulls in cv2, PIL, etc.)
+            import importlib.util
+
+            _sm_pkg_path = Path(__file__).parent.parent.parent / "qontinui" / "src" / "qontinui" / "state_machine"
+
+            def _load_mod(name: str, file: str):
+                spec = importlib.util.spec_from_file_location(name, str(_sm_pkg_path / file))
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[name] = mod
+                spec.loader.exec_module(mod)
+                return mod
+
+            # Load fingerprint_types first (dependency), then the main module
+            _ft_mod = _load_mod("qontinui.state_machine.fingerprint_types", "fingerprint_types.py")
+            _fd_mod = _load_mod("qontinui.state_machine.fingerprint_state_discovery", "fingerprint_state_discovery.py")
+
+            FingerprintStateDiscovery = _fd_mod.FingerprintStateDiscovery
+            FingerprintStateDiscoveryConfig = _fd_mod.FingerprintStateDiscoveryConfig
+
+            cooccurrence_export = params.get("cooccurrence_export")
+            if not cooccurrence_export:
+                return {"success": False, "error": "No cooccurrence_export provided"}
+
+            user_config = params.get("config") or {}
+            min_cooccurrence_rate = (
+                user_config.get("minCooccurrenceRate", 0.95)
+                if user_config
+                else 0.95
+            )
+
+            presence_matrix = cooccurrence_export.get("presenceMatrix", [])
+            fingerprint_stats = cooccurrence_export.get("fingerprintStats", {})
+            logger.info(
+                f"Input: {len(presence_matrix)} captures, "
+                f"{len(fingerprint_stats)} unique fingerprints"
+            )
+
+            config = FingerprintStateDiscoveryConfig(
+                min_cooccurrence_rate=min_cooccurrence_rate,
+            )
+            discovery = FingerprintStateDiscovery(config=config)
+            discovery.load_cooccurrence_export(cooccurrence_export)
+            discovered_states = discovery.discover_states()
+
+            logger.info(f"Discovered {len(discovered_states)} states")
+
+            raw_transitions = discovery.get_transitions()
+            state_transitions = self._map_transitions_to_states(raw_transitions, discovered_states)
+            stats = discovery.get_statistics()
+
+            result = {
+                "states": [
+                    {
+                        "stateId": state.state_id,
+                        "name": state.name,
+                        "fingerprintHashes": list(state.fingerprint_hashes),
+                        "elementIds": list(state.element_ids),
+                        "positionZone": state.position_zone,
+                        "landmarkContext": state.landmark_context,
+                        "isGlobal": state.is_global,
+                        "isModal": state.is_modal,
+                        "repeatPatternCount": getattr(state, "repeat_pattern_count", 0),
+                        "confidence": state.confidence,
+                        "observationCount": getattr(state, "observation_count", 0),
+                    }
+                    for state in discovered_states
+                ],
+                "transitions": state_transitions,
+                "statistics": {
+                    "totalCaptures": stats.get("total_captures", 0),
+                    "totalTransitions": stats.get("total_transitions", 0),
+                    "uniqueFingerprints": stats.get("total_fingerprints", 0),
+                    "discoveredStates": stats.get("discovered_states", 0),
+                    "globalStates": stats.get("global_states", 0),
+                    "modalStates": stats.get("modal_states", 0),
+                    "discoveredTransitions": len(state_transitions),
+                },
+            }
+
+            return {"success": True, "data": result}
+
+        except Exception as e:
+            logger.error(f"Fingerprint state discovery failed: {e}")
+            traceback.print_exc(file=sys.stderr)
+            return {"success": False, "error": str(e)}
+
+    def _map_transitions_to_states(
+        self,
+        raw_transitions: list[Any],
+        discovered_states: list[Any],
+    ) -> list[dict[str, Any]]:
+        """Map raw transitions to state transitions."""
+        fp_to_state: dict[str, str] = {}
+        for state in discovered_states:
+            for fp in state.fingerprint_hashes:
+                fp_to_state[fp] = state.state_id
+
+        state_transitions: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for t in raw_transitions:
+            target_fp = getattr(t, "target_fingerprint", "")
+            action_type = getattr(t, "action_type", "click")
+            before_fps = set(getattr(t, "before_fingerprints", []))
+            after_fps = set(getattr(t, "after_fingerprints", []))
+
+            before_states = {fp_to_state.get(fp) for fp in before_fps if fp in fp_to_state}
+            after_states = {fp_to_state.get(fp) for fp in after_fps if fp in fp_to_state}
+            before_states.discard(None)
+            after_states.discard(None)
+
+            for from_state in before_states - after_states:
+                for to_state in after_states - before_states:
+                    key = f"{from_state}->{to_state}"
+                    if key not in seen:
+                        seen.add(key)
+                        state_transitions.append({
+                            "fromStateId": from_state,
+                            "toStateId": to_state,
+                            "actionType": action_type,
+                            "count": 1,
+                        })
+
+        return state_transitions
 
 
 def main():

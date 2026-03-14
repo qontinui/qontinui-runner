@@ -7,6 +7,7 @@
  */
 
 import { useState, useEffect, useRef } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import { X, Wifi, Cloud, LogOut, User, Tag, ChevronDown, Check } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { useAuth } from "../AuthProvider";
@@ -50,15 +51,15 @@ export function AuthConnectionSettings({
   const [showProjectDropdown, setShowProjectDropdown] = useState(false);
   const projectDropdownRef = useRef<HTMLDivElement>(null);
 
-  // Runner name state - persisted in localStorage
+  // Runner name state - persisted in instanceStorage
   const [runnerName, setRunnerName] = useState<string>(() => {
-    return localStorage.getItem(RUNNER_NAME_STORAGE_KEY) || "";
+    return instanceStorage.getItem(RUNNER_NAME_STORAGE_KEY) || "";
   });
 
-  // Persist runner name to localStorage and dispatch event for StatusIndicator
+  // Persist runner name to instanceStorage and dispatch event for StatusIndicator
   const handleRunnerNameChange = (name: string) => {
     setRunnerName(name);
-    localStorage.setItem(RUNNER_NAME_STORAGE_KEY, name);
+    instanceStorage.setItem(RUNNER_NAME_STORAGE_KEY, name);
     // Dispatch custom event so StatusIndicator can update
     window.dispatchEvent(new CustomEvent("runner-name-changed", { detail: name }));
   };

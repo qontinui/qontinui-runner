@@ -6,6 +6,7 @@
  */
 
 import { useState, useEffect } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import { AuthConnectionSettings } from "./AuthConnectionSettings";
 import { GeneralSettings } from "./GeneralSettings";
 import { StorageSettings } from "./StorageSettings";
@@ -34,7 +35,7 @@ interface WebSocketState {
 }
 
 interface SettingsProps {
-  /** Default tab to open. If provided, overrides localStorage persistence. */
+  /** Default tab to open. If provided, overrides instanceStorage persistence. */
   defaultTab?: string;
   onLog: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
   onDebugModeChange: (enabled: boolean) => void;
@@ -100,7 +101,7 @@ export function Settings({
       return defaultTab as SettingsTab;
     }
     // Otherwise load persisted tab on mount
-    const stored = localStorage.getItem(STORAGE_KEY);
+    const stored = instanceStorage.getItem(STORAGE_KEY);
     // Handle migration from old "connection" tab name
     if (stored === "connection") {
       return "account";
@@ -120,7 +121,7 @@ export function Settings({
 
   // Persist active tab
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, activeTab);
+    instanceStorage.setItem(STORAGE_KEY, activeTab);
   }, [activeTab]);
 
   const renderContent = () => {

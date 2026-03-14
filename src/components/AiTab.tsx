@@ -46,8 +46,9 @@ import { useRunSelectionOptional } from "../contexts/RunSelectionContext";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import { PageTutorialMenu } from "./tutorial";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { instanceStorage } from "@/lib/instance-storage";
 
-// localStorage key for stats panel collapse
+// instanceStorage key for stats panel collapse
 const STORAGE_KEY_STATS_COLLAPSED = "aiTab.statsCollapsed";
 
 // Special value to indicate "All Sessions" is explicitly selected
@@ -91,7 +92,7 @@ export function AiTab({
 }: AiTabProps) {
   // Stats panel collapse state (persisted)
   const [statsCollapsed, setStatsCollapsed] = useState(() => {
-    const stored = localStorage.getItem(STORAGE_KEY_STATS_COLLAPSED);
+    const stored = instanceStorage.getItem(STORAGE_KEY_STATS_COLLAPSED);
     return stored === "true";
   });
 
@@ -131,7 +132,7 @@ export function AiTab({
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(() => {
     // Check for pending navigation from Recap page
     try {
-      const pending = localStorage.getItem("qontinui-ai-output-navigate");
+      const pending = instanceStorage.getItem("qontinui-ai-output-navigate");
       if (pending) {
         // Don't consume yet - we need loops to be available first
         // Just signal that we have a pending navigation
@@ -183,11 +184,11 @@ export function AiTab({
     if (loops.length === 0) return;
 
     try {
-      const pending = localStorage.getItem("qontinui-ai-output-navigate");
+      const pending = instanceStorage.getItem("qontinui-ai-output-navigate");
       if (!pending) return;
 
       // Consume the navigation intent immediately
-      localStorage.removeItem("qontinui-ai-output-navigate");
+      instanceStorage.removeItem("qontinui-ai-output-navigate");
 
       const { phase, phaseIteration } = JSON.parse(pending) as {
         phase: string;
@@ -220,13 +221,13 @@ export function AiTab({
       }
     } catch {
       // Ignore parse errors
-      localStorage.removeItem("qontinui-ai-output-navigate");
+      instanceStorage.removeItem("qontinui-ai-output-navigate");
     }
   }, [loops]);
 
   // Persist stats collapse state
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_STATS_COLLAPSED, String(statsCollapsed));
+    instanceStorage.setItem(STORAGE_KEY_STATS_COLLAPSED, String(statsCollapsed));
   }, [statsCollapsed]);
 
   // Close dropdown when clicking outside

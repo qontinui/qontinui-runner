@@ -2911,3 +2911,21 @@ CREATE INDEX IF NOT EXISTS idx_rule_apps_rule ON rule_applications(rule_id);
 CREATE INDEX IF NOT EXISTS idx_rule_apps_workflow ON rule_applications(workflow_id);
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (106, datetime('now'));
+
+-- =============================================================================
+-- Cached App Specs (from version 69 migration)
+-- =============================================================================
+-- Stores specs discovered from UI Bridge SDK-integrated apps via /control/specs.
+-- Used by the Architecture page to display project architecture diagrams.
+
+CREATE TABLE IF NOT EXISTS cached_app_specs (
+    id TEXT PRIMARY KEY,
+    app_url TEXT NOT NULL,
+    app_name TEXT NOT NULL,
+    spec_id TEXT NOT NULL,
+    spec_json TEXT NOT NULL,
+    discovered_at TEXT NOT NULL,
+    page_url TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cached_specs_app ON cached_app_specs(app_url);

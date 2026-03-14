@@ -14,6 +14,7 @@
  */
 
 import { useState, useCallback, useMemo, useEffect, useRef } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
@@ -316,9 +317,9 @@ export function ElementDescriptionPanel({
     aiDescriptions: number;
   } | null>(null);
   const [selectedFramework, setSelectedFramework] = useState<string>(() => {
-    // Load from localStorage, default to Playwright
+    // Load from instanceStorage, default to Playwright
     if (typeof window !== "undefined") {
-      return localStorage.getItem("qontinui-preferred-framework") || "playwright";
+      return instanceStorage.getItem("qontinui-preferred-framework") || "playwright";
     }
     return "playwright";
   });
@@ -326,10 +327,10 @@ export function ElementDescriptionPanel({
   // Track if we've loaded descriptions for the current page
   const loadedPageRef = useRef<string | null>(null);
 
-  // Save framework preference to localStorage
+  // Save framework preference to instanceStorage
   useEffect(() => {
     if (typeof window !== "undefined") {
-      localStorage.setItem("qontinui-preferred-framework", selectedFramework);
+      instanceStorage.setItem("qontinui-preferred-framework", selectedFramework);
     }
   }, [selectedFramework]);
 

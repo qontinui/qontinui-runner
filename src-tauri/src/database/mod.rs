@@ -6542,6 +6542,40 @@ impl CheckpointDb {
             }
         }
 
+        // Repair migration: cached_app_specs table may be missing on databases created from
+        // schema.sql before the table was added (schema.sql skipped migration 69).
+        {
+            let has_table: bool = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='cached_app_specs'",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(0))
+                        .map(|rows| rows.filter_map(|r| r.ok()).count() > 0)
+                })
+                .unwrap_or(false);
+
+            if !has_table {
+                info!("Repair: creating missing cached_app_specs table");
+                conn.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS cached_app_specs (
+                        id TEXT PRIMARY KEY,
+                        app_url TEXT NOT NULL,
+                        app_name TEXT NOT NULL,
+                        spec_id TEXT NOT NULL,
+                        spec_json TEXT NOT NULL,
+                        discovered_at TEXT NOT NULL,
+                        page_url TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_cached_specs_app ON cached_app_specs(app_url);
+                    "#,
+                )
+                .map_err(|e| format!("Failed to repair cached_app_specs: {}", e))?;
+                info!("Repair: successfully created cached_app_specs table");
+            }
+        }
+
         Ok(())
     }
 
@@ -13348,7 +13382,7 @@ impl CheckpointDb {
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
-                   quality_report
+                   quality_report, constraint_overrides
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -13459,7 +13493,7 @@ impl CheckpointDb {
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
-                   quality_report
+                   quality_report, constraint_overrides
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -14014,7 +14048,7 @@ impl CheckpointDb {
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
-                   quality_report
+                   quality_report, constraint_overrides
             FROM unified_workflows
             WHERE 1=1
             "#,

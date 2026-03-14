@@ -298,7 +298,35 @@ impl ExtractionExecutor {
 
     /// Start extraction executor on-demand if not already running.
     pub fn ensure_started(&mut self) -> Result<(), String> {
-        if self.process.is_none() {
+        let needs_start = if self.process.is_none() {
+            true
+        } else if !self.is_running_internal() {
+            // Process handle exists but process has crashed/exited — clean up and restart
+            warn!("Extraction executor process is dead, restarting...");
+            self.process = None;
+            true
+        } else {
+            false
+        };
+
+        if needs_start {
+            // Reset lifecycle to Initializing so the new process can transition to Ready
+            let lifecycle = Arc::clone(&self.lifecycle);
+            let reset_result = self.runtime.block_on(async {
+                let lc = lifecycle.read().await;
+                lc.set_state(crate::executor::state::ExecutorState::Initializing {
+                    started_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                })
+                .await
+            });
+            match &reset_result {
+                Ok(()) => info!("Lifecycle reset to Initializing"),
+                Err(e) => error!("Failed to reset lifecycle: {}", e),
+            }
+
             info!("Starting extraction executor on-demand");
             self.start_internal()?;
 

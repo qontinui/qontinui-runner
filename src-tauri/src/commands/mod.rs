@@ -135,6 +135,10 @@ pub struct AppState {
     /// This allows extraction (which uses Playwright) to run concurrently with
     /// GUI automation workflows (which use HAL).
     pub extraction_executor: Mutex<Option<ExtractionExecutor>>,
+    /// Shared SDK connection for UI Bridge (shared with ApiState)
+    pub sdk_connection: Arc<TokioMutex<crate::mcp::sdk_client::SdkConnectionManager>>,
+    /// Cancel token for native exploration (allows stopping from another command)
+    pub exploration_cancel: Arc<TokioMutex<Option<tokio_util::sync::CancellationToken>>>,
     pub current_config: Mutex<Option<QontinuiConfig>>,
     pub display_processor: Arc<TokioMutex<DisplayProcessor>>,
     pub local_storage: Arc<Mutex<LocalStorage>>,

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import type { ReactNode } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import { Search } from "lucide-react";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import type { TerminalTab } from "./useTerminalManager";
@@ -143,15 +144,9 @@ export function CommandPalette({
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [prevQuery, setPrevQuery] = useState("");
-  const [recentIds, setRecentIds] = useState<string[]>(() => {
-    try {
-      const stored = localStorage.getItem("zone-recent-commands");
-      if (stored) return JSON.parse(stored) as string[];
-    } catch {
-      // intentionally empty
-    }
-    return [];
-  });
+  const [recentIds, setRecentIds] = useState<string[]>(() =>
+    instanceStorage.getJSON<string[]>("zone-recent-commands", []),
+  );
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -405,7 +400,7 @@ export function CommandPalette({
     (action: PaletteAction) => {
       setRecentIds((prev) => {
         const next = [action.id, ...prev.filter((id) => id !== action.id)].slice(0, 5);
-        localStorage.setItem("zone-recent-commands", JSON.stringify(next));
+        instanceStorage.setJSON("zone-recent-commands", next);
         return next;
       });
       action.action();
@@ -577,7 +572,7 @@ export function CommandPalette({
                 <button
                   onClick={() => {
                     setRecentIds([]);
-                    localStorage.removeItem("zone-recent-commands");
+                    instanceStorage.removeItem("zone-recent-commands");
                   }}
                   className="w-full px-4 py-1 text-[10px] text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/30 transition-colors text-left"
                 >

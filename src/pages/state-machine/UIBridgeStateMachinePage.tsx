@@ -144,7 +144,9 @@ export function UIBridgeStateMachinePage() {
       <div className="flex items-center justify-between px-6 py-4 border-b border-border-primary bg-surface-primary">
         <div className="flex items-center gap-3">
           <Network className="size-5 text-brand-primary" />
-          <h1 className="text-lg font-semibold text-text-primary">UI Bridge States</h1>
+          <h1 className="text-lg font-semibold text-text-primary">
+            {sm.activeConfig ? sm.activeConfig.name : "UI Bridge States"}
+          </h1>
         </div>
 
         <div className="flex items-center gap-3">
@@ -160,7 +162,8 @@ export function UIBridgeStateMachinePage() {
                 sm.setActiveConfig(null);
               }
             }}
-            className="w-[220px] h-9 rounded-md border border-border-primary bg-surface-primary px-3 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-primary"
+            className="w-[220px] h-9 rounded-md border border-border-primary bg-surface-primary px-3 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-primary [&>option]:text-black [&>option]:bg-white"
+            style={{ colorScheme: "dark" }}
           >
             <option value="">Select configuration...</option>
             {sm.configs.map((c) => (

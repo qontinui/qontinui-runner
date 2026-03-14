@@ -76,11 +76,22 @@ use crate::mcp::awas::{
 };
 
 use crate::mcp::shared::get_workspace_paths_internal;
-use crate::mcp::types::{ApiResponse, ApiState};
+use crate::mcp::types::ApiState;
 
-/// Health check endpoint
-async fn health() -> Json<ApiResponse<String>> {
-    Json(ApiResponse::success("ok".to_string()))
+/// Health check endpoint.
+/// Includes `uiBridge` metadata so the app discovery scanner can detect the runner.
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "success": true,
+        "data": "ok",
+        "uiBridge": {
+            "appId": "qontinui-runner",
+            "appName": "Qontinui Runner",
+            "appType": "desktop",
+            "framework": "tauri",
+            "capabilities": ["control", "renderLog", "debug"],
+        }
+    }))
 }
 
 /// Create the API router
@@ -119,6 +130,7 @@ pub fn create_router(
     ));
 
     let current_ai_pids = app_state.ai_pid_tracker.clone();
+    let shared_sdk_connection = app_state.sdk_connection.clone();
     let api_state = Arc::new(ApiState {
         app_state,
         rag_state,
@@ -128,9 +140,7 @@ pub fn create_router(
         action_service,
         current_ai_pids,
         extraction_state: Arc::new(crate::mcp::extraction::ExtractionState::new()),
-        sdk_connection: Arc::new(tokio::sync::Mutex::new(
-            crate::mcp::sdk_client::SdkConnectionManager::new(),
-        )),
+        sdk_connection: shared_sdk_connection,
         ui_bridge_pending: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         doctor_handle: None, // Doctor handle accessed via app_state.doctor_handle when needed
     });
@@ -329,6 +339,7 @@ pub fn create_router(
     Router::new()
         // Local routes
         .route("/health", get(health))
+        .route("/ui-bridge/health", get(health))
         // AWAS routes (imported directly)
         .route("/awas/discover", post(awas_discover))
         .route("/awas/execute", post(awas_execute))

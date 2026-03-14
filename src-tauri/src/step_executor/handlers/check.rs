@@ -888,6 +888,10 @@ impl CheckHandler {
         let result = match ai_result {
             Ok(response) => {
                 if !response.success {
+                    // Detect interruption: fast failure with no meaningful error
+                    if duration_ms < 5000 && response.error.is_none() {
+                        return StepHandlerResult::interrupted();
+                    }
                     let err = response
                         .error
                         .unwrap_or_else(|| "AI review failed".to_string());
@@ -951,7 +955,12 @@ impl CheckHandler {
                     }
                 }
             }
-            Err(e) => (false, format!("Failed to run AI review: {}", e), None),
+            Err(e) => {
+                if e.is_cancelled() || duration_ms < 5000 {
+                    return StepHandlerResult::interrupted();
+                }
+                (false, format!("Failed to run AI review: {}", e), None)
+            }
         };
 
         let (success, error_msg, output_data) = result;

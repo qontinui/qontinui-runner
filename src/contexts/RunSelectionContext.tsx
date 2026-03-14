@@ -18,6 +18,7 @@ import {
 import { useExecution } from "./ExecutionContext";
 import { useTaskRuns, useTaskRun } from "../hooks/useAiData";
 import type { TaskRun } from "../types/aiData";
+import { instanceStorage } from "@/lib/instance-storage";
 
 // Store context in window to survive HMR
 declare global {
@@ -69,14 +70,9 @@ export function RunSelectionProvider({ children }: RunSelectionProviderProps) {
   // Get configId from loaded config (for reference, not used for filtering)
   const configId = config?.name && config.name.length > 0 ? config.name : (config?.path ?? null);
 
-  // Load saved selection from localStorage (global, not config-scoped)
+  // Load saved selection from instanceStorage (global, not config-scoped)
   const [selectedRunId, setSelectedRunIdState] = useState<string | null>(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      return stored ? JSON.parse(stored) : null;
-    } catch {
-      return null;
-    }
+    return instanceStorage.getJSON<string | null>(STORAGE_KEY, null);
   });
 
   // Fetch recent task runs (not filtered by config)
@@ -103,9 +99,9 @@ export function RunSelectionProvider({ children }: RunSelectionProviderProps) {
     // If there's a running run that wasn't in previous list, auto-select it
     if (runningRun && !prevRunIdsRef.current.has(runningRun.id)) {
       setSelectedRunIdState(runningRun.id);
-      // Also persist to localStorage
+      // Also persist to instanceStorage
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(runningRun.id));
+        instanceStorage.setJSON(STORAGE_KEY, runningRun.id);
       } catch {
         // Ignore storage errors
       }
@@ -115,14 +111,14 @@ export function RunSelectionProvider({ children }: RunSelectionProviderProps) {
     prevRunIdsRef.current = currentIds;
   }, [recentRuns]);
 
-  // Persist selection to localStorage
+  // Persist selection to instanceStorage
   const setSelectedRunId = useCallback((id: string | null) => {
     setSelectedRunIdState(id);
     try {
       if (id) {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(id));
+        instanceStorage.setJSON(STORAGE_KEY, id);
       } else {
-        localStorage.removeItem(STORAGE_KEY);
+        instanceStorage.removeItem(STORAGE_KEY);
       }
     } catch {
       // Ignore storage errors

@@ -7,6 +7,7 @@
 
 import { useState, useCallback, useMemo } from "react";
 import type { ActivityType } from "../../types/dashboard/activity-types";
+import { instanceStorage } from "@/lib/instance-storage";
 
 const STORAGE_KEY = "qontinui-widget-prefs";
 
@@ -45,33 +46,27 @@ export interface UseWidgetPreferencesResult {
 }
 
 /**
- * Read preferences from localStorage.
+ * Read preferences from instanceStorage.
  */
 function readPrefs(): WidgetPrefs {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      return {
-        pinned: Array.isArray(parsed.pinned) ? parsed.pinned : [],
-        hidden: Array.isArray(parsed.hidden) ? parsed.hidden : [],
-      };
-    }
-  } catch {
-    // localStorage may be unavailable or corrupted
+  const parsed = instanceStorage.getJSON<{ pinned?: unknown; hidden?: unknown } | null>(
+    STORAGE_KEY,
+    null,
+  );
+  if (parsed) {
+    return {
+      pinned: Array.isArray(parsed.pinned) ? parsed.pinned : [],
+      hidden: Array.isArray(parsed.hidden) ? parsed.hidden : [],
+    };
   }
   return { pinned: [], hidden: [] };
 }
 
 /**
- * Write preferences to localStorage.
+ * Write preferences to instanceStorage.
  */
 function writePrefs(prefs: WidgetPrefs): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
-  } catch {
-    // localStorage may be unavailable
-  }
+  instanceStorage.setJSON(STORAGE_KEY, prefs);
 }
 
 /**

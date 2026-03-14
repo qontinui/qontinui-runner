@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 
 const GROUP_COLORS = ["#bb9af7", "#7aa2f7", "#9ece6a", "#e0af68", "#f7768e", "#7dcfff"];
 
@@ -25,34 +26,17 @@ export function useZoneLabelsAndTags(
 ): UseZoneLabelsAndTagsReturn {
   // ── State ─────────────────────────────────────────────────────────────────
 
-  const [zoneLabels, setZoneLabels] = useState<Record<number, string>>(() => {
-    try {
-      const stored = localStorage.getItem(`zone-labels-${layoutId}`);
-      if (stored) return JSON.parse(stored) as Record<number, string>;
-    } catch {
-      // intentionally empty
-    }
-    return {};
-  });
+  const [zoneLabels, setZoneLabels] = useState<Record<number, string>>(() =>
+    instanceStorage.getJSON<Record<number, string>>(`zone-labels-${layoutId}`, {}),
+  );
 
-  const [zoneNotes, setZoneNotes] = useState<Record<number, string>>(() => {
-    try {
-      const stored = localStorage.getItem(`zone-notes-${layoutId}`);
-      if (stored) return JSON.parse(stored) as Record<number, string>;
-    } catch {
-      // intentionally empty
-    }
-    return {};
-  });
+  const [zoneNotes, setZoneNotes] = useState<Record<number, string>>(() =>
+    instanceStorage.getJSON<Record<number, string>>(`zone-notes-${layoutId}`, {}),
+  );
 
   const [pinnedZones, setPinnedZones] = useState<Set<number>>(() => {
-    try {
-      const stored = localStorage.getItem(`zone-pinned-${layoutId}`);
-      if (stored) return new Set(JSON.parse(stored) as number[]);
-    } catch {
-      // intentionally empty
-    }
-    return new Set();
+    const stored = instanceStorage.getJSON<number[]>(`zone-pinned-${layoutId}`, []);
+    return new Set(stored);
   });
 
   const [activeTagFilters, setActiveTagFilters] = useState<Set<string>>(new Set());
@@ -93,15 +77,15 @@ export function useZoneLabelsAndTags(
   // ── Persist to localStorage ───────────────────────────────────────────────
 
   useEffect(() => {
-    localStorage.setItem(`zone-labels-${layoutId}`, JSON.stringify(zoneLabels));
+    instanceStorage.setJSON(`zone-labels-${layoutId}`, zoneLabels);
   }, [zoneLabels, layoutId]);
 
   useEffect(() => {
-    localStorage.setItem(`zone-notes-${layoutId}`, JSON.stringify(zoneNotes));
+    instanceStorage.setJSON(`zone-notes-${layoutId}`, zoneNotes);
   }, [zoneNotes, layoutId]);
 
   useEffect(() => {
-    localStorage.setItem(`zone-pinned-${layoutId}`, JSON.stringify([...pinnedZones]));
+    instanceStorage.setJSON(`zone-pinned-${layoutId}`, [...pinnedZones]);
   }, [pinnedZones, layoutId]);
 
   // ── Reload labels/pins when layout changes, with pin migration ────────────
@@ -121,21 +105,12 @@ export function useZoneLabelsAndTags(
       prevLayoutIdRef2.current = layoutId;
       prevAssignmentsRef.current = assignments;
 
-      try {
-        const storedLabels = localStorage.getItem(`zone-labels-${layoutId}`);
-        setZoneLabels(storedLabels ? JSON.parse(storedLabels) : {});
-      } catch {
-        setZoneLabels({});
-      }
+      setZoneLabels(instanceStorage.getJSON<Record<number, string>>(`zone-labels-${layoutId}`, {}));
 
       // Restore pins: merge stored pins with migrated tab-based pins
-      let newPins = new Set<number>();
-      try {
-        const storedPins = localStorage.getItem(`zone-pinned-${layoutId}`);
-        if (storedPins) newPins = new Set(JSON.parse(storedPins) as number[]);
-      } catch {
-        // intentionally empty
-      }
+      let newPins = new Set<number>(
+        instanceStorage.getJSON<number[]>(`zone-pinned-${layoutId}`, []),
+      );
       // Add pins for tabs that were pinned in the previous layout
       for (const [zoneStr, tabId] of Object.entries(assignments)) {
         if (pinnedTabIds.has(tabId)) {
@@ -144,12 +119,7 @@ export function useZoneLabelsAndTags(
       }
       setPinnedZones(newPins);
 
-      try {
-        const storedNotes = localStorage.getItem(`zone-notes-${layoutId}`);
-        setZoneNotes(storedNotes ? JSON.parse(storedNotes) : {});
-      } catch {
-        setZoneNotes({});
-      }
+      setZoneNotes(instanceStorage.getJSON<Record<number, string>>(`zone-notes-${layoutId}`, {}));
     } else {
       // Keep assignments ref in sync for non-layout-change updates (e.g., tab swaps)
       prevAssignmentsRef.current = assignments;

@@ -43,7 +43,10 @@ export function UIBridgeDiscoveryPanel({
   const sdk = useSdkUIBridge();
 
   // All discovered apps (web + desktop)
-  const allApps: DiscoveredApp[] = [...appDiscovery.webApps, ...appDiscovery.desktopApps];
+  const allApps: DiscoveredApp[] = [
+    ...(appDiscovery.webApps || []),
+    ...(appDiscovery.desktopApps || []),
+  ];
 
   const isConnected = sdk.connectionStatus === "connected";
 
@@ -103,7 +106,7 @@ export function UIBridgeDiscoveryPanel({
   // State checks
   const hasData = discovery.cooccurrenceData !== null;
   const hasDiscoveryResult = discovery.discoveryResult !== null;
-  const captureCount = hasData ? discovery.cooccurrenceData!.presenceMatrix.length : 0;
+  const captureCount = hasData ? (discovery.cooccurrenceData!.presenceMatrix?.length ?? 0) : 0;
 
   return (
     <div className="p-4">
@@ -353,7 +356,7 @@ export function UIBridgeDiscoveryPanel({
                 {captureCount} captures
               </span>
               <span className="inline-flex items-center text-sm bg-surface-primary rounded-full px-2 py-0.5">
-                {discovery.cooccurrenceData?.allFingerprints.length ?? 0} fingerprints
+                {discovery.cooccurrenceData?.allFingerprints?.length ?? 0} fingerprints
               </span>
               <span className="inline-flex items-center text-sm border border-border-primary rounded-full px-2 py-0.5 capitalize">
                 via {discovery.dataSource}
@@ -401,13 +404,13 @@ export function UIBridgeDiscoveryPanel({
 
             <div className="flex items-center gap-4">
               <span className="inline-flex items-center text-sm bg-surface-primary rounded-full px-2 py-0.5">
-                {discovery.discoveryResult?.states.length ?? 0} states
+                {discovery.discoveryResult?.states?.length ?? 0} states
               </span>
               <span className="inline-flex items-center text-sm bg-surface-primary rounded-full px-2 py-0.5">
-                {discovery.discoveryResult?.statistics.uniqueFingerprints ?? 0} fingerprints
+                {discovery.discoveryResult?.statistics?.uniqueFingerprints ?? 0} fingerprints
               </span>
               <span className="inline-flex items-center text-sm border border-border-primary rounded-full px-2 py-0.5">
-                {discovery.discoveryResult?.statistics.totalCaptures ?? 0} captures
+                {discovery.discoveryResult?.statistics?.totalCaptures ?? 0} captures
               </span>
             </div>
 

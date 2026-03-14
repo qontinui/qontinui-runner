@@ -7,6 +7,7 @@
  */
 
 import { useState, useEffect, useCallback, useMemo } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import { Play, RefreshCw, Trash2, Loader2, Settings2, ChevronRight } from "lucide-react";
 import { WorkflowLibraryPanel } from "./WorkflowLibraryPanel";
 import { WorkflowQueuePanel } from "./WorkflowQueuePanel";
@@ -33,41 +34,30 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState<string>("all");
 
-  // Queue state - persisted to localStorage
+  // Queue state - persisted to instanceStorage
   const [queue, setQueue] = useState<QueuedWorkflow[]>(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      return stored ? JSON.parse(stored) : [];
-    } catch {
-      return [];
-    }
+    return instanceStorage.getJSON<QueuedWorkflow[]>(STORAGE_KEY, []);
   });
 
   // Execution options
   const [stopOnFailure, setStopOnFailure] = useState<boolean>(() => {
-    try {
-      const stored = localStorage.getItem(OPTIONS_STORAGE_KEY);
-      return stored ? (JSON.parse(stored).stopOnFailure ?? true) : true;
-    } catch {
-      return true;
-    }
+    const parsed = instanceStorage.getJSON<{ stopOnFailure?: boolean } | null>(
+      OPTIONS_STORAGE_KEY,
+      null,
+    );
+    return parsed?.stopOnFailure ?? true;
   });
   const [showOptions, setShowOptions] = useState(false);
 
-  // Library panel visibility — persisted to localStorage
+  // Library panel visibility -- persisted to instanceStorage
   const [isLibraryOpen, setIsLibraryOpen] = useState<boolean>(() => {
-    try {
-      const stored = localStorage.getItem(LIBRARY_OPEN_KEY);
-      return stored !== null ? JSON.parse(stored) : true;
-    } catch {
-      return true;
-    }
+    return instanceStorage.getJSON(LIBRARY_OPEN_KEY, true);
   });
 
   const toggleLibrary = useCallback(() => {
     setIsLibraryOpen((prev) => {
       const next = !prev;
-      localStorage.setItem(LIBRARY_OPEN_KEY, JSON.stringify(next));
+      instanceStorage.setJSON(LIBRARY_OPEN_KEY, next);
       return next;
     });
   }, []);
@@ -78,14 +68,14 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
   // Execution state
   const [isExecuting, setIsExecuting] = useState(false);
 
-  // Persist queue to localStorage
+  // Persist queue to instanceStorage
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(queue));
+    instanceStorage.setJSON(STORAGE_KEY, queue);
   }, [queue]);
 
-  // Persist options to localStorage
+  // Persist options to instanceStorage
   useEffect(() => {
-    localStorage.setItem(OPTIONS_STORAGE_KEY, JSON.stringify({ stopOnFailure }));
+    instanceStorage.setJSON(OPTIONS_STORAGE_KEY, { stopOnFailure });
   }, [stopOnFailure]);
 
   // Fetch workflows with stats

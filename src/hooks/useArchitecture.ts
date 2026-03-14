@@ -9,6 +9,9 @@ import type {
   WorkflowTrends,
   ComponentTrend,
   EffectivenessOverTime,
+  SdkArchitectureGraph,
+  SdkArchitectureNode,
+  SdkArchitectureEdge,
 } from "@/types/architecture";
 import type { TimeRange } from "@/types/performance-metrics";
 
@@ -257,4 +260,96 @@ export function useEffectivenessTrend(
   }, [workflowName, timeRange, bucket]);
 
   return { data, loading };
+}
+
+export function useSdkArchitecture() {
+  const [specs, setSpecs] = useState<SdkArchitectureGraph[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/cached-specs`);
+      const json = await res.json();
+      if (json.success && json.data) {
+        const graphs: SdkArchitectureGraph[] = [];
+        for (const spec of json.data) {
+          try {
+            const parsed =
+              typeof spec.spec_json === "string" ? JSON.parse(spec.spec_json) : spec.spec_json;
+            // Detect architecture specs by structure
+            if (parsed.techStack && parsed.features) {
+              const nodes: SdkArchitectureNode[] = [];
+              const edges: SdkArchitectureEdge[] = [];
+
+              // Add feature nodes
+              for (const feature of parsed.features ?? []) {
+                nodes.push({
+                  id: `feature:${feature.id}`,
+                  label: feature.name,
+                  type: "feature",
+                  status: feature.status,
+                  priority: feature.priority,
+                });
+              }
+
+              // Add tech stack nodes
+              for (const tech of parsed.techStack ?? []) {
+                nodes.push({
+                  id: `tech:${tech.name}`,
+                  label: tech.name,
+                  type: "tech",
+                });
+              }
+
+              // Add pattern nodes
+              for (const pattern of parsed.patterns ?? []) {
+                nodes.push({
+                  id: `pattern:${pattern.id}`,
+                  label: pattern.name,
+                  type: "pattern",
+                });
+              }
+
+              // Add dependency edges
+              for (const dep of parsed.dependencies ?? []) {
+                edges.push({
+                  source: `feature:${dep.featureId}`,
+                  target: `feature:${dep.dependsOn}`,
+                  type: dep.type,
+                  label: dep.description,
+                });
+              }
+
+              graphs.push({
+                projectName: parsed.projectName ?? spec.app_name ?? "Unknown",
+                appUrl: spec.app_url,
+                nodes,
+                edges,
+                techStack: parsed.techStack ?? [],
+                directories: parsed.directories ?? [],
+              });
+            }
+          } catch {
+            // Skip unparseable specs
+          }
+        }
+        setSpecs(graphs);
+      } else {
+        setError(json.error ?? "Failed to load SDK specs");
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Network error");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  return { specs, loading, error, refresh };
 }

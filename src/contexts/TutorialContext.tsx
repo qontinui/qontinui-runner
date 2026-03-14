@@ -21,8 +21,9 @@ import type {
   ValidationState,
   PersistedTutorialState,
 } from "../types/tutorial";
+import { instanceStorage } from "@/lib/instance-storage";
 
-// Storage key for localStorage persistence
+// Storage key for instanceStorage persistence
 const STORAGE_KEY = "qontinui-runner-tutorial-state";
 
 // Default persisted state
@@ -101,16 +102,18 @@ interface TutorialProviderProps {
 }
 
 /**
- * Load persisted state from localStorage
+ * Load persisted state from instanceStorage
  */
 function loadPersistedState(): PersistedTutorialState {
   try {
-    const stored = localStorage.getItem(STORAGE_KEY);
+    const stored = instanceStorage.getJSON<Partial<PersistedTutorialState> | null>(
+      STORAGE_KEY,
+      null,
+    );
     if (stored) {
-      const parsed = JSON.parse(stored);
       return {
         ...DEFAULT_PERSISTED_STATE,
-        ...parsed,
+        ...stored,
       };
     }
   } catch (error) {
@@ -120,11 +123,11 @@ function loadPersistedState(): PersistedTutorialState {
 }
 
 /**
- * Save state to localStorage
+ * Save state to instanceStorage
  */
 function savePersistedState(state: PersistedTutorialState): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    instanceStorage.setJSON(STORAGE_KEY, state);
   } catch (error) {
     console.warn("[TutorialContext] Failed to save persisted state:", error);
   }
@@ -134,7 +137,7 @@ function savePersistedState(state: PersistedTutorialState): void {
  * TutorialProvider - Manages tutorial state and provides context
  */
 export function TutorialProvider({ children, onNavigate }: TutorialProviderProps) {
-  // Load initial state from localStorage
+  // Load initial state from instanceStorage
   const [persistedState, setPersistedState] = useState<PersistedTutorialState>(() =>
     loadPersistedState(),
   );
@@ -154,7 +157,7 @@ export function TutorialProvider({ children, onNavigate }: TutorialProviderProps
   // Target element registry
   const targetRegistry = useRef<Map<string, HTMLElement>>(new Map());
 
-  // Persist state changes to localStorage
+  // Persist state changes to instanceStorage
   useEffect(() => {
     savePersistedState(persistedState);
   }, [persistedState]);

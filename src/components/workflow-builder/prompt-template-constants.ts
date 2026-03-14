@@ -5,6 +5,8 @@
  * Based on the legacy AI Builder implementation in components/ai-builder/constants.ts.
  */
 
+import { instanceStorage } from "@/lib/instance-storage";
+
 // Storage key for global custom prompt template
 export const GLOBAL_PROMPT_TEMPLATE_KEY = "qontinui-unified-workflow-prompt-template";
 
@@ -153,7 +155,7 @@ When you fix an issue:
  */
 export const getGlobalPromptTemplate = (): string => {
   if (typeof window !== "undefined") {
-    const customTemplate = localStorage.getItem(GLOBAL_PROMPT_TEMPLATE_KEY);
+    const customTemplate = instanceStorage.getItem(GLOBAL_PROMPT_TEMPLATE_KEY);
     if (customTemplate) {
       return customTemplate;
     }
@@ -166,7 +168,7 @@ export const getGlobalPromptTemplate = (): string => {
  */
 export const saveGlobalPromptTemplate = (template: string): void => {
   if (typeof window !== "undefined") {
-    localStorage.setItem(GLOBAL_PROMPT_TEMPLATE_KEY, template);
+    instanceStorage.setItem(GLOBAL_PROMPT_TEMPLATE_KEY, template);
   }
 };
 
@@ -175,7 +177,7 @@ export const saveGlobalPromptTemplate = (template: string): void => {
  */
 export const resetGlobalPromptTemplate = (): void => {
   if (typeof window !== "undefined") {
-    localStorage.removeItem(GLOBAL_PROMPT_TEMPLATE_KEY);
+    instanceStorage.removeItem(GLOBAL_PROMPT_TEMPLATE_KEY);
   }
 };
 
@@ -184,7 +186,7 @@ export const resetGlobalPromptTemplate = (): void => {
  */
 export const isUsingGlobalCustomTemplate = (): boolean => {
   if (typeof window !== "undefined") {
-    return localStorage.getItem(GLOBAL_PROMPT_TEMPLATE_KEY) !== null;
+    return instanceStorage.getItem(GLOBAL_PROMPT_TEMPLATE_KEY) !== null;
   }
   return false;
 };

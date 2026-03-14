@@ -89,3 +89,9 @@ export {
   type LLMIntentResponse,
   type ParsedIntent as LLMParsedIntent,
 } from "./llmElementMatcher";
+
+// UI Bridge hook registrations (state machine, shortcuts, annotations)
+export { UIBridgeHooks, type UIBridgeHooksProps } from "./UIBridgeHooks";
+
+// Intent definitions for composite user actions
+export { APP_INTENTS, type Intent, type IntentParam } from "./intents";

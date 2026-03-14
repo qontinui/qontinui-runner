@@ -1069,6 +1069,7 @@ impl StepHandler for UiBridgeHandler {
                         error,
                         output_data: Some(output_data),
                         screenshot_path: None,
+                        interrupted: false,
                     };
                     self.track_result(context, base_url, &result).await;
                     return result;
@@ -1496,6 +1497,7 @@ impl UiBridgeHandler {
                     "results": [],
                 })),
                 screenshot_path: None,
+                interrupted: false,
             };
         }
 
@@ -1650,6 +1652,7 @@ impl UiBridgeHandler {
                 "results": results,
             })),
             screenshot_path: None,
+            interrupted: false,
         }
     }
 

@@ -8,7 +8,7 @@
  * and WorkflowDataProvider to make the shared context available for
  * headless components, while preserving the runner's own rich API layer
  * that includes Tauri-specific features, loading/saving state,
- * localStorage persistence, and export/import operations.
+ * instanceStorage persistence, and export/import operations.
  */
 
 import React, {
@@ -52,6 +52,7 @@ import {
 } from "../../types";
 import { registerUserSkills } from "@qontinui/workflow-utils";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { instanceStorage } from "@/lib/instance-storage";
 
 // Re-export shared types for consumers that may need them
 export type { SharedBuilderState, SharedBuilderAction, SharedBuilderContextValue };
@@ -616,62 +617,56 @@ const WorkflowBuilderContext = createContext<WorkflowBuilderContextValue | null>
 interface WorkflowBuilderProviderProps {
   children: React.ReactNode;
   initialWorkflow?: UnifiedWorkflow;
-  /** When true, skip restoring draft from localStorage and start with an empty workflow */
+  /** When true, skip restoring draft from storage and start with an empty workflow */
   startEmpty?: boolean;
 }
 
-// Helper to load workflow from localStorage
+// Helper to load workflow from storage
 function loadFromStorage(): UnifiedWorkflow | null {
   try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      // Validate it has the required structure
-      if (parsed && typeof parsed === "object" && "setup_steps" in parsed) {
-        return parsed as UnifiedWorkflow;
-      }
+    const parsed = instanceStorage.getJSON<UnifiedWorkflow | null>(STORAGE_KEY, null);
+    // Validate it has the required structure
+    if (parsed && typeof parsed === "object" && "setup_steps" in parsed) {
+      return parsed as UnifiedWorkflow;
     }
   } catch (e) {
-    console.warn("Failed to load workflow from localStorage:", e);
+    console.warn("Failed to load workflow from storage:", e);
   }
   return null;
 }
 
-// Helper to load original workflow from localStorage (tracks if workflow was saved)
+// Helper to load original workflow from storage (tracks if workflow was saved)
 function loadOriginalFromStorage(): UnifiedWorkflow | null {
   try {
-    const stored = localStorage.getItem(STORAGE_KEY_ORIGINAL);
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      if (parsed && typeof parsed === "object" && "setup_steps" in parsed) {
-        return parsed as UnifiedWorkflow;
-      }
+    const parsed = instanceStorage.getJSON<UnifiedWorkflow | null>(STORAGE_KEY_ORIGINAL, null);
+    if (parsed && typeof parsed === "object" && "setup_steps" in parsed) {
+      return parsed as UnifiedWorkflow;
     }
   } catch (e) {
-    console.warn("Failed to load original workflow from localStorage:", e);
+    console.warn("Failed to load original workflow from storage:", e);
   }
   return null;
 }
 
-// Helper to save workflow to localStorage
+// Helper to save workflow to storage
 function saveToStorage(workflow: UnifiedWorkflow): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(workflow));
+    instanceStorage.setJSON(STORAGE_KEY, workflow);
   } catch (e) {
-    console.warn("Failed to save workflow to localStorage:", e);
+    console.warn("Failed to save workflow to storage:", e);
   }
 }
 
-// Helper to save original workflow to localStorage (called after successful save)
+// Helper to save original workflow to storage (called after successful save)
 function saveOriginalToStorage(workflow: UnifiedWorkflow | null): void {
   try {
     if (workflow) {
-      localStorage.setItem(STORAGE_KEY_ORIGINAL, JSON.stringify(workflow));
+      instanceStorage.setJSON(STORAGE_KEY_ORIGINAL, workflow);
     } else {
-      localStorage.removeItem(STORAGE_KEY_ORIGINAL);
+      instanceStorage.removeItem(STORAGE_KEY_ORIGINAL);
     }
   } catch (e) {
-    console.warn("Failed to save original workflow to localStorage:", e);
+    console.warn("Failed to save original workflow to storage:", e);
   }
 }
 
@@ -684,7 +679,7 @@ function RunnerWorkflowBuilderInner({
   initialWorkflow,
   startEmpty,
 }: WorkflowBuilderProviderProps) {
-  // Try to load from localStorage if no initial workflow provided (and not starting empty)
+  // Try to load from storage if no initial workflow provided (and not starting empty)
   const storedWorkflow = !initialWorkflow && !startEmpty ? loadFromStorage() : null;
   // Also load the original workflow to preserve update vs create state
   const storedOriginalWorkflow = !initialWorkflow && !startEmpty ? loadOriginalFromStorage() : null;
@@ -726,12 +721,12 @@ function RunnerWorkflowBuilderInner({
 
   const [state, dispatch] = useReducer(workflowBuilderReducer, initialState);
 
-  // Persist workflow to localStorage whenever it changes
+  // Persist workflow to storage whenever it changes
   useEffect(() => {
     saveToStorage(state.workflow);
   }, [state.workflow]);
 
-  // Persist originalWorkflow to localStorage to track whether workflow was saved
+  // Persist originalWorkflow to storage to track whether workflow was saved
   // This ensures updates work correctly after app reload
   useEffect(() => {
     saveOriginalToStorage(state.originalWorkflow);

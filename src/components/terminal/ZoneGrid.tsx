@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useState, useRef, useEffect, type RefObject } from "react";
+import { instanceStorage } from "@/lib/instance-storage";
 import {
   Maximize2,
   Terminal,
@@ -1604,27 +1605,13 @@ export function ZoneGrid({
   const [showFilterInput, setShowFilterInput] = useState<number | null>(null);
   // Custom column/row ratios for drag-to-resize (persisted per layout)
   const [colRatios, setColRatios] = useState<number[]>(() => {
-    try {
-      const stored = localStorage.getItem(`zone-col-ratios-${layout.id}`);
-      if (stored) {
-        const parsed = JSON.parse(stored) as number[];
-        if (parsed.length === layout.columns) return parsed;
-      }
-    } catch {
-      // intentionally empty
-    }
+    const parsed = instanceStorage.getJSON<number[]>(`zone-col-ratios-${layout.id}`, []);
+    if (parsed.length === layout.columns) return parsed;
     return Array(layout.columns).fill(1);
   });
   const [rowRatios, setRowRatios] = useState<number[]>(() => {
-    try {
-      const stored = localStorage.getItem(`zone-row-ratios-${layout.id}`);
-      if (stored) {
-        const parsed = JSON.parse(stored) as number[];
-        if (parsed.length === layout.rows) return parsed;
-      }
-    } catch {
-      // intentionally empty
-    }
+    const parsed = instanceStorage.getJSON<number[]>(`zone-row-ratios-${layout.id}`, []);
+    if (parsed.length === layout.rows) return parsed;
     return Array(layout.rows).fill(1);
   });
   const gridRef = useRef<HTMLDivElement>(null);
@@ -1632,44 +1619,26 @@ export function ZoneGrid({
 
   // Persist ratios when they change
   useEffect(() => {
-    localStorage.setItem(`zone-col-ratios-${layout.id}`, JSON.stringify(colRatios));
+    instanceStorage.setJSON(`zone-col-ratios-${layout.id}`, colRatios);
   }, [colRatios, layout.id]);
   useEffect(() => {
-    localStorage.setItem(`zone-row-ratios-${layout.id}`, JSON.stringify(rowRatios));
+    instanceStorage.setJSON(`zone-row-ratios-${layout.id}`, rowRatios);
   }, [rowRatios, layout.id]);
 
   // Load or reset ratios when layout changes
   useEffect(() => {
     if (prevLayoutIdRef.current !== layout.id) {
       prevLayoutIdRef.current = layout.id;
-      try {
-        const storedCols = localStorage.getItem(`zone-col-ratios-${layout.id}`);
-        if (storedCols) {
-          const parsed = JSON.parse(storedCols) as number[];
-          if (parsed.length === layout.columns) {
-            setColRatios(parsed);
-          } else {
-            setColRatios(Array(layout.columns).fill(1));
-          }
-        } else {
-          setColRatios(Array(layout.columns).fill(1));
-        }
-      } catch {
+      const parsedCols = instanceStorage.getJSON<number[]>(`zone-col-ratios-${layout.id}`, []);
+      if (parsedCols.length === layout.columns) {
+        setColRatios(parsedCols);
+      } else {
         setColRatios(Array(layout.columns).fill(1));
       }
-      try {
-        const storedRows = localStorage.getItem(`zone-row-ratios-${layout.id}`);
-        if (storedRows) {
-          const parsed = JSON.parse(storedRows) as number[];
-          if (parsed.length === layout.rows) {
-            setRowRatios(parsed);
-          } else {
-            setRowRatios(Array(layout.rows).fill(1));
-          }
-        } else {
-          setRowRatios(Array(layout.rows).fill(1));
-        }
-      } catch {
+      const parsedRows = instanceStorage.getJSON<number[]>(`zone-row-ratios-${layout.id}`, []);
+      if (parsedRows.length === layout.rows) {
+        setRowRatios(parsedRows);
+      } else {
         setRowRatios(Array(layout.rows).fill(1));
       }
     }

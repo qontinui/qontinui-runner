@@ -547,53 +547,64 @@ pub async fn ui_bridge_discover_states_from_fingerprints(
 ) -> Result<CommandResponse, String> {
     info!("UI Bridge: Discovering states from fingerprints");
 
-    let mut executor_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.extraction_executor, "extraction_executor");
+    // The extraction executor uses block_on internally (it has its own tokio runtime).
+    // We must run it on a blocking thread to avoid "Cannot start a runtime from within
+    // a runtime" panics, since this Tauri command runs on the main tokio runtime.
+    let app_state = state.inner().clone();
 
-    if let Some(ref mut executor) = *executor_lock {
-        // Start executor on-demand if not running
-        executor.ensure_started().map_err(|e| {
-            error!("Failed to start extraction executor: {}", e);
-            e
-        })?;
+    tokio::task::spawn_blocking(move || -> Result<CommandResponse, String> {
+        let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
+            &app_state.extraction_executor,
+            "extraction_executor",
+        );
 
-        // Build config object for Python
-        let config_params = config.map(|c| {
-            json!({
-                "minCooccurrenceRate": c.min_cooccurrence_rate.unwrap_or(0.95),
-            })
-        });
+        if let Some(ref mut executor) = *executor_lock {
+            // Start executor on-demand if not running
+            executor.ensure_started().map_err(|e| {
+                error!("Failed to start extraction executor: {}", e);
+                e
+            })?;
 
-        let params = json!({
-            "cooccurrence_export": cooccurrence_export,
-            "config": config_params,
-        });
+            // Build config object for Python
+            let config_params = config.map(|c| {
+                json!({
+                    "minCooccurrenceRate": c.min_cooccurrence_rate.unwrap_or(0.95),
+                })
+            });
 
-        // Send command and wait for response
-        let response_result = executor
-            .send_command_and_wait(
-                "discover_states_from_fingerprints",
-                Some(params),
-                std::time::Duration::from_secs(60),
-            )
-            .map_err(|e| e.to_string())?;
+            let params = json!({
+                "cooccurrence_export": cooccurrence_export,
+                "config": config_params,
+            });
 
-        // Check if the response indicates success
-        if response_result.success {
-            Ok(CommandResponse {
-                success: true,
-                message: Some("Fingerprint state discovery complete".to_string()),
-                data: response_result.data,
-            })
+            // Send command and wait for response
+            let response_result = executor
+                .send_command_and_wait(
+                    "discover_states_from_fingerprints",
+                    Some(params),
+                    std::time::Duration::from_secs(60),
+                )
+                .map_err(|e| e.to_string())?;
+
+            // Check if the response indicates success
+            if response_result.success {
+                Ok(CommandResponse {
+                    success: true,
+                    message: Some("Fingerprint state discovery complete".to_string()),
+                    data: response_result.data,
+                })
+            } else {
+                let error_msg = response_result
+                    .error
+                    .unwrap_or_else(|| "Unknown error".to_string());
+                Err(format!("Discovery failed: {}", error_msg))
+            }
         } else {
-            let error_msg = response_result
-                .error
-                .unwrap_or_else(|| "Unknown error".to_string());
-            Err(format!("Discovery failed: {}", error_msg))
+            Err("Extraction executor not initialized".to_string())
         }
-    } else {
-        Err("Extraction executor not initialized".to_string())
-    }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
 }
 
 /// Reload the runner's webview.
@@ -690,55 +701,60 @@ pub async fn ui_bridge_run_exploration(
 ) -> Result<CommandResponse, String> {
     info!("UI Bridge: Running automatic exploration");
 
-    let mut executor_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.extraction_executor, "extraction_executor");
+    let app_state = state.inner().clone();
+    let self_url = crate::mcp::types::get_self_base_url(&state);
 
-    if let Some(ref mut executor) = *executor_lock {
-        // Start executor on-demand if not running
-        executor.ensure_started().map_err(|e| {
-            error!("Failed to start extraction executor: {}", e);
-            e
-        })?;
+    tokio::task::spawn_blocking(move || -> Result<CommandResponse, String> {
+        let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
+            &app_state.extraction_executor,
+            "extraction_executor",
+        );
 
-        // Build parameters for Python
-        let params = json!({
-            "runner_url": runner_url.unwrap_or_else(|| crate::mcp::types::get_self_base_url(&state)),
-            "config": config.map(|c| json!({
-                "max_depth": c.max_depth.unwrap_or(2),
-                "max_elements_per_page": c.max_elements_per_page.unwrap_or(20),
-                "max_total_elements": c.max_total_elements.unwrap_or(100),
-                "action_delay_ms": c.action_delay_ms.unwrap_or(500),
-                "blocked_keywords": c.blocked_keywords.unwrap_or_default(),
-                "safe_keywords": c.safe_keywords.unwrap_or_default(),
-                "capture_screenshots": c.capture_screenshots.unwrap_or(false),
-            })),
-        });
+        if let Some(ref mut executor) = *executor_lock {
+            executor.ensure_started().map_err(|e| {
+                error!("Failed to start extraction executor: {}", e);
+                e
+            })?;
 
-        // Send command and wait for response (longer timeout for exploration)
-        let response_result = executor
-            .send_command_and_wait(
-                "run_ui_bridge_exploration",
-                Some(params),
-                std::time::Duration::from_secs(300), // 5 minute timeout
-            )
-            .map_err(|e| e.to_string())?;
+            let params = json!({
+                "runner_url": runner_url.unwrap_or(self_url),
+                "config": config.map(|c| json!({
+                    "max_depth": c.max_depth.unwrap_or(2),
+                    "max_elements_per_page": c.max_elements_per_page.unwrap_or(20),
+                    "max_total_elements": c.max_total_elements.unwrap_or(100),
+                    "action_delay_ms": c.action_delay_ms.unwrap_or(500),
+                    "blocked_keywords": c.blocked_keywords.unwrap_or_default(),
+                    "safe_keywords": c.safe_keywords.unwrap_or_default(),
+                    "capture_screenshots": c.capture_screenshots.unwrap_or(false),
+                })),
+            });
 
-        // Check if the response indicates success
-        if response_result.success {
-            Ok(CommandResponse {
-                success: true,
-                message: Some("UI Bridge exploration complete".to_string()),
-                data: response_result.data,
-            })
+            let response_result = executor
+                .send_command_and_wait(
+                    "run_ui_bridge_exploration",
+                    Some(params),
+                    std::time::Duration::from_secs(300),
+                )
+                .map_err(|e| e.to_string())?;
+
+            if response_result.success {
+                Ok(CommandResponse {
+                    success: true,
+                    message: Some("UI Bridge exploration complete".to_string()),
+                    data: response_result.data,
+                })
+            } else {
+                let error_msg = response_result
+                    .error
+                    .unwrap_or_else(|| "Unknown error".to_string());
+                Err(format!("Exploration failed: {}", error_msg))
+            }
         } else {
-            let error_msg = response_result
-                .error
-                .unwrap_or_else(|| "Unknown error".to_string());
-            Err(format!("Exploration failed: {}", error_msg))
+            Err("Extraction executor not initialized".to_string())
         }
-    } else {
-        Err("Extraction executor not initialized".to_string())
-    }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
 }
 
 /// Stop a running UI Bridge exploration
@@ -756,36 +772,151 @@ pub async fn ui_bridge_stop_exploration(
 ) -> Result<CommandResponse, String> {
     info!("UI Bridge: Stopping exploration");
 
-    let mut executor_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.extraction_executor, "extraction_executor");
+    let app_state = state.inner().clone();
 
-    if let Some(ref mut executor) = *executor_lock {
-        if !executor.is_running() {
-            return Err("Extraction executor not running".to_string());
-        }
+    let response_result = tokio::task::spawn_blocking(
+        move || -> Result<crate::executor::lifecycle::CommandResponseResult, String> {
+            let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
+                &app_state.extraction_executor,
+                "extraction_executor",
+            );
 
-        // Send stop command to Python
-        let response_result = executor
-            .send_command_and_wait(
-                "stop_ui_bridge_exploration",
-                None,
-                std::time::Duration::from_secs(10),
-            )
-            .map_err(|e| e.to_string())?;
+            if let Some(ref mut executor) = *executor_lock {
+                if !executor.is_running() {
+                    return Err("Extraction executor not running".to_string());
+                }
 
-        if response_result.success {
-            Ok(CommandResponse {
-                success: true,
-                message: Some("Exploration stop requested".to_string()),
-                data: response_result.data,
-            })
-        } else {
-            let error_msg = response_result
-                .error
-                .unwrap_or_else(|| "Unknown error".to_string());
-            Err(format!("Failed to stop exploration: {}", error_msg))
-        }
+                executor
+                    .send_command_and_wait(
+                        "stop_ui_bridge_exploration",
+                        None,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .map_err(|e| e.to_string())
+            } else {
+                Err("Extraction executor not initialized".to_string())
+            }
+        },
+    )
+    .await
+    .map_err(|e| format!("Task join error: {}", e))??;
+
+    if response_result.success {
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Exploration stop requested".to_string()),
+            data: response_result.data,
+        })
     } else {
-        Err("Extraction executor not initialized".to_string())
+        let error_msg = response_result
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
+        Err(format!("Failed to stop exploration: {}", error_msg))
     }
+}
+
+// =============================================================================
+// Native Rust Exploration (no Python dependency)
+// =============================================================================
+
+/// Run exploration using the native Rust engine.
+///
+/// This starts a background exploration task that fetches snapshots,
+/// generates fingerprints, clicks elements across pages, and runs
+/// state discovery. Results are returned when exploration completes.
+///
+/// Unlike the Python-based exploration, this runs entirely in Rust
+/// and survives page navigation in the runner's webview.
+#[tauri::command]
+pub async fn ui_bridge_run_exploration_native(
+    state: State<'_, Arc<super::AppState>>,
+    config: Option<crate::exploration::ExplorationConfig>,
+) -> Result<CommandResponse, String> {
+    info!("UI Bridge: Starting native Rust exploration");
+
+    let sdk_conn = state.sdk_connection.clone();
+    let config = config.unwrap_or_default();
+
+    let mut engine = crate::exploration::ExplorationEngine::new();
+
+    // Store cancel token so it can be cancelled from another command
+    {
+        let mut cancel_guard = state.exploration_cancel.lock().await;
+        *cancel_guard = Some(engine.cancel_token());
+    }
+
+    let result = engine.explore(&sdk_conn, config).await;
+
+    // Clear cancel token
+    {
+        let mut cancel_guard = state.exploration_cancel.lock().await;
+        *cancel_guard = None;
+    }
+
+    let result = result?;
+
+    let result_json = serde_json::to_value(&result)
+        .map_err(|e| format!("Failed to serialize discovery result: {}", e))?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!(
+            "Exploration complete: {} states discovered",
+            result.states.len()
+        )),
+        data: Some(result_json),
+    })
+}
+
+/// Stop a running native exploration.
+#[tauri::command]
+pub async fn ui_bridge_stop_exploration_native(
+    state: State<'_, Arc<super::AppState>>,
+) -> Result<CommandResponse, String> {
+    info!("UI Bridge: Stopping native exploration");
+
+    let cancel_guard = state.exploration_cancel.lock().await;
+    if let Some(ref token) = *cancel_guard {
+        token.cancel();
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Exploration cancel requested".to_string()),
+            data: None,
+        })
+    } else {
+        Err("No native exploration is currently running".to_string())
+    }
+}
+
+/// Run state discovery from fingerprint co-occurrence data using the native Rust engine.
+///
+/// Accepts optional config for tuning discovery parameters (e.g., min_cooccurrence_rate).
+#[tauri::command]
+pub async fn ui_bridge_discover_states_native(
+    cooccurrence_export: serde_json::Value,
+    config: Option<crate::exploration::discovery::DiscoveryConfig>,
+) -> Result<CommandResponse, String> {
+    info!("UI Bridge: Running native Rust state discovery");
+
+    let export: crate::exploration::CooccurrenceExport =
+        serde_json::from_value(cooccurrence_export)
+            .map_err(|e| format!("Failed to parse co-occurrence export: {}", e))?;
+
+    let discovery_config = config.unwrap_or_default();
+    let mut discovery = crate::exploration::FingerprintStateDiscovery::new(discovery_config);
+    discovery.load_cooccurrence_export(&export);
+    discovery.discover_states();
+    let result = discovery.into_result();
+
+    let result_json =
+        serde_json::to_value(&result).map_err(|e| format!("Failed to serialize result: {}", e))?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!(
+            "Discovery complete: {} states",
+            result.states.len()
+        )),
+        data: Some(result_json),
+    })
 }
