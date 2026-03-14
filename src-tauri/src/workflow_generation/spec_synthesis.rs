@@ -334,7 +334,7 @@ fn derive_command(criterion: &AcceptanceCriterion, working_dir: &Option<String>)
     if let Some(start) = hint.find('`') {
         if let Some(end) = hint[start + 1..].find('`') {
             let extracted = &hint[start + 1..start + 1 + end];
-            if !extracted.is_empty() && !extracted.contains(' ') || extracted.contains("--") {
+            if !extracted.is_empty() && (!extracted.contains(' ') || extracted.contains("--")) {
                 return extracted.to_string();
             }
         }
