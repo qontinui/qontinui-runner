@@ -15,14 +15,14 @@ export const PROVIDERS = [
   { value: "gemini_api", label: "Gemini API" },
 ] as const;
 
-export const CLAUDE_MODELS = [
+const CLAUDE_MODELS = [
   { value: "claude-sonnet-4", label: "Claude Sonnet 4" },
   { value: "claude-opus-4", label: "Claude Opus 4" },
   { value: "claude-3-5-sonnet", label: "Claude 3.5 Sonnet" },
   { value: "claude-3-opus", label: "Claude 3 Opus" },
 ];
 
-export const GEMINI_MODELS = [
+const GEMINI_MODELS = [
   { value: "gemini-3-flash", label: "Gemini 3 Flash" },
   { value: "gemini-3-pro", label: "Gemini 3 Pro" },
   { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },

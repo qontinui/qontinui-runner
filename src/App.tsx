@@ -119,8 +119,6 @@ import { useGlobalLogSources } from "./hooks/useGlobalLogSources";
 
 // Components
 import StatusIndicator from "./components/StatusIndicator";
-import { ConfigurationPanel as _ConfigurationPanel } from "./components/ConfigurationPanel";
-import { ExecutionControlPanel as _ExecutionControlPanel } from "./components/ExecutionControlPanel";
 import { LogsTab } from "./components/LogsTab";
 import { CaptureTab } from "./components/CaptureTab";
 import ActionDetailModal from "./components/ActionDetailModal";
@@ -165,7 +163,6 @@ import { RunRecapTab } from "./components/run-recap";
 import { useTaskRuns } from "./hooks/useAiData";
 // Page Sweep builder
 // Configure components
-import { ExternalLogsTab as _ExternalLogsTab } from "./components/ExternalLogsTab";
 import { CategoryManager } from "./components/findings/CategoryManager";
 import { HooksManagerPanel } from "./components/hooks";
 import { ErrorMonitorTab } from "./components/error-monitor";
