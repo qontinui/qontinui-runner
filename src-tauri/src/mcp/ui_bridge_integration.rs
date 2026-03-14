@@ -773,7 +773,6 @@ async fn integrate_nextjs(
     }
 }
 
-
 async fn add_sdk_to_package_json(
     project: &std::path::Path,
     options: &IntegrationOptions,

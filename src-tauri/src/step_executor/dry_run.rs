@@ -170,7 +170,7 @@ fn validate_step(step: &serde_json::Value) -> DryRunStepResult {
 fn validate_command_step(step: &serde_json::Value, issues: &mut Vec<DryRunIssue>) {
     // Check that command field exists and is non-empty
     match step.get("command").and_then(|v| v.as_str()) {
-        Some(cmd) if cmd.is_empty() => {
+        Some("") => {
             issues.push(DryRunIssue {
                 severity: DryRunSeverity::Error,
                 check: "command_empty".to_string(),
@@ -182,9 +182,7 @@ fn validate_command_step(step: &serde_json::Value, issues: &mut Vec<DryRunIssue>
             // 1. Verify the base command exists (first word)
             let base_cmd = cmd.split_whitespace().next().unwrap_or("");
             // Check if it's a file path reference
-            if base_cmd.starts_with("./")
-                || base_cmd.starts_with('/')
-                || base_cmd.starts_with("..")
+            if base_cmd.starts_with("./") || base_cmd.starts_with('/') || base_cmd.starts_with("..")
             {
                 issues.push(DryRunIssue {
                     severity: DryRunSeverity::Info,
@@ -234,7 +232,7 @@ fn validate_command_step(step: &serde_json::Value, issues: &mut Vec<DryRunIssue>
 
     // Check expected_status is valid HTTP status
     if let Some(status) = step.get("expected_status").and_then(|v| v.as_u64()) {
-        if status < 100 || status > 599 {
+        if !(100..=599).contains(&status) {
             issues.push(DryRunIssue {
                 severity: DryRunSeverity::Error,
                 check: "expected_status_range".to_string(),
@@ -255,8 +253,7 @@ fn validate_ui_bridge_step(step: &serde_json::Value, issues: &mut Vec<DryRunIssu
         .and_then(|v| v.as_array())
         .map(|a| !a.is_empty())
         .unwrap_or(false);
-    let has_snapshot =
-        step.get("snapshot").is_some() || step.get("snapshot_assert").is_some();
+    let has_snapshot = step.get("snapshot").is_some() || step.get("snapshot_assert").is_some();
 
     if !has_action && !has_assertions && !has_snapshot {
         issues.push(DryRunIssue {

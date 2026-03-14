@@ -2580,16 +2580,17 @@ function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
                   )}
 
                   {/* Resolved arguments (if different) */}
-                  {Boolean(resolvedArgs) && JSON.stringify(resolvedArgs) !== JSON.stringify(args) && (
-                    <div>
-                      <p className="text-xs font-medium text-muted-foreground mb-1">
-                        Resolved Arguments
-                      </p>
-                      <pre className="text-xs font-mono bg-background p-2 rounded overflow-auto max-h-32 text-foreground">
-                        {JSON.stringify(resolvedArgs, null, 2)}
-                      </pre>
-                    </div>
-                  )}
+                  {Boolean(resolvedArgs) &&
+                    JSON.stringify(resolvedArgs) !== JSON.stringify(args) && (
+                      <div>
+                        <p className="text-xs font-medium text-muted-foreground mb-1">
+                          Resolved Arguments
+                        </p>
+                        <pre className="text-xs font-mono bg-background p-2 rounded overflow-auto max-h-32 text-foreground">
+                          {JSON.stringify(resolvedArgs, null, 2)}
+                        </pre>
+                      </div>
+                    )}
 
                   {/* Response */}
                   {response != null && (

@@ -132,12 +132,12 @@ pub fn evaluate_and_promote(conn: &Connection) -> Result<PromotionResult, String
     // Load already-promoted source workflow IDs to avoid duplicates
     let existing_sources: std::collections::HashSet<String> = conn
         .prepare("SELECT source_workflow_id FROM promoted_templates")
-        .and_then(|mut s| {
+        .map(|mut s| {
             let ids: Vec<String> = s
                 .query_map([], |row| row.get::<_, String>(0))
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
                 .unwrap_or_default();
-            Ok(ids)
+            ids
         })
         .unwrap_or_default()
         .into_iter()
@@ -164,9 +164,7 @@ pub fn evaluate_and_promote(conn: &Connection) -> Result<PromotionResult, String
                         );
                         continue;
                     }
-                    qr.get("score")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.5) as f32
+                    qr.get("score").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32
                 }
                 Err(_) => 0.5,
             }
@@ -200,7 +198,7 @@ pub fn evaluate_and_promote(conn: &Connection) -> Result<PromotionResult, String
         let template_json = parameterize_json(&workflow_json, &params);
 
         // Extract tags from the workflow
-        let tags = extract_tags(&workflow_json, &description);
+        let tags = extract_tags(&workflow_json, description);
 
         let template = PromotedTemplate {
             id: format!("tmpl-{}", Uuid::new_v4()),
@@ -397,7 +395,8 @@ fn extract_parameters(workflow_json: &serde_json::Value) -> Vec<TemplateParamete
     collect_strings(workflow_json, &mut all_strings);
 
     // Deduplicate for frequency analysis
-    let mut string_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut string_counts: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     for s in &all_strings {
         *string_counts.entry(s.clone()).or_insert(0) += 1;
     }
@@ -423,7 +422,8 @@ fn extract_parameters(workflow_json: &serde_json::Value) -> Vec<TemplateParamete
                 name: "project_path".to_string(),
                 description: "Project directory path".to_string(),
                 default_value: s.clone(),
-                extraction_pattern: r"(?:/[\w.-]+){2,}|(?:[A-Z]:\\[\w.-]+(?:\\[\w.-]+)*)".to_string(),
+                extraction_pattern: r"(?:/[\w.-]+){2,}|(?:[A-Z]:\\[\w.-]+(?:\\[\w.-]+)*)"
+                    .to_string(),
             });
         }
 
@@ -501,7 +501,10 @@ fn is_file_path(s: &str) -> bool {
         }
     }
     // Windows-style paths
-    if trimmed.len() > 3 && trimmed.chars().nth(1) == Some(':') && trimmed.chars().nth(2) == Some('\\') {
+    if trimmed.len() > 3
+        && trimmed.chars().nth(1) == Some(':')
+        && trimmed.chars().nth(2) == Some('\\')
+    {
         return true;
     }
     false
@@ -510,7 +513,7 @@ fn is_file_path(s: &str) -> bool {
 /// Check if a string looks like a standalone port number.
 fn is_port_number(s: &str) -> bool {
     if let Ok(n) = s.parse::<u32>() {
-        n >= 1024 && n <= 65535
+        (1024..=65535).contains(&n)
     } else {
         false
     }
@@ -523,7 +526,8 @@ fn is_identifier_like(s: &str) -> bool {
         && !s.contains(' ')
         && !s.starts_with('/')
         && !s.starts_with("http")
-        && s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 /// Simple regex escape helper (avoids pulling in the regex crate just for this).
@@ -548,10 +552,7 @@ fn parameterize_json(
 
     for p in params {
         if !p.default_value.is_empty() {
-            json_str = json_str.replace(
-                &p.default_value,
-                &format!("{{{{{}}}}}", p.name),
-            );
+            json_str = json_str.replace(&p.default_value, &format!("{{{{{}}}}}", p.name));
         }
     }
 
@@ -569,10 +570,32 @@ fn extract_tags(workflow_json: &serde_json::Value, description: &str) -> Vec<Str
 
     // Extract technology keywords from description
     let tech_keywords = [
-        "react", "vue", "angular", "node", "python", "rust", "java", "go",
-        "docker", "kubernetes", "api", "web", "mobile", "database", "frontend",
-        "backend", "fullstack", "microservice", "serverless", "ci", "cd",
-        "test", "lint", "format", "typecheck", "deploy",
+        "react",
+        "vue",
+        "angular",
+        "node",
+        "python",
+        "rust",
+        "java",
+        "go",
+        "docker",
+        "kubernetes",
+        "api",
+        "web",
+        "mobile",
+        "database",
+        "frontend",
+        "backend",
+        "fullstack",
+        "microservice",
+        "serverless",
+        "ci",
+        "cd",
+        "test",
+        "lint",
+        "format",
+        "typecheck",
+        "deploy",
     ];
     let desc_lower = description.to_lowercase();
     for kw in &tech_keywords {
@@ -587,8 +610,7 @@ fn extract_tags(workflow_json: &serde_json::Value, description: &str) -> Vec<Str
 
 /// Store a promoted template in the database.
 fn store_template(conn: &Connection, template: &PromotedTemplate) -> Result<(), String> {
-    let template_json_str =
-        serde_json::to_string(&template.template_json).unwrap_or_default();
+    let template_json_str = serde_json::to_string(&template.template_json).unwrap_or_default();
     let params_str = serde_json::to_string(&template.parameters).unwrap_or_default();
     let tags_str = serde_json::to_string(&template.tags).unwrap_or_default();
 

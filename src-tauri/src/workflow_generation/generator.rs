@@ -231,18 +231,13 @@ fn find_undiscovered_references(
         .chain(workflow.verification_steps.iter())
         .chain(workflow.agentic_steps.iter())
         .chain(workflow.completion_steps.iter())
-        .chain(
-            workflow
-                .stages
+        .chain(workflow.stages.iter().flat_map(|s| {
+            s.setup_steps
                 .iter()
-                .flat_map(|s| {
-                    s.setup_steps
-                        .iter()
-                        .chain(s.verification_steps.iter())
-                        .chain(s.agentic_steps.iter())
-                        .chain(s.completion_steps.iter())
-                }),
-        );
+                .chain(s.verification_steps.iter())
+                .chain(s.agentic_steps.iter())
+                .chain(s.completion_steps.iter())
+        }));
 
     for step in all_steps {
         // Extract command field
@@ -250,9 +245,7 @@ fn find_undiscovered_references(
             // Extract the base command/tool name (first word)
             if let Some(base_cmd) = cmd.split_whitespace().next() {
                 let clean = base_cmd.trim_start_matches("./");
-                if !clean.is_empty()
-                    && clean.len() > 2
-                    && !dc_lower.contains(&clean.to_lowercase())
+                if !clean.is_empty() && clean.len() > 2 && !dc_lower.contains(&clean.to_lowercase())
                 {
                     refs.push(clean.to_string());
                 }
@@ -738,10 +731,8 @@ pub fn generate_workflow(
                 "Found {} references not in discovery context, running targeted re-discovery",
                 undiscovered.len()
             );
-            let feedback_description = format!(
-                "Gather information about: {}",
-                undiscovered.join(", ")
-            );
+            let feedback_description =
+                format!("Gather information about: {}", undiscovered.join(", "));
             let config = super::discovery_tools::DiscoveryConfig::default();
             let feedback_result =
                 super::discovery_tools::run_discovery(&feedback_description, &config, "enabled");
@@ -1028,8 +1019,7 @@ pub fn generate_workflow(
         // Factor 4: Hardening conversion count (more conversions = builder produced more prompt steps)
         if let Some(ref summary) = hardening_summary {
             if summary.converted_count > 0 {
-                let hardening_penalty =
-                    (summary.converted_count as f32 * 0.03).min(0.25);
+                let hardening_penalty = (summary.converted_count as f32 * 0.03).min(0.25);
                 score *= 1.0 - hardening_penalty;
             }
         }

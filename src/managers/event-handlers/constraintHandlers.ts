@@ -22,34 +22,30 @@ export const setupConstraintHandlers: HandlerSetupFunction = (context) => {
 
   // Handler for "constraint-results" event
   unsubscribers.push(
-    eventRouter.subscribe(
-      "constraint-results",
-      (payload: EventPayload) => {
-        const data = payload.data as {
-          task_run_id?: string;
-          iteration?: number;
-          summary?: string;
-          has_blocking?: boolean;
-          results?: unknown[];
-        } | undefined;
-        const summary = data?.summary || "Constraint evaluation completed";
-        const hasBlocking = data?.has_blocking || false;
-        const iteration = data?.iteration;
+    eventRouter.subscribe("constraint-results", (payload: EventPayload) => {
+      const data = payload.data as
+        | {
+            task_run_id?: string;
+            iteration?: number;
+            summary?: string;
+            has_blocking?: boolean;
+            results?: unknown[];
+          }
+        | undefined;
+      const summary = data?.summary || "Constraint evaluation completed";
+      const hasBlocking = data?.has_blocking || false;
+      const iteration = data?.iteration;
 
-        console.log(
-          `[CONSTRAINT_HANDLER] constraint-results event received: iteration=${iteration}, has_blocking=${hasBlocking}`,
-        );
+      console.log(
+        `[CONSTRAINT_HANDLER] constraint-results event received: iteration=${iteration}, has_blocking=${hasBlocking}`,
+      );
 
-        if (hasBlocking) {
-          logManager.addLog(
-            "warning",
-            `Constraint violations (iteration ${iteration}): ${summary}`,
-          );
-        } else {
-          logManager.addLog("info", `Constraints passed (iteration ${iteration}): ${summary}`);
-        }
-      },
-    ),
+      if (hasBlocking) {
+        logManager.addLog("warning", `Constraint violations (iteration ${iteration}): ${summary}`);
+      } else {
+        logManager.addLog("info", `Constraints passed (iteration ${iteration}): ${summary}`);
+      }
+    }),
   );
 
   return unsubscribers;

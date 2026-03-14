@@ -86,7 +86,13 @@ export function DiscoveryPanel({ onIntegrate }: DiscoveryPanelProps) {
   );
 }
 
-function AppCard({ app, onIntegrate }: { app: DiscoveredApp; onIntegrate?: (projectPath: string) => void }) {
+function AppCard({
+  app,
+  onIntegrate,
+}: {
+  app: DiscoveredApp;
+  onIntegrate?: (projectPath: string) => void;
+}) {
   const hasUiBridge = app.capabilities.length > 0;
 
   return (

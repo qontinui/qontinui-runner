@@ -125,9 +125,7 @@ fn detect_working_dir(discovery_context: &str) -> Option<String> {
             if let Some(colon_pos) = after.find(':') {
                 let value_start = colon_pos + 1;
                 let rest = after[value_start..].trim_start();
-                let end = rest
-                    .find(|c: char| c == '"' || c == '\'' || c == ',' || c == '\n' || c == '}')
-                    .unwrap_or(rest.len());
+                let end = rest.find(['"', '\'', ',', '\n', '}']).unwrap_or(rest.len());
                 let path = rest[..end].trim().trim_matches('"').trim_matches('\'');
                 if !path.is_empty() {
                     return Some(path.to_string());
@@ -186,8 +184,7 @@ pub fn synthesize_verification_steps(
                             .map(|c| c == command)
                             .unwrap_or(false)
                     }) {
-                        if let Some(existing_id) =
-                            existing_step.get("id").and_then(|v| v.as_str())
+                        if let Some(existing_id) = existing_step.get("id").and_then(|v| v.as_str())
                         {
                             criterion_step_map
                                 .entry(criterion.id.clone())
@@ -387,10 +384,7 @@ fn derive_command(criterion: &AcceptanceCriterion, working_dir: &Option<String>)
     let _ = working_dir; // reserved for future use
     if hint.starts_with("Run ") {
         // Strip "Run " prefix and backticks
-        let cmd = hint
-            .trim_start_matches("Run ")
-            .trim_matches('`')
-            .trim();
+        let cmd = hint.trim_start_matches("Run ").trim_matches('`').trim();
         if !cmd.is_empty() {
             return cmd.to_string();
         }
@@ -681,12 +675,20 @@ mod tests {
         // With vitest context
         let result = synthesize_verification_steps(&criteria, "project uses vitest for testing");
         let cmd = result.steps[0]["command"].as_str().unwrap();
-        assert!(cmd.contains("vitest"), "Expected vitest in command: {}", cmd);
+        assert!(
+            cmd.contains("vitest"),
+            "Expected vitest in command: {}",
+            cmd
+        );
 
         // With pytest context
         let result = synthesize_verification_steps(&criteria, "python project with pytest");
         let cmd = result.steps[0]["command"].as_str().unwrap();
-        assert!(cmd.contains("pytest"), "Expected pytest in command: {}", cmd);
+        assert!(
+            cmd.contains("pytest"),
+            "Expected pytest in command: {}",
+            cmd
+        );
     }
 
     #[test]
@@ -746,10 +748,7 @@ mod tests {
 
         merge_synthesized_steps(&mut workflow, &synthesis);
         assert!(workflow.get("verification_steps").is_some());
-        assert_eq!(
-            workflow["verification_steps"].as_array().unwrap().len(),
-            1
-        );
+        assert_eq!(workflow["verification_steps"].as_array().unwrap().len(), 1);
     }
 
     #[test]

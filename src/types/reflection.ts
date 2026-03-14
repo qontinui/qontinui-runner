@@ -108,3 +108,13 @@ export interface EvaluateResponse {
   evaluated_count: number;
   effective_count: number;
 }
+
+/** Convergence/stall status with explanation */
+export interface ConvergenceStatus {
+  status: "converging" | "stalled" | "improving" | "regressing" | "insufficient_data";
+  reason: string;
+  consecutive_clean_runs: number;
+  convergence_score: number;
+  stall_findings: string[];
+  recommendation: string;
+}

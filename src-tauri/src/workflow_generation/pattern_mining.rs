@@ -161,12 +161,12 @@ pub fn mine_patterns(conn: &Connection) -> Result<MiningReport, String> {
              JOIN task_runs tr ON tr.workflow_id = w.id \
              WHERE tr.status = 'success'",
         )
-        .and_then(|mut s| {
+        .map(|mut s| {
             let ids: Vec<String> = s
                 .query_map([], |row| row.get::<_, String>(0))
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
                 .unwrap_or_default();
-            Ok(ids)
+            ids
         })
         .unwrap_or_default()
         .into_iter()
@@ -178,12 +178,12 @@ pub fn mine_patterns(conn: &Connection) -> Result<MiningReport, String> {
              JOIN task_runs tr ON tr.workflow_id = w.id \
              WHERE tr.status = 'failure'",
         )
-        .and_then(|mut s| {
+        .map(|mut s| {
             let ids: Vec<String> = s
                 .query_map([], |row| row.get::<_, String>(0))
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
                 .unwrap_or_default();
-            Ok(ids)
+            ids
         })
         .unwrap_or_default()
         .into_iter()
@@ -260,7 +260,10 @@ pub fn patterns_to_rules(
         .collect();
 
     if qualifying.is_empty() {
-        debug!("No patterns meet the minimum occurrence threshold of {}", min_occurrences);
+        debug!(
+            "No patterns meet the minimum occurrence threshold of {}",
+            min_occurrences
+        );
         return Ok(0);
     }
 
@@ -322,7 +325,10 @@ pub fn patterns_to_rules(
                 created += 1;
             }
             Err(e) => {
-                warn!("Failed to create rule for pattern '{}': {}", pattern.name, e);
+                warn!(
+                    "Failed to create rule for pattern '{}': {}",
+                    pattern.name, e
+                );
             }
         }
     }

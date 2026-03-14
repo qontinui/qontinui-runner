@@ -7,6 +7,7 @@
 //! 3. Parent hierarchy tracking
 
 use rusqlite::Connection;
+use serde::Serialize;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -294,6 +295,310 @@ fn has_repeated_findings(
     }
 
     Ok(all_identical)
+}
+
+// =============================================================================
+// Convergence Status Analysis
+// =============================================================================
+
+/// High-level convergence/stall status with human-readable explanation.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConvergenceStatus {
+    /// One of: "converging", "stalled", "improving", "regressing", "insufficient_data"
+    pub status: String,
+    /// Human-readable explanation of why this status was determined
+    pub reason: String,
+    /// Number of consecutive runs with zero findings
+    pub consecutive_clean_runs: u32,
+    /// Continuous convergence score (0.0-1.0)
+    pub convergence_score: f64,
+    /// Recurring finding titles if the workflow is stalled
+    pub stall_findings: Vec<String>,
+    /// Actionable recommendation for what to try next
+    pub recommendation: String,
+}
+
+/// Extract the recurring finding titles when all recent reflection snapshots
+/// share the same set of findings.
+///
+/// Adapts the logic from `has_repeated_findings()` — instead of returning a
+/// bool, returns the finding titles from the first snapshot when all sets
+/// (across recent reflection runs) are identical. Returns an empty vec when
+/// findings are not repeated.
+fn get_stall_finding_titles(conn: &Connection, workflow_name: &str) -> Result<Vec<String>, String> {
+    // Get last REPEAT_THRESHOLD reflection runs for this workflow
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT tr.id
+            FROM task_runs tr
+            WHERE tr.workflow_name LIKE 'Reflection: %'
+              AND tr.is_reflection = 1
+              AND tr.status IN ('complete', 'completed')
+              AND tr.reflection_source_task_run_id IN (
+                SELECT id FROM task_runs WHERE workflow_name = ?1
+              )
+            ORDER BY tr.completed_at DESC
+            LIMIT ?2
+            "#,
+        )
+        .map_err(|e| format!("Failed to prepare stall-findings query: {}", e))?;
+
+    let reflection_ids: Vec<String> = stmt
+        .query_map(rusqlite::params![workflow_name, REPEAT_THRESHOLD], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| format!("Failed to query reflection runs: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Need at least REPEAT_THRESHOLD reflection runs
+    if reflection_ids.len() < REPEAT_THRESHOLD as usize {
+        return Ok(Vec::new());
+    }
+
+    // Collect (signature_or_title) sets for each reflection run, and also
+    // keep the titles from the first set for the response
+    let mut sig_stmt = conn
+        .prepare(
+            r#"
+            SELECT COALESCE(signature_hash, title) as sig,
+                   COALESCE(title, signature_hash) as display_title
+            FROM task_run_findings
+            WHERE task_run_id = ?1
+            ORDER BY sig
+            "#,
+        )
+        .map_err(|e| format!("Failed to prepare signature query: {}", e))?;
+
+    let mut finding_sets: Vec<BTreeSet<String>> = Vec::new();
+    let mut first_titles: Vec<String> = Vec::new();
+
+    for (idx, ref_id) in reflection_ids.iter().enumerate() {
+        let mut sigs = BTreeSet::new();
+        let rows: Vec<(String, String)> = sig_stmt
+            .query_map(rusqlite::params![ref_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Failed to query findings for {}: {}", ref_id, e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (sig, title) in rows {
+            sigs.insert(sig);
+            if idx == 0 {
+                first_titles.push(title);
+            }
+        }
+        finding_sets.push(sigs);
+    }
+
+    // All sets must be identical and non-empty
+    let first = &finding_sets[0];
+    if first.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let all_identical = finding_sets.iter().all(|s| s == first);
+    if all_identical {
+        Ok(first_titles)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// Build an actionable recommendation by analyzing which fix types have been
+/// attempted and their effectiveness rates.
+fn build_stall_recommendation(conn: &Connection, workflow_name: &str) -> Result<String, String> {
+    // Query fix_type grouped effectiveness stats for this workflow
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT rf.fix_type,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN rf.effectiveness = 'effective' THEN 1 ELSE 0 END) as effective,
+                   SUM(CASE WHEN rf.effectiveness = 'ineffective' THEN 1 ELSE 0 END) as ineffective,
+                   SUM(CASE WHEN rf.effectiveness = 'caused_regression' THEN 1 ELSE 0 END) as regression
+            FROM reflection_fixes rf
+            INNER JOIN task_runs tr ON tr.id = rf.source_task_run_id
+            WHERE tr.workflow_name = ?1
+              AND rf.status = 'applied'
+            GROUP BY rf.fix_type
+            "#,
+        )
+        .map_err(|e| format!("Failed to prepare recommendation query: {}", e))?;
+
+    struct FixTypeStats {
+        fix_type: String,
+        total: u32,
+        effective: u32,
+        ineffective: u32,
+        _regression: u32,
+    }
+
+    let stats: Vec<FixTypeStats> = stmt
+        .query_map(rusqlite::params![workflow_name], |row| {
+            Ok(FixTypeStats {
+                fix_type: row.get(0)?,
+                total: row.get(1)?,
+                effective: row.get(2)?,
+                ineffective: row.get(3)?,
+                _regression: row.get(4)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query fix type stats: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // All known fix types
+    let all_fix_types = [
+        "knowledge_base_update",
+        "workflow_step_rewrite",
+        "selector_fix",
+        "tool_config_update",
+        "context_addition",
+        "instruction_clarification",
+    ];
+
+    let attempted_types: BTreeSet<&str> = stats.iter().map(|s| s.fix_type.as_str()).collect();
+
+    // Find unattempted fix types
+    let unattempted: Vec<&str> = all_fix_types
+        .iter()
+        .filter(|t| !attempted_types.contains(*t))
+        .copied()
+        .collect();
+
+    // Find fix types with low effectiveness
+    let low_effectiveness: Vec<(&str, f64)> = stats
+        .iter()
+        .filter(|s| {
+            let evaluated = s.effective + s.ineffective;
+            evaluated > 0 && (s.effective as f64 / evaluated as f64) < 0.4
+        })
+        .map(|s| {
+            let evaluated = s.effective + s.ineffective;
+            let rate = if evaluated > 0 {
+                s.effective as f64 / evaluated as f64
+            } else {
+                0.0
+            };
+            (s.fix_type.as_str(), rate)
+        })
+        .collect();
+
+    let mut parts: Vec<String> = Vec::new();
+
+    if !unattempted.is_empty() {
+        let types_str = unattempted
+            .iter()
+            .map(|t| format!("'{}'", t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!(
+            "Consider trying {} fixes (not yet attempted).",
+            types_str
+        ));
+    }
+
+    for (fix_type, rate) in &low_effectiveness {
+        parts.push(format!(
+            "'{}' has {:.0}% effectiveness — try a different approach.",
+            fix_type,
+            rate * 100.0
+        ));
+    }
+
+    if parts.is_empty() {
+        if stats.is_empty() {
+            parts.push(
+                "No fixes have been attempted yet. Run a reflection workflow to start.".to_string(),
+            );
+        } else {
+            parts.push(
+                "All attempted fix types show reasonable effectiveness. \
+                 Consider manual review of the recurring findings."
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(parts.join(" "))
+}
+
+/// Analyze the convergence status of a workflow, producing a human-readable
+/// explanation and actionable recommendation.
+pub fn analyze_convergence_status(
+    conn: &Connection,
+    workflow_name: &str,
+) -> Result<ConvergenceStatus, String> {
+    // 1. Compute convergence metrics
+    let metrics = super::prediction::compute_convergence_score(conn, workflow_name, "workflow")?;
+
+    // 2. Check for stalled findings
+    let stall_findings = get_stall_finding_titles(conn, workflow_name)?;
+
+    // 3. Determine status
+    let (status, reason, recommendation) = if metrics.score >= 0.85 {
+        (
+            "converging".to_string(),
+            format!(
+                "Workflow is converging with score {:.2}. {} consecutive clean runs.",
+                metrics.score, metrics.consecutive_clean_runs
+            ),
+            "The workflow is healthy. Continue monitoring for regressions.".to_string(),
+        )
+    } else if !stall_findings.is_empty() {
+        let titles_display = stall_findings
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reason = format!(
+            "Same findings recurring across last {} snapshots: [{}]. Fixes are not resolving the issues.",
+            REPEAT_THRESHOLD, titles_display
+        );
+        let rec = build_stall_recommendation(conn, workflow_name)?;
+        ("stalled".to_string(), reason, rec)
+    } else if metrics.effective_fix_rate >= 0.6 {
+        (
+            "improving".to_string(),
+            format!(
+                "Fixes are effective ({:.0}% effectiveness rate). Workflow is trending toward convergence.",
+                metrics.effective_fix_rate * 100.0
+            ),
+            "Current fix strategy is working. Continue with the same approach.".to_string(),
+        )
+    } else if metrics.effective_fix_rate < 0.3 && metrics.total_fixes > 3 {
+        let rec = build_stall_recommendation(conn, workflow_name)?;
+        (
+            "regressing".to_string(),
+            format!(
+                "Low fix effectiveness ({:.0}%). Most attempted fixes are not resolving issues.",
+                metrics.effective_fix_rate * 100.0
+            ),
+            rec,
+        )
+    } else {
+        (
+            "insufficient_data".to_string(),
+            format!(
+                "Not enough data to determine convergence status ({} fixes total).",
+                metrics.total_fixes
+            ),
+            "Run more workflow iterations to gather convergence data.".to_string(),
+        )
+    };
+
+    Ok(ConvergenceStatus {
+        status,
+        reason,
+        consecutive_clean_runs: metrics.consecutive_clean_runs,
+        convergence_score: metrics.score,
+        stall_findings,
+        recommendation,
+    })
 }
 
 /// Launch a reflection workflow to analyze the given source task run.

@@ -14,7 +14,9 @@ export type PythonStatus = "stopped" | "running";
 interface UsePythonExecutorReturn {
   pythonStatus: PythonStatus;
   setPythonStatus: (status: PythonStatus) => void;
-  startPython: (onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void) => Promise<boolean>;
+  startPython: (
+    onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void,
+  ) => Promise<boolean>;
 }
 
 /**
@@ -27,7 +29,9 @@ export function usePythonExecutor(): UsePythonExecutorReturn {
    * Start the Python executor
    */
   const startPython = useCallback(
-    async (onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void): Promise<boolean> => {
+    async (
+      onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void,
+    ): Promise<boolean> => {
       if (pythonStatus === "running") {
         return true;
       }

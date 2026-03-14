@@ -6,7 +6,12 @@
  */
 
 import { useRef, useCallback, type CSSProperties } from "react";
-import { FixedSizeList, VariableSizeList, type ListChildComponentProps, type ListOnScrollProps } from "react-window";
+import {
+  FixedSizeList,
+  VariableSizeList,
+  type ListChildComponentProps,
+  type ListOnScrollProps,
+} from "react-window";
 import AutoSizer from "react-virtualized-auto-sizer";
 import { cn } from "../../lib/utils";
 

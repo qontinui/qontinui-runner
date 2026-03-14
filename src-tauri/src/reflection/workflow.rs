@@ -113,6 +113,19 @@ pub fn build_setup_steps(
             Some("previous_fixes"),
             true,
         ),
+        // Step 6: Load structured already-tried summary (all fixes, grouped by type with DO NOT retry warnings)
+        build_api_step(
+            "Load already-tried summary",
+            "GET",
+            &format!(
+                "{}/reflection/already-tried-summary?workflow_name={}",
+                base_url,
+                urlencoding::encode(source_workflow_name)
+            ),
+            None,
+            Some("already_tried_summary"),
+            true,
+        ),
     ]
 }
 
@@ -267,7 +280,14 @@ The setup phase loaded the following data into runtime variables:
 - `{{source_knowledge}}` — Observations, solutions, root causes recorded during execution
 - `{{source_ai_output}}` — The complete AI conversation output (CRITICAL — read this end-to-end)
 - `{{source_workflow_state}}` — Workflow execution state (phases, iterations, timing)
-- `{{previous_fixes}}` — Previous reflection fixes for this workflow (for effectiveness comparison)"#;
+- `{{previous_fixes}}` — Previous reflection fixes for this workflow (for effectiveness comparison)
+- `{{already_tried_summary}}` — Structured summary of ALL prior fixes grouped by type, with effectiveness labels and DO NOT retry warnings
+
+## CRITICAL: Already-Tried Context
+
+Review the already-tried summary (`{{already_tried_summary}}`) BEFORE proposing any fixes.
+Do NOT re-attempt approaches marked as FAILED or REGRESSION. If a fix type has low effectiveness
+across prior attempts, try a fundamentally different strategy rather than variations of the same approach."#;
 
     let marker_section = r#"
 ## Recording Fixes
@@ -650,6 +670,19 @@ pub fn build_project_setup_steps(
             Some("previous_fixes"),
             true,
         ),
+        // Step 6: Load structured already-tried summary
+        build_api_step(
+            "Load already-tried summary",
+            "GET",
+            &format!(
+                "{}/reflection/already-tried-summary?workflow_name={}",
+                base_url,
+                urlencoding::encode(source_workflow_name)
+            ),
+            None,
+            Some("already_tried_summary"),
+            true,
+        ),
     ]
 }
 
@@ -741,6 +774,13 @@ The setup phase loaded the following data into runtime variables:
 - `{{{{source_ai_output}}}}` — The complete AI conversation output (CRITICAL — read this end-to-end)
 - `{{{{source_workflow_state}}}}` — Workflow execution state
 - `{{{{previous_fixes}}}}` — Previous project reflection knowledge (for deduplication)
+- `{{{{already_tried_summary}}}}` — Structured summary of ALL prior fixes grouped by type, with effectiveness labels and DO NOT retry warnings
+
+## CRITICAL: Already-Tried Context
+
+Review the already-tried summary (`{{{{already_tried_summary}}}}`) BEFORE proposing any fixes.
+Do NOT re-attempt approaches marked as FAILED or REGRESSION. If a fix type has low effectiveness
+across prior attempts, try a fundamentally different strategy rather than variations of the same approach.
 
 ## Recording Project Knowledge
 

@@ -325,8 +325,20 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         bridgeRegistry.registerElement(`terminal-input-${termId}`, xtermTextarea, {
           type: "textarea",
           label: `Terminal input (${termId.slice(0, 8)})`,
-          actions: ["focus", "blur", "sendKeys"],
+          actions: ["focus", "blur"],
           customActions: {
+            sendKeys: {
+              id: "sendKeys",
+              description: "Send key sequences to the terminal",
+              handler: (params?: unknown) => {
+                const { keys } = (params || {}) as { keys?: string };
+                if (!keys) return;
+                const bytes = encoder.encode(keys);
+                invoke("terminal_write", { terminalId: termId, data: uint8ToBase64(bytes) }).catch(
+                  () => {},
+                );
+              },
+            },
             writeToTerminal: {
               id: "writeToTerminal",
               description: "Write text directly to the PTY (no keyboard events)",

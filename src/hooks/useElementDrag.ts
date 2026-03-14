@@ -35,9 +35,7 @@ function deriveAction(elementId: string): {
 } {
   // URL/navigation elements → navigate action
   if (elementId.startsWith("url:") || elementId.startsWith("nav:")) {
-    const label = elementId.includes(":")
-      ? elementId.split(":").slice(1).join(":")
-      : elementId;
+    const label = elementId.includes(":") ? elementId.split(":").slice(1).join(":") : elementId;
     return {
       name: `Navigate to ${label}`,
       action: { type: "navigate" as const, url: label },
@@ -46,9 +44,7 @@ function deriveAction(elementId: string): {
 
   // Text inputs → type action
   if (elementId.startsWith("text:")) {
-    const label = elementId.includes(":")
-      ? elementId.split(":").slice(1).join(":")
-      : elementId;
+    const label = elementId.includes(":") ? elementId.split(":").slice(1).join(":") : elementId;
     return {
       name: `Type in ${label}`,
       action: { type: "type" as const, target: elementId, text: "" },
@@ -68,9 +64,7 @@ function deriveAction(elementId: string): {
   }
 
   // Default → click action
-  const label = elementId.includes(":")
-    ? elementId.split(":").slice(1).join(":")
-    : elementId;
+  const label = elementId.includes(":") ? elementId.split(":").slice(1).join(":") : elementId;
   return {
     name: `Click ${label}`,
     action: { type: "click" as const, target: elementId },
@@ -84,9 +78,7 @@ function findExistingTransition(
   targetStateId: string,
 ): StateMachineTransition | undefined {
   return transitions.find(
-    (t) =>
-      t.from_states.includes(sourceStateId) &&
-      t.activate_states.includes(targetStateId),
+    (t) => t.from_states.includes(sourceStateId) && t.activate_states.includes(targetStateId),
   );
 }
 
@@ -115,13 +107,10 @@ export function useElementDrag({
     return () => window.removeEventListener("dragend", handleDragEnd);
   }, []);
 
-  const handleStartElementDrag = useCallback(
-    (stateId: string, elementId: string) => {
-      setDragData({ sourceStateId: stateId, elementId });
-      setIsDragging(true);
-    },
-    [],
-  );
+  const handleStartElementDrag = useCallback((stateId: string, elementId: string) => {
+    setDragData({ sourceStateId: stateId, elementId });
+    setIsDragging(true);
+  }, []);
 
   const handleElementDropOnState = useCallback(
     async (targetStateId: string, dragInfo: ElementDragData) => {
@@ -146,9 +135,7 @@ export function useElementDrag({
       }
 
       if (isMoveOperation) {
-        const updatedSourceElements = sourceState.element_ids.filter(
-          (eid) => eid !== elementId,
-        );
+        const updatedSourceElements = sourceState.element_ids.filter((eid) => eid !== elementId);
         const updatedTargetElements = targetState.element_ids.includes(elementId)
           ? targetState.element_ids
           : [...targetState.element_ids, elementId];
@@ -195,9 +182,7 @@ export function useElementDrag({
 
   const handleDragOver = useCallback(
     (event: React.DragEvent) => {
-      const hasData = event.dataTransfer.types.includes(
-        "application/ui-bridge-element-drag",
-      );
+      const hasData = event.dataTransfer.types.includes("application/ui-bridge-element-drag");
       if (hasData) {
         event.preventDefault();
         event.dataTransfer.dropEffect = event.altKey ? "move" : "link";
@@ -224,9 +209,7 @@ export function useElementDrag({
       setIsDragging(false);
       setDropTargetStateId(null);
 
-      const dragDataStr = event.dataTransfer.getData(
-        "application/ui-bridge-element-drag",
-      );
+      const dragDataStr = event.dataTransfer.getData("application/ui-bridge-element-drag");
       if (!dragDataStr) return;
 
       try {

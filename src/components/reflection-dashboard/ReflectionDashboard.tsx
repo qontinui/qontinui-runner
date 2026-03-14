@@ -17,14 +17,31 @@ import {
   ChevronRight,
   Loader2,
   RefreshCw,
+  TrendingUp,
 } from "lucide-react";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+  Bar,
+  BarChart,
+} from "recharts";
 import type {
   ReflectionFix,
   EffectivenessReport,
   ReflectionRunSummary,
   FixType,
   FixEffectiveness,
+  ConvergenceStatus,
 } from "../../types/reflection";
+import type {
+  WorkflowTrends,
+  EffectivenessOverTime,
+  EffectivenessBucket,
+} from "../../types/architecture";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // ============================================================================
@@ -88,6 +105,106 @@ function formatDate(dateStr: string): string {
 }
 
 // ============================================================================
+// Chart Helpers
+// ============================================================================
+
+function formatShortDate(label: unknown): string {
+  const d = new Date(String(label));
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+function TrendTooltip({
+  active,
+  payload,
+  label,
+  valueLabel,
+  valueSuffix = "",
+}: {
+  active?: boolean;
+  payload?: { value: number }[];
+  label?: string;
+  valueLabel: string;
+  valueSuffix?: string;
+}) {
+  if (active && payload && payload.length) {
+    return (
+      <div className="bg-popover border border-border rounded-lg p-2 shadow-lg text-xs">
+        <p className="font-medium">{label}</p>
+        <p className="text-purple-400">
+          {valueLabel}: {payload[0].value.toFixed(1)}
+          {valueSuffix}
+        </p>
+      </div>
+    );
+  }
+  return null;
+}
+
+function EffectivenessChartTooltip({
+  active,
+  payload,
+}: {
+  active?: boolean;
+  payload?: { payload: EffectivenessBucket & { ratePercent: number } }[];
+}) {
+  if (active && payload && payload.length) {
+    const d = payload[0].payload;
+    return (
+      <div className="bg-popover border border-border rounded-lg p-2 shadow-lg text-xs">
+        <p className="font-medium">{d.bucket}</p>
+        <p className="text-green-400">
+          Effective: {d.effective}/{d.total} ({d.ratePercent.toFixed(1)}%)
+        </p>
+        {d.ineffective > 0 && <p className="text-yellow-400">Ineffective: {d.ineffective}</p>}
+        {d.regression > 0 && <p className="text-red-400">Regression: {d.regression}</p>}
+      </div>
+    );
+  }
+  return null;
+}
+
+const CONVERGENCE_STYLES: Record<
+  string,
+  { border: string; bg: string; text: string; icon: typeof CheckCircle }
+> = {
+  converging: {
+    border: "border-green-500/50",
+    bg: "bg-green-500/10",
+    text: "text-green-400",
+    icon: CheckCircle,
+  },
+  stalled: {
+    border: "border-red-500/50",
+    bg: "bg-red-500/10",
+    text: "text-red-400",
+    icon: XCircle,
+  },
+  improving: {
+    border: "border-blue-500/50",
+    bg: "bg-blue-500/10",
+    text: "text-blue-400",
+    icon: TrendingUp,
+  },
+  regressing: {
+    border: "border-orange-500/50",
+    bg: "bg-orange-500/10",
+    text: "text-orange-400",
+    icon: AlertTriangle,
+  },
+  insufficient_data: {
+    border: "border-gray-500/50",
+    bg: "bg-gray-500/10",
+    text: "text-gray-400",
+    icon: HelpCircle,
+  },
+};
+
+const AXIS_TICK_STYLE = {
+  fontSize: 9,
+  fill: "hsl(var(--muted-foreground))",
+};
+
+// ============================================================================
 // Component
 // ============================================================================
 
@@ -97,6 +214,9 @@ export function ReflectionDashboard() {
   const [report, setReport] = useState<EffectivenessReport | null>(null);
   const [history, setHistory] = useState<ReflectionRunSummary[]>([]);
   const [fixes, setFixes] = useState<ReflectionFix[]>([]);
+  const [trends, setTrends] = useState<WorkflowTrends | null>(null);
+  const [effectivenessTrend, setEffectivenessTrend] = useState<EffectivenessOverTime | null>(null);
+  const [convergenceStatus, setConvergenceStatus] = useState<ConvergenceStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [expandedFixes, setExpandedFixes] = useState<Set<string>>(new Set());
 
@@ -138,20 +258,32 @@ export function ReflectionDashboard() {
     if (!workflowName) return;
     setLoading(true);
     try {
-      const [reportData, historyData, fixesData] = await Promise.all([
-        fetchApi<EffectivenessReport>(
-          `${getApiBase()}/reflection/effectiveness-report?workflow_name=${encodeURIComponent(workflowName)}`,
-        ),
-        fetchApi<ReflectionRunSummary[]>(
-          `${getApiBase()}/reflection/history?workflow_name=${encodeURIComponent(workflowName)}`,
-        ),
-        fetchApi<ReflectionFix[]>(
-          `${getApiBase()}/reflection-fixes?workflow_name=${encodeURIComponent(workflowName)}`,
-        ),
-      ]);
+      const encoded = encodeURIComponent(workflowName);
+      const [reportData, historyData, fixesData, trendsData, effTrendData, convergenceData] =
+        await Promise.all([
+          fetchApi<EffectivenessReport>(
+            `${getApiBase()}/reflection/effectiveness-report?workflow_name=${encoded}`,
+          ),
+          fetchApi<ReflectionRunSummary[]>(
+            `${getApiBase()}/reflection/history?workflow_name=${encoded}`,
+          ),
+          fetchApi<ReflectionFix[]>(`${getApiBase()}/reflection-fixes?workflow_name=${encoded}`),
+          fetchApi<WorkflowTrends>(
+            `${getApiBase()}/reflection/trends?workflow_name=${encoded}&time_range=30d`,
+          ),
+          fetchApi<EffectivenessOverTime>(
+            `${getApiBase()}/reflection/trends/effectiveness?workflow_name=${encoded}&bucket=week&time_range=30d`,
+          ),
+          fetchApi<ConvergenceStatus>(
+            `${getApiBase()}/reflection/convergence-status?workflow_name=${encoded}`,
+          ),
+        ]);
       setReport(reportData);
       setHistory(historyData || []);
       setFixes(fixesData || []);
+      setTrends(trendsData);
+      setEffectivenessTrend(effTrendData);
+      setConvergenceStatus(convergenceData);
     } finally {
       setLoading(false);
     }
@@ -182,6 +314,8 @@ export function ReflectionDashboard() {
           <select
             value={workflowName}
             onChange={(e) => setWorkflowName(e.target.value)}
+            disabled={workflows.length === 0}
+            aria-label="Select workflow"
             className="px-3 py-1.5 text-sm bg-muted border border-border rounded-md"
           >
             {workflows.length === 0 && <option value="">No workflows found</option>}
@@ -194,6 +328,7 @@ export function ReflectionDashboard() {
           <button
             onClick={loadData}
             disabled={loading}
+            aria-label="Refresh data"
             className="p-1.5 rounded hover:bg-muted transition-colors"
           >
             <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} />
@@ -240,6 +375,184 @@ export function ReflectionDashboard() {
                 <div className="text-xs text-muted-foreground">Effectiveness Rate</div>
               </div>
             </div>
+
+            {/* Convergence Status */}
+            {convergenceStatus &&
+              convergenceStatus.status !== "insufficient_data" &&
+              (() => {
+                const style =
+                  CONVERGENCE_STYLES[convergenceStatus.status] ||
+                  CONVERGENCE_STYLES.insufficient_data;
+                const StatusIcon = style.icon;
+                return (
+                  <div className={`border ${style.border} ${style.bg} rounded-lg p-3`}>
+                    <div className="flex items-center gap-2 mb-1">
+                      <StatusIcon className={`w-4 h-4 ${style.text}`} />
+                      <span className={`text-sm font-semibold ${style.text} capitalize`}>
+                        {convergenceStatus.status}
+                      </span>
+                      {convergenceStatus.convergence_score > 0 && (
+                        <span className="text-xs text-muted-foreground ml-auto">
+                          Score: {(convergenceStatus.convergence_score * 100).toFixed(0)}%
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-muted-foreground">{convergenceStatus.reason}</p>
+                    {convergenceStatus.stall_findings.length > 0 && (
+                      <div className="mt-1.5">
+                        <span className="text-xs font-medium">Recurring findings:</span>
+                        <ul className="mt-0.5 text-xs text-muted-foreground list-disc list-inside">
+                          {convergenceStatus.stall_findings.slice(0, 5).map((f, i) => (
+                            <li key={i}>{f}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {convergenceStatus.recommendation && (
+                      <p className="mt-1.5 text-xs italic text-muted-foreground">
+                        {convergenceStatus.recommendation}
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
+
+            {/* Trend Charts */}
+            {trends && trends.snapshot_count > 1 && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                {/* Convergence Score */}
+                <div className="bg-card border border-border rounded-lg p-3">
+                  <h4 className="text-[11px] font-medium text-muted-foreground mb-1">
+                    Convergence Score
+                  </h4>
+                  <div className="h-24">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart
+                        data={trends.convergence}
+                        margin={{ left: 0, right: 4, top: 4, bottom: 0 }}
+                      >
+                        <XAxis
+                          dataKey="timestamp"
+                          tick={AXIS_TICK_STYLE}
+                          tickLine={false}
+                          axisLine={false}
+                          interval="preserveStartEnd"
+                          tickFormatter={formatShortDate}
+                        />
+                        <YAxis
+                          tick={AXIS_TICK_STYLE}
+                          tickLine={false}
+                          axisLine={false}
+                          width={32}
+                          domain={[0, 1]}
+                          tickFormatter={(v: number) => `${(v * 100).toFixed(0)}%`}
+                        />
+                        <Tooltip
+                          content={<TrendTooltip valueLabel="Convergence" valueSuffix="" />}
+                          labelFormatter={formatShortDate}
+                        />
+                        <Line
+                          type="monotone"
+                          dataKey="value"
+                          stroke="#a78bfa"
+                          strokeWidth={1.5}
+                          dot={{ r: 2, fill: "#a78bfa" }}
+                          activeDot={{ r: 4, fill: "#a78bfa" }}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                {/* Effectiveness Rate + Volume */}
+                {effectivenessTrend &&
+                  effectivenessTrend.buckets.length > 0 &&
+                  (() => {
+                    const chartData = effectivenessTrend.buckets.map((b) => ({
+                      ...b,
+                      ratePercent: b.effectiveness_rate * 100,
+                    }));
+                    const firstRate = chartData[0]?.ratePercent ?? 0;
+                    const lastRate = chartData[chartData.length - 1]?.ratePercent ?? 0;
+                    const trendColor = lastRate >= firstRate ? "#22c55e" : "#ef4444";
+                    return (
+                      <div className="bg-card border border-border rounded-lg p-3">
+                        <h4 className="text-[11px] font-medium text-muted-foreground mb-1">
+                          Effectiveness Rate
+                        </h4>
+                        <div className="h-24">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <LineChart
+                              data={chartData}
+                              margin={{ left: 0, right: 4, top: 4, bottom: 0 }}
+                            >
+                              <XAxis
+                                dataKey="bucket"
+                                tick={AXIS_TICK_STYLE}
+                                tickLine={false}
+                                axisLine={false}
+                                interval="preserveStartEnd"
+                              />
+                              <YAxis
+                                tick={AXIS_TICK_STYLE}
+                                tickLine={false}
+                                axisLine={false}
+                                width={32}
+                                domain={[0, 100]}
+                                tickFormatter={(v: number) => `${v}%`}
+                              />
+                              <Tooltip content={<EffectivenessChartTooltip />} />
+                              <Line
+                                type="monotone"
+                                dataKey="ratePercent"
+                                stroke={trendColor}
+                                strokeWidth={1.5}
+                                dot={{ r: 2, fill: trendColor }}
+                                activeDot={{ r: 4, fill: trendColor }}
+                              />
+                            </LineChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                {/* Fix Velocity */}
+                <div className="bg-card border border-border rounded-lg p-3">
+                  <h4 className="text-[11px] font-medium text-muted-foreground mb-1">
+                    Fix Velocity
+                  </h4>
+                  <div className="h-24">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart
+                        data={trends.velocity}
+                        margin={{ left: 0, right: 4, top: 4, bottom: 0 }}
+                      >
+                        <XAxis
+                          dataKey="timestamp"
+                          tick={AXIS_TICK_STYLE}
+                          tickLine={false}
+                          axisLine={false}
+                          interval="preserveStartEnd"
+                          tickFormatter={formatShortDate}
+                        />
+                        <YAxis
+                          tick={AXIS_TICK_STYLE}
+                          tickLine={false}
+                          axisLine={false}
+                          width={24}
+                        />
+                        <Tooltip
+                          content={<TrendTooltip valueLabel="Velocity" />}
+                          labelFormatter={formatShortDate}
+                        />
+                        <Bar dataKey="value" fill="#6366f1" radius={[2, 2, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Reflection History */}
             {history.length > 0 && (
@@ -297,6 +610,7 @@ export function ReflectionDashboard() {
                     <div key={fix.id}>
                       <button
                         onClick={() => toggleFix(fix.id)}
+                        aria-expanded={isExpanded}
                         className="w-full px-4 py-2 flex items-center gap-3 text-left hover:bg-muted/50 transition-colors"
                       >
                         {isExpanded ? (

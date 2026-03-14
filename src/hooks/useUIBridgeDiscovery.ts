@@ -90,7 +90,10 @@ interface CommandResponse {
   data?: unknown;
 }
 
-export function useUIBridgeDiscovery(smConfig: UseStateMachineConfigReturn, showToast?: ShowToastFn) {
+export function useUIBridgeDiscovery(
+  smConfig: UseStateMachineConfigReturn,
+  showToast?: ShowToastFn,
+) {
   const [initial] = useState(() => loadPersistedState());
 
   const [cooccurrenceData, setCooccurrenceDataState] = useState<CooccurrenceExport | null>(
@@ -99,8 +102,9 @@ export function useUIBridgeDiscovery(smConfig: UseStateMachineConfigReturn, show
   const [dataSource, setDataSource] = useState<"explore" | "record" | null>(
     initial?.dataSource ?? null,
   );
-  const [discoveryResult, setDiscoveryResult] =
-    useState<FingerprintDiscoveryResult | null>(initial?.discoveryResult ?? null);
+  const [discoveryResult, setDiscoveryResult] = useState<FingerprintDiscoveryResult | null>(
+    initial?.discoveryResult ?? null,
+  );
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [configName, setConfigName] = useState(initial?.configName ?? "");
   const [isSaving, setIsSaving] = useState(false);
@@ -202,7 +206,10 @@ export function useUIBridgeDiscovery(smConfig: UseStateMachineConfigReturn, show
       // Reload the full config so the UI reflects all created states
       await smConfig.loadConfig(config.id);
 
-      showToast?.(`Saved config "${configName.trim()}" with ${discoveryResult.states.length} states`, "success");
+      showToast?.(
+        `Saved config "${configName.trim()}" with ${discoveryResult.states.length} states`,
+        "success",
+      );
       console.log(
         `[useUIBridgeDiscovery] Saved config "${configName.trim()}" with ${discoveryResult.states.length} states`,
       );

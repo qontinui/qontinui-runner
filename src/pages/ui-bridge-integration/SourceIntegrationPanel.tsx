@@ -18,7 +18,10 @@ interface SourceIntegrationPanelProps {
   onPrefillConsumed?: () => void;
 }
 
-export function SourceIntegrationPanel({ prefillPath, onPrefillConsumed }: SourceIntegrationPanelProps = {}) {
+export function SourceIntegrationPanel({
+  prefillPath,
+  onPrefillConsumed,
+}: SourceIntegrationPanelProps = {}) {
   const [projectPath, setProjectPath] = useState(prefillPath || "");
   const [analysis, setAnalysis] = useState<ProjectAnalysis | null>(null);
   const [analyzing, setAnalyzing] = useState(false);

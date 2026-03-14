@@ -785,7 +785,7 @@ export function useUIBridgeEventHandler(): void {
               const safeExpressionPattern = /^[a-zA-Z_$][\w$.[\]'"()\s,]*$/;
               if (!safeExpressionPattern.test(expression)) {
                 throw new Error(
-                  "Expression rejected: only simple property access and function calls are allowed"
+                  "Expression rejected: only simple property access and function calls are allowed",
                 );
               }
               const result = new Function("return " + expression)();

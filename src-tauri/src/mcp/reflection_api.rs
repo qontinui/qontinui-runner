@@ -18,9 +18,11 @@ use crate::reflection::architecture::{
     self, ComponentDetails, ComponentGraph, ImpactAnalysis, RebuildResult,
 };
 use crate::reflection::causal::{self, CausalChain, CausalEvent, CausalSummary};
+use crate::reflection::context;
 use crate::reflection::prediction::{self, ConvergenceMetrics, PredictedFix, ScoredKnowledge};
 use crate::reflection::storage::{self, ReflectionRunSummary};
 use crate::reflection::trends::{self, ComponentTrend, EffectivenessOverTime, WorkflowTrends};
+use crate::reflection::trigger::ConvergenceStatus;
 use crate::reflection::types::{
     CreateReflectionFixInput, EffectivenessReport, ReflectionFix, UpdateEffectivenessInput,
     UpdateFixStatusInput,
@@ -399,6 +401,51 @@ pub async fn evaluate_fixes_handler(
 pub struct EvaluateResponse {
     pub evaluated_count: u32,
     pub effective_count: u32,
+}
+
+// =============================================================================
+// Already-tried summary endpoint
+// =============================================================================
+
+/// Query parameters for the already-tried summary.
+#[derive(Debug, Deserialize)]
+pub struct AlreadyTriedQuery {
+    pub workflow_name: String,
+}
+
+/// Response for the already-tried summary.
+#[derive(Debug, Serialize)]
+pub struct AlreadyTriedResponse {
+    pub summary: String,
+}
+
+/// GET /reflection/already-tried-summary?workflow_name=...
+///
+/// Returns a structured summary of all previously attempted fixes for a workflow,
+/// grouped by type with effectiveness labels and "DO NOT retry" warnings.
+pub async fn already_tried_summary_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<AlreadyTriedQuery>,
+) -> Result<Json<ApiResponse<AlreadyTriedResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let fixes = state
+        .app_state
+        .checkpoint_db
+        .with_conn(|conn| {
+            storage::get_fixes_by_workflow_name(conn, &query.workflow_name, None, None)
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "Failed to get fixes for already-tried summary: {}",
+                    e
+                ))),
+            )
+        })?;
+
+    let summary = context::build_already_tried_summary(&fixes);
+
+    Ok(Json(ApiResponse::success(AlreadyTriedResponse { summary })))
 }
 
 /// Response for reflection settings.
@@ -1004,6 +1051,43 @@ pub async fn component_trend_handler(
     Ok(Json(ApiResponse::success(trend)))
 }
 
+// ---------------------------------------------------------------------------
+// Convergence status endpoint (Gap 5)
+// ---------------------------------------------------------------------------
+
+/// Query parameters for convergence status.
+#[derive(Debug, Deserialize)]
+pub struct ConvergenceStatusQuery {
+    pub workflow_name: String,
+}
+
+/// GET /reflection/convergence-status?workflow_name=...
+///
+/// Returns a high-level convergence/stall status with human-readable explanation
+/// and actionable recommendation.
+pub async fn convergence_status_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ConvergenceStatusQuery>,
+) -> Result<Json<ApiResponse<ConvergenceStatus>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let status = state
+        .app_state
+        .checkpoint_db
+        .with_conn(|conn| {
+            crate::reflection::trigger::analyze_convergence_status(conn, &query.workflow_name)
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "Failed to analyze convergence status: {}",
+                    e
+                ))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(status)))
+}
+
 /// Create routes for this module.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post, put};
@@ -1038,6 +1122,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             post(trigger_reflection_handler),
         )
         .route("/reflection/evaluate", post(evaluate_fixes_handler))
+        // Already-tried summary
+        .route(
+            "/reflection/already-tried-summary",
+            get(already_tried_summary_handler),
+        )
         // Reflection settings
         .route(
             "/reflection/settings",
@@ -1046,6 +1135,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         // Prediction API (v99 cognitive system model)
         .route("/reflection/predict-fix", get(predict_fix_handler))
         .route("/reflection/convergence", get(convergence_handler))
+        .route(
+            "/reflection/convergence-status",
+            get(convergence_status_handler),
+        )
         .route("/reflection/change-velocity", get(change_velocity_handler))
         .route(
             "/reflection/scored-knowledge",

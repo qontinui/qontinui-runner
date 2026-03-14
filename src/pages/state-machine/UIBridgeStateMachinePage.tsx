@@ -62,20 +62,16 @@ export function UIBridgeStateMachinePage() {
   const [selectedStateId, setSelectedStateId] = useState<string | null>(null);
   const [selectedTransitionId, setSelectedTransitionId] = useState<string | null>(null);
   const [showNewTransition, setShowNewTransition] = useState(false);
-  const [highlightedPath, setHighlightedPath] = useState<
-    PathfindingResult["steps"] | undefined
-  >();
+  const [highlightedPath, setHighlightedPath] = useState<PathfindingResult["steps"] | undefined>();
 
   // Derived state
   const states = sm.activeConfig?.states ?? [];
   const transitions = sm.activeConfig?.transitions ?? [];
   const selectedState = states.find((s) => s.id === selectedStateId) ?? null;
-  const selectedTransition =
-    transitions.find((t) => t.id === selectedTransitionId) ?? null;
+  const selectedTransition = transitions.find((t) => t.id === selectedTransitionId) ?? null;
 
   const showStatePanel = selectedState && !showNewTransition;
-  const showTransitionPanel =
-    (selectedTransition || showNewTransition) && !selectedState;
+  const showTransitionPanel = (selectedTransition || showNewTransition) && !selectedState;
   const noConfig = !sm.activeConfig;
   const hasConfig = !!sm.activeConfig;
 
@@ -148,9 +144,7 @@ export function UIBridgeStateMachinePage() {
       <div className="flex items-center justify-between px-6 py-4 border-b border-border-primary bg-surface-primary">
         <div className="flex items-center gap-3">
           <Network className="size-5 text-brand-primary" />
-          <h1 className="text-lg font-semibold text-text-primary">
-            UI Bridge States
-          </h1>
+          <h1 className="text-lg font-semibold text-text-primary">UI Bridge States</h1>
         </div>
 
         <div className="flex items-center gap-3">
@@ -185,9 +179,7 @@ export function UIBridgeStateMachinePage() {
             disabled={sm.isLoading}
             className="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium border border-border-primary text-text-primary hover:bg-surface-secondary disabled:opacity-50"
           >
-            <RefreshCw
-              className={`size-3.5 ${sm.isLoading ? "animate-spin" : ""}`}
-            />
+            <RefreshCw className={`size-3.5 ${sm.isLoading ? "animate-spin" : ""}`} />
             Refresh
           </button>
         </div>
@@ -216,26 +208,13 @@ export function UIBridgeStateMachinePage() {
       {/* Tab Content — all panels stay in DOM (hidden when inactive) */}
 
       {/* Discovery Tab */}
-      <div
-        className={`flex-1 overflow-y-auto ${activeTab !== "discovery" ? "hidden" : ""}`}
-      >
-        <UIBridgeDiscoveryPanel
-          discovery={discovery}
-          onConfigCreated={handleConfigCreated}
-        />
+      <div className={`flex-1 overflow-y-auto ${activeTab !== "discovery" ? "hidden" : ""}`}>
+        <UIBridgeDiscoveryPanel discovery={discovery} onConfigCreated={handleConfigCreated} />
       </div>
 
       {/* Graph Editor Tab */}
-      <div
-        className={`flex-1 flex min-h-0 ${activeTab !== "graph" ? "hidden" : ""}`}
-      >
-        <div
-          className={
-            sm.isLoading
-              ? "flex-1 flex items-center justify-center"
-              : "hidden"
-          }
-        >
+      <div className={`flex-1 flex min-h-0 ${activeTab !== "graph" ? "hidden" : ""}`}>
+        <div className={sm.isLoading ? "flex-1 flex items-center justify-center" : "hidden"}>
           <Loader2 className="size-8 animate-spin text-brand-primary" />
         </div>
         <div
@@ -331,9 +310,7 @@ export function UIBridgeStateMachinePage() {
       </div>
 
       {/* State View Tab */}
-      <div
-        className={`flex-1 flex min-h-0 ${activeTab !== "states" ? "hidden" : ""}`}
-      >
+      <div className={`flex-1 flex min-h-0 ${activeTab !== "states" ? "hidden" : ""}`}>
         <div
           className={
             noConfig && !sm.isLoading
@@ -357,9 +334,7 @@ export function UIBridgeStateMachinePage() {
       </div>
 
       {/* Transitions Tab */}
-      <div
-        className={`flex-1 flex min-h-0 ${activeTab !== "transitions" ? "hidden" : ""}`}
-      >
+      <div className={`flex-1 flex min-h-0 ${activeTab !== "transitions" ? "hidden" : ""}`}>
         <div
           className={
             noConfig && !sm.isLoading
@@ -382,9 +357,7 @@ export function UIBridgeStateMachinePage() {
       </div>
 
       {/* Pathfinding Tab */}
-      <div
-        className={`flex-1 overflow-y-auto ${activeTab !== "pathfinding" ? "hidden" : ""}`}
-      >
+      <div className={`flex-1 overflow-y-auto ${activeTab !== "pathfinding" ? "hidden" : ""}`}>
         <div
           className={
             noConfig && !sm.isLoading
@@ -404,9 +377,7 @@ export function UIBridgeStateMachinePage() {
       </div>
 
       {/* Export Tab */}
-      <div
-        className={`flex-1 overflow-y-auto ${activeTab !== "export" ? "hidden" : ""}`}
-      >
+      <div className={`flex-1 overflow-y-auto ${activeTab !== "export" ? "hidden" : ""}`}>
         <div
           className={
             noConfig && !sm.isLoading

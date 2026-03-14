@@ -43,10 +43,7 @@ export function UIBridgeDiscoveryPanel({
   const sdk = useSdkUIBridge();
 
   // All discovered apps (web + desktop)
-  const allApps: DiscoveredApp[] = [
-    ...appDiscovery.webApps,
-    ...appDiscovery.desktopApps,
-  ];
+  const allApps: DiscoveredApp[] = [...appDiscovery.webApps, ...appDiscovery.desktopApps];
 
   const isConnected = sdk.connectionStatus === "connected";
 
@@ -106,9 +103,7 @@ export function UIBridgeDiscoveryPanel({
   // State checks
   const hasData = discovery.cooccurrenceData !== null;
   const hasDiscoveryResult = discovery.discoveryResult !== null;
-  const captureCount = hasData
-    ? discovery.cooccurrenceData!.presenceMatrix.length
-    : 0;
+  const captureCount = hasData ? discovery.cooccurrenceData!.presenceMatrix.length : 0;
 
   return (
     <div className="p-4">
@@ -224,8 +219,8 @@ export function UIBridgeDiscoveryPanel({
             <div className={`mt-3 ${collectTab !== "explore" ? "hidden" : ""}`}>
               <div className="rounded-lg border border-border-primary bg-surface-secondary p-4 space-y-3">
                 <p className="text-sm text-text-muted">
-                  Automatically explore the connected app by interacting with UI elements
-                  and capturing state snapshots.
+                  Automatically explore the connected app by interacting with UI elements and
+                  capturing state snapshots.
                 </p>
 
                 <div className="flex items-center gap-3">
@@ -244,16 +239,25 @@ export function UIBridgeDiscoveryPanel({
 
                   <button
                     onClick={() => sdk.cancelExploration()}
-                    className={sdk.isExploring ? "inline-flex items-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium border border-border-primary text-text-primary hover:bg-surface-primary" : "hidden"}
+                    className={
+                      sdk.isExploring
+                        ? "inline-flex items-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium border border-border-primary text-text-primary hover:bg-surface-primary"
+                        : "hidden"
+                    }
                   >
                     Cancel
                   </button>
                 </div>
 
                 {/* Exploration progress */}
-                <div className={sdk.explorationProgress ? "text-xs text-text-muted space-y-1" : "hidden"}>
+                <div
+                  className={
+                    sdk.explorationProgress ? "text-xs text-text-muted space-y-1" : "hidden"
+                  }
+                >
                   <div>
-                    Progress: {sdk.explorationProgress?.current ?? 0} / {sdk.explorationProgress?.total ?? 0} interactions
+                    Progress: {sdk.explorationProgress?.current ?? 0} /{" "}
+                    {sdk.explorationProgress?.total ?? 0} interactions
                   </div>
                   {sdk.explorationProgress?.currentElement && (
                     <div className="truncate">
@@ -268,21 +272,29 @@ export function UIBridgeDiscoveryPanel({
             <div className={`mt-3 ${collectTab !== "record" ? "hidden" : ""}`}>
               <div className="rounded-lg border border-border-primary bg-surface-secondary p-4 space-y-3">
                 <p className="text-sm text-text-muted">
-                  Start a capture session to record UI state changes. Navigate the app
-                  manually while recording to capture different UI states.
+                  Start a capture session to record UI state changes. Navigate the app manually
+                  while recording to capture different UI states.
                 </p>
 
                 <div className="flex items-center gap-3">
                   <button
                     onClick={handleStartRecording}
-                    className={sdk.captureSession.active ? "hidden" : "inline-flex items-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium bg-brand-primary text-white hover:bg-brand-primary/90"}
+                    className={
+                      sdk.captureSession.active
+                        ? "hidden"
+                        : "inline-flex items-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium bg-brand-primary text-white hover:bg-brand-primary/90"
+                    }
                   >
                     <Circle className="size-3.5 text-red-400" />
                     Start Recording
                   </button>
                   <button
                     onClick={handleStopRecording}
-                    className={sdk.captureSession.active ? "inline-flex items-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium bg-red-600 text-white hover:bg-red-700" : "hidden"}
+                    className={
+                      sdk.captureSession.active
+                        ? "inline-flex items-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium bg-red-600 text-white hover:bg-red-700"
+                        : "hidden"
+                    }
                   >
                     <Square className="size-3.5" />
                     Stop Recording
@@ -402,10 +414,7 @@ export function UIBridgeDiscoveryPanel({
             {/* State preview */}
             <div className="border border-border-primary rounded-md p-3 space-y-1.5 max-h-40 overflow-y-auto">
               {(discovery.discoveryResult?.states ?? []).map((state) => (
-                <div
-                  key={state.stateId}
-                  className="flex items-center justify-between text-sm"
-                >
+                <div key={state.stateId} className="flex items-center justify-between text-sm">
                   <span className="text-text-primary">{state.name}</span>
                   <span className="text-text-muted">
                     {(state.confidence * 100).toFixed(0)}% confidence
@@ -417,10 +426,7 @@ export function UIBridgeDiscoveryPanel({
             {/* Save form */}
             <div className="border-t border-border-primary pt-4 space-y-3">
               <div className="space-y-1.5">
-                <label
-                  htmlFor="config-name"
-                  className="text-sm font-medium text-text-primary"
-                >
+                <label htmlFor="config-name" className="text-sm font-medium text-text-primary">
                   Configuration Name
                 </label>
                 <input

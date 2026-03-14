@@ -238,7 +238,8 @@ pub fn compose_sub_workflows(
     let mut sub_task_step_map: HashMap<String, Vec<String>> = HashMap::new();
 
     // Track setup commands we have already seen (for deduplication).
-    let mut seen_setup_commands: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_setup_commands: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for sub_task_id in &ordered_ids {
         let workflow_json = match workflow_map.get(sub_task_id.as_str()) {
@@ -254,10 +255,7 @@ pub fn compose_sub_workflows(
         // ── Setup steps ──────────────────────────────────────────────────
         if let Some(steps) = workflow_json.get("setup_steps").and_then(|v| v.as_array()) {
             for step in steps {
-                let command = step
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let command = step.get("command").and_then(|v| v.as_str()).unwrap_or("");
                 // Deduplicate setup steps by command string.
                 if !command.is_empty() && !seen_setup_commands.insert(command.to_string()) {
                     debug!(
@@ -645,10 +643,7 @@ mod tests {
         assert_eq!(agentic.len(), 3);
 
         // Step IDs should be prefixed
-        assert_eq!(
-            setup[0]["id"].as_str().unwrap(),
-            "setup-db_install-deps"
-        );
+        assert_eq!(setup[0]["id"].as_str().unwrap(), "setup-db_install-deps");
         assert_eq!(
             verification[0]["id"].as_str().unwrap(),
             "setup-db_check-build"

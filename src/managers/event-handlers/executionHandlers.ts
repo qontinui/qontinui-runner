@@ -45,80 +45,79 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
 
   // Handler for "execution_started" event
   unsubscribers.push(
-    eventRouter.subscribe(
-      "execution_started",
-      async (payload: EventPayload) => {
-        console.log("[EXECUTION_HANDLER] execution_started event received");
-        setExecutionActive(true);
+    eventRouter.subscribe("execution_started", async (payload: EventPayload) => {
+      console.log("[EXECUTION_HANDLER] execution_started event received");
+      setExecutionActive(true);
 
-        // Start execution run reporting using the new unified service
-        const projectId = configManager.getProjectId();
-        if (projectId) {
-          const data = payload?.data as {
-            workflow_id?: string;
-            workflow_name?: string;
-            run_type?: string;
-            initial_state_ids?: string[];
-          } | undefined;
-          const workflowId = data?.workflow_id || `workflow-${Date.now()}`;
-          const workflowName = data?.workflow_name || "Workflow Execution";
-          const runTypeStr = data?.run_type || "live_automation";
-          const initialStateIds = data?.initial_state_ids || [];
+      // Start execution run reporting using the new unified service
+      const projectId = configManager.getProjectId();
+      if (projectId) {
+        const data = payload?.data as
+          | {
+              workflow_id?: string;
+              workflow_name?: string;
+              run_type?: string;
+              initial_state_ids?: string[];
+            }
+          | undefined;
+        const workflowId = data?.workflow_id || `workflow-${Date.now()}`;
+        const workflowName = data?.workflow_name || "Workflow Execution";
+        const runTypeStr = data?.run_type || "live_automation";
+        const initialStateIds = data?.initial_state_ids || [];
 
-          // Map run type string to enum
-          let runType: RunType;
-          switch (runTypeStr) {
-            case "qa_test":
-              runType = RunType.QA_TEST;
-              break;
-            case "integration_test":
-              runType = RunType.INTEGRATION_TEST;
-              break;
-            case "recording":
-              runType = RunType.RECORDING;
-              break;
-            case "debug":
-              runType = RunType.DEBUG;
-              break;
-            default:
-              runType = RunType.LIVE_AUTOMATION;
-          }
-
-          // Get runner metadata
-          const runnerMetadata = {
-            runner_version: APP_VERSION,
-            os: navigator.platform || "unknown",
-            hostname: "qontinui-runner",
-          };
-
-          // Get workflow metadata including initial states
-          const workflowMetadata = {
-            workflow_id: workflowId,
-            workflow_name: workflowName,
-            initial_state_ids: initialStateIds.length > 0 ? initialStateIds : undefined,
-          };
-
-          console.log(
-            `[EXECUTION_HANDLER] Starting ${runType} run for project ${projectId}, workflow ${workflowName}, initial states: ${JSON.stringify(initialStateIds)}`,
-          );
-
-          // Start execution run reporting
-          await executionReportingService
-            .startRun(
-              projectId,
-              runType,
-              `${workflowName} - ${new Date().toISOString().slice(0, 16)}`,
-              runnerMetadata,
-              workflowMetadata,
-            )
-            .catch((error) => {
-              console.error("[EXECUTION_HANDLER] Failed to start execution run:", error);
-            });
-        } else {
-          console.log("[EXECUTION_HANDLER] No project selected, skipping execution run reporting");
+        // Map run type string to enum
+        let runType: RunType;
+        switch (runTypeStr) {
+          case "qa_test":
+            runType = RunType.QA_TEST;
+            break;
+          case "integration_test":
+            runType = RunType.INTEGRATION_TEST;
+            break;
+          case "recording":
+            runType = RunType.RECORDING;
+            break;
+          case "debug":
+            runType = RunType.DEBUG;
+            break;
+          default:
+            runType = RunType.LIVE_AUTOMATION;
         }
-      },
-    ),
+
+        // Get runner metadata
+        const runnerMetadata = {
+          runner_version: APP_VERSION,
+          os: navigator.platform || "unknown",
+          hostname: "qontinui-runner",
+        };
+
+        // Get workflow metadata including initial states
+        const workflowMetadata = {
+          workflow_id: workflowId,
+          workflow_name: workflowName,
+          initial_state_ids: initialStateIds.length > 0 ? initialStateIds : undefined,
+        };
+
+        console.log(
+          `[EXECUTION_HANDLER] Starting ${runType} run for project ${projectId}, workflow ${workflowName}, initial states: ${JSON.stringify(initialStateIds)}`,
+        );
+
+        // Start execution run reporting
+        await executionReportingService
+          .startRun(
+            projectId,
+            runType,
+            `${workflowName} - ${new Date().toISOString().slice(0, 16)}`,
+            runnerMetadata,
+            workflowMetadata,
+          )
+          .catch((error) => {
+            console.error("[EXECUTION_HANDLER] Failed to start execution run:", error);
+          });
+      } else {
+        console.log("[EXECUTION_HANDLER] No project selected, skipping execution run reporting");
+      }
+    }),
   );
 
   // Handler for "execution_completed" event
@@ -152,37 +151,32 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
 
   // Handler for "execution_failed" event (if execution fails)
   unsubscribers.push(
-    eventRouter.subscribe(
-      "execution_failed",
-      async (payload: EventPayload) => {
-        console.log("[EXECUTION_HANDLER] execution_failed event received");
-        setExecutionActive(false);
+    eventRouter.subscribe("execution_failed", async (payload: EventPayload) => {
+      console.log("[EXECUTION_HANDLER] execution_failed event received");
+      setExecutionActive(false);
 
-        const data = payload?.data as { error_message?: string } | undefined;
-        const errorMessage = data?.error_message;
+      const data = payload?.data as { error_message?: string } | undefined;
+      const errorMessage = data?.error_message;
 
-        // Complete execution run (failure)
-        if (executionReportingService.isActive) {
-          console.log("[EXECUTION_HANDLER] Completing execution run (failed)");
-          await executionReportingService
-            .completeRun(RunStatus.FAILED, undefined, undefined, errorMessage)
-            .catch((error) => {
-              console.error("[EXECUTION_HANDLER] Failed to complete execution run:", error);
-            });
-        }
-
-        // Archive findings from the session (even on failure)
-        const findingsCount = findingsTracker.count;
-        if (findingsCount > 0) {
-          console.log(
-            `[EXECUTION_HANDLER] Archiving ${findingsCount} findings from failed session`,
-          );
-          findingsTracker.archiveCurrentSession("failed").catch((error) => {
-            console.error("[EXECUTION_HANDLER] Failed to archive failed session:", error);
+      // Complete execution run (failure)
+      if (executionReportingService.isActive) {
+        console.log("[EXECUTION_HANDLER] Completing execution run (failed)");
+        await executionReportingService
+          .completeRun(RunStatus.FAILED, undefined, undefined, errorMessage)
+          .catch((error) => {
+            console.error("[EXECUTION_HANDLER] Failed to complete execution run:", error);
           });
-        }
-      },
-    ),
+      }
+
+      // Archive findings from the session (even on failure)
+      const findingsCount = findingsTracker.count;
+      if (findingsCount > 0) {
+        console.log(`[EXECUTION_HANDLER] Archiving ${findingsCount} findings from failed session`);
+        findingsTracker.archiveCurrentSession("failed").catch((error) => {
+          console.error("[EXECUTION_HANDLER] Failed to archive failed session:", error);
+        });
+      }
+    }),
   );
 
   return unsubscribers;

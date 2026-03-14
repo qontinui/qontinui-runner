@@ -21,6 +21,226 @@ pub struct EvaluationResult {
     pub evidence: String,
 }
 
+/// Verification pass rate metrics from workflow_verification_phase_results.
+#[derive(Debug)]
+struct VerificationMetrics {
+    pass_rate: f64,
+    total_steps: u32,
+    all_passed: bool,
+}
+
+/// Check if a fix type is structural — meaning it rewrites workflow steps or
+/// clarifies instructions rather than fixing a specific finding signature.
+///
+/// Structural fixes change the workflow itself, so signature-hash recurrence
+/// is meaningless (the old check was rewritten). Instead, these should be
+/// evaluated by comparing verification pass rates before and after.
+fn is_structural_fix_type(fix_type: &str) -> bool {
+    matches!(
+        fix_type,
+        "workflow_step_rewrite" | "instruction_clarification" | "context_addition"
+    )
+}
+
+/// Query the last iteration's verification metrics for a given task run.
+///
+/// Returns None if no verification data exists for the run (e.g., the run
+/// didn't have a verification phase or the table doesn't exist yet).
+fn get_verification_metrics(
+    conn: &Connection,
+    task_run_id: &str,
+) -> Result<Option<VerificationMetrics>, String> {
+    let result = conn.query_row(
+        r#"
+        SELECT total_steps, passed_steps, all_passed
+        FROM workflow_verification_phase_results
+        WHERE task_run_id = ?1
+        ORDER BY iteration DESC
+        LIMIT 1
+        "#,
+        params![task_run_id],
+        |row| {
+            let total_steps: u32 = row.get(0)?;
+            let passed_steps: u32 = row.get(1)?;
+            let all_passed: bool = row.get(2)?;
+            Ok(VerificationMetrics {
+                pass_rate: if total_steps > 0 {
+                    passed_steps as f64 / total_steps as f64
+                } else {
+                    0.0
+                },
+                total_steps,
+                all_passed,
+            })
+        },
+    );
+
+    match result {
+        Ok(metrics) => Ok(Some(metrics)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => {
+            // Table may not exist in older databases
+            let msg = e.to_string();
+            if msg.contains("no such table") {
+                debug!(
+                    "workflow_verification_phase_results table not found, \
+                     skipping structural evaluation"
+                );
+                Ok(None)
+            } else {
+                Err(format!(
+                    "Failed to query verification metrics for {}: {}",
+                    task_run_id, e
+                ))
+            }
+        }
+    }
+}
+
+/// Evaluate a structural fix using verification pass rates instead of
+/// signature-hash recurrence.
+///
+/// Structural fixes (step rewrites, instruction clarifications, context additions)
+/// change the workflow itself, making signature-based tracking meaningless — the
+/// old check was rewritten so the old signature will never recur, falsely appearing
+/// "effective". Instead, we compare verification pass rates before and after the fix.
+fn evaluate_structural_fix(
+    conn: &Connection,
+    fix: &ReflectionFix,
+    _workflow_name: &str,
+    subsequent_run_ids: &[String],
+) -> Result<EvaluationResult, String> {
+    // Get the source run's verification baseline
+    let source_metrics = get_verification_metrics(conn, &fix.source_task_run_id)?;
+
+    // Collect verification metrics from subsequent runs
+    let mut subsequent_pass_rates: Vec<f64> = Vec::new();
+    let mut subsequent_total_steps: Vec<u32> = Vec::new();
+    for run_id in subsequent_run_ids {
+        if let Some(metrics) = get_verification_metrics(conn, run_id)? {
+            subsequent_total_steps.push(metrics.total_steps);
+            subsequent_pass_rates.push(metrics.pass_rate);
+        }
+    }
+
+    // If no subsequent runs have verification data, we can't evaluate
+    if subsequent_pass_rates.is_empty() {
+        return Ok(EvaluationResult {
+            fix_id: fix.id.clone(),
+            effectiveness: FixEffectiveness::Inconclusive,
+            evidence: format!(
+                "Structural fix ({}): no verification data in {} subsequent run(s)",
+                fix.fix_type,
+                subsequent_run_ids.len()
+            ),
+        });
+    }
+
+    let avg_subsequent_pass_rate =
+        subsequent_pass_rates.iter().sum::<f64>() / subsequent_pass_rates.len() as f64;
+
+    // Guard: if total_steps dropped >50% compared to source, mark inconclusive
+    // (verification steps may have been removed rather than fixed)
+    if let Some(ref src) = source_metrics {
+        if src.total_steps > 0 {
+            let avg_subsequent_total = subsequent_total_steps.iter().sum::<u32>() as f64
+                / subsequent_total_steps.len() as f64;
+            if avg_subsequent_total < (src.total_steps as f64 * 0.5) {
+                return Ok(EvaluationResult {
+                    fix_id: fix.id.clone(),
+                    effectiveness: FixEffectiveness::Inconclusive,
+                    evidence: format!(
+                        "Structural fix ({}): verification steps were removed \
+                         (source: {} steps, subsequent avg: {:.0} steps)",
+                        fix.fix_type, src.total_steps, avg_subsequent_total
+                    ),
+                });
+            }
+        }
+    }
+
+    const EPSILON: f64 = 0.01;
+
+    match source_metrics {
+        Some(ref src) => {
+            let delta = avg_subsequent_pass_rate - src.pass_rate;
+
+            if delta > EPSILON {
+                // Pass rate improved
+                Ok(EvaluationResult {
+                    fix_id: fix.id.clone(),
+                    effectiveness: FixEffectiveness::Effective,
+                    evidence: format!(
+                        "Structural fix ({}): verification pass rate improved \
+                         {:.1}% → {:.1}% across {} subsequent run(s)",
+                        fix.fix_type,
+                        src.pass_rate * 100.0,
+                        avg_subsequent_pass_rate * 100.0,
+                        subsequent_pass_rates.len()
+                    ),
+                })
+            } else if delta < -EPSILON {
+                // Pass rate decreased
+                Ok(EvaluationResult {
+                    fix_id: fix.id.clone(),
+                    effectiveness: FixEffectiveness::CausedRegression,
+                    evidence: format!(
+                        "Structural fix ({}): verification pass rate decreased \
+                         {:.1}% → {:.1}% across {} subsequent run(s)",
+                        fix.fix_type,
+                        src.pass_rate * 100.0,
+                        avg_subsequent_pass_rate * 100.0,
+                        subsequent_pass_rates.len()
+                    ),
+                })
+            } else {
+                // Pass rate unchanged
+                Ok(EvaluationResult {
+                    fix_id: fix.id.clone(),
+                    effectiveness: FixEffectiveness::Inconclusive,
+                    evidence: format!(
+                        "Structural fix ({}): verification pass rate unchanged \
+                         at {:.1}% across {} subsequent run(s)",
+                        fix.fix_type,
+                        avg_subsequent_pass_rate * 100.0,
+                        subsequent_pass_rates.len()
+                    ),
+                })
+            }
+        }
+        None => {
+            // No source baseline — use absolute threshold
+            if avg_subsequent_pass_rate > 0.90 {
+                Ok(EvaluationResult {
+                    fix_id: fix.id.clone(),
+                    effectiveness: FixEffectiveness::Effective,
+                    evidence: format!(
+                        "Structural fix ({}): no source baseline, but subsequent \
+                         verification pass rate is {:.1}% (>{:.0}% threshold) across {} run(s)",
+                        fix.fix_type,
+                        avg_subsequent_pass_rate * 100.0,
+                        90.0,
+                        subsequent_pass_rates.len()
+                    ),
+                })
+            } else {
+                Ok(EvaluationResult {
+                    fix_id: fix.id.clone(),
+                    effectiveness: FixEffectiveness::Inconclusive,
+                    evidence: format!(
+                        "Structural fix ({}): no source baseline and subsequent \
+                         verification pass rate is {:.1}% (<{:.0}% threshold) across {} run(s)",
+                        fix.fix_type,
+                        avg_subsequent_pass_rate * 100.0,
+                        90.0,
+                        subsequent_pass_rates.len()
+                    ),
+                })
+            }
+        }
+    }
+}
+
 /// Evaluate the effectiveness of a single reflection fix.
 ///
 /// Algorithm:
@@ -92,6 +312,13 @@ pub fn evaluate_fix(conn: &Connection, fix: &ReflectionFix) -> Result<Evaluation
             effectiveness: FixEffectiveness::Inconclusive,
             evidence: "No subsequent runs of this workflow completed yet".to_string(),
         });
+    }
+
+    // Structural fixes (step rewrites, instruction clarifications, context additions)
+    // change the workflow itself, so signature-hash recurrence is meaningless.
+    // Evaluate using verification pass rates instead.
+    if is_structural_fix_type(&fix.fix_type) && !subsequent_run_ids.is_empty() {
+        return evaluate_structural_fix(conn, fix, &workflow_name, &subsequent_run_ids);
     }
 
     // If we have a source_finding_id, check by signature hash
@@ -670,6 +897,20 @@ mod tests {
                 applied_at TEXT NOT NULL,
                 evaluated_at TEXT
             );
+            CREATE TABLE workflow_verification_phase_results (
+                id TEXT PRIMARY KEY,
+                task_run_id TEXT NOT NULL,
+                iteration INTEGER NOT NULL,
+                all_passed BOOLEAN NOT NULL,
+                total_steps INTEGER NOT NULL,
+                passed_steps INTEGER NOT NULL,
+                failed_steps INTEGER NOT NULL,
+                skipped_steps INTEGER NOT NULL,
+                total_duration_ms INTEGER NOT NULL,
+                critical_failure BOOLEAN NOT NULL DEFAULT 0,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             "#,
         )
         .unwrap();
@@ -900,14 +1141,17 @@ mod tests {
             [],
         ).unwrap();
 
+        // context_addition is now a structural fix type and uses verification
+        // pass rates. With no verification data, it's inconclusive.
+        // Use knowledge_base_update (non-structural) to test the outcome path.
         let fix = ReflectionFix {
             id: "fix-1".to_string(),
             source_task_run_id: "src-1".to_string(),
             reflection_task_run_id: "ref-1".to_string(),
             source_finding_id: None,
             source_knowledge_id: None,
-            fix_type: "context_addition".to_string(),
-            fix_description: "Added context".to_string(),
+            fix_type: "knowledge_base_update".to_string(),
+            fix_description: "Added knowledge".to_string(),
             file_changed: None,
             old_value: None,
             new_value: None,
@@ -1038,5 +1282,310 @@ mod tests {
 
         let result = evaluate_fix(&conn, &fix).unwrap();
         assert_eq!(result.effectiveness, FixEffectiveness::Inconclusive);
+    }
+
+    #[test]
+    fn test_is_structural_fix_type() {
+        // Structural types
+        assert!(is_structural_fix_type("workflow_step_rewrite"));
+        assert!(is_structural_fix_type("instruction_clarification"));
+        assert!(is_structural_fix_type("context_addition"));
+
+        // Non-structural types
+        assert!(!is_structural_fix_type("selector_fix"));
+        assert!(!is_structural_fix_type("tool_config_update"));
+        assert!(!is_structural_fix_type("knowledge_base_update"));
+        assert!(!is_structural_fix_type("project_environment"));
+        assert!(!is_structural_fix_type(""));
+    }
+
+    /// Helper to create a ReflectionFix with the given fix_type for structural tests.
+    fn make_structural_fix(fix_type: &str) -> ReflectionFix {
+        ReflectionFix {
+            id: "fix-1".to_string(),
+            source_task_run_id: "src-1".to_string(),
+            reflection_task_run_id: "ref-1".to_string(),
+            source_finding_id: Some("f-1".to_string()),
+            source_knowledge_id: None,
+            fix_type: fix_type.to_string(),
+            fix_description: "Rewrote verification step".to_string(),
+            file_changed: None,
+            old_value: None,
+            new_value: None,
+            confidence: "high".to_string(),
+            content_hash: None,
+            status: "applied".to_string(),
+            effectiveness: None,
+            effectiveness_evidence: None,
+            applied_at: "2025-01-01T01:00:00Z".to_string(),
+            evaluated_at: None,
+            created_at: "2025-01-01T01:00:00Z".to_string(),
+            source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
+            reflection_scope: None,
+            project_path: None,
+            applicability_context: None,
+        }
+    }
+
+    /// Helper to insert verification results for a task run.
+    fn insert_verification(
+        conn: &Connection,
+        id: &str,
+        task_run_id: &str,
+        iteration: u32,
+        total: u32,
+        passed: u32,
+    ) {
+        let failed = total - passed;
+        let all_passed = if passed == total { 1 } else { 0 };
+        conn.execute(
+            r#"INSERT INTO workflow_verification_phase_results
+               (id, task_run_id, iteration, all_passed, total_steps, passed_steps,
+                failed_steps, skipped_steps, total_duration_ms, critical_failure,
+                result_json, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1000, 0, '{}', '2025-01-01T00:00:00Z')"#,
+            params![
+                id,
+                task_run_id,
+                iteration,
+                all_passed,
+                total,
+                passed,
+                failed
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_structural_fix_effective_when_pass_rate_improves() {
+        let conn = setup_test_db();
+
+        // Source run with 50% pass rate (5/10)
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, completed_at, created_at, updated_at) \
+             VALUES ('src-1', 'Test', 'wf-1', 'complete', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        insert_verification(&conn, "v-src", "src-1", 1, 10, 5);
+
+        // Subsequent run with 90% pass rate (9/10)
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, completed_at, created_at, updated_at) \
+             VALUES ('run-2', 'Test', 'wf-1', 'complete', 0, '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z')",
+            [],
+        ).unwrap();
+        insert_verification(&conn, "v-sub", "run-2", 1, 10, 9);
+
+        let fix = make_structural_fix("workflow_step_rewrite");
+        let result = evaluate_fix(&conn, &fix).unwrap();
+
+        assert_eq!(result.effectiveness, FixEffectiveness::Effective);
+        assert!(
+            result.evidence.contains("pass rate improved"),
+            "Expected 'pass rate improved' in evidence: {}",
+            result.evidence
+        );
+    }
+
+    #[test]
+    fn test_structural_fix_regression_when_pass_rate_drops() {
+        let conn = setup_test_db();
+
+        // Source run with 80% pass rate (8/10)
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, completed_at, created_at, updated_at) \
+             VALUES ('src-1', 'Test', 'wf-1', 'complete', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        insert_verification(&conn, "v-src", "src-1", 1, 10, 8);
+
+        // Subsequent run with 40% pass rate (4/10)
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, completed_at, created_at, updated_at) \
+             VALUES ('run-2', 'Test', 'wf-1', 'complete', 0, '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z')",
+            [],
+        ).unwrap();
+        insert_verification(&conn, "v-sub", "run-2", 1, 10, 4);
+
+        let fix = make_structural_fix("instruction_clarification");
+        let result = evaluate_fix(&conn, &fix).unwrap();
+
+        assert_eq!(result.effectiveness, FixEffectiveness::CausedRegression);
+        assert!(
+            result.evidence.contains("pass rate decreased"),
+            "Expected 'pass rate decreased' in evidence: {}",
+            result.evidence
+        );
+    }
+
+    #[test]
+    fn test_structural_fix_inconclusive_when_steps_removed() {
+        let conn = setup_test_db();
+
+        // Source run with 10 steps, 5 passed (50%)
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, completed_at, created_at, updated_at) \
+             VALUES ('src-1', 'Test', 'wf-1', 'complete', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        insert_verification(&conn, "v-src", "src-1", 1, 10, 5);
+
+        // Subsequent run with only 3 steps (>50% dropped), all passed (100%)
+        // The pass rate "improved" but only because steps were removed
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, completed_at, created_at, updated_at) \
+             VALUES ('run-2', 'Test', 'wf-1', 'complete', 0, '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z')",
+            [],
+        ).unwrap();
+        insert_verification(&conn, "v-sub", "run-2", 1, 3, 3);
+
+        let fix = make_structural_fix("workflow_step_rewrite");
+        let result = evaluate_fix(&conn, &fix).unwrap();
+
+        assert_eq!(result.effectiveness, FixEffectiveness::Inconclusive);
+        assert!(
+            result.evidence.contains("verification steps were removed"),
+            "Expected 'verification steps were removed' in evidence: {}",
+            result.evidence
+        );
+    }
+
+    #[test]
+    fn test_non_structural_fix_bypasses_structural_path() {
+        let conn = setup_test_db();
+
+        // Source run
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, completed_at, created_at, updated_at) \
+             VALUES ('src-1', 'Test', 'wf-1', 'complete', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        // Source finding
+        conn.execute(
+            "INSERT INTO task_run_findings (id, task_run_id, signature_hash, detected_at) \
+             VALUES ('f-1', 'src-1', 'hash-abc', '2025-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Add verification data (high pass rate) — should NOT affect selector_fix evaluation
+        insert_verification(&conn, "v-src", "src-1", 1, 10, 5);
+
+        // Subsequent run with recurrence of the finding
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, completed_at, created_at, updated_at) \
+             VALUES ('run-2', 'Test', 'wf-1', 'complete', 0, '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO task_run_findings (id, task_run_id, signature_hash, detected_at) \
+             VALUES ('f-2', 'run-2', 'hash-abc', '2025-01-01T02:00:00Z')",
+            [],
+        )
+        .unwrap();
+        insert_verification(&conn, "v-sub", "run-2", 1, 10, 10);
+
+        // selector_fix is NOT structural — should use signature-hash path
+        let fix = ReflectionFix {
+            id: "fix-1".to_string(),
+            source_task_run_id: "src-1".to_string(),
+            reflection_task_run_id: "ref-1".to_string(),
+            source_finding_id: Some("f-1".to_string()),
+            source_knowledge_id: None,
+            fix_type: "selector_fix".to_string(),
+            fix_description: "Fixed selector".to_string(),
+            file_changed: None,
+            old_value: None,
+            new_value: None,
+            confidence: "high".to_string(),
+            content_hash: None,
+            status: "applied".to_string(),
+            effectiveness: None,
+            effectiveness_evidence: None,
+            applied_at: "2025-01-01T01:00:00Z".to_string(),
+            evaluated_at: None,
+            created_at: "2025-01-01T01:00:00Z".to_string(),
+            source_agent: None,
+            reasoning: None,
+            alternatives_considered: None,
+            reflection_scope: None,
+            project_path: None,
+            applicability_context: None,
+        };
+
+        let result = evaluate_fix(&conn, &fix).unwrap();
+
+        // Should be Ineffective (finding recurred), NOT Effective (which structural path
+        // would say based on the high verification pass rate)
+        assert_eq!(result.effectiveness, FixEffectiveness::Ineffective);
+        assert!(
+            result.evidence.contains("recurred"),
+            "Expected 'recurred' in evidence (signature-hash path): {}",
+            result.evidence
+        );
+    }
+
+    #[test]
+    fn test_structural_fix_effective_no_baseline_high_pass_rate() {
+        let conn = setup_test_db();
+
+        // Source run with NO verification data
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, completed_at, created_at, updated_at) \
+             VALUES ('src-1', 'Test', 'wf-1', 'complete', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        // Subsequent run with 95% pass rate (no source baseline)
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, completed_at, created_at, updated_at) \
+             VALUES ('run-2', 'Test', 'wf-1', 'complete', 0, '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z')",
+            [],
+        ).unwrap();
+        insert_verification(&conn, "v-sub", "run-2", 1, 20, 19);
+
+        let fix = make_structural_fix("context_addition");
+        let result = evaluate_fix(&conn, &fix).unwrap();
+
+        assert_eq!(result.effectiveness, FixEffectiveness::Effective);
+        assert!(
+            result.evidence.contains("no source baseline"),
+            "Expected 'no source baseline' in evidence: {}",
+            result.evidence
+        );
+    }
+
+    #[test]
+    fn test_structural_fix_inconclusive_no_baseline_low_pass_rate() {
+        let conn = setup_test_db();
+
+        // Source run with NO verification data
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, completed_at, created_at, updated_at) \
+             VALUES ('src-1', 'Test', 'wf-1', 'complete', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        // Subsequent run with 60% pass rate (below 90% threshold, no baseline)
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, completed_at, created_at, updated_at) \
+             VALUES ('run-2', 'Test', 'wf-1', 'complete', 0, '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z')",
+            [],
+        ).unwrap();
+        insert_verification(&conn, "v-sub", "run-2", 1, 10, 6);
+
+        let fix = make_structural_fix("context_addition");
+        let result = evaluate_fix(&conn, &fix).unwrap();
+
+        assert_eq!(result.effectiveness, FixEffectiveness::Inconclusive);
+        assert!(
+            result.evidence.contains("no source baseline"),
+            "Expected 'no source baseline' in evidence: {}",
+            result.evidence
+        );
     }
 }

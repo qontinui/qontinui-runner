@@ -549,7 +549,7 @@ function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
  */
 function AppContent() {
   // Performance profiling (dev mode only)
-  const { ProfilerWrapper } = useRenderPerformance({ componentName: 'AppContent' });
+  const { ProfilerWrapper } = useRenderPerformance({ componentName: "AppContent" });
 
   // Auth state from context
   const auth = useAuth();
@@ -1073,7 +1073,6 @@ function AppContent() {
   if (setupCompleted === false) {
     return <SetupWizard onComplete={() => setSetupCompleted(true)} />;
   }
-
 
   // Get last run task_run_id for render logging context
   const lastRunId = lastRun?.id;
@@ -1697,118 +1696,118 @@ function AppContent() {
   return (
     <ProfilerWrapper>
       <RenderLogWrapper
-      activeTab={activeTab}
-      taskRunId={lastRunId}
-      enableOnMount={true}
-      enableMutationObserver={true}
-      mutationDebounceMs={500}
-    >
-      <RunnerPageContext activeTab={activeTab} />
-      <div className="h-screen w-screen bg-background grid-dots flex flex-col overflow-hidden min-w-[1200px] min-h-[700px]">
-        {/* Status Bar - Sticky Top */}
-        <StatusIndicator
-          pythonStatus={execution.pythonStatus}
-          executionActive={execution.executionActive}
-          backgroundActivities={backgroundActivities}
-        />
-
-        {/* Main Content: Sidebar + Content Area */}
-        <div className="flex flex-1 overflow-hidden">
-          {/* Sidebar Navigation */}
-          <Sidebar
-            activeTab={activeTab}
-            onTabChange={(tab) => setActiveTab(tab as MainTabId)}
-            collapsed={sidebarCollapsed}
-            onCollapsedChange={handleSidebarCollapsedChange}
+        activeTab={activeTab}
+        taskRunId={lastRunId}
+        enableOnMount={true}
+        enableMutationObserver={true}
+        mutationDebounceMs={500}
+      >
+        <RunnerPageContext activeTab={activeTab} />
+        <div className="h-screen w-screen bg-background grid-dots flex flex-col overflow-hidden min-w-[1200px] min-h-[700px]">
+          {/* Status Bar - Sticky Top */}
+          <StatusIndicator
+            pythonStatus={execution.pythonStatus}
+            executionActive={execution.executionActive}
+            backgroundActivities={backgroundActivities}
           />
 
-          {/* Content Area */}
-          <main className="flex-1 overflow-hidden relative">
-            {renderTabContent()}
-            {/* Terminal is always-mounted to preserve PTY sessions and scrollback across tab switches */}
-            <div className={`absolute inset-0 ${activeTab === "terminal" ? "" : "hidden"}`}>
-              <TerminalPage
-                onNavigateToBuilder={() => setActiveTab("unified-workflow-builder")}
-                onNavigateToActive={() => setActiveTab("active")}
-                onSessionCountChange={setTerminalSessionCount}
-              />
+          {/* Main Content: Sidebar + Content Area */}
+          <div className="flex flex-1 overflow-hidden">
+            {/* Sidebar Navigation */}
+            <Sidebar
+              activeTab={activeTab}
+              onTabChange={(tab) => setActiveTab(tab as MainTabId)}
+              collapsed={sidebarCollapsed}
+              onCollapsedChange={handleSidebarCollapsedChange}
+            />
+
+            {/* Content Area */}
+            <main className="flex-1 overflow-hidden relative">
+              {renderTabContent()}
+              {/* Terminal is always-mounted to preserve PTY sessions and scrollback across tab switches */}
+              <div className={`absolute inset-0 ${activeTab === "terminal" ? "" : "hidden"}`}>
+                <TerminalPage
+                  onNavigateToBuilder={() => setActiveTab("unified-workflow-builder")}
+                  onNavigateToActive={() => setActiveTab("active")}
+                  onSessionCountChange={setTerminalSessionCount}
+                />
+              </div>
+            </main>
+          </div>
+
+          {/* Action Detail Modal */}
+          <ActionDetailModal
+            action={modalState.selectedAction}
+            isOpen={modalState.isActionModalOpen}
+            onClose={modalState.closeActionModal}
+          />
+
+          {/* Image Detail Modal */}
+          <ImageDetailModal
+            entry={modalState.selectedImageEntry}
+            isOpen={modalState.isImageModalOpen}
+            onClose={modalState.closeImageModal}
+          />
+
+          {/* Log Source Picker Modal */}
+          {projectLogs.config && (
+            <LogSourcePicker
+              isOpen={showLogSourcePicker}
+              onClose={() => setShowLogSourcePicker(false)}
+              selectedSourceIds={projectLogs.config.selectedSourceIds}
+              globalProfileId={projectLogs.config.globalProfileId}
+              onSave={(sourceIds, profileId) => {
+                if (profileId) {
+                  projectLogs.setGlobalProfile(profileId);
+                } else {
+                  projectLogs.setSelectedSources(sourceIds);
+                }
+                setShowLogSourcePicker(false);
+              }}
+            />
+          )}
+
+          {/* Run Last Workflow error toast */}
+          {runLastWorkflowError && (
+            <div className="fixed bottom-4 right-4 p-4 rounded-lg shadow-lg border max-w-md z-toast bg-card border-destructive/50">
+              <div className="flex items-start gap-3">
+                <div className="flex-1 min-w-0">
+                  <h4 className="font-medium text-sm text-destructive">Workflow Not Found</h4>
+                  <p className="text-sm text-muted-foreground mt-1">{runLastWorkflowError}</p>
+                </div>
+                <button
+                  onClick={() => setRunLastWorkflowError(null)}
+                  className="text-muted-foreground hover:text-foreground flex-shrink-0"
+                >
+                  &times;
+                </button>
+              </div>
             </div>
-          </main>
+          )}
+
+          {/* Stale task detection toast */}
+          {staleTaskMessage && (
+            <div className="fixed bottom-4 right-4 p-4 rounded-lg shadow-lg border max-w-md z-toast bg-card border-yellow-500/50">
+              <div className="flex items-start gap-3">
+                <div className="flex-1 min-w-0">
+                  <h4 className="font-medium text-sm text-yellow-600 dark:text-yellow-400">
+                    Possibly Stale Task
+                  </h4>
+                  <p className="text-sm text-muted-foreground mt-1">{staleTaskMessage}</p>
+                </div>
+                <button
+                  onClick={() => setStaleTaskMessage(null)}
+                  className="text-muted-foreground hover:text-foreground flex-shrink-0"
+                >
+                  &times;
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Performance Overlay (dev mode only, toggle with Ctrl+Shift+P) */}
+          <PerformanceOverlay position="bottom-right" />
         </div>
-
-        {/* Action Detail Modal */}
-        <ActionDetailModal
-          action={modalState.selectedAction}
-          isOpen={modalState.isActionModalOpen}
-          onClose={modalState.closeActionModal}
-        />
-
-        {/* Image Detail Modal */}
-        <ImageDetailModal
-          entry={modalState.selectedImageEntry}
-          isOpen={modalState.isImageModalOpen}
-          onClose={modalState.closeImageModal}
-        />
-
-        {/* Log Source Picker Modal */}
-        {projectLogs.config && (
-          <LogSourcePicker
-            isOpen={showLogSourcePicker}
-            onClose={() => setShowLogSourcePicker(false)}
-            selectedSourceIds={projectLogs.config.selectedSourceIds}
-            globalProfileId={projectLogs.config.globalProfileId}
-            onSave={(sourceIds, profileId) => {
-              if (profileId) {
-                projectLogs.setGlobalProfile(profileId);
-              } else {
-                projectLogs.setSelectedSources(sourceIds);
-              }
-              setShowLogSourcePicker(false);
-            }}
-          />
-        )}
-
-        {/* Run Last Workflow error toast */}
-        {runLastWorkflowError && (
-          <div className="fixed bottom-4 right-4 p-4 rounded-lg shadow-lg border max-w-md z-toast bg-card border-destructive/50">
-            <div className="flex items-start gap-3">
-              <div className="flex-1 min-w-0">
-                <h4 className="font-medium text-sm text-destructive">Workflow Not Found</h4>
-                <p className="text-sm text-muted-foreground mt-1">{runLastWorkflowError}</p>
-              </div>
-              <button
-                onClick={() => setRunLastWorkflowError(null)}
-                className="text-muted-foreground hover:text-foreground flex-shrink-0"
-              >
-                &times;
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Stale task detection toast */}
-        {staleTaskMessage && (
-          <div className="fixed bottom-4 right-4 p-4 rounded-lg shadow-lg border max-w-md z-toast bg-card border-yellow-500/50">
-            <div className="flex items-start gap-3">
-              <div className="flex-1 min-w-0">
-                <h4 className="font-medium text-sm text-yellow-600 dark:text-yellow-400">
-                  Possibly Stale Task
-                </h4>
-                <p className="text-sm text-muted-foreground mt-1">{staleTaskMessage}</p>
-              </div>
-              <button
-                onClick={() => setStaleTaskMessage(null)}
-                className="text-muted-foreground hover:text-foreground flex-shrink-0"
-              >
-                &times;
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Performance Overlay (dev mode only, toggle with Ctrl+Shift+P) */}
-        <PerformanceOverlay position="bottom-right" />
-      </div>
       </RenderLogWrapper>
     </ProfilerWrapper>
   );
