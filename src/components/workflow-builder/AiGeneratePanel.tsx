@@ -52,11 +52,6 @@ import { useGenerateData, type SavedPrompt } from "./useGenerateData";
 import { useAdvancedOptions, PROVIDERS } from "./useAdvancedOptions";
 import { useTemplatePopover } from "./useTemplatePopover";
 import { instanceStorage } from "@/lib/instance-storage";
-import { buildSpecPrompt } from "@/lib/spec-prompt-builder";
-import {
-  SpecSourceSection,
-  type SpecSourceState,
-} from "./SpecSourceSection";
 
 // Icon lookup map for template icons
 const TEMPLATE_ICONS: Record<string, LucideIcon> = {
@@ -218,16 +213,6 @@ export function AiGeneratePanel({
   const [showContext, setShowContext] = useState(false);
   const [contextTab, setContextTab] = useState<"saved" | "custom" | "file">("saved");
 
-  // Spec source state (from SpecSourceSection)
-  const [specState, setSpecState] = useState<SpecSourceState>({
-    discoveredSpecs: [],
-    selectedGroupIds: new Set(),
-    discoveredPages: [],
-    selectedPageUrls: new Set(),
-  });
-  const hasSpecs =
-    specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0;
-
   // Hydrate description from storage after mount
   useEffect(() => {
     const saved = instanceStorage.getItem("generate-workflow-prompt");
@@ -300,27 +285,12 @@ export function AiGeneratePanel({
   /** Build a single request (non-batch or fallback). */
   const buildGenerateRequest = useCallback(() => {
     const base = buildBaseRequest({ selectedContextIds, inlineContext });
-
-    let fullDescription = "";
-    if (specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0) {
-      const specResult = buildSpecPrompt({
-        discoveredSpecs: specState.discoveredSpecs,
-        selectedGroupIds: specState.selectedGroupIds,
-      });
-      fullDescription = specResult.prompt;
-      if (description.trim()) {
-        fullDescription += `\n\n## Additional Instructions\n${description.trim()}`;
-      }
-    } else {
-      fullDescription = description.trim();
-    }
-
-    return { ...base, description: fullDescription };
-  }, [buildBaseRequest, description, specState, selectedContextIds, inlineContext, hasSpecs]);
+    return { ...base, description: description.trim() };
+  }, [buildBaseRequest, description, selectedContextIds, inlineContext]);
 
   const canGenerate = batchMode
     ? batchEntries.some((e) => e.prompt.trim())
-    : description.trim() || hasSpecs;
+    : !!description.trim();
 
   /** Fire a single generate-async request and return the task_run_id. */
   const fireGenerateRequest = async (request: Record<string, unknown>): Promise<string> => {
@@ -677,11 +647,7 @@ export function AiGeneratePanel({
                 <textarea
                   id="generate-description"
                   className="w-full flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 text-sm min-h-[200px] resize-none focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                  placeholder={
-                    hasSpecs
-                      ? "Optional: add additional instructions for the AI..."
-                      : "e.g., Run TypeScript type checking on the web frontend and fix any errors\ne.g., Check the runner API health, then verify UI Bridge elements are registered\ne.g., Run pytest with coverage and fix failing tests"
-                  }
+                  placeholder="e.g., Run TypeScript type checking on the web frontend and fix any errors\ne.g., Check the runner API health, then verify UI Bridge elements are registered\ne.g., Run pytest with coverage and fix failing tests"
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
                   autoFocus
@@ -698,9 +664,6 @@ export function AiGeneratePanel({
                 These settings apply to all {batchEntries.length} workflows
               </div>
             )}
-            {/* Page Specs Section */}
-            <SpecSourceSection onSpecsChanged={setSpecState} />
-
             {/* Context Section */}
             <div className="space-y-1">
               <button
