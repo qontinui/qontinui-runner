@@ -1,8 +1,6 @@
-export { buildSpecWorkflow, buildMultiStageSpecWorkflow } from "./buildSpecWorkflow";
+export { buildSpecWorkflow } from "./buildSpecWorkflow";
 export type {
   BuildSpecWorkflowInput,
-  BuildMultiStageSpecWorkflowInput,
-  PageSpecGroup,
   SpecConfig,
   SpecGroup,
   SpecAssertion,

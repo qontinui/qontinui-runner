@@ -213,9 +213,6 @@ export function buildSpecPrompt({
   };
 }
 
-/** @deprecated Use `buildSpecPrompt` instead. */
-export const buildSemanticSpecPrompt = buildSpecPrompt;
-
 // =============================================================================
 // Spec creation & review instructions
 // =============================================================================
