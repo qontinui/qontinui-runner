@@ -101,7 +101,7 @@ impl ExplorationEngine {
         self.update_progress("running", 0, 0, None, &builder);
 
         // Step 1: Fetch initial snapshot
-        let (mut current_elements, catalog, mut current_element_map) =
+        let (current_elements, catalog, mut current_element_map) =
             self.fetch_and_fingerprint(sdk_conn, &fp_config).await?;
 
         let hashes = fingerprint::extract_hashes(&current_element_map);
@@ -193,8 +193,7 @@ impl ExplorationEngine {
                     }
                 };
 
-            // Update current state for next iteration
-            current_elements = new_elements.clone();
+            // Update current element map for next iteration's fingerprint comparison
             current_element_map = new_element_map.clone();
 
             let after_hashes_vec = fingerprint::extract_hashes(&new_element_map);
