@@ -547,10 +547,8 @@ pub async fn ui_bridge_discover_states_from_fingerprints(
 ) -> Result<CommandResponse, String> {
     info!("UI Bridge: Discovering states from fingerprints");
 
-    let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
-        &state.extraction_executor,
-        "extraction_executor",
-    );
+    let mut executor_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.extraction_executor, "extraction_executor");
 
     if let Some(ref mut executor) = *executor_lock {
         // Start executor on-demand if not running
@@ -692,10 +690,8 @@ pub async fn ui_bridge_run_exploration(
 ) -> Result<CommandResponse, String> {
     info!("UI Bridge: Running automatic exploration");
 
-    let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
-        &state.extraction_executor,
-        "extraction_executor",
-    );
+    let mut executor_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.extraction_executor, "extraction_executor");
 
     if let Some(ref mut executor) = *executor_lock {
         // Start executor on-demand if not running
@@ -760,10 +756,8 @@ pub async fn ui_bridge_stop_exploration(
 ) -> Result<CommandResponse, String> {
     info!("UI Bridge: Stopping exploration");
 
-    let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
-        &state.extraction_executor,
-        "extraction_executor",
-    );
+    let mut executor_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.extraction_executor, "extraction_executor");
 
     if let Some(ref mut executor) = *executor_lock {
         if !executor.is_running() {

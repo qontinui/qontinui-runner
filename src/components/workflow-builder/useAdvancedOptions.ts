@@ -77,15 +77,11 @@ export function useAdvancedOptions(aiSettings: Record<string, unknown> | null) {
 
   // Build the base request object (everything except description)
   const buildBaseRequest = useCallback(
-    (extras: { selectedContextIds: string[]; inlineContext: string; hasSpecs: boolean }) => {
+    (extras: { selectedContextIds: string[]; inlineContext: string }) => {
       const tags = tagsInput
         .split(",")
         .map((t) => t.trim())
         .filter(Boolean);
-
-      if (extras.hasSpecs && !tags.includes("spec-generated")) {
-        tags.push("spec-generated");
-      }
 
       const request: Record<string, unknown> = {};
       if (category.trim()) request.category = category.trim();

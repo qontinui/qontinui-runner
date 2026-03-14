@@ -183,9 +183,10 @@ export function ConnectionBar({
         {hasSelectedSpec && (
           <button
             onClick={onBuildWorkflow}
-            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
-            bg-orange-500/10 text-orange-400 border border-orange-500/20
-            hover:bg-orange-500/20 transition-colors shrink-0"
+            disabled={isLoading}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md
+            bg-orange-500 text-white shadow-sm shadow-orange-500/25
+            hover:bg-orange-600 disabled:opacity-50 transition-colors shrink-0"
           >
             <Hammer className="w-3.5 h-3.5" />
             Build Workflow

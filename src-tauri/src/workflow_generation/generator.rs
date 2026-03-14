@@ -128,6 +128,13 @@ pub struct GenerateWorkflowRequest {
     /// Controls how many verification steps are generated and whether known issues are checked.
     #[serde(default)]
     pub verification_depth: Option<String>,
+
+    /// Whether to discover and include UI Bridge page specs during the discovery phase.
+    /// When true, fetches semantic page specs (page purpose, spec groups, architecture)
+    /// to give the generator deeper understanding of the target application.
+    /// Default: None (auto — included when WebApp keywords are detected)
+    #[serde(default)]
+    pub discover_ui_bridge_specs: Option<bool>,
 }
 
 fn default_true() -> Option<bool> {
@@ -159,6 +166,7 @@ impl Default for GenerateWorkflowRequest {
             auto_run: None,
             generate_specification: Some(true),
             verification_depth: None,
+            discover_ui_bridge_specs: None,
         }
     }
 }
@@ -397,7 +405,7 @@ pub fn generate_workflow(
     // ── Discovery Phase ──────────────────────────────────────────────────
     let discovery_start = Instant::now();
     let discovery_mode = request.discovery_mode.as_deref().unwrap_or("auto");
-    let (mut discovery_context, discovery_calls) = if discovery_mode != "disabled" {
+    let (mut discovery_context, mut discovery_calls) = if discovery_mode != "disabled" {
         let config = super::discovery_tools::DiscoveryConfig::default();
         let result =
             super::discovery_tools::run_discovery(&request.description, &config, discovery_mode);
@@ -413,6 +421,39 @@ pub fn generate_workflow(
         debug!("Discovery disabled by request");
         (String::new(), vec![])
     };
+    // If discover_ui_bridge_specs is explicitly true and the tool didn't already run,
+    // force-run it to enrich the generator with semantic page specs.
+    if request.discover_ui_bridge_specs == Some(true)
+        && !discovery_calls
+            .iter()
+            .any(|c| c.tool_name == "ui_bridge_specs")
+    {
+        let dc = super::discovery_tools::DiscoveryConfig::default();
+        let force_start = Instant::now();
+        if let Some(spec_section) =
+            super::discovery_tools::run_single_tool("ui_bridge_specs", &request.description, &dc)
+        {
+            if discovery_context.is_empty() {
+                discovery_context = format!(
+                    "## Discovery Results\n\n\
+                     The following information was gathered about the target system. \
+                     Use it to generate accurate steps.\n\n{}",
+                    spec_section
+                );
+            } else {
+                discovery_context.push_str("\n\n");
+                discovery_context.push_str(&spec_section);
+            }
+            discovery_calls.push(super::discovery_tools::DiscoveryCall {
+                tool_name: "ui_bridge_specs".to_string(),
+                input_summary: "force-included".to_string(),
+                success: true,
+                duration_ms: force_start.elapsed().as_millis() as u64,
+            });
+            info!("UI Bridge specs force-included via discover_ui_bridge_specs=true");
+        }
+    }
+
     artifact_builder.discovery_duration_ms = Some(discovery_start.elapsed().as_millis() as u64);
     artifact_builder.discovery_calls = serde_json::to_value(&discovery_calls).ok();
 

@@ -3,7 +3,7 @@
  *
  * Primary AI workflow generation panel for the runner.
  * Displayed as the default view when no workflow is loaded in the builder.
- * Features: description textarea, templates, spec integration, context attachment,
+ * Features: description textarea, templates, context attachment,
  * advanced options, and Generate/Generate & Run actions.
  */
 
@@ -41,14 +41,6 @@ import {
   MODELS_BY_PROVIDER,
   MODEL_OVERRIDE_PHASES,
 } from "@qontinui/workflow-utils";
-import { SpecSourceSection, type SpecSourceState } from "./SpecSourceSection";
-import { buildSpecPrompt, type DiscoveredSpec } from "@/lib/spec-prompt-builder";
-import {
-  buildMultiStageSpecWorkflow,
-  buildSpecWorkflow,
-  type PageSpecGroup,
-  type SpecGroup as BuildSpecGroup,
-} from "@/lib/workflow-builder";
 import {
   GENERATION_TEMPLATES,
   type WorkflowGenerationTemplate,
@@ -79,8 +71,6 @@ const TEMPLATE_ICONS: Record<string, LucideIcon> = {
 export interface AiGeneratePanelProps {
   onCreateManually: () => void;
   onNavigateToActiveRuns: () => void;
-  /** Load a pre-built workflow into the builder (for deterministic spec workflows). */
-  onLoadWorkflow?: (workflow: import("../../types/unified-workflow").UnifiedWorkflow) => void;
 }
 
 // =============================================================================
@@ -123,7 +113,6 @@ async function autoSaveGenerationPrompt(promptText: string): Promise<void> {
 export function AiGeneratePanel({
   onCreateManually,
   onNavigateToActiveRuns,
-  onLoadWorkflow,
 }: AiGeneratePanelProps) {
   const accentColors = getAccentColors("blue");
 
@@ -194,13 +183,6 @@ export function AiGeneratePanel({
   } | null>(null);
   const [showContext, setShowContext] = useState(false);
   const [contextTab, setContextTab] = useState<"saved" | "custom" | "file">("saved");
-  const [specState, setSpecState] = useState<SpecSourceState>({
-    discoveredSpecs: [],
-    selectedGroupIds: new Set(),
-    discoveredPages: [],
-    selectedPageUrls: new Set(),
-  });
-  const hasSpecs = specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0;
 
   // Hydrate description from localStorage after mount
   useEffect(() => {
@@ -273,26 +255,11 @@ export function AiGeneratePanel({
 
   /** Build a single request (non-batch or fallback). */
   const buildGenerateRequest = useCallback(() => {
-    const base = buildBaseRequest({ selectedContextIds, inlineContext, hasSpecs });
+    const base = buildBaseRequest({ selectedContextIds, inlineContext });
+    return { ...base, description: description.trim() };
+  }, [buildBaseRequest, description, selectedContextIds, inlineContext]);
 
-    let fullDescription = "";
-    if (specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0) {
-      const specResult = buildSpecPrompt({
-        discoveredSpecs: specState.discoveredSpecs,
-        selectedGroupIds: specState.selectedGroupIds,
-      });
-      fullDescription = specResult.prompt;
-      if (description.trim()) {
-        fullDescription += `\n\n## Additional Instructions\n${description.trim()}`;
-      }
-    } else {
-      fullDescription = description.trim();
-    }
-
-    return { ...base, description: fullDescription };
-  }, [buildBaseRequest, description, specState, selectedContextIds, inlineContext, hasSpecs]);
-
-  const canGenerate = description.trim() || hasSpecs;
+  const canGenerate = !!description.trim();
 
   /** Fire a single generate-async request and return the task_run_id. */
   const fireGenerateRequest = async (request: Record<string, unknown>): Promise<string> => {
@@ -314,21 +281,6 @@ export function AiGeneratePanel({
     setSubmittingAction("generate");
     setError(null);
     try {
-      // Specs selected → deterministic builder (instant, loads into builder)
-      if (hasSpecs && onLoadWorkflow) {
-        const workflow = buildDeterministicSpecWorkflow();
-        if (workflow) {
-          onLoadWorkflow(workflow);
-          console.log(
-            "[AiGeneratePanel] Deterministic spec workflow built:",
-            workflow.stages?.length ?? 0,
-            "stages",
-          );
-          setSubmittingAction(null);
-          return;
-        }
-      }
-      // No specs → AI generation
       const taskRunId = await fireGenerateRequest(buildGenerateRequest());
       console.log("[AiGeneratePanel] Generation started:", taskRunId);
       if (description.trim()) {
@@ -356,26 +308,6 @@ export function AiGeneratePanel({
     setSubmittingAction("generate-and-run");
     setError(null);
     try {
-      // Specs selected → deterministic builder + execute inline
-      if (hasSpecs) {
-        const workflow = buildDeterministicSpecWorkflow();
-        if (workflow) {
-          const resp = await tracedFetch(`${getApiBase()}/unified-workflows/execute-inline`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(workflow),
-          });
-          if (!resp.ok) {
-            const json = await resp.json();
-            throw new Error(json.error || `HTTP ${resp.status}`);
-          }
-          console.log("[AiGeneratePanel] Deterministic spec workflow built and executed");
-          onNavigateToActiveRuns();
-          setSubmittingAction(null);
-          return;
-        }
-      }
-      // No specs → AI generation + auto_run
       const request = { ...buildGenerateRequest(), auto_run: true };
       const taskRunId = await fireGenerateRequest(request);
       console.log("[AiGeneratePanel] Generate & Run started:", taskRunId);
@@ -398,58 +330,6 @@ export function AiGeneratePanel({
       setSubmittingAction(null);
     }
   };
-
-  /**
-   * Build a deterministic spec workflow from selected specs.
-   * Single page → flat workflow; multiple pages → multi-stage (one stage per page).
-   * User description is injected as additionalInstructions into the agentic phase.
-   */
-  const buildDeterministicSpecWorkflow = useCallback(() => {
-    // Group discovered specs by page URL
-    const pageMap = new Map<string, { pageName: string; specs: DiscoveredSpec[] }>();
-    for (const spec of specState.discoveredSpecs) {
-      const pageUrl = spec.config?.metadata?.pageUrl || spec.specId;
-      const pageName =
-        (spec.config?.metadata?.component as string) ||
-        (spec.appName ? `${spec.appName}` : pageUrl);
-      if (!pageMap.has(pageUrl)) {
-        pageMap.set(pageUrl, { pageName, specs: [] });
-      }
-      pageMap.get(pageUrl)!.specs.push(spec);
-    }
-
-    // Build PageSpecGroup array
-    const pages: PageSpecGroup[] = [];
-    for (const [pageUrl, { pageName, specs }] of pageMap) {
-      const groups = specs.flatMap((s) => s.config?.groups ?? []) as unknown as BuildSpecGroup[];
-      const hasSelectedGroups = groups.some((g) => specState.selectedGroupIds.has(g.id));
-      if (!hasSelectedGroups) continue;
-      pages.push({ pageUrl, pageName, groups });
-    }
-
-    if (pages.length === 0) return null;
-
-    const userPrompt = description.trim() || undefined;
-
-    // Single page → flat workflow; multiple pages → multi-stage
-    if (pages.length === 1) {
-      return buildSpecWorkflow({
-        specConfig: { version: "1.0", groups: pages[0].groups },
-        selectedGroupIds: specState.selectedGroupIds,
-        additionalInstructions: userPrompt,
-        elementSource: "external",
-        pageUrl: pages[0].pageUrl,
-        workflowName: `Spec Verification — ${pages[0].pageName}`,
-      });
-    } else {
-      return buildMultiStageSpecWorkflow({
-        pages,
-        selectedGroupIds: specState.selectedGroupIds,
-        additionalInstructions: userPrompt,
-        elementSource: "external",
-      });
-    }
-  }, [specState, description]);
 
   return (
     <div className="flex flex-col h-full">
@@ -579,22 +459,15 @@ export function AiGeneratePanel({
             <textarea
               id="generate-description"
               className="w-full flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 text-sm min-h-[200px] resize-none focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-              placeholder={
-                hasSpecs
-                  ? "Optional: add additional instructions for the AI..."
-                  : "e.g., Run TypeScript type checking on the web frontend and fix any errors\ne.g., Check the runner API health, then verify UI Bridge elements are registered\ne.g., Run pytest with coverage and fix failing tests"
-              }
+              placeholder="e.g., Run TypeScript type checking on the web frontend and fix any errors&#10;e.g., Check the runner API health, then verify UI Bridge elements are registered&#10;e.g., Run pytest with coverage and fix failing tests"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               autoFocus
             />
           </div>
 
-          {/* Right column - Specs, Context, Advanced Options */}
+          {/* Right column - Context, Advanced Options */}
           <div className="w-96 shrink-0 space-y-5 overflow-y-auto">
-            {/* Page Specs Section */}
-            <SpecSourceSection onSpecsChanged={setSpecState} />
-
             {/* Context Section */}
             <div className="space-y-1">
               <button

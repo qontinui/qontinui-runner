@@ -1048,7 +1048,6 @@ function WorkflowBuilderContent({
     resetToNew,
     saveWorkflow,
     loadWorkflow,
-    setWorkflow,
     updateWorkflow,
     getActiveSteps,
   } = useWorkflowBuilder();
@@ -2513,7 +2512,6 @@ function WorkflowBuilderContent({
               <AiGeneratePanel
                 onCreateManually={() => handleAddStep("setup")}
                 onNavigateToActiveRuns={() => onNavigateToActive?.()}
-                onLoadWorkflow={setWorkflow}
               />
             </div>
           ) : (

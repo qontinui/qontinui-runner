@@ -6522,7 +6522,10 @@ impl CheckpointDb {
                 .prepare("PRAGMA table_info(unified_workflows)")
                 .and_then(|mut stmt| {
                     stmt.query_map([], |row| row.get::<_, String>(1))
-                        .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == "is_favorite"))
+                        .map(|rows| {
+                            rows.filter_map(|r| r.ok())
+                                .any(|name| name == "is_favorite")
+                        })
                 })
                 .unwrap_or(false);
 

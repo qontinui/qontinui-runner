@@ -357,7 +357,7 @@ function migrateTabId(stored: string | null): MainTabId {
     extract: "capture",
     "live-page-generator": "unified-workflow-builder", // Spec discovery now in AI Generate panel
     "spec-discovery": "unified-workflow-builder", // Spec discovery now in AI Generate panel
-    "page-sweep": "unified-workflow-builder", // Page Sweep removed, multi-page now in SpecSourceSection
+    "page-sweep": "unified-workflow-builder", // Page Sweep removed, multi-page now in Specs page
     "run-plan": "terminal", // Chat page removed, workflow generation now in Terminal
     // Old observe tab migrations to new structure
     logs: "run-recap",
@@ -615,7 +615,7 @@ function AppContent() {
         task_run_id?: number;
         select_run?: number;
       }>("test-navigation", (event) => {
-        const { page, task_run_id, select_run } = event.payload;
+        const { page, task_run_id: _taskRunId, select_run: _selectRun } = event.payload;
 
         // Map page names to tab IDs (same mapping as tutorials)
         const pageToTab: Record<string, MainTabId> = {
@@ -636,12 +636,7 @@ function AppContent() {
         const tabId = pageToTab[page];
         if (tabId) {
           setActiveTab(tabId);
-
-          // If select_run is provided and we're going to a run-related page,
-          // we might need to select the run (this would require RunSelectionContext)
-          // For now, just log it - the run selection will need to be done via
-          // the RunSelectionContext or a separate mechanism
-          // select_run and task_run_id are available for future run selection via RunSelectionContext
+          // _taskRunId and _selectRun reserved for future run selection via RunSelectionContext
         } else {
           console.warn(`[APP] Unknown page for navigation: ${page}`);
         }

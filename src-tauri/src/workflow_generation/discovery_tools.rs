@@ -89,6 +89,7 @@ const TOOL_SCAN_WORKSPACE: &str = "scan_workspace";
 const TOOL_LIST_CHECKS: &str = "list_checks";
 const TOOL_SCAN_APPS: &str = "scan_apps";
 const TOOL_SDK_SNAPSHOT: &str = "sdk_snapshot";
+const TOOL_UI_BRIDGE_SPECS: &str = "ui_bridge_specs";
 const TOOL_TEST_API: &str = "test_api_request";
 const TOOL_LIST_MCP: &str = "list_mcp_servers";
 const TOOL_LIST_SHELL_COMMANDS: &str = "list_shell_commands";
@@ -176,6 +177,27 @@ const TOOL_TRIGGERS: &[ToolTrigger] = &[
             "button",
             "input",
             "form",
+        ],
+        needs_data: ToolDataReq::WebApp,
+    },
+    ToolTrigger {
+        name: TOOL_UI_BRIDGE_SPECS,
+        keywords: &[
+            "spec",
+            "page spec",
+            "verify",
+            "verification",
+            "test",
+            "check",
+            "web app",
+            "frontend",
+            "page",
+            "ui",
+            "dashboard",
+            "app",
+            "quality",
+            "assert",
+            "semantic",
         ],
         needs_data: ToolDataReq::WebApp,
     },
@@ -525,6 +547,34 @@ pub fn run_discovery(description: &str, config: &DiscoveryConfig, mode: &str) ->
     DiscoveryResult { context, calls }
 }
 
+/// Run a single discovery tool by name and return its formatted markdown section.
+///
+/// Useful when the caller wants to force a specific tool that wasn't selected
+/// by keyword matching (e.g., `discover_ui_bridge_specs: true` in the request).
+pub fn run_single_tool(name: &str, description: &str, config: &DiscoveryConfig) -> Option<String> {
+    let input = parse_description(description);
+    let start = Instant::now();
+    match execute_tool(name, &input, config) {
+        Ok(section) => {
+            let truncated = truncate_at_line_boundary(&section, config.max_result_chars);
+            debug!(
+                "{} (single) completed in {}ms",
+                name,
+                start.elapsed().as_millis()
+            );
+            if truncated.is_empty() {
+                None
+            } else {
+                Some(truncated)
+            }
+        }
+        Err(e) => {
+            warn!("{} (single) failed: {}", name, e);
+            None
+        }
+    }
+}
+
 /// Execute a single discovery tool and return its markdown section.
 fn execute_tool(
     name: &str,
@@ -536,6 +586,7 @@ fn execute_tool(
         TOOL_LIST_CHECKS => execute_list_checks(config),
         TOOL_SCAN_APPS => execute_scan_apps(config),
         TOOL_SDK_SNAPSHOT => execute_sdk_snapshot(input, config),
+        TOOL_UI_BRIDGE_SPECS => execute_ui_bridge_specs(config),
         TOOL_TEST_API => execute_test_api(input, config),
         TOOL_LIST_MCP => execute_list_mcp_servers(config),
         TOOL_LIST_SHELL_COMMANDS => execute_list_shell_commands(config),
@@ -565,6 +616,7 @@ fn summarize_input(tool_name: &str, input: &DiscoveryInput) -> String {
             let endpoints: Vec<&str> = input.api_endpoints.iter().map(|s| s.as_str()).collect();
             format!("endpoints: {:?}", &endpoints[..endpoints.len().min(3)])
         }
+        TOOL_UI_BRIDGE_SPECS => "runner + cached specs".to_string(),
         _ => "default".to_string(),
     }
 }
@@ -897,6 +949,228 @@ fn take_sdk_snapshot(
             }
         }
     }
+
+    Ok(s)
+}
+
+/// Fetch UI Bridge page specs and format them as project context.
+///
+/// Queries both cached external app specs and the runner's own bundled specs.
+/// Extracts page descriptions (semantic page specs), group summaries, and
+/// architecture information to give the workflow generator a deeper
+/// understanding of the target application's pages and purpose.
+fn execute_ui_bridge_specs(config: &DiscoveryConfig) -> Result<String, String> {
+    let client = build_http_client(config)?;
+    let base = format!("http://localhost:{}", config.runner_port);
+
+    let mut all_specs: Vec<serde_json::Value> = Vec::new();
+
+    // 1. Fetch cached external app specs
+    let cached_url = format!("{}/ui-bridge/sdk/cached-specs", base);
+    match client.get(&cached_url).send() {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(body) = resp.json::<serde_json::Value>() {
+                let specs = body
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .or_else(|| body.as_array());
+                if let Some(arr) = specs {
+                    for spec in arr {
+                        all_specs.push(spec.clone());
+                    }
+                }
+            }
+        }
+        _ => {
+            debug!("No cached external app specs available");
+        }
+    }
+
+    // 2. Fetch runner's own page specs
+    let control_url = format!("{}/ui-bridge/control/specs", base);
+    match client.get(&control_url).send() {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(body) = resp.json::<serde_json::Value>() {
+                let specs = body
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .or_else(|| body.as_array());
+                if let Some(arr) = specs {
+                    for spec in arr {
+                        all_specs.push(spec.clone());
+                    }
+                }
+            }
+        }
+        _ => {
+            debug!("No runner page specs available");
+        }
+    }
+
+    if all_specs.is_empty() {
+        return Err("No UI Bridge page specs found".to_string());
+    }
+
+    let header = "### UI Bridge Page Specs\n\n";
+    let mut s = String::from(header);
+    s.push_str(
+        "The following page specifications describe the purpose, structure, and expected behavior \
+         of pages in the target application. Use these to understand what each page does and to \
+         generate accurate verification steps.\n\n",
+    );
+
+    let mut page_count = 0;
+
+    for spec in &all_specs {
+        // Each spec can be a CachedAppSpec (with spec_json field) or a direct spec config
+        let config_val = if let Some(spec_json_str) = spec.get("spec_json").and_then(|v| v.as_str())
+        {
+            // CachedAppSpec: parse the spec_json string
+            serde_json::from_str::<serde_json::Value>(spec_json_str).ok()
+        } else if spec.get("version").is_some() {
+            // Direct spec config object
+            Some(spec.clone())
+        } else {
+            // DiscoveredSpec format: { specId, config, appName }
+            spec.get("config").cloned()
+        };
+
+        let config_val = match config_val {
+            Some(v) => v,
+            None => continue,
+        };
+
+        // Extract spec identity
+        let spec_id = spec
+            .get("spec_id")
+            .or_else(|| spec.get("specId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let app_name = spec
+            .get("app_name")
+            .or_else(|| spec.get("appName"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // Top-level description = semantic page spec (page purpose)
+        let description = config_val
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let page_url = config_val
+            .get("metadata")
+            .and_then(|m| m.get("pageUrl"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let component = config_val
+            .get("metadata")
+            .and_then(|m| m.get("component"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let groups = config_val.get("groups").and_then(|v| v.as_array());
+
+        // Skip specs with no meaningful content
+        if description.is_empty() && groups.is_none_or(|g| g.is_empty()) {
+            continue;
+        }
+
+        page_count += 1;
+
+        // Page header
+        let title = if !page_url.is_empty() {
+            page_url.to_string()
+        } else {
+            spec_id.to_string()
+        };
+        s.push_str(&format!("#### {}", title));
+        if !app_name.is_empty() {
+            s.push_str(&format!(" ({})", app_name));
+        }
+        s.push('\n');
+
+        if !component.is_empty() {
+            s.push_str(&format!("- **Component:** {}\n", component));
+        }
+
+        // Semantic page description — the most valuable part for understanding page purpose
+        if !description.is_empty() {
+            // Truncate very long descriptions to keep context manageable
+            let desc = if description.len() > 500 {
+                format!("{}...", truncate_str(description, 497))
+            } else {
+                description.to_string()
+            };
+            s.push_str(&format!("- **Purpose:** {}\n", desc));
+        }
+
+        // Group summaries — show what the page covers without individual assertions
+        if let Some(groups) = groups {
+            if !groups.is_empty() {
+                let total_assertions: usize = groups
+                    .iter()
+                    .filter_map(|g| g.get("assertions").and_then(|a| a.as_array()))
+                    .map(|a| a.len())
+                    .sum();
+
+                s.push_str(&format!(
+                    "- **Spec coverage:** {} groups, {} assertions\n",
+                    groups.len(),
+                    total_assertions
+                ));
+
+                // List group names with categories for quick overview
+                s.push_str("- **Spec groups:**\n");
+                for group in groups.iter().take(15) {
+                    let group_name = group
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unnamed");
+                    let category = group.get("category").and_then(|v| v.as_str()).unwrap_or("");
+                    let group_desc = group
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    s.push_str(&format!("  - **{}**", group_name));
+                    if !category.is_empty() {
+                        s.push_str(&format!(" [{}]", category));
+                    }
+
+                    // Include group description (truncated) for semantic context
+                    if !group_desc.is_empty() {
+                        let desc = if group_desc.len() > 200 {
+                            format!("{}...", truncate_str(group_desc, 197))
+                        } else {
+                            group_desc.to_string()
+                        };
+                        s.push_str(&format!(": {}", desc));
+                    }
+                    s.push('\n');
+                }
+                if groups.len() > 15 {
+                    s.push_str(&format!("  - ... and {} more groups\n", groups.len() - 15));
+                }
+            }
+        }
+
+        s.push('\n');
+    }
+
+    if page_count == 0 {
+        return Err("No meaningful page specs found".to_string());
+    }
+
+    // Summary line at the top
+    let summary = format!(
+        "**{} page specs available.** These semantic page specs describe what each page does, \
+         what users can accomplish, and what correct behavior looks like. Use them to generate \
+         verification steps that check real page behavior rather than guessing at element names.\n\n",
+        page_count
+    );
+    s.insert_str(header.len(), &summary);
 
     Ok(s)
 }
@@ -1296,6 +1570,7 @@ mod tests {
         let tools = select_tools(&input, "auto");
         assert!(tools.contains(&TOOL_SCAN_APPS));
         assert!(tools.contains(&TOOL_SDK_SNAPSHOT));
+        assert!(tools.contains(&TOOL_UI_BRIDGE_SPECS));
     }
 
     #[test]
@@ -1397,6 +1672,7 @@ mod tests {
         assert!(tools.contains(&TOOL_SCAN_WORKSPACE));
         assert!(tools.contains(&TOOL_SCAN_APPS));
         assert!(tools.contains(&TOOL_SDK_SNAPSHOT));
+        assert!(tools.contains(&TOOL_UI_BRIDGE_SPECS));
     }
 
     #[test]
