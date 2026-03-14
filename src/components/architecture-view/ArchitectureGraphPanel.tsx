@@ -1,4 +1,4 @@
-import { useMemo, useCallback, useEffect, memo } from "react";
+import { useMemo, useCallback, useRef, memo } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -171,11 +171,17 @@ export function ArchitectureGraphPanel({ nodes: rawNodes, edges: rawEdges, onNod
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
-  // Sync when data changes (workflow switch, rebuild, refresh)
-  useEffect(() => {
+  // Sync when data changes (workflow switch, rebuild, refresh) — computed during render
+  const prevInitialNodesRef = useRef(initialNodes);
+  const prevInitialEdgesRef = useRef(initialEdges);
+  if (prevInitialNodesRef.current !== initialNodes) {
+    prevInitialNodesRef.current = initialNodes;
     setNodes(initialNodes);
+  }
+  if (prevInitialEdgesRef.current !== initialEdges) {
+    prevInitialEdgesRef.current = initialEdges;
     setEdges(initialEdges);
-  }, [initialNodes, initialEdges, setNodes, setEdges]);
+  }
 
   const handleNodeClick = useCallback(
     (_: React.MouseEvent, node: Node) => {
