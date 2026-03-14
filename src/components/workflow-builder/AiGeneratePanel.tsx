@@ -52,6 +52,11 @@ import { useGenerateData, type SavedPrompt } from "./useGenerateData";
 import { useAdvancedOptions, PROVIDERS } from "./useAdvancedOptions";
 import { useTemplatePopover } from "./useTemplatePopover";
 import { instanceStorage } from "@/lib/instance-storage";
+import { buildSpecPrompt } from "@/lib/spec-prompt-builder";
+import {
+  SpecSourceSection,
+  type SpecSourceState,
+} from "./SpecSourceSection";
 
 // Icon lookup map for template icons
 const TEMPLATE_ICONS: Record<string, LucideIcon> = {
@@ -213,6 +218,16 @@ export function AiGeneratePanel({
   const [showContext, setShowContext] = useState(false);
   const [contextTab, setContextTab] = useState<"saved" | "custom" | "file">("saved");
 
+  // Spec source state (from SpecSourceSection)
+  const [specState, setSpecState] = useState<SpecSourceState>({
+    discoveredSpecs: [],
+    selectedGroupIds: new Set(),
+    discoveredPages: [],
+    selectedPageUrls: new Set(),
+  });
+  const hasSpecs =
+    specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0;
+
   // Hydrate description from storage after mount
   useEffect(() => {
     const saved = instanceStorage.getItem("generate-workflow-prompt");
@@ -325,13 +340,13 @@ export function AiGeneratePanel({
   /** Build a generate request for a single batch entry. */
   const buildBatchEntryRequest = useCallback(
     (entry: { title: string; prompt: string }) => {
-      const base = buildBaseRequest({ selectedContextIds, inlineContext, hasSpecs });
+      const base = buildBaseRequest({ selectedContextIds, inlineContext });
       const fullDescription = entry.title.trim()
         ? `## ${entry.title.trim()}\n\n${entry.prompt.trim()}`
         : entry.prompt.trim();
       return { ...base, description: fullDescription };
     },
-    [buildBaseRequest, selectedContextIds, inlineContext, hasSpecs],
+    [buildBaseRequest, selectedContextIds, inlineContext],
   );
 
   const handleGenerate = async () => {
@@ -375,21 +390,9 @@ export function AiGeneratePanel({
         onNavigateToActiveRuns();
         return;
       }
-      // Specs selected → deterministic builder (instant, loads into builder)
-      if (hasSpecs && onLoadWorkflow) {
-        const workflow = buildDeterministicSpecWorkflow();
-        if (workflow) {
-          onLoadWorkflow(workflow);
-          console.log(
-            "[AiGeneratePanel] Deterministic spec workflow built:",
-            workflow.stages?.length ?? 0,
-            "stages",
-          );
-          setSubmittingAction(null);
-          return;
-        }
-      }
-      // No specs → AI generation
+      // TODO: Specs selected → deterministic builder (instant, loads into builder)
+      // Deterministic spec workflow builder not yet implemented; fall through to AI generation.
+      // No specs or no deterministic builder → AI generation
       const taskRunId = await fireGenerateRequest(buildGenerateRequest());
       console.log("[AiGeneratePanel] Generation started:", taskRunId);
       if (description.trim()) {
@@ -452,26 +455,9 @@ export function AiGeneratePanel({
         onNavigateToActiveRuns();
         return;
       }
-      // Specs selected → deterministic builder + execute inline
-      if (hasSpecs) {
-        const workflow = buildDeterministicSpecWorkflow();
-        if (workflow) {
-          const resp = await tracedFetch(`${getApiBase()}/unified-workflows/execute-inline`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(workflow),
-          });
-          if (!resp.ok) {
-            const json = await resp.json();
-            throw new Error(json.error || `HTTP ${resp.status}`);
-          }
-          console.log("[AiGeneratePanel] Deterministic spec workflow built and executed");
-          onNavigateToActiveRuns();
-          setSubmittingAction(null);
-          return;
-        }
-      }
-      // No specs → AI generation + auto_run
+      // TODO: Specs selected → deterministic builder + execute inline
+      // Deterministic spec workflow builder not yet implemented; fall through to AI generation.
+      // No specs or no deterministic builder → AI generation + auto_run
       const request = { ...buildGenerateRequest(), auto_run: true };
       const taskRunId = await fireGenerateRequest(request);
       console.log("[AiGeneratePanel] Generate & Run started:", taskRunId);

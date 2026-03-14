@@ -51,7 +51,61 @@ export interface DiscoveredSpec {
 }
 
 // =============================================================================
-// Prompt builder
+// buildSpecPrompt — used by AiGeneratePanel & SpecSourceSection
+// =============================================================================
+
+/**
+ * Build a structured AI prompt from discovered specs and selected groups.
+ * Returns the prompt text plus summary stats for the UI.
+ */
+export function buildSpecPrompt(input: {
+  discoveredSpecs: DiscoveredSpec[];
+  selectedGroupIds: Set<string>;
+}): { prompt: string; totalGroups: number; pageCount: number } {
+  const { discoveredSpecs, selectedGroupIds } = input;
+  const lines: string[] = [];
+  let totalGroups = 0;
+  const pageUrls = new Set<string>();
+
+  for (const spec of discoveredSpecs) {
+    const groups = (spec.config?.groups ?? []).filter((g) =>
+      selectedGroupIds.has(g.id),
+    );
+    if (groups.length === 0) continue;
+
+    const pageUrl = spec.config?.metadata?.pageUrl || spec.specId;
+    pageUrls.add(pageUrl);
+
+    lines.push(`## Spec: ${spec.specId}`);
+    if (spec.appName) lines.push(`Application: ${spec.appName}`);
+    if (spec.config?.description) lines.push(spec.config.description);
+    if (pageUrl) lines.push(`Page: ${pageUrl}`);
+    lines.push("");
+
+    for (const group of groups) {
+      totalGroups++;
+      lines.push(`### ${group.name} [${group.category}]`);
+      if (group.description) lines.push(group.description);
+      lines.push("");
+
+      for (const assertion of group.assertions) {
+        if (!assertion.enabled) continue;
+        const severity = assertion.severity || "info";
+        lines.push(`- [${severity}] ${assertion.description}`);
+      }
+      lines.push("");
+    }
+  }
+
+  return {
+    prompt: lines.join("\n").trim(),
+    totalGroups,
+    pageCount: pageUrls.size,
+  };
+}
+
+// =============================================================================
+// Prompt builder (internal helpers)
 // =============================================================================
 
 /**
