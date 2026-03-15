@@ -152,6 +152,10 @@ pub struct UiBridgeCircuitBreaker {
     threshold: u32,
     /// Cooldown in ms before transitioning from Open to HalfOpen
     cooldown_ms: u64,
+    /// Counts recovery attempts since last success to prevent infinite reload loops
+    recovery_attempts: std::sync::atomic::AtomicU32,
+    /// Timestamp of the last recovery attempt in ms
+    last_recovery_time: std::sync::atomic::AtomicU64,
 }
 
 impl UiBridgeCircuitBreaker {
@@ -162,6 +166,8 @@ impl UiBridgeCircuitBreaker {
             last_failure_time: std::sync::atomic::AtomicU64::new(0),
             threshold: 3,
             cooldown_ms: 5000,
+            recovery_attempts: std::sync::atomic::AtomicU32::new(0),
+            last_recovery_time: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2931,6 +2937,104 @@ pub async fn ui_bridge_find_handler(
     }
 }
 
+/// POST /ui-bridge/control/workflow/:id/run — Run a workflow via the unified workflow engine.
+/// Proxies to the runner's existing `/unified-workflows/:id/run` endpoint via internal HTTP.
+pub async fn ui_bridge_run_workflow_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Running workflow {}", id);
+
+    let base_url = crate::mcp::types::get_self_base_url(&state.app_state);
+    let url = format!("{}/unified-workflows/{}/run", base_url, id);
+
+    let request_body = body
+        .map(|Json(v)| v)
+        .unwrap_or_else(|| serde_json::json!({ "force_fresh_start": false }));
+
+    let client = reqwest::Client::new();
+    match client.post(&url).json(&request_body).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            match resp.json::<serde_json::Value>().await {
+                Ok(result) => {
+                    if status.is_success() {
+                        Ok(Json(ApiResponse::success(result)))
+                    } else {
+                        let err_msg = result
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("Workflow execution failed")
+                            .to_string();
+                        Err((
+                            StatusCode::from_u16(status.as_u16())
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                            Json(api_error(err_msg)),
+                        ))
+                    }
+                }
+                Err(e) => {
+                    error!("UI Bridge API: Failed to parse run response: {}", e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!("Failed to parse response: {}", e))),
+                    ))
+                }
+            }
+        }
+        Err(e) => {
+            error!("UI Bridge API: Failed to call unified workflow run: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to run workflow: {}", e))),
+            ))
+        }
+    }
+}
+
+/// GET /ui-bridge/control/workflow/:run_id/status — Get workflow run status.
+/// Reads the task run directly from the checkpoint database.
+pub async fn ui_bridge_get_workflow_status_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting workflow status for run {}", run_id);
+
+    match state.app_state.checkpoint_db.get_task_run(&run_id) {
+        Ok(Some(task_run)) => {
+            let status = match task_run.status.as_str() {
+                "running" | "in_progress" => "running",
+                "complete" | "completed" | "success" => "completed",
+                "failed" | "error" => "failed",
+                "stopped" | "cancelled" => "cancelled",
+                _ => "pending",
+            };
+            Ok(Json(ApiResponse::success(serde_json::json!({
+                "workflowId": task_run.workflow_id.unwrap_or_default(),
+                "runId": run_id,
+                "status": status,
+                "taskName": task_run.task_name,
+                "sessionsCount": task_run.sessions_count,
+                "startedAt": task_run.created_at,
+                "completedAt": task_run.completed_at,
+                "errorMessage": task_run.error_message,
+            }))))
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Task run not found: {}", run_id))),
+        )),
+        Err(e) => {
+            error!("UI Bridge API: Failed to get task run: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get task run: {}", e))),
+            ))
+        }
+    }
+}
+
 /// Get all workflows.
 pub async fn ui_bridge_get_workflows_handler(
     State(state): State<Arc<ApiState>>,
@@ -3298,6 +3402,14 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/workflows",
             get(ui_bridge_get_workflows_handler),
+        )
+        .route(
+            "/ui-bridge/control/workflow/:id/run",
+            post(ui_bridge_run_workflow_handler),
+        )
+        .route(
+            "/ui-bridge/control/workflow/:run_id/status",
+            get(ui_bridge_get_workflow_status_handler),
         )
         .route(
             "/ui-bridge/control/element/:id/state",

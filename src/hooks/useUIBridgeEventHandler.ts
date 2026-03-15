@@ -147,11 +147,37 @@ type UIBridgeRequestType =
   | "find"
   | "get_workflows"
   | "get_element_state"
+  // Workflow execution
+  | "run_workflow"
+  | "get_workflow_status"
   // Media discovery
   | "find_media"
   | "media_audit"
   | "capture_media_snapshot"
   | "analyze_media";
+
+/**
+ * Map task run status strings from the runner to SDK-compatible workflow status values.
+ */
+function mapTaskRunStatus(status: string): string {
+  switch (status) {
+    case "in_progress":
+    case "running":
+      return "running";
+    case "completed":
+    case "complete":
+    case "success":
+      return "completed";
+    case "failed":
+    case "error":
+      return "failed";
+    case "cancelled":
+    case "stopped":
+      return "cancelled";
+    default:
+      return "pending";
+  }
+}
 
 /**
  * Payload structure for UI Bridge requests from Rust
@@ -312,10 +338,10 @@ export function useUIBridgeEventHandler(): void {
     typeof import("ui-bridge").CompositeIdleDetector
   > | null>(null);
 
-  // Keep bridge ref updated to avoid stale closures
-  useEffect(() => {
-    bridgeRef.current = bridge;
-  }, [bridge]);
+  // Keep bridge ref updated synchronously during render to avoid stale closures.
+  // Using useEffect would leave a gap between rerender and effect execution
+  // where IPC events could arrive and use the stale bridge reference.
+  bridgeRef.current = bridge;
 
   /**
    * Send a response back to the Rust backend
@@ -1535,6 +1561,94 @@ export function useUIBridgeEventHandler(): void {
               data: { workflows: (snapshot as unknown as Record<string, unknown>).workflows ?? [], timestamp: Date.now() },
               timestamp: Date.now(),
             });
+            break;
+          }
+
+          case "run_workflow": {
+            // Execute a workflow via the runner's unified workflow engine
+            const workflowId = (payload as unknown as Record<string, unknown>).id as string;
+            const runRequest = ((payload as unknown as Record<string, unknown>).request || {}) as Record<string, unknown>;
+            try {
+              const runResponse = await fetch(
+                `http://127.0.0.1:9876/unified-workflows/${encodeURIComponent(workflowId)}/run`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    force_fresh_start:
+                      (runRequest.params as Record<string, unknown>)?.force_fresh_start ?? false,
+                  }),
+                },
+              );
+              const runResult = (await runResponse.json()) as Record<string, unknown>;
+              const runResultData = (runResult.data || {}) as Record<string, unknown>;
+              await sendResponse({
+                requestId,
+                type,
+                success: (runResult.success as boolean) ?? runResponse.ok,
+                data: {
+                  workflowId,
+                  runId:
+                    runResultData.task_run_id ||
+                    runResultData.execution_id ||
+                    `run-${Date.now()}`,
+                  status: "running",
+                  steps: [],
+                  totalSteps: 0,
+                  startedAt: Date.now(),
+                },
+                timestamp: Date.now(),
+              });
+            } catch (runErr) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: String(runErr),
+                timestamp: Date.now(),
+              });
+            }
+            break;
+          }
+
+          case "get_workflow_status": {
+            // Get workflow run status from the runner
+            const statusRunId = (payload as unknown as Record<string, unknown>).runId as string;
+            try {
+              const statusResponse = await fetch(
+                `http://127.0.0.1:9876/task-runs/${encodeURIComponent(statusRunId)}`,
+              );
+              const statusResult = (await statusResponse.json()) as Record<string, unknown>;
+              const taskRun = (statusResult.data || statusResult) as Record<string, unknown>;
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: {
+                  workflowId: taskRun.workflow_id || "",
+                  runId: statusRunId,
+                  status: mapTaskRunStatus(taskRun.status as string),
+                  steps: [],
+                  totalSteps: (taskRun.total_steps as number) || 0,
+                  currentStep: taskRun.current_step,
+                  startedAt: taskRun.created_at
+                    ? new Date(taskRun.created_at as string).getTime()
+                    : Date.now(),
+                  completedAt: taskRun.completed_at
+                    ? new Date(taskRun.completed_at as string).getTime()
+                    : undefined,
+                },
+                timestamp: Date.now(),
+              });
+            } catch (statusErr) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: String(statusErr),
+                timestamp: Date.now(),
+              });
+            }
             break;
           }
 
