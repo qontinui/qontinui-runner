@@ -1569,8 +1569,9 @@ export function useUIBridgeEventHandler(): void {
             const workflowId = (payload as unknown as Record<string, unknown>).id as string;
             const runRequest = ((payload as unknown as Record<string, unknown>).request || {}) as Record<string, unknown>;
             try {
+              const port = getApiPort();
               const runResponse = await fetch(
-                `http://127.0.0.1:9876/unified-workflows/${encodeURIComponent(workflowId)}/run`,
+                `http://127.0.0.1:${port}/unified-workflows/${encodeURIComponent(workflowId)}/run`,
                 {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
@@ -1615,9 +1616,21 @@ export function useUIBridgeEventHandler(): void {
             // Get workflow run status from the runner
             const statusRunId = (payload as unknown as Record<string, unknown>).runId as string;
             try {
+              const port = getApiPort();
               const statusResponse = await fetch(
-                `http://127.0.0.1:9876/task-runs/${encodeURIComponent(statusRunId)}`,
+                `http://127.0.0.1:${port}/task-runs/${encodeURIComponent(statusRunId)}`,
               );
+              if (!statusResponse.ok) {
+                const errBody = await statusResponse.json().catch(() => ({})) as Record<string, unknown>;
+                await sendResponse({
+                  requestId,
+                  type,
+                  success: false,
+                  error: (errBody.error as string) || `Runner returned ${statusResponse.status}`,
+                  timestamp: Date.now(),
+                });
+                break;
+              }
               const statusResult = (await statusResponse.json()) as Record<string, unknown>;
               const taskRun = (statusResult.data || statusResult) as Record<string, unknown>;
               await sendResponse({

@@ -3010,15 +3010,19 @@ pub async fn ui_bridge_get_workflow_status_handler(
                 "stopped" | "cancelled" => "cancelled",
                 _ => "pending",
             };
+            let is_terminal = matches!(status, "completed" | "failed" | "cancelled");
             Ok(Json(ApiResponse::success(serde_json::json!({
                 "workflowId": task_run.workflow_id.unwrap_or_default(),
                 "runId": run_id,
                 "status": status,
+                "steps": [],
+                "totalSteps": 0,
+                "success": if is_terminal { Some(status == "completed") } else { None::<bool> },
                 "taskName": task_run.task_name,
                 "sessionsCount": task_run.sessions_count,
                 "startedAt": task_run.created_at,
                 "completedAt": task_run.completed_at,
-                "errorMessage": task_run.error_message,
+                "error": task_run.error_message,
             }))))
         }
         Ok(None) => Err((
