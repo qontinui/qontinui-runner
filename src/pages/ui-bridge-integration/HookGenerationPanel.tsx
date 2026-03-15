@@ -183,6 +183,8 @@ export function HookGenerationPanel({
 
   // When AI transitions to ready, handle the current step completion
   useEffect(() => {
+    const controller = new AbortController();
+
     const prevState = prevSessionStateRef.current;
     prevSessionStateRef.current = session.sessionState;
 
@@ -218,7 +220,7 @@ export function HookGenerationPanel({
           );
           // Send the architecture spec prompt in the same session
           const analysisForPrompt = { framework: analysis.framework, project_path: projectPath };
-          (async () => {
+          async function fetchAndSendSpecPrompt() {
             let specPrompt: string;
             if (isRegenSpec) {
               let existingSpec = "";
@@ -231,10 +233,12 @@ export function HookGenerationPanel({
                     project_path: projectPath,
                     file_path: "project.architecture.uibridge.json",
                   }),
+                  signal: controller.signal,
                 });
                 const data = await resp.json();
                 if (data.success && data.data) existingSpec = data.data;
-              } catch {
+              } catch (e) {
+                if (controller.signal.aborted) return;
                 // Fall through to fresh generation
               }
               specPrompt = existingSpec
@@ -243,11 +247,13 @@ export function HookGenerationPanel({
             } else {
               specPrompt = buildArchitectureSpecPrompt(analysisForPrompt);
             }
+            if (controller.signal.aborted) return;
             await session.sendMessage(
               "Now generate an architecture spec for this project. You already have context from the hook generation step — use what you learned.\n\n" +
                 specPrompt,
             );
-          })();
+          }
+          fetchAndSendSpecPrompt();
         } else {
           // No spec step — go to preview
           pendingStepRef.current = null;
@@ -265,6 +271,7 @@ export function HookGenerationPanel({
     } else if (currentStep === "architecture-spec") {
       // Extract JSON — try immediately, then retry via API if text events are still in transit
       const handleSpecError = () => {
+        if (controller.signal.aborted) return;
         setStepStatuses((prev) =>
           prev.map((s) => (s.label.includes("Architecture") ? { ...s, state: "error" } : s)),
         );
@@ -328,6 +335,7 @@ export function HookGenerationPanel({
           try {
             const resp = await fetch(
               `${getApiBase()}/task-runs/${taskRunId}/output?tail_chars=200000`,
+              { signal: controller.signal },
             );
             const data = await resp.json();
             const apiOutput: string = data?.output || "";
@@ -335,11 +343,15 @@ export function HookGenerationPanel({
               handleSpecError();
             }
           } catch {
-            handleSpecError();
+            if (!controller.signal.aborted) {
+              handleSpecError();
+            }
           }
         }, 1000);
       }
     }
+
+    return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.sessionState]);
 

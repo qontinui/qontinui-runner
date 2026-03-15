@@ -48,8 +48,11 @@ export function DiscoveryPanel({ onSelectApp }: DiscoveryPanelProps = {}) {
 
   // Load process configs and runner path on mount
   useEffect(() => {
+    const controller = new AbortController();
+
     invoke<ProcessConfig[]>("get_process_configs")
       .then((configs) => {
+        if (controller.signal.aborted) return;
         setProcessConfigs(configs);
         const map = new Map<number, string>();
         for (const cfg of configs) {
@@ -62,12 +65,22 @@ export function DiscoveryPanel({ onSelectApp }: DiscoveryPanelProps = {}) {
       .catch(() => {});
 
     // Get runner's own project path (available in dev mode)
-    fetch(`${getApiBase()}/ui-bridge/integration/runner-project`)
-      .then((r) => r.json())
-      .then((data: ApiResponse<string | null>) => {
+    async function fetchRunnerProject() {
+      try {
+        const r = await fetch(`${getApiBase()}/ui-bridge/integration/runner-project`, {
+          signal: controller.signal,
+        });
+        const data: ApiResponse<string | null> = await r.json();
         if (data.success && data.data) setRunnerPath(data.data);
-      })
-      .catch(() => {});
+      } catch (e) {
+        if (!controller.signal.aborted) {
+          // Silently ignore — runner project path is optional
+        }
+      }
+    }
+    fetchRunnerProject();
+
+    return () => controller.abort();
   }, []);
 
   const scan = useCallback(async () => {
