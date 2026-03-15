@@ -8,6 +8,8 @@ import {
   Smartphone,
   FolderOpen,
   Wrench,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react";
 import { useState, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -35,16 +37,25 @@ interface ProcessConfig {
 
 interface DiscoveryPanelProps {
   onSelectApp?: (projectPath: string) => void;
+  selectedProjectPath?: string;
 }
 
-export function DiscoveryPanel({ onSelectApp }: DiscoveryPanelProps = {}) {
+export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPanelProps = {}) {
   const [result, setResult] = useState<DiscoveryResult | null>(null);
   const [scanning, setScanning] = useState(false);
   const [processConfigs, setProcessConfigs] = useState<ProcessConfig[]>([]);
   // Port → project path map built from process configs
   const [portToPath, setPortToPath] = useState<Map<number, string>>(new Map());
+  const [projectsExpanded, setProjectsExpanded] = useState(true);
 
   const [runnerPath, setRunnerPath] = useState<string | null>(null);
+
+  // Collapse "Your Projects" when a project is selected
+  useEffect(() => {
+    if (selectedProjectPath) {
+      setProjectsExpanded(false);
+    }
+  }, [selectedProjectPath]);
 
   // Load process configs and runner path on mount
   useEffect(() => {
@@ -72,7 +83,7 @@ export function DiscoveryPanel({ onSelectApp }: DiscoveryPanelProps = {}) {
         });
         const data: ApiResponse<string | null> = await r.json();
         if (data.success && data.data) setRunnerPath(data.data);
-      } catch (e) {
+      } catch (_e) {
         if (!controller.signal.aborted) {
           // Silently ignore — runner project path is optional
         }
@@ -135,35 +146,55 @@ export function DiscoveryPanel({ onSelectApp }: DiscoveryPanelProps = {}) {
       {/* Known projects from setup wizard + runner itself */}
       {(unscannedProjects.length > 0 || showRunner) && (
         <div>
-          <div className="flex items-center justify-between mb-2">
-            <div>
-              <h3 className="text-sm font-medium">Your Projects</h3>
-              <p className="text-xs text-muted-foreground mt-0.5">
-                Click a project to set up UI Bridge integration
-              </p>
-            </div>
-          </div>
-          <div className="grid gap-2">
-            {showRunner && (
-              <ProjectCard
-                name="Qontinui Runner"
-                projectPath={runnerPath}
-                category="runner"
-                port={null}
-                onSelect={onSelectApp}
-              />
+          <button
+            onClick={() => setProjectsExpanded((v) => !v)}
+            className="flex items-center gap-1.5 mb-2 w-full text-left group"
+          >
+            {projectsExpanded ? (
+              <ChevronDown className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+            ) : (
+              <ChevronRight className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
             )}
-            {unscannedProjects.map((cfg) => (
-              <ProjectCard
-                key={cfg.id}
-                name={cfg.name}
-                projectPath={cfg.cwd}
-                category={cfg.category}
-                port={cfg.health_port}
-                onSelect={onSelectApp}
-              />
-            ))}
-          </div>
+            <div className="flex-1">
+              <h3 className="text-sm font-medium group-hover:text-foreground transition-colors">
+                Your Projects
+              </h3>
+              {projectsExpanded && (
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  Click a project to set up UI Bridge integration
+                </p>
+              )}
+            </div>
+            {!projectsExpanded && (
+              <span className="text-[10px] text-muted-foreground/60">
+                {(showRunner ? 1 : 0) + unscannedProjects.length} project
+                {(showRunner ? 1 : 0) + unscannedProjects.length !== 1 ? "s" : ""}
+              </span>
+            )}
+          </button>
+          {projectsExpanded && (
+            <div className="grid gap-2">
+              {showRunner && (
+                <ProjectCard
+                  name="Qontinui Runner"
+                  projectPath={runnerPath}
+                  category="runner"
+                  port={null}
+                  onSelect={onSelectApp}
+                />
+              )}
+              {unscannedProjects.map((cfg) => (
+                <ProjectCard
+                  key={cfg.id}
+                  name={cfg.name}
+                  projectPath={cfg.cwd}
+                  category={cfg.category}
+                  port={cfg.health_port}
+                  onSelect={onSelectApp}
+                />
+              ))}
+            </div>
+          )}
         </div>
       )}
 

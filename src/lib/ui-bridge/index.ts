@@ -94,4 +94,5 @@ export {
 export { UIBridgeHooks, type UIBridgeHooksProps } from "./UIBridgeHooks";
 
 // Intent definitions for composite user actions
-export { APP_INTENTS, type Intent, type IntentParam } from "./intents";
+export { APP_INTENTS } from "./intents";
+export type { Intent, IntentParam } from "@qontinui/ui-bridge";

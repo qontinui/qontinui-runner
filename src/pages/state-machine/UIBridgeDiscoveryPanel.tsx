@@ -101,7 +101,10 @@ export function UIBridgeDiscoveryPanel({
     if (result && result.states.length > 0) {
       const appName = sdk.connectedApp?.appName || "App";
       const timestamp = new Date().toLocaleString("en-US", {
-        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
       });
       const autoName = `${appName} — ${timestamp}`;
       const configId = await discovery.saveConfig(autoName, result);

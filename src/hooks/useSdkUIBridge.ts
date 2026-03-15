@@ -1152,10 +1152,17 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
             // Track element bounds for thumbnail cropping
             if (!session.elementBoundsMap) session.elementBoundsMap = {};
             for (const el of mapped) {
-              if (el.fingerprint?.hash && el.bounds && el.bounds.width > 0 && el.bounds.height > 0) {
+              if (
+                el.fingerprint?.hash &&
+                el.bounds &&
+                el.bounds.width > 0 &&
+                el.bounds.height > 0
+              ) {
                 session.elementBoundsMap[el.fingerprint.hash] = {
-                  x: el.bounds.x, y: el.bounds.y,
-                  width: el.bounds.width, height: el.bounds.height,
+                  x: el.bounds.x,
+                  y: el.bounds.y,
+                  width: el.bounds.width,
+                  height: el.bounds.height,
                 };
               }
             }
@@ -1200,7 +1207,9 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
                       },
                     }));
                   if (newElements.length > 0) {
-                    const thumbs = await cropThumbnails(ssJson.data.screenshot, newElements, { maxSize: 48 });
+                    const thumbs = await cropThumbnails(ssJson.data.screenshot, newElements, {
+                      maxSize: 48,
+                    });
                     if (!session.elementThumbnails) session.elementThumbnails = {};
                     for (const [id, data] of thumbs) {
                       session.elementThumbnails[id] = data;
@@ -1219,7 +1228,10 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
         }
       };
 
-      const executeExplorationAction = async (elementId: string, action: string): Promise<ExternalElement[]> => {
+      const executeExplorationAction = async (
+        elementId: string,
+        action: string,
+      ): Promise<ExternalElement[]> => {
         const session = captureSessionRef.current;
         const beforeCaptureId = session?.lastCaptureId || null;
 
@@ -1246,8 +1258,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
           const afterCaptureId = session.lastCaptureId;
           if (afterCaptureId && afterCaptureId !== beforeCaptureId) {
             const afterCapture = session.captures.find((c) => c.captureId === afterCaptureId);
-            const targetEl =
-              afterElements.find((e) => e.id === elementId) || undefined;
+            const targetEl = afterElements.find((e) => e.id === elementId) || undefined;
             const targetFingerprint = targetEl?.fingerprint?.hash || "";
 
             if (afterCapture) {

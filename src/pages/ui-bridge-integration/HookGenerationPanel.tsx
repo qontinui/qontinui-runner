@@ -61,13 +61,31 @@ function extractGeneratedFiles(content: string): GeneratedFile[] {
   return results;
 }
 
+/** Maximum size (in bytes) for extracted JSON blocks to prevent caching oversized payloads. */
+const MAX_JSON_BLOCK_SIZE = 1024 * 1024; // 1 MB
+
 function extractJsonBlock(content: string): string | null {
-  const regex = /```(?:json)?\s*\n([\s\S]*?)```/g;
+  // First pass: match ```json blocks specifically (avoids pairing with closing ``` of other code blocks)
+  const jsonRegex = /```json\s*\n([\s\S]*?)```/gi;
   let match;
-  while ((match = regex.exec(content)) !== null) {
+  while ((match = jsonRegex.exec(content)) !== null) {
+    const raw = match[1];
+    if (raw.length > MAX_JSON_BLOCK_SIZE) continue; // Skip oversized blocks
     try {
-      JSON.parse(match[1]);
-      return match[1].trim();
+      JSON.parse(raw);
+      return raw.trim();
+    } catch {
+      // Not valid JSON, try next block
+    }
+  }
+  // Fallback: try bare ``` blocks (no language tag)
+  const bareRegex = /```\s*\n(\s*\{[\s\S]*?\})\s*\n```/g;
+  while ((match = bareRegex.exec(content)) !== null) {
+    const raw = match[1];
+    if (raw.length > MAX_JSON_BLOCK_SIZE) continue; // Skip oversized blocks
+    try {
+      JSON.parse(raw);
+      return raw.trim();
     } catch {
       // Not valid JSON, try next block
     }
@@ -237,7 +255,7 @@ export function HookGenerationPanel({
                 });
                 const data = await resp.json();
                 if (data.success && data.data) existingSpec = data.data;
-              } catch (e) {
+              } catch (_e) {
                 if (controller.signal.aborted) return;
                 // Fall through to fresh generation
               }
@@ -525,6 +543,25 @@ export function HookGenerationPanel({
         setWriteResult(data.data);
         setPhase("applied");
         onRefreshAnalysis?.();
+
+        // Cache architecture spec so it appears in the Architecture page
+        const specFile = generatedFiles.find((f) =>
+          f.filePath.endsWith(".architecture.uibridge.json"),
+        );
+        if (specFile) {
+          try {
+            await fetch(`${getApiBase()}/ui-bridge/integration/cache-architecture-spec`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                project_path: projectPath,
+                spec_json: specFile.content,
+              }),
+            });
+          } catch {
+            // Non-critical — spec written to disk, just not cached
+          }
+        }
       } else {
         setError(data.error || "Failed to write files");
         setPhase("preview");

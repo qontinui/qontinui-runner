@@ -1857,6 +1857,56 @@ async fn handle_runner_project_path() -> Json<ApiResponse<Option<String>>> {
 }
 
 // ============================================================================
+// Cache Architecture Spec
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct CacheArchitectureSpecRequest {
+    project_path: String,
+    spec_json: String,
+}
+
+/// Caches an architecture spec in the cached_app_specs table so it appears
+/// in the Architecture page's SDK Projects view.
+async fn handle_cache_architecture_spec(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<CacheArchitectureSpecRequest>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let db = &state.app_state.checkpoint_db;
+
+    // Normalize the project path: canonicalize resolves "..", symlinks, and
+    // produces an absolute path.  Fall back to the raw input if canonicalization
+    // fails (e.g. the path doesn't exist on this machine).
+    let normalized_path = std::path::Path::new(&req.project_path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&req.project_path));
+
+    // Derive a project name from the normalized path
+    let project_name = normalized_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Unknown Project".to_string());
+
+    // Use normalized project path as the "app_url" key for local file-based specs
+    let normalized_str = normalized_path.to_string_lossy().replace('\\', "/");
+    let app_url = format!("file://{}", normalized_str);
+    let spec_id = format!(
+        "{}.architecture",
+        project_name.to_lowercase().replace(' ', "-")
+    );
+
+    if let Err(e) = db.upsert_cached_spec(&app_url, &project_name, &spec_id, &req.spec_json, None) {
+        return Json(ApiResponse::error(format!("Failed to cache spec: {}", e)));
+    }
+
+    Json(ApiResponse::success(serde_json::json!({
+        "cached": true,
+        "app_url": app_url,
+        "spec_id": spec_id,
+    })))
+}
+
+// ============================================================================
 // Router
 // ============================================================================
 
@@ -1879,6 +1929,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/integration/health-check",
             post(handle_health_check),
+        )
+        .route(
+            "/ui-bridge/integration/cache-architecture-spec",
+            post(handle_cache_architecture_spec),
         )
         .route(
             "/ui-bridge/integration/:id",

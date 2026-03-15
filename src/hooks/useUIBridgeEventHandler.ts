@@ -352,12 +352,18 @@ export function useUIBridgeEventHandler(): void {
     // so the HTTP fallback ensures the response always reaches the Rust backend.
     const httpPromise = httpSendResponse(response).then((ok) => {
       if (ok) {
-        console.log(`[UIBridgeEventHandler] HTTP sent response for ${response.type}:`, response.requestId);
+        console.log(
+          `[UIBridgeEventHandler] HTTP sent response for ${response.type}:`,
+          response.requestId,
+        );
       }
     });
     const emitPromise = emit("ui-bridge-response", response)
       .then(() => {
-        console.log(`[UIBridgeEventHandler] Tauri emit sent response for ${response.type}:`, response.requestId);
+        console.log(
+          `[UIBridgeEventHandler] Tauri emit sent response for ${response.type}:`,
+          response.requestId,
+        );
       })
       .catch(() => {
         // Tauri emit failed — HTTP fallback already running
@@ -452,8 +458,7 @@ export function useUIBridgeEventHandler(): void {
 
             // Normalize: action may be a string (from SDK proxy fallback)
             // or an object { action, params, waitOptions } (from control endpoint)
-            const actionObj =
-              typeof action === "string" ? { action } : action;
+            const actionObj = typeof action === "string" ? { action } : action;
 
             const result = await currentBridge.executeAction(elementId, {
               action: actionObj.action,
@@ -758,9 +763,9 @@ export function useUIBridgeEventHandler(): void {
               // Only allow relative URL navigation via history API.
               // Absolute URLs (window.location.href = ...) would cause a full page reload,
               // resetting all React state and flashing "Checking authentication...".
-              if (url.startsWith('/')) {
-                window.history.pushState({}, '', url);
-                window.dispatchEvent(new PopStateEvent('popstate'));
+              if (url.startsWith("/")) {
+                window.history.pushState({}, "", url);
+                window.dispatchEvent(new PopStateEvent("popstate"));
               } else {
                 console.warn(`[UIBridge] page_navigate: ignoring absolute URL navigation in runner: ${url}`);
               }
@@ -1563,7 +1568,10 @@ export function useUIBridgeEventHandler(): void {
               requestId,
               type,
               success: true,
-              data: { workflows: (snapshot as unknown as Record<string, unknown>).workflows ?? [], timestamp: Date.now() },
+              data: {
+                workflows: (snapshot as unknown as Record<string, unknown>).workflows ?? [],
+                timestamp: Date.now(),
+              },
               timestamp: Date.now(),
             });
             break;
@@ -1572,7 +1580,8 @@ export function useUIBridgeEventHandler(): void {
           case "run_workflow": {
             // Execute a workflow via the runner's unified workflow engine
             const workflowId = (payload as unknown as Record<string, unknown>).id as string;
-            const runRequest = ((payload as unknown as Record<string, unknown>).request || {}) as Record<string, unknown>;
+            const runRequest = ((payload as unknown as Record<string, unknown>).request ||
+              {}) as Record<string, unknown>;
             try {
               const port = getApiPort();
               const runResponse = await fetch(
@@ -1595,9 +1604,7 @@ export function useUIBridgeEventHandler(): void {
                 data: {
                   workflowId,
                   runId:
-                    runResultData.task_run_id ||
-                    runResultData.execution_id ||
-                    `run-${Date.now()}`,
+                    runResultData.task_run_id || runResultData.execution_id || `run-${Date.now()}`,
                   status: "running",
                   steps: [],
                   totalSteps: 0,
@@ -1626,7 +1633,10 @@ export function useUIBridgeEventHandler(): void {
                 `http://127.0.0.1:${port}/task-runs/${encodeURIComponent(statusRunId)}`,
               );
               if (!statusResponse.ok) {
-                const errBody = await statusResponse.json().catch(() => ({})) as Record<string, unknown>;
+                const errBody = (await statusResponse.json().catch(() => ({}))) as Record<
+                  string,
+                  unknown
+                >;
                 await sendResponse({
                   requestId,
                   type,
@@ -1723,7 +1733,8 @@ export function useUIBridgeEventHandler(): void {
           }
 
           case "media_audit": {
-            const auditType = (payload.params ?? payload.body ?? {} as Record<string, unknown>)?.auditType;
+            const auditType = (payload.params ?? payload.body ?? ({} as Record<string, unknown>))
+              ?.auditType;
             const discovered = await currentBridge.discover({
               mediaOnly: true,
               includeMedia: true,
@@ -1834,14 +1845,14 @@ export function useUIBridgeEventHandler(): void {
     const handleBeforeUnload = () => {
       console.log("[UIBridgeEventHandler] Page unloading, cleaning up");
     };
-    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener("beforeunload", handleBeforeUnload);
 
     setupListener();
 
     return () => {
       console.log("[UIBridgeEventHandler] Cleaning up listener");
       isMounted = false;
-      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener("beforeunload", handleBeforeUnload);
       if (unlisten) {
         unlisten();
       }

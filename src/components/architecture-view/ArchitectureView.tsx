@@ -8,6 +8,10 @@ import {
   Link2,
   Activity,
   AlertTriangle,
+  X,
+  FileCode,
+  Cpu,
+  ArrowRight,
 } from "lucide-react";
 import { tracedFetch } from "@/lib/traced-fetch";
 import { getApiBase } from "@/lib/runner-api";
@@ -20,6 +24,8 @@ import { ArchitectureGraphPanel } from "./ArchitectureGraphPanel";
 import { ComponentDetailPanel } from "./ComponentDetailPanel";
 import { TrendsPanel } from "./TrendsPanel";
 import { SdkAppConnector } from "@/components/ui-bridge/SdkAppConnector";
+import { DeveloperArchitecturePanel } from "./DeveloperArchitecturePanel";
+import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
 
 export function ArchitectureView() {
   const [workflowName, setWorkflowName] = useState<string>("");
@@ -57,11 +63,11 @@ export function ArchitectureView() {
   const { graph, loading, error, refresh, rebuild } = useArchitectureGraph(workflowName);
   const { details, loading: detailsLoading } = useComponentDetails(workflowName, selectedComponent);
   const sdkArch = useSdkArchitecture();
-  const [viewMode, setViewMode] = useState<"reflection" | "sdk">("reflection");
+  const [viewMode, setViewMode] = useState<"reflection" | "sdk" | "developer">("reflection");
 
   useEffect(() => {
     if (sdkArch.specs.length > 0 && workflows.length === 0) {
-      setViewMode("sdk");
+      setViewMode("developer");
     }
   }, [sdkArch.specs.length, workflows.length]);
 
@@ -96,6 +102,16 @@ export function ArchitectureView() {
             }`}
           >
             SDK Projects{sdkArch.specs.length > 0 ? ` (${sdkArch.specs.length})` : ""}
+          </button>
+          <button
+            onClick={() => setViewMode("developer")}
+            className={`px-2.5 py-1 text-xs rounded transition-colors ${
+              viewMode === "developer"
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            Developer
           </button>
         </div>
         {viewMode === "reflection" ? (
@@ -218,13 +234,34 @@ export function ArchitectureView() {
             )}
           </div>
         </>
+      ) : viewMode === "sdk" ? (
+        <ErrorBoundary
+          componentName="SdkArchitecturePanel"
+          fallback={
+            <DeveloperPanelFallback panelName="SDK Architecture" onRetry={sdkArch.refresh} />
+          }
+        >
+          <SdkArchitecturePanel
+            specs={sdkArch.specs}
+            loading={sdkArch.loading}
+            error={sdkArch.error}
+            onRefresh={sdkArch.refresh}
+          />
+        </ErrorBoundary>
       ) : (
-        <SdkArchitecturePanel
-          specs={sdkArch.specs}
-          loading={sdkArch.loading}
-          error={sdkArch.error}
-          onRefresh={sdkArch.refresh}
-        />
+        <ErrorBoundary
+          componentName="DeveloperArchitecturePanel"
+          fallback={
+            <DeveloperPanelFallback panelName="Developer Architecture" onRetry={sdkArch.refresh} />
+          }
+        >
+          <DeveloperArchitecturePanel
+            specs={sdkArch.specs}
+            loading={sdkArch.loading}
+            error={sdkArch.error}
+            onRefresh={sdkArch.refresh}
+          />
+        </ErrorBoundary>
       )}
     </div>
   );
@@ -275,6 +312,34 @@ function EmptyState({ workflowName, onRebuild }: { workflowName: string; onRebui
   );
 }
 
+function DeveloperPanelFallback({
+  panelName,
+  onRetry,
+}: {
+  panelName: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center text-center space-y-3 p-6">
+      <AlertTriangle className="w-10 h-10 text-red-400/50" />
+      <div>
+        <h3 className="text-sm font-medium text-red-400">{panelName} failed to render</h3>
+        <p className="text-xs text-muted-foreground/60 mt-1 max-w-sm">
+          An error occurred while rendering this panel. This may be caused by malformed data in the
+          architecture spec.
+        </p>
+      </div>
+      <button
+        onClick={onRetry}
+        className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-muted hover:bg-muted/80 text-foreground rounded-md transition-colors"
+      >
+        <RefreshCw className="w-3.5 h-3.5" />
+        Retry
+      </button>
+    </div>
+  );
+}
+
 function SdkArchitecturePanel({
   specs,
   loading,
@@ -287,6 +352,9 @@ function SdkArchitecturePanel({
   onRefresh: () => void;
 }) {
   const [selectedProject, setSelectedProject] = useState(0);
+  const [selectedNode, setSelectedNode] = useState<
+    import("@/types/architecture").SdkArchitectureNode | null
+  >(null);
   const [discovering, setDiscovering] = useState(false);
 
   // When a user connects to an app, trigger discover-and-cache for its specs
@@ -409,10 +477,15 @@ function SdkArchitecturePanel({
               .map((node) => (
                 <div
                   key={node.id}
-                  className="flex items-center gap-2 px-2 py-1.5 bg-muted/50 rounded text-sm"
+                  onClick={() => setSelectedNode(selectedNode?.id === node.id ? null : node)}
+                  className={`flex items-center gap-2 px-2 py-1.5 rounded text-sm cursor-pointer transition-colors ${
+                    selectedNode?.id === node.id
+                      ? "bg-blue-500/15 border border-blue-500/30"
+                      : "bg-muted/50 hover:bg-muted"
+                  }`}
                 >
                   <span
-                    className={`w-2 h-2 rounded-full ${
+                    className={`w-2 h-2 rounded-full shrink-0 ${
                       node.status === "completed"
                         ? "bg-green-400"
                         : node.status === "in-progress"
@@ -422,10 +495,10 @@ function SdkArchitecturePanel({
                             : "bg-gray-400"
                     }`}
                   />
-                  <span className="flex-1">{node.label}</span>
+                  <span className="flex-1 truncate">{node.label}</span>
                   {node.priority && (
                     <span
-                      className={`text-[10px] px-1.5 py-0.5 rounded ${
+                      className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
                         node.priority === "critical"
                           ? "bg-red-500/20 text-red-400"
                           : node.priority === "high"
@@ -455,14 +528,176 @@ function SdkArchitecturePanel({
                 {project.nodes
                   .filter((n) => n.type === "pattern")
                   .map((node) => (
-                    <div key={node.id} className="px-2 py-1.5 bg-muted/50 rounded text-sm">
+                    <div
+                      key={node.id}
+                      onClick={() => setSelectedNode(selectedNode?.id === node.id ? null : node)}
+                      className={`px-2 py-1.5 rounded text-sm cursor-pointer transition-colors ${
+                        selectedNode?.id === node.id
+                          ? "bg-blue-500/15 border border-blue-500/30"
+                          : "bg-muted/50 hover:bg-muted"
+                      }`}
+                    >
                       {node.label}
+                      {node.category && (
+                        <span className="text-[10px] text-muted-foreground ml-1.5">
+                          {node.category}
+                        </span>
+                      )}
                     </div>
                   ))}
               </div>
             </>
           )}
         </div>
+
+        {/* Detail panel */}
+        {selectedNode && (
+          <div className="w-72 flex-shrink-0 border border-border/50 rounded-lg overflow-auto bg-card">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-border/50">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span
+                  className={`text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 ${
+                    selectedNode.type === "feature"
+                      ? "bg-blue-500/20 text-blue-400"
+                      : "bg-purple-500/20 text-purple-400"
+                  }`}
+                >
+                  {selectedNode.type}
+                </span>
+                <span className="text-sm font-medium truncate">{selectedNode.label}</span>
+              </div>
+              <button
+                onClick={() => setSelectedNode(null)}
+                className="p-0.5 rounded hover:bg-muted transition-colors shrink-0"
+              >
+                <X className="w-3.5 h-3.5 text-muted-foreground" />
+              </button>
+            </div>
+            <div className="p-3 space-y-3">
+              {selectedNode.description && (
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  {selectedNode.description}
+                </p>
+              )}
+
+              {selectedNode.status && (
+                <div className="flex items-center gap-2 text-xs">
+                  <span className="text-muted-foreground/60">Status</span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded ${
+                      selectedNode.status === "active"
+                        ? "bg-green-500/15 text-green-400"
+                        : selectedNode.status === "deprecated"
+                          ? "bg-red-500/15 text-red-400"
+                          : "bg-gray-500/15 text-gray-400"
+                    }`}
+                  >
+                    {selectedNode.status}
+                  </span>
+                  {selectedNode.priority && (
+                    <>
+                      <span className="text-muted-foreground/60">Priority</span>
+                      <span className="text-foreground">{selectedNode.priority}</span>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {selectedNode.entryPoints && selectedNode.entryPoints.length > 0 && (
+                <div>
+                  <div className="flex items-center gap-1 text-[10px] text-muted-foreground/60 uppercase tracking-wider mb-1">
+                    <FileCode className="w-3 h-3" />
+                    Entry Points
+                  </div>
+                  <div className="space-y-0.5">
+                    {selectedNode.entryPoints.map((ep, i) => (
+                      <div key={i} className="text-xs font-mono text-blue-400 truncate" title={ep}>
+                        {ep}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {selectedNode.techUsed && selectedNode.techUsed.length > 0 && (
+                <div>
+                  <div className="flex items-center gap-1 text-[10px] text-muted-foreground/60 uppercase tracking-wider mb-1">
+                    <Cpu className="w-3 h-3" />
+                    Tech Used
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {selectedNode.techUsed.map((t, i) => (
+                      <span
+                        key={i}
+                        className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground"
+                      >
+                        {t}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {selectedNode.usedBy && selectedNode.usedBy.length > 0 && (
+                <div>
+                  <div className="flex items-center gap-1 text-[10px] text-muted-foreground/60 uppercase tracking-wider mb-1">
+                    <ArrowRight className="w-3 h-3" />
+                    Used By
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {selectedNode.usedBy.map((f, i) => (
+                      <span
+                        key={i}
+                        className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400"
+                      >
+                        {f}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Related dependencies */}
+              {project.edges.filter(
+                (e) => e.source === selectedNode.id || e.target === selectedNode.id,
+              ).length > 0 && (
+                <div>
+                  <div className="text-[10px] text-muted-foreground/60 uppercase tracking-wider mb-1">
+                    Dependencies
+                  </div>
+                  <div className="space-y-0.5">
+                    {project.edges
+                      .filter((e) => e.source === selectedNode.id || e.target === selectedNode.id)
+                      .map((edge, i) => {
+                        const isSource = edge.source === selectedNode.id;
+                        const other = isSource
+                          ? edge.target.replace("feature:", "")
+                          : edge.source.replace("feature:", "");
+                        return (
+                          <div key={i} className="text-xs text-muted-foreground">
+                            {isSource ? (
+                              <>
+                                <span className="text-muted-foreground/60">{edge.type}</span>{" "}
+                                <span className="text-foreground">{other}</span>
+                              </>
+                            ) : (
+                              <>
+                                <span className="text-foreground">{other}</span>{" "}
+                                <span className="text-muted-foreground/60">{edge.type} this</span>
+                              </>
+                            )}
+                            {edge.label && (
+                              <span className="text-muted-foreground/40 ml-1">— {edge.label}</span>
+                            )}
+                          </div>
+                        );
+                      })}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Tech stack & directories */}
         <div className="w-64 flex-shrink-0 border border-border/50 rounded-lg overflow-auto p-3">

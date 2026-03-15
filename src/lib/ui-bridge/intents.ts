@@ -1,55 +1,32 @@
 // FILE: src/lib/ui-bridge/intents.ts
+import type { Intent } from "@qontinui/ui-bridge";
+
 /**
- * App-specific intent definitions for the UI Bridge.
- *
- * Intents represent composite user actions that span multiple steps.
- * They are registered with the backend via POST /ai/intents/register
- * at startup (not as React hooks).
+ * Application-level intents — named composite user actions that AI agents
+ * can discover and orchestrate. Registered at startup via the UI Bridge
+ * control API (POST /ai/intents/register).
  */
-
-export interface IntentParam {
-  type: string;
-  required?: boolean;
-  description?: string;
-  default?: unknown;
-}
-
-export interface Intent {
-  id: string;
-  name: string;
-  description: string;
-  tags?: string[];
-  params?: Record<string, IntentParam>;
-  handler?: string;
-}
-
 export const APP_INTENTS: Intent[] = [
-  // -------------------------------------------------------------------------
-  // Workflow execution
-  // -------------------------------------------------------------------------
   {
-    id: "run-workflow",
-    name: "Run Workflow",
+    id: "execute-workflow",
+    name: "Execute Workflow",
     description:
-      "Navigate to Execute tab, select a workflow by name, choose run mode (GUI or headless), and start execution. Optionally force GUI lock acquisition.",
-    tags: ["execution", "workflow", "run"],
+      "Run a workflow end-to-end: navigate to the Execute tab (gui-automation), " +
+      "select a workflow from the dropdown, optionally configure monitors and initial " +
+      "states, then click Start. The app navigates to the Active Dashboard to monitor " +
+      "execution in real-time. On completion it auto-navigates to Run Recap.",
+    tags: ["workflow", "execution", "run", "automation"],
     params: {
       workflowName: {
         type: "string",
         required: true,
-        description: "Name of the workflow to execute",
+        description: "Name of the saved workflow to execute",
       },
-      mode: {
-        type: "string",
-        required: false,
-        description: '"gui" or "headless"',
-        default: "headless",
-      },
-      forceGuiLock: {
+      navigateToActive: {
         type: "boolean",
         required: false,
-        description: "Force GUI lock acquisition",
-        default: false,
+        default: true,
+        description: "Whether to auto-navigate to the Active Dashboard after starting",
       },
     },
   },
@@ -57,207 +34,200 @@ export const APP_INTENTS: Intent[] = [
     id: "rerun-last-workflow",
     name: "Re-run Last Workflow",
     description:
-      "Re-execute the most recently completed workflow using its saved configuration. Navigates to active dashboard after starting.",
-    tags: ["execution", "workflow", "rerun"],
+      "Re-execute the most recently run workflow. Looks up the workflow by name " +
+      "in the database, or falls back to the cached inline workflow definition. " +
+      "Triggered via the 'Run Last Workflow' button on the Active Dashboard.",
+    tags: ["workflow", "execution", "rerun", "quick-action"],
+    params: {},
   },
-
-  // -------------------------------------------------------------------------
-  // Workflow building
-  // -------------------------------------------------------------------------
   {
-    id: "create-workflow",
-    name: "Create New Workflow",
+    id: "build-workflow",
+    name: "Build New Workflow",
     description:
-      "Navigate to the Workflow Builder tab to create a new automation workflow. Optionally provide a natural-language spec for AI generation.",
-    tags: ["build", "workflow", "create"],
+      "Create a new unified workflow: navigate to the Workflow Builder tab, " +
+      "add setup, verification, agentic, and completion steps using the step " +
+      "configuration panel. Optionally use AI generation (AiGenerateWorkflowModal) " +
+      "to scaffold from a natural language prompt. Save the workflow via the save dialog.",
+    tags: ["workflow", "builder", "create", "build"],
     params: {
-      spec: {
+      workflowName: {
         type: "string",
         required: false,
-        description: "Natural-language workflow specification for AI generation",
+        description: "Name for the new workflow",
+      },
+      prompt: {
+        type: "string",
+        required: false,
+        description: "Natural language prompt for AI workflow generation",
       },
     },
   },
   {
-    id: "edit-workflow",
-    name: "Edit Existing Workflow",
+    id: "generate-workflow-from-prompt",
+    name: "Generate Workflow from Prompt",
     description:
-      "Open a saved workflow in the Workflow Builder for editing. Navigate to Build > Workflows and load the workflow by name.",
-    tags: ["build", "workflow", "edit"],
+      "Open the Workflow Builder, click the AI Generate button to open " +
+      "AiGenerateWorkflowModal, enter a natural language description of the " +
+      "desired automation, configure generation settings (model, verification type), " +
+      "and generate a complete workflow definition automatically.",
+    tags: ["workflow", "ai", "generation", "prompt"],
     params: {
-      workflowName: { type: "string", required: true, description: "Name of the workflow to edit" },
-    },
-  },
-
-  // -------------------------------------------------------------------------
-  // Run inspection
-  // -------------------------------------------------------------------------
-  {
-    id: "inspect-run",
-    name: "Inspect Run Results",
-    description:
-      "Select a specific run from History, then navigate through its sub-tabs (Recap, Findings, Test Results, Traces, AI Output, Statistics) to inspect results.",
-    tags: ["observe", "run", "inspect"],
-    params: {
-      runId: {
+      prompt: {
         type: "string",
-        required: false,
-        description: "Task run ID to select. If omitted, uses the most recent run.",
-      },
-      tab: {
-        type: "string",
-        required: false,
-        description:
-          'Sub-tab to open: "run-recap", "run-findings", "run-tests", "run-traces", "run-ai-output", "run-statistics"',
-        default: "run-recap",
+        required: true,
+        description: "Natural language description of the workflow to generate",
       },
     },
   },
   {
-    id: "view-run-traces",
-    name: "View Run Traces",
+    id: "view-run-results",
+    name: "View Run Results",
     description:
-      "Navigate to the Traces sub-tab for a selected run to inspect the execution trace waterfall, span details, and performance insights.",
-    tags: ["observe", "traces", "performance"],
+      "Navigate to the Observe section to review a completed workflow run. " +
+      "Start at Run Recap for a summary, then drill into specific tabs: " +
+      "Actions (execution log), Image Recognition (visual matches), " +
+      "Findings (AI-detected issues), AI Output (full conversation), " +
+      "Statistics (performance metrics), or Traces (execution traces).",
+    tags: ["observe", "results", "recap", "review"],
     params: {
-      runId: {
-        type: "string",
-        required: false,
-        description: "Task run ID. If omitted, uses the currently selected run.",
-      },
-    },
-  },
-
-  // -------------------------------------------------------------------------
-  // Terminal management
-  // -------------------------------------------------------------------------
-  {
-    id: "open-terminal",
-    name: "Open Terminal Session",
-    description:
-      "Navigate to the Terminal tab and create a new terminal session. Optionally set a specific zone layout.",
-    tags: ["terminal", "session"],
-    params: {
-      layout: {
+      taskRunId: {
         type: "number",
         required: false,
-        description: "Zone layout preset (1-8)",
-        default: 1,
+        description: "Specific task run ID to view. If omitted, shows the most recent run.",
       },
     },
-  },
-  {
-    id: "approve-all-sessions",
-    name: "Approve All Waiting Sessions",
-    description:
-      "In the Terminal tab, approve all Claude Code sessions that are waiting for user input. Equivalent to Ctrl+Shift+Enter.",
-    tags: ["terminal", "approval", "batch"],
-  },
-  {
-    id: "broadcast-command",
-    name: "Broadcast Command to All Sessions",
-    description:
-      "In the Terminal tab, send a shell command to all active terminal sessions simultaneously via the batch operations bar.",
-    tags: ["terminal", "batch", "command"],
-    params: {
-      command: { type: "string", required: true, description: "Shell command to broadcast" },
-    },
-  },
-  {
-    id: "switch-terminal-layout",
-    name: "Switch Terminal Zone Layout",
-    description:
-      "Change the terminal zone layout preset. Supports 1 (single) through 8 (eight zones) presets, accessible via Ctrl+Shift+1-8.",
-    tags: ["terminal", "layout", "zones"],
-    params: {
-      preset: { type: "number", required: true, description: "Layout preset number (1-8)" },
-    },
-  },
-
-  // -------------------------------------------------------------------------
-  // Configuration
-  // -------------------------------------------------------------------------
-  {
-    id: "configure-ai-provider",
-    name: "Configure AI Provider",
-    description:
-      "Navigate to Settings > AI Providers to configure API keys and model selection for AI-powered features.",
-    tags: ["settings", "ai", "configuration"],
   },
   {
     id: "configure-log-sources",
     name: "Configure Log Sources",
     description:
-      "Navigate to Settings > Log Sources to add, remove, or modify global log source configurations for error monitoring.",
-    tags: ["settings", "logs", "configuration"],
-  },
-
-  // -------------------------------------------------------------------------
-  // Error monitoring
-  // -------------------------------------------------------------------------
-  {
-    id: "investigate-errors",
-    name: "Investigate Application Errors",
-    description:
-      "Navigate to the Error Monitor tab to review recent application errors from configured log sources. Errors can be auto-fixed or used to generate workflows.",
-    tags: ["errors", "monitoring", "debug"],
-  },
-
-  // -------------------------------------------------------------------------
-  // Finding management
-  // -------------------------------------------------------------------------
-  {
-    id: "manage-finding-categories",
-    name: "Manage Finding Categories",
-    description:
-      "Navigate to Configure > Finding Categories to create, reorder, show/hide, or reset finding category definitions used for workflow result classification.",
-    tags: ["configure", "findings", "categories"],
-  },
-
-  // -------------------------------------------------------------------------
-  // UI Bridge integration
-  // -------------------------------------------------------------------------
-  {
-    id: "discover-ui-elements",
-    name: "Discover UI Elements",
-    description:
-      "Navigate to Configure > UI Bridge to connect to an application instance and discover its interactive UI elements, states, and action targets for automation.",
-    tags: ["configure", "ui-bridge", "discovery"],
+      "Set up external log file monitoring: navigate to Settings > Log Sources " +
+      "to add, enable/disable, or remove log source entries. Each source specifies " +
+      "a file path, category, color, and tail line count. Sources are monitored " +
+      "during workflow execution for error detection.",
+    tags: ["configure", "logs", "monitoring", "settings"],
     params: {
-      appUrl: {
+      sourcePath: {
         type: "string",
         required: false,
-        description: "URL of the application to connect to for element discovery",
+        description: "File path of the log source to add",
+      },
+      category: {
+        type: "string",
+        required: false,
+        description: "Category for the log source (e.g., 'application', 'server')",
       },
     },
   },
-
-  // -------------------------------------------------------------------------
-  // Specs and AI chat
-  // -------------------------------------------------------------------------
   {
-    id: "create-spec",
-    name: "Create or Edit Spec",
+    id: "create-verification-check",
+    name: "Create Verification Check",
     description:
-      "Navigate to the Specs tab to view, create, or edit workflow specifications. Includes an AI chat panel for iterating on specs via natural language.",
-    tags: ["build", "specs", "ai"],
+      "Create a new verification check in the Library: navigate to the Library " +
+      "or Step Builders > Checks page, click Create, configure the check type " +
+      "(visual, text, DOM, API, etc.), set assertion conditions, and save. " +
+      "Checks can then be added to workflow verification steps.",
+    tags: ["check", "verification", "build", "library"],
     params: {
-      specName: {
+      checkName: {
         type: "string",
         required: false,
-        description: "Name of the spec to open. If omitted, shows the spec list.",
+        description: "Name for the new check",
+      },
+      checkType: {
+        type: "string",
+        required: false,
+        description: "Type of check (e.g., 'visual', 'text', 'dom', 'api')",
       },
     },
   },
-
-  // -------------------------------------------------------------------------
-  // Setup
-  // -------------------------------------------------------------------------
   {
-    id: "initial-setup",
-    name: "Run Initial Setup",
+    id: "queue-workflows",
+    name: "Queue Multiple Workflows",
     description:
-      "Walk through the setup wizard: Welcome, Projects, Processes, Dev Services, AI Provider, and Claude Sessions configuration.",
-    tags: ["setup", "onboarding", "wizard"],
+      "Navigate to the Workflow Queue tab to set up a sequence of workflows " +
+      "to run one after another. Add workflows from the saved library, " +
+      "reorder them, and start the queue. Each workflow runs to completion " +
+      "before the next begins.",
+    tags: ["workflow", "queue", "batch", "sequence"],
+    params: {
+      workflowNames: {
+        type: "string",
+        required: false,
+        description: "Comma-separated list of workflow names to queue",
+      },
+    },
+  },
+  {
+    id: "approve-workflow-gate",
+    name: "Approve Workflow Gate",
+    description:
+      "When a running workflow pauses at an approval gate, the Active Dashboard " +
+      "shows an ApprovalDialog. Review the gate context, optionally add a comment, " +
+      "and click Approve (or press Enter) to continue execution. " +
+      "Press Escape to dismiss the dialog temporarily (shows floating badge).",
+    tags: ["approval", "gate", "execution", "active-dashboard"],
+    params: {
+      comment: {
+        type: "string",
+        required: false,
+        description: "Optional comment to include with the approval",
+      },
+    },
+  },
+  {
+    id: "generate-ui-bridge-hooks",
+    name: "Generate UI Bridge Hooks",
+    description:
+      "Navigate to Configure > UI Bridge, open the Hook Generation panel, " +
+      "select which hook categories to generate (route awareness, state machine, " +
+      "components, keyboard shortcuts, annotations, intents), optionally enable " +
+      "architecture spec generation, then click Generate. The AI analyzes the " +
+      "target app's source code and produces hook files. Preview the generated " +
+      "files and click Apply to write them to the project.",
+    tags: ["ui-bridge", "hooks", "generation", "ai", "configure"],
+    params: {
+      categories: {
+        type: "string",
+        required: false,
+        description:
+          "Comma-separated hook categories to generate (e.g., 'route-awareness,state-machine,keyboard-shortcuts')",
+      },
+      includeArchitectureSpec: {
+        type: "boolean",
+        required: false,
+        default: false,
+        description: "Whether to also generate an architecture specification JSON",
+      },
+    },
+  },
+  {
+    id: "inspect-errors",
+    name: "Inspect Error Monitor",
+    description:
+      "Navigate to the Error Monitor tab in the Observe section to review " +
+      "application errors detected from configured log sources. Errors are " +
+      "grouped by pattern and source, with severity levels, timestamps, and " +
+      "occurrence counts. Use this to diagnose issues found during or after " +
+      "workflow execution.",
+    tags: ["errors", "monitor", "observe", "debugging", "logs"],
+    params: {
+      severity: {
+        type: "string",
+        required: false,
+        description: "Filter by severity level (e.g., 'error', 'warning', 'critical')",
+      },
+    },
+  },
+  {
+    id: "manage-processes",
+    name: "Manage Spawned Processes",
+    description:
+      "Navigate to the Process Manager tab to view, monitor, and control " +
+      "child processes spawned by the runner. Shows process status, resource " +
+      "usage, and provides controls to stop or restart processes. Useful for " +
+      "managing long-running automation tasks and debugging process issues.",
+    tags: ["processes", "system", "management", "monitor"],
+    params: {},
   },
 ];

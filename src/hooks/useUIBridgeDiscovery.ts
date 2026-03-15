@@ -182,124 +182,133 @@ export function useUIBridgeDiscovery(
     }
   }, [cooccurrenceData, showToast]);
 
-  const saveConfig = useCallback(async (
-    nameOverride?: string,
-    discoveryResultOverride?: FingerprintDiscoveryResult,
-  ): Promise<string | null> => {
-    if (!cooccurrenceData) {
-      showToast?.("No co-occurrence data available", "error");
-      return null;
-    }
-    const saveName = nameOverride || configName;
-    if (!saveName.trim()) {
-      showToast?.("Config name is required", "error");
-      return null;
-    }
-    const result = discoveryResultOverride || discoveryResult;
-    if (!result) {
-      showToast?.("Run discovery first", "error");
-      return null;
-    }
+  const saveConfig = useCallback(
+    async (
+      nameOverride?: string,
+      discoveryResultOverride?: FingerprintDiscoveryResult,
+    ): Promise<string | null> => {
+      if (!cooccurrenceData) {
+        showToast?.("No co-occurrence data available", "error");
+        return null;
+      }
+      const saveName = nameOverride || configName;
+      if (!saveName.trim()) {
+        showToast?.("Config name is required", "error");
+        return null;
+      }
+      const result = discoveryResultOverride || discoveryResult;
+      if (!result) {
+        showToast?.("Run discovery first", "error");
+        return null;
+      }
 
-    setIsSaving(true);
-    try {
-      const config = await smConfig.createConfig({
-        name: saveName.trim(),
-        description: `Discovered from ${cooccurrenceData.presenceMatrix?.length ?? 0} captures via ${dataSource || "unknown"}`,
-      });
+      setIsSaving(true);
+      try {
+        const config = await smConfig.createConfig({
+          name: saveName.trim(),
+          description: `Discovered from ${cooccurrenceData.presenceMatrix?.length ?? 0} captures via ${dataSource || "unknown"}`,
+        });
 
-      // Create states via direct Tauri IPC to avoid React state batching issue.
-      // createConfig sets activeConfig asynchronously, so calling smConfig.createState
-      // immediately would fail because activeConfig hasn't updated yet.
-      const fpDetails = cooccurrenceData.fingerprintDetails ?? {};
-      for (const state of result.states) {
-        // Build element labels and positions from fingerprint details so they
-        // survive across sessions (stored in extra_metadata).
-        const elementLabels: Record<string, string> = {};
-        const elementPositions: Record<string, { top: number; left: number }> = {};
-        const elementTags: Record<string, { tagName: string; role: string; zone: string }> = {};
-        for (const eid of state.elementIds) {
-          const fp = fpDetails[eid];
-          if (fp) {
-            elementLabels[eid] = fp.accessibleName || fp.role || fp.tagName || eid.slice(0, 12);
-            if (fp.relativePosition) {
-              elementPositions[eid] = fp.relativePosition;
+        // Create states via direct Tauri IPC to avoid React state batching issue.
+        // createConfig sets activeConfig asynchronously, so calling smConfig.createState
+        // immediately would fail because activeConfig hasn't updated yet.
+        const fpDetails = cooccurrenceData.fingerprintDetails ?? {};
+        for (const state of result.states) {
+          // Build element labels and positions from fingerprint details so they
+          // survive across sessions (stored in extra_metadata).
+          const elementLabels: Record<string, string> = {};
+          const elementPositions: Record<string, { top: number; left: number }> = {};
+          const elementTags: Record<string, { tagName: string; role: string; zone: string }> = {};
+          for (const eid of state.elementIds) {
+            const fp = fpDetails[eid];
+            if (fp) {
+              elementLabels[eid] =
+                fp.accessibleName || fp.role || fp.tagName || eid.slice(0, 12);
+              if (fp.relativePosition) {
+                elementPositions[eid] = fp.relativePosition;
+              }
+              elementTags[eid] = {
+                tagName: fp.tagName || "",
+                role: fp.role || "",
+                zone: fp.positionZone || "",
+              };
             }
-            elementTags[eid] = {
-              tagName: fp.tagName || "",
-              role: fp.role || "",
-              zone: fp.positionZone || "",
-            };
+          }
+
+          const request: StateMachineStateCreate = {
+            state_id: state.stateId,
+            name: state.name,
+            description: state.landmarkContext || "",
+            element_ids: state.elementIds,
+            confidence: state.confidence,
+            extra_metadata: {
+              elementLabels,
+              elementPositions,
+              elementTags,
+            },
+          };
+          try {
+            await invoke<StateMachineState>("sm_create_state", {
+              configId: config.id,
+              request,
+            });
+          } catch (stateErr) {
+            console.warn(
+              `[useUIBridgeDiscovery] Failed to create state "${state.name}":`,
+              stateErr,
+            );
           }
         }
 
-        const request: StateMachineStateCreate = {
-          state_id: state.stateId,
-          name: state.name,
-          description: state.landmarkContext || "",
-          element_ids: state.elementIds,
-          confidence: state.confidence,
-          extra_metadata: {
-            elementLabels,
-            elementPositions,
-            elementTags,
-          },
-        };
-        try {
-          await invoke<StateMachineState>("sm_create_state", {
-            configId: config.id,
-            request,
-          });
-        } catch (stateErr) {
-          console.warn(`[useUIBridgeDiscovery] Failed to create state "${state.name}":`, stateErr);
+        showToast?.(
+          `Saved config "${saveName.trim()}" with ${result.states.length} states`,
+          "success",
+        );
+
+        const savedConfigId = config.id;
+
+        // Save thumbnails to database (survives across sessions).
+        // Thumbnails may be in cooccurrenceData.elementThumbnails (if exploration just finished)
+        // or in the separate localStorage key (if data was loaded from persistence without thumbnails).
+        let thumbnails = cooccurrenceData.elementThumbnails;
+        if (!thumbnails || Object.keys(thumbnails).length === 0) {
+          try {
+            const stored = localStorage.getItem("qontinui-runner-sm-thumbnails");
+            if (stored) thumbnails = JSON.parse(stored);
+          } catch {
+            /* */
+          }
         }
-      }
-
-      showToast?.(
-        `Saved config "${saveName.trim()}" with ${result.states.length} states`,
-        "success",
-      );
-
-      const savedConfigId = config.id;
-
-      // Save thumbnails to database (survives across sessions).
-      // Thumbnails may be in cooccurrenceData.elementThumbnails (if exploration just finished)
-      // or in the separate localStorage key (if data was loaded from persistence without thumbnails).
-      let thumbnails = cooccurrenceData.elementThumbnails;
-      if (!thumbnails || Object.keys(thumbnails).length === 0) {
-        try {
-          const stored = localStorage.getItem("qontinui-runner-sm-thumbnails");
-          if (stored) thumbnails = JSON.parse(stored);
-        } catch { /* */ }
-      }
-      if (thumbnails && Object.keys(thumbnails).length > 0) {
-        try {
-          await invoke<number>("sm_save_thumbnails", {
-            configId: savedConfigId,
-            thumbnails,
-          });
-        } catch (err) {
-          console.warn("[useUIBridgeDiscovery] Failed to save thumbnails:", err);
+        if (thumbnails && Object.keys(thumbnails).length > 0) {
+          try {
+            await invoke<number>("sm_save_thumbnails", {
+              configId: savedConfigId,
+              thumbnails,
+            });
+          } catch (err) {
+            console.warn("[useUIBridgeDiscovery] Failed to save thumbnails:", err);
+          }
         }
+
+        // Clear discovery state
+        setCooccurrenceDataState(null);
+        setDataSource(null);
+        setDiscoveryResult(null);
+        setConfigName("");
+        clearPersistedState();
+
+        return savedConfigId;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to save";
+        showToast?.(message, "error");
+        console.warn("[useUIBridgeDiscovery]", message);
+        return null;
+      } finally {
+        setIsSaving(false);
       }
-
-      // Clear discovery state
-      setCooccurrenceDataState(null);
-      setDataSource(null);
-      setDiscoveryResult(null);
-      setConfigName("");
-      clearPersistedState();
-
-      return savedConfigId;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to save";
-      showToast?.(message, "error");
-      console.warn("[useUIBridgeDiscovery]", message);
-      return null;
-    } finally {
-      setIsSaving(false);
-    }
-  }, [cooccurrenceData, dataSource, configName, discoveryResult, smConfig, showToast]);
+    },
+    [cooccurrenceData, dataSource, configName, discoveryResult, smConfig, showToast],
+  );
 
   const reset = useCallback(() => {
     setCooccurrenceDataState(null);

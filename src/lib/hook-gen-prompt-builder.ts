@@ -655,19 +655,168 @@ ${existingCode}
 // Architecture Spec Prompt (delegates to spec-prompt-builder)
 // =============================================================================
 
-import { SPEC_CREATION_INSTRUCTIONS, SPEC_MERGE_INSTRUCTIONS } from "./spec-prompt-builder";
+// Architecture spec format — describes tech stack, features, patterns, and dependencies.
+// This is NOT the page spec format (groups + assertions). It's a project-level
+// architecture description used by the Architecture page graph visualization.
+const ARCHITECTURE_SPEC_FORMAT = `
+# Architecture Spec Generation
+
+Generate a project architecture spec in JSON format. This spec describes the tech stack,
+features, patterns, and dependencies of the project — used for architecture visualization
+and AI project understanding.
+
+**IMPORTANT: Do NOT use file-writing tools. Output the spec as a single JSON code block
+in your text response. The output will be parsed by a script.**
+
+## Read the Source Code First
+
+Explore the codebase to understand:
+1. **Tech stack** — frameworks, libraries, languages, build tools, databases
+2. **Features/modules** — major functional areas of the application
+3. **Directory structure** — key directories and their purposes
+4. **Architectural patterns** — state management, routing, API patterns, etc.
+5. **Dependencies between features** — which features depend on, extend, or use others
+6. **Agentic patterns** — AI/LLM integration, feedback loops, orchestrators, autonomous agents
+
+Output brief progress notes as you explore.
+
+## JSON Schema
+
+Output a single \`\`\`json code block with this structure:
+
+\`\`\`json
+{
+  "projectName": "My Project",
+  "description": "Brief description of the project",
+  "techStack": [
+    {
+      "name": "React",
+      "category": "frontend | backend | database | build | testing | styling | state | routing | other",
+      "version": "18.2.0",
+      "purpose": "UI component framework"
+    }
+  ],
+  "features": [
+    {
+      "id": "feature-id",
+      "name": "Feature Name",
+      "description": "What this feature does",
+      "status": "active | planned | deprecated",
+      "priority": "core | important | nice-to-have",
+      "entryPoints": ["src/pages/FeaturePage.tsx"],
+      "techUsed": ["React", "Redux"]
+    }
+  ],
+  "patterns": [
+    {
+      "id": "pattern-id",
+      "name": "Pattern Name",
+      "description": "Description of the architectural pattern",
+      "category": "state-management | routing | api | auth | error-handling | other",
+      "usedBy": ["feature-id-1", "feature-id-2"]
+    }
+  ],
+  "dependencies": [
+    {
+      "featureId": "feature-a",
+      "dependsOn": "feature-b",
+      "type": "requires | extends | uses",
+      "description": "Why this dependency exists"
+    }
+  ],
+  "directories": [
+    {
+      "path": "src/components",
+      "purpose": "Shared React components",
+      "required": true
+    }
+  ],
+  "constraints": [
+    {
+      "id": "constraint-id",
+      "description": "Important constraint or rule",
+      "category": "performance | security | compatibility | convention"
+    }
+  ],
+  "agenticStructure": {
+    "agents": [
+      {
+        "id": "agent-id",
+        "name": "Agent Name",
+        "role": "orchestrator | executor | analyzer | session | monitor",
+        "description": "What this agent does and what authority it has",
+        "parentAgent": "parent-agent-id (optional, for nesting)",
+        "capabilities": ["capability-1", "capability-2"],
+        "delegatesTo": ["other-agent-id"],
+        "triggers": ["what-activates-this-agent"],
+        "decisionAuthority": ["what-decisions-this-agent-makes-autonomously"]
+      }
+    ],
+    "feedbackLoops": [
+      {
+        "id": "loop-id",
+        "name": "Loop Name",
+        "description": "What cycles through this loop and why",
+        "agents": ["agent-id-1", "agent-id-2"],
+        "exitCondition": "When does the loop stop",
+        "type": "inner | outer | cross"
+      }
+    ],
+    "delegationChains": [
+      {
+        "from": "agent-id",
+        "to": "agent-id",
+        "via": "HTTP API | IPC | subprocess | direct call",
+        "description": "How and why this delegation happens"
+      }
+    ]
+  }
+}
+\`\`\`
+
+## Agentic Structure Discovery
+
+**If the project has AI/LLM integration or autonomous agents, populate the \`agenticStructure\` field.**
+Skip this field entirely if the project has no agentic patterns.
+
+Look for these patterns:
+- **Retry/feedback loops** — \`while !success\`, iteration with max_iterations, verify-then-fix cycles
+- **AI/LLM integration** — subprocess spawning of AI tools (Claude, GPT), API calls to LLM providers
+- **Orchestrator patterns** — components that manage other components' lifecycles or coordinate multi-step processes
+- **Verification authorities** — components that determine pass/fail and control whether a loop continues
+- **Delegation chains** — HTTP calls between services, IPC between processes, subprocess spawning
+- **Event-driven decisions** — event handlers that trigger different autonomous behavior paths
+- **Error monitors** — systems that detect errors and autonomously trigger fixes
+
+For each agent, clearly identify:
+- What **role** it plays (orchestrator controls others, executor does work, analyzer examines results, session manages AI conversations, monitor watches for events)
+- What **decisions** it makes autonomously (vs. what it delegates)
+- What **triggers** activate it
+- What it **delegates to** other agents
+
+## Quality Rules
+
+1. **Only include things found in actual source code.** Do not guess or fabricate.
+2. **Use real names** — actual package names, real directory paths, real component names.
+3. **Features should be functional areas**, not individual files. Group related code into features.
+4. **Tech stack should include all significant dependencies** from package.json, Cargo.toml, pyproject.toml, etc.
+5. **Dependencies should reflect real relationships** — if feature A imports from feature B, that's a dependency.
+6. **Patterns should describe actual patterns in use**, not aspirational ones.
+7. **Every feature needs a unique \`id\`** — use kebab-case (e.g., "workflow-builder", "terminal-page").
+`.trim();
 
 /**
  * Build an AI prompt for generating an architecture spec for the project.
- * Delegates to the canonical SPEC_CREATION_INSTRUCTIONS and
- * appends framework context.
+ * Generates the architecture format (techStack/features/patterns/dependencies),
+ * NOT the page spec format (groups/assertions).
  */
 export function buildArchitectureSpecPrompt(analysis: ProjectAnalysisForHooks): string {
-  return `${SPEC_CREATION_INSTRUCTIONS}
+  return `${ARCHITECTURE_SPEC_FORMAT}
 
 ---
 
-Create a comprehensive architecture spec for this project. Read the source code first, then generate a complete JSON spec.
+Create a comprehensive architecture spec for this project. Read the source code first,
+then generate a complete JSON spec.
 
 Framework detected: **${analysis.framework}**
 Project path: \`${analysis.project_path}\``;
@@ -680,17 +829,20 @@ export function buildArchitectureSpecRegenPrompt(
   analysis: ProjectAnalysisForHooks,
   existingSpec: string,
 ): string {
-  return `${SPEC_CREATION_INSTRUCTIONS}
+  return `${ARCHITECTURE_SPEC_FORMAT}
 
 ---
 
-${SPEC_MERGE_INSTRUCTIONS}
+## Updating an Existing Architecture Spec
 
----
+You are UPDATING an existing spec. The current spec is below. Read the source code and:
+1. **Keep** features/tech/patterns that still exist in the code
+2. **Add** new features/tech/patterns you discover
+3. **Remove** items no longer in the codebase
+4. **Enhance** descriptions with more detail where possible
+5. **Preserve feature IDs** for items that haven't changed
 
-## Current Architecture Spec to Merge With
-
-### Raw JSON (preserve feature IDs and enhance detail)
+### Existing Spec:
 
 \`\`\`json
 ${existingSpec}
@@ -698,7 +850,7 @@ ${existingSpec}
 
 ---
 
-Update this architecture spec by reading the current source code and merging improvements.
+Update this architecture spec by reading the current source code.
 
 Framework detected: **${analysis.framework}**
 Project path: \`${analysis.project_path}\``;

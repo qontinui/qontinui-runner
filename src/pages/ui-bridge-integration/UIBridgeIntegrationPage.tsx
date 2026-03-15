@@ -27,7 +27,7 @@ export function UIBridgeIntegrationPage() {
       <SourceIntegrationPanel initialProjectPath={selectedProjectPath} />
 
       {/* Discovery — scan for running apps */}
-      <DiscoveryPanel onSelectApp={handleSelectApp} />
+      <DiscoveryPanel onSelectApp={handleSelectApp} selectedProjectPath={selectedProjectPath} />
     </div>
   );
 }

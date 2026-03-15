@@ -38,11 +38,10 @@ export interface UIBridgeHooksProps {
 }
 
 // -------------------------------------------------------------------------
-// Main navigation tab groups (static, defined at module level to avoid
-// re-allocation on every render)
+// Main navigation tab groups — aligned with RunnerPageContext sections.
 // -------------------------------------------------------------------------
 const TAB_GROUPS = {
-  run: ["gui-automation", "workflow-queue", "active", "terminal"],
+  run: ["gui-automation", "workflow-queue", "active"],
   observe: [
     "runs",
     "history",
@@ -61,8 +60,6 @@ const TAB_GROUPS = {
     "unified-workflow-builder",
     "step-builders",
     "library",
-    "state-machine",
-    "specs",
     "capture",
     "check-builder",
     "check-group-builder",
@@ -71,14 +68,8 @@ const TAB_GROUPS = {
     "context-builder",
     "playwright-test-builder",
   ],
-  configure: [
-    "config-findings",
-    "config-hooks",
-    "config-ui-bridge",
-    "config-log-sources",
-    "triggers",
-    "tasks",
-  ],
+  configure: ["config-findings", "config-hooks", "config-log-sources", "triggers", "tasks"],
+  tools: ["terminal", "specs", "state-machine", "generator-eval", "config-ui-bridge"],
   system: [
     "settings",
     "settings-account",
@@ -102,9 +93,18 @@ const TAB_GROUPS = {
     "processes",
     "reflection",
     "architecture",
-    "generator-eval",
   ],
 } satisfies Record<string, readonly string[]>;
+
+/** All section state IDs — used as fromStates for cross-section transitions. */
+const ANY_SECTION = [
+  "section-run",
+  "section-observe",
+  "section-build",
+  "section-configure",
+  "section-tools",
+  "section-system",
+] as const;
 
 export function UIBridgeHooks({
   activeTab,
@@ -121,14 +121,14 @@ export function UIBridgeHooks({
   // -------------------------------------------------------------------------
 
   const routeInfo = useMemo(() => {
-    // Derive a pseudo-route from the active tab ID
-    const section = activeTab.startsWith("settings")
-      ? "settings"
-      : activeTab.startsWith("run-")
-        ? "observe"
-        : activeTab.startsWith("config-")
-          ? "configure"
-          : undefined;
+    // Derive section from TAB_GROUPS
+    let section: string | undefined;
+    for (const [group, tabs] of Object.entries(TAB_GROUPS)) {
+      if (tabs.includes(activeTab) || (group === "system" && activeTab.startsWith("settings"))) {
+        section = group;
+        break;
+      }
+    }
 
     return {
       pattern: `/${activeTab}`,
@@ -229,7 +229,10 @@ export function UIBridgeHooks({
     states: ["execution-active", "execution-idle"],
   });
 
-  // Register a UI state for each active section
+  // -------------------------------------------------------------------------
+  // Section states — one for each navigation section
+  // -------------------------------------------------------------------------
+
   useUIState({
     id: "section-run",
     name: "Run Section Active",
@@ -259,9 +262,16 @@ export function UIBridgeHooks({
   });
 
   useUIState({
+    id: "section-tools",
+    name: "Tools Section Active",
+    activeWhen: () => TAB_GROUPS.tools.includes(activeTab),
+    group: "nav-section",
+  });
+
+  useUIState({
     id: "section-system",
     name: "System Section Active",
-    activeWhen: () => TAB_GROUPS.system.includes(activeTab),
+    activeWhen: () => TAB_GROUPS.system.includes(activeTab) || activeTab.startsWith("settings"),
     group: "nav-section",
   });
 
@@ -273,6 +283,7 @@ export function UIBridgeHooks({
       "section-observe",
       "section-build",
       "section-configure",
+      "section-tools",
       "section-system",
     ],
   });
@@ -337,10 +348,88 @@ export function UIBridgeHooks({
     group: "active-tab",
   });
 
+  useUIState({
+    id: "tab-library",
+    name: "Library Tab",
+    activeWhen: () => activeTab === "library",
+    group: "active-tab",
+  });
+
+  useUIState({
+    id: "tab-workflow-queue",
+    name: "Workflow Queue Tab",
+    activeWhen: () => activeTab === "workflow-queue",
+    group: "active-tab",
+  });
+
+  useUIState({
+    id: "tab-capture",
+    name: "Capture Tab",
+    activeWhen: () => activeTab === "capture",
+    group: "active-tab",
+  });
+
+  useUIState({
+    id: "tab-processes",
+    name: "Process Manager Tab",
+    activeWhen: () => activeTab === "processes",
+    group: "active-tab",
+  });
+
+  useUIState({
+    id: "tab-reflection",
+    name: "Reflection Dashboard Tab",
+    activeWhen: () => activeTab === "reflection",
+    group: "active-tab",
+  });
+
+  useUIState({
+    id: "tab-run-recap",
+    name: "Run Recap Tab",
+    activeWhen: () => activeTab === "run-recap",
+    group: "active-tab",
+  });
+
+  useUIState({
+    id: "tab-run-ai-output",
+    name: "AI Output Tab",
+    activeWhen: () => activeTab === "run-ai-output",
+    group: "active-tab",
+  });
+
+  useUIState({
+    id: "tab-state-machine",
+    name: "UI Bridge State Machine Tab",
+    activeWhen: () => activeTab === "state-machine",
+    group: "active-tab",
+  });
+
+  useUIState({
+    id: "tab-architecture",
+    name: "Architecture View Tab",
+    activeWhen: () => activeTab === "architecture",
+    group: "active-tab",
+  });
+
+  useUIState({
+    id: "tab-config-ui-bridge",
+    name: "UI Bridge Integration Tab",
+    activeWhen: () => activeTab === "config-ui-bridge",
+    group: "active-tab",
+  });
+
+  useUIState({
+    id: "tab-generator-eval",
+    name: "Generator Eval Tab",
+    activeWhen: () => activeTab === "generator-eval",
+    group: "active-tab",
+  });
+
   // -------------------------------------------------------------------------
   // 2. Transitions
   // -------------------------------------------------------------------------
 
+  // Modal open/close transitions
   useUITransition({
     id: "open-action-modal",
     name: "Open Action Detail Modal",
@@ -374,6 +463,22 @@ export function UIBridgeHooks({
   });
 
   useUITransition({
+    id: "open-log-source-picker",
+    name: "Open Log Source Picker",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["log-source-picker-modal"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "close-log-source-picker",
+    name: "Close Log Source Picker",
+    fromStates: ["log-source-picker-modal"],
+    activateStates: [],
+    exitStates: ["log-source-picker-modal"],
+  });
+
+  useUITransition({
     id: "toggle-sidebar",
     name: "Toggle Sidebar",
     fromStates: ["sidebar-collapsed", "sidebar-expanded"],
@@ -384,13 +489,7 @@ export function UIBridgeHooks({
   useUITransition({
     id: "open-tutorial",
     name: "Open Tutorial Overlay",
-    fromStates: [
-      "section-run",
-      "section-observe",
-      "section-build",
-      "section-configure",
-      "section-system",
-    ],
+    fromStates: [...ANY_SECTION],
     activateStates: ["tutorial-overlay"],
     exitStates: [],
   });
@@ -420,34 +519,6 @@ export function UIBridgeHooks({
   });
 
   useUITransition({
-    id: "navigate-to-terminal",
-    name: "Navigate to Terminal",
-    fromStates: [
-      "section-run",
-      "section-observe",
-      "section-build",
-      "section-configure",
-      "section-system",
-    ],
-    activateStates: ["tab-terminal"],
-    exitStates: [],
-  });
-
-  useUITransition({
-    id: "navigate-to-active-dashboard",
-    name: "Navigate to Active Dashboard",
-    fromStates: [
-      "section-run",
-      "section-observe",
-      "section-build",
-      "section-configure",
-      "section-system",
-    ],
-    activateStates: ["tab-active-dashboard"],
-    exitStates: [],
-  });
-
-  useUITransition({
     id: "open-workflow-save-dialog",
     name: "Open Workflow Save Dialog",
     fromStates: ["tab-workflow-builder"],
@@ -461,6 +532,127 @@ export function UIBridgeHooks({
     fromStates: ["workflow-save-dialog"],
     activateStates: [],
     exitStates: ["workflow-save-dialog"],
+  });
+
+  // Navigation transitions
+  useUITransition({
+    id: "navigate-to-terminal",
+    name: "Navigate to Terminal",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-terminal"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-active-dashboard",
+    name: "Navigate to Active Dashboard",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-active-dashboard"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-gui-automation",
+    name: "Navigate to Execute Tab",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-gui-automation"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-workflow-builder",
+    name: "Navigate to Workflow Builder",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-workflow-builder"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-history",
+    name: "Navigate to History",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-history"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-library",
+    name: "Navigate to Library",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-library"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-run-recap",
+    name: "Navigate to Run Recap",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-run-recap"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-specs",
+    name: "Navigate to Specs",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-specs"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-error-monitor",
+    name: "Navigate to Error Monitor",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-error-monitor"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-settings",
+    name: "Navigate to Settings",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-settings"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-state-machine",
+    name: "Navigate to UI Bridge State Machine",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-state-machine"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-config-ui-bridge",
+    name: "Navigate to UI Bridge Integration",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-config-ui-bridge"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-architecture",
+    name: "Navigate to Architecture View",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-architecture"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-processes",
+    name: "Navigate to Process Manager",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-processes"],
+    exitStates: [],
+  });
+
+  useUITransition({
+    id: "navigate-to-workflow-queue",
+    name: "Navigate to Workflow Queue",
+    fromStates: [...ANY_SECTION],
+    activateStates: ["tab-workflow-queue"],
+    exitStates: [],
   });
 
   // -------------------------------------------------------------------------
@@ -733,12 +925,17 @@ export function UIBridgeHooks({
         scope: "active-dashboard",
         category: "Widget Selection",
       },
-
       {
         combo: "Escape",
         description: "Dismiss completion summary or shortcuts modal",
         scope: "active-dashboard",
         category: "Actions",
+      },
+      {
+        combo: "Enter",
+        description: "Approve first waiting approval request",
+        scope: "active-dashboard",
+        category: "Approval",
       },
 
       // ---- Multi-run bar shortcuts ----
@@ -758,6 +955,68 @@ export function UIBridgeHooks({
         combo: "Ctrl+`",
         description: "Cycle to next active run (alt)",
         scope: "active-runs",
+        category: "Navigation",
+      },
+      {
+        combo: "ArrowLeft",
+        description: "Select previous run",
+        scope: "active-runs",
+        category: "Navigation",
+      },
+      {
+        combo: "ArrowRight",
+        description: "Select next run",
+        scope: "active-runs",
+        category: "Navigation",
+      },
+      {
+        combo: "Home",
+        description: "Jump to first run",
+        scope: "active-runs",
+        category: "Navigation",
+      },
+      {
+        combo: "End",
+        description: "Jump to last run",
+        scope: "active-runs",
+        category: "Navigation",
+      },
+      {
+        combo: "1-9",
+        description: "Quick select run by position",
+        scope: "active-runs",
+        category: "Navigation",
+      },
+
+      // ---- Sidebar navigation shortcuts ----
+      {
+        combo: "ArrowDown",
+        description: "Navigate to next sidebar item",
+        scope: "sidebar",
+        category: "Navigation",
+      },
+      {
+        combo: "ArrowUp",
+        description: "Navigate to previous sidebar item",
+        scope: "sidebar",
+        category: "Navigation",
+      },
+      {
+        combo: "ArrowRight",
+        description: "Expand sidebar item or open flyout",
+        scope: "sidebar",
+        category: "Navigation",
+      },
+      {
+        combo: "ArrowLeft",
+        description: "Collapse sidebar item or close flyout",
+        scope: "sidebar",
+        category: "Navigation",
+      },
+      {
+        combo: "Enter",
+        description: "Activate selected sidebar item",
+        scope: "sidebar",
         category: "Navigation",
       },
 
@@ -793,6 +1052,32 @@ export function UIBridgeHooks({
         description: "Focus HTML search input",
         scope: "html-viewer",
         category: "Search",
+      },
+
+      // ---- Command Palette shortcuts ----
+      {
+        combo: "ArrowDown",
+        description: "Select next command",
+        scope: "command-palette",
+        category: "Navigation",
+      },
+      {
+        combo: "ArrowUp",
+        description: "Select previous command",
+        scope: "command-palette",
+        category: "Navigation",
+      },
+      {
+        combo: "Enter",
+        description: "Execute selected command",
+        scope: "command-palette",
+        category: "Actions",
+      },
+      {
+        combo: "Escape",
+        description: "Close command palette",
+        scope: "command-palette",
+        category: "Actions",
       },
     ],
     [],

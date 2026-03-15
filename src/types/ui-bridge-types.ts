@@ -153,7 +153,7 @@ export interface ExternalElement {
   _discovered?: boolean;
 
   // Category
-  category?: 'interactive' | 'content' | 'media';
+  category?: "interactive" | "content" | "media";
 
   // Media metadata (for media elements)
   mediaMetadata?: {

@@ -1148,7 +1148,7 @@ pub(crate) async fn fetch_existing_specs() -> String {
 
     let self_base = crate::mcp::types::get_self_base_url_from_env();
 
-    // Fetch cached external app specs
+    // Fetch cached external app specs — separate architecture specs from page specs
     match client
         .get(format!("{}/ui-bridge/sdk/cached-specs", self_base))
         .send()
@@ -1157,7 +1157,65 @@ pub(crate) async fn fetch_existing_specs() -> String {
         Ok(resp) if resp.status().is_success() => {
             if let Ok(body) = resp.text().await {
                 if body.len() > 5 {
-                    specs_parts.push(format!("### External App Specs\n{}", body));
+                    // Parse the response to separate architecture specs from page specs
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                        let specs_array = parsed
+                            .get("data")
+                            .and_then(|d| d.as_array())
+                            .or_else(|| parsed.as_array());
+
+                        if let Some(specs) = specs_array {
+                            let mut arch_parts: Vec<String> = Vec::new();
+                            let mut page_specs: Vec<&serde_json::Value> = Vec::new();
+
+                            for spec in specs {
+                                let spec_json_str = spec.get("spec_json").and_then(|v| v.as_str());
+                                let is_arch = spec_json_str
+                                    .map(crate::spec_utils::is_architecture_spec_str)
+                                    .unwrap_or(false);
+
+                                if is_arch {
+                                    if let Some(s) = spec_json_str {
+                                        if let Ok(parsed_spec) =
+                                            serde_json::from_str::<serde_json::Value>(s)
+                                        {
+                                            let project_name = spec
+                                                .get("app_name")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("unknown");
+                                            arch_parts.push(
+                                                crate::spec_utils::format_architecture_markdown(
+                                                    &parsed_spec,
+                                                    project_name,
+                                                ),
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    page_specs.push(spec);
+                                }
+                            }
+
+                            // Add architecture specs section
+                            if !arch_parts.is_empty() {
+                                specs_parts.push(format!(
+                                    "### Project Architecture\n\n{}",
+                                    arch_parts.join("\n")
+                                ));
+                            }
+
+                            // Add page specs section (re-serialize only the page specs)
+                            if !page_specs.is_empty() {
+                                if let Ok(page_json) = serde_json::to_string_pretty(&page_specs) {
+                                    specs_parts
+                                        .push(format!("### External App Specs\n{}", page_json));
+                                }
+                            }
+                        }
+                    } else {
+                        // Fallback: couldn't parse, use raw body
+                        specs_parts.push(format!("### External App Specs\n{}", body));
+                    }
                 }
             }
         }

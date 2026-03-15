@@ -296,8 +296,16 @@
         {
           "id": "sm-discovery-no-apps-hint",
           "description": "When no apps are found and not scanning or connected, a hint reads 'Click Scan to find apps with the UI Bridge SDK installed.'",
-          "category": "element-presence", "severity": "info", "assertionType": "hasText",
-          "target": { "type": "search", "criteria": { "textContent": "Click Scan to find apps with the UI Bridge SDK installed." }, "label": "No apps hint" },
+          "category": "element-presence",
+          "severity": "info",
+          "assertionType": "hasText",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Click Scan to find apps with the UI Bridge SDK installed."
+            },
+            "label": "No apps hint"
+          },
           "precondition": "Discovery tab active, no apps found, not scanning, not connected",
           "source": "manual", "reviewed": true, "enabled": true
         }

@@ -704,7 +704,48 @@ pub async fn ui_bridge_get_snapshot_handler(
     info!("UI Bridge API: Getting snapshot");
 
     match ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Ok(mut data) => {
+            // Enrich snapshot with architecture spec summaries from the database
+            let db = state.app_state.checkpoint_db.clone();
+            let arch_result = tokio::task::spawn_blocking(move || db.get_all_cached_specs()).await;
+
+            match arch_result {
+                Ok(Ok(specs)) => {
+                    let summaries: Vec<serde_json::Value> = specs
+                        .iter()
+                        .filter(|s| crate::spec_utils::is_architecture_spec_str(&s.spec_json))
+                        .filter_map(|s| {
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&s.spec_json).ok()?;
+                            Some(crate::spec_utils::format_architecture_summary(
+                                &parsed,
+                                &s.app_name,
+                            ))
+                        })
+                        .collect();
+
+                    if !summaries.is_empty() {
+                        if let Some(obj) = data.as_object_mut() {
+                            obj.insert(
+                                "architecture".to_string(),
+                                serde_json::json!({ "projects": summaries }),
+                            );
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "Snapshot enrichment: failed to fetch cached specs from database: {}",
+                        e
+                    );
+                }
+                Err(e) => {
+                    warn!("Snapshot enrichment: spawn_blocking task failed: {}", e);
+                }
+            }
+
+            Ok(Json(ApiResponse::success(data)))
+        }
         Err(e) => {
             error!("UI Bridge API: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))

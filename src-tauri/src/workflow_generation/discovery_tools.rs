@@ -11,10 +11,11 @@
 use crate::check_generation::{
     recommended_tools_for_language, scan_workspace, ScanWorkspaceRequest,
 };
+use crate::spec_utils::{format_architecture_markdown, is_architecture_spec};
 use crate::str_utils::truncate_str;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -94,6 +95,7 @@ const TOOL_TEST_API: &str = "test_api_request";
 const TOOL_LIST_MCP: &str = "list_mcp_servers";
 const TOOL_LIST_SHELL_COMMANDS: &str = "list_shell_commands";
 const TOOL_DATABASE_STATS: &str = "database_stats";
+const TOOL_ARCHITECTURE_SPECS: &str = "architecture_specs";
 
 /// Keywords that trigger each tool.
 struct ToolTrigger {
@@ -228,6 +230,20 @@ const TOOL_TRIGGERS: &[ToolTrigger] = &[
             "task run",
             "workflow history",
             "storage",
+        ],
+        needs_data: ToolDataReq::KeywordsOnly,
+    },
+    ToolTrigger {
+        name: TOOL_ARCHITECTURE_SPECS,
+        keywords: &[
+            "architecture",
+            "tech stack",
+            "project structure",
+            "framework",
+            "pattern",
+            "dependency",
+            "feature list",
+            "design",
         ],
         needs_data: ToolDataReq::KeywordsOnly,
     },
@@ -591,6 +607,7 @@ fn execute_tool(
         TOOL_LIST_MCP => execute_list_mcp_servers(config),
         TOOL_LIST_SHELL_COMMANDS => execute_list_shell_commands(config),
         TOOL_DATABASE_STATS => execute_database_stats(config),
+        TOOL_ARCHITECTURE_SPECS => execute_architecture_specs(config),
         _ => Err(format!("Unknown tool: {}", name)),
     }
 }
@@ -617,6 +634,7 @@ fn summarize_input(tool_name: &str, input: &DiscoveryInput) -> String {
             format!("endpoints: {:?}", &endpoints[..endpoints.len().min(3)])
         }
         TOOL_UI_BRIDGE_SPECS => "runner + cached specs".to_string(),
+        TOOL_ARCHITECTURE_SPECS => "cached architecture specs".to_string(),
         _ => "default".to_string(),
     }
 }
@@ -1011,8 +1029,47 @@ fn execute_ui_bridge_specs(config: &DiscoveryConfig) -> Result<String, String> {
         return Err("No UI Bridge page specs found".to_string());
     }
 
+    // First pass: separate architecture specs from page specs
+    let mut arch_spec_ids: HashSet<usize> = HashSet::new();
+    let mut arch_section = String::new();
+    let mut arch_count = 0;
+
+    for (idx, spec) in all_specs.iter().enumerate() {
+        let spec_json_str = spec.get("spec_json").and_then(|v| v.as_str());
+        let parsed_spec =
+            spec_json_str.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+
+        let is_arch = parsed_spec
+            .as_ref()
+            .map(crate::spec_utils::is_architecture_spec)
+            .unwrap_or(false);
+
+        if is_arch {
+            if let Some(ref parsed) = parsed_spec {
+                let project_name = spec
+                    .get("app_name")
+                    .or_else(|| spec.get("appName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                arch_section.push_str(&crate::spec_utils::format_architecture_markdown(
+                    parsed,
+                    project_name,
+                ));
+                arch_count += 1;
+                arch_spec_ids.insert(idx);
+            }
+        }
+    }
+
     let header = "### UI Bridge Page Specs\n\n";
     let mut s = String::from(header);
+
+    // Insert architecture section before page specs
+    if !arch_section.is_empty() {
+        s.push_str("### Project Architecture\n\n");
+        s.push_str(&arch_section);
+    }
+
     s.push_str(
         "The following page specifications describe the purpose, structure, and expected behavior \
          of pages in the target application. Use these to understand what each page does and to \
@@ -1021,7 +1078,11 @@ fn execute_ui_bridge_specs(config: &DiscoveryConfig) -> Result<String, String> {
 
     let mut page_count = 0;
 
-    for spec in &all_specs {
+    for (idx, spec) in all_specs.iter().enumerate() {
+        // Skip architecture specs — already formatted above
+        if arch_spec_ids.contains(&idx) {
+            continue;
+        }
         // Each spec can be a CachedAppSpec (with spec_json field) or a direct spec config
         let config_val = if let Some(spec_json_str) = spec.get("spec_json").and_then(|v| v.as_str())
         {
@@ -1159,17 +1220,27 @@ fn execute_ui_bridge_specs(config: &DiscoveryConfig) -> Result<String, String> {
         s.push('\n');
     }
 
-    if page_count == 0 {
+    if page_count == 0 && arch_count == 0 {
         return Err("No meaningful page specs found".to_string());
     }
 
     // Summary line at the top
-    let summary = format!(
-        "**{} page specs available.** These semantic page specs describe what each page does, \
-         what users can accomplish, and what correct behavior looks like. Use them to generate \
-         verification steps that check real page behavior rather than guessing at element names.\n\n",
-        page_count
-    );
+    let summary = if arch_count > 0 {
+        format!(
+            "**{} page specs and {} architecture spec(s) available.** Architecture specs describe \
+             the project's tech stack, features, and patterns. Page specs describe what each page does, \
+             what users can accomplish, and what correct behavior looks like. Use them to generate \
+             verification steps that check real page behavior rather than guessing at element names.\n\n",
+            page_count, arch_count
+        )
+    } else {
+        format!(
+            "**{} page specs available.** These semantic page specs describe what each page does, \
+             what users can accomplish, and what correct behavior looks like. Use them to generate \
+             verification steps that check real page behavior rather than guessing at element names.\n\n",
+            page_count
+        )
+    };
     s.insert_str(header.len(), &summary);
 
     Ok(s)
@@ -1427,6 +1498,71 @@ fn execute_database_stats(config: &DiscoveryConfig) -> Result<String, String> {
     // If we didn't get any data, report it
     if s == "### Database Stats\n" {
         return Err("Could not retrieve database stats".to_string());
+    }
+
+    Ok(s)
+}
+
+/// Fetch cached architecture specs and format them as markdown context.
+fn execute_architecture_specs(config: &DiscoveryConfig) -> Result<String, String> {
+    let client = build_http_client(config)?;
+    let base = format!("http://localhost:{}", config.runner_port);
+    let url = format!("{}/ui-bridge/sdk/cached-specs", base);
+
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("Failed to fetch cached specs: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("cached-specs returned status {}", resp.status()));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .map_err(|e| format!("Failed to parse cached specs response: {}", e))?;
+
+    let specs = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| "No data array in cached-specs response".to_string())?;
+
+    let mut sections = Vec::new();
+
+    for spec_entry in specs {
+        let spec_json_str = match spec_entry.get("spec_json").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let parsed: serde_json::Value = match serde_json::from_str(spec_json_str) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if !is_architecture_spec(&parsed) {
+            continue;
+        }
+
+        let app_name = spec_entry
+            .get("app_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        sections.push(format_architecture_markdown(&parsed, app_name));
+    }
+
+    if sections.is_empty() {
+        return Err("No architecture specs found".to_string());
+    }
+
+    let mut s = String::from("### Architecture Specs\n\n");
+    s.push_str(
+        "The following architecture specifications describe the tech stack, features, \
+         and design patterns of discovered projects.\n\n",
+    );
+    for section in sections {
+        s.push_str(&section);
     }
 
     Ok(s)

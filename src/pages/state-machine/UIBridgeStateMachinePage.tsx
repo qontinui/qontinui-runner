@@ -65,16 +65,20 @@ export function UIBridgeStateMachinePage() {
   const [showNewTransition, setShowNewTransition] = useState(false);
   const [highlightedPath, setHighlightedPath] = useState<PathfindingResult["steps"] | undefined>();
   // Thumbnails loaded from database when config changes, with localStorage fallback
-  const [elementThumbnails, setElementThumbnails] = useState<Record<string, string> | undefined>(() => {
-    try {
-      const stored = localStorage.getItem("qontinui-runner-sm-thumbnails");
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (parsed && Object.keys(parsed).length > 0) return parsed;
+  const [elementThumbnails, setElementThumbnails] = useState<Record<string, string> | undefined>(
+    () => {
+      try {
+        const stored = localStorage.getItem("qontinui-runner-sm-thumbnails");
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          if (parsed && Object.keys(parsed).length > 0) return parsed;
+        }
+      } catch {
+        /* */
       }
-    } catch { /* */ }
-    return undefined;
-  });
+      return undefined;
+    },
+  );
   const activeConfigId = sm.activeConfig?.id;
   useEffect(() => {
     if (!activeConfigId) {
@@ -96,7 +100,6 @@ export function UIBridgeStateMachinePage() {
       isCancelled = true;
     };
   }, [activeConfigId]);
-
 
   // Also sync from discovery co-occurrence data (available during exploration before save)
   const coocThumbs = discovery.cooccurrenceData?.elementThumbnails;

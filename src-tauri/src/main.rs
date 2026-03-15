@@ -77,6 +77,7 @@ mod secure_storage;
 mod semantic_conventions;
 mod settings;
 mod skills;
+mod spec_utils;
 mod state_explorer;
 mod state_machine_configs;
 mod step_event_builder;
@@ -255,6 +256,124 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Migrate plaintext API keys to secure keychain storage
     if let Err(e) = config_facade::migrate_api_keys_to_keychain() {
         warn!("API key migration to keychain failed (non-fatal): {}", e);
+    }
+
+    // Auto-cache architecture specs from local .architecture.uibridge.json files
+    {
+        let db_for_arch = checkpoint_db.clone();
+        std::thread::spawn(move || {
+            let cwd = match std::env::current_dir() {
+                Ok(p) => p,
+                Err(e) => {
+                    info!(
+                        "Could not get working directory for architecture spec scan: {}",
+                        e
+                    );
+                    return;
+                }
+            };
+
+            let mut dirs_to_scan: Vec<std::path::PathBuf> = vec![cwd.clone()];
+
+            // Also scan parent directory's immediate children (sibling projects)
+            if let Some(parent) = cwd.parent() {
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() && path != cwd {
+                            dirs_to_scan.push(path);
+                        }
+                    }
+                }
+            }
+
+            let mut cached_count = 0;
+            for dir in &dirs_to_scan {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        if !file_name.ends_with(".architecture.uibridge.json") {
+                            continue;
+                        }
+
+                        // Check file size before reading (10MB limit)
+                        const MAX_SPEC_FILE_SIZE: u64 = 10 * 1024 * 1024;
+                        match std::fs::metadata(&path) {
+                            Ok(meta) => {
+                                if meta.len() > MAX_SPEC_FILE_SIZE {
+                                    warn!(
+                                        "Skipping architecture spec file {} — size {} bytes exceeds 10MB limit",
+                                        path.display(),
+                                        meta.len()
+                                    );
+                                    continue;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to read metadata for {}: {}", path.display(), e);
+                                continue;
+                            }
+                        }
+
+                        let content = match std::fs::read_to_string(&path) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to read architecture spec file {}: {}",
+                                    path.display(),
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+
+                        // Validate it has techStack + features
+                        let parsed: serde_json::Value = match serde_json::from_str(&content) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to parse architecture spec file {}: {}",
+                                    path.display(),
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+                        if !crate::spec_utils::is_architecture_spec(&parsed) {
+                            continue;
+                        }
+
+                        let dir_name = dir
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown");
+                        let dir_path_str = dir.to_string_lossy().replace('\\', "/");
+                        let app_url = format!("file://{}", dir_path_str);
+                        let spec_id = format!("{}.architecture", dir_name);
+
+                        if let Err(e) = db_for_arch
+                            .upsert_cached_spec(&app_url, dir_name, &spec_id, &content, None)
+                        {
+                            warn!(
+                                "Failed to cache architecture spec from {}: {}",
+                                path.display(),
+                                e
+                            );
+                        } else {
+                            cached_count += 1;
+                        }
+                    }
+                }
+            }
+
+            if cached_count > 0 {
+                info!(
+                    "Auto-cached {} architecture spec(s) from local files",
+                    cached_count
+                );
+            }
+        });
     }
 
     // Initialize RAGState (graceful degradation if dependencies missing)

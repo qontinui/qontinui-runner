@@ -127,6 +127,11 @@ export interface SdkArchitectureNode {
   type: "feature" | "tech" | "directory" | "pattern";
   status?: string;
   priority?: string;
+  description?: string;
+  entryPoints?: string[];
+  techUsed?: string[];
+  category?: string;
+  usedBy?: string[];
 }
 
 export interface SdkArchitectureEdge {
@@ -136,11 +141,58 @@ export interface SdkArchitectureEdge {
   label?: string;
 }
 
+export interface SdkArchitectureConstraint {
+  id: string;
+  description: string;
+  category: string;
+}
+
+// Agentic structure types
+
+export type AgentRole = "orchestrator" | "executor" | "analyzer" | "session" | "monitor";
+
+export interface AgenticAgent {
+  id: string;
+  name: string;
+  role: AgentRole;
+  description: string;
+  parentAgent?: string;
+  capabilities: string[];
+  delegatesTo?: string[];
+  triggers?: string[];
+  decisionAuthority?: string[];
+}
+
+export interface AgenticFeedbackLoop {
+  id: string;
+  name: string;
+  description: string;
+  agents: string[];
+  exitCondition: string;
+  type: "inner" | "outer" | "cross";
+}
+
+export interface AgenticDelegationChain {
+  from: string;
+  to: string;
+  via: string;
+  description: string;
+}
+
+export interface AgenticStructure {
+  agents: AgenticAgent[];
+  feedbackLoops: AgenticFeedbackLoop[];
+  delegationChains: AgenticDelegationChain[];
+}
+
 export interface SdkArchitectureGraph {
   projectName: string;
+  description: string;
   appUrl: string;
   nodes: SdkArchitectureNode[];
   edges: SdkArchitectureEdge[];
   techStack: Array<{ name: string; category: string; version?: string; purpose: string }>;
   directories: Array<{ path: string; purpose: string; required: boolean }>;
+  constraints: SdkArchitectureConstraint[];
+  agenticStructure?: AgenticStructure;
 }

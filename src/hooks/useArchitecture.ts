@@ -292,6 +292,9 @@ export function useSdkArchitecture() {
                   type: "feature",
                   status: feature.status,
                   priority: feature.priority,
+                  description: feature.description,
+                  entryPoints: feature.entryPoints,
+                  techUsed: feature.techUsed,
                 });
               }
 
@@ -301,6 +304,8 @@ export function useSdkArchitecture() {
                   id: `tech:${tech.name}`,
                   label: tech.name,
                   type: "tech",
+                  category: tech.category,
+                  description: tech.purpose,
                 });
               }
 
@@ -310,6 +315,9 @@ export function useSdkArchitecture() {
                   id: `pattern:${pattern.id}`,
                   label: pattern.name,
                   type: "pattern",
+                  description: pattern.description,
+                  category: pattern.category,
+                  usedBy: pattern.usedBy,
                 });
               }
 
@@ -325,11 +333,52 @@ export function useSdkArchitecture() {
 
               graphs.push({
                 projectName: parsed.projectName ?? spec.app_name ?? "Unknown",
+                description: parsed.description ?? "",
                 appUrl: spec.app_url,
                 nodes,
                 edges,
                 techStack: parsed.techStack ?? [],
                 directories: parsed.directories ?? [],
+                constraints: (parsed.constraints ?? []).map((c: Record<string, unknown>) => ({
+                  id: (c.id as string) ?? "",
+                  description: (c.description as string) ?? "",
+                  category: (c.category as string) ?? "",
+                })),
+                agenticStructure: parsed.agenticStructure
+                  ? {
+                      agents: (parsed.agenticStructure.agents ?? []).map(
+                        (a: Record<string, unknown>) => ({
+                          id: (a.id as string) ?? "",
+                          name: (a.name as string) ?? "",
+                          role: (a.role as string) ?? "executor",
+                          description: (a.description as string) ?? "",
+                          parentAgent: a.parentAgent as string | undefined,
+                          capabilities: (a.capabilities as string[]) ?? [],
+                          delegatesTo: a.delegatesTo as string[] | undefined,
+                          triggers: a.triggers as string[] | undefined,
+                          decisionAuthority: a.decisionAuthority as string[] | undefined,
+                        }),
+                      ),
+                      feedbackLoops: (parsed.agenticStructure.feedbackLoops ?? []).map(
+                        (l: Record<string, unknown>) => ({
+                          id: (l.id as string) ?? "",
+                          name: (l.name as string) ?? "",
+                          description: (l.description as string) ?? "",
+                          agents: (l.agents as string[]) ?? [],
+                          exitCondition: (l.exitCondition as string) ?? "",
+                          type: ((l.type as string) ?? "inner") as "inner" | "outer" | "cross",
+                        }),
+                      ),
+                      delegationChains: (parsed.agenticStructure.delegationChains ?? []).map(
+                        (d: Record<string, unknown>) => ({
+                          from: (d.from as string) ?? "",
+                          to: (d.to as string) ?? "",
+                          via: (d.via as string) ?? "",
+                          description: (d.description as string) ?? "",
+                        }),
+                      ),
+                    }
+                  : undefined,
               });
             }
           } catch {
