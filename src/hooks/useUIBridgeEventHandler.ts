@@ -36,6 +36,40 @@ import {
   runStyleAudit,
 } from "ui-bridge";
 import { handleChangeTrackingCommand } from "./changeTrackingHandler";
+import { getApiPort } from "@/lib/runner-api";
+
+/**
+ * Send a response to the Rust backend via HTTP fallback.
+ * Used when the Tauri event system is unresponsive.
+ */
+async function httpSendResponse(response: unknown): Promise<boolean> {
+  try {
+    const port = getApiPort();
+    const resp = await fetch(`http://localhost:${port}/ui-bridge/ipc-response`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(response),
+    });
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Send a pong to the Rust backend via HTTP fallback.
+ */
+async function httpSendPong(): Promise<boolean> {
+  try {
+    const port = getApiPort();
+    const resp = await fetch(`http://localhost:${port}/ui-bridge/pong`, {
+      method: "POST",
+    });
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
 import type {
   RegisteredElement,
   RegisteredComponent,
@@ -109,7 +143,15 @@ type UIBridgeRequestType =
   | "get_keyboard_shortcuts"
   // AI search & find
   | "ai_search"
-  | "ai_find";
+  | "ai_find"
+  | "find"
+  | "get_workflows"
+  | "get_element_state"
+  // Media discovery
+  | "find_media"
+  | "media_audit"
+  | "capture_media_snapshot"
+  | "analyze_media";
 
 /**
  * Payload structure for UI Bridge requests from Rust
@@ -279,12 +321,22 @@ export function useUIBridgeEventHandler(): void {
    * Send a response back to the Rust backend
    */
   const sendResponse = useCallback(async (response: UIBridgeResponsePayload) => {
-    try {
-      await emit("ui-bridge-response", response);
-      console.log(`[UIBridgeEventHandler] Sent response for ${response.type}:`, response.requestId);
-    } catch (error) {
-      console.error("[UIBridgeEventHandler] Failed to emit response:", error);
-    }
+    // Send via both Tauri emit AND HTTP fallback simultaneously.
+    // Tauri emit may hang if the IPC channel is broken (WebView2 issue),
+    // so the HTTP fallback ensures the response always reaches the Rust backend.
+    const httpPromise = httpSendResponse(response).then((ok) => {
+      if (ok) {
+        console.log(`[UIBridgeEventHandler] HTTP sent response for ${response.type}:`, response.requestId);
+      }
+    });
+    const emitPromise = emit("ui-bridge-response", response)
+      .then(() => {
+        console.log(`[UIBridgeEventHandler] Tauri emit sent response for ${response.type}:`, response.requestId);
+      })
+      .catch(() => {
+        // Tauri emit failed — HTTP fallback already running
+      });
+    await Promise.allSettled([httpPromise, emitPromise]);
   }, []);
 
   /**
@@ -312,12 +364,13 @@ export function useUIBridgeEventHandler(): void {
       try {
         switch (type) {
           case "get_elements": {
-            const elements = currentBridge.elements.map(serializeElement);
+            const snapshot = await currentBridge.createSnapshotAsync();
+            const elements = snapshot.elements;
             await sendResponse({
               requestId,
               type,
               success: true,
-              data: { elements, count: elements.length },
+              data: elements,
               timestamp: Date.now(),
             });
             break;
@@ -371,10 +424,15 @@ export function useUIBridgeEventHandler(): void {
               return;
             }
 
+            // Normalize: action may be a string (from SDK proxy fallback)
+            // or an object { action, params, waitOptions } (from control endpoint)
+            const actionObj =
+              typeof action === "string" ? { action } : action;
+
             const result = await currentBridge.executeAction(elementId, {
-              action: action.action,
-              params: action.params,
-              waitOptions: action.waitOptions,
+              action: actionObj.action,
+              params: actionObj.params,
+              waitOptions: actionObj.waitOptions,
             });
 
             await sendResponse({
@@ -667,14 +725,30 @@ export function useUIBridgeEventHandler(): void {
               });
               return;
             }
-            window.location.href = url;
-            await sendResponse({
-              requestId,
-              type,
-              success: true,
-              data: { success: true, url },
-              timestamp: Date.now(),
-            });
+            try {
+              // Use history.pushState for relative URLs to avoid full page reload
+              if (url.startsWith('/')) {
+                window.history.pushState({}, '', url);
+                window.dispatchEvent(new PopStateEvent('popstate'));
+              } else {
+                window.location.href = url;
+              }
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: { success: true, url },
+                timestamp: Date.now(),
+              });
+            } catch (err) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: `Navigation failed: ${err instanceof Error ? err.message : String(err)}`,
+                timestamp: Date.now(),
+              });
+            }
             break;
           }
 
@@ -1434,6 +1508,118 @@ export function useUIBridgeEventHandler(): void {
             break;
           }
 
+          // ========== Find, Workflows, Element State ==========
+          case "find": {
+            const findParams = payload.params ?? payload.body ?? {};
+            const discovered = await currentBridge.discover({
+              ...(findParams as Record<string, unknown>),
+              includeHidden: true,
+            });
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: discovered,
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "get_workflows": {
+            // Return workflows from snapshot
+            const snapshot = await currentBridge.createSnapshotAsync();
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { workflows: (snapshot as unknown as Record<string, unknown>).workflows ?? [], timestamp: Date.now() },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "get_element_state": {
+            const { elementId: stateId } = payload;
+            if (!stateId) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: "elementId is required",
+                timestamp: Date.now(),
+              });
+              return;
+            }
+            const stateEl = currentBridge.getElement(stateId);
+            if (!stateEl) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: `Element not found: ${stateId}`,
+                timestamp: Date.now(),
+              });
+              return;
+            }
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: stateEl.getState(),
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          // ========== Media Discovery ==========
+          case "find_media": {
+            const mediaParams = payload.params ?? payload.body ?? {};
+            const discovered = await currentBridge.discover({
+              ...(mediaParams as Record<string, unknown>),
+              mediaOnly: true,
+              includeMedia: true,
+              includeHidden: true,
+            });
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: discovered,
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "media_audit": {
+            const auditType = (payload.params ?? payload.body ?? {} as Record<string, unknown>)?.auditType;
+            const discovered = await currentBridge.discover({
+              mediaOnly: true,
+              includeMedia: true,
+              includeHidden: true,
+            });
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { auditType, elements: discovered },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "capture_media_snapshot":
+          case "analyze_media": {
+            // These require browser-side canvas operations — relay to SDK
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { relayRequired: true, command: type, payload },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
           default: {
             await sendResponse({
               requestId,
@@ -1482,17 +1668,48 @@ export function useUIBridgeEventHandler(): void {
           });
         });
 
+        // Listen for ping and respond with pong (Tauri event + HTTP fallback)
+        const unlistenPing = await listen("ui-bridge-ping", async () => {
+          try {
+            await emit("ui-bridge-pong", { timestamp: Date.now() });
+          } catch {
+            // Tauri event failed — use HTTP fallback
+            await httpSendPong();
+          }
+        });
+
+        // Also set up a periodic HTTP pong as a safety net in case
+        // Tauri events from JS→Rust stop working (WebView2 IPC issue)
+        const pongInterval = setInterval(() => {
+          httpSendPong().catch(() => {});
+        }, 3000);
+
         console.log("[UIBridgeEventHandler] Listener set up successfully");
+
+        // Store ping unlisten for cleanup
+        const originalUnlisten = unlisten;
+        unlisten = () => {
+          originalUnlisten?.();
+          unlistenPing();
+          clearInterval(pongInterval);
+        };
       } catch (error) {
         console.error("[UIBridgeEventHandler] Failed to set up listener:", error);
       }
     };
+
+    // Log page unload for diagnostics (no pending-request tracking to clean up)
+    const handleBeforeUnload = () => {
+      console.log("[UIBridgeEventHandler] Page unloading, cleaning up");
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
 
     setupListener();
 
     return () => {
       console.log("[UIBridgeEventHandler] Cleaning up listener");
       isMounted = false;
+      window.removeEventListener('beforeunload', handleBeforeUnload);
       if (unlisten) {
         unlisten();
       }

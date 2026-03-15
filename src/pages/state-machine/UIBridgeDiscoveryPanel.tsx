@@ -95,7 +95,23 @@ export function UIBridgeDiscoveryPanel({
     }
   }, [sdk, discovery]);
 
-  // Save handler
+  // Discover + auto-save handler
+  const handleDiscoverAndSave = useCallback(async () => {
+    const result = await discovery.runDiscovery();
+    if (result && result.states.length > 0) {
+      const appName = sdk.connectedApp?.appName || "App";
+      const timestamp = new Date().toLocaleString("en-US", {
+        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+      });
+      const autoName = `${appName} — ${timestamp}`;
+      const configId = await discovery.saveConfig(autoName, result);
+      if (configId) {
+        onConfigCreated(configId);
+      }
+    }
+  }, [discovery, sdk.connectedApp?.appName, onConfigCreated]);
+
+  // Manual save handler (for the save form)
   const handleSave = useCallback(async () => {
     const configId = await discovery.saveConfig();
     if (configId) {
@@ -376,16 +392,16 @@ export function UIBridgeDiscoveryPanel({
               Run fingerprint-based state discovery to identify UI states from the collected data.
             </p>
             <button
-              onClick={discovery.runDiscovery}
-              disabled={discovery.isDiscovering}
+              onClick={handleDiscoverAndSave}
+              disabled={discovery.isDiscovering || discovery.isSaving}
               className="inline-flex items-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium bg-brand-primary text-white hover:bg-brand-primary/90 disabled:opacity-50"
             >
-              {discovery.isDiscovering ? (
+              {discovery.isDiscovering || discovery.isSaving ? (
                 <Loader2 className="size-4 animate-spin" />
               ) : (
                 <Sparkles className="size-4" />
               )}
-              Discover States
+              {discovery.isSaving ? "Saving..." : "Discover States"}
             </button>
           </div>
 

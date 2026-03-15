@@ -20,6 +20,12 @@ export default defineConfig({
       // Allow serving files from sibling directories (ui-bridge, qontinui-schemas)
       allow: ['.', '..'],
     },
+    headers: {
+      // Prevent browser caching of linked package modules served via @fs/ paths.
+      // Without this, the Tauri webview HTTP cache may serve stale versions of
+      // sibling packages (workflow-ui, schemas, ui-bridge) after rebuilds.
+      'Cache-Control': 'no-store',
+    },
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {

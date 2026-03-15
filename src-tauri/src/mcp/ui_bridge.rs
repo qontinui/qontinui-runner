@@ -131,11 +131,239 @@ fn get_ui_bridge_timeout_ms() -> u64 {
     Timeouts::ui_bridge_ipc().as_millis() as u64
 }
 
+// ============================================================================
+// Circuit Breaker
+// ============================================================================
+
+/// Circuit breaker states for UI Bridge
+#[derive(Debug, Clone, PartialEq)]
+pub enum CircuitBreakerState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+/// Circuit breaker to prevent cascading failures when the webview is unresponsive.
+pub struct UiBridgeCircuitBreaker {
+    state: tokio::sync::Mutex<CircuitBreakerState>,
+    consecutive_failures: std::sync::atomic::AtomicU32,
+    last_failure_time: std::sync::atomic::AtomicU64,
+    /// Threshold: consecutive timeouts before opening
+    threshold: u32,
+    /// Cooldown in ms before transitioning from Open to HalfOpen
+    cooldown_ms: u64,
+}
+
+impl UiBridgeCircuitBreaker {
+    pub fn new() -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(CircuitBreakerState::Closed),
+            consecutive_failures: std::sync::atomic::AtomicU32::new(0),
+            last_failure_time: std::sync::atomic::AtomicU64::new(0),
+            threshold: 3,
+            cooldown_ms: 5000,
+        }
+    }
+
+    /// Check if a request should be allowed through
+    pub async fn check(&self) -> Result<(), String> {
+        let mut state = self.state.lock().await;
+        match *state {
+            CircuitBreakerState::Closed => Ok(()),
+            CircuitBreakerState::Open => {
+                let last_failure = self
+                    .last_failure_time
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                if now - last_failure >= self.cooldown_ms {
+                    *state = CircuitBreakerState::HalfOpen;
+                    info!("UI Bridge circuit breaker: Open -> HalfOpen (cooldown elapsed)");
+                    Ok(())
+                } else {
+                    Err("UI Bridge temporarily unavailable (circuit breaker open)".to_string())
+                }
+            }
+            CircuitBreakerState::HalfOpen => Ok(()),
+        }
+    }
+
+    /// Record a successful request
+    pub async fn record_success(&self) {
+        self.consecutive_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut state = self.state.lock().await;
+        if *state != CircuitBreakerState::Closed {
+            info!(
+                "UI Bridge circuit breaker: {:?} -> Closed (success)",
+                *state
+            );
+            *state = CircuitBreakerState::Closed;
+        }
+    }
+
+    /// Record a failed request (timeout)
+    pub async fn record_failure(&self) {
+        let failures = self
+            .consecutive_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        self.last_failure_time
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+
+        if failures >= self.threshold {
+            let mut state = self.state.lock().await;
+            if *state != CircuitBreakerState::Open {
+                warn!(
+                    "UI Bridge circuit breaker: {:?} -> Open ({} consecutive failures)",
+                    *state, failures
+                );
+                *state = CircuitBreakerState::Open;
+            }
+        }
+    }
+
+    /// Attempt auto-recovery by navigating the webview to "/" when circuit breaker opens.
+    /// Should be called after record_failure detects the circuit breaker has opened.
+    pub fn attempt_recovery(&self, app_handle: &tauri::AppHandle) {
+        use tauri::Manager;
+        if let Some(window) = app_handle.get_webview_window("main") {
+            warn!("UI Bridge: Attempting auto-recovery — navigating webview to /");
+            if let Err(e) = window.eval("window.location.href = '/'") {
+                error!("UI Bridge: Auto-recovery eval failed: {}", e);
+            }
+        } else {
+            warn!("UI Bridge: Auto-recovery skipped — main window not found");
+        }
+    }
+
+    /// Get current state for diagnostics
+    pub async fn get_state(&self) -> CircuitBreakerState {
+        self.state.lock().await.clone()
+    }
+
+    /// Get consecutive failure count
+    pub fn get_failure_count(&self) -> u32 {
+        self.consecutive_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Send a UI Bridge request and wait for the response synchronously.
 ///
 /// This creates a oneshot channel, stores the sender in the pending map,
 /// emits the request to the frontend, and waits for the response with a timeout.
+///
+/// Includes circuit breaker, concurrency limiting, frontend liveness check,
+/// and request deduplication for read-only operations.
 pub async fn ui_bridge_request_sync(
+    state: &Arc<ApiState>,
+    request_type: &str,
+    additional_payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    // 1. Check circuit breaker
+    state.ui_bridge_circuit_breaker.check().await?;
+
+    // 2. Check frontend liveness (warn if stale, but don't fail — let IPC timeout handle it)
+    let last_pong = state
+        .ui_bridge_last_pong
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if last_pong > 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let pong_age = now - last_pong;
+        if pong_age > 15000 {
+            warn!(
+                "UI Bridge: Frontend may be unresponsive (last pong {}ms ago)",
+                pong_age
+            );
+        }
+    }
+
+    // 3. Check for dedup opportunity on read-only requests
+    let dedup_key = match request_type {
+        "get_elements" | "get_snapshot" | "get_components" => Some(request_type.to_string()),
+        _ => None,
+    };
+
+    if let Some(ref key) = dedup_key {
+        let dedup = state.ui_bridge_dedup.lock().await;
+        if let Some(tx) = dedup.get(key) {
+            // Subscribe to existing in-flight request
+            let mut rx = tx.subscribe();
+            drop(dedup);
+            debug!("UI Bridge: Deduplicating {} request", key);
+            return match rx.recv().await {
+                Ok(result) => result,
+                Err(_) => Err("Dedup channel closed".to_string()),
+            };
+        }
+    }
+
+    // 4. Acquire semaphore permit (max 6 concurrent, 2s timeout)
+    let _permit = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.ui_bridge_semaphore.acquire(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err("UI Bridge semaphore closed".to_string()),
+        Err(_) => {
+            return Err(
+                "UI Bridge concurrency limit reached (timeout acquiring permit)".to_string(),
+            )
+        }
+    };
+
+    // 5. Set up dedup broadcast for read-only requests
+    let dedup_tx = if let Some(ref key) = dedup_key {
+        let (tx, _) = tokio::sync::broadcast::channel(1);
+        let mut dedup = state.ui_bridge_dedup.lock().await;
+        dedup.insert(key.clone(), tx.clone());
+        Some(tx)
+    } else {
+        None
+    };
+
+    // 6. Execute the actual request
+    let result = ui_bridge_request_inner(state, request_type, additional_payload).await;
+
+    // 7. Update circuit breaker and attempt recovery if it opens
+    match &result {
+        Ok(_) => state.ui_bridge_circuit_breaker.record_success().await,
+        Err(e) if e.contains("timed out") => {
+            state.ui_bridge_circuit_breaker.record_failure().await;
+            // If circuit breaker just opened, attempt auto-recovery
+            if state.ui_bridge_circuit_breaker.get_state().await == CircuitBreakerState::Open {
+                state
+                    .ui_bridge_circuit_breaker
+                    .attempt_recovery(&state.app_handle);
+            }
+        }
+        Err(_) => {} // Non-timeout errors don't trigger circuit breaker
+    }
+
+    // 8. Broadcast dedup result
+    if let (Some(ref key), Some(tx)) = (&dedup_key, &dedup_tx) {
+        let _ = tx.send(result.clone());
+        let mut dedup = state.ui_bridge_dedup.lock().await;
+        dedup.remove(key);
+    }
+
+    result
+}
+
+/// Inner implementation of ui_bridge_request_sync (the actual IPC logic)
+async fn ui_bridge_request_inner(
     state: &Arc<ApiState>,
     request_type: &str,
     additional_payload: serde_json::Value,
@@ -179,10 +407,7 @@ pub async fn ui_bridge_request_sync(
     let timeout_duration = std::time::Duration::from_millis(get_ui_bridge_timeout_ms());
     match tokio::time::timeout(timeout_duration, rx).await {
         Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) => {
-            // Channel was closed without sending
-            Err("UI Bridge request channel closed unexpectedly".to_string())
-        }
+        Ok(Err(_)) => Err("UI Bridge request channel closed unexpectedly".to_string()),
         Err(_) => {
             // Timeout - clean up the pending entry
             let mut pending = state.ui_bridge_pending.lock().await;
@@ -816,6 +1041,42 @@ pub async fn ui_bridge_page_refresh_handler(
     }
 }
 
+/// Hard refresh the page, bypassing browser cache.
+/// Uses Tauri's webview eval to clear caches and force reload.
+pub async fn ui_bridge_page_hard_refresh_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use tauri::Manager;
+    info!("UI Bridge API: Hard refresh (cache bypass)");
+
+    if let Some(window) = state.app_handle.get_webview_window("main") {
+        // Use fetch cache-busting + location replacement to bypass browser cache.
+        // This is safer than deleting the EBWebView Cache directory.
+        let js = r#"
+            (function() {
+                // Add cache-buster to current URL and navigate
+                var url = new URL(location.href);
+                url.searchParams.set('_hrc', Date.now());
+                location.replace(url.toString());
+            })();
+        "#;
+        window.eval(js).map_err(|e| {
+            let msg = format!("Failed to hard refresh: {}", e);
+            error!("{}", msg);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg)))
+        })?;
+        Ok(Json(ApiResponse::success(serde_json::json!({
+            "success": true,
+            "message": "Hard refresh triggered"
+        }))))
+    } else {
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error("Main webview window not found".to_string())),
+        ))
+    }
+}
+
 /// Navigate to a URL.
 pub async fn ui_bridge_page_navigate_handler(
     State(state): State<Arc<ApiState>>,
@@ -823,7 +1084,34 @@ pub async fn ui_bridge_page_navigate_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Page navigate to {}", request.url);
 
-    let payload = serde_json::json!({ "url": request.url });
+    // Validate URL
+    let url = request.url.trim();
+    if url.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("URL cannot be empty".to_string())),
+        ));
+    }
+    if url.starts_with("about:") || url.starts_with("javascript:") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!("Unsafe URL scheme rejected: {}", url))),
+        ));
+    }
+    if !url.starts_with('/')
+        && !url.starts_with("http://localhost")
+        && !url.starts_with("https://localhost")
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "Only relative URLs (starting with /) or localhost URLs are allowed, got: {}",
+                url
+            ))),
+        ));
+    }
+
+    let payload = serde_json::json!({ "url": url });
 
     match ui_bridge_request_sync(&state, "page_navigate", payload).await {
         Ok(data) => Ok(Json(ApiResponse::success(data))),
@@ -1336,6 +1624,10 @@ pub struct AnnotatedScreenshotData {
     screenshot: String,
     width: i32,
     height: i32,
+    /// Device pixel ratio (physical pixels / CSS pixels).
+    /// Use this to scale CSS element bounds to screenshot pixel coordinates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scale_factor: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     monitor: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1448,6 +1740,30 @@ fn capture_window_screenshot(
         .capture_image()
         .map_err(|e| format!("Failed to capture window '{}': {}", title, e))?;
 
+    // Determine the scale factor from the monitor the window is on
+    let scale = {
+        use xcap::Monitor;
+        let win_x = target.x().unwrap_or(0);
+        let win_y = target.y().unwrap_or(0);
+        Monitor::all()
+            .ok()
+            .and_then(|monitors| {
+                monitors.iter().find_map(|m| {
+                    let mx = m.x().unwrap_or(0);
+                    let my = m.y().unwrap_or(0);
+                    let ms = m.scale_factor().unwrap_or(1.0) as f64;
+                    let mw = (m.width().unwrap_or(0) as f64 / ms) as i32;
+                    let mh = (m.height().unwrap_or(0) as f64 / ms) as i32;
+                    if win_x >= mx && win_x < mx + mw && win_y >= my && win_y < my + mh {
+                        Some(ms)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or(1.0)
+    };
+
     let width = image.width() as i32;
     let height = image.height() as i32;
     let dynamic = image::DynamicImage::ImageRgba8(image);
@@ -1457,6 +1773,7 @@ fn capture_window_screenshot(
         screenshot: b64,
         width,
         height,
+        scale_factor: Some(scale),
         monitor: None,
         window_title: Some(title),
         window_app_name: Some(app),
@@ -1561,6 +1878,7 @@ fn capture_runner_window(
         screenshot: b64,
         width: crop_w as i32,
         height: crop_h as i32,
+        scale_factor: Some(scale),
         monitor: None,
         window_title: Some(title.to_string()),
         window_app_name: Some("Qontinui Runner".to_string()),
@@ -1591,6 +1909,7 @@ fn capture_monitor_screenshot(
         monitors.into_iter().next().unwrap()
     };
 
+    let scale = monitor.scale_factor().unwrap_or(1.0) as f64;
     let image = monitor
         .capture_image()
         .map_err(|e| format!("Failed to capture monitor: {}", e))?;
@@ -1604,6 +1923,7 @@ fn capture_monitor_screenshot(
         screenshot: b64,
         width,
         height,
+        scale_factor: Some(scale),
         monitor: monitor_index,
         window_title: None,
         window_app_name: None,
@@ -1647,8 +1967,11 @@ pub async fn ui_bridge_annotated_screenshot_handler(
             let window = state.app_handle.get_webview_window("main");
             if let Some(win) = window {
                 let scale = win.scale_factor().unwrap_or(1.0);
-                let pos = win.outer_position().unwrap_or_default();
-                let size = win.outer_size().unwrap_or_default();
+                // Use inner_position/inner_size for the content area (viewport).
+                // Element bounds from the UI Bridge SDK are relative to the viewport,
+                // not the outer window frame (which includes title bar).
+                let pos = win.inner_position().unwrap_or_default();
+                let size = win.inner_size().unwrap_or_default();
                 let x = pos.x;
                 let y = pos.y;
                 let w = size.width;
@@ -2592,6 +2915,146 @@ pub async fn ui_bridge_ai_find_handler(
     }
 }
 
+/// Find elements matching criteria.
+pub async fn ui_bridge_find_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Find elements");
+
+    match ui_bridge_request_sync(&state, "find", request).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get all workflows.
+pub async fn ui_bridge_get_workflows_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting workflows");
+
+    match ui_bridge_request_sync(&state, "get_workflows", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get element state by ID.
+pub async fn ui_bridge_get_element_state_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting element state for {}", id);
+
+    match ui_bridge_request_sync(
+        &state,
+        "get_element_state",
+        serde_json::json!({ "elementId": id }),
+    )
+    .await
+    {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get render log entries.
+pub async fn ui_bridge_get_render_log_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting render log");
+
+    let log = state.ui_bridge_render_log.lock().await;
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "entries": *log,
+        "count": log.len()
+    }))))
+}
+
+/// UI Bridge diagnostics endpoint.
+pub async fn ui_bridge_diagnostics_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Diagnostics");
+
+    let cb_state = state.ui_bridge_circuit_breaker.get_state().await;
+    let failure_count = state.ui_bridge_circuit_breaker.get_failure_count();
+    let available_permits = state.ui_bridge_semaphore.available_permits();
+    let last_pong = state
+        .ui_bridge_last_pong
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let pending_count = state.ui_bridge_pending.lock().await.len();
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "circuitBreaker": {
+            "state": format!("{:?}", cb_state),
+            "consecutiveFailures": failure_count
+        },
+        "semaphore": {
+            "availablePermits": available_permits,
+            "maxPermits": 6
+        },
+        "frontend": {
+            "lastPongTimestamp": last_pong,
+            "lastPongAgeMs": if last_pong > 0 {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                now - last_pong
+            } else { 0 }
+        },
+        "pendingRequestCount": pending_count
+    }))))
+}
+
+/// Handle UI Bridge pong from frontend.
+pub async fn ui_bridge_pong_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state
+        .ui_bridge_last_pong
+        .store(now, std::sync::atomic::Ordering::Relaxed);
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "pong": true }),
+    )))
+}
+
+/// Accept an IPC response via HTTP (fallback when Tauri event system is unavailable).
+/// The frontend can POST responses here instead of using emit("ui-bridge-response").
+pub async fn ui_bridge_ipc_response_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(response): Json<serde_json::Value>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let pending = state.ui_bridge_pending.clone();
+    handle_ui_bridge_response(pending, response).await;
+    // Also update pong timestamp since this proves the frontend is alive
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state
+        .ui_bridge_last_pong
+        .store(now, std::sync::atomic::Ordering::Relaxed);
+    Json(ApiResponse::success(
+        serde_json::json!({ "received": true }),
+    ))
+}
+
 /// Create routes for this module.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
@@ -2692,6 +3155,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/page/refresh",
             post(ui_bridge_page_refresh_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/hard-refresh",
+            post(ui_bridge_page_hard_refresh_handler),
         )
         .route(
             "/ui-bridge/control/page/navigate",
@@ -2825,6 +3292,27 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/ai/find",
             post(ui_bridge_ai_find_handler),
+        )
+        // Find, workflows, element state, render log
+        .route("/ui-bridge/control/find", post(ui_bridge_find_handler))
+        .route(
+            "/ui-bridge/control/workflows",
+            get(ui_bridge_get_workflows_handler),
+        )
+        .route(
+            "/ui-bridge/control/element/:id/state",
+            get(ui_bridge_get_element_state_handler),
+        )
+        .route(
+            "/ui-bridge/control/render-log",
+            get(ui_bridge_get_render_log_handler),
+        )
+        // Diagnostics & health
+        .route("/ui-bridge/diagnostics", get(ui_bridge_diagnostics_handler))
+        .route("/ui-bridge/pong", post(ui_bridge_pong_handler))
+        .route(
+            "/ui-bridge/ipc-response",
+            post(ui_bridge_ipc_response_handler),
         )
         // Exploration
         .route("/ui-bridge/explore", post(start_ui_bridge_exploration))

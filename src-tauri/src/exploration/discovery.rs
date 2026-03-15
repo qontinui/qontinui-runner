@@ -222,7 +222,7 @@ impl FingerprintStateDiscovery {
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for fp_hash in fps {
             if let Some(fp) = self.fingerprints.get(fp_hash) {
-                if !fp.landmark_context.is_empty() {
+                if !fp.landmark_context.is_empty() && fp.landmark_context != "none" {
                     *counts.entry(&fp.landmark_context).or_insert(0) += 1;
                 }
             }
@@ -448,7 +448,7 @@ impl FingerprintStateDiscovery {
             parts.push("Global".to_string());
         }
 
-        if !landmark.is_empty() {
+        if !landmark.is_empty() && landmark != "none" {
             parts.push(
                 landmark
                     .replace('-', " ")

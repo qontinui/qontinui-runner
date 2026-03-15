@@ -155,9 +155,9 @@ impl Timeouts {
     }
 
     /// UI Bridge IPC timeout (frontend communication)
-    /// Default: 30 seconds - detect stuck UI
+    /// Default: 10 seconds - detect stuck UI
     pub fn ui_bridge_ipc() -> Duration {
-        Self::get_required_timeout("UI_BRIDGE_IPC", 30)
+        Self::get_required_timeout("UI_BRIDGE_IPC", 10)
     }
 
     /// HTTP request timeout for external APIs (auth, sync, etc.)

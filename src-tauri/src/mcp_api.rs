@@ -142,6 +142,11 @@ pub fn create_router(
         extraction_state: Arc::new(crate::mcp::extraction::ExtractionState::new()),
         sdk_connection: shared_sdk_connection,
         ui_bridge_pending: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        ui_bridge_circuit_breaker: Arc::new(crate::mcp::ui_bridge::UiBridgeCircuitBreaker::new()),
+        ui_bridge_semaphore: Arc::new(tokio::sync::Semaphore::new(6)),
+        ui_bridge_last_pong: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ui_bridge_dedup: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        ui_bridge_render_log: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         doctor_handle: None, // Doctor handle accessed via app_state.doctor_handle when needed
     });
 
@@ -180,6 +185,37 @@ pub fn create_router(
             }
         });
         info!("UI Bridge: Response listener set up");
+    }
+
+    // Set up UI Bridge pong listener for frontend liveness tracking
+    {
+        let last_pong = api_state.ui_bridge_last_pong.clone();
+        let handle = app_handle.clone();
+
+        use tauri::Listener;
+
+        handle.listen("ui-bridge-pong", move |_event| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            last_pong.store(now, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    // Start UI Bridge ping task (every 3s)
+    {
+        let handle = app_handle.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                interval.tick().await;
+                let _ = handle.emit(
+                    "ui-bridge-ping",
+                    serde_json::json!({ "timestamp": chrono::Utc::now().timestamp_millis() }),
+                );
+            }
+        });
     }
 
     // Resume interrupted unified workflows on startup

@@ -64,26 +64,39 @@ export function UIBridgeStateMachinePage() {
   const [selectedTransitionId, setSelectedTransitionId] = useState<string | null>(null);
   const [showNewTransition, setShowNewTransition] = useState(false);
   const [highlightedPath, setHighlightedPath] = useState<PathfindingResult["steps"] | undefined>();
-  // Thumbnails loaded from database when config changes
-  const [elementThumbnails, setElementThumbnails] = useState<Record<string, string> | undefined>();
+  // Thumbnails loaded from database when config changes, with localStorage fallback
+  const [elementThumbnails, setElementThumbnails] = useState<Record<string, string> | undefined>(() => {
+    try {
+      const stored = localStorage.getItem("qontinui-runner-sm-thumbnails");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed && Object.keys(parsed).length > 0) return parsed;
+      }
+    } catch { /* */ }
+    return undefined;
+  });
   const activeConfigId = sm.activeConfig?.id;
   useEffect(() => {
     if (!activeConfigId) {
       setElementThumbnails(undefined);
       return;
     }
-    console.log("[UIBridgeStateMachinePage] Loading thumbnails for config:", activeConfigId);
+    let isCancelled = false;
     invoke<Record<string, string>>("sm_get_thumbnails", { configId: activeConfigId })
       .then((thumbs) => {
-        console.log(`[UIBridgeStateMachinePage] Loaded ${Object.keys(thumbs).length} thumbnails`);
+        if (isCancelled) return;
         if (Object.keys(thumbs).length > 0) {
           setElementThumbnails(thumbs);
         }
       })
-      .catch((err) => {
-        console.error("[UIBridgeStateMachinePage] Failed to load thumbnails:", err);
+      .catch(() => {
+        // Command may not be available in older runner builds
       });
+    return () => {
+      isCancelled = true;
+    };
   }, [activeConfigId]);
+
 
   // Also sync from discovery co-occurrence data (available during exploration before save)
   const coocThumbs = discovery.cooccurrenceData?.elementThumbnails;
@@ -197,7 +210,7 @@ export function UIBridgeStateMachinePage() {
             <option value="">Select configuration...</option>
             {sm.configs.map((c) => (
               <option key={c.id} value={c.id}>
-                {c.name} ({c.render_count} renders)
+                {c.name}
               </option>
             ))}
           </select>

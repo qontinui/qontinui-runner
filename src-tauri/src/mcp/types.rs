@@ -59,6 +59,23 @@ pub struct ApiState {
     /// Pending UI Bridge requests waiting for frontend response
     pub ui_bridge_pending:
         Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
+    /// UI Bridge circuit breaker state
+    pub ui_bridge_circuit_breaker: Arc<crate::mcp::ui_bridge::UiBridgeCircuitBreaker>,
+    /// UI Bridge concurrency semaphore (max 6 concurrent requests)
+    pub ui_bridge_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Last frontend pong timestamp (epoch ms)
+    pub ui_bridge_last_pong: Arc<std::sync::atomic::AtomicU64>,
+    /// Pending dedup channels for read-only UI Bridge requests
+    pub ui_bridge_dedup: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                tokio::sync::broadcast::Sender<Result<serde_json::Value, String>>,
+            >,
+        >,
+    >,
+    /// Render log entries for diagnostics (in-memory)
+    pub ui_bridge_render_log: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
     /// Web extraction state tracking
     pub extraction_state: Arc<crate::mcp::extraction::ExtractionState>,
     /// SDK app connections manager (supports multiple simultaneous connections)

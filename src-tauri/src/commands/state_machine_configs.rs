@@ -204,6 +204,7 @@ pub async fn sm_get_thumbnails(
     config_id: String,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
+    info!("Loading thumbnails for config {}", config_id);
     let conn = app_state.checkpoint_db.get_conn()?;
     let mut stmt = conn
         .prepare("SELECT fingerprint_hash, thumbnail_base64 FROM sm_element_thumbnails WHERE config_id = ?1")
@@ -218,5 +219,10 @@ pub async fn sm_get_thumbnails(
         let (hash, data) = row.map_err(|e| format!("Row error: {}", e))?;
         result.insert(hash, data);
     }
+    info!(
+        "Loaded {} thumbnails for config {}",
+        result.len(),
+        config_id
+    );
     Ok(result)
 }

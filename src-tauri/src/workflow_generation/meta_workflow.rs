@@ -223,7 +223,10 @@ pub fn build_meta_workflow_template(
                 steps.push(spec_step);
             }
 
-            // Step 3: Builder — generates workflow JSON, informed by acceptance criteria
+            // Step 3: Builder — generates workflow JSON, informed by acceptance criteria.
+            // input_path reads criteria.json produced by the non-required spec step.
+            // If spec failed/skipped, criteria.json won't exist — the builder proceeds
+            // without it since input_path reads are now gracefully degraded to warnings.
             {
                 let builder_step = json!({
                     "id": Uuid::new_v4().to_string(),
@@ -235,8 +238,6 @@ pub fn build_meta_workflow_template(
                     "output_path": "{{artifact_dir}}/workflow.json",
                     "input_path": "{{artifact_dir}}/criteria.json"
                 });
-                // If investigation ran, the criteria already incorporate it.
-                // The builder still reads criteria.json which includes the enriched context.
                 steps.push(builder_step);
             }
 

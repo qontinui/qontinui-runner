@@ -497,7 +497,10 @@ async fn execute_prompt_response_mode(
     // Build the prompt content
     let mut prompt = step.prompt_content.clone().unwrap_or_default();
 
-    // If input_path is specified, read the file and append to prompt
+    // If input_path is specified, read the file and append to prompt.
+    // Missing input files are treated as warnings — the input is supplementary context
+    // from a prior step that may have failed or been skipped (e.g., non-required spec step).
+    // This allows the step to proceed with its own prompt content.
     if let Some(ref input_path) = step.input_path {
         match std::fs::read_to_string(input_path) {
             Ok(content) => {
@@ -507,7 +510,11 @@ async fn execute_prompt_response_mode(
                 );
             }
             Err(e) => {
-                return Err(format!("Failed to read input file '{}': {}", input_path, e));
+                tracing::warn!(
+                    "Input file '{}' not found ({}), proceeding without supplementary context",
+                    input_path,
+                    e
+                );
             }
         }
     }
@@ -2254,7 +2261,7 @@ impl SetupExecutor {
                                 config: crate::step_executor::StepExecutionConfig::default(),
                                 verification_details: None,
                                 output_data: Some(serde_json::json!({ "output": output })),
-                                required: None,
+                                required: step.required,
                                 resolved_inputs: None,
                                 extracted_values: None,
                                 failure_category: None,
@@ -2263,6 +2270,7 @@ impl SetupExecutor {
                         }
                         Err(e) => {
                             let duration_ms = 0u64; // Duration already elapsed during retries
+                            response_step_count += 1; // Increment to avoid step_index collisions with subsequent steps
                             warn!(
                                 "SETUP-PHASE: Response-mode step '{}' failed: {}",
                                 step_name, e
@@ -2300,6 +2308,7 @@ impl SetupExecutor {
                                 warn!("Failed to log setup AI step error event: {}", log_err);
                             }
 
+                            let is_required = step.required.unwrap_or(true);
                             all_results.push(StepExecutionResult {
                                 step_index: all_results.len(),
                                 step_type: "prompt".to_string(),
@@ -2314,13 +2323,21 @@ impl SetupExecutor {
                                 config: crate::step_executor::StepExecutionConfig::default(),
                                 verification_details: None,
                                 output_data: None,
-                                required: None,
+                                required: step.required,
                                 resolved_inputs: None,
                                 extracted_values: None,
                                 failure_category: None,
                                 interrupted: Some(true),
                             });
-                            return (false, all_results);
+                            if is_required {
+                                return (false, all_results);
+                            } else {
+                                warn!(
+                                    "SETUP-PHASE: Non-required response-mode step '{}' failed, continuing",
+                                    step_name
+                                );
+                                // Non-required step failure doesn't affect overall_success
+                            }
                         }
                     }
                 } else {

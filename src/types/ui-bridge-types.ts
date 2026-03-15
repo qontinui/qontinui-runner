@@ -152,6 +152,29 @@ export interface ExternalElement {
   depth?: number;
   _discovered?: boolean;
 
+  // Category
+  category?: 'interactive' | 'content' | 'media';
+
+  // Media metadata (for media elements)
+  mediaMetadata?: {
+    mediaType: string;
+    src?: string;
+    altText?: string;
+    isDecorative: boolean;
+    naturalWidth?: number;
+    naturalHeight?: number;
+    renderedWidth: number;
+    renderedHeight: number;
+    oversizeRatio?: number;
+    loadingState: string;
+    lazyLoading: boolean;
+    format?: string;
+    transferSize?: number;
+    srcset?: string;
+    sizes?: string;
+    svgViewBox?: string;
+  };
+
   // Fingerprint for cross-page element matching
   fingerprint?: ElementFingerprint;
 }

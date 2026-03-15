@@ -59,6 +59,10 @@ pub struct SdkConnection {
 pub struct SdkConnectionManager {
     pub connections: HashMap<String, SdkConnection>,
     pub active_url: Option<String>,
+    /// Cached responsiveness status of the active app (from health endpoint)
+    pub active_responsive: Option<bool>,
+    /// Timestamp (ms) of the last responsiveness check
+    pub active_responsive_checked_at: i64,
 }
 
 impl SdkConnectionManager {
@@ -66,6 +70,8 @@ impl SdkConnectionManager {
         Self {
             connections: HashMap::new(),
             active_url: None,
+            active_responsive: None,
+            active_responsive_checked_at: 0,
         }
     }
 
@@ -154,22 +160,92 @@ pub struct ConnectResponse {
 // Core Client
 // =============================================================================
 
-/// Send an HTTP request to the connected SDK app
+/// Send an HTTP request to the connected SDK app.
+///
+/// Before making the request, checks if the SDK app is responsive (cached for
+/// 10 seconds). If the app reports `responsive: false` (no active browser tab),
+/// returns an error immediately so handlers can fall back to IPC.
 pub async fn sdk_request(
     state: &Arc<ApiState>,
     method: Method,
     path: &str,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let conn_guard = state.sdk_connection.lock().await;
-    let conn = conn_guard
-        .active_connection()
-        .ok_or_else(|| "No active SDK app connection".to_string())?;
+    // 1. Read connection info and check cached responsiveness
+    let (app_url, base_path, client) = {
+        let conn_guard = state.sdk_connection.lock().await;
+        let conn = conn_guard
+            .active_connection()
+            .ok_or_else(|| "No active SDK app connection".to_string())?;
 
-    let url = format!("{}{}{}", conn.app_url, conn.base_path, path);
+        // If we recently checked and the app is not responsive, fail fast
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let cache_age = now_ms - conn_guard.active_responsive_checked_at;
+        if cache_age < 10_000 {
+            if conn_guard.active_responsive == Some(false) {
+                return Err("SDK app is not responsive (no active browser tab)".to_string());
+            }
+        }
+
+        (
+            conn.app_url.clone(),
+            conn.base_path.clone(),
+            conn.client.clone(),
+        )
+    };
+    // Mutex released — safe to make HTTP requests
+
+    // 2. Refresh responsiveness cache if stale (>10s or never checked)
+    {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let conn_guard = state.sdk_connection.lock().await;
+        let cache_age = now_ms - conn_guard.active_responsive_checked_at;
+        if cache_age >= 10_000 {
+            // Drop the lock before making HTTP request
+            drop(conn_guard);
+
+            let health_url = format!("{}{}/health", app_url, base_path);
+            let responsive = match client
+                .get(&health_url)
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|h| h.get("data")?.get("responsive")?.as_bool())
+                    .unwrap_or(true),
+                _ => true, // Assume responsive if health check fails
+            };
+
+            // Re-acquire lock to update cache
+            let mut conn_guard = state.sdk_connection.lock().await;
+            conn_guard.active_responsive = Some(responsive);
+            conn_guard.active_responsive_checked_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+
+            if !responsive {
+                debug!("SDK app at {} is not responsive, skipping", app_url);
+                return Err("SDK app is not responsive (no active browser tab)".to_string());
+            }
+        }
+    }
+
+    // 3. Make the actual SDK request
+    let url = format!("{}{}{}", app_url, base_path, path);
     debug!(url = %url, method = %method, "SDK request");
 
-    let mut request = conn.client.request(method.clone(), &url);
+    let mut request = client.request(method.clone(), &url);
 
     if let Some(body) = body {
         request = request.json(&body);
@@ -251,6 +327,8 @@ async fn handle_connect(
         if manager.connections.contains_key(&url) {
             // Already connected — just make it active
             manager.active_url = Some(url.clone());
+            manager.active_responsive = None;
+            manager.active_responsive_checked_at = 0;
             let conn = manager.connections.get(&url).unwrap();
             let response = ConnectResponse {
                 app: conn.app_info.clone(),
@@ -380,6 +458,8 @@ pub async fn connect_sdk_app(
         },
     );
     manager.active_url = Some(url.to_string());
+    manager.active_responsive = None;
+    manager.active_responsive_checked_at = 0;
 
     info!("Connected to SDK app: {}", response.app.app_name);
     Ok(response)
@@ -455,6 +535,8 @@ async fn handle_disconnect(
                 // If we disconnected the active connection, clear active_url
                 if manager.active_url.as_deref() == Some(&url) {
                     manager.active_url = None;
+                    manager.active_responsive = None;
+                    manager.active_responsive_checked_at = 0;
                 }
                 info!("Disconnected from SDK app: {} ({})", name, url);
                 Json(ApiResponse::success(format!("Disconnected from {}", name)))
@@ -577,6 +659,22 @@ async fn handle_elements(
 ) -> impl IntoResponse {
     match sdk_request(&state, Method::GET, "/control/elements", None).await {
         Ok(mut data) => {
+            // Normalize: if data.data is an object with an "elements" array, flatten it
+            // so the response is { "success": true, "data": [...elements...] }.
+            // The Tauri IPC handler returns { elements: [...], count: N } but SDK
+            // consumers expect a flat array.
+            if let Some(inner) = data
+                .get("data")
+                .and_then(|d| d.as_object())
+                .and_then(|obj| obj.get("elements"))
+                .and_then(|e| e.as_array())
+                .cloned()
+            {
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert("data".to_string(), serde_json::json!(inner));
+                }
+            }
+
             // Add helpful note if no elements found
             if let Some(arr) = data.get("data").and_then(|d| d.as_array()) {
                 if arr.is_empty() {
@@ -670,10 +768,32 @@ async fn handle_elements(
 
             (StatusCode::OK, Json(data))
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "success": false, "error": e })),
-        ),
+        Err(_sdk_err) => {
+            // No SDK app connected — fall back to the runner's own UI via IPC
+            debug!("SDK elements unavailable, falling back to IPC control endpoint");
+            match ui_bridge_request_sync(&state, "get_elements", serde_json::json!({})).await {
+                Ok(mut data) => {
+                    // Normalize: IPC returns { elements: [...], count: N }
+                    if let Some(inner) = data
+                        .as_object()
+                        .and_then(|obj| obj.get("elements"))
+                        .and_then(|e| e.as_array())
+                        .cloned()
+                    {
+                        data = serde_json::json!(inner);
+                    }
+                    let total = data.as_array().map(|a| a.len()).unwrap_or(0);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "success": true, "data": data, "total": total })),
+                    )
+                }
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "success": false, "error": e })),
+                ),
+            }
+        }
     }
 }
 
@@ -682,10 +802,19 @@ async fn handle_element(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Json<serde_json::Value> {
+    let id = id.trim().to_string();
     let path = format!("/control/element/{}", id);
     match sdk_request(&state, Method::GET, &path, None).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_) => {
+            // Fall back to IPC
+            match ui_bridge_request_sync(&state, "get_element", serde_json::json!({ "id": id }))
+                .await
+            {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -695,10 +824,38 @@ async fn handle_element_action(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    let id = id.trim().to_string();
     let path = format!("/control/element/{}/action", id);
-    match sdk_request(&state, Method::POST, &path, Some(body)).await {
+    match sdk_request(&state, Method::POST, &path, Some(body.clone())).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_) => {
+            // Fall back to IPC — wrap action in an object to match the format
+            // expected by the TypeScript handler (action.action, action.params, etc.)
+            let action_name = body
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("click");
+            let params = body
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::json!(null));
+            let wait_options = body
+                .get("waitOptions")
+                .cloned()
+                .unwrap_or(serde_json::json!(null));
+            let payload = serde_json::json!({
+                "elementId": id,
+                "action": {
+                    "action": action_name,
+                    "params": params,
+                    "waitOptions": wait_options
+                }
+            });
+            match ui_bridge_request_sync(&state, "execute_action", payload).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -730,9 +887,26 @@ async fn handle_discover(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::POST, "/control/find", Some(body)).await {
+    match sdk_request(&state, Method::POST, "/control/find", Some(body.clone())).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_) => {
+            // Fall back to IPC — get all elements and return as discovery result
+            match ui_bridge_request_sync(&state, "get_elements", serde_json::json!({})).await {
+                Ok(mut data) => {
+                    // Normalize IPC response
+                    if let Some(inner) = data
+                        .as_object()
+                        .and_then(|obj| obj.get("elements"))
+                        .and_then(|e| e.as_array())
+                        .cloned()
+                    {
+                        data = serde_json::json!(inner);
+                    }
+                    Json(serde_json::json!({ "success": true, "data": data }))
+                }
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -753,7 +927,13 @@ async fn handle_components(State(state): State<Arc<ApiState>>) -> Json<serde_jso
             }
             Json(data)
         }
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_) => {
+            // Fall back to IPC
+            match ui_bridge_request_sync(&state, "get_components", serde_json::json!({})).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -787,7 +967,14 @@ async fn handle_console_errors(
     }
     match sdk_request(&state, Method::GET, &path, None).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_) => {
+            // Fall back to IPC
+            match ui_bridge_request_sync(&state, "get_console_errors", serde_json::json!({})).await
+            {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -893,7 +1080,13 @@ async fn handle_clipboard_write(
 async fn handle_forms(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/control/forms", None).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_) => {
+            // Fall back to IPC
+            match ui_bridge_request_sync(&state, "get_forms", serde_json::json!({})).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -969,7 +1162,15 @@ async fn handle_network_requests(
     }
     match sdk_request(&state, Method::GET, &path, None).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_) => {
+            // Fall back to IPC
+            match ui_bridge_request_sync(&state, "get_network_requests", serde_json::json!({}))
+                .await
+            {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -1129,6 +1330,13 @@ async fn handle_wait_for_targets(
 // Page Navigation Relay Handlers
 // =============================================================================
 
+/// GET /ui-bridge/sdk/windows — List capturable windows
+async fn handle_windows(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<Vec<super::ui_bridge::WindowInfo>>> {
+    super::ui_bridge::ui_bridge_list_windows_handler(axum::extract::State(state)).await
+}
+
 /// GET /ui-bridge/sdk/tabs — List connected browser tabs
 async fn handle_tabs(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/tabs", None).await {
@@ -1151,7 +1359,13 @@ async fn handle_page_refresh(
     .await
     {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_) => {
+            // Fall back to IPC
+            match ui_bridge_request_sync(&state, "page_refresh", serde_json::json!({})).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -1160,9 +1374,22 @@ async fn handle_page_navigate(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::POST, "/control/page/navigate", Some(body)).await {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/page/navigate",
+        Some(body.clone()),
+    )
+    .await
+    {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_) => {
+            // Fall back to IPC
+            match ui_bridge_request_sync(&state, "page_navigate", body).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -1237,6 +1464,8 @@ async fn handle_switch(
             base_path: conn.base_path.clone(),
         };
         manager.active_url = Some(url.clone());
+        manager.active_responsive = None;
+        manager.active_responsive_checked_at = 0;
         info!(
             "Switched active SDK connection to: {} ({})",
             response.app.app_name, url
@@ -1312,6 +1541,8 @@ async fn handle_check_health(State(state): State<Arc<ApiState>>) -> Json<serde_j
         }
         if manager.active_url.as_deref() == Some(url.as_str()) {
             manager.active_url = None;
+            manager.active_responsive = None;
+            manager.active_responsive_checked_at = 0;
         }
     }
 
@@ -2077,7 +2308,13 @@ async fn handle_ct_get_change_buffer_size(
 async fn handle_undo_state(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/control/undo-state", None).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_) => {
+            // Fall back to IPC
+            match ui_bridge_request_sync(&state, "get_undo_state", serde_json::json!({})).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -2142,10 +2379,19 @@ async fn handle_element_state(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Json<serde_json::Value> {
+    let id = id.trim().to_string();
     let path = format!("/control/element/{}/state", id);
     match sdk_request(&state, Method::GET, &path, None).await {
         Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(_) => {
+            // Fall back to IPC — get element details which include state
+            match ui_bridge_request_sync(&state, "get_element", serde_json::json!({ "id": id }))
+                .await
+            {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -2797,6 +3043,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(handle_wait_for_targets),
         )
         .route("/ui-bridge/sdk/diagnose-stuck", post(handle_diagnose_stuck))
+        // Windows
+        .route("/ui-bridge/sdk/windows", get(handle_windows))
         // Tab registry
         .route("/ui-bridge/sdk/tabs", get(handle_tabs))
         // Page navigation
@@ -3316,8 +3564,128 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/control/error-report",
             get(handle_error_report),
         )
+        // Media discovery & analysis
+        .route("/ui-bridge/sdk/ai/media/find", post(handle_media_find))
+        .route(
+            "/ui-bridge/sdk/ai/media/audit/accessibility",
+            post(handle_media_audit_accessibility),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/media/audit/performance",
+            post(handle_media_audit_performance),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/media/snapshot",
+            post(handle_media_snapshot),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/media/compare",
+            post(handle_media_compare),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/media/analyze",
+            post(handle_media_analyze),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/media/analyze/batch",
+            post(handle_media_analyze_batch),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/media/analyze/page",
+            post(handle_media_analyze_page),
+        )
         // Heartbeat
         .route("/ui-bridge/sdk/heartbeat", post(handle_heartbeat))
+}
+
+// =============================================================================
+// Media Discovery & Analysis
+// =============================================================================
+
+/// POST /ui-bridge/sdk/ai/media/find — Find media elements with filters
+async fn handle_media_find(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/media/find", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/media/audit/accessibility — Alt text audit
+async fn handle_media_audit_accessibility(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/media/audit/accessibility", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/media/audit/performance — Performance audit
+async fn handle_media_audit_performance(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/media/audit/performance", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/media/snapshot — Capture media snapshot
+async fn handle_media_snapshot(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/media/snapshot", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/media/compare — Compare two media snapshots
+async fn handle_media_compare(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/media/compare", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/media/analyze — AI analysis of single media element
+async fn handle_media_analyze(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/media/analyze", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/media/analyze/batch — AI analysis of multiple media elements
+async fn handle_media_analyze_batch(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/media/analyze/batch", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/media/analyze/page — AI analysis of all visible media on page
+async fn handle_media_analyze_page(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/ai/media/analyze/page", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
 }
 
 // =============================================================================

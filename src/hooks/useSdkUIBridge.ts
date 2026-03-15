@@ -948,10 +948,6 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
       }
 
       // Build transitions from captures that have triggeredBy
-      const triggeredCount = captures.filter((c) => c.triggeredBy).length;
-      console.log(
-        `[useSdkUIBridge] Building transitions: ${captures.length} captures, ${triggeredCount} with triggeredBy`,
-      );
       const transitions: CooccurrenceExport["transitions"] = [];
       for (const cap of captures) {
         if (!cap.triggeredBy) continue;
@@ -1133,29 +1129,12 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
           const mapped = (rawElements as Record<string, unknown>[]).map(mapSdkElement);
           const { catalog } = generateFingerprints(mapped);
 
-          // Also update the hook state and capture session
+          // Update hook state
           setElements(mapped);
 
+          // Record capture in session (MUST succeed for transitions to work)
           const session = captureSessionRef.current;
           if (session) {
-            // Track element bounds for thumbnail cropping
-            if (!session.elementBoundsMap) session.elementBoundsMap = {};
-            for (const el of mapped) {
-              if (
-                el.fingerprint?.hash &&
-                el.bounds &&
-                el.bounds.width > 0 &&
-                el.bounds.height > 0
-              ) {
-                session.elementBoundsMap[el.fingerprint.hash] = {
-                  x: el.bounds.x,
-                  y: el.bounds.y,
-                  width: el.bounds.width,
-                  height: el.bounds.height,
-                };
-              }
-            }
-
             const hashes = extractFingerprintHashes(mapped);
             const captureId = `cap-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
             const capture: CaptureRecord = {
@@ -1170,6 +1149,17 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
             session.lastCaptureId = captureId;
             Object.assign(session.fingerprintCatalog, catalog);
 
+            // Track element bounds for thumbnail cropping
+            if (!session.elementBoundsMap) session.elementBoundsMap = {};
+            for (const el of mapped) {
+              if (el.fingerprint?.hash && el.bounds && el.bounds.width > 0 && el.bounds.height > 0) {
+                session.elementBoundsMap[el.fingerprint.hash] = {
+                  x: el.bounds.x, y: el.bounds.y,
+                  width: el.bounds.width, height: el.bounds.height,
+                };
+              }
+            }
+
             setCaptureSession({
               active: true,
               sessionId: session.sessionId,
@@ -1178,29 +1168,48 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
               uniqueFingerprints: Object.keys(session.fingerprintCatalog).length,
             });
 
-            // Capture element thumbnails for new elements from the current page screenshot
-            if (Object.keys(session.elementBoundsMap || {}).length > 0) {
-              try {
-                const ssResp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/screenshot`);
+            // Capture thumbnails (non-fatal, in separate try/catch)
+            try {
+              if (Object.keys(session.elementBoundsMap).length > 0) {
+                // Capture the connected app's window so element bounds align with the screenshot.
+                // For self-connection (same port), use runner=true (Tauri window capture).
+                // For cross-runner connections, target the other window by title.
+                const ssParams = new URLSearchParams();
+                const isSelfConnection = connectedApp?.port === Number(new URL(getApiBase()).port);
+                if (isSelfConnection) {
+                  ssParams.set("runner", "true");
+                } else if (connectedApp?.appName) {
+                  // Try window title match for the other runner instance
+                  ssParams.set("window_title", connectedApp.appName);
+                }
+                const ssUrl = `${getApiBase()}/ui-bridge/sdk/screenshot${ssParams.toString() ? `?${ssParams}` : ""}`;
+                const ssResp = await tracedFetch(ssUrl);
                 const ssJson = await ssResp.json();
                 if (ssJson.success && ssJson.data?.screenshot) {
+                  const dpr = ssJson.data.scaleFactor || 1;
                   const existingThumbs = session.elementThumbnails || {};
                   const newElements = Object.entries(session.elementBoundsMap)
                     .filter(([hash]) => !existingThumbs[hash])
-                    .map(([hash, bounds]) => ({ id: hash, bounds }));
+                    .map(([hash, bounds]) => ({
+                      id: hash,
+                      bounds: {
+                        x: (bounds as { x: number }).x * dpr,
+                        y: (bounds as { y: number }).y * dpr,
+                        width: (bounds as { width: number }).width * dpr,
+                        height: (bounds as { height: number }).height * dpr,
+                      },
+                    }));
                   if (newElements.length > 0) {
-                    const thumbs = await cropThumbnails(ssJson.data.screenshot, newElements, {
-                      maxSize: 48,
-                    });
+                    const thumbs = await cropThumbnails(ssJson.data.screenshot, newElements, { maxSize: 48 });
                     if (!session.elementThumbnails) session.elementThumbnails = {};
                     for (const [id, data] of thumbs) {
                       session.elementThumbnails[id] = data;
                     }
                   }
                 }
-              } catch {
-                // Non-fatal — thumbnails are optional
               }
+            } catch {
+              // Thumbnails are optional — don't fail the capture
             }
           }
 
@@ -1210,7 +1219,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
         }
       };
 
-      const executeExplorationAction = async (elementId: string, action: string): Promise<void> => {
+      const executeExplorationAction = async (elementId: string, action: string): Promise<ExternalElement[]> => {
         const session = captureSessionRef.current;
         const beforeCaptureId = session?.lastCaptureId || null;
 
@@ -1224,8 +1233,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
             },
           );
         } catch {
-          // Action failed, continue with exploration
-          return;
+          // Action failed — still capture current state for co-occurrence
         }
 
         // Wait for UI to settle, then capture
@@ -1238,13 +1246,8 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
           const afterCaptureId = session.lastCaptureId;
           if (afterCaptureId && afterCaptureId !== beforeCaptureId) {
             const afterCapture = session.captures.find((c) => c.captureId === afterCaptureId);
-            console.log(
-              `[useSdkUIBridge] Transition: ${beforeCaptureId} -> ${afterCaptureId} (found=${!!afterCapture})`,
-            );
             const targetEl =
-              afterElements.find((e) => e.id === elementId) ||
-              // Element may have disappeared; look up by fingerprint in pre-action elements
-              undefined;
+              afterElements.find((e) => e.id === elementId) || undefined;
             const targetFingerprint = targetEl?.fingerprint?.hash || "";
 
             if (afterCapture) {
@@ -1254,16 +1257,10 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
                 previousCaptureId: beforeCaptureId,
               };
             }
-          } else {
-            console.log(
-              `[useSdkUIBridge] No transition: beforeId=${beforeCaptureId}, afterId=${afterCaptureId}`,
-            );
           }
-        } else {
-          console.log(
-            `[useSdkUIBridge] No transition: session=${!!session}, beforeId=${beforeCaptureId}`,
-          );
         }
+
+        return afterElements;
       };
 
       /**
@@ -1334,11 +1331,9 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
         // Capture the fingerprint set before the action
         const beforeFingerprints = new Set(extractFingerprintHashes(currentElements));
 
-        // Execute click
-        await executeExplorationAction(element.id, "click");
-
-        // Get the new state
-        currentElements = await fetchLatestElements();
+        // Execute click — creates a capture with triggeredBy for transition tracking
+        // and returns the post-action elements (avoids duplicate fetchLatestElements call)
+        currentElements = await executeExplorationAction(element.id, "click");
         const afterFingerprints = new Set(extractFingerprintHashes(currentElements));
 
         // Detect significant change: more than 30% of fingerprints changed
@@ -1395,8 +1390,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
             console.log(
               `[useSdkUIBridge] Attempting to navigate back via "${backElement.accessibleName || backElement.label || backElement.text || backElement.id}"`,
             );
-            await executeExplorationAction(backElement.id, "click");
-            currentElements = await fetchLatestElements();
+            currentElements = await executeExplorationAction(backElement.id, "click");
 
             // Check if we returned to baseline
             const returnedFingerprints = new Set(extractFingerprintHashes(currentElements));
