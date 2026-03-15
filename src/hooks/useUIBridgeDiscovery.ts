@@ -211,13 +211,39 @@ export function useUIBridgeDiscovery(
       // Create states via direct Tauri IPC to avoid React state batching issue.
       // createConfig sets activeConfig asynchronously, so calling smConfig.createState
       // immediately would fail because activeConfig hasn't updated yet.
+      const fpDetails = cooccurrenceData.fingerprintDetails ?? {};
       for (const state of result.states) {
+        // Build element labels and positions from fingerprint details so they
+        // survive across sessions (stored in extra_metadata).
+        const elementLabels: Record<string, string> = {};
+        const elementPositions: Record<string, { top: number; left: number }> = {};
+        const elementTags: Record<string, { tagName: string; role: string; zone: string }> = {};
+        for (const eid of state.elementIds) {
+          const fp = fpDetails[eid];
+          if (fp) {
+            elementLabels[eid] = fp.accessibleName || fp.role || fp.tagName || eid.slice(0, 12);
+            if (fp.relativePosition) {
+              elementPositions[eid] = fp.relativePosition;
+            }
+            elementTags[eid] = {
+              tagName: fp.tagName || "",
+              role: fp.role || "",
+              zone: fp.positionZone || "",
+            };
+          }
+        }
+
         const request: StateMachineStateCreate = {
           state_id: state.stateId,
           name: state.name,
           description: state.landmarkContext || "",
           element_ids: state.elementIds,
           confidence: state.confidence,
+          extra_metadata: {
+            elementLabels,
+            elementPositions,
+            elementTags,
+          },
         };
         try {
           await invoke<StateMachineState>("sm_create_state", {

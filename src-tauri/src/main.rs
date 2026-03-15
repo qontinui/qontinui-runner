@@ -123,6 +123,9 @@ use tracing::{error, info, warn};
 use video_recorder::VideoRecordingService;
 
 fn main() {
+    // Enable backtraces in crash dumps for better diagnostics
+    std::env::set_var("RUST_BACKTRACE", "1");
+
     // Initialize lifecycle debugging BEFORE anything else
     debug_lifecycle::init_lifecycle_debug();
 
@@ -1362,22 +1365,52 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // which is exactly what we want.)
                 instance_manager::clear_active_instances();
 
-                // Stop all bridges via bridge manager
+                // ── Explicit shutdown ordering ──
+                // Take PythonBridge (via bridge manager) and ExtractionExecutor out
+                // of AppState and clean them up on a dedicated thread with its own
+                // runtime, so Drop never runs inside Tauri's async context.
+                let extraction = {
+                    if let Ok(mut guard) = app_state.extraction_executor.lock() {
+                        guard.take()
+                    } else {
+                        None
+                    }
+                };
+
                 let app_state_clone = app_state.inner().clone();
-                tauri::async_runtime::block_on(async {
-                    let manager_guard = app_state_clone.bridge_manager.lock().await;
-                    if let Some(ref manager) = *manager_guard {
-                        info!("Stopping all bridges via bridge manager");
-                        manager.remove_all().await;
+
+                let shutdown_handle = std::thread::spawn(move || {
+                    // Build a small current-thread runtime for the cleanup work
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+
+                    match rt {
+                        Ok(rt) => {
+                            // Stop all bridges via bridge manager
+                            rt.block_on(async {
+                                let manager_guard =
+                                    app_state_clone.bridge_manager.lock().await;
+                                if let Some(ref manager) = *manager_guard {
+                                    info!("Stopping all bridges via bridge manager");
+                                    manager.remove_all().await;
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to create shutdown runtime: {}", e);
+                        }
+                    }
+
+                    // Stop extraction executor (synchronous — owns its own runtime)
+                    if let Some(mut ee) = extraction {
+                        info!("Stopping extraction executor on shutdown thread");
+                        let _ = ee.stop();
                     }
                 });
 
-                // Stop extraction executor
-                if let Ok(mut executor) = app_state.extraction_executor.lock() {
-                    if let Some(ref mut ee) = *executor {
-                        let _ = ee.stop();
-                    }
-                };
+                // Wait for the dedicated shutdown thread (bounded wait)
+                let _ = shutdown_handle.join();
 
                 // Close all interactive Claude sessions
                 if let Some(sm) =

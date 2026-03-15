@@ -181,19 +181,49 @@ impl ExtractionExecutor {
     }
 
     /// Stops the extraction executor process (internal implementation).
+    ///
+    /// Detects whether we are inside an async context and, if so, offloads the
+    /// `block_on` call to a dedicated thread to avoid the "cannot start a runtime
+    /// from within a runtime" panic.
     fn stop_internal(&mut self) -> Result<(), String> {
         info!("Stopping extraction executor");
 
-        // Initiate shutdown
-        self.runtime.block_on(async {
-            let lifecycle = self.lifecycle.read().await;
-            let _ = lifecycle.shutdown().await;
-        });
+        // Initiate shutdown — use a dedicated thread if we are already inside a
+        // tokio runtime to avoid nested block_on panic.
+        let runtime = Arc::clone(&self.runtime);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let protocol_handler_sender = self.protocol_handler.get_sender();
+
+        let do_async_cleanup = move || {
+            runtime.block_on(async {
+                let lc = lifecycle.read().await;
+                let _ = lc.shutdown().await;
+
+                // Send stop command if channel is available
+                if let Some(tx) = protocol_handler_sender {
+                    let stop_cmd = ExecutorCommand {
+                        cmd_type: "command".to_string(),
+                        id: uuid::Uuid::new_v4().to_string(),
+                        command: "stop".to_string(),
+                        params: None,
+                    };
+                    let _ = tx.send(stop_cmd).await;
+                }
+            });
+        };
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // We are inside an async context — run block_on on a dedicated thread
+            let handle = std::thread::spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(do_async_cleanup));
+            });
+            let _ = handle.join();
+        } else {
+            // Not in an async context — safe to call directly, still wrap for safety
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(do_async_cleanup));
+        }
 
         if let Some(mut process) = self.process.take() {
-            // Send stop command
-            let _ = self.send_command("stop", None);
-
             // Wait a bit for graceful shutdown
             std::thread::sleep(std::time::Duration::from_millis(500));
 

@@ -6,6 +6,7 @@
  */
 
 import { useState, useEffect } from "react";
+import { useUIComponent } from "ui-bridge";
 import { instanceStorage } from "@/lib/instance-storage";
 import { AuthConnectionSettings } from "./AuthConnectionSettings";
 import { GeneralSettings } from "./GeneralSettings";
@@ -123,6 +124,33 @@ export function Settings({
   useEffect(() => {
     instanceStorage.setItem(STORAGE_KEY, activeTab);
   }, [activeTab]);
+
+  // UI Bridge: Component-level actions for AI control
+  useUIComponent({
+    id: 'settings-panel',
+    name: 'Settings Panel',
+    description: 'Application settings with multiple configuration tabs',
+    actions: [
+      {
+        id: 'save',
+        label: 'Save Settings',
+        handler: async () => {
+          // Each settings sub-tab manages its own persistence independently.
+          // Persist the currently active tab selection, then log confirmation.
+          instanceStorage.setItem(STORAGE_KEY, activeTab);
+          onLog("info", `Settings tab "${activeTab}" preference saved. Note: individual setting values are saved within each tab's own Save button.`);
+        },
+      },
+      {
+        id: 'reset',
+        label: 'Reset Settings',
+        handler: async () => {
+          setActiveTab("account");
+          onLog("info", "Settings reset to defaults");
+        },
+      },
+    ],
+  });
 
   const renderContent = () => {
     switch (activeTab) {

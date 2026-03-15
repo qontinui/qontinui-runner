@@ -7,6 +7,7 @@
  */
 
 import { useState, useCallback, useEffect } from "react";
+import { useUIComponent } from "ui-bridge";
 import { X, Monitor, Cloud, AlertTriangle, Loader2 } from "lucide-react";
 import { Button } from "../ui";
 import { getAccentColors } from "@/design-system";
@@ -112,6 +113,39 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
       setIsLoading(false);
     }
   }, [selectedMode, forceGuiLock, refresh, onSuccess, onClose]);
+
+  // UI Bridge: Component-level actions for AI control
+  // Note: Actions no-op when dialog is not open since the component
+  // returns null below, but the hook must be called unconditionally.
+  useUIComponent({
+    id: 'new-run-dialog',
+    name: 'New Run Dialog',
+    description: 'Dialog for creating a new workflow run with mode selection. Actions are only effective when the dialog is open.',
+    actions: [
+      {
+        id: 'submit',
+        label: 'Submit',
+        handler: async () => {
+          if (!open) {
+            console.warn("[NewRunDialog] Cannot submit: dialog is not open");
+            return;
+          }
+          await handleCreate();
+        },
+      },
+      {
+        id: 'select-mode-gui',
+        label: 'Select GUI Mode',
+        handler: async () => {
+          if (!open) {
+            console.warn("[NewRunDialog] Cannot select mode: dialog is not open");
+            return;
+          }
+          setSelectedMode("gui");
+        },
+      },
+    ],
+  });
 
   if (!open) return null;
 

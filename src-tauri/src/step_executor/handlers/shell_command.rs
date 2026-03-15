@@ -97,6 +97,23 @@ impl StepHandler for ShellCommandHandler {
             command
         };
 
+        // Runtime sanitization: on Windows, Python outputs \r\n line endings.
+        // When piped to xargs, the \r gets embedded in the substituted value,
+        // breaking URLs and other string interpolations. Insert `tr -d '\r'`
+        // before xargs to strip carriage returns.
+        let command = if cfg!(target_os = "windows") && command.contains("| xargs") {
+            let sanitized = Self::fix_crlf_before_xargs(&command);
+            if sanitized != command {
+                info!(
+                    "Runtime \\r fix applied before xargs: {}",
+                    &sanitized[..sanitized.len().min(100)]
+                );
+            }
+            sanitized
+        } else {
+            command
+        };
+
         let step_name = step.name.as_deref().unwrap_or("Shell Command");
         let working_directory = step.shell_command_working_directory.clone();
         let fail_on_error = step.shell_command_fail_on_error.unwrap_or(true);
@@ -311,6 +328,12 @@ impl ShellCommandHandler {
             }
         }
         None
+    }
+
+    /// On Windows, insert `tr -d '\r'` before `| xargs` to strip carriage returns
+    /// that Python and other tools emit with \r\n line endings.
+    fn fix_crlf_before_xargs(command: &str) -> String {
+        command.replace("| xargs", "| tr -d '\\r' | xargs")
     }
 
     /// Check if a command uses PowerShell syntax.

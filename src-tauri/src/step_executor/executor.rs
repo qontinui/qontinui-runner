@@ -4109,6 +4109,21 @@ impl StepExecutor {
             command
         };
 
+        // Runtime sanitization: on Windows, Python outputs \r\n line endings which
+        // corrupt URLs when piped through xargs (curl rejects \r in URL paths).
+        // Insert `tr -d '\r'` before xargs to strip carriage returns.
+        let command = if cfg!(target_os = "windows") && command.contains("| xargs") {
+            let sanitized = command.replace("| xargs", "| tr -d '\\r' | xargs");
+            if sanitized != command {
+                info!(
+                    "Windows CR sanitization: inserted tr -d '\\r' before xargs"
+                );
+            }
+            sanitized
+        } else {
+            command
+        };
+
         let step_name = step.name.as_deref().unwrap_or("Shell Command");
         let working_directory = step.shell_command_working_directory.clone();
         let fail_on_error = step.shell_command_fail_on_error.unwrap_or(true);

@@ -31,8 +31,13 @@
  *   (orchestrator state, checkpoints, progress markers, restart recovery)
  */
 
+import { useCallback } from "react";
+import { useUIComponent } from "ui-bridge";
+import { invoke } from "@tauri-apps/api/core";
 import { ActiveRunsProvider, WorkflowExecutionProvider } from "../../contexts";
 import { DashboardPage, type DashboardPageProps } from "./DashboardPage";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import type { CommandResponse } from "../../types/displayProfile";
 
 export type ActiveDashboardPageProps = DashboardPageProps;
 
@@ -44,6 +49,63 @@ export type ActiveDashboardPageProps = DashboardPageProps;
  * 2. WorkflowExecutionProvider - for unified workflow state management
  */
 export function ActiveDashboardPage(props: ActiveDashboardPageProps) {
+  const handleStartRun = useCallback(() => {
+    // Navigate to the Execute page where runs can be started
+    props.onGoToExecute();
+  }, [props.onGoToExecute]);
+
+  const handleStopRun = useCallback(async () => {
+    // Stop any active execution via the GUI automation command
+    try {
+      const result = await invoke<CommandResponse>("stop_execution");
+      if (result.success) {
+        console.log("[ActiveDashboard] Execution stopped via UI Bridge action");
+      }
+    } catch {
+      console.log("[ActiveDashboard] No active execution to stop");
+    }
+  }, []);
+
+  const handleRefresh = useCallback(async () => {
+    // Force a refresh by re-fetching dashboard data via the API
+    try {
+      await tracedFetch(`${getApiBase()}/status`);
+      console.log("[ActiveDashboard] Dashboard data refreshed via UI Bridge action");
+    } catch (err) {
+      console.error("[ActiveDashboard] Failed to refresh dashboard data:", err);
+    }
+  }, []);
+
+  // UI Bridge: Component-level actions for AI control
+  useUIComponent({
+    id: 'active-dashboard',
+    name: 'Active Dashboard',
+    description: 'Main dashboard for monitoring and controlling active workflow runs',
+    actions: [
+      {
+        id: 'start-run',
+        label: 'Start Run',
+        handler: async () => {
+          handleStartRun();
+        },
+      },
+      {
+        id: 'stop-run',
+        label: 'Stop Run',
+        handler: async () => {
+          await handleStopRun();
+        },
+      },
+      {
+        id: 'refresh',
+        label: 'Refresh',
+        handler: async () => {
+          await handleRefresh();
+        },
+      },
+    ],
+  });
+
   return (
     <ActiveRunsProvider>
       <WorkflowExecutionProvider>

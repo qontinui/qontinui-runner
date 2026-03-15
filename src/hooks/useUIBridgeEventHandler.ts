@@ -466,7 +466,7 @@ export function useUIBridgeEventHandler(): void {
               type,
               success: result.success,
               data: result,
-              error: result.error,
+              error: result.error || (result.success === false ? `Action '${actionObj.action}' failed on element '${elementId}'` : undefined),
               timestamp: Date.now(),
             });
             break;
@@ -728,7 +728,10 @@ export function useUIBridgeEventHandler(): void {
           }
 
           case "page_refresh": {
-            window.location.reload();
+            // Do NOT call window.location.reload() — the runner is a Tauri app and
+            // a full page reload resets all React state (auth, execution, terminals),
+            // causing the "Checking authentication..." screen to flash repeatedly.
+            console.log("[UIBridge] page_refresh: ignoring (full reload disabled in runner)");
             await sendResponse({
               requestId,
               type,
@@ -752,12 +755,14 @@ export function useUIBridgeEventHandler(): void {
               return;
             }
             try {
-              // Use history.pushState for relative URLs to avoid full page reload
+              // Only allow relative URL navigation via history API.
+              // Absolute URLs (window.location.href = ...) would cause a full page reload,
+              // resetting all React state and flashing "Checking authentication...".
               if (url.startsWith('/')) {
                 window.history.pushState({}, '', url);
                 window.dispatchEvent(new PopStateEvent('popstate'));
               } else {
-                window.location.href = url;
+                console.warn(`[UIBridge] page_navigate: ignoring absolute URL navigation in runner: ${url}`);
               }
               await sendResponse({
                 requestId,

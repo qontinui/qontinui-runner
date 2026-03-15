@@ -62,7 +62,6 @@ import {
   UIBridgeProvider,
   AutoRegisterProvider,
   usePageContext,
-  CommandRelayListener,
 } from "ui-bridge";
 
 // Navigation context for tutorials to navigate to pages
@@ -1841,7 +1840,9 @@ function AppWithTutorials() {
 export default function App() {
   return (
     <UIBridgeProvider features={{ renderLog: true, control: true, debug: true }}>
-      <CommandRelayListener />
+      {/* CommandRelayListener removed — the runner uses Tauri IPC via UIBridgeEventHandler
+          instead. Having both caused page_refresh commands to trigger window.location.reload(),
+          resetting React state and flashing "Checking authentication..." during workflows. */}
       <UIBridgeEventHandler />
       <SpecExecutionHandler />
       {/* AutoRegisterProvider enables automatic UI Bridge element registration */}

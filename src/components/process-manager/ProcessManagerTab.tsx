@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useUIComponent } from "ui-bridge";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -386,6 +387,51 @@ Be concise and actionable.`;
       }
     };
   }, [aiFixActive, aiClose]);
+
+  // UI Bridge: Component-level actions for AI control
+  useUIComponent({
+    id: 'process-manager',
+    name: 'Process Manager',
+    description: 'Manage and monitor system processes',
+    actions: [
+      {
+        id: 'start-process',
+        label: 'Start Process',
+        handler: async () => {
+          if (!selectedId) {
+            console.warn("[ProcessManager] Cannot start: no process selected");
+            return;
+          }
+          await invoke("start_managed_process", { id: selectedId });
+          await loadProcesses();
+        },
+      },
+      {
+        id: 'stop-process',
+        label: 'Stop Process',
+        handler: async () => {
+          if (!selectedId) {
+            console.warn("[ProcessManager] Cannot stop: no process selected");
+            return;
+          }
+          await invoke("stop_managed_process", { id: selectedId });
+          await loadProcesses();
+        },
+      },
+      {
+        id: 'restart-process',
+        label: 'Restart Process',
+        handler: async () => {
+          if (!selectedId) {
+            console.warn("[ProcessManager] Cannot restart: no process selected");
+            return;
+          }
+          await invoke("restart_managed_process", { id: selectedId });
+          await loadProcesses();
+        },
+      },
+    ],
+  });
 
   const isRunning = (state: string) =>
     ["starting", "running", "healthy", "stopping"].includes(state);

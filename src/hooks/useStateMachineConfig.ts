@@ -57,11 +57,25 @@ export interface UseStateMachineConfigReturn {
   error: string | null;
 }
 
+const SM_SELECTED_CONFIG_KEY = "qontinui-runner-sm-selected-config";
+
 export function useStateMachineConfig(): UseStateMachineConfigReturn {
   const [configs, setConfigs] = useState<StateMachineConfig[]>([]);
-  const [activeConfig, setActiveConfig] = useState<StateMachineConfigFull | null>(null);
+  const [activeConfig, setActiveConfigRaw] = useState<StateMachineConfigFull | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Wrap setActiveConfig to persist selection
+  const setActiveConfig = useCallback((config: StateMachineConfigFull | null) => {
+    setActiveConfigRaw(config);
+    try {
+      if (config) {
+        localStorage.setItem(SM_SELECTED_CONFIG_KEY, config.id);
+      } else {
+        localStorage.removeItem(SM_SELECTED_CONFIG_KEY);
+      }
+    } catch { /* */ }
+  }, []);
 
   // ---- Config list ----
 
@@ -96,7 +110,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [setActiveConfig]);
 
   // ---- Config CRUD ----
 
@@ -112,13 +126,13 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
       setError(msg);
       throw new Error(msg);
     }
-  }, []);
+  }, [setActiveConfig]);
 
   const updateConfig = useCallback(async (id: string, req: StateMachineConfigUpdate) => {
     try {
       const result = await invoke<StateMachineConfig>("sm_update_config", { id, request: req });
       setConfigs((prev) => prev.map((c) => (c.id === id ? result : c)));
-      setActiveConfig((prev) => (prev && prev.id === id ? { ...prev, ...result } : prev));
+      setActiveConfigRaw((prev) => (prev && prev.id === id ? { ...prev, ...result } : prev));
       return result;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -131,7 +145,13 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
     try {
       await invoke("sm_delete_config", { id });
       setConfigs((prev) => prev.filter((c) => c.id !== id));
-      setActiveConfig((prev) => (prev && prev.id === id ? null : prev));
+      setActiveConfigRaw((prev) => {
+        if (prev && prev.id === id) {
+          try { localStorage.removeItem(SM_SELECTED_CONFIG_KEY); } catch { /* */ }
+          return null;
+        }
+        return prev;
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
@@ -149,7 +169,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
           configId: activeConfig.id,
           request: req,
         });
-        setActiveConfig((prev) => (prev ? { ...prev, states: [...prev.states, result] } : prev));
+        setActiveConfigRaw((prev) => (prev ? { ...prev, states: [...prev.states, result] } : prev));
         return result;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -163,7 +183,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
   const updateState = useCallback(async (id: string, req: StateMachineStateUpdate) => {
     try {
       const result = await invoke<StateMachineState>("sm_update_state", { id, request: req });
-      setActiveConfig((prev) =>
+      setActiveConfigRaw((prev) =>
         prev ? { ...prev, states: prev.states.map((s) => (s.id === id ? result : s)) } : prev,
       );
       return result;
@@ -177,7 +197,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
   const deleteState = useCallback(async (id: string) => {
     try {
       await invoke("sm_delete_state", { id });
-      setActiveConfig((prev) =>
+      setActiveConfigRaw((prev) =>
         prev ? { ...prev, states: prev.states.filter((s) => s.id !== id) } : prev,
       );
     } catch (err) {
@@ -197,7 +217,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
           configId: activeConfig.id,
           request: req,
         });
-        setActiveConfig((prev) =>
+        setActiveConfigRaw((prev) =>
           prev ? { ...prev, transitions: [...prev.transitions, result] } : prev,
         );
         return result;
@@ -216,7 +236,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
         id,
         request: req,
       });
-      setActiveConfig((prev) =>
+      setActiveConfigRaw((prev) =>
         prev
           ? {
               ...prev,
@@ -235,7 +255,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
   const deleteTransition = useCallback(async (id: string) => {
     try {
       await invoke("sm_delete_transition", { id });
-      setActiveConfig((prev) =>
+      setActiveConfigRaw((prev) =>
         prev ? { ...prev, transitions: prev.transitions.filter((t) => t.id !== id) } : prev,
       );
     } catch (err) {
@@ -266,10 +286,41 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
     [loadConfigs, loadConfig],
   );
 
-  // Load configs on mount
+  // Load configs on mount, then auto-select the last used or most recent config
   useEffect(() => {
-    loadConfigs();
-  }, [loadConfigs]);
+    let cancelled = false;
+    (async () => {
+      await loadConfigs();
+    })().then(async () => {
+      if (cancelled) return;
+      // After loadConfigs sets state, we need to read the fresh list.
+      // Because setConfigs is async React state, read from the IPC result instead.
+      try {
+        const freshConfigs = await invoke<StateMachineConfig[]>("sm_list_configs");
+        if (cancelled || freshConfigs.length === 0) return;
+
+        // Try to restore persisted selection
+        let targetId: string | null = null;
+        try {
+          targetId = localStorage.getItem(SM_SELECTED_CONFIG_KEY);
+        } catch { /* */ }
+
+        // Validate persisted ID still exists, otherwise pick most recent
+        if (targetId && freshConfigs.some((c) => c.id === targetId)) {
+          await loadConfig(targetId);
+        } else {
+          // Sort by created_at descending, pick the latest
+          const sorted = [...freshConfigs].sort(
+            (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+          );
+          await loadConfig(sorted[0]!.id);
+        }
+      } catch {
+        // Non-critical: if auto-select fails the user can still pick manually
+      }
+    });
+    return () => { cancelled = true; };
+  }, [loadConfigs, loadConfig]);
 
   return {
     configs,

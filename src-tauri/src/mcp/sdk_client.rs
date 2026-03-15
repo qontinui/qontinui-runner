@@ -184,10 +184,8 @@ pub async fn sdk_request(
             .unwrap()
             .as_millis() as i64;
         let cache_age = now_ms - conn_guard.active_responsive_checked_at;
-        if cache_age < 10_000 {
-            if conn_guard.active_responsive == Some(false) {
-                return Err("SDK app is not responsive (no active browser tab)".to_string());
-            }
+        if cache_age < 10_000 && conn_guard.active_responsive == Some(false) {
+            return Err("SDK app is not responsive (no active browser tab)".to_string());
         }
 
         (
@@ -852,7 +850,15 @@ async fn handle_element_action(
                 }
             });
             match ui_bridge_request_sync(&state, "execute_action", payload).await {
-                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Ok(data) => {
+                    // If the inner response already indicates failure, return it directly
+                    // instead of wrapping in { success: true, data } which masks the error
+                    if data.get("success") == Some(&serde_json::json!(false)) {
+                        Json(data)
+                    } else {
+                        Json(serde_json::json!({ "success": true, "data": data }))
+                    }
+                }
                 Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
             }
         }
@@ -3596,6 +3602,41 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         // Heartbeat
         .route("/ui-bridge/sdk/heartbeat", post(handle_heartbeat))
+        // Query selector & page evaluate (IPC relay)
+        .route(
+            "/ui-bridge/sdk/control/query-selector",
+            post(handle_query_selector),
+        )
+        .route(
+            "/ui-bridge/sdk/control/page-evaluate",
+            post(handle_page_evaluate),
+        )
+}
+
+// =============================================================================
+// Query Selector & Page Evaluate (IPC relay)
+// =============================================================================
+
+/// POST /ui-bridge/sdk/control/query-selector — Query DOM elements by CSS selector
+async fn handle_query_selector(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match ui_bridge_request_sync(&state, "query_selector", body).await {
+        Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/control/page-evaluate — Evaluate JS expression in the webview
+async fn handle_page_evaluate(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match ui_bridge_request_sync(&state, "page_evaluate", body).await {
+        Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
 }
 
 // =============================================================================

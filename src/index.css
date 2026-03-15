@@ -56,6 +56,14 @@
   body {
     @apply bg-background text-foreground;
   }
+
+  /* Reset form controls to inherit dark theme instead of white UA defaults */
+  input,
+  textarea,
+  select {
+    color: inherit;
+    background-color: inherit;
+  }
 }
 
 @layer components {

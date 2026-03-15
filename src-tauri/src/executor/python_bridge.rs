@@ -329,27 +329,33 @@ impl PythonBridge {
         let protocol_handler_sender = self.protocol_handler.get_sender();
 
         let cleanup_handle = std::thread::spawn(move || {
-            runtime.block_on(async {
-                // Stop health monitoring
-                health_monitor.stop().await;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(async {
+                    // Stop health monitoring
+                    health_monitor.stop().await;
 
-                // Initiate shutdown
-                {
-                    let lc = lifecycle.read().await;
-                    let _ = lc.shutdown().await;
-                }
+                    // Initiate shutdown
+                    {
+                        let lc = lifecycle.read().await;
+                        let _ = lc.shutdown().await;
+                    }
 
-                // Send stop command if channel is available
-                if let Some(tx) = protocol_handler_sender {
-                    let stop_cmd = ExecutorCommand {
-                        cmd_type: "command".to_string(),
-                        id: uuid::Uuid::new_v4().to_string(),
-                        command: "stop".to_string(),
-                        params: None,
-                    };
-                    let _ = tx.send(stop_cmd).await;
-                }
-            });
+                    // Send stop command if channel is available
+                    if let Some(tx) = protocol_handler_sender {
+                        let stop_cmd = ExecutorCommand {
+                            cmd_type: "command".to_string(),
+                            id: uuid::Uuid::new_v4().to_string(),
+                            command: "stop".to_string(),
+                            params: None,
+                        };
+                        let _ = tx.send(stop_cmd).await;
+                    }
+                });
+            }));
+            if result.is_err() {
+                // Panic during async cleanup — fall through to process kill below
+                eprintln!("PythonBridge: async cleanup panicked, falling through to process kill");
+            }
         });
 
         // Wait for cleanup thread with timeout

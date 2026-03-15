@@ -502,6 +502,18 @@ impl DeterministicVerifier {
     ) -> VerificationResult {
         info!("Running {}: {}", check_name, command);
 
+        // Runtime sanitization: on Windows, Python outputs \r\n line endings which
+        // corrupt URLs when piped through xargs (curl rejects \r in URL paths).
+        // Insert `tr -d '\r'` before xargs to strip carriage returns.
+        let command = if cfg!(target_os = "windows") && command.contains("| xargs") {
+            let sanitized = command.replace("| xargs", "| tr -d '\\r' | xargs");
+            info!("Windows CR sanitization: inserted tr -d '\\r' before xargs");
+            sanitized
+        } else {
+            command.to_string()
+        };
+        let command = command.as_str();
+
         // Build enhanced PATH to ensure npm/npx tools are found
         let enhanced_path = build_enhanced_path(&self.working_directory);
 

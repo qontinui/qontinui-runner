@@ -144,15 +144,21 @@ pub enum CircuitBreakerState {
 }
 
 /// Circuit breaker to prevent cascading failures when the webview is unresponsive.
+///
+/// Uses a rolling-window failure counter instead of a simple consecutive counter.
+/// Failures older than `window_ms` are pruned automatically.
 pub struct UiBridgeCircuitBreaker {
     state: tokio::sync::Mutex<CircuitBreakerState>,
-    consecutive_failures: std::sync::atomic::AtomicU32,
+    /// Rolling window of failure timestamps (epoch ms)
+    failure_timestamps: tokio::sync::Mutex<Vec<u64>>,
     last_failure_time: std::sync::atomic::AtomicU64,
-    /// Threshold: consecutive timeouts before opening
+    /// Threshold: failures within the rolling window before opening
     threshold: u32,
     /// Cooldown in ms before transitioning from Open to HalfOpen
     cooldown_ms: u64,
-    /// Counts recovery attempts since last success to prevent infinite reload loops
+    /// Rolling window size in ms — failures older than this are pruned
+    window_ms: u64,
+    /// Counts recovery attempts since last success to prevent infinite loops
     recovery_attempts: std::sync::atomic::AtomicU32,
     /// Timestamp of the last recovery attempt in ms
     last_recovery_time: std::sync::atomic::AtomicU64,
@@ -162,10 +168,11 @@ impl UiBridgeCircuitBreaker {
     pub fn new() -> Self {
         Self {
             state: tokio::sync::Mutex::new(CircuitBreakerState::Closed),
-            consecutive_failures: std::sync::atomic::AtomicU32::new(0),
+            failure_timestamps: tokio::sync::Mutex::new(Vec::new()),
             last_failure_time: std::sync::atomic::AtomicU64::new(0),
-            threshold: 3,
-            cooldown_ms: 5000,
+            threshold: 5,
+            cooldown_ms: 15000,
+            window_ms: 30000,
             recovery_attempts: std::sync::atomic::AtomicU32::new(0),
             last_recovery_time: std::sync::atomic::AtomicU64::new(0),
         }
@@ -198,7 +205,12 @@ impl UiBridgeCircuitBreaker {
 
     /// Record a successful request
     pub async fn record_success(&self) {
-        self.consecutive_failures
+        // Clear the rolling window on success
+        {
+            let mut timestamps = self.failure_timestamps.lock().await;
+            timestamps.clear();
+        }
+        self.recovery_attempts
             .store(0, std::sync::atomic::Ordering::Relaxed);
         let mut state = self.state.lock().await;
         if *state != CircuitBreakerState::Closed {
@@ -210,12 +222,11 @@ impl UiBridgeCircuitBreaker {
         }
     }
 
-    /// Record a failed request (timeout)
+    /// Record a failed request (timeout).
+    ///
+    /// Uses a rolling window: only failures within the last `window_ms` count
+    /// towards the threshold.
     pub async fn record_failure(&self) {
-        let failures = self
-            .consecutive_failures
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -223,30 +234,81 @@ impl UiBridgeCircuitBreaker {
         self.last_failure_time
             .store(now, std::sync::atomic::Ordering::Relaxed);
 
-        if failures >= self.threshold {
+        let count = {
+            let mut timestamps = self.failure_timestamps.lock().await;
+            // Add current failure
+            timestamps.push(now);
+            // Prune entries older than the rolling window
+            let cutoff = now.saturating_sub(self.window_ms);
+            timestamps.retain(|&ts| ts >= cutoff);
+            timestamps.len() as u32
+        };
+
+        if count >= self.threshold {
             let mut state = self.state.lock().await;
             if *state != CircuitBreakerState::Open {
                 warn!(
-                    "UI Bridge circuit breaker: {:?} -> Open ({} consecutive failures)",
-                    *state, failures
+                    "UI Bridge circuit breaker: {:?} -> Open ({} failures in {}s window)",
+                    *state,
+                    count,
+                    self.window_ms / 1000
                 );
                 *state = CircuitBreakerState::Open;
             }
         }
     }
 
-    /// Attempt auto-recovery by navigating the webview to "/" when circuit breaker opens.
-    /// Should be called after record_failure detects the circuit breaker has opened.
+    /// Attempt recovery by emitting an event instead of destructively navigating.
+    ///
+    /// The frontend can listen for `ui-bridge-circuit-open` and show a toast or
+    /// attempt reconnection without losing page state.
     pub fn attempt_recovery(&self, app_handle: &tauri::AppHandle) {
-        use tauri::Manager;
-        if let Some(window) = app_handle.get_webview_window("main") {
-            warn!("UI Bridge: Attempting auto-recovery — navigating webview to /");
-            if let Err(e) = window.eval("window.location.href = '/'") {
-                error!("UI Bridge: Auto-recovery eval failed: {}", e);
-            }
-        } else {
-            warn!("UI Bridge: Auto-recovery skipped — main window not found");
+        let attempts = self
+            .recovery_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        self.last_recovery_time
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+
+        warn!(
+            "UI Bridge: Emitting circuit-open event (attempt {})",
+            attempts
+        );
+        if let Err(e) = app_handle.emit(
+            "ui-bridge-circuit-open",
+            serde_json::json!({
+                "recovery_attempt": attempts,
+                "timestamp": now,
+            }),
+        ) {
+            error!("UI Bridge: Failed to emit circuit-open event: {}", e);
         }
+    }
+
+    /// Manually reset the circuit breaker to Closed state.
+    ///
+    /// Clears failure timestamps and recovery attempt counters.
+    pub async fn reset(&self) {
+        {
+            let mut timestamps = self.failure_timestamps.lock().await;
+            timestamps.clear();
+        }
+        self.recovery_attempts
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.last_recovery_time
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.last_failure_time
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut state = self.state.lock().await;
+        info!(
+            "UI Bridge circuit breaker: {:?} -> Closed (manual reset)",
+            *state
+        );
+        *state = CircuitBreakerState::Closed;
     }
 
     /// Get current state for diagnostics
@@ -254,10 +316,15 @@ impl UiBridgeCircuitBreaker {
         self.state.lock().await.clone()
     }
 
-    /// Get consecutive failure count
-    pub fn get_failure_count(&self) -> u32 {
-        self.consecutive_failures
-            .load(std::sync::atomic::Ordering::Relaxed)
+    /// Get failure count within the rolling window
+    pub async fn get_failure_count(&self) -> u32 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let timestamps = self.failure_timestamps.lock().await;
+        let cutoff = now.saturating_sub(self.window_ms);
+        timestamps.iter().filter(|&&ts| ts >= cutoff).count() as u32
     }
 }
 
@@ -3089,6 +3156,18 @@ pub async fn ui_bridge_get_render_log_handler(
     }))))
 }
 
+/// Manually reset the UI Bridge circuit breaker to Closed state.
+pub async fn ui_bridge_circuit_breaker_reset_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Circuit breaker manual reset");
+    state.ui_bridge_circuit_breaker.reset().await;
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "reset": true,
+        "state": "Closed"
+    }))))
+}
+
 /// UI Bridge diagnostics endpoint.
 pub async fn ui_bridge_diagnostics_handler(
     State(state): State<Arc<ApiState>>,
@@ -3096,7 +3175,7 @@ pub async fn ui_bridge_diagnostics_handler(
     info!("UI Bridge API: Diagnostics");
 
     let cb_state = state.ui_bridge_circuit_breaker.get_state().await;
-    let failure_count = state.ui_bridge_circuit_breaker.get_failure_count();
+    let failure_count = state.ui_bridge_circuit_breaker.get_failure_count().await;
     let available_permits = state.ui_bridge_semaphore.available_permits();
     let last_pong = state
         .ui_bridge_last_pong
@@ -3106,7 +3185,7 @@ pub async fn ui_bridge_diagnostics_handler(
     Ok(Json(ApiResponse::success(serde_json::json!({
         "circuitBreaker": {
             "state": format!("{:?}", cb_state),
-            "consecutiveFailures": failure_count
+            "failuresInWindow": failure_count
         },
         "semaphore": {
             "availablePermits": available_permits,
@@ -3425,6 +3504,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         // Diagnostics & health
         .route("/ui-bridge/diagnostics", get(ui_bridge_diagnostics_handler))
+        .route(
+            "/ui-bridge/circuit-breaker/reset",
+            post(ui_bridge_circuit_breaker_reset_handler),
+        )
         .route("/ui-bridge/pong", post(ui_bridge_pong_handler))
         .route(
             "/ui-bridge/ipc-response",
