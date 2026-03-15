@@ -104,6 +104,7 @@ type UIBridgeRequestType =
   // Idle detection
   | "get_idle_status"
   | "wait_for_idle"
+  | "diagnose_stuck_screen"
   // Keyboard shortcuts
   | "get_keyboard_shortcuts"
   // AI search & find
@@ -1320,6 +1321,30 @@ export function useUIBridgeEventHandler(): void {
                 timestamp: Date.now(),
               });
             }
+            break;
+          }
+
+          // ========== Stuck Screen Diagnosis ==========
+          case "diagnose_stuck_screen": {
+            const { CompositeIdleDetector, StuckScreenDetector } = await import("ui-bridge");
+
+            if (!idleDetectorRef.current) {
+              idleDetectorRef.current = CompositeIdleDetector.create();
+            }
+
+            const stuckDetector = new StuckScreenDetector(idleDetectorRef.current, {
+              observationWindowMs: (payload.params?.observationWindowMs as number) ?? 3000,
+              domMutationThreshold: (payload.params?.domMutationThreshold as number) ?? 3,
+            });
+
+            const diagnosis = await stuckDetector.diagnose();
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: diagnosis,
+              timestamp: Date.now(),
+            });
             break;
           }
 

@@ -27,6 +27,7 @@ import {
   extractFingerprintHashes,
 } from "../lib/ui-bridge/fingerprintGenerator";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { cropThumbnails } from "@/lib/thumbnail-cropper";
 
 // =============================================================================
 // Types
@@ -160,7 +161,10 @@ const GLOBAL_POSITION_ZONES = new Set(["header", "footer", "fixed-top", "fixed-b
 
 /** Map an SDK element to the ExternalElement interface used by the inspector UI */
 function mapSdkElement(raw: Record<string, unknown>): ExternalElement {
-  const bounds = (raw.bounds as Record<string, number>) || {};
+  // Bounds may be at raw.bounds (flat) or raw.state.rect (nested from SDK discover/snapshot)
+  const rawState = raw.state as Record<string, unknown> | undefined;
+  const rawRect = rawState?.rect as Record<string, number> | undefined;
+  const bounds = (raw.bounds as Record<string, number>) || rawRect || {};
   const actions = (raw.actions as string[]) || [];
   const accessibility = raw.accessibility as ExternalElement["accessibility"] | undefined;
 
@@ -178,8 +182,8 @@ function mapSdkElement(raw: Record<string, unknown>): ExternalElement {
       bottom: bounds.bottom,
       left: bounds.left,
     },
-    visible: (raw.visible as boolean) ?? true,
-    enabled: (raw.enabled as boolean) ?? true,
+    visible: (raw.visible as boolean) ?? (rawState?.visible as boolean) ?? true,
+    enabled: (raw.enabled as boolean) ?? (rawState?.enabled as boolean) ?? true,
     focused: (raw.focused as boolean) ?? false,
     value: raw.value as string | undefined,
     checked: raw.checked as boolean | undefined,
@@ -239,6 +243,10 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
     captures: CaptureRecord[];
     fingerprintCatalog: Record<string, ElementFingerprint>;
     lastCaptureId: string | null;
+    /** Element bounds keyed by fingerprint hash — used for thumbnail cropping */
+    elementBoundsMap?: Record<string, { x: number; y: number; width: number; height: number }>;
+    /** Cropped element thumbnails keyed by fingerprint hash */
+    elementThumbnails?: Record<string, string>;
   } | null>(null);
   const [cooccurrenceData, setCooccurrenceData] = useState<CooccurrenceExport | null>(null);
   const [isLoadingCooccurrence, setIsLoadingCooccurrence] = useState(false);
@@ -940,6 +948,10 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
       }
 
       // Build transitions from captures that have triggeredBy
+      const triggeredCount = captures.filter((c) => c.triggeredBy).length;
+      console.log(
+        `[useSdkUIBridge] Building transitions: ${captures.length} captures, ${triggeredCount} with triggeredBy`,
+      );
       const transitions: CooccurrenceExport["transitions"] = [];
       for (const cap of captures) {
         if (!cap.triggeredBy) continue;
@@ -1013,6 +1025,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
         fingerprintStats,
         transitions,
         stateCandidates,
+        elementThumbnails: session.elementThumbnails,
       };
 
       console.log(
@@ -1125,6 +1138,24 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
 
           const session = captureSessionRef.current;
           if (session) {
+            // Track element bounds for thumbnail cropping
+            if (!session.elementBoundsMap) session.elementBoundsMap = {};
+            for (const el of mapped) {
+              if (
+                el.fingerprint?.hash &&
+                el.bounds &&
+                el.bounds.width > 0 &&
+                el.bounds.height > 0
+              ) {
+                session.elementBoundsMap[el.fingerprint.hash] = {
+                  x: el.bounds.x,
+                  y: el.bounds.y,
+                  width: el.bounds.width,
+                  height: el.bounds.height,
+                };
+              }
+            }
+
             const hashes = extractFingerprintHashes(mapped);
             const captureId = `cap-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
             const capture: CaptureRecord = {
@@ -1146,6 +1177,31 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
               captureCount: session.captures.length,
               uniqueFingerprints: Object.keys(session.fingerprintCatalog).length,
             });
+
+            // Capture element thumbnails for new elements from the current page screenshot
+            if (Object.keys(session.elementBoundsMap || {}).length > 0) {
+              try {
+                const ssResp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/screenshot`);
+                const ssJson = await ssResp.json();
+                if (ssJson.success && ssJson.data?.screenshot) {
+                  const existingThumbs = session.elementThumbnails || {};
+                  const newElements = Object.entries(session.elementBoundsMap)
+                    .filter(([hash]) => !existingThumbs[hash])
+                    .map(([hash, bounds]) => ({ id: hash, bounds }));
+                  if (newElements.length > 0) {
+                    const thumbs = await cropThumbnails(ssJson.data.screenshot, newElements, {
+                      maxSize: 48,
+                    });
+                    if (!session.elementThumbnails) session.elementThumbnails = {};
+                    for (const [id, data] of thumbs) {
+                      session.elementThumbnails[id] = data;
+                    }
+                  }
+                }
+              } catch {
+                // Non-fatal — thumbnails are optional
+              }
+            }
           }
 
           return mapped;
@@ -1182,6 +1238,9 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
           const afterCaptureId = session.lastCaptureId;
           if (afterCaptureId && afterCaptureId !== beforeCaptureId) {
             const afterCapture = session.captures.find((c) => c.captureId === afterCaptureId);
+            console.log(
+              `[useSdkUIBridge] Transition: ${beforeCaptureId} -> ${afterCaptureId} (found=${!!afterCapture})`,
+            );
             const targetEl =
               afterElements.find((e) => e.id === elementId) ||
               // Element may have disappeared; look up by fingerprint in pre-action elements
@@ -1195,7 +1254,15 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
                 previousCaptureId: beforeCaptureId,
               };
             }
+          } else {
+            console.log(
+              `[useSdkUIBridge] No transition: beforeId=${beforeCaptureId}, afterId=${afterCaptureId}`,
+            );
           }
+        } else {
+          console.log(
+            `[useSdkUIBridge] No transition: session=${!!session}, beforeId=${beforeCaptureId}`,
+          );
         }
       };
 
@@ -1373,10 +1440,45 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
         `[useSdkUIBridge] Exploration complete: ${interactionCount} interactions, ${captureSessionRef.current?.captures.length ?? 0} captures`,
       );
 
-      // Step 5: Generate co-occurrence export
+      // Step 5: Persist thumbnails to dedicated localStorage key
+      const thumbs = captureSessionRef.current?.elementThumbnails;
+      const thumbCount = Object.keys(thumbs || {}).length;
+      if (thumbCount > 0) {
+        console.log(
+          `[useSdkUIBridge] Captured ${thumbCount} element thumbnails during exploration`,
+        );
+        try {
+          localStorage.setItem("qontinui-runner-sm-thumbnails", JSON.stringify(thumbs));
+        } catch {
+          /* */
+        }
+      }
+
+      // Step 6: Generate co-occurrence export
       const result = await generateCooccurrenceExport();
 
-      // Step 6: Stop capture session if we started it
+      // Step 7: Persist the result to localStorage so it survives page navigation
+      // (self-connection exploration causes the runner to navigate away from the
+      // State Machine page, unmounting the discovery component)
+      if (result) {
+        try {
+          const { instanceStorage } = await import("@/lib/instance-storage");
+          // Strip thumbnails from the persisted discovery data (they're saved separately
+          // in sm-thumbnails and would make this JSON too large for localStorage)
+          const { elementThumbnails: _thumbs, ...resultWithoutThumbs } = result;
+          instanceStorage.setJSON("qontinui-runner-sm-discovery", {
+            cooccurrenceData: resultWithoutThumbs,
+            dataSource: "explore",
+            discoveryResult: null,
+            configName: "",
+          });
+          console.log("[useSdkUIBridge] Persisted exploration result to localStorage");
+        } catch {
+          console.warn("[useSdkUIBridge] Failed to persist exploration result");
+        }
+      }
+
+      // Step 8: Stop capture session if we started it
       if (!sessionWasActive) {
         captureSessionRef.current = null;
         setCaptureSession({ active: false });

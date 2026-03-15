@@ -385,14 +385,19 @@ impl FingerprintStateDiscovery {
         let repeat_count = self.count_repeat_patterns(fps);
         let confidence = self.calculate_confidence(fps);
 
-        // Use accessible names as element labels for display
+        // Store fingerprint hashes as element IDs (prefixed with role or tag for display)
+        // so they can be matched to thumbnails and other fingerprint-keyed data.
         let element_ids: Vec<String> = fps
             .iter()
             .filter_map(|fp_hash| {
                 self.fingerprints.get(fp_hash).map(|fp| {
-                    fp.accessible_name
-                        .clone()
-                        .unwrap_or_else(|| fp.tag_name.clone())
+                    let prefix = if !fp.role.is_empty() && fp.role != "generic" {
+                        &fp.role
+                    } else {
+                        &fp.tag_name
+                    };
+                    // Use "prefix:hash" format so the graph can look up thumbnails by hash
+                    format!("{}:{}", prefix, fp_hash)
                 })
             })
             .collect();

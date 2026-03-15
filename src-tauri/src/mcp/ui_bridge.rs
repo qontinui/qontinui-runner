@@ -2203,6 +2203,356 @@ pub async fn ui_bridge_wait_for_idle_handler(
 }
 
 // ============================================================================
+// Stuck Screen Diagnosis Handler
+// ============================================================================
+
+/// Internal capture result for diagnosis.
+struct DiagnosisCapture {
+    image: image::DynamicImage,
+    base64: String,
+    width: i32,
+    height: i32,
+    source: String,
+}
+
+/// Capture the runner window for diagnosis, falling back to primary monitor.
+fn capture_for_diagnosis(app_handle: &tauri::AppHandle) -> Result<DiagnosisCapture, String> {
+    use base64::Engine;
+    use tauri::Manager;
+
+    // Try runner window first
+    if let Some(win) = app_handle.get_webview_window("main") {
+        let scale = win.scale_factor().unwrap_or(1.0);
+        let pos = win.outer_position().unwrap_or_default();
+        let size = win.outer_size().unwrap_or_default();
+
+        if size.width > 0 && size.height > 0 {
+            match capture_runner_window(
+                pos.x,
+                pos.y,
+                size.width,
+                size.height,
+                scale,
+                "Qontinui Runner",
+            ) {
+                Ok(data) => {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(&data.screenshot)
+                        .map_err(|e| format!("Base64 decode failed: {}", e))?;
+                    let img = image::load_from_memory(&bytes)
+                        .map_err(|e| format!("Image decode failed: {}", e))?;
+                    return Ok(DiagnosisCapture {
+                        image: img,
+                        base64: data.screenshot,
+                        width: data.width,
+                        height: data.height,
+                        source: "runner_window".to_string(),
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        "Runner window capture failed, falling back to monitor: {}",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // Fallback: primary monitor
+    let data = capture_monitor_screenshot(None)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&data.screenshot)
+        .map_err(|e| format!("Base64 decode failed: {}", e))?;
+    let img = image::load_from_memory(&bytes).map_err(|e| format!("Image decode failed: {}", e))?;
+    Ok(DiagnosisCapture {
+        image: img,
+        base64: data.screenshot,
+        width: data.width,
+        height: data.height,
+        source: "primary_monitor".to_string(),
+    })
+}
+
+/// Compare two screenshots by sampling pixels. Returns similarity 0.0-1.0.
+fn compute_screenshot_similarity(img1: &image::DynamicImage, img2: &image::DynamicImage) -> f64 {
+    let rgba1 = img1.to_rgba8();
+    let rgba2 = img2.to_rgba8();
+
+    if rgba1.dimensions() != rgba2.dimensions() {
+        return 0.0;
+    }
+
+    let (w, h) = rgba1.dimensions();
+    let total = w as u64 * h as u64;
+    if total == 0 {
+        return 1.0;
+    }
+
+    let pixels1 = rgba1.as_raw();
+    let pixels2 = rgba2.as_raw();
+
+    // Sample ~10,000 pixels evenly for speed
+    let step = (total / 10_000u64).max(1) as usize;
+    let mut matching = 0u64;
+    let mut sampled = 0u64;
+
+    for i in (0..total as usize).step_by(step) {
+        let offset = i * 4;
+        if offset + 3 >= pixels1.len() {
+            break;
+        }
+
+        let diff: u32 = (0..4)
+            .map(|c| (pixels1[offset + c] as i32 - pixels2[offset + c] as i32).unsigned_abs())
+            .sum();
+
+        // Tolerance for rendering/compression artifacts
+        if diff <= 20 {
+            matching += 1;
+        }
+        sampled += 1;
+    }
+
+    if sampled == 0 {
+        1.0
+    } else {
+        matching as f64 / sampled as f64
+    }
+}
+
+/// Try to get DOM-based idle signals from the React frontend.
+/// Returns None if React hasn't mounted or doesn't respond within timeout.
+async fn try_get_dom_signals(state: &Arc<ApiState>, timeout_ms: u64) -> Option<serde_json::Value> {
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        ui_bridge_request_sync(state, "get_idle_status", serde_json::json!({})),
+    )
+    .await
+    {
+        Ok(Ok(data)) => Some(data),
+        _ => None,
+    }
+}
+
+/// Diagnose whether the app is stuck on a loading screen.
+///
+/// Uses native screenshot capture (xcap) to compare visual state across an
+/// observation window. Optionally enriches with DOM signals from the React
+/// UI Bridge if it's responsive. Works even if React hasn't mounted.
+pub async fn ui_bridge_diagnose_stuck_screen_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    info!("UI Bridge API: Diagnose stuck screen (native)");
+
+    let observation_ms = body
+        .get("observationWindowMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3000);
+
+    // Phase 1: Capture initial screenshot
+    let app_handle1 = state.app_handle.clone();
+    let cap1 = match tokio::task::spawn_blocking(move || capture_for_diagnosis(&app_handle1)).await
+    {
+        Ok(Ok(cap)) => cap,
+        Ok(Err(e)) => {
+            error!("Diagnosis: initial screenshot failed: {}", e);
+            return Json(ApiResponse::error(format!(
+                "Screenshot capture failed: {}",
+                e
+            )));
+        }
+        Err(e) => {
+            return Json(ApiResponse::error(format!("Capture task failed: {}", e)));
+        }
+    };
+
+    // Phase 2: Try to get DOM signals (short timeout — don't block if React hasn't mounted)
+    let dom_status1 = try_get_dom_signals(&state, 2000).await;
+
+    // Phase 3: Wait observation window
+    tokio::time::sleep(std::time::Duration::from_millis(observation_ms)).await;
+
+    // Phase 4: Capture second screenshot
+    let app_handle2 = state.app_handle.clone();
+    let cap2 = match tokio::task::spawn_blocking(move || capture_for_diagnosis(&app_handle2)).await
+    {
+        Ok(Ok(cap)) => cap,
+        Ok(Err(e)) => {
+            error!("Diagnosis: second screenshot failed: {}", e);
+            return Json(ApiResponse::error(format!(
+                "Second screenshot capture failed: {}",
+                e
+            )));
+        }
+        Err(e) => {
+            return Json(ApiResponse::error(format!("Capture task failed: {}", e)));
+        }
+    };
+
+    // Phase 5: Try DOM signals again
+    let dom_status2 = try_get_dom_signals(&state, 2000).await;
+
+    // Phase 6: Compare screenshots
+    let img1 = cap1.image;
+    let img2 = cap2.image;
+    let similarity =
+        tokio::task::spawn_blocking(move || compute_screenshot_similarity(&img1, &img2))
+            .await
+            .unwrap_or(0.5); // Couldn't compare — inconclusive
+    let screenshot_changed = similarity < 0.95;
+
+    // Phase 7: Extract DOM signal details
+    let ui_bridge_responsive = dom_status1.is_some() || dom_status2.is_some();
+
+    let dom_ref = dom_status2.as_ref().or(dom_status1.as_ref());
+    let signals = dom_ref.and_then(|d| d.get("signals"));
+
+    let has_loading_indicators = signals
+        .and_then(|s| s.get("loading-indicators"))
+        .and_then(|li| li.get("idle"))
+        .and_then(|v| v.as_bool())
+        .map(|idle| !idle)
+        .unwrap_or(false);
+
+    let loading_indicators_list = signals
+        .and_then(|s| s.get("loading-indicators"))
+        .and_then(|li| li.get("status"))
+        .and_then(|s| s.get("indicators"))
+        .cloned()
+        .unwrap_or(serde_json::json!([]));
+
+    let network_busy = signals
+        .and_then(|s| s.get("network"))
+        .and_then(|net| net.get("idle"))
+        .and_then(|v| v.as_bool())
+        .map(|idle| !idle)
+        .unwrap_or(false);
+
+    let pending_requests = signals
+        .and_then(|s| s.get("network"))
+        .and_then(|net| net.get("status"))
+        .and_then(|s| s.get("pendingCount"))
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0);
+
+    // Phase 8: Determine verdict
+    let obs_secs = observation_ms / 1000;
+
+    let (verdict, confidence, summary, suggestions) =
+        if !screenshot_changed && !ui_bridge_responsive {
+            (
+                "stuck",
+                0.95f64,
+                format!(
+                    "The app appears stuck. The screen has not changed during the \
+                     {obs_secs}s observation window and the UI Bridge is not responding \
+                     (React may not have mounted)."
+                ),
+                vec![
+                    "Check if the Tauri webview loaded successfully.",
+                    "Check the browser console for JavaScript errors.",
+                    "Check if the API server started (ports 9876-9878).",
+                    "Try restarting the runner.",
+                ],
+            )
+        } else if !screenshot_changed && has_loading_indicators {
+            (
+                "stuck",
+                0.95,
+                format!(
+                    "The app appears stuck on a loading screen. Loading indicators \
+                     are visible, the screen has not changed during the {obs_secs}s \
+                     observation window, and no content is being rendered."
+                ),
+                vec![
+                    "Check if a required backend service is running.",
+                    "Check the browser console for JavaScript errors.",
+                    "Try refreshing the page.",
+                ],
+            )
+        } else if !screenshot_changed && network_busy {
+            (
+                "stuck",
+                0.7,
+                format!(
+                    "The app appears stuck. The screen has not changed during the \
+                     {obs_secs}s observation window but {pending_requests} network \
+                     request(s) are still in flight. A request may be hanging."
+                ),
+                vec![
+                    "Check if a network request is hanging.",
+                    "Verify the API server is reachable.",
+                ],
+            )
+        } else if !screenshot_changed && ui_bridge_responsive && !has_loading_indicators {
+            (
+                "idle",
+                0.9,
+                "The app appears to be in a normal resting state. No loading \
+                 indicators detected and the screen is stable."
+                    .to_string(),
+                vec![],
+            )
+        } else if screenshot_changed && has_loading_indicators {
+            (
+                "loading",
+                0.85,
+                format!(
+                    "The app is loading. The screen changed during the {obs_secs}s \
+                     observation window and loading indicators are visible, indicating \
+                     content is being rendered."
+                ),
+                vec![],
+            )
+        } else if screenshot_changed && !ui_bridge_responsive {
+            (
+                "unknown",
+                0.5,
+                "The screen is changing but the UI Bridge is not responding. \
+                 The app may be loading or recovering."
+                    .to_string(),
+                vec!["Wait a few seconds and try again."],
+            )
+        } else {
+            (
+                "idle",
+                0.7,
+                "The app appears to be in a normal state. The screen changed \
+                 slightly during observation but no loading indicators are present."
+                    .to_string(),
+                vec![],
+            )
+        };
+
+    let evidence = serde_json::json!({
+        "screenshotSimilarity": similarity,
+        "screenshotChanged": screenshot_changed,
+        "uiBridgeResponsive": ui_bridge_responsive,
+        "loadingIndicators": loading_indicators_list,
+        "networkBusy": network_busy,
+        "pendingNetworkRequests": pending_requests,
+    });
+
+    let diagnosis = serde_json::json!({
+        "verdict": verdict,
+        "confidence": confidence,
+        "summary": summary,
+        "evidence": evidence,
+        "observationWindowMs": observation_ms,
+        "suggestions": suggestions,
+        "screenshot": cap2.base64,
+        "screenshotWidth": cap2.width,
+        "screenshotHeight": cap2.height,
+        "captureSource": cap2.source,
+        "timestamp": chrono::Utc::now().timestamp_millis(),
+    });
+
+    Json(ApiResponse::success(diagnosis))
+}
+
+// ============================================================================
 // AI Search & Find Handlers
 // ============================================================================
 
@@ -2462,6 +2812,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/wait-for-idle",
             post(ui_bridge_wait_for_idle_handler),
+        )
+        .route(
+            "/ui-bridge/control/diagnose-stuck",
+            post(ui_bridge_diagnose_stuck_screen_handler),
         )
         // AI search & find
         .route(

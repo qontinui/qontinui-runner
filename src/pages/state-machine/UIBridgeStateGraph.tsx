@@ -28,6 +28,7 @@ interface UIBridgeStateGraphProps {
   isDragging?: boolean;
   dropTargetStateId?: string | null;
   onDeleteTransition?: (id: string) => void;
+  elementThumbnails?: Record<string, string>;
 }
 
 export function UIBridgeStateGraph({
@@ -44,6 +45,7 @@ export function UIBridgeStateGraph({
   isDragging,
   dropTargetStateId,
   onDeleteTransition,
+  elementThumbnails,
 }: UIBridgeStateGraphProps) {
   return (
     <StateMachineGraphView
@@ -67,6 +69,7 @@ export function UIBridgeStateGraph({
         ["Create transition", "Drag element"],
         ["Move element", "Alt+Drag"],
       ]}
+      elementThumbnails={elementThumbnails}
     />
   );
 }

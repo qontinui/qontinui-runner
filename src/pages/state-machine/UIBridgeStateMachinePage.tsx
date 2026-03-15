@@ -7,7 +7,8 @@
  * Tabs: Discovery, Graph Editor, State View, Transitions, Pathfinding, Export
  */
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   Network,
   GitBranch,
@@ -63,6 +64,34 @@ export function UIBridgeStateMachinePage() {
   const [selectedTransitionId, setSelectedTransitionId] = useState<string | null>(null);
   const [showNewTransition, setShowNewTransition] = useState(false);
   const [highlightedPath, setHighlightedPath] = useState<PathfindingResult["steps"] | undefined>();
+  // Thumbnails loaded from database when config changes
+  const [elementThumbnails, setElementThumbnails] = useState<Record<string, string> | undefined>();
+  const activeConfigId = sm.activeConfig?.id;
+  useEffect(() => {
+    if (!activeConfigId) {
+      setElementThumbnails(undefined);
+      return;
+    }
+    console.log("[UIBridgeStateMachinePage] Loading thumbnails for config:", activeConfigId);
+    invoke<Record<string, string>>("sm_get_thumbnails", { configId: activeConfigId })
+      .then((thumbs) => {
+        console.log(`[UIBridgeStateMachinePage] Loaded ${Object.keys(thumbs).length} thumbnails`);
+        if (Object.keys(thumbs).length > 0) {
+          setElementThumbnails(thumbs);
+        }
+      })
+      .catch((err) => {
+        console.error("[UIBridgeStateMachinePage] Failed to load thumbnails:", err);
+      });
+  }, [activeConfigId]);
+
+  // Also sync from discovery co-occurrence data (available during exploration before save)
+  const coocThumbs = discovery.cooccurrenceData?.elementThumbnails;
+  useEffect(() => {
+    if (coocThumbs && Object.keys(coocThumbs).length > 0) {
+      setElementThumbnails(coocThumbs);
+    }
+  }, [coocThumbs]);
 
   // Derived state
   const states = sm.activeConfig?.states ?? [];
@@ -252,6 +281,7 @@ export function UIBridgeStateMachinePage() {
               transitions={transitions}
               selectedStateId={selectedStateId}
               selectedTransitionId={selectedTransitionId}
+              elementThumbnails={elementThumbnails}
               onSelectState={(id) => {
                 setSelectedStateId(id);
                 setSelectedTransitionId(null);
@@ -332,6 +362,7 @@ export function UIBridgeStateMachinePage() {
               setSelectedStateId(id);
               setSelectedTransitionId(null);
             }}
+            elementThumbnails={elementThumbnails}
           />
         </div>
       </div>

@@ -1096,6 +1096,17 @@ async fn handle_wait_for_signal(
     }
 }
 
+/// POST /ui-bridge/sdk/diagnose-stuck — Diagnose stuck screen in SDK app
+async fn handle_diagnose_stuck(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/diagnose-stuck", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
 /// POST /ui-bridge/sdk/wait-for-targets — Wait for specific targets in SDK app
 async fn handle_wait_for_targets(
     State(state): State<Arc<ApiState>>,
@@ -2785,6 +2796,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/wait-for-targets",
             post(handle_wait_for_targets),
         )
+        .route("/ui-bridge/sdk/diagnose-stuck", post(handle_diagnose_stuck))
         // Tab registry
         .route("/ui-bridge/sdk/tabs", get(handle_tabs))
         // Page navigation

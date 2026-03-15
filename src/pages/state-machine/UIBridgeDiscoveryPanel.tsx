@@ -438,7 +438,7 @@ export function UIBridgeDiscoveryPanel({
                   placeholder="e.g., My App States"
                   value={discovery.configName}
                   onChange={(e) => discovery.setConfigName(e.target.value)}
-                  className="w-full rounded-md border border-border-primary bg-surface-primary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-brand-primary"
+                  className="w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-brand-primary"
                 />
               </div>
               <button

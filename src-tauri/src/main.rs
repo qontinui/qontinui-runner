@@ -586,6 +586,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::state_machine_configs::sm_update_transition,
             commands::state_machine_configs::sm_delete_transition,
             commands::state_machine_configs::sm_import_config,
+            commands::state_machine_configs::sm_save_thumbnails,
+            commands::state_machine_configs::sm_get_thumbnails,
             // State Explorer commands
             commands::state_explorer::start_exploration,
             commands::state_explorer::get_exploration_strategies,

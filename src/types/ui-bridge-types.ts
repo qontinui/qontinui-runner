@@ -337,6 +337,8 @@ export interface CooccurrenceExport {
     cooccurrenceRate: number;
     appearanceCount: number;
   }>;
+  /** Optional map of fingerprint hash → base64 PNG thumbnail of the element. */
+  elementThumbnails?: Record<string, string>;
 }
 
 // =============================================================================

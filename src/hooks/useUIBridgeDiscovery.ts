@@ -59,7 +59,30 @@ interface PersistedDiscoveryState {
 }
 
 function loadPersistedState(): PersistedDiscoveryState | null {
-  return instanceStorage.getJSON<PersistedDiscoveryState | null>(STORAGE_KEY, null);
+  try {
+    const state = instanceStorage.getJSON<PersistedDiscoveryState | null>(STORAGE_KEY, null);
+    // Validate the persisted data — reject if critical fields are missing
+    if (state?.cooccurrenceData) {
+      const data = state.cooccurrenceData;
+      if (!Array.isArray(data.allFingerprints) || !Array.isArray(data.presenceMatrix)) {
+        console.warn("[useUIBridgeDiscovery] Clearing stale/invalid persisted co-occurrence data");
+        instanceStorage.removeItem(STORAGE_KEY);
+        return null;
+      }
+    }
+    if (state?.discoveryResult) {
+      const result = state.discoveryResult;
+      if (!Array.isArray(result.states) || !result.statistics) {
+        console.warn("[useUIBridgeDiscovery] Clearing stale/invalid persisted discovery result");
+        instanceStorage.removeItem(STORAGE_KEY);
+        return null;
+      }
+    }
+    return state;
+  } catch {
+    instanceStorage.removeItem(STORAGE_KEY);
+    return null;
+  }
 }
 
 function savePersistedState(state: PersistedDiscoveryState): void {
@@ -123,7 +146,7 @@ export function useUIBridgeDiscovery(
 
     setIsDiscovering(true);
     try {
-      // Try Tauri IPC first (Python-based discovery)
+      // Run fingerprint-based state discovery via Rust backend
       let result: FingerprintDiscoveryResult;
       try {
         const response = await invoke<CommandResponse>(
@@ -138,17 +161,19 @@ export function useUIBridgeDiscovery(
         }
         result = response.data as FingerprintDiscoveryResult;
       } catch (ipcErr) {
-        // Fallback: run discovery in JS when extraction executor is unavailable
+        // Fallback: run discovery in JS when Rust backend is unavailable
         console.warn(
-          "[useUIBridgeDiscovery] Tauri IPC failed, running JS-based discovery:",
+          "[useUIBridgeDiscovery] Rust discovery failed, running JS-based fallback:",
           ipcErr,
         );
         result = discoverStatesFromFingerprints(cooccurrenceData);
       }
 
+      console.log(
+        `[useUIBridgeDiscovery] Discovery result: ${result.states.length} states, ${result.transitions.length} transitions`,
+      );
       setDiscoveryResult(result);
       showToast?.(`Discovered ${result.states.length} states`, "success");
-      console.log(`[useUIBridgeDiscovery] Discovered ${result.states.length} states`);
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -179,6 +204,9 @@ export function useUIBridgeDiscovery(
 
     setIsSaving(true);
     try {
+      console.log(
+        `[useUIBridgeDiscovery] Saving config with ${discoveryResult.states.length} states`,
+      );
       const config = await smConfig.createConfig({
         name: configName.trim(),
         description: `Discovered from ${cooccurrenceData.presenceMatrix?.length ?? 0} captures via ${dataSource || "unknown"}`,
@@ -187,6 +215,9 @@ export function useUIBridgeDiscovery(
       // Create states via direct Tauri IPC to avoid React state batching issue.
       // createConfig sets activeConfig asynchronously, so calling smConfig.createState
       // immediately would fail because activeConfig hasn't updated yet.
+      console.log(
+        `[useUIBridgeDiscovery] Creating ${discoveryResult.states.length} states for config ${config.id}`,
+      );
       for (const state of discoveryResult.states) {
         const request: StateMachineStateCreate = {
           state_id: state.stateId,
@@ -195,10 +226,15 @@ export function useUIBridgeDiscovery(
           element_ids: state.elementIds,
           confidence: state.confidence,
         };
-        await invoke<StateMachineState>("sm_create_state", {
-          configId: config.id,
-          request,
-        });
+        try {
+          await invoke<StateMachineState>("sm_create_state", {
+            configId: config.id,
+            request,
+          });
+          console.log(`[useUIBridgeDiscovery] Created state: ${state.name}`);
+        } catch (stateErr) {
+          console.error(`[useUIBridgeDiscovery] Failed to create state "${state.name}":`, stateErr);
+        }
       }
 
       // Reload the full config so the UI reflects all created states
@@ -212,6 +248,24 @@ export function useUIBridgeDiscovery(
         `[useUIBridgeDiscovery] Saved config "${configName.trim()}" with ${discoveryResult.states.length} states`,
       );
 
+      const savedConfigId = config.id;
+
+      // Save thumbnails to database (survives across sessions)
+      if (
+        cooccurrenceData.elementThumbnails &&
+        Object.keys(cooccurrenceData.elementThumbnails).length > 0
+      ) {
+        try {
+          const count = await invoke<number>("sm_save_thumbnails", {
+            configId: savedConfigId,
+            thumbnails: cooccurrenceData.elementThumbnails,
+          });
+          console.log(`[useUIBridgeDiscovery] Saved ${count} thumbnails to database`);
+        } catch (err) {
+          console.warn("[useUIBridgeDiscovery] Failed to save thumbnails:", err);
+        }
+      }
+
       // Clear discovery state
       setCooccurrenceDataState(null);
       setDataSource(null);
@@ -219,7 +273,7 @@ export function useUIBridgeDiscovery(
       setConfigName("");
       clearPersistedState();
 
-      return config.id;
+      return savedConfigId;
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to save";
       showToast?.(message, "error");
@@ -264,6 +318,9 @@ function discoverStatesFromFingerprints(data: CooccurrenceExport): FingerprintDi
   const fingerprintDetails = data.fingerprintDetails ?? {};
   const transitions = data.transitions ?? [];
   const totalCaptures = presenceMatrix.length;
+  console.log(
+    `[discoverStatesFromFingerprints] Input: ${allFingerprints.length} fingerprints, ${totalCaptures} captures, ${transitions.length} transitions, ${Object.keys(fingerprintDetails).length} details`,
+  );
   if (totalCaptures === 0 || allFingerprints.length === 0) {
     return {
       states: [],

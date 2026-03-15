@@ -541,67 +541,51 @@ pub struct FingerprintDiscoveryResult {
 /// * `Err(String)` - Error message if discovery fails
 #[tauri::command]
 pub async fn ui_bridge_discover_states_from_fingerprints(
-    state: State<'_, Arc<super::AppState>>,
+    _state: State<'_, Arc<super::AppState>>,
     cooccurrence_export: serde_json::Value,
     config: Option<FingerprintDiscoveryConfig>,
 ) -> Result<CommandResponse, String> {
-    info!("UI Bridge: Discovering states from fingerprints");
+    info!("UI Bridge: Discovering states from fingerprints (Rust)");
 
-    // The extraction executor uses block_on internally (it has its own tokio runtime).
-    // We must run it on a blocking thread to avoid "Cannot start a runtime from within
-    // a runtime" panics, since this Tauri command runs on the main tokio runtime.
-    let app_state = state.inner().clone();
-
+    // Run on a blocking thread since the discovery may be CPU-intensive
     tokio::task::spawn_blocking(move || -> Result<CommandResponse, String> {
-        let mut executor_lock = crate::safe_lock::safe_lock_or_recover(
-            &app_state.extraction_executor,
-            "extraction_executor",
+        // Deserialize the co-occurrence export
+        let export: crate::exploration::types::CooccurrenceExport =
+            serde_json::from_value(cooccurrence_export)
+                .map_err(|e| format!("Failed to parse co-occurrence export: {}", e))?;
+
+        // Build discovery config
+        let discovery_config = if let Some(c) = config {
+            let mut dc = crate::exploration::discovery::DiscoveryConfig::default();
+            if let Some(rate) = c.min_cooccurrence_rate {
+                dc.min_cooccurrence_rate = rate;
+            }
+            dc
+        } else {
+            crate::exploration::discovery::DiscoveryConfig::default()
+        };
+
+        // Run Rust-native discovery
+        let mut discovery =
+            crate::exploration::discovery::FingerprintStateDiscovery::new(discovery_config);
+        discovery.load_cooccurrence_export(&export);
+        discovery.discover_states();
+        let result = discovery.into_result();
+
+        info!(
+            "Discovery complete: {} states, {} transitions",
+            result.states.len(),
+            result.transitions.len()
         );
 
-        if let Some(ref mut executor) = *executor_lock {
-            // Start executor on-demand if not running
-            executor.ensure_started().map_err(|e| {
-                error!("Failed to start extraction executor: {}", e);
-                e
-            })?;
+        let data = serde_json::to_value(&result)
+            .map_err(|e| format!("Failed to serialize result: {}", e))?;
 
-            // Build config object for Python
-            let config_params = config.map(|c| {
-                json!({
-                    "minCooccurrenceRate": c.min_cooccurrence_rate.unwrap_or(0.95),
-                })
-            });
-
-            let params = json!({
-                "cooccurrence_export": cooccurrence_export,
-                "config": config_params,
-            });
-
-            // Send command and wait for response
-            let response_result = executor
-                .send_command_and_wait(
-                    "discover_states_from_fingerprints",
-                    Some(params),
-                    std::time::Duration::from_secs(60),
-                )
-                .map_err(|e| e.to_string())?;
-
-            // Check if the response indicates success
-            if response_result.success {
-                Ok(CommandResponse {
-                    success: true,
-                    message: Some("Fingerprint state discovery complete".to_string()),
-                    data: response_result.data,
-                })
-            } else {
-                let error_msg = response_result
-                    .error
-                    .unwrap_or_else(|| "Unknown error".to_string());
-                Err(format!("Discovery failed: {}", error_msg))
-            }
-        } else {
-            Err("Extraction executor not initialized".to_string())
-        }
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Fingerprint state discovery complete".to_string()),
+            data: Some(data),
+        })
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?

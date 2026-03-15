@@ -174,3 +174,49 @@ pub async fn sm_import_config(
     );
     Ok(result)
 }
+
+// =============================================================================
+// Thumbnail Commands
+// =============================================================================
+
+#[tauri::command]
+pub async fn sm_save_thumbnails(
+    config_id: String,
+    thumbnails: std::collections::HashMap<String, String>,
+    app_state: State<'_, Arc<AppState>>,
+) -> Result<usize, String> {
+    let conn = app_state.checkpoint_db.get_conn()?;
+    let mut count = 0;
+    for (hash, data) in &thumbnails {
+        conn.execute(
+            "INSERT OR REPLACE INTO sm_element_thumbnails (config_id, fingerprint_hash, thumbnail_base64) VALUES (?1, ?2, ?3)",
+            rusqlite::params![config_id, hash, data],
+        )
+        .map_err(|e| format!("Failed to save thumbnail: {}", e))?;
+        count += 1;
+    }
+    info!("Saved {} thumbnails for config {}", count, config_id);
+    Ok(count)
+}
+
+#[tauri::command]
+pub async fn sm_get_thumbnails(
+    config_id: String,
+    app_state: State<'_, Arc<AppState>>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let conn = app_state.checkpoint_db.get_conn()?;
+    let mut stmt = conn
+        .prepare("SELECT fingerprint_hash, thumbnail_base64 FROM sm_element_thumbnails WHERE config_id = ?1")
+        .map_err(|e| format!("Failed to query thumbnails: {}", e))?;
+    let rows = stmt
+        .query_map(rusqlite::params![config_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("Failed to fetch thumbnails: {}", e))?;
+    let mut result = std::collections::HashMap::new();
+    for row in rows {
+        let (hash, data) = row.map_err(|e| format!("Row error: {}", e))?;
+        result.insert(hash, data);
+    }
+    Ok(result)
+}

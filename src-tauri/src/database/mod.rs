@@ -6513,6 +6513,28 @@ impl CheckpointDb {
             info!("Successfully migrated to version 109 (confidence_score)");
         }
 
+        if current_version < 110 {
+            info!("Migrating to version 110 (state machine element thumbnails)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS sm_element_thumbnails (
+                    config_id TEXT NOT NULL REFERENCES state_machine_configs(id) ON DELETE CASCADE,
+                    fingerprint_hash TEXT NOT NULL,
+                    thumbnail_base64 TEXT NOT NULL,
+                    PRIMARY KEY (config_id, fingerprint_hash)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_sm_thumbnails_config ON sm_element_thumbnails(config_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (110, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 110: {}", e))?;
+
+            info!("Successfully migrated to version 110 (sm_element_thumbnails)");
+        }
+
         // Repair migration: is_favorite column may be missing on databases created from
         // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
         // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,
