@@ -47,7 +47,7 @@ export function ExportPanel({ config, showToast }: ExportPanelProps) {
     } finally {
       setIsExporting(false);
     }
-  }, [config]);
+  }, [config, showToast]);
 
   const handleLoadIntoRuntime = useCallback(async () => {
     if (!config) return;
@@ -74,7 +74,7 @@ export function ExportPanel({ config, showToast }: ExportPanelProps) {
     } finally {
       setIsLoading(false);
     }
-  }, [config]);
+  }, [config, showToast]);
 
   return (
     <div className="p-6 space-y-6 max-w-lg mx-auto">

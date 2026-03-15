@@ -135,6 +135,7 @@ export async function handleChangeTrackingCommand(
         const mgr = deps.createSnapshotManager({});
         const currentSemantic = mgr.createSnapshot({
           timestamp: Date.now(),
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any -- deps.createSnapshot() returns any
           elements: snap.elements.map((e: any) => ({
             id: e.id,
             type: e.type,
