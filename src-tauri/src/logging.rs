@@ -394,20 +394,5 @@ pub fn log_panic(info: &std::panic::PanicHookInfo) {
 pub fn setup_panic_handler() {
     std::panic::set_hook(Box::new(|info| {
         log_panic(info);
-
-        // TODO: This re-initializes Sentry on every panic, which is redundant if main.rs
-        // already initialized it. Remove this once the main.rs guard scoping is fixed.
-        #[cfg(not(debug_assertions))]
-        {
-            let guard = sentry::init((
-                std::env::var("SENTRY_DSN").unwrap_or_default(),
-                sentry::ClientOptions {
-                    release: sentry::release_name!(),
-                    environment: Some("beta".into()),
-                    ..Default::default()
-                },
-            ));
-            std::mem::forget(guard);
-        }
     }));
 }

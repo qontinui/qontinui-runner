@@ -150,15 +150,11 @@ function ScreenshotView({ screenshots }: { screenshots?: ScreenshotInfo[] }) {
   }, [screenshots, currentIndex]);
 
   const goNext = () => {
-    if (currentIndex < screenshotCount - 1) {
-      setCurrentIndex(currentIndex + 1);
-    }
+    setCurrentIndex(prev => Math.min(prev + 1, screenshotCount - 1));
   };
 
   const goPrev = () => {
-    if (currentIndex > 0) {
-      setCurrentIndex(currentIndex - 1);
-    }
+    setCurrentIndex(prev => Math.max(prev - 1, 0));
   };
 
   const currentScreenshot = screenshots?.[currentIndex];

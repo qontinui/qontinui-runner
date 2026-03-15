@@ -160,28 +160,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting Qontinui Runner v{}", env!("CARGO_PKG_VERSION"));
 
-    // TODO: The Sentry guard is scoped to this block — when it drops, Sentry shuts down.
-    // Move _guard to the outer scope so it lives for the entire application lifetime.
-    // Also, the panic handler in logging.rs re-initializes Sentry redundantly.
-    // Consolidate into a single initialization here and remove the duplicate in setup_panic_handler().
+    // Initialize Sentry for crash reporting (release builds only).
+    // The guard must live for the entire application lifetime — when it drops, Sentry shuts down.
     #[cfg(not(debug_assertions))]
-    {
-        if let Ok(dsn) = std::env::var("SENTRY_DSN") {
-            let _guard = sentry::init((
-                dsn,
-                sentry::ClientOptions {
-                    release: sentry::release_name!(),
-                    environment: Some("beta".into()),
-                    before_send: Some(std::sync::Arc::new(|event| {
-                        info!("Sending error to Sentry: {:?}", event);
-                        Some(event)
-                    })),
-                    ..Default::default()
-                },
-            ));
-            info!("Sentry crash reporting initialized");
-        }
-    }
+    let _sentry_guard = std::env::var("SENTRY_DSN").ok().map(|dsn| {
+        let guard = sentry::init((
+            dsn,
+            sentry::ClientOptions {
+                release: sentry::release_name!(),
+                environment: Some("beta".into()),
+                before_send: Some(std::sync::Arc::new(|event| {
+                    info!("Sending error to Sentry: {:?}", event);
+                    Some(event)
+                })),
+                ..Default::default()
+            },
+        ));
+        info!("Sentry crash reporting initialized");
+        guard
+    });
 
     // Initialize DisplayProcessor with ActionLogProfile
     let mut display_processor = DisplayProcessor::new();
