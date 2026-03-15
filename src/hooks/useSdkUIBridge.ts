@@ -1439,7 +1439,6 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- hydrate once on mount
   }, []);
 
   // =========================================================================

@@ -35,22 +35,23 @@ export const HOOK_CATEGORY_LABELS: Record<HookCategory, string> = {
   "route-awareness": "Route Awareness",
   "page-context": "Page Context",
   "state-machine": "State Machine (UI States & Transitions)",
-  "components": "Component Actions & State",
+  components: "Component Actions & State",
   "keyboard-shortcuts": "Keyboard Shortcuts",
   "undo-redo": "Undo/Redo",
-  "annotations": "Element Annotations",
-  "intents": "Intents",
+  annotations: "Element Annotations",
+  intents: "Intents",
 };
 
 export const HOOK_CATEGORY_DESCRIPTIONS: Record<HookCategory, string> = {
-  "route-awareness": "Router integration for navigation tracking — route patterns, params, query strings",
+  "route-awareness":
+    "Router integration for navigation tracking — route patterns, params, query strings",
   "page-context": "Semantic page names, sections, breadcrumbs derived from routes",
   "state-machine": "Modals, panels, tabs, auth states, form steps — with transitions between them",
-  "components": "Component-level actions, state getters, computed properties",
+  components: "Component-level actions, state getters, computed properties",
   "keyboard-shortcuts": "Non-ARIA keyboard shortcuts from event handlers or hotkey libraries",
   "undo-redo": "Wiring to the app's state management undo/redo system",
-  "annotations": "Semantic metadata for specific UI elements",
-  "intents": "Named composite user actions (e.g., 'create-new-project', 'submit-form')",
+  annotations: "Semantic metadata for specific UI elements",
+  intents: "Named composite user actions (e.g., 'create-new-project', 'submit-form')",
 };
 
 // =============================================================================
@@ -342,7 +343,7 @@ For tab groups, wizard steps, or exclusive states:
 - Create a \`useUIStateGroup()\` with \`exclusive: true\`
 `.trim(),
 
-  "components": `
+  components: `
 ### Component Actions (\`useUIComponent\`)
 
 Look for:
@@ -391,7 +392,7 @@ Generate: A \`useUndoRedo()\` call wired to the app's undo system:
 **Only generate this if the app has an actual undo/redo system.** Do not generate a stub.
 `.trim(),
 
-  "annotations": `
+  annotations: `
 ### Element Annotations (\`useUIAnnotation\`)
 
 Look for:
@@ -409,7 +410,7 @@ Generate: \`useUIAnnotation()\` calls for important elements, providing:
 **Be selective.** Only annotate elements where the annotation adds value beyond what the DOM already communicates. Don't annotate every element.
 `.trim(),
 
-  "intents": `
+  intents: `
 ### Intents (\`registerIntent\`)
 
 Look for:
@@ -436,7 +437,11 @@ Intents are registered via the API at startup, not as React hooks.
 const OUTPUT_FORMAT = `
 ## Output Format
 
-Output each generated file as a fenced code block with \`// FILE: <relative-path>\` on the **first line** inside the fence. Use TypeScript/TSX syntax.
+**CRITICAL: Do NOT use file-writing tools (Write, Edit, etc.) to create or modify files.
+Your output will be parsed by a script that extracts code blocks. You MUST output
+all generated files as fenced code blocks in your text response.**
+
+Output each generated file as a fenced code block with \`// FILE: <relative-path>\` on the **first line** inside the fence. Use \`tsx\` or \`ts\` as the language tag.
 
 Example:
 \`\`\`tsx
@@ -466,6 +471,10 @@ export const APP_INTENTS: Intent[] = [
   // ... intent definitions
 ];
 \`\`\`
+
+**If you do not output code blocks with \`// FILE:\` markers, the generation will fail.**
+You may use file-reading tools to explore the codebase, but all generated code must be
+output as text in the format above.
 
 ### File Structure Rules
 
@@ -512,6 +521,10 @@ const EXPLORATION_INSTRUCTIONS = `
 
 You MUST explore the actual source code before generating any hooks. Do not guess at app structure.
 
+**IMPORTANT: Use file-reading tools to explore the code, but do NOT use file-writing
+tools (Write, Edit, etc.) to create or modify any files. Your final output must be
+code blocks in your text response with \`// FILE:\` markers — see the Output Format section.**
+
 ### Code exploration steps:
 1. **Find the router configuration** — look for route definitions, page directories, router setup files
 2. **Read page/layout components** — understand the component tree, what wraps what
@@ -552,6 +565,15 @@ export function buildHookGenPrompt(
   lines.push("Your job is to read the application's source code, understand its structure,");
   lines.push("and generate accurate, app-specific hook files that register the app's UI states,");
   lines.push("routes, components, shortcuts, and intents with the UI Bridge.");
+  lines.push("");
+  lines.push("**SYSTEM CONSTRAINT: You MUST NOT use any file-writing tools (Write, Edit,");
+  lines.push("save_file, create_file, etc.). Your output is parsed by a script. All generated");
+  lines.push(
+    "code must appear as fenced code blocks in your text response with `// FILE:` markers.",
+  );
+  lines.push(
+    "If you write files directly instead of outputting code blocks, the generation will fail.**",
+  );
   lines.push("");
 
   // Exploration instructions
@@ -605,6 +627,10 @@ export function buildHookRegenPrompt(
 
 You are UPDATING existing hook files, not creating from scratch. The current code is below.
 
+**IMPORTANT: Do NOT edit the existing files directly with tools. Output the COMPLETE
+updated file contents as a code block with the \`// FILE:\` marker, just like fresh
+generation. The system will apply the changes for you.**
+
 ### Merge Rules:
 1. **Read the source code first** (same process as fresh generation)
 2. **Compare existing hooks against what you find in the code:**
@@ -629,20 +655,15 @@ ${existingCode}
 // Architecture Spec Prompt (delegates to spec-prompt-builder)
 // =============================================================================
 
-import {
-  ARCHITECTURE_SPEC_CREATION_INSTRUCTIONS,
-  ARCHITECTURE_SPEC_MERGE_INSTRUCTIONS,
-} from "./spec-prompt-builder";
+import { SPEC_CREATION_INSTRUCTIONS, SPEC_MERGE_INSTRUCTIONS } from "./spec-prompt-builder";
 
 /**
  * Build an AI prompt for generating an architecture spec for the project.
- * Delegates to the canonical ARCHITECTURE_SPEC_CREATION_INSTRUCTIONS and
+ * Delegates to the canonical SPEC_CREATION_INSTRUCTIONS and
  * appends framework context.
  */
-export function buildArchitectureSpecPrompt(
-  analysis: ProjectAnalysisForHooks,
-): string {
-  return `${ARCHITECTURE_SPEC_CREATION_INSTRUCTIONS}
+export function buildArchitectureSpecPrompt(analysis: ProjectAnalysisForHooks): string {
+  return `${SPEC_CREATION_INSTRUCTIONS}
 
 ---
 
@@ -659,11 +680,11 @@ export function buildArchitectureSpecRegenPrompt(
   analysis: ProjectAnalysisForHooks,
   existingSpec: string,
 ): string {
-  return `${ARCHITECTURE_SPEC_CREATION_INSTRUCTIONS}
+  return `${SPEC_CREATION_INSTRUCTIONS}
 
 ---
 
-${ARCHITECTURE_SPEC_MERGE_INSTRUCTIONS}
+${SPEC_MERGE_INSTRUCTIONS}
 
 ---
 

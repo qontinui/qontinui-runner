@@ -11,11 +11,7 @@
 import type { StepStats, StepExecutionStatus } from "./types";
 import type { StepType } from "../execution-timeline/types";
 import type { WorkflowStage } from "@/types/dashboard/activity-types";
-import {
-  getStatusColors,
-  type StatusType,
-  type StatusColorClasses,
-} from "@/design-system/colors";
+import { getStatusColors, type StatusType, type StatusColorClasses } from "@/design-system/colors";
 
 // ---------------------------------------------------------------------------
 // Duration Formatting

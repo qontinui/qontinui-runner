@@ -27,11 +27,10 @@ import { useAiSession } from "@/hooks/useAiSession";
 import { MarkdownViewer } from "@/components/MarkdownViewer";
 import {
   SPEC_CREATION_INSTRUCTIONS,
-  ARCHITECTURE_SPEC_CREATION_INSTRUCTIONS,
   buildDetailedSpecContext,
   buildSpecReviewPrompt,
   buildSpecCreationWithMergeContext,
-  buildArchitectureSpecCreationWithMergeContext,
+  type SpecConfig,
 } from "@/lib/spec-prompt-builder";
 import type { LoadedSpec, SpecKind } from "./types";
 
@@ -379,10 +378,10 @@ export function SpecChatPanel({
         let message: string;
         if (selectedSpec && selectedSpec.kind === "architecture") {
           // Merge mode: existing architecture spec selected
-          message = buildArchitectureSpecCreationWithMergeContext(
+          message = buildSpecCreationWithMergeContext(
             {
               specId: selectedSpec.specId,
-              config: selectedSpec.config as unknown as Record<string, unknown>,
+              config: selectedSpec.config as unknown as SpecConfig,
               appName: selectedSpec.appName,
             },
             text,
@@ -390,7 +389,7 @@ export function SpecChatPanel({
           setTargetSpecId(selectedSpec.specId);
         } else {
           // Fresh creation
-          message = `${ARCHITECTURE_SPEC_CREATION_INSTRUCTIONS}\n\n---\n\nCreate a comprehensive architecture spec for the following project. Read the source code first, then generate a complete JSON spec.\n\n${text}`;
+          message = `${SPEC_CREATION_INSTRUCTIONS}\n\n---\n\nCreate a comprehensive architecture spec for the following project. Read the source code first, then generate a complete JSON spec.\n\n${text}`;
         }
         setPendingCreateType(null);
         await session.sendMessage(message);

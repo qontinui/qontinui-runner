@@ -5,7 +5,11 @@
  * These types define the shape of data displayed during GUI automation execution.
  */
 
-import type { ActionItem, ImageRecognitionResult, ScreenshotInfo } from "@/components/active-dashboard/types";
+import type {
+  ActionItem,
+  ImageRecognitionResult,
+  ScreenshotInfo,
+} from "@/components/active-dashboard/types";
 
 /**
  * Statistics for the GUI automation widget.

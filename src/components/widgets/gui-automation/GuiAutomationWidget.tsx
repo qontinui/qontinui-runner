@@ -22,7 +22,12 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { cn } from "@/lib/utils";
 import { Badge, ScrollArea, Progress, Button } from "@/components/ui";
 import type { GuiAutomationWidgetProps, GuiAutomationData } from "./types";
-import type { ActionItem, ActionStatus, ImageRecognitionResult, ScreenshotInfo } from "@/components/active-dashboard/types";
+import type {
+  ActionItem,
+  ActionStatus,
+  ImageRecognitionResult,
+  ScreenshotInfo,
+} from "@/components/active-dashboard/types";
 import { getStatusColors, getAccentColors } from "@/design-system";
 
 /**

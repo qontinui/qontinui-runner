@@ -11,13 +11,7 @@
  */
 
 import { useState, useCallback, useEffect } from "react";
-import {
-  Scan,
-  Loader2,
-  CheckCircle2,
-  Plug,
-  Unplug,
-} from "lucide-react";
+import { Scan, Loader2, CheckCircle2, Plug, Unplug } from "lucide-react";
 import { useAppDiscovery, type DiscoveredApp } from "@/hooks/useAppDiscovery";
 import { useSdkUIBridge } from "@/hooks/useSdkUIBridge";
 
@@ -60,10 +54,7 @@ export function SdkAppConnector({
   const [connectingAppId, setConnectingAppId] = useState<string | null>(null);
   const [connectedUrl, setConnectedUrl] = useState<string | null>(null);
 
-  const allApps: DiscoveredApp[] = [
-    ...appDiscovery.webApps,
-    ...appDiscovery.desktopApps,
-  ];
+  const allApps: DiscoveredApp[] = [...appDiscovery.webApps, ...appDiscovery.desktopApps];
 
   const isConnected = sdk.connectionStatus === "connected";
 
@@ -194,9 +185,7 @@ export function SdkAppConnector({
       )}
 
       {/* Error */}
-      {appDiscovery.error && (
-        <p className="text-xs text-red-400">{appDiscovery.error}</p>
-      )}
+      {appDiscovery.error && <p className="text-xs text-red-400">{appDiscovery.error}</p>}
     </div>
   );
 }

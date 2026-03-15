@@ -26,6 +26,8 @@ export const instanceStorage = {
   setJSON(key: string, value: unknown): void {
     try {
       localStorage.setItem(namespacedKey(key), JSON.stringify(value));
-    } catch { /* quota exceeded */ }
+    } catch {
+      /* quota exceeded */
+    }
   },
 };

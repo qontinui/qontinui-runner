@@ -44,10 +44,7 @@ import {
 } from "../shared";
 import { TimelineStatsBar } from "./TimelineStatsBar";
 import { getAccentColors, getStatusColors } from "@/design-system";
-import {
-  WORKFLOW_STAGE_CONFIG,
-  type WorkflowStage,
-} from "@/types/dashboard/activity-types";
+import { WORKFLOW_STAGE_CONFIG, type WorkflowStage } from "@/types/dashboard/activity-types";
 import type {
   ExecutionTimelineWidgetProps,
   TimelineStep,

@@ -334,7 +334,11 @@
             "label": "App list with Connect buttons"
           },
           "expected": "Each discovered app card shows: app name (font-medium), URL and framework in text-muted, and a 'Connect' button (brand-primary background). After connecting, the app list is hidden and replaced by a connected banner.",
-          "preconditions": ["Discovery tab is active", "Scan has completed with results", "Not yet connected"],
+          "preconditions": [
+            "Discovery tab is active",
+            "Scan has completed with results",
+            "Not yet connected"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -364,10 +368,17 @@
           "assertionType": "hasText",
           "target": {
             "type": "search",
-            "criteria": { "textContent": "Click Scan to find apps with the UI Bridge SDK installed." },
+            "criteria": {
+              "textContent": "Click Scan to find apps with the UI Bridge SDK installed."
+            },
             "label": "No apps hint text"
           },
-          "preconditions": ["Discovery tab is active", "Not connected", "No apps found", "Not scanning"],
+          "preconditions": [
+            "Discovery tab is active",
+            "Not connected",
+            "No apps found",
+            "Not scanning"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -392,7 +403,11 @@
             "criteria": { "textContent": "Explore" },
             "label": "Explore sub-tab"
           },
-          "preconditions": ["Discovery tab is active", "Connected to an SDK app", "No co-occurrence data collected"],
+          "preconditions": [
+            "Discovery tab is active",
+            "Connected to an SDK app",
+            "No co-occurrence data collected"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -408,7 +423,11 @@
             "criteria": { "textContent": "Record" },
             "label": "Record sub-tab"
           },
-          "preconditions": ["Discovery tab is active", "Connected to an SDK app", "No co-occurrence data collected"],
+          "preconditions": [
+            "Discovery tab is active",
+            "Connected to an SDK app",
+            "No co-occurrence data collected"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -425,7 +444,11 @@
             "label": "Start Exploration button"
           },
           "expected": "Clicking 'Start Exploration' begins automated exploration. The button text changes to 'Exploring...' with a Loader2 spinner and becomes disabled. A 'Cancel' button appears alongside. Progress text shows 'Progress: X / Y interactions' and 'Current: <element name>'. When exploration completes, co-occurrence data is stored and the view advances to Phase 3.",
-          "preconditions": ["Discovery tab is active", "Connected to an SDK app", "Explore sub-tab selected"],
+          "preconditions": [
+            "Discovery tab is active",
+            "Connected to an SDK app",
+            "Explore sub-tab selected"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -442,7 +465,11 @@
             "label": "Start Recording button"
           },
           "expected": "Initially shows 'Start Recording' button with a red Circle icon. When recording, the button changes to 'Stop Recording' (red background, Square icon). A recording status area shows: a red pulsing dot with 'N captures' badge, and 'N unique fingerprints' text. Stopping recording generates co-occurrence export data and advances to Phase 3.",
-          "preconditions": ["Discovery tab is active", "Connected to an SDK app", "Record sub-tab selected"],
+          "preconditions": [
+            "Discovery tab is active",
+            "Connected to an SDK app",
+            "Record sub-tab selected"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -459,7 +486,11 @@
             "label": "Explore description text"
           },
           "expected": "Automatically explore",
-          "preconditions": ["Discovery tab is active", "Connected to an SDK app", "Explore sub-tab selected"],
+          "preconditions": [
+            "Discovery tab is active",
+            "Connected to an SDK app",
+            "Explore sub-tab selected"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -516,7 +547,11 @@
             "criteria": { "textContent": "Discover States" },
             "label": "Discover States button"
           },
-          "preconditions": ["Discovery tab is active", "Co-occurrence data collected", "Discovery has not been run yet"],
+          "preconditions": [
+            "Discovery tab is active",
+            "Co-occurrence data collected",
+            "Discovery has not been run yet"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -566,7 +601,11 @@
             "label": "Save Configuration button"
           },
           "expected": "Clicking 'Save Configuration' calls discovery.saveConfig() which creates a new state machine config from the discovered states. The button is disabled (opacity-50) when the config name is empty or while saving. On success, the page switches to the Graph Editor tab with the newly created config loaded and selected.",
-          "preconditions": ["Discovery tab is active", "State discovery has completed", "Config name is not empty"],
+          "preconditions": [
+            "Discovery tab is active",
+            "State discovery has completed",
+            "Config name is not empty"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -685,7 +724,10 @@
             "label": "Graph state node"
           },
           "expected": "Clicking a state node should: (1) highlight the node, (2) open the StateDetailPanel in the right side panel showing 'State Details' header, (3) deselect any previously selected transition and close the transition editor",
-          "preconditions": ["A config is selected with at least one state", "Graph Editor tab is active"],
+          "preconditions": [
+            "A config is selected with at least one state",
+            "Graph Editor tab is active"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -702,7 +744,10 @@
             "label": "Graph transition edge"
           },
           "expected": "Clicking a transition edge should: (1) select the edge, (2) open the TransitionEditor in the right side panel in edit mode showing 'Edit Transition' header, (3) deselect any previously selected state",
-          "preconditions": ["A config is selected with at least one transition", "Graph Editor tab is active"],
+          "preconditions": [
+            "A config is selected with at least one transition",
+            "Graph Editor tab is active"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -719,7 +764,10 @@
             "label": "Graph canvas"
           },
           "expected": "Dragging an element tile from one state node to another should: without Alt key, create a new transition between the two states; with Alt key held, move the element from the source state to the target state. Drop targets are highlighted during drag.",
-          "preconditions": ["A config is selected with at least two states", "Graph Editor tab is active"],
+          "preconditions": [
+            "A config is selected with at least two states",
+            "Graph Editor tab is active"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -1163,7 +1211,11 @@
             "label": "Pathfinding result and graph"
           },
           "expected": "After finding a path with result.found === true, switching to the Graph Editor tab should show the path edges highlighted. If no path is found, highlightedPath is cleared.",
-          "preconditions": ["A config is selected with states and transitions", "Pathfinding tab is active", "A path has been found"],
+          "preconditions": [
+            "A config is selected with states and transitions",
+            "Pathfinding tab is active",
+            "A path has been found"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -1180,7 +1232,11 @@
             "label": "Pathfinding results"
           },
           "expected": "After clicking 'Find Path': (1) Success: shows path found with step count and total cost, listing each step with transition name and from-to states. (2) Same state: indicates already at target. (3) No path: shows no path found message.",
-          "preconditions": ["A config is selected with states", "Pathfinding tab is active", "User has clicked Find Path"],
+          "preconditions": [
+            "A config is selected with states",
+            "Pathfinding tab is active",
+            "User has clicked Find Path"
+          ],
           "source": "manual",
           "reviewed": true,
           "enabled": true

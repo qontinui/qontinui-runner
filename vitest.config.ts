@@ -19,9 +19,18 @@ export default defineConfig({
   resolve: {
     alias: [
       { find: "@", replacement: resolve(__dirname, "./src") },
-      { find: /^@qontinui\/shared-types\/(.+)$/, replacement: resolve(__dirname, "../qontinui-schemas/ts/dist/$1.js") },
-      { find: "@qontinui/shared-types", replacement: resolve(__dirname, "../qontinui-schemas/ts/dist/index.js") },
-      { find: "@qontinui/workflow-utils", replacement: resolve(__dirname, "../qontinui-workflow-utils/dist/index.js") },
+      {
+        find: /^@qontinui\/shared-types\/(.+)$/,
+        replacement: resolve(__dirname, "../qontinui-schemas/ts/dist/$1.js"),
+      },
+      {
+        find: "@qontinui/shared-types",
+        replacement: resolve(__dirname, "../qontinui-schemas/ts/dist/index.js"),
+      },
+      {
+        find: "@qontinui/workflow-utils",
+        replacement: resolve(__dirname, "../qontinui-workflow-utils/dist/index.js"),
+      },
     ],
   },
 });

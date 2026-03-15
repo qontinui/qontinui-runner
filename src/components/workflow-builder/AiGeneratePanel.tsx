@@ -172,29 +172,21 @@ export function AiGeneratePanel({
 
   // --- Batch mode state ---
   const [batchMode, setBatchMode] = useState(false);
-  const [batchEntries, setBatchEntries] = useState<
-    { id: string; title: string; prompt: string }[]
-  >(() => Array.from({ length: 12 }, () => ({ id: crypto.randomUUID(), title: "", prompt: "" })));
+  const [batchEntries, setBatchEntries] = useState<{ id: string; title: string; prompt: string }[]>(
+    () => Array.from({ length: 12 }, () => ({ id: crypto.randomUUID(), title: "", prompt: "" })),
+  );
 
   const addBatchEntry = useCallback(() => {
-    setBatchEntries((prev) => [
-      ...prev,
-      { id: crypto.randomUUID(), title: "", prompt: "" },
-    ]);
+    setBatchEntries((prev) => [...prev, { id: crypto.randomUUID(), title: "", prompt: "" }]);
   }, []);
 
   const removeBatchEntry = useCallback((id: string) => {
     setBatchEntries((prev) => (prev.length <= 1 ? prev : prev.filter((e) => e.id !== id)));
   }, []);
 
-  const updateBatchEntry = useCallback(
-    (id: string, field: "title" | "prompt", value: string) => {
-      setBatchEntries((prev) =>
-        prev.map((e) => (e.id === id ? { ...e, [field]: value } : e)),
-      );
-    },
-    [],
-  );
+  const updateBatchEntry = useCallback((id: string, field: "title" | "prompt", value: string) => {
+    setBatchEntries((prev) => prev.map((e) => (e.id === id ? { ...e, [field]: value } : e)));
+  }, []);
 
   // --- Remaining local state ---
   const [description, setDescription] = useState("");
@@ -288,9 +280,7 @@ export function AiGeneratePanel({
     return { ...base, description: description.trim() };
   }, [buildBaseRequest, description, selectedContextIds, inlineContext]);
 
-  const canGenerate = batchMode
-    ? batchEntries.some((e) => e.prompt.trim())
-    : !!description.trim();
+  const canGenerate = batchMode ? batchEntries.some((e) => e.prompt.trim()) : !!description.trim();
 
   /** Fire a single generate-async request and return the task_run_id. */
   const fireGenerateRequest = async (request: Record<string, unknown>): Promise<string> => {

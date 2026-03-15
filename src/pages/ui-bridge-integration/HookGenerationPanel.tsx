@@ -48,7 +48,10 @@ interface GeneratedFile {
 
 function extractGeneratedFiles(content: string): GeneratedFile[] {
   const results: GeneratedFile[] = [];
-  const regex = /```(?:tsx?|jsx?|typescript(?:react)?|javascript(?:react)?)\s*\r?\n\/\/ FILE:\s*(.+?)\r?\n([\s\S]*?)```/g;
+  // Match code blocks with optional language tag, then // FILE: marker on first line
+  // Case-insensitive for language tags, allows blank lines between fence and marker
+  const regex =
+    /```(?:tsx?|jsx?|typescript(?:react)?|javascript(?:react)?)?\s*\r?\n\s*\/\/ FILE:\s*(.+?)\r?\n([\s\S]*?)```/gi;
   let match;
   while ((match = regex.exec(content)) !== null) {
     const filePath = match[1].trim();
@@ -161,9 +164,17 @@ export function HookGenerationPanel({
   // Track what we're waiting for in the AI flow
   const pendingStepRef = useRef<IntegrationStep | null>(null);
   const prevSessionStateRef = useRef<string>(session.sessionState);
+  const specRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const isRegenHooks = analysis.has_generated_hooks;
   const isRegenSpec = analysis.has_architecture_spec;
+
+  // Clean up retry timer on unmount
+  useEffect(() => {
+    return () => {
+      if (specRetryTimerRef.current) clearTimeout(specRetryTimerRef.current);
+    };
+  }, []);
 
   // Auto-scroll on streaming content
   useEffect(() => {
@@ -203,9 +214,7 @@ export function HookGenerationPanel({
           pendingStepRef.current = "architecture-spec";
           setPhase("generating-spec");
           setStepStatuses((prev) =>
-            prev.map((s) =>
-              s.label.includes("Architecture") ? { ...s, state: "active" } : s,
-            ),
+            prev.map((s) => (s.label.includes("Architecture") ? { ...s, state: "active" } : s)),
           );
           // Send the architecture spec prompt in the same session
           const analysisForPrompt = { framework: analysis.framework, project_path: projectPath };
@@ -254,8 +263,48 @@ export function HookGenerationPanel({
         setPhase("idle");
       }
     } else if (currentStep === "architecture-spec") {
-      // Extract JSON from the latest AI messages (after the hooks were already extracted)
-      // Get only messages after the hook generation completed
+      // Extract JSON — try immediately, then retry via API if text events are still in transit
+      const handleSpecError = () => {
+        setStepStatuses((prev) =>
+          prev.map((s) => (s.label.includes("Architecture") ? { ...s, state: "error" } : s)),
+        );
+        setError(
+          "Architecture spec generation did not produce valid JSON. You can still apply the hook files.",
+        );
+        pendingStepRef.current = null;
+        setPhase("preview");
+      };
+
+      const tryExtractSpec = (content: string) => {
+        const jsonBlock = extractJsonBlock(content);
+        if (jsonBlock) {
+          let specFileName = "project.architecture.uibridge.json";
+          try {
+            const parsed = JSON.parse(jsonBlock);
+            if (typeof parsed.projectName === "string" && parsed.projectName) {
+              specFileName =
+                parsed.projectName
+                  .toLowerCase()
+                  .replace(/[^a-z0-9]+/g, "-")
+                  .replace(/^-|-$/g, "") + ".architecture.uibridge.json";
+            }
+          } catch {
+            // Use default name
+          }
+
+          setGeneratedFiles((prev) => [...prev, { filePath: specFileName, content: jsonBlock }]);
+          setStepStatuses((prev) =>
+            prev.map((s) => (s.label.includes("Architecture") ? { ...s, state: "done" } : s)),
+          );
+          pendingStepRef.current = null;
+          setExpandedFiles(new Set(generatedFiles.map((f) => f.filePath).concat(["spec"])));
+          setPhase("preview");
+          return true;
+        }
+        return false;
+      };
+
+      // Try extracting from current content
       const specContent = session.messages
         .filter((m) => m.role === "ai")
         .map((m) => m.content)
@@ -264,51 +313,32 @@ export function HookGenerationPanel({
         ? specContent + "\n\n" + session.streamingContent
         : specContent;
 
-      const jsonBlock = extractJsonBlock(fullSpecContent);
-      if (jsonBlock) {
-        // Determine filename — use projectName from spec if available
-        let specFileName = "project.architecture.uibridge.json";
-        try {
-          const parsed = JSON.parse(jsonBlock);
-          if (parsed.projectName) {
-            specFileName =
-              parsed.projectName
-                .toLowerCase()
-                .replace(/[^a-z0-9]+/g, "-")
-                .replace(/^-|-$/g, "") + ".architecture.uibridge.json";
+      if (!tryExtractSpec(fullSpecContent)) {
+        // Race condition: state changed to "ready" before all text events arrived.
+        // Retry after a delay by fetching the full output from the runner API.
+        const taskRunId = session.taskRunId;
+        if (specRetryTimerRef.current) clearTimeout(specRetryTimerRef.current);
+        specRetryTimerRef.current = setTimeout(async () => {
+          specRetryTimerRef.current = null;
+          if (!taskRunId) {
+            handleSpecError();
+            return;
           }
-        } catch {
-          // Use default name
-        }
 
-        setGeneratedFiles((prev) => [
-          ...prev,
-          { filePath: specFileName, content: jsonBlock },
-        ]);
-        setStepStatuses((prev) =>
-          prev.map((s) =>
-            s.label.includes("Architecture") ? { ...s, state: "done" } : s,
-          ),
-        );
-      } else {
-        setStepStatuses((prev) =>
-          prev.map((s) =>
-            s.label.includes("Architecture") ? { ...s, state: "error" } : s,
-          ),
-        );
-        setError(
-          "Architecture spec generation did not produce valid JSON. You can still apply the hook files.",
-        );
+          try {
+            const resp = await fetch(
+              `${getApiBase()}/task-runs/${taskRunId}/output?tail_chars=200000`,
+            );
+            const data = await resp.json();
+            const apiOutput: string = data?.output || "";
+            if (!tryExtractSpec(apiOutput)) {
+              handleSpecError();
+            }
+          } catch {
+            handleSpecError();
+          }
+        }, 1000);
       }
-
-      pendingStepRef.current = null;
-      setExpandedFiles(
-        new Set(
-          generatedFiles.map((f) => f.filePath).concat(jsonBlock ? ["spec"] : []),
-        ),
-      );
-      // Re-expand all files including any newly added spec
-      setPhase("preview");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.sessionState]);
@@ -352,9 +382,7 @@ export function HookGenerationPanel({
     if (includeArchSpec) {
       steps.push({
         state: "pending",
-        label: isRegenSpec
-          ? "Updating Architecture Spec"
-          : "Generating Architecture Spec",
+        label: isRegenSpec ? "Updating Architecture Spec" : "Generating Architecture Spec",
       });
     }
     setStepStatuses(steps);
@@ -410,9 +438,7 @@ export function HookGenerationPanel({
       setPhase("generating-spec");
       pendingStepRef.current = "architecture-spec";
       setStepStatuses((prev) =>
-        prev.map((s) =>
-          s.label.includes("Architecture") ? { ...s, state: "active" } : s,
-        ),
+        prev.map((s) => (s.label.includes("Architecture") ? { ...s, state: "active" } : s)),
       );
 
       let specPrompt: string;
@@ -466,14 +492,13 @@ export function HookGenerationPanel({
 
     const files = generatedFiles.map((f) => ({
       file_path: f.filePath,
-      modification_type:
-        f.filePath.endsWith(".json")
-          ? isRegenSpec
-            ? "replace"
-            : "create_new"
-          : isRegenHooks
-            ? "replace"
-            : "create_new",
+      modification_type: f.filePath.endsWith(".json")
+        ? isRegenSpec
+          ? "replace"
+          : "create_new"
+        : isRegenHooks
+          ? "replace"
+          : "create_new",
       new_content: f.content,
     }));
 
