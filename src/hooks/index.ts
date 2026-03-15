@@ -249,3 +249,5 @@ export type { UseStateMachineConfigReturn } from "./useStateMachineConfig";
 
 export { useConstraints } from "./useConstraints";
 export type { UseConstraintsOptions, UseConstraintsReturn } from "./useConstraints";
+
+export { useCloudRelayAutoConnect } from "./useCloudRelayAutoConnect";

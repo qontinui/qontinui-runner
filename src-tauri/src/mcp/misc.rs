@@ -1106,7 +1106,7 @@ pub fn load_config_internal(
     // Set project context for runtime environment
     crate::runtime_env::set_project_context(crate::runtime_env::ProjectContext {
         project_id: config.metadata.project_id.clone(),
-        workspace_id: None, // TODO: Add workspace_id to ConfigMetadata if needed
+        workspace_id: None, // workspace_id intentionally omitted — configs are not workspace-scoped (single-tenant desktop app)
         name: Some(config.metadata.name.clone()),
         triggered_by: None, // Set dynamically when task is triggered via API
     });

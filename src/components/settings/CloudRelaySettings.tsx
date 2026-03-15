@@ -40,9 +40,7 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
   const [isSaving, setIsSaving] = useState(false);
   const [hasChanges, setHasChanges] = useState(false);
 
-  // Load settings and status on mount, auto-connect if configured
-  // TODO: For true startup auto-connect (without visiting Settings page),
-  // move auto-connect logic to App.tsx or a startup hook.
+  // Load settings and status on mount
   useEffect(() => {
     const init = async () => {
       try {
@@ -55,20 +53,6 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
         const currentStatus = await invoke<CloudRelayStatus>("get_cloud_relay_status");
         if (currentStatus) {
           setIsRunning(currentStatus.is_running);
-        }
-
-        // Auto-connect if configured and not already running
-        if (
-          currentSettings?.enabled &&
-          currentSettings?.auto_connect &&
-          !currentStatus?.is_running
-        ) {
-          try {
-            await invoke<string>("start_cloud_relay");
-            setTimeout(loadStatus, 2000);
-          } catch (err) {
-            console.error("Auto-connect failed:", err);
-          }
         }
       } catch (err) {
         console.error("Failed to initialize Cloud Relay settings:", err);

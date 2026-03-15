@@ -116,6 +116,7 @@ import {
   useProjectLogs,
   useWebSocketAutoConnect,
   useBackgroundActivities,
+  useCloudRelayAutoConnect,
   UIBridgeEventHandler,
   SpecExecutionHandler,
   useRenderPerformance,
@@ -935,6 +936,9 @@ function AppContent() {
     selectedProjectId: projectSelection.selectedProjectId,
     onLog: addLog,
   });
+
+  // Cloud relay auto-connect on startup (if enabled + auto_connect in settings)
+  useCloudRelayAutoConnect();
 
   // Log source picker modal state
   const [showLogSourcePicker, setShowLogSourcePicker] = useState(false);
