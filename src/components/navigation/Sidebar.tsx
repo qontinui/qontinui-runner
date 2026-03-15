@@ -40,6 +40,7 @@ import {
   ChevronRight,
   PanelLeftClose,
   PanelLeft,
+  Eye,
   LucideIcon,
   Sparkles,
   TestTube,
@@ -99,6 +100,7 @@ import {
   type IconName,
   getRunnerNavigation,
   getChildrenForPlatform,
+  setProductMode,
   STORAGE_KEYS,
   createInitialState,
   navigationReducer,
@@ -107,6 +109,7 @@ import {
   serializeState,
   deserializeState,
 } from "qontinui-navigation";
+import { useProductMode, type ProductMode } from "@/contexts/ProductModeContext";
 
 // ============================================================================
 // Icon Mapping
@@ -662,6 +665,72 @@ function FlyoutSidebar({
 }
 
 // ============================================================================
+// Product Mode Switcher Component
+// ============================================================================
+
+interface ProductModeSwitcherProps {
+  mode: ProductMode;
+  onModeChange: (mode: ProductMode) => void;
+  collapsed: boolean;
+}
+
+function ProductModeSwitcher({ mode, onModeChange, collapsed }: ProductModeSwitcherProps) {
+  if (collapsed) {
+    return (
+      <Tooltip content={mode === "ai" ? "Switch to Visual" : "Switch to AI Dev"}>
+        <button
+          onClick={() => onModeChange(mode === "ai" ? "visual" : "ai")}
+          aria-label={mode === "ai" ? "Switch to Visual mode" : "Switch to AI Dev mode"}
+          className="w-full flex items-center justify-center py-2 rounded-md
+                     hover:bg-muted/30 transition-colors"
+        >
+          {mode === "ai" ? (
+            <Bot className="w-4 h-4 text-primary" />
+          ) : (
+            <Eye className="w-4 h-4 text-cyan-400" />
+          )}
+        </button>
+      </Tooltip>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-0.5 p-0.5 rounded-md bg-muted/20 border border-border/50" role="group" aria-label="Product mode">
+      <button
+        onClick={() => onModeChange("ai")}
+        aria-pressed={mode === "ai"}
+        className={`
+          flex-1 flex items-center justify-center gap-1.5 px-2 py-1 rounded text-xs font-medium
+          transition-all duration-150
+          ${mode === "ai"
+            ? "bg-card text-foreground shadow-sm"
+            : "text-muted-foreground hover:text-foreground"
+          }
+        `}
+      >
+        <Bot className="w-3.5 h-3.5" />
+        AI Dev
+      </button>
+      <button
+        onClick={() => onModeChange("visual")}
+        aria-pressed={mode === "visual"}
+        className={`
+          flex-1 flex items-center justify-center gap-1.5 px-2 py-1 rounded text-xs font-medium
+          transition-all duration-150
+          ${mode === "visual"
+            ? "bg-card text-foreground shadow-sm"
+            : "text-muted-foreground hover:text-foreground"
+          }
+        `}
+      >
+        <Eye className="w-3.5 h-3.5" />
+        Visual
+      </button>
+    </div>
+  );
+}
+
+// ============================================================================
 // Sidebar Component
 // ============================================================================
 
@@ -691,8 +760,14 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
     });
   });
 
-  // Build navigation groups (no mode filtering needed)
-  const navigationGroups = useMemo(() => buildNavigationGroups(), []);
+  // Product mode filtering
+  const { mode: productMode, setMode: setProductModeState } = useProductMode();
+
+  // Sync product mode to shared navigation package and rebuild groups
+  const navigationGroups = useMemo(() => {
+    setProductMode(productMode);
+    return buildNavigationGroups();
+  }, [productMode]);
 
   // Flyout state
   const [openFlyout, setOpenFlyout] = useState<{
@@ -895,6 +970,15 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         style={{ width: collapsed ? SIDEBAR_WIDTH_COLLAPSED : SIDEBAR_WIDTH_EXPANDED }}
         aria-label="Main navigation"
       >
+        {/* Product Mode Switcher */}
+        <div className="px-2 pt-2 pb-0">
+          <ProductModeSwitcher
+            mode={productMode}
+            onModeChange={setProductModeState}
+            collapsed={collapsed}
+          />
+        </div>
+
         {/* Navigation Groups */}
         <div className="flex-1 overflow-y-auto py-2 px-2 space-y-4">
           {navigationGroups.map((group) => (

@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setDevelopmentMode } from "qontinui-navigation";
+import { ProductModeProvider } from "./contexts/ProductModeContext";
 import App from "./App";
 import ErrorBoundary from "./ErrorBoundary";
 import "./index.css";
@@ -30,7 +31,9 @@ if (!rootElement) {
     <React.StrictMode>
       <QueryClientProvider client={queryClient}>
         <ErrorBoundary>
-          <App />
+          <ProductModeProvider>
+            <App />
+          </ProductModeProvider>
         </ErrorBoundary>
       </QueryClientProvider>
     </React.StrictMode>,
