@@ -118,13 +118,14 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
   // Note: Actions no-op when dialog is not open since the component
   // returns null below, but the hook must be called unconditionally.
   useUIComponent({
-    id: 'new-run-dialog',
-    name: 'New Run Dialog',
-    description: 'Dialog for creating a new workflow run with mode selection. Actions are only effective when the dialog is open.',
+    id: "new-run-dialog",
+    name: "New Run Dialog",
+    description:
+      "Dialog for creating a new workflow run with mode selection. Actions are only effective when the dialog is open.",
     actions: [
       {
-        id: 'submit',
-        label: 'Submit',
+        id: "submit",
+        label: "Submit",
         handler: async () => {
           if (!open) {
             console.warn("[NewRunDialog] Cannot submit: dialog is not open");
@@ -134,8 +135,8 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
         },
       },
       {
-        id: 'select-mode-gui',
-        label: 'Select GUI Mode',
+        id: "select-mode-gui",
+        label: "Select GUI Mode",
         handler: async () => {
           if (!open) {
             console.warn("[NewRunDialog] Cannot select mode: dialog is not open");

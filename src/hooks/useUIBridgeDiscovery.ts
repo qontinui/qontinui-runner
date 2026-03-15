@@ -222,8 +222,7 @@ export function useUIBridgeDiscovery(
           for (const eid of state.elementIds) {
             const fp = fpDetails[eid];
             if (fp) {
-              elementLabels[eid] =
-                fp.accessibleName || fp.role || fp.tagName || eid.slice(0, 12);
+              elementLabels[eid] = fp.accessibleName || fp.role || fp.tagName || eid.slice(0, 12);
               if (fp.relativePosition) {
                 elementPositions[eid] = fp.relativePosition;
               }

@@ -390,13 +390,13 @@ Be concise and actionable.`;
 
   // UI Bridge: Component-level actions for AI control
   useUIComponent({
-    id: 'process-manager',
-    name: 'Process Manager',
-    description: 'Manage and monitor system processes',
+    id: "process-manager",
+    name: "Process Manager",
+    description: "Manage and monitor system processes",
     actions: [
       {
-        id: 'start-process',
-        label: 'Start Process',
+        id: "start-process",
+        label: "Start Process",
         handler: async () => {
           if (!selectedId) {
             console.warn("[ProcessManager] Cannot start: no process selected");
@@ -407,8 +407,8 @@ Be concise and actionable.`;
         },
       },
       {
-        id: 'stop-process',
-        label: 'Stop Process',
+        id: "stop-process",
+        label: "Stop Process",
         handler: async () => {
           if (!selectedId) {
             console.warn("[ProcessManager] Cannot stop: no process selected");
@@ -419,8 +419,8 @@ Be concise and actionable.`;
         },
       },
       {
-        id: 'restart-process',
-        label: 'Restart Process',
+        id: "restart-process",
+        label: "Restart Process",
         handler: async () => {
           if (!selectedId) {
             console.warn("[ProcessManager] Cannot restart: no process selected");

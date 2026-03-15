@@ -58,11 +58,7 @@ import { TutorialProvider } from "./contexts/TutorialContext";
 import { ContextualTutorial } from "./components/tutorial";
 
 // UI Bridge for AI-driven UI automation
-import {
-  UIBridgeProvider,
-  AutoRegisterProvider,
-  usePageContext,
-} from "ui-bridge";
+import { UIBridgeProvider, AutoRegisterProvider, usePageContext } from "ui-bridge";
 
 // Navigation context for tutorials to navigate to pages
 interface NavigationContextValue {

@@ -379,7 +379,6 @@ export function UIBridgeStateMachinePage() {
               setSelectedTransitionId(null);
             }}
             elementThumbnails={elementThumbnails}
-            fingerprintDetails={discovery.cooccurrenceData?.fingerprintDetails}
           />
         </div>
       </div>

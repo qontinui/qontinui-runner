@@ -471,7 +471,11 @@ export function useUIBridgeEventHandler(): void {
               type,
               success: result.success,
               data: result,
-              error: result.error || (result.success === false ? `Action '${actionObj.action}' failed on element '${elementId}'` : undefined),
+              error:
+                result.error ||
+                (result.success === false
+                  ? `Action '${actionObj.action}' failed on element '${elementId}'`
+                  : undefined),
               timestamp: Date.now(),
             });
             break;
@@ -767,7 +771,9 @@ export function useUIBridgeEventHandler(): void {
                 window.history.pushState({}, "", url);
                 window.dispatchEvent(new PopStateEvent("popstate"));
               } else {
-                console.warn(`[UIBridge] page_navigate: ignoring absolute URL navigation in runner: ${url}`);
+                console.warn(
+                  `[UIBridge] page_navigate: ignoring absolute URL navigation in runner: ${url}`,
+                );
               }
               await sendResponse({
                 requestId,

@@ -49,10 +49,11 @@ export type ActiveDashboardPageProps = DashboardPageProps;
  * 2. WorkflowExecutionProvider - for unified workflow state management
  */
 export function ActiveDashboardPage(props: ActiveDashboardPageProps) {
+  const { onGoToExecute } = props;
   const handleStartRun = useCallback(() => {
     // Navigate to the Execute page where runs can be started
-    props.onGoToExecute();
-  }, [props.onGoToExecute]);
+    onGoToExecute();
+  }, [onGoToExecute]);
 
   const handleStopRun = useCallback(async () => {
     // Stop any active execution via the GUI automation command
@@ -78,27 +79,27 @@ export function ActiveDashboardPage(props: ActiveDashboardPageProps) {
 
   // UI Bridge: Component-level actions for AI control
   useUIComponent({
-    id: 'active-dashboard',
-    name: 'Active Dashboard',
-    description: 'Main dashboard for monitoring and controlling active workflow runs',
+    id: "active-dashboard",
+    name: "Active Dashboard",
+    description: "Main dashboard for monitoring and controlling active workflow runs",
     actions: [
       {
-        id: 'start-run',
-        label: 'Start Run',
+        id: "start-run",
+        label: "Start Run",
         handler: async () => {
           handleStartRun();
         },
       },
       {
-        id: 'stop-run',
-        label: 'Stop Run',
+        id: "stop-run",
+        label: "Stop Run",
         handler: async () => {
           await handleStopRun();
         },
       },
       {
-        id: 'refresh',
-        label: 'Refresh',
+        id: "refresh",
+        label: "Refresh",
         handler: async () => {
           await handleRefresh();
         },

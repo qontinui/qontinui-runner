@@ -74,7 +74,9 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
       } else {
         localStorage.removeItem(SM_SELECTED_CONFIG_KEY);
       }
-    } catch { /* */ }
+    } catch {
+      /* */
+    }
   }, []);
 
   // ---- Config list ----
@@ -94,39 +96,45 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
 
   // ---- Active config ----
 
-  const loadConfig = useCallback(async (id: string) => {
-    setIsLoading(true);
-    setError(null);
-    try {
-      const result = await invoke<StateMachineConfigFull | null>("sm_get_config", { id });
-      if (!result) {
-        setError("Config not found");
-        setActiveConfig(null);
-        return;
+  const loadConfig = useCallback(
+    async (id: string) => {
+      setIsLoading(true);
+      setError(null);
+      try {
+        const result = await invoke<StateMachineConfigFull | null>("sm_get_config", { id });
+        if (!result) {
+          setError("Config not found");
+          setActiveConfig(null);
+          return;
+        }
+        setActiveConfig(result);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setIsLoading(false);
       }
-      setActiveConfig(result);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setIsLoading(false);
-    }
-  }, [setActiveConfig]);
+    },
+    [setActiveConfig],
+  );
 
   // ---- Config CRUD ----
 
-  const createConfig = useCallback(async (req: StateMachineConfigCreate) => {
-    try {
-      const result = await invoke<StateMachineConfig>("sm_create_config", { request: req });
-      setConfigs((prev) => [...prev, result]);
-      // Auto-load the new config (spread config fields + empty states/transitions)
-      setActiveConfig({ ...result, states: [], transitions: [] });
-      return result;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setError(msg);
-      throw new Error(msg);
-    }
-  }, [setActiveConfig]);
+  const createConfig = useCallback(
+    async (req: StateMachineConfigCreate) => {
+      try {
+        const result = await invoke<StateMachineConfig>("sm_create_config", { request: req });
+        setConfigs((prev) => [...prev, result]);
+        // Auto-load the new config (spread config fields + empty states/transitions)
+        setActiveConfig({ ...result, states: [], transitions: [] });
+        return result;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setError(msg);
+        throw new Error(msg);
+      }
+    },
+    [setActiveConfig],
+  );
 
   const updateConfig = useCallback(async (id: string, req: StateMachineConfigUpdate) => {
     try {
@@ -147,7 +155,11 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
       setConfigs((prev) => prev.filter((c) => c.id !== id));
       setActiveConfigRaw((prev) => {
         if (prev && prev.id === id) {
-          try { localStorage.removeItem(SM_SELECTED_CONFIG_KEY); } catch { /* */ }
+          try {
+            localStorage.removeItem(SM_SELECTED_CONFIG_KEY);
+          } catch {
+            /* */
+          }
           return null;
         }
         return prev;
@@ -303,7 +315,9 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
         let targetId: string | null = null;
         try {
           targetId = localStorage.getItem(SM_SELECTED_CONFIG_KEY);
-        } catch { /* */ }
+        } catch {
+          /* */
+        }
 
         // Validate persisted ID still exists, otherwise pick most recent
         if (targetId && freshConfigs.some((c) => c.id === targetId)) {
@@ -319,7 +333,9 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
         // Non-critical: if auto-select fails the user can still pick manually
       }
     });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [loadConfigs, loadConfig]);
 
   return {
