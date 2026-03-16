@@ -895,14 +895,26 @@ export function useUIBridgeEventHandler(): void {
               return;
             }
             try {
-              // SECURITY: Avoid eval() on arbitrary expressions from event payloads.
-              // Use new Function() which does not have access to the local scope,
-              // and validate that the expression only contains safe property access
-              // patterns (alphanumeric, dots, brackets) to mitigate injection risk.
-              const safeExpressionPattern = /^[a-zA-Z_$][\w$.[\]'"()\s,]*$/;
-              if (!safeExpressionPattern.test(expression)) {
+              // SECURITY: Block dangerous patterns while allowing diagnostic expressions.
+              // Uses new Function() which does not have access to local scope.
+              const dangerousPatterns = [
+                /\bimport\s*\(/,           // dynamic import
+                /\brequire\s*\(/,          // require
+                /\b__proto__\b/,           // prototype pollution
+                /\bconstructor\s*\[/,      // constructor bracket access
+                /\beval\s*\(/,             // nested eval
+                /\bnew\s+Function\b/,      // Function constructor
+                /\bfetch\s*\(/,            // network requests
+                /\bXMLHttpRequest\b/,      // network requests
+                /\bnavigator\.sendBeacon\b/, // data exfiltration
+                /\blocalStorage\b/,        // storage access
+                /\bsessionStorage\b/,      // storage access
+                /\bindexedDB\b/,           // storage access
+              ];
+              const isDangerous = dangerousPatterns.some(p => p.test(expression));
+              if (isDangerous) {
                 throw new Error(
-                  "Expression rejected: only simple property access and function calls are allowed",
+                  "Expression rejected: contains prohibited pattern",
                 );
               }
               const result = new Function("return " + expression)();

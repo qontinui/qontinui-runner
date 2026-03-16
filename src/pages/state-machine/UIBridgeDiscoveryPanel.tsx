@@ -109,7 +109,7 @@ export function UIBridgeDiscoveryPanel({
       const autoName = `${appName} — ${timestamp}`;
       const configId = await discovery.saveConfig(autoName, result);
       if (configId) {
-        onConfigCreated(configId);
+        await onConfigCreated(configId);
       }
     }
   }, [discovery, sdk.connectedApp?.appName, onConfigCreated]);
@@ -118,7 +118,7 @@ export function UIBridgeDiscoveryPanel({
   const handleSave = useCallback(async () => {
     const configId = await discovery.saveConfig();
     if (configId) {
-      onConfigCreated(configId);
+      await onConfigCreated(configId);
     }
   }, [discovery, onConfigCreated]);
 

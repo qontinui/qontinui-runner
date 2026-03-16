@@ -220,7 +220,10 @@ export function useUIBridgeDiscovery(
           const elementPositions: Record<string, { top: number; left: number }> = {};
           const elementTags: Record<string, { tagName: string; role: string; zone: string }> = {};
           for (const eid of state.elementIds) {
-            const fp = fpDetails[eid];
+            // Element IDs are "prefix:hash" but fingerprintDetails is keyed by hash only
+            const colonIdx = eid.indexOf(":");
+            const hash = colonIdx > 0 ? eid.slice(colonIdx + 1) : eid;
+            const fp = fpDetails[hash] ?? fpDetails[eid];
             if (fp) {
               elementLabels[eid] = fp.accessibleName || fp.role || fp.tagName || eid.slice(0, 12);
               if (fp.relativePosition) {
@@ -288,6 +291,10 @@ export function useUIBridgeDiscovery(
             console.warn("[useUIBridgeDiscovery] Failed to save thumbnails:", err);
           }
         }
+
+        // Refresh configs list from DB so the dropdown shows the new config
+        // immediately, even before onConfigCreated runs.
+        await smConfig.loadConfigs();
 
         // Clear discovery state
         setCooccurrenceDataState(null);
