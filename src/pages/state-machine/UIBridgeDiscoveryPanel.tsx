@@ -29,7 +29,7 @@ import type { useUIBridgeDiscovery } from "@/hooks/useUIBridgeDiscovery";
 
 interface UIBridgeDiscoveryPanelProps {
   discovery: ReturnType<typeof useUIBridgeDiscovery>;
-  onConfigCreated: (configId: string) => void;
+  onConfigCreated: (configId: string) => void | Promise<void>;
 }
 
 export function UIBridgeDiscoveryPanel({
