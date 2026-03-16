@@ -228,17 +228,20 @@ impl DeterministicVerifier {
             // Look up script by ID from database
             match self.resolve_playwright_script_path(id) {
                 Ok(ResolvedScript::FilePath(path)) => {
-                    format!("npx playwright test {}", path)
+                    // Shell-quote path to prevent injection via database-sourced values
+                    format!("npx playwright test \"{}\"", path.replace('"', "\\\""))
                 }
                 Ok(ResolvedScript::TempFile(path)) => {
-                    let cmd = format!("npx playwright test {}", path.display());
+                    let display = path.display().to_string();
+                    let cmd = format!("npx playwright test \"{}\"", display.replace('"', "\\\""));
                     temp_script_path = Some(path);
                     cmd
                 }
                 Err(err_result) => return *err_result,
             }
         } else if let Some(path) = script_path {
-            format!("npx playwright test {}", path)
+            // Shell-quote path to prevent injection via config-sourced values
+            format!("npx playwright test \"{}\"", path.replace('"', "\\\""))
         } else {
             "npx playwright test".to_string()
         };
@@ -342,7 +345,17 @@ impl DeterministicVerifier {
         if let Some(ref code) = test.playwright_code {
             if !code.is_empty() {
                 let temp_dir = std::env::temp_dir();
-                let temp_path = temp_dir.join(format!("qontinui_pw_{}.spec.ts", script_id));
+                // Sanitize script_id: strip path separators and special chars to prevent path traversal
+                let safe_id: String = script_id
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                    .collect();
+                let safe_id = if safe_id.is_empty() {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    safe_id
+                };
+                let temp_path = temp_dir.join(format!("qontinui_pw_{}.spec.ts", safe_id));
                 if let Err(e) = std::fs::write(&temp_path, code) {
                     error!(
                         "Failed to write temp Playwright script for '{}': {}",

@@ -354,6 +354,8 @@ export function DashboardPage({
       } catch (error) {
         console.error("[DASHBOARD] Failed to pause/resume unified workflow:", error);
       }
+      // Do not fall through to GUI automation IPC for unified workflows
+      return;
     }
 
     // Fallback: Handle GUI automation pause/resume via Tauri IPC
