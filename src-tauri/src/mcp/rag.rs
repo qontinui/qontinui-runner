@@ -349,27 +349,73 @@ pub async fn load_rag_project(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("MCP API: Loading RAG project for project_id={}", project_id);
 
-    // Load QontinuiConfig
+    // Load the RAG QontinuiConfig for metadata, and get the on-disk config path
     let storage = state.rag_state.storage.lock().await;
+    let config_path = storage.get_config_path(&project_id);
 
-    match storage.load_qontinui_config(&project_id) {
-        Ok(config) => {
-            drop(storage);
-
-            // TODO: Load into executor if needed
-            Ok(Json(ApiResponse::success(serde_json::json!({
-                "project_id": project_id,
-                "name": config.metadata.name,
-                "states": config.states.len(),
-                "patterns": config.pattern_count(),
-                "loaded": true
-            }))))
+    let rag_config = match storage.load_qontinui_config(&project_id) {
+        Ok(c) => c,
+        Err(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Project not found: {}", project_id))),
+            ));
         }
-        Err(_) => Err((
-            StatusCode::NOT_FOUND,
-            Json(api_error(format!("Project not found: {}", project_id))),
-        )),
+    };
+    drop(storage);
+
+    let config_name = rag_config.metadata.name.clone();
+    let states_count = rag_config.states.len();
+    let pattern_count = rag_config.pattern_count();
+
+    // Load config into the executor using the shared load_config_internal helper.
+    // This stores the config in app state, sets project context, and sends to the
+    // Python bridge — the same path used by the /load-config endpoint.
+    let config_path_str = config_path.to_string_lossy().to_string();
+    let app_state = state.app_state.clone();
+
+    let load_result = tokio::task::spawn_blocking(move || {
+        crate::mcp::misc::load_config_internal(&app_state, &config_path_str)
+    })
+    .await
+    .map_err(|e| {
+        error!("load_rag_project: spawn_blocking join error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match &load_result {
+        Ok(summary) => {
+            info!(
+                "MCP API: RAG project loaded into executor: {} ({})",
+                project_id, summary
+            );
+        }
+        Err(e) => {
+            // Non-fatal: the config file may not parse as the executor's config type
+            // (e.g., if RAG config has fields the executor doesn't expect). Log and continue.
+            warn!(
+                "MCP API: RAG project config could not be loaded into executor: {}. \
+                 RAG search will still work but automation instructions won't be available.",
+                e
+            );
+        }
     }
+
+    // Track the active config ID
+    if let Ok(mut current_id) = state.current_config_id.lock() {
+        *current_id = Some(project_id.clone());
+    }
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "project_id": project_id,
+        "name": config_name,
+        "states": states_count,
+        "patterns": pattern_count,
+        "loaded": load_result.is_ok()
+    }))))
 }
 
 /// Get RAG availability (ML models status)
