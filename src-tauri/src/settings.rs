@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::error;
 
 use crate::ai_router::RoutingConfig;
 use crate::orchestrator::{CompressionConfig, RetryConfig};
@@ -730,14 +730,14 @@ impl Default for CloudRelaySettings {
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_config_path: Option<String>,
+    pub last_config_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_workflow_id: Option<String>,
+    pub last_workflow_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_monitor_index: Option<i32>,
+    pub last_monitor_index: Option<i32>,
     /// Multi-monitor selection support (takes precedence over last_monitor_index)
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_monitor_indices: Option<Vec<i32>>,
+    pub last_monitor_indices: Option<Vec<i32>>,
     #[serde(default = "default_auto_load_last_config")]
     pub auto_load_last_config: bool,
     /// Auto-continue AI Developer workflows after runner restart (default: true)
@@ -881,128 +881,83 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
 
 /// Save the last loaded config path
 pub fn save_last_config_path(path: &str) -> Result<(), String> {
-    info!("Saving last config path: {}", path);
-    let mut settings = load_settings();
-    settings.last_config_path = Some(path.to_string());
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_last_config_path(path)
 }
 
 /// Get the last loaded config path
 pub fn get_last_config_path() -> Option<String> {
-    let settings = load_settings();
-    settings.last_config_path
+    crate::config_facade::get_last_config_path()
 }
 
 /// Check if setup wizard has been completed
 pub fn get_setup_completed() -> bool {
-    load_settings().setup_completed
+    crate::config_facade::get_setup_completed()
 }
 
 /// Mark setup wizard as completed
 pub fn save_setup_completed(completed: bool) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.setup_completed = completed;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_setup_completed(completed)
 }
 
 /// Get the current debug settings
 pub fn get_debug_settings() -> DebugSettings {
-    let settings = load_settings();
-    settings.debug
+    crate::config_facade::get_setting::<DebugSettings>()
 }
 
 /// Save debug settings
 pub fn save_debug_settings(debug_settings: DebugSettings) -> Result<(), String> {
-    info!("Saving debug settings: {:?}", debug_settings);
-    let mut settings = load_settings();
-    settings.debug = debug_settings;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_setting(debug_settings)
 }
 
 /// Save the last used workflow ID
 pub fn save_last_workflow_id(workflow_id: &str) -> Result<(), String> {
-    info!("Saving last workflow ID: {}", workflow_id);
-    let mut settings = load_settings();
-    settings.last_workflow_id = Some(workflow_id.to_string());
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_last_workflow_id(workflow_id)
 }
 
 /// Get the last used workflow ID
 pub fn get_last_workflow_id() -> Option<String> {
-    let settings = load_settings();
-    settings.last_workflow_id
+    crate::config_facade::get_last_workflow_id()
 }
 
 /// Save the last used monitor index
 pub fn save_last_monitor_index(monitor_index: i32) -> Result<(), String> {
-    info!("Saving last monitor index: {}", monitor_index);
-    let mut settings = load_settings();
-    settings.last_monitor_index = Some(monitor_index);
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_last_monitor_index(monitor_index)
 }
 
 /// Get the last used monitor index
 pub fn get_last_monitor_index() -> Option<i32> {
-    let settings = load_settings();
-    settings.last_monitor_index
+    crate::config_facade::get_last_monitor_index()
 }
 
 /// Save the last used monitor indices (multi-monitor support)
 pub fn save_last_monitor_indices(monitor_indices: Vec<i32>) -> Result<(), String> {
-    info!("Saving last monitor indices: {:?}", monitor_indices);
-    let mut settings = load_settings();
-    settings.last_monitor_indices = Some(monitor_indices.clone());
-    // Also update legacy single monitor for backward compatibility
-    if let Some(first) = monitor_indices.first() {
-        settings.last_monitor_index = Some(*first);
-    }
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_last_monitor_indices(monitor_indices)
 }
 
 /// Get the last used monitor indices (multi-monitor support)
 /// Falls back to legacy single monitor index if not set
 pub fn get_last_monitor_indices() -> Option<Vec<i32>> {
-    let settings = load_settings();
-    // Prefer new multi-monitor setting, fall back to legacy single monitor
-    settings
-        .last_monitor_indices
-        .or_else(|| settings.last_monitor_index.map(|idx| vec![idx]))
+    crate::config_facade::get_last_monitor_indices()
 }
 
 /// Get the auto-load last config setting
 pub fn get_auto_load_last_config() -> bool {
-    let settings = load_settings();
-    settings.auto_load_last_config
+    crate::config_facade::get_auto_load_last_config()
 }
 
 /// Save the auto-load last config setting
 pub fn save_auto_load_last_config(enabled: bool) -> Result<(), String> {
-    info!("Saving auto-load last config setting: {}", enabled);
-    let mut settings = load_settings();
-    settings.auto_load_last_config = enabled;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_auto_load_last_config(enabled)
 }
 
 /// Get the configured Claude Code config directories
 pub fn get_claude_config_dirs() -> Vec<String> {
-    let settings = load_settings();
-    settings.claude_config_dirs
+    crate::config_facade::get_claude_config_dirs()
 }
 
 /// Save the configured Claude Code config directories
 pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<(), String> {
-    info!("Saving {} Claude config dirs", dirs.len());
-    let mut settings = load_settings();
-    settings.claude_config_dirs = dirs;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_claude_config_dirs(dirs)
 }
 
 /// Get the current AI settings
@@ -1017,31 +972,22 @@ pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
 
 /// Get the interactive sessions enabled setting
 pub fn get_interactive_sessions_enabled() -> bool {
-    let settings = load_settings();
-    settings.ai.interactive_sessions_enabled
+    crate::config_facade::get_interactive_sessions_enabled()
 }
 
 /// Save the interactive sessions enabled setting
 pub fn save_interactive_sessions_enabled(enabled: bool) -> Result<(), String> {
-    info!("Saving interactive sessions enabled setting: {}", enabled);
-    let mut settings = load_settings();
-    settings.ai.interactive_sessions_enabled = enabled;
-    save_settings(&settings)
+    crate::config_facade::save_interactive_sessions_enabled(enabled)
 }
 
 /// Get the auto-continue AI workflow setting
 pub fn get_auto_continue_ai_workflow() -> bool {
-    let settings = load_settings();
-    settings.auto_continue_ai_workflow
+    crate::config_facade::get_auto_continue_ai_workflow()
 }
 
 /// Save the auto-continue AI workflow setting
 pub fn save_auto_continue_ai_workflow(enabled: bool) -> Result<(), String> {
-    info!("Saving auto-continue AI workflow setting: {}", enabled);
-    let mut settings = load_settings();
-    settings.auto_continue_ai_workflow = enabled;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_auto_continue_ai_workflow(enabled)
 }
 
 /// Get the current Playwright settings
@@ -1057,73 +1003,47 @@ pub fn save_playwright_settings(playwright_settings: PlaywrightSettings) -> Resu
 /// Get the session auto-fix on failure setting
 #[allow(dead_code)]
 pub fn get_session_auto_fix_on_failure() -> bool {
-    let settings = load_settings();
-    settings.session_auto_fix_on_failure
+    crate::config_facade::get_session_auto_fix_on_failure()
 }
 
 /// Save the session auto-fix on failure setting
 #[allow(dead_code)]
 pub fn save_session_auto_fix_on_failure(enabled: bool) -> Result<(), String> {
-    info!("Saving session auto-fix on failure setting: {}", enabled);
-    let mut settings = load_settings();
-    settings.session_auto_fix_on_failure = enabled;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_session_auto_fix_on_failure(enabled)
 }
 
 /// Get the include summary step by default setting
 pub fn get_include_summary_step_by_default() -> bool {
-    let settings = load_settings();
-    settings.include_summary_step_by_default
+    crate::config_facade::get_include_summary_step_by_default()
 }
 
 /// Save the include summary step by default setting
 pub fn save_include_summary_step_by_default(enabled: bool) -> Result<(), String> {
-    info!(
-        "Saving include summary step by default setting: {}",
-        enabled
-    );
-    let mut settings = load_settings();
-    settings.include_summary_step_by_default = enabled;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_include_summary_step_by_default(enabled)
 }
 
 /// Get the current Accessibility settings
 pub fn get_accessibility_settings() -> AccessibilitySettings {
-    let settings = load_settings();
-    settings.accessibility
+    crate::config_facade::get_setting::<AccessibilitySettings>()
 }
 
 /// Save Accessibility settings
 pub fn save_accessibility_settings(
     accessibility_settings: AccessibilitySettings,
 ) -> Result<(), String> {
-    info!(
-        "Saving Accessibility settings: {:?}",
-        accessibility_settings
-    );
-    let mut settings = load_settings();
-    settings.accessibility = accessibility_settings;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_setting(accessibility_settings)
 }
 
 /// Get the current Self-Healing settings
 pub fn get_self_healing_settings() -> SelfHealingSettings {
-    let settings = load_settings();
-    settings.self_healing
+    crate::config_facade::get_setting::<SelfHealingSettings>()
 }
 
 /// Save Self-Healing settings
 pub fn save_self_healing_settings(
     self_healing_settings: SelfHealingSettings,
 ) -> Result<(), String> {
-    info!("Saving Self-Healing settings: {:?}", self_healing_settings);
-    let mut settings = load_settings();
-    settings.self_healing = self_healing_settings;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_setting(self_healing_settings)
 }
 
 // ============================================================================
@@ -1132,32 +1052,22 @@ pub fn save_self_healing_settings(
 
 /// Get the current Path settings
 pub fn get_path_settings() -> PathSettings {
-    let settings = load_settings();
-    settings.paths
+    crate::config_facade::get_setting::<PathSettings>()
 }
 
 /// Get the dev_logs_dir override (used by paths module)
 pub fn get_dev_logs_dir_override() -> Option<String> {
-    let settings = load_settings();
-    settings.paths.dev_logs_dir
+    crate::config_facade::get_dev_logs_dir_override()
 }
 
 /// Save Path settings
 pub fn save_path_settings(path_settings: PathSettings) -> Result<(), String> {
-    info!("Saving Path settings: {:?}", path_settings);
-    let mut settings = load_settings();
-    settings.paths = path_settings;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_setting(path_settings)
 }
 
 /// Save the dev_logs_dir override
 pub fn save_dev_logs_dir(dev_logs_dir: Option<String>) -> Result<(), String> {
-    info!("Saving dev_logs_dir: {:?}", dev_logs_dir);
-    let mut settings = load_settings();
-    settings.paths.dev_logs_dir = dev_logs_dir;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_dev_logs_dir(dev_logs_dir)
 }
 
 // ============================================================================
@@ -1166,17 +1076,12 @@ pub fn save_dev_logs_dir(dev_logs_dir: Option<String>) -> Result<(), String> {
 
 /// Get the current Mobile settings
 pub fn get_mobile_settings() -> MobileSettings {
-    let settings = load_settings();
-    settings.mobile
+    crate::config_facade::get_setting::<MobileSettings>()
 }
 
 /// Save Mobile settings
 pub fn save_mobile_settings(mobile_settings: MobileSettings) -> Result<(), String> {
-    info!("Saving Mobile settings: {:?}", mobile_settings);
-    let mut settings = load_settings();
-    settings.mobile = mobile_settings;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_setting(mobile_settings)
 }
 
 // ============================================================================
@@ -1185,203 +1090,34 @@ pub fn save_mobile_settings(mobile_settings: MobileSettings) -> Result<(), Strin
 
 /// Get the current Global Log Source settings
 pub fn get_global_log_source_settings() -> GlobalLogSourceSettings {
-    let settings = load_settings();
-    settings.log_sources
+    crate::config_facade::get_setting::<GlobalLogSourceSettings>()
 }
 
 /// Save Global Log Source settings
 pub fn save_global_log_source_settings(
     log_source_settings: GlobalLogSourceSettings,
 ) -> Result<(), String> {
-    info!(
-        "Saving Global Log Source settings: {} sources, {} profiles",
-        log_source_settings.sources.len(),
-        log_source_settings.profiles.len()
-    );
-    let mut settings = load_settings();
-    settings.log_sources = log_source_settings;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_setting(log_source_settings)
 }
 
 /// Get enabled log sources, optionally filtered by profile
 pub fn get_enabled_log_sources(profile_id: Option<&str>) -> Vec<GlobalLogSource> {
-    let settings = get_global_log_source_settings();
-
-    // If profile specified, filter by profile's source_ids
-    if let Some(pid) = profile_id {
-        if let Some(profile) = settings.profiles.iter().find(|p| p.id == pid) {
-            return settings
-                .sources
-                .into_iter()
-                .filter(|s| s.enabled && profile.source_ids.contains(&s.id))
-                .collect();
-        }
-    }
-
-    // If default profile is set and no explicit profile, use default
-    if let Some(default_pid) = &settings.default_profile_id {
-        if let Some(profile) = settings.profiles.iter().find(|p| p.id == *default_pid) {
-            return settings
-                .sources
-                .into_iter()
-                .filter(|s| s.enabled && profile.source_ids.contains(&s.id))
-                .collect();
-        }
-    }
-
-    // Fall back to all enabled sources if configured to do so
-    if settings.include_all_when_no_profile {
-        settings.sources.into_iter().filter(|s| s.enabled).collect()
-    } else {
-        Vec::new()
-    }
+    crate::config_facade::get_enabled_log_sources(profile_id)
 }
 
 /// Seed default log sources if the sources list is empty.
-///
-/// Called on startup to ensure there are always some log sources configured.
-/// If the user has any sources (even disabled ones), this is a no-op.
-/// Creates 4 default sources: Backend, Frontend, Runner, Runner Actions.
 pub fn seed_default_log_sources_if_empty() {
-    let settings = get_global_log_source_settings();
-    if !settings.sources.is_empty() {
-        return;
-    }
-
-    info!("No log sources configured, seeding defaults");
-    let dev_logs_dir = crate::paths::get_dev_logs_dir();
-    let dev_logs = dev_logs_dir.to_string_lossy().to_string();
-
-    let defaults = vec![
-        GlobalLogSource {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: "Backend".to_string(),
-            description: "FastAPI backend logs including HTTP requests and errors".to_string(),
-            category: LogSourceCategory::Backend,
-            source_type: "file".to_string(),
-            path: format!("{}/backend.log", dev_logs.replace('\\', "/")),
-            pattern: None,
-            tail_lines: 100,
-            enabled: true,
-            color: Some("#22c55e".to_string()),
-            keywords: vec![
-                "python".to_string(),
-                "fastapi".to_string(),
-                "http".to_string(),
-                "api".to_string(),
-            ],
-            format: "plaintext".to_string(),
-            parser: "python".to_string(),
-            timestamp_pattern: None,
-            timezone: "local".to_string(),
-            error_patterns: vec![],
-            warning_patterns: vec![],
-            ignore_patterns: vec![],
-            poll_interval_ms: 5000,
-        },
-        GlobalLogSource {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: "Frontend".to_string(),
-            description: "Next.js frontend logs including build and runtime errors".to_string(),
-            category: LogSourceCategory::Frontend,
-            source_type: "file".to_string(),
-            path: format!("{}/frontend.log", dev_logs.replace('\\', "/")),
-            pattern: None,
-            tail_lines: 100,
-            enabled: true,
-            color: Some("#3b82f6".to_string()),
-            keywords: vec![
-                "javascript".to_string(),
-                "nextjs".to_string(),
-                "react".to_string(),
-                "frontend".to_string(),
-            ],
-            format: "plaintext".to_string(),
-            parser: "javascript".to_string(),
-            timestamp_pattern: None,
-            timezone: "local".to_string(),
-            error_patterns: vec![],
-            warning_patterns: vec![],
-            ignore_patterns: vec![],
-            poll_interval_ms: 5000,
-        },
-        GlobalLogSource {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: "Runner".to_string(),
-            description: "Qontinui runner Vite + Rust logs".to_string(),
-            category: LogSourceCategory::Runner,
-            source_type: "file".to_string(),
-            path: format!("{}/runner-tauri.log", dev_logs.replace('\\', "/")),
-            pattern: None,
-            tail_lines: 100,
-            enabled: true,
-            color: Some("#f97316".to_string()),
-            keywords: vec![
-                "rust".to_string(),
-                "tauri".to_string(),
-                "runner".to_string(),
-                "vite".to_string(),
-            ],
-            format: "plaintext".to_string(),
-            parser: "rust".to_string(),
-            timestamp_pattern: None,
-            timezone: "local".to_string(),
-            error_patterns: vec![],
-            warning_patterns: vec![],
-            ignore_patterns: vec![],
-            poll_interval_ms: 5000,
-        },
-        GlobalLogSource {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: "Runner Actions".to_string(),
-            description: "Workflow action execution events in JSONL format".to_string(),
-            category: LogSourceCategory::Runner,
-            source_type: "file".to_string(),
-            path: format!("{}/runner-actions.jsonl", dev_logs.replace('\\', "/")),
-            pattern: None,
-            tail_lines: 100,
-            enabled: true,
-            color: Some("#a855f7".to_string()),
-            keywords: vec![
-                "actions".to_string(),
-                "workflow".to_string(),
-                "execution".to_string(),
-            ],
-            format: "jsonl".to_string(),
-            parser: "generic".to_string(),
-            timestamp_pattern: None,
-            timezone: "local".to_string(),
-            error_patterns: vec![],
-            warning_patterns: vec![],
-            ignore_patterns: vec![],
-            poll_interval_ms: 5000,
-        },
-    ];
-
-    let new_settings = GlobalLogSourceSettings {
-        sources: defaults,
-        ..settings
-    };
-
-    if let Err(e) = save_global_log_source_settings(new_settings) {
-        tracing::error!("Failed to seed default log sources: {}", e);
-    } else {
-        info!("Seeded 4 default log sources");
-    }
+    crate::config_facade::seed_default_log_sources_if_empty()
 }
 
 /// Get log sources for AI selection prompt
-/// Returns sources with their descriptions and categories for AI to choose from
 pub fn get_log_sources_for_ai_selection() -> Vec<GlobalLogSource> {
-    let settings = get_global_log_source_settings();
-    settings.sources.into_iter().filter(|s| s.enabled).collect()
+    crate::config_facade::get_log_sources_for_ai_selection()
 }
 
 /// Get the AI selection mode
 pub fn get_log_source_ai_selection_mode() -> LogSourceAiSelectionMode {
-    let settings = get_global_log_source_settings();
-    settings.ai_selection_mode
+    crate::config_facade::get_log_source_ai_selection_mode()
 }
 
 // ============================================================================
@@ -1390,32 +1126,19 @@ pub fn get_log_source_ai_selection_mode() -> LogSourceAiSelectionMode {
 
 /// Get all managed process configurations
 pub fn get_managed_process_configs() -> Vec<crate::process_capture::ProcessConfig> {
-    let settings = load_settings();
-    settings.managed_processes
+    crate::config_facade::get_managed_process_configs()
 }
 
 /// Save a managed process config (add or update).
 pub fn save_managed_process_config(
     config: crate::process_capture::ProcessConfig,
 ) -> Result<(), String> {
-    let mut settings = load_settings();
-    if let Some(existing) = settings
-        .managed_processes
-        .iter_mut()
-        .find(|p| p.id == config.id)
-    {
-        *existing = config;
-    } else {
-        settings.managed_processes.push(config);
-    }
-    save_settings(&settings)
+    crate::config_facade::save_managed_process_config(config)
 }
 
 /// Delete a managed process config by ID.
 pub fn delete_managed_process_config(id: &str) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.managed_processes.retain(|p| p.id != id);
-    save_settings(&settings)
+    crate::config_facade::delete_managed_process_config(id)
 }
 
 // ============================================================================
@@ -1424,63 +1147,24 @@ pub fn delete_managed_process_config(id: &str) -> Result<(), String> {
 
 /// Get the current Execution Variables settings
 pub fn get_execution_variables_settings() -> ExecutionVariablesSettings {
-    let settings = load_settings();
-    settings.execution_variables
+    crate::config_facade::get_setting::<ExecutionVariablesSettings>()
 }
 
 /// Save Execution Variables settings
 pub fn save_execution_variables_settings(
     execution_variables_settings: ExecutionVariablesSettings,
 ) -> Result<(), String> {
-    info!(
-        "Saving Execution Variables settings: auth_source={:?}, {} custom variables",
-        execution_variables_settings.auth_source,
-        execution_variables_settings.custom_variables.len()
-    );
-    let mut settings = load_settings();
-    settings.execution_variables = execution_variables_settings;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_setting(execution_variables_settings)
 }
 
 /// Get the resolved auth token based on current settings
-///
-/// Returns the auth token to use based on the configured auth source:
-/// - Captured: Returns None (use original captured headers)
-/// - Manual: Returns the manually configured token
-/// - Environment: Returns the value from the configured environment variable
 pub fn get_resolved_auth_token() -> Option<String> {
-    let settings = get_execution_variables_settings();
-
-    match settings.auth_source {
-        AuthSource::Captured => None, // Use original captured headers
-        AuthSource::Manual => settings.auth_token,
-        AuthSource::Environment => std::env::var(&settings.auth_env_var).ok(),
-    }
+    crate::config_facade::get_resolved_auth_token()
 }
 
 /// Get resolved custom variables
-///
-/// Returns all custom variables with their resolved values.
-/// For environment variables, resolves them from the environment.
 pub fn get_resolved_custom_variables() -> HashMap<String, String> {
-    let settings = get_execution_variables_settings();
-    let mut resolved = HashMap::new();
-
-    for var in settings.custom_variables {
-        let value = match var.source {
-            VariableSource::Manual => var.value,
-            VariableSource::Environment => var
-                .env_var
-                .and_then(|env_name| std::env::var(&env_name).ok()),
-        };
-
-        if let Some(v) = value {
-            resolved.insert(var.name, v);
-        }
-    }
-
-    resolved
+    crate::config_facade::get_resolved_custom_variables()
 }
 
 // ============================================================================
@@ -1489,28 +1173,15 @@ pub fn get_resolved_custom_variables() -> HashMap<String, String> {
 
 /// Get all configured runner instances.
 pub fn get_runner_instances() -> Vec<RunnerInstanceConfig> {
-    load_settings().runner_instances
+    crate::config_facade::get_runner_instances()
 }
 
 /// Save or update a runner instance configuration.
 pub fn save_runner_instance(config: RunnerInstanceConfig) -> Result<(), String> {
-    let mut settings = load_settings();
-    if let Some(existing) = settings
-        .runner_instances
-        .iter_mut()
-        .find(|i| i.id == config.id)
-    {
-        existing.name = config.name;
-        existing.port = config.port;
-    } else {
-        settings.runner_instances.push(config);
-    }
-    save_settings(&settings)
+    crate::config_facade::save_runner_instance(config)
 }
 
 /// Delete a runner instance configuration by ID.
 pub fn delete_runner_instance(id: &str) -> Result<(), String> {
-    let mut settings = load_settings();
-    settings.runner_instances.retain(|i| i.id != id);
-    save_settings(&settings)
+    crate::config_facade::delete_runner_instance(id)
 }

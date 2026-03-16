@@ -26,10 +26,14 @@ use keyring::Entry;
 use serde::{de::DeserializeOwned, Serialize};
 use tracing::info;
 
+use std::collections::HashMap;
+
 use crate::settings::{
-    load_settings, save_settings, AccessibilitySettings, AiSettings, DebugSettings,
-    ExecutionVariablesSettings, GlobalLogSourceSettings, MobileSettings, PathSettings,
-    PlaywrightSettings, SelfHealingSettings, Settings,
+    load_settings, save_settings, AccessibilitySettings, AiSettings, AuthSource,
+    CloudRelaySettings, DebugSettings, ExecutionVariablesSettings, GlobalLogSource,
+    GlobalLogSourceSettings, LogSourceAiSelectionMode, LogSourceCategory, MobileSettings,
+    PathSettings, PlaywrightSettings, RunnerInstanceConfig, SelfHealingSettings, Settings,
+    VariableSource,
 };
 
 // ============================================================================
@@ -178,6 +182,20 @@ impl SettingsField for GlobalLogSourceSettings {
 
     fn field_name() -> &'static str {
         "log_sources"
+    }
+}
+
+impl SettingsField for CloudRelaySettings {
+    fn get_from(settings: &Settings) -> &Self {
+        &settings.cloud_relay
+    }
+
+    fn set_in(settings: &mut Settings, value: Self) {
+        settings.cloud_relay = value;
+    }
+
+    fn field_name() -> &'static str {
+        "cloud_relay"
     }
 }
 
@@ -404,6 +422,475 @@ pub fn migrate_api_keys_to_keychain() -> Result<(), String> {
 }
 
 // ============================================================================
+// Scalar Settings Accessors
+// ============================================================================
+//
+// These access individual fields on the top-level Settings struct rather than
+// sub-struct fields. They follow the same load-modify-save pattern but for
+// scalar values.
+
+/// Get the last loaded config path.
+pub fn get_last_config_path() -> Option<String> {
+    load_settings().last_config_path
+}
+
+/// Save the last loaded config path.
+pub fn save_last_config_path(path: &str) -> Result<(), String> {
+    info!("Saving last config path: {}", path);
+    let mut settings = load_settings();
+    settings.last_config_path = Some(path.to_string());
+    save_settings(&settings)
+}
+
+/// Get the last used workflow ID.
+pub fn get_last_workflow_id() -> Option<String> {
+    load_settings().last_workflow_id
+}
+
+/// Save the last used workflow ID.
+pub fn save_last_workflow_id(workflow_id: &str) -> Result<(), String> {
+    info!("Saving last workflow ID: {}", workflow_id);
+    let mut settings = load_settings();
+    settings.last_workflow_id = Some(workflow_id.to_string());
+    save_settings(&settings)
+}
+
+/// Get the last used monitor index.
+pub fn get_last_monitor_index() -> Option<i32> {
+    load_settings().last_monitor_index
+}
+
+/// Save the last used monitor index.
+pub fn save_last_monitor_index(monitor_index: i32) -> Result<(), String> {
+    info!("Saving last monitor index: {}", monitor_index);
+    let mut settings = load_settings();
+    settings.last_monitor_index = Some(monitor_index);
+    save_settings(&settings)
+}
+
+/// Get the last used monitor indices (multi-monitor support).
+/// Falls back to legacy single monitor index if not set.
+pub fn get_last_monitor_indices() -> Option<Vec<i32>> {
+    let settings = load_settings();
+    settings
+        .last_monitor_indices
+        .or_else(|| settings.last_monitor_index.map(|idx| vec![idx]))
+}
+
+/// Save the last used monitor indices (multi-monitor support).
+pub fn save_last_monitor_indices(monitor_indices: Vec<i32>) -> Result<(), String> {
+    info!("Saving last monitor indices: {:?}", monitor_indices);
+    let mut settings = load_settings();
+    settings.last_monitor_indices = Some(monitor_indices.clone());
+    // Also update legacy single monitor for backward compatibility
+    if let Some(first) = monitor_indices.first() {
+        settings.last_monitor_index = Some(*first);
+    }
+    save_settings(&settings)
+}
+
+/// Get the auto-load last config setting.
+pub fn get_auto_load_last_config() -> bool {
+    load_settings().auto_load_last_config
+}
+
+/// Save the auto-load last config setting.
+pub fn save_auto_load_last_config(enabled: bool) -> Result<(), String> {
+    info!("Saving auto-load last config setting: {}", enabled);
+    let mut settings = load_settings();
+    settings.auto_load_last_config = enabled;
+    save_settings(&settings)
+}
+
+/// Get the auto-continue AI workflow setting.
+pub fn get_auto_continue_ai_workflow() -> bool {
+    load_settings().auto_continue_ai_workflow
+}
+
+/// Save the auto-continue AI workflow setting.
+pub fn save_auto_continue_ai_workflow(enabled: bool) -> Result<(), String> {
+    info!("Saving auto-continue AI workflow setting: {}", enabled);
+    let mut settings = load_settings();
+    settings.auto_continue_ai_workflow = enabled;
+    save_settings(&settings)
+}
+
+/// Get the session auto-fix on failure setting.
+#[allow(dead_code)]
+pub fn get_session_auto_fix_on_failure() -> bool {
+    load_settings().session_auto_fix_on_failure
+}
+
+/// Save the session auto-fix on failure setting.
+#[allow(dead_code)]
+pub fn save_session_auto_fix_on_failure(enabled: bool) -> Result<(), String> {
+    info!("Saving session auto-fix on failure setting: {}", enabled);
+    let mut settings = load_settings();
+    settings.session_auto_fix_on_failure = enabled;
+    save_settings(&settings)
+}
+
+/// Get the include summary step by default setting.
+pub fn get_include_summary_step_by_default() -> bool {
+    load_settings().include_summary_step_by_default
+}
+
+/// Save the include summary step by default setting.
+pub fn save_include_summary_step_by_default(enabled: bool) -> Result<(), String> {
+    info!(
+        "Saving include summary step by default setting: {}",
+        enabled
+    );
+    let mut settings = load_settings();
+    settings.include_summary_step_by_default = enabled;
+    save_settings(&settings)
+}
+
+/// Check if setup wizard has been completed.
+pub fn get_setup_completed() -> bool {
+    load_settings().setup_completed
+}
+
+/// Mark setup wizard as completed.
+pub fn save_setup_completed(completed: bool) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.setup_completed = completed;
+    save_settings(&settings)
+}
+
+/// Get the interactive sessions enabled setting.
+pub fn get_interactive_sessions_enabled() -> bool {
+    load_settings().ai.interactive_sessions_enabled
+}
+
+/// Save the interactive sessions enabled setting.
+pub fn save_interactive_sessions_enabled(enabled: bool) -> Result<(), String> {
+    info!("Saving interactive sessions enabled setting: {}", enabled);
+    let mut settings = load_settings();
+    settings.ai.interactive_sessions_enabled = enabled;
+    save_settings(&settings)
+}
+
+/// Get the configured Claude Code config directories.
+pub fn get_claude_config_dirs() -> Vec<String> {
+    load_settings().claude_config_dirs
+}
+
+/// Save the configured Claude Code config directories.
+pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<(), String> {
+    info!("Saving {} Claude config dirs", dirs.len());
+    let mut settings = load_settings();
+    settings.claude_config_dirs = dirs;
+    save_settings(&settings)
+}
+
+/// Get the dev_logs_dir override (used by paths module).
+pub fn get_dev_logs_dir_override() -> Option<String> {
+    load_settings().paths.dev_logs_dir
+}
+
+/// Save the dev_logs_dir override.
+pub fn save_dev_logs_dir(dev_logs_dir: Option<String>) -> Result<(), String> {
+    info!("Saving dev_logs_dir: {:?}", dev_logs_dir);
+    let mut settings = load_settings();
+    settings.paths.dev_logs_dir = dev_logs_dir;
+    save_settings(&settings)
+}
+
+// ============================================================================
+// Log Source Helpers
+// ============================================================================
+
+/// Get enabled log sources, optionally filtered by profile.
+pub fn get_enabled_log_sources(profile_id: Option<&str>) -> Vec<GlobalLogSource> {
+    let settings: GlobalLogSourceSettings = get_setting();
+
+    // If profile specified, filter by profile's source_ids
+    if let Some(pid) = profile_id {
+        if let Some(profile) = settings.profiles.iter().find(|p| p.id == pid) {
+            return settings
+                .sources
+                .into_iter()
+                .filter(|s| s.enabled && profile.source_ids.contains(&s.id))
+                .collect();
+        }
+    }
+
+    // If default profile is set and no explicit profile, use default
+    if let Some(default_pid) = &settings.default_profile_id {
+        if let Some(profile) = settings.profiles.iter().find(|p| p.id == *default_pid) {
+            return settings
+                .sources
+                .into_iter()
+                .filter(|s| s.enabled && profile.source_ids.contains(&s.id))
+                .collect();
+        }
+    }
+
+    // Fall back to all enabled sources if configured to do so
+    if settings.include_all_when_no_profile {
+        settings.sources.into_iter().filter(|s| s.enabled).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Seed default log sources if the sources list is empty.
+///
+/// Called on startup to ensure there are always some log sources configured.
+/// If the user has any sources (even disabled ones), this is a no-op.
+/// Creates 4 default sources: Backend, Frontend, Runner, Runner Actions.
+pub fn seed_default_log_sources_if_empty() {
+    let settings: GlobalLogSourceSettings = get_setting();
+    if !settings.sources.is_empty() {
+        return;
+    }
+
+    info!("No log sources configured, seeding defaults");
+    let dev_logs_dir = crate::paths::get_dev_logs_dir();
+    let dev_logs = dev_logs_dir.to_string_lossy().to_string();
+
+    let defaults = vec![
+        GlobalLogSource {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Backend".to_string(),
+            description: "FastAPI backend logs including HTTP requests and errors".to_string(),
+            category: LogSourceCategory::Backend,
+            source_type: "file".to_string(),
+            path: format!("{}/backend.log", dev_logs.replace('\\', "/")),
+            pattern: None,
+            tail_lines: 100,
+            enabled: true,
+            color: Some("#22c55e".to_string()),
+            keywords: vec![
+                "python".to_string(),
+                "fastapi".to_string(),
+                "http".to_string(),
+                "api".to_string(),
+            ],
+            format: "plaintext".to_string(),
+            parser: "python".to_string(),
+            timestamp_pattern: None,
+            timezone: "local".to_string(),
+            error_patterns: vec![],
+            warning_patterns: vec![],
+            ignore_patterns: vec![],
+            poll_interval_ms: 5000,
+        },
+        GlobalLogSource {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Frontend".to_string(),
+            description: "Next.js frontend logs including build and runtime errors".to_string(),
+            category: LogSourceCategory::Frontend,
+            source_type: "file".to_string(),
+            path: format!("{}/frontend.log", dev_logs.replace('\\', "/")),
+            pattern: None,
+            tail_lines: 100,
+            enabled: true,
+            color: Some("#3b82f6".to_string()),
+            keywords: vec![
+                "javascript".to_string(),
+                "nextjs".to_string(),
+                "react".to_string(),
+                "frontend".to_string(),
+            ],
+            format: "plaintext".to_string(),
+            parser: "javascript".to_string(),
+            timestamp_pattern: None,
+            timezone: "local".to_string(),
+            error_patterns: vec![],
+            warning_patterns: vec![],
+            ignore_patterns: vec![],
+            poll_interval_ms: 5000,
+        },
+        GlobalLogSource {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Runner".to_string(),
+            description: "Qontinui runner Vite + Rust logs".to_string(),
+            category: LogSourceCategory::Runner,
+            source_type: "file".to_string(),
+            path: format!("{}/runner-tauri.log", dev_logs.replace('\\', "/")),
+            pattern: None,
+            tail_lines: 100,
+            enabled: true,
+            color: Some("#f97316".to_string()),
+            keywords: vec![
+                "rust".to_string(),
+                "tauri".to_string(),
+                "runner".to_string(),
+                "vite".to_string(),
+            ],
+            format: "plaintext".to_string(),
+            parser: "rust".to_string(),
+            timestamp_pattern: None,
+            timezone: "local".to_string(),
+            error_patterns: vec![],
+            warning_patterns: vec![],
+            ignore_patterns: vec![],
+            poll_interval_ms: 5000,
+        },
+        GlobalLogSource {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Runner Actions".to_string(),
+            description: "Workflow action execution events in JSONL format".to_string(),
+            category: LogSourceCategory::Runner,
+            source_type: "file".to_string(),
+            path: format!("{}/runner-actions.jsonl", dev_logs.replace('\\', "/")),
+            pattern: None,
+            tail_lines: 100,
+            enabled: true,
+            color: Some("#a855f7".to_string()),
+            keywords: vec![
+                "actions".to_string(),
+                "workflow".to_string(),
+                "execution".to_string(),
+            ],
+            format: "jsonl".to_string(),
+            parser: "generic".to_string(),
+            timestamp_pattern: None,
+            timezone: "local".to_string(),
+            error_patterns: vec![],
+            warning_patterns: vec![],
+            ignore_patterns: vec![],
+            poll_interval_ms: 5000,
+        },
+    ];
+
+    let new_settings = GlobalLogSourceSettings {
+        sources: defaults,
+        ..settings
+    };
+
+    if let Err(e) = save_setting(new_settings) {
+        tracing::error!("Failed to seed default log sources: {}", e);
+    } else {
+        info!("Seeded 4 default log sources");
+    }
+}
+
+/// Get log sources for AI selection prompt.
+/// Returns sources with their descriptions and categories for AI to choose from.
+pub fn get_log_sources_for_ai_selection() -> Vec<GlobalLogSource> {
+    let settings: GlobalLogSourceSettings = get_setting();
+    settings.sources.into_iter().filter(|s| s.enabled).collect()
+}
+
+/// Get the AI selection mode.
+pub fn get_log_source_ai_selection_mode() -> LogSourceAiSelectionMode {
+    let settings: GlobalLogSourceSettings = get_setting();
+    settings.ai_selection_mode
+}
+
+// ============================================================================
+// Managed Processes Helpers
+// ============================================================================
+
+/// Get all managed process configurations.
+pub fn get_managed_process_configs() -> Vec<crate::process_capture::ProcessConfig> {
+    load_settings().managed_processes
+}
+
+/// Save a managed process config (add or update).
+pub fn save_managed_process_config(
+    config: crate::process_capture::ProcessConfig,
+) -> Result<(), String> {
+    let mut settings = load_settings();
+    if let Some(existing) = settings
+        .managed_processes
+        .iter_mut()
+        .find(|p| p.id == config.id)
+    {
+        *existing = config;
+    } else {
+        settings.managed_processes.push(config);
+    }
+    save_settings(&settings)
+}
+
+/// Delete a managed process config by ID.
+pub fn delete_managed_process_config(id: &str) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.managed_processes.retain(|p| p.id != id);
+    save_settings(&settings)
+}
+
+// ============================================================================
+// Execution Variables Helpers
+// ============================================================================
+
+/// Get the resolved auth token based on current settings.
+///
+/// Returns the auth token to use based on the configured auth source:
+/// - Captured: Returns None (use original captured headers)
+/// - Manual: Returns the manually configured token
+/// - Environment: Returns the value from the configured environment variable
+pub fn get_resolved_auth_token() -> Option<String> {
+    let settings: ExecutionVariablesSettings = get_setting();
+
+    match settings.auth_source {
+        AuthSource::Captured => None,
+        AuthSource::Manual => settings.auth_token,
+        AuthSource::Environment => std::env::var(&settings.auth_env_var).ok(),
+    }
+}
+
+/// Get resolved custom variables.
+///
+/// Returns all custom variables with their resolved values.
+/// For environment variables, resolves them from the environment.
+pub fn get_resolved_custom_variables() -> HashMap<String, String> {
+    let settings: ExecutionVariablesSettings = get_setting();
+    let mut resolved = HashMap::new();
+
+    for var in settings.custom_variables {
+        let value = match var.source {
+            VariableSource::Manual => var.value,
+            VariableSource::Environment => var
+                .env_var
+                .and_then(|env_name| std::env::var(&env_name).ok()),
+        };
+
+        if let Some(v) = value {
+            resolved.insert(var.name, v);
+        }
+    }
+
+    resolved
+}
+
+// ============================================================================
+// Runner Instance CRUD Helpers
+// ============================================================================
+
+/// Get all configured runner instances.
+pub fn get_runner_instances() -> Vec<RunnerInstanceConfig> {
+    load_settings().runner_instances
+}
+
+/// Save or update a runner instance configuration.
+pub fn save_runner_instance(config: RunnerInstanceConfig) -> Result<(), String> {
+    let mut settings = load_settings();
+    if let Some(existing) = settings
+        .runner_instances
+        .iter_mut()
+        .find(|i| i.id == config.id)
+    {
+        existing.name = config.name;
+        existing.port = config.port;
+    } else {
+        settings.runner_instances.push(config);
+    }
+    save_settings(&settings)
+}
+
+/// Delete a runner instance configuration by ID.
+pub fn delete_runner_instance(id: &str) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.runner_instances.retain(|i| i.id != id);
+    save_settings(&settings)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -434,35 +921,6 @@ mod tests {
             "execution_variables"
         );
         assert_eq!(GlobalLogSourceSettings::field_name(), "log_sources");
+        assert_eq!(CloudRelaySettings::field_name(), "cloud_relay");
     }
 }
-
-// ============================================================================
-// TODO: Remaining settings to migrate from settings.rs
-// ============================================================================
-//
-// The following settings are managed with individual functions in settings.rs
-// and could be migrated to use this facade:
-//
-// Already migrated (using config_facade):
-// - AiSettings (get_ai_settings, save_ai_settings)
-// - PlaywrightSettings (get_playwright_settings, save_playwright_settings)
-//
-// Remaining to migrate:
-// - DebugSettings (get_debug_settings, save_debug_settings)
-// - MobileSettings (get_mobile_settings, save_mobile_settings)
-// - SelfHealingSettings (get_self_healing_settings, save_self_healing_settings)
-// - AccessibilitySettings (get_accessibility_settings, save_accessibility_settings)
-// - PathSettings (get_path_settings, save_path_settings)
-// - ExecutionVariablesSettings (get_execution_variables_settings, save_execution_variables_settings)
-// - GlobalLogSourceSettings (get_global_log_source_settings, save_global_log_source_settings)
-//
-// Scalar settings that use different patterns (not struct-based):
-// - last_config_path (save_last_config_path, get_last_config_path)
-// - last_workflow_id (save_last_workflow_id, get_last_workflow_id)
-// - last_monitor_index (save_last_monitor_index, get_last_monitor_index)
-// - last_monitor_indices (save_last_monitor_indices, get_last_monitor_indices)
-// - auto_load_last_config (get_auto_load_last_config, save_auto_load_last_config)
-// - auto_continue_ai_workflow (get_auto_continue_ai_workflow, save_auto_continue_ai_workflow)
-// - session_auto_fix_on_failure (get_session_auto_fix_on_failure, save_session_auto_fix_on_failure)
-// - include_summary_step_by_default (get_include_summary_step_by_default, save_include_summary_step_by_default)

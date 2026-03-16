@@ -96,6 +96,14 @@ use crate::ai_router::TaskContext;
 use crate::commands::AppState;
 use crate::state_explorer::{ExplorationConfig, ExplorationStatus, ExplorationTask};
 
+/// Result of resolving a Playwright script ID from the database.
+enum ResolvedScript {
+    /// Script resolved to a filesystem path (from `source_file`).
+    FilePath(String),
+    /// Script code written to a temp file (from `playwright_code`).
+    TempFile(std::path::PathBuf),
+}
+
 /// Executor for deterministic verification checks.
 pub struct DeterministicVerifier {
     /// Working directory for running commands
@@ -213,16 +221,175 @@ impl DeterministicVerifier {
             .and_then(|c| c.get("script_path"))
             .and_then(|v| v.as_str());
 
+        // Track temp file so we can clean it up after the command runs
+        let mut temp_script_path: Option<std::path::PathBuf> = None;
+
         let command = if let Some(id) = script_id {
-            // TODO: Look up script by ID from database
-            format!("npx playwright test --grep {}", id)
+            // Look up script by ID from database
+            match self.resolve_playwright_script_path(id) {
+                Ok(ResolvedScript::FilePath(path)) => {
+                    format!("npx playwright test {}", path)
+                }
+                Ok(ResolvedScript::TempFile(path)) => {
+                    let cmd = format!("npx playwright test {}", path.display());
+                    temp_script_path = Some(path);
+                    cmd
+                }
+                Err(err_result) => return *err_result,
+            }
         } else if let Some(path) = script_path {
             format!("npx playwright test {}", path)
         } else {
             "npx playwright test".to_string()
         };
 
-        self.run_command(criterion, &command, "Playwright").await
+        let result = self.run_command(criterion, &command, "Playwright").await;
+
+        // Clean up temp file if we created one
+        if let Some(path) = temp_script_path {
+            if let Err(e) = std::fs::remove_file(&path) {
+                warn!(
+                    "Failed to clean up temp Playwright script {:?}: {}",
+                    path, e
+                );
+            }
+        }
+
+        result
+    }
+
+    /// Resolve a Playwright script ID to either a file path or inline code written to a temp file.
+    fn resolve_playwright_script_path(
+        &self,
+        script_id: &str,
+    ) -> Result<ResolvedScript, Box<VerificationResult>> {
+        let app_state = match &self.app_state {
+            Some(state) => state,
+            None => {
+                warn!(
+                    "Cannot look up script_id '{}': no app_state available",
+                    script_id
+                );
+                return Err(Box::new(VerificationResult {
+                    criterion_id: script_id.to_string(),
+                    passed: false,
+                    criterion_type: CriterionType::Deterministic,
+                    confidence: None,
+                    observations: vec![],
+                    issues: vec![format!(
+                        "Cannot look up script_id '{}': verifier has no database access",
+                        script_id
+                    )],
+                    suggestions: vec![
+                        "Use DeterministicVerifier::with_app_state() or provide script_path instead"
+                            .to_string(),
+                    ],
+                    raw_output: None,
+                }));
+            }
+        };
+
+        let test = match app_state.checkpoint_db.get_verification_test(script_id) {
+            Ok(Some(test)) => test,
+            Ok(None) => {
+                error!("Playwright script not found in database: {}", script_id);
+                return Err(Box::new(VerificationResult {
+                    criterion_id: script_id.to_string(),
+                    passed: false,
+                    criterion_type: CriterionType::Deterministic,
+                    confidence: None,
+                    observations: vec![],
+                    issues: vec![format!(
+                        "Playwright script with id '{}' not found in database",
+                        script_id
+                    )],
+                    suggestions: vec![
+                        "Verify the script_id exists in the verification_tests table".to_string(),
+                    ],
+                    raw_output: None,
+                }));
+            }
+            Err(e) => {
+                error!("Failed to look up Playwright script '{}': {}", script_id, e);
+                return Err(Box::new(VerificationResult {
+                    criterion_id: script_id.to_string(),
+                    passed: false,
+                    criterion_type: CriterionType::Deterministic,
+                    confidence: None,
+                    observations: vec![],
+                    issues: vec![format!(
+                        "Database error looking up script '{}': {}",
+                        script_id, e
+                    )],
+                    suggestions: vec!["Check database connectivity".to_string()],
+                    raw_output: None,
+                }));
+            }
+        };
+
+        // Prefer source_file (filesystem path) if available
+        if let Some(ref path) = test.source_file {
+            if !path.is_empty() {
+                debug!(
+                    "Resolved script_id '{}' to source_file: {}",
+                    script_id, path
+                );
+                return Ok(ResolvedScript::FilePath(path.clone()));
+            }
+        }
+
+        // Fall back to inline playwright_code written to a temp file
+        if let Some(ref code) = test.playwright_code {
+            if !code.is_empty() {
+                let temp_dir = std::env::temp_dir();
+                let temp_path = temp_dir.join(format!("qontinui_pw_{}.spec.ts", script_id));
+                if let Err(e) = std::fs::write(&temp_path, code) {
+                    error!(
+                        "Failed to write temp Playwright script for '{}': {}",
+                        script_id, e
+                    );
+                    return Err(Box::new(VerificationResult {
+                        criterion_id: script_id.to_string(),
+                        passed: false,
+                        criterion_type: CriterionType::Deterministic,
+                        confidence: None,
+                        observations: vec![],
+                        issues: vec![format!(
+                            "Failed to write temp script file for '{}': {}",
+                            script_id, e
+                        )],
+                        suggestions: vec!["Check temp directory permissions".to_string()],
+                        raw_output: None,
+                    }));
+                }
+                debug!(
+                    "Resolved script_id '{}' to temp file: {:?}",
+                    script_id, temp_path
+                );
+                return Ok(ResolvedScript::TempFile(temp_path));
+            }
+        }
+
+        // Neither source_file nor playwright_code available
+        error!(
+            "Script '{}' has no source_file or playwright_code",
+            script_id
+        );
+        Err(Box::new(VerificationResult {
+            criterion_id: script_id.to_string(),
+            passed: false,
+            criterion_type: CriterionType::Deterministic,
+            confidence: None,
+            observations: vec![],
+            issues: vec![format!(
+                "Script '{}' exists but has no source_file or playwright_code",
+                script_id
+            )],
+            suggestions: vec![
+                "Add a source_file path or playwright_code to the verification test".to_string(),
+            ],
+            raw_output: None,
+        }))
     }
 
     async fn verify_log_pattern(&self, criterion: &SuccessCriterion) -> VerificationResult {
