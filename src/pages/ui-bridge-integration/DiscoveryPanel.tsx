@@ -61,8 +61,10 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
   useEffect(() => {
     const controller = new AbortController();
 
-    invoke<ProcessConfig[]>("get_process_configs")
-      .then((configs) => {
+    async function loadData() {
+      // Load process configs via Tauri IPC (not abortable, check signal after)
+      try {
+        const configs = await invoke<ProcessConfig[]>("get_process_configs");
         if (controller.signal.aborted) return;
         setProcessConfigs(configs);
         const map = new Map<number, string>();
@@ -72,24 +74,24 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
           }
         }
         setPortToPath(map);
-      })
-      .catch(() => {});
+      } catch {
+        // Ignore — process configs may not be available
+      }
 
-    // Get runner's own project path (available in dev mode)
-    async function fetchRunnerProject() {
+      // Get runner's own project path (available in dev mode)
       try {
         const r = await fetch(`${getApiBase()}/ui-bridge/integration/runner-project`, {
           signal: controller.signal,
         });
         const data: ApiResponse<string | null> = await r.json();
-        if (data.success && data.data) setRunnerPath(data.data);
-      } catch (_e) {
-        if (!controller.signal.aborted) {
-          // Silently ignore — runner project path is optional
+        if (!controller.signal.aborted && data.success && data.data) {
+          setRunnerPath(data.data);
         }
+      } catch {
+        // Silently ignore — runner project path is optional
       }
     }
-    fetchRunnerProject();
+    loadData();
 
     return () => controller.abort();
   }, []);

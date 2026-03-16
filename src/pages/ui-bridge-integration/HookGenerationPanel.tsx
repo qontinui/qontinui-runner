@@ -202,6 +202,7 @@ export function HookGenerationPanel({
   // When AI transitions to ready, handle the current step completion
   useEffect(() => {
     const controller = new AbortController();
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
     const prevState = prevSessionStateRef.current;
     prevSessionStateRef.current = session.sessionState;
@@ -253,6 +254,7 @@ export function HookGenerationPanel({
                   }),
                   signal: controller.signal,
                 });
+                if (controller.signal.aborted) return;
                 const data = await resp.json();
                 if (data.success && data.data) existingSpec = data.data;
               } catch (_e) {
@@ -343,10 +345,11 @@ export function HookGenerationPanel({
         // Retry after a delay by fetching the full output from the runner API.
         const taskRunId = session.taskRunId;
         if (specRetryTimerRef.current) clearTimeout(specRetryTimerRef.current);
-        specRetryTimerRef.current = setTimeout(async () => {
+        retryTimer = setTimeout(async () => {
           specRetryTimerRef.current = null;
-          if (!taskRunId) {
-            handleSpecError();
+          retryTimer = null;
+          if (controller.signal.aborted || !taskRunId) {
+            if (!controller.signal.aborted) handleSpecError();
             return;
           }
 
@@ -355,6 +358,7 @@ export function HookGenerationPanel({
               `${getApiBase()}/task-runs/${taskRunId}/output?tail_chars=200000`,
               { signal: controller.signal },
             );
+            if (controller.signal.aborted) return;
             const data = await resp.json();
             const apiOutput: string = data?.output || "";
             if (!tryExtractSpec(apiOutput)) {
@@ -366,10 +370,14 @@ export function HookGenerationPanel({
             }
           }
         }, 1000);
+        specRetryTimerRef.current = retryTimer;
       }
     }
 
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      if (retryTimer) clearTimeout(retryTimer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.sessionState]);
 
