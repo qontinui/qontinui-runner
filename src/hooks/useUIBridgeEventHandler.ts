@@ -943,6 +943,16 @@ export function useUIBridgeEventHandler(): void {
                 /\blocalStorage\b/, // storage access
                 /\bsessionStorage\b/, // storage access
                 /\bindexedDB\b/, // storage access
+                /\bglobalThis\b/, // global scope access
+                /\bReflect\b/, // metaprogramming
+                /\bProxy\b/, // metaprogramming
+                /\bWebSocket\b/, // network access
+                /\bwindow\.open\b/, // popup/navigation
+                /\bdocument\.cookie\b/, // cookie access
+                /\bWorker\b/, // web workers
+                /\bSharedWorker\b/, // shared workers
+                /\bServiceWorker\b/, // service workers
+                /\bcrypto\.subtle\b/, // cryptographic operations
               ];
               const isDangerous = dangerousPatterns.some((p) => p.test(expression));
               if (isDangerous) {
