@@ -344,6 +344,7 @@ pub async fn create_ai_session(
             None,              // finding_ctx
             None,              // progress_ctx
             None,              // pid_tracker
+            None,              // model_override
         ) {
             Ok(session) => {
                 let session = Arc::new(session);
@@ -1075,6 +1076,7 @@ pub async fn resume_ai_sessions(
             None, // finding_ctx
             None, // progress_ctx
             None, // pid_tracker
+            None, // model_override
         ) {
             Ok(session) => {
                 // Send the replay prompt as the initial message

@@ -98,6 +98,7 @@ impl ClaudeSession {
         finding_ctx: Option<FindingContext>,
         progress_ctx: Option<ProgressContext>,
         pid_tracker: Option<Arc<Mutex<Vec<u32>>>>,
+        model_override: Option<&str>,
     ) -> Result<Self, String> {
         info!(
             "Spawning interactive Claude session: {} in {}",
@@ -106,25 +107,38 @@ impl ClaudeSession {
 
         // Spawn CLI with stream-json input AND output
         let mut cmd = crate::process_helpers::cmd_no_window();
-        cmd.args([
-            "/c",
-            "claude",
-            "--output-format",
-            "stream-json",
-            "--input-format",
-            "stream-json",
-            "--verbose",
-            "--permission-mode",
-            "bypassPermissions",
-        ])
-        .current_dir(working_dir)
-        // Remove CLAUDECODE env var to prevent "nested session" detection.
-        // The runner spawns Claude CLI as an automation tool, not as a nested session.
-        .env_remove("CLAUDECODE")
-        .env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        let mut cli_args = vec![
+            "/c".to_string(),
+            "claude".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+            "--permission-mode".to_string(),
+            "bypassPermissions".to_string(),
+        ];
+
+        // Add model override if specified (e.g., from per-stage config)
+        if let Some(model) = model_override {
+            cli_args.push("--model".to_string());
+            cli_args.push(model.to_string());
+            info!(
+                "Using model override for interactive session {}: {}",
+                session_id, model
+            );
+        }
+
+        let cli_arg_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
+        cmd.args(&cli_arg_refs)
+            .current_dir(working_dir)
+            // Remove CLAUDECODE env var to prevent "nested session" detection.
+            // The runner spawns Claude CLI as an automation tool, not as a nested session.
+            .env_remove("CLAUDECODE")
+            .env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let mut child = cmd
             .spawn()

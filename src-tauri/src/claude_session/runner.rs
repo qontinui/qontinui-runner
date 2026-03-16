@@ -1790,6 +1790,7 @@ pub fn run_claude_session_interactive(
     doctor_handle: Option<&DoctorHandle>,
     _reflection_fix_ctx: Option<ReflectionFixContext>,
     _step_injection_ctx: Option<StepInjectionContext>,
+    model_override: Option<&str>,
 ) -> Result<(bool, String, Vec<ExecutionStepConfig>), String> {
     use crate::claude_session::ClaudeSession;
     use crate::commands::ai_session::emit_session_state;
@@ -1809,6 +1810,7 @@ pub fn run_claude_session_interactive(
         finding_ctx,
         progress_ctx,
         pid_tracker,
+        model_override,
     )?;
 
     // Register with Doctor health monitoring
@@ -1898,7 +1900,7 @@ pub fn run_claude_session_interactive_with_retry(
     doctor_handle: Option<&DoctorHandle>,
     reflection_fix_ctx: Option<ReflectionFixContext>,
     step_injection_ctx: Option<StepInjectionContext>,
-    _model_override: Option<&str>, // TODO: wire to interactive session CLI args
+    model_override: Option<&str>,
 ) -> Result<(bool, String, Option<RetryState>, Vec<ExecutionStepConfig>), String> {
     use std::thread;
     use std::time::Duration;
@@ -1921,6 +1923,7 @@ pub fn run_claude_session_interactive_with_retry(
                 doctor_handle,
                 reflection_fix_ctx,
                 step_injection_ctx,
+                model_override,
             )?;
             return Ok((result.0, result.1, None, result.2));
         }
@@ -1960,6 +1963,7 @@ pub fn run_claude_session_interactive_with_retry(
             doctor_handle,
             reflection_fix_ctx_clone,
             step_injection_ctx_clone,
+            model_override,
         );
 
         match result {

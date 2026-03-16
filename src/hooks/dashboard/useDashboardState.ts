@@ -30,7 +30,7 @@ const ACTIVITY_POLL_INTERVAL_MS = 5000;
 /**
  * Overall dashboard status.
  */
-export type DashboardStatus = "idle" | "running" | "completed" | "failed" | "stopped";
+export type DashboardStatus = "idle" | "running" | "paused" | "completed" | "failed" | "stopped";
 
 /**
  * Complete dashboard state.
