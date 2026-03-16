@@ -478,6 +478,24 @@ export function useUIBridgeEventHandler(): void {
                   : undefined),
               timestamp: Date.now(),
             });
+
+            // Capture render log entry for the interaction
+            try {
+              fetch("http://localhost:9876/ui-bridge/control/render-log", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  type: "interaction",
+                  timestamp: Date.now(),
+                  action: actionObj?.action,
+                  elementId: elementId,
+                  elementType: currentBridge.getElement(elementId)?.type,
+                  success: result.success,
+                }),
+              }).catch(() => {});
+            } catch {
+              // Non-critical — don't block action execution
+            }
             break;
           }
 
@@ -782,6 +800,21 @@ export function useUIBridgeEventHandler(): void {
                 data: { success: true, url },
                 timestamp: Date.now(),
               });
+
+              try {
+                fetch("http://localhost:9876/ui-bridge/control/render-log", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    type: "navigation",
+                    timestamp: Date.now(),
+                    from: window.location.pathname,
+                    to: url,
+                  }),
+                }).catch(() => {});
+              } catch {
+                // Non-critical
+              }
             } catch (err) {
               await sendResponse({
                 requestId,
@@ -898,24 +931,22 @@ export function useUIBridgeEventHandler(): void {
               // SECURITY: Block dangerous patterns while allowing diagnostic expressions.
               // Uses new Function() which does not have access to local scope.
               const dangerousPatterns = [
-                /\bimport\s*\(/,           // dynamic import
-                /\brequire\s*\(/,          // require
-                /\b__proto__\b/,           // prototype pollution
-                /\bconstructor\s*\[/,      // constructor bracket access
-                /\beval\s*\(/,             // nested eval
-                /\bnew\s+Function\b/,      // Function constructor
-                /\bfetch\s*\(/,            // network requests
-                /\bXMLHttpRequest\b/,      // network requests
+                /\bimport\s*\(/, // dynamic import
+                /\brequire\s*\(/, // require
+                /\b__proto__\b/, // prototype pollution
+                /\bconstructor\s*\[/, // constructor bracket access
+                /\beval\s*\(/, // nested eval
+                /\bnew\s+Function\b/, // Function constructor
+                /\bfetch\s*\(/, // network requests
+                /\bXMLHttpRequest\b/, // network requests
                 /\bnavigator\.sendBeacon\b/, // data exfiltration
-                /\blocalStorage\b/,        // storage access
-                /\bsessionStorage\b/,      // storage access
-                /\bindexedDB\b/,           // storage access
+                /\blocalStorage\b/, // storage access
+                /\bsessionStorage\b/, // storage access
+                /\bindexedDB\b/, // storage access
               ];
-              const isDangerous = dangerousPatterns.some(p => p.test(expression));
+              const isDangerous = dangerousPatterns.some((p) => p.test(expression));
               if (isDangerous) {
-                throw new Error(
-                  "Expression rejected: contains prohibited pattern",
-                );
+                throw new Error("Expression rejected: contains prohibited pattern");
               }
               const result = new Function("return " + expression)();
               const resolvedResult = await Promise.resolve(result);

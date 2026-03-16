@@ -695,16 +695,21 @@ function ProductModeSwitcher({ mode, onModeChange, collapsed }: ProductModeSwitc
   }
 
   return (
-    <div className="flex items-center gap-0.5 p-0.5 rounded-md bg-muted/20 border border-border/50" role="group" aria-label="Product mode">
+    <div
+      className="flex items-center gap-0.5 p-0.5 rounded-md bg-muted/20 border border-border/50"
+      role="group"
+      aria-label="Product mode"
+    >
       <button
         onClick={() => onModeChange("ai")}
         aria-pressed={mode === "ai"}
         className={`
           flex-1 flex items-center justify-center gap-1.5 px-2 py-1 rounded text-xs font-medium
           transition-all duration-150
-          ${mode === "ai"
-            ? "bg-card text-foreground shadow-sm"
-            : "text-muted-foreground hover:text-foreground"
+          ${
+            mode === "ai"
+              ? "bg-card text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
           }
         `}
       >
@@ -717,9 +722,10 @@ function ProductModeSwitcher({ mode, onModeChange, collapsed }: ProductModeSwitc
         className={`
           flex-1 flex items-center justify-center gap-1.5 px-2 py-1 rounded text-xs font-medium
           transition-all duration-150
-          ${mode === "visual"
-            ? "bg-card text-foreground shadow-sm"
-            : "text-muted-foreground hover:text-foreground"
+          ${
+            mode === "visual"
+              ? "bg-card text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
           }
         `}
       >

@@ -3197,6 +3197,22 @@ pub async fn ui_bridge_get_render_log_handler(
     }))))
 }
 
+/// Append an entry to the render log.
+pub async fn ui_bridge_append_render_log_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(entry): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let mut log = state.ui_bridge_render_log.lock().await;
+    // Keep render log bounded to prevent memory leaks
+    if log.len() >= 1000 {
+        log.drain(0..100);
+    }
+    log.push(entry);
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "count": log.len()
+    }))))
+}
+
 /// Manually reset the UI Bridge circuit breaker to Closed state.
 pub async fn ui_bridge_circuit_breaker_reset_handler(
     State(state): State<Arc<ApiState>>,
@@ -3541,7 +3557,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route(
             "/ui-bridge/control/render-log",
-            get(ui_bridge_get_render_log_handler),
+            get(ui_bridge_get_render_log_handler).post(ui_bridge_append_render_log_handler),
         )
         // Diagnostics & health
         .route("/ui-bridge/diagnostics", get(ui_bridge_diagnostics_handler))

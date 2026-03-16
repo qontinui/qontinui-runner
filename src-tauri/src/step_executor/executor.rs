@@ -4115,9 +4115,7 @@ impl StepExecutor {
         let command = if cfg!(target_os = "windows") && command.contains("| xargs") {
             let sanitized = command.replace("| xargs", "| tr -d '\\r' | xargs");
             if sanitized != command {
-                info!(
-                    "Windows CR sanitization: inserted tr -d '\\r' before xargs"
-                );
+                info!("Windows CR sanitization: inserted tr -d '\\r' before xargs");
             }
             sanitized
         } else {

@@ -31,9 +31,7 @@ export function ProductModeProvider({ children }: { children: React.ReactNode })
   }, []);
 
   return (
-    <ProductModeContext.Provider value={{ mode, setMode }}>
-      {children}
-    </ProductModeContext.Provider>
+    <ProductModeContext.Provider value={{ mode, setMode }}>{children}</ProductModeContext.Provider>
   );
 }
 
