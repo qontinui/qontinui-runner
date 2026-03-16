@@ -481,7 +481,7 @@ export function useUIBridgeEventHandler(): void {
 
             // Capture render log entry for the interaction
             try {
-              fetch("http://localhost:9876/ui-bridge/control/render-log", {
+              fetch(`http://localhost:${getApiPort()}/ui-bridge/control/render-log`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -802,7 +802,7 @@ export function useUIBridgeEventHandler(): void {
               });
 
               try {
-                fetch("http://localhost:9876/ui-bridge/control/render-log", {
+                fetch(`http://localhost:${getApiPort()}/ui-bridge/control/render-log`, {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({
