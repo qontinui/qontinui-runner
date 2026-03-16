@@ -543,6 +543,9 @@ impl LoopController {
                 .on_stage_start(stage_idx as u32, &stage.name, total_stages)
                 .await;
 
+            // Wait if paused before starting a new stage
+            self.wait_while_paused(&config.execution_id).await;
+
             // Check for external stop
             if self.is_task_stopped(&config.execution_id) {
                 warn!("Task stopped before stage {}/{}", stage_num, total_stages);
@@ -1627,6 +1630,23 @@ impl LoopController {
             // Check if the task has been stopped externally (e.g., user clicked Stop button)
             if self.is_task_stopped(&config.execution_id) {
                 warn!("Task was stopped externally - exiting loop");
+                break LoopResult {
+                    iterations_run: iteration - 1,
+                    verification_passed: false,
+                    max_iterations_reached: false,
+                    critical_failure: false,
+                    was_stopped: true,
+                    unfixable_errors: false,
+                    iteration_results,
+                };
+            }
+
+            // Wait if paused (user clicked Pause in the dashboard)
+            self.wait_while_paused(&config.execution_id).await;
+
+            // Re-check stop after unpause (user may have stopped while paused)
+            if self.is_task_stopped(&config.execution_id) {
+                warn!("Task was stopped while paused - exiting loop");
                 break LoopResult {
                     iterations_run: iteration - 1,
                     verification_passed: false,
@@ -2762,6 +2782,23 @@ impl LoopController {
                 };
             }
 
+            // Wait if paused after agentic phase
+            self.wait_while_paused(&config.execution_id).await;
+
+            // Re-check stop after unpause
+            if self.is_task_stopped(&config.execution_id) {
+                warn!("Task was stopped while paused (post-agentic) - exiting loop");
+                break LoopResult {
+                    iterations_run: iteration,
+                    verification_passed: false,
+                    max_iterations_reached: false,
+                    critical_failure: false,
+                    was_stopped: true,
+                    unfixable_errors: false,
+                    iteration_results,
+                };
+            }
+
             // -----------------------------------------------------------------
             // APPROVAL GATE (optional human-in-the-loop pause)
             // -----------------------------------------------------------------
@@ -3368,6 +3405,43 @@ impl LoopController {
                     task_id_to_check, e
                 );
                 false
+            }
+        }
+    }
+
+    /// Check if the task has been paused by the user.
+    fn is_task_paused(&self, execution_id: &str) -> bool {
+        let task_id_to_check = get_parent_task_id(execution_id);
+
+        match self.checkpoint_db.get_task_run(&task_id_to_check) {
+            Ok(Some(task)) => task.status == "paused",
+            _ => false,
+        }
+    }
+
+    /// Wait while the task is paused, polling every 500ms.
+    /// Returns immediately if the task is not paused.
+    /// Also returns if the task is stopped (so the caller can handle stop).
+    async fn wait_while_paused(&self, execution_id: &str) {
+        if !self.is_task_paused(execution_id) {
+            return;
+        }
+
+        info!("Task {} is paused - waiting for resume", execution_id);
+
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+            // Check if stopped (takes priority over pause)
+            if self.is_task_stopped(execution_id) {
+                info!("Task {} was stopped while paused", execution_id);
+                return;
+            }
+
+            // Check if still paused
+            if !self.is_task_paused(execution_id) {
+                info!("Task {} resumed - continuing execution", execution_id);
+                return;
             }
         }
     }

@@ -116,8 +116,31 @@ export function DashboardPage({
   // Get flow execution data for flow-specific controls
   const flowExecutionData = useFlowExecutionData();
 
-  // Track paused state locally (for GUI automation)
+  // Track paused state locally (for GUI automation and unified workflows)
   const [isPaused, setIsPaused] = useState(false);
+
+  // Sync isPaused state with backend when task ID changes
+  useEffect(() => {
+    const taskId = state.taskInfo?.taskId;
+    if (!taskId) {
+      setIsPaused(false);
+      return;
+    }
+
+    const checkPauseState = async () => {
+      try {
+        const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/workflow-state`);
+        if (response.ok) {
+          const data = await response.json();
+          setIsPaused(data.is_paused === true);
+        }
+      } catch {
+        // Ignore - workflow state may not be available yet
+      }
+    };
+
+    checkPauseState();
+  }, [state.taskInfo?.taskId]);
 
   // --- Shortcuts modal state ---
   const [showShortcuts, setShowShortcuts] = useState(false);
@@ -286,7 +309,54 @@ export function DashboardPage({
       return;
     }
 
-    // Handle GUI automation pause/resume
+    // Handle unified workflow (AI task) pause/resume via REST API
+    const taskId = state.taskInfo?.taskId;
+    if (taskId) {
+      try {
+        // Check if the task is currently paused by querying the workflow state
+        const stateResponse = await tracedFetch(
+          `${getApiBase()}/task-runs/${taskId}/workflow-state`,
+        );
+        if (stateResponse.ok) {
+          const stateData = await stateResponse.json();
+          const taskIsPaused = stateData.is_paused === true;
+
+          if (taskIsPaused) {
+            console.log(`[DASHBOARD] Unpausing unified workflow: ${taskId}`);
+            const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/unpause`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+            });
+            if (response.ok) {
+              const data = await response.json();
+              if (data.success) {
+                console.log("[DASHBOARD] Unified workflow resumed successfully");
+                setIsPaused(false);
+                return;
+              }
+            }
+          } else {
+            console.log(`[DASHBOARD] Pausing unified workflow: ${taskId}`);
+            const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/pause`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+            });
+            if (response.ok) {
+              const data = await response.json();
+              if (data.success) {
+                console.log("[DASHBOARD] Unified workflow paused successfully");
+                setIsPaused(true);
+                return;
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error("[DASHBOARD] Failed to pause/resume unified workflow:", error);
+      }
+    }
+
+    // Fallback: Handle GUI automation pause/resume via Tauri IPC
     try {
       if (isPaused) {
         console.log("[DASHBOARD] Resume execution called");
@@ -304,11 +374,15 @@ export function DashboardPage({
         }
       }
     } catch {
-      // Pause/resume only works for GUI automation via Python bridge
-      // Unified workflows (AI tasks) don't support pause yet
       console.log("[DASHBOARD] Pause/resume not available for this workflow type");
     }
-  }, [isPaused, isFlowActive, flowExecutionData.instanceId, flowExecutionData.status]);
+  }, [
+    isPaused,
+    state.taskInfo?.taskId,
+    isFlowActive,
+    flowExecutionData.instanceId,
+    flowExecutionData.status,
+  ]);
 
   // Get current action text for bottom bar
   const _currentAction = state.layout.activeWidget

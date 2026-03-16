@@ -176,10 +176,14 @@ export function useDashboardState(): DashboardState {
 
   // Determine execution status
   const status: ExecutionStatus = useMemo(() => {
-    if (runningTasks.length > 0) return "running";
+    if (runningTasks.length > 0) {
+      // Check if the primary task is paused
+      if (runningTasks[0].status === "paused") return "paused";
+      return "running";
+    }
     if (execution.executionActive) return "running";
     return "idle";
-  }, [runningTasks.length, execution.executionActive]);
+  }, [runningTasks, execution.executionActive]);
 
   // Map action log data to ActionItem[]
   const actions: ActionItem[] = useMemo(() => {
@@ -262,9 +266,37 @@ export function useDashboardState(): DashboardState {
 
   // Control handlers
   const onPlayPause = useCallback(async () => {
-    // TODO: Implement pause/resume functionality
-    console.log("[DashboardState] Play/Pause not yet implemented");
-  }, []);
+    if (runningTasks.length === 0) return;
+
+    const taskId = runningTasks[0].id;
+    const isPaused = runningTasks[0].status === "paused";
+
+    try {
+      if (isPaused) {
+        // Resume the paused task
+        const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/unpause`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        });
+        if (response.ok) {
+          console.log("[DashboardState] Task resumed:", taskId);
+          setTimeout(refresh, 300);
+        }
+      } else {
+        // Pause the running task
+        const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/pause`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        });
+        if (response.ok) {
+          console.log("[DashboardState] Task paused:", taskId);
+          setTimeout(refresh, 300);
+        }
+      }
+    } catch (e) {
+      console.error("[DashboardState] Failed to pause/resume:", e);
+    }
+  }, [runningTasks, refresh]);
 
   const onStop = useCallback(async () => {
     try {

@@ -8138,6 +8138,49 @@ impl CheckpointDb {
         Ok(())
     }
 
+    /// Pause a running task run.
+    /// Sets the status to 'paused' so the loop controller will wait instead of proceeding.
+    /// Only pauses tasks that are currently 'running'.
+    pub fn pause_task_run(&self, id: &str) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        let rows = conn
+            .execute(
+                r#"
+            UPDATE task_runs SET
+                status = 'paused',
+                updated_at = ?1
+            WHERE id = ?2 AND status = 'running'
+            "#,
+                params![now, id],
+            )
+            .map_err(|e| format!("Failed to pause task run: {}", e))?;
+
+        Ok(rows > 0)
+    }
+
+    /// Unpause a paused task run, setting it back to 'running'.
+    /// Only unpauses tasks that are currently 'paused'.
+    pub fn unpause_task_run(&self, id: &str) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        let rows = conn
+            .execute(
+                r#"
+            UPDATE task_runs SET
+                status = 'running',
+                updated_at = ?1
+            WHERE id = ?2 AND status = 'paused'
+            "#,
+                params![now, id],
+            )
+            .map_err(|e| format!("Failed to unpause task run: {}", e))?;
+
+        Ok(rows > 0)
+    }
+
     /// Update execution steps for a task run.
     /// Used to add/update deterministic execution steps that should be re-run on session resume.
     pub fn update_task_run_execution_steps(
@@ -8246,7 +8289,7 @@ impl CheckpointDb {
                        created_at, updated_at, completed_at,
                        task_type, config_id, workflow_name
                 FROM task_runs
-                WHERE status = 'running' AND (workflow_type IS NULL OR workflow_type != 'chat')
+                WHERE status IN ('running', 'paused') AND (workflow_type IS NULL OR workflow_type != 'chat')
                 ORDER BY updated_at DESC
                 "#,
             )

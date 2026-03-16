@@ -270,7 +270,7 @@ pub async fn get_workflow_state(
             "completion_complete" | "failed" | "stopped"
         );
         let is_stopped = ws.state_name == "stopped";
-        let is_paused = ws.state_name == "paused";
+        let is_paused = ws.state_name == "paused" || task_run.status == "paused";
 
         // Map state name to stage for UI
         let (workflow_stage, workflow_stage_display) = state_name_to_stage(&ws.state_name);
@@ -891,6 +891,114 @@ pub async fn stop_task_run(
     Ok(Json(serde_json::json!({
         "success": true,
         "message": format!("Task run stopped, killed {} process(es)", killed_count)
+    })))
+}
+
+/// Pause a running task run.
+///
+/// Sets the task status to 'paused'. The loop controller checks this status
+/// at the start of each iteration and between phases, waiting until the task
+/// is unpaused before continuing.
+pub async fn pause_task_run(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    info!("Pausing task run: {}", id);
+
+    let paused = state
+        .app_state
+        .checkpoint_db
+        .pause_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if !paused {
+        // Either task not found or not in 'running' status
+        let task_run = state
+            .app_state
+            .checkpoint_db
+            .get_task_run(&id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+        return match task_run {
+            None => Err((StatusCode::NOT_FOUND, format!("Task run not found: {}", id))),
+            Some(tr) => Ok(Json(serde_json::json!({
+                "success": false,
+                "message": format!("Task is not running (status: {})", tr.status)
+            }))),
+        };
+    }
+
+    // Emit status to frontend
+    emit_ai_output(
+        &state.app_handle,
+        &format!("⏸ Task {} paused", id),
+        "status",
+        None,
+        None,
+    );
+
+    // Broadcast task-run-update
+    let broadcaster = crate::event_system::EventBroadcaster::new(state.app_handle.clone());
+    broadcaster.task_run_update(&id, "paused", None, None);
+
+    info!("Task {} paused", id);
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Task run paused"
+    })))
+}
+
+/// Unpause (resume) a paused task run.
+///
+/// Sets the task status back to 'running'. The loop controller will detect
+/// this change and continue execution.
+pub async fn unpause_task_run(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    info!("Unpausing task run: {}", id);
+
+    let unpaused = state
+        .app_state
+        .checkpoint_db
+        .unpause_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if !unpaused {
+        let task_run = state
+            .app_state
+            .checkpoint_db
+            .get_task_run(&id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+        return match task_run {
+            None => Err((StatusCode::NOT_FOUND, format!("Task run not found: {}", id))),
+            Some(tr) => Ok(Json(serde_json::json!({
+                "success": false,
+                "message": format!("Task is not paused (status: {})", tr.status)
+            }))),
+        };
+    }
+
+    // Emit status to frontend
+    emit_ai_output(
+        &state.app_handle,
+        &format!("▶ Task {} resumed", id),
+        "status",
+        None,
+        None,
+    );
+
+    // Broadcast task-run-update
+    let broadcaster = crate::event_system::EventBroadcaster::new(state.app_handle.clone());
+    broadcaster.task_run_update(&id, "running", None, None);
+
+    info!("Task {} unpaused", id);
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Task run resumed"
     })))
 }
 
@@ -3066,6 +3174,7 @@ pub async fn create_ai_session(
         None, // finding_ctx
         None, // progress_ctx
         None, // pid_tracker
+        None, // model_override
     ) {
         Ok(session) => {
             let session = Arc::new(session);
@@ -3422,6 +3531,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/task-runs/:id/orchestrator-state", get(get_workflow_state)) // Alias for backward compatibility
         .route("/task-runs/:id/full-state", get(get_full_workflow_state)) // Full state for restart recovery
         .route("/task-runs/:id/stop", post(stop_task_run))
+        .route("/task-runs/:id/pause", post(pause_task_run))
+        .route("/task-runs/:id/unpause", post(unpause_task_run))
         .route(
             "/task-runs/:id/auto-continue",
             get(get_task_auto_continue).put(set_task_auto_continue),
