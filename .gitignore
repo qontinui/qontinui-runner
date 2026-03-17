@@ -116,3 +116,8 @@ tmpclaude-*
 
 # Template artifact directories
 src-tauri/{{artifact_dir}}/
+
+# Build artifacts
+*.tsbuildinfo
+vite.config.d.ts
+vite.config.js
