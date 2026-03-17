@@ -142,14 +142,17 @@ pub fn execute_tests_for_trigger(
 
         // Track results
         result.total += 1;
-        let passed = matches!(exec_result.status, TestStatus::Passed);
+        let status = &exec_result.status;
 
-        if passed {
+        if matches!(status, TestStatus::Passed) {
             result.passed += 1;
             context_lines.push(format!(
                 "PASSED: {} ({}ms)",
                 test.name, exec_result.duration_ms
             ));
+        } else if matches!(status, TestStatus::Skipped) {
+            // Skipped tests are not failures — don't count them
+            context_lines.push(format!("SKIPPED: {}", test.name));
         } else {
             result.failed += 1;
             if test.is_critical {
@@ -215,7 +218,7 @@ pub fn create_findings_for_failures(
     _config_id: &str,
 ) {
     for exec_result in &tests_result.results {
-        if matches!(exec_result.status, TestStatus::Passed) {
+        if matches!(exec_result.status, TestStatus::Passed | TestStatus::Skipped) {
             continue;
         }
 

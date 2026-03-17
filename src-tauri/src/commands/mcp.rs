@@ -107,7 +107,10 @@ pub async fn create_mcp_server(
     }
 }
 
-/// Update an existing MCP server configuration
+/// Update an existing MCP server configuration.
+///
+/// Goes through the MCP client manager to ensure any active stdio
+/// subprocess is killed before updating the configuration.
 #[tauri::command]
 pub async fn update_mcp_server(
     state: State<'_, Arc<AppState>>,
@@ -116,7 +119,9 @@ pub async fn update_mcp_server(
 ) -> Result<McpResponse<McpServerConfig>, String> {
     info!("Updating MCP server: {}", server_id);
 
-    match state.checkpoint_db.update_mcp_server(&server_id, input) {
+    let mcp_manager = state.mcp_client_manager.lock().await;
+
+    match mcp_manager.update_server(&server_id, input).await {
         Ok(server) => {
             info!("Updated MCP server: {} ({})", server.name, server.id);
             Ok(McpResponse::ok(server))
@@ -128,7 +133,10 @@ pub async fn update_mcp_server(
     }
 }
 
-/// Delete an MCP server configuration
+/// Delete an MCP server configuration.
+///
+/// Goes through the MCP client manager to ensure any active stdio
+/// subprocess is killed before deleting the configuration.
 #[tauri::command]
 pub async fn delete_mcp_server(
     state: State<'_, Arc<AppState>>,
@@ -136,7 +144,9 @@ pub async fn delete_mcp_server(
 ) -> Result<McpResponse<()>, String> {
     info!("Deleting MCP server: {}", server_id);
 
-    match state.checkpoint_db.delete_mcp_server(&server_id) {
+    let mcp_manager = state.mcp_client_manager.lock().await;
+
+    match mcp_manager.delete_server(&server_id).await {
         Ok(()) => {
             info!("Deleted MCP server: {}", server_id);
             Ok(McpResponse::ok(()))

@@ -1366,6 +1366,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 database::embedding_jobs::EmbeddingJobConfig::default(),
             );
 
+            // Auto-start MCP servers marked with auto_start in background
+            let app_state_for_mcp_auto = app.state::<Arc<AppState>>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                let mcp_manager = app_state_for_mcp_auto.mcp_client_manager.lock().await;
+                mcp_manager.start_auto_start_servers().await;
+            });
+
             // Cloud relay auto-start is handled in mcp_api.rs where ApiState is available
 
             // Check Claude CLI auth status on startup

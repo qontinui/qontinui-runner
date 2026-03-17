@@ -5037,7 +5037,11 @@ pub async fn run_deterministic_verification(
 
             // Categorize failures as critical or non-critical
             for result in &test_results.results {
-                if matches!(result.status, crate::test_executor::TestStatus::Passed) {
+                if matches!(
+                    result.status,
+                    crate::test_executor::TestStatus::Passed
+                        | crate::test_executor::TestStatus::Skipped
+                ) {
                     continue;
                 }
                 let msg = format!(

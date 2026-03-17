@@ -20,13 +20,13 @@ pub use types::*;
 
 /// Handle for a stdio MCP server subprocess
 struct StdioHandle {
-    /// The child process
-    child: Child,
+    /// The child process (behind a Mutex so we can check/kill it)
+    child: tokio::sync::Mutex<Child>,
     /// Stdin writer for sending JSON-RPC requests
     stdin: tokio::sync::Mutex<ChildStdin>,
     /// Stdout reader for receiving JSON-RPC responses
     stdout: tokio::sync::Mutex<BufReader<ChildStdout>>,
-    /// Monotonically increasing request ID counter
+    /// Monotonically increasing request ID counter (starts at 1)
     next_id: AtomicU64,
 }
 
@@ -34,6 +34,19 @@ impl StdioHandle {
     /// Get the next JSON-RPC request ID
     fn next_request_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Check if the child process has exited.
+    /// Returns Some(exit_status) if exited, None if still running.
+    async fn try_wait(&self) -> Option<std::process::ExitStatus> {
+        let mut child = self.child.lock().await;
+        child.try_wait().unwrap_or_default()
+    }
+
+    /// Kill the child process.
+    async fn kill(&self) -> Result<(), std::io::Error> {
+        let mut child = self.child.lock().await;
+        child.kill().await
     }
 }
 
@@ -253,22 +266,14 @@ impl McpClientManager {
         if let Some(mut conn) = connections.remove(server_id) {
             // Kill stdio subprocess if present
             if let Some(handle) = conn.stdio_handle.take() {
-                // Try to get exclusive access and kill the child
-                if let Ok(handle) = Arc::try_unwrap(handle) {
-                    let mut child = handle.child;
-                    if let Err(e) = child.kill().await {
-                        warn!(
-                            "Failed to kill stdio process for server {}: {}",
-                            server_id, e
-                        );
-                    } else {
-                        debug!("Killed stdio process for server {}", server_id);
-                    }
-                } else {
+                if let Err(e) = handle.kill().await {
+                    // The process may have already exited — only warn on unexpected errors
                     warn!(
-                        "Could not get exclusive handle to kill stdio process for server {}",
-                        server_id
+                        "Failed to kill stdio process for server {}: {}",
+                        server_id, e
                     );
+                } else {
+                    debug!("Killed stdio process for server {}", server_id);
                 }
             }
         }
@@ -276,17 +281,52 @@ impl McpClientManager {
         Ok(())
     }
 
-    /// Ensure connected to a server, connecting if necessary
+    /// Ensure connected to a server, connecting if necessary.
+    ///
+    /// For stdio servers, also checks whether the child process is still alive.
+    /// If the process has exited, marks the connection as dead and reconnects.
     pub async fn ensure_connected(&self, server_id: &str) -> Result<(), String> {
-        let connections = self.connections.read().await;
-        if let Some(conn) = connections.get(server_id) {
-            if conn.connected {
-                return Ok(());
+        let needs_reconnect = {
+            let connections = self.connections.read().await;
+            if let Some(conn) = connections.get(server_id) {
+                if conn.connected {
+                    // For stdio connections, verify the process is still alive
+                    if let Some(ref handle) = conn.stdio_handle {
+                        if let Some(exit_status) = handle.try_wait().await {
+                            warn!(
+                                "MCP stdio process for server {} has exited ({}), will reconnect",
+                                server_id, exit_status
+                            );
+                            true // needs reconnect
+                        } else {
+                            false // process is alive, we're good
+                        }
+                    } else {
+                        // HTTP connection — connected flag is sufficient
+                        false
+                    }
+                } else {
+                    true // not connected
+                }
+            } else {
+                true // no connection entry at all
             }
-        }
-        drop(connections);
+        };
 
-        self.connect(server_id).await?;
+        if needs_reconnect {
+            // Clean up any dead connection state first
+            {
+                let mut connections = self.connections.write().await;
+                if let Some(conn) = connections.get(server_id) {
+                    if conn.connected {
+                        // The process died — remove the stale connection
+                        connections.remove(server_id);
+                    }
+                }
+            }
+            self.connect(server_id).await?;
+        }
+
         Ok(())
     }
 
@@ -300,32 +340,55 @@ impl McpClientManager {
         // Ensure connected
         self.ensure_connected(server_id).await?;
 
-        let connections = self.connections.read().await;
-        let conn = connections
-            .get(server_id)
-            .ok_or_else(|| format!("Not connected to server: {}", server_id))?;
-
-        if !conn.connected {
-            return Err(format!("Not connected to server: {}", server_id));
+        // Extract what we need from the connection, then drop the lock before
+        // making any async network/IPC calls. This prevents blocking other
+        // operations (connect, disconnect, status) during tool execution.
+        enum TransportInfo {
+            Http {
+                config: Box<McpServerConfig>,
+            },
+            Stdio {
+                handle: Arc<StdioHandle>,
+                timeout_secs: u64,
+            },
         }
 
-        let config = &conn.config;
-        debug!("Calling tool {} on server {}", tool_name, config.name);
+        let transport_info = {
+            let connections = self.connections.read().await;
+            let conn = connections
+                .get(server_id)
+                .ok_or_else(|| format!("Not connected to server: {}", server_id))?;
+
+            if !conn.connected {
+                return Err(format!("Not connected to server: {}", server_id));
+            }
+
+            debug!("Calling tool {} on server {}", tool_name, conn.config.name);
+
+            match conn.config.transport {
+                McpTransport::Http => TransportInfo::Http {
+                    config: Box::new(conn.config.clone()),
+                },
+                McpTransport::Stdio => TransportInfo::Stdio {
+                    handle: conn
+                        .stdio_handle
+                        .as_ref()
+                        .ok_or("Stdio handle missing for connected stdio server")?
+                        .clone(),
+                    timeout_secs: conn.config.timeout_seconds,
+                },
+            }
+        }; // connections lock dropped here
 
         let start = Instant::now();
-        let result = match config.transport {
-            McpTransport::Http => self.call_tool_http(config, tool_name, &arguments).await,
-            McpTransport::Stdio => {
-                let handle = conn
-                    .stdio_handle
-                    .as_ref()
-                    .ok_or("Stdio handle missing for connected stdio server")?
-                    .clone();
-                let timeout_secs = config.timeout_seconds;
-                // Drop the read lock before the async call
-                drop(connections);
-                Self::call_tool_stdio_impl(&handle, tool_name, &arguments, timeout_secs).await
+        let result = match transport_info {
+            TransportInfo::Http { ref config } => {
+                self.call_tool_http(config, tool_name, &arguments).await
             }
+            TransportInfo::Stdio {
+                ref handle,
+                timeout_secs,
+            } => Self::call_tool_stdio_impl(handle, tool_name, &arguments, timeout_secs).await,
         };
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -594,10 +657,9 @@ impl McpClientManager {
         }
 
         let handle = Arc::new(StdioHandle {
-            child,
+            child: tokio::sync::Mutex::new(child),
             stdin: tokio::sync::Mutex::new(stdin),
             stdout: tokio::sync::Mutex::new(BufReader::new(stdout)),
-            // Start at 1 since we use 1 for the initialize request below
             next_id: AtomicU64::new(1),
         });
 
