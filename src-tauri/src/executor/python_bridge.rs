@@ -4,11 +4,11 @@ use super::output::OutputProcessor;
 use super::process::ProcessManager;
 use super::protocol::{ExecutorCommand, ProtocolHandler};
 use super::state::ExecutorState;
+use crate::event_system::EventEmitter;
 use serde_json::{json, Value};
 use std::process::Child;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::Emitter;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, error, info, instrument};
@@ -37,6 +37,9 @@ pub struct PythonBridge {
     /// Tauri app handle for emitting events
     app_handle: tauri::AppHandle,
 
+    /// Typed event emitter for frontend communication
+    emitter: EventEmitter,
+
     /// Runtime for async tasks
     runtime: Arc<tokio::runtime::Runtime>,
 
@@ -49,6 +52,7 @@ impl PythonBridge {
     pub fn new(app_handle: tauri::AppHandle) -> Self {
         let runtime =
             Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
+        let emitter = EventEmitter::new(app_handle.clone());
 
         Self {
             process: None,
@@ -57,6 +61,7 @@ impl PythonBridge {
             lifecycle: Arc::new(RwLock::new(ExecutorLifecycle::new())),
             health_monitor: Arc::new(HealthMonitor::new()),
             app_handle,
+            emitter,
             runtime,
             headless_events: None,
         }
@@ -69,6 +74,7 @@ impl PythonBridge {
     pub fn new_headless(app_handle: tauri::AppHandle) -> Self {
         let runtime =
             Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
+        let emitter = EventEmitter::new(app_handle.clone());
 
         Self {
             process: None,
@@ -77,6 +83,7 @@ impl PythonBridge {
             lifecycle: Arc::new(RwLock::new(ExecutorLifecycle::new())),
             health_monitor: Arc::new(HealthMonitor::new()),
             app_handle,
+            emitter,
             runtime,
             headless_events: None,
         }
@@ -275,9 +282,10 @@ impl PythonBridge {
                 sequence: 0,
                 data: queued.data,
             };
-            if let Err(e) = self.app_handle.emit("executor-event", &event) {
-                error!("Failed to emit queued event: {}", e);
-            }
+            self.emitter.emit_raw_or_error(
+                "executor-event",
+                &serde_json::to_value(&event).unwrap_or_default(),
+            );
         }
 
         Ok(())

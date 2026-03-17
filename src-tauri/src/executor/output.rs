@@ -1,10 +1,10 @@
 use super::events::EventForwarder;
 use super::health::HealthMonitor;
 use super::lifecycle::{parse_executor_message, ExecutorLifecycle, ExecutorMessage};
+use crate::event_system::EventEmitter;
 use serde_json::json;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
-use tauri::Emitter;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info};
 
@@ -63,6 +63,7 @@ impl OutputProcessor {
         app_handle: tauri::AppHandle,
     ) {
         info!("[OUTPUT_PROCESSOR] stdout_reader_task started");
+        let emitter = EventEmitter::new(app_handle.clone());
         let reader = BufReader::new(stdout);
         let mut line_count = 0;
 
@@ -124,7 +125,7 @@ impl OutputProcessor {
                                         "error": "message_handling_error",
                                         "message": e.to_string(),
                                     });
-                                    let _ = app_handle.emit("executor-error", &error_event);
+                                    emitter.emit_raw_or_warn("executor-error", &error_event);
                                 }
                             }
                         }
@@ -139,7 +140,7 @@ impl OutputProcessor {
                                 "raw_line": line,
                                 "timestamp": chrono::Utc::now().timestamp_millis(),
                             });
-                            let _ = app_handle.emit("executor-error", &error_event);
+                            emitter.emit_raw_or_warn("executor-error", &error_event);
                         }
                     }
                 }
@@ -166,7 +167,7 @@ impl OutputProcessor {
                 "error": "executor_crashed",
                 "message": "Python executor process terminated unexpectedly",
             });
-            let _ = app_handle.emit("executor-error", &error_event);
+            emitter.emit_raw_or_error("executor-error", &error_event);
         }
     }
 
@@ -189,6 +190,7 @@ impl OutputProcessor {
         app_handle: tauri::AppHandle,
     ) {
         info!("[EXTRACTION_EXECUTOR] stdout_reader_task started");
+        let emitter = EventEmitter::new(app_handle.clone());
         let reader = BufReader::new(stdout);
         let mut line_count = 0;
 
@@ -239,7 +241,7 @@ impl OutputProcessor {
                                         "error": "message_handling_error",
                                         "message": e.to_string(),
                                     });
-                                    let _ = app_handle.emit("extraction-error", &error_event);
+                                    emitter.emit_raw_or_warn("extraction-error", &error_event);
                                 }
                             }
                         }
@@ -253,7 +255,7 @@ impl OutputProcessor {
                                 "raw_line": line,
                                 "timestamp": chrono::Utc::now().timestamp_millis(),
                             });
-                            let _ = app_handle.emit("extraction-error", &error_event);
+                            emitter.emit_raw_or_warn("extraction-error", &error_event);
                         }
                     }
                 }
@@ -279,7 +281,7 @@ impl OutputProcessor {
                 "error": "extraction_executor_crashed",
                 "message": "Extraction executor process terminated unexpectedly",
             });
-            let _ = app_handle.emit("extraction-error", &error_event);
+            emitter.emit_raw_or_error("extraction-error", &error_event);
         }
     }
 

@@ -3,12 +3,13 @@ use super::lifecycle::ExecutorMessage;
 use super::protocol::ExecutorEvent;
 use crate::commands::AppState;
 use crate::display::RawEvent;
+use crate::event_system::EventEmitter;
 use crate::safe_eprintln;
 use serde_json::json;
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Handles event forwarding from Python executor to Tauri frontend and WebSocket clients
 pub struct EventForwarder;
@@ -110,7 +111,8 @@ impl EventForwarder {
             }
         }
 
-        // Continue with normal event emission
+        // Continue with normal event emission via EventEmitter
+        let emitter = EventEmitter::new(app_handle.clone());
         match message {
             ExecutorMessage::Event {
                 event,
@@ -128,9 +130,10 @@ impl EventForwarder {
                     sequence,
                     data,
                 };
-                if let Err(e) = app_handle.emit("executor-event", &event_obj) {
-                    error!("Failed to emit event: {}", e);
-                }
+                emitter.emit_raw_or_error(
+                    "executor-event",
+                    &serde_json::to_value(&event_obj).unwrap_or_default(),
+                );
             }
             ExecutorMessage::TreeEvent {
                 event_type,
@@ -155,9 +158,7 @@ impl EventForwarder {
                 // Broadcast to WebSocket clients for live perception
                 Self::broadcast_to_websocket(app_handle, &tree_event);
 
-                if let Err(e) = app_handle.emit("executor-event", &tree_event) {
-                    error!("Failed to emit tree event: {}", e);
-                }
+                emitter.emit_raw_or_error("executor-event", &tree_event);
             }
             ExecutorMessage::Response {
                 id,
@@ -172,9 +173,10 @@ impl EventForwarder {
                     data,
                     error,
                 };
-                if let Err(e) = app_handle.emit("executor-response", &response) {
-                    error!("Failed to emit response: {}", e);
-                }
+                emitter.emit_raw_or_error(
+                    "executor-response",
+                    &serde_json::to_value(&response).unwrap_or_default(),
+                );
             }
             ExecutorMessage::Error { message, details } => {
                 // Log to file
@@ -186,9 +188,7 @@ impl EventForwarder {
                     "message": message,
                     "details": details,
                 });
-                if let Err(e) = app_handle.emit("executor-error", &error_event) {
-                    error!("Failed to emit error: {}", e);
-                }
+                emitter.emit_raw_or_error("executor-error", &error_event);
             }
             ExecutorMessage::ImageRecognition { data } => {
                 // Log to file (with screenshot saving)
@@ -205,9 +205,7 @@ impl EventForwarder {
                 // This includes found coordinates for displaying StateImages at runtime positions
                 Self::broadcast_to_websocket(app_handle, &image_recognition_event);
 
-                if let Err(e) = app_handle.emit("executor-event", &image_recognition_event) {
-                    error!("Failed to emit image recognition event: {}", e);
-                }
+                emitter.emit_raw_or_error("executor-event", &image_recognition_event);
             }
             _ => {
                 debug!("Unhandled message type: {:?}", message);
@@ -359,6 +357,7 @@ impl EventForwarder {
         app_handle: &tauri::AppHandle,
         message: ExecutorMessage,
     ) {
+        let emitter = EventEmitter::new(app_handle.clone());
         match message {
             ExecutorMessage::Event {
                 event,
@@ -369,17 +368,13 @@ impl EventForwarder {
                 // Check if this is a UI Bridge exploration progress event
                 // If so, also emit to the dedicated exploration-progress channel
                 if event == "ui_bridge_exploration_progress" {
-                    if let Err(e) = app_handle.emit("exploration-progress", &data) {
-                        error!("Failed to emit exploration-progress event: {}", e);
-                    }
+                    emitter.emit_raw_or_error("exploration-progress", &data);
                 }
 
                 // Also check for exploration started/completed/failed events
                 if event.starts_with("ui_bridge_exploration_") {
                     let channel_name = event.replace('_', "-");
-                    if let Err(e) = app_handle.emit(&channel_name, &data) {
-                        debug!("Failed to emit {}: {}", channel_name, e);
-                    }
+                    emitter.emit_raw_or_warn(&channel_name, &data);
                 }
 
                 let event_obj = ExecutorEvent {
@@ -389,9 +384,10 @@ impl EventForwarder {
                     sequence,
                     data,
                 };
-                if let Err(e) = app_handle.emit("extraction-event", &event_obj) {
-                    error!("Failed to emit extraction event: {}", e);
-                }
+                emitter.emit_raw_or_error(
+                    "extraction-event",
+                    &serde_json::to_value(&event_obj).unwrap_or_default(),
+                );
             }
             ExecutorMessage::Response {
                 id,
@@ -406,9 +402,10 @@ impl EventForwarder {
                     data,
                     error,
                 };
-                if let Err(e) = app_handle.emit("extraction-response", &response) {
-                    error!("Failed to emit extraction response: {}", e);
-                }
+                emitter.emit_raw_or_error(
+                    "extraction-response",
+                    &serde_json::to_value(&response).unwrap_or_default(),
+                );
             }
             ExecutorMessage::Error { message, details } => {
                 let error_event = json!({
@@ -417,9 +414,7 @@ impl EventForwarder {
                     "message": message,
                     "details": details,
                 });
-                if let Err(e) = app_handle.emit("extraction-error", &error_event) {
-                    error!("Failed to emit extraction error: {}", e);
-                }
+                emitter.emit_raw_or_error("extraction-error", &error_event);
             }
             _ => {
                 debug!("Unhandled extraction message type: {:?}", message);

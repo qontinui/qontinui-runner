@@ -43,10 +43,10 @@
 //!
 //! The following files currently emit events directly and should be migrated to use EventEmitter:
 //!
-//! ## High Priority (Core Event Emission)
-//! - `executor/events.rs` - EventForwarder (executor-event, executor-error, executor-response)
-//! - `executor/output.rs` - Output handling (executor-error, extraction-error)
-//! - `executor/python_bridge.rs` - Python bridge events (executor-event)
+//! ## High Priority (Core Event Emission) - DONE
+//! - ~~`executor/events.rs`~~ - Migrated: EventForwarder uses EventEmitter (emit_raw_or_error/emit_raw_or_warn)
+//! - ~~`executor/output.rs`~~ - Migrated: OutputProcessor uses EventEmitter for error emission
+//! - ~~`executor/python_bridge.rs`~~ - Migrated: PythonBridge holds EventEmitter field, uses emit_raw_or_error
 //!
 //! ## Medium Priority (Feature-Specific Events)
 //! - `commands/rag.rs` - RAG events (rag-progress, rag-completion)
