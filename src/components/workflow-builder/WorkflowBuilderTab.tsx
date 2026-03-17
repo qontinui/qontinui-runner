@@ -1127,6 +1127,7 @@ function WorkflowBuilderContent({
     updateStep,
     showAddDropdown: _showAddDropdown,
     resetToNew,
+    setWorkflow,
     saveWorkflow,
     loadWorkflow,
     updateWorkflow,
@@ -1736,6 +1737,35 @@ function WorkflowBuilderContent({
     // Workflow is already saved, run it directly
     await executeWorkflowRun(state.workflow.id);
   }, [state.workflow.id, isEmpty, hasUnsavedChanges, isExecuting, executeWorkflowRun]);
+
+  // Handle loading a deterministic spec workflow into the builder
+  const handleLoadSpecWorkflow = useCallback(
+    (workflow: UnifiedWorkflow) => {
+      setWorkflow(workflow);
+      console.log("[WorkflowBuilder] Loaded spec workflow into builder:", workflow.name);
+    },
+    [setWorkflow],
+  );
+
+  // Handle save + run for a deterministic spec workflow
+  const handleSaveAndRunSpecWorkflow = useCallback(
+    async (workflow: UnifiedWorkflow) => {
+      setWorkflow(workflow);
+      // Need a brief delay so state updates, then save and run
+      try {
+        const savedWorkflow = await saveWorkflow();
+        if (!savedWorkflow) {
+          setExecutionError("Failed to save spec workflow. Cannot run.");
+          return;
+        }
+        await executeWorkflowRun(savedWorkflow.id);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Failed to save and run spec workflow";
+        setExecutionError(msg);
+      }
+    },
+    [setWorkflow, saveWorkflow, executeWorkflowRun],
+  );
 
   // Handle stop execution
   const handleStop = useCallback(async () => {
@@ -2585,6 +2615,8 @@ function WorkflowBuilderContent({
               <AiGeneratePanel
                 onCreateManually={() => handleAddStep("setup")}
                 onNavigateToActiveRuns={() => onNavigateToActive?.()}
+                onLoadSpecWorkflow={handleLoadSpecWorkflow}
+                onSaveAndRunSpecWorkflow={handleSaveAndRunSpecWorkflow}
               />
             </div>
           ) : (

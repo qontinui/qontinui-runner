@@ -12,11 +12,10 @@
 
 import { useState, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, Square, ChevronDown, Search, Settings2, CircleDot, Cpu } from "lucide-react";
+import { ChevronDown, Search, Settings2, CircleDot, Cpu } from "lucide-react";
 import { Card, CardHeader, CardTitle, CardContent } from "../ui/Card";
 import { MonitorSelector } from "../MonitorSelector";
 import { InitialStatesSelector } from "../InitialStatesSelector";
-import { WorkflowStatusPreview, type ExecutionStatus } from "./WorkflowStatusPreview";
 import { cn } from "../../lib/utils";
 import type { Workflow, ConfigState } from "../../contexts/ExecutionContext";
 import type { ResolvedInitialStates } from "../../types/state-machine";
@@ -43,11 +42,8 @@ interface WorkflowRunnerPanelProps {
   initialStatesOverride?: string[] | null;
   onInitialStatesOverrideChange?: (ids: string[] | null) => void;
 
-  // Execution controls
+  // Execution state (for disabling controls during execution)
   executionActive: boolean;
-  onStartExecution: () => void;
-  onStopExecution: () => void;
-  onNavigateToActive?: () => void;
 }
 
 export function WorkflowRunnerPanel({
@@ -65,9 +61,6 @@ export function WorkflowRunnerPanel({
   initialStatesOverride,
   onInitialStatesOverrideChange,
   executionActive,
-  onStartExecution,
-  onStopExecution,
-  onNavigateToActive,
 }: WorkflowRunnerPanelProps) {
   // Local state
   const [showWorkflowDropdown, setShowWorkflowDropdown] = useState(false);
@@ -113,13 +106,6 @@ export function WorkflowRunnerPanel({
   // Show initial states section only if all required props are provided
   const showInitialStates =
     states && resolvedInitialStates && onInitialStatesOverrideChange && selectedWorkflow;
-
-  // Determine execution status
-  const executionStatus: ExecutionStatus = executionActive
-    ? "running"
-    : selectedWorkflow
-      ? "ready"
-      : "ready";
 
   // Load available monitors on mount
   useEffect(() => {
@@ -403,44 +389,6 @@ export function WorkflowRunnerPanel({
             </div>
           )}
         </div>
-
-        {/* Start/Stop Buttons - Large h-16 */}
-        <div className="flex gap-3 pt-2">
-          <button
-            data-tutorial-id="start-execution-button"
-            onClick={() => {
-              onStartExecution();
-              onNavigateToActive?.();
-            }}
-            disabled={executionActive || !configLoaded || !selectedWorkflow}
-            className={cn(
-              "flex-1 h-16 flex items-center justify-center gap-3",
-              "text-lg font-semibold rounded-lg transition-all",
-              "bg-green-600 text-white hover:bg-green-700",
-              "disabled:opacity-50 disabled:cursor-not-allowed",
-              executionActive && "animate-pulse",
-            )}
-          >
-            <Play className="w-6 h-6" />
-            Start Execution
-          </button>
-          <button
-            onClick={onStopExecution}
-            disabled={!executionActive}
-            className={cn(
-              "flex-1 h-16 flex items-center justify-center gap-3",
-              "text-lg font-semibold rounded-lg transition-all",
-              "bg-red-600 text-white hover:bg-red-700",
-              "disabled:opacity-50 disabled:cursor-not-allowed",
-            )}
-          >
-            <Square className="w-6 h-6" />
-            Stop
-          </button>
-        </div>
-
-        {/* Status Preview */}
-        <WorkflowStatusPreview status={executionStatus} workflowName={selectedWorkflowObj?.name} />
       </CardContent>
     </Card>
   );

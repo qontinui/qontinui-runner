@@ -7,7 +7,7 @@
  * advanced options, and Generate/Generate & Run actions.
  */
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import {
   Sparkles,
   Loader2,
@@ -35,6 +35,8 @@ import {
   CheckCircle2,
   Grid,
   Trash2,
+  Check,
+  Zap,
   type LucideIcon,
 } from "lucide-react";
 import { getAccentColors } from "@/design-system";
@@ -52,6 +54,12 @@ import { useGenerateData, type SavedPrompt } from "./useGenerateData";
 import { useAdvancedOptions, PROVIDERS } from "./useAdvancedOptions";
 import { useTemplatePopover } from "./useTemplatePopover";
 import { instanceStorage } from "@/lib/instance-storage";
+import { getAllSpecs } from "@/lib/spec-registry";
+import {
+  buildSpecWorkflow,
+  type SpecConfig as BuildSpecConfig,
+} from "@/lib/workflow-builder/buildSpecWorkflow";
+import type { UnifiedWorkflow } from "../../types/unified-workflow";
 
 // Icon lookup map for template icons
 const TEMPLATE_ICONS: Record<string, LucideIcon> = {
@@ -74,6 +82,10 @@ const TEMPLATE_ICONS: Record<string, LucideIcon> = {
 export interface AiGeneratePanelProps {
   onCreateManually: () => void;
   onNavigateToActiveRuns: () => void;
+  /** Load a deterministically-built spec workflow into the builder (no AI). */
+  onLoadSpecWorkflow?: (workflow: UnifiedWorkflow) => void;
+  /** Save and run a deterministically-built spec workflow (no AI). */
+  onSaveAndRunSpecWorkflow?: (workflow: UnifiedWorkflow) => void;
 }
 
 // =============================================================================
@@ -116,6 +128,8 @@ async function autoSaveGenerationPrompt(promptText: string): Promise<void> {
 export function AiGeneratePanel({
   onCreateManually,
   onNavigateToActiveRuns,
+  onLoadSpecWorkflow,
+  onSaveAndRunSpecWorkflow,
 }: AiGeneratePanelProps) {
   const accentColors = getAccentColors("blue");
 
@@ -169,6 +183,106 @@ export function AiGeneratePanel({
     setIsSavingTemplate,
     templatePopoverRef,
   } = useTemplatePopover();
+
+  // --- Spec selection state ---
+  const allSpecs = useMemo(() => getAllSpecs(), []);
+  const [showSpecs, setShowSpecs] = useState(false);
+  const [selectedSpecIds, setSelectedSpecIds] = useState<Set<string>>(new Set());
+  const [selectedGroupIds, setSelectedGroupIds] = useState<Set<string>>(new Set());
+
+  // Build a flat list of groups from selected specs for the group picker
+  const availableGroups = useMemo(() => {
+    const groups: {
+      specId: string;
+      groupId: string;
+      groupName: string;
+      category: string;
+      assertionCount: number;
+    }[] = [];
+    for (const spec of allSpecs) {
+      if (!selectedSpecIds.has(spec.specId)) continue;
+      for (const group of spec.config.groups) {
+        const enabledCount = group.assertions.filter((a) => a.enabled).length;
+        if (enabledCount === 0) continue;
+        groups.push({
+          specId: spec.specId,
+          groupId: group.id,
+          groupName: group.name,
+          category: group.category,
+          assertionCount: enabledCount,
+        });
+      }
+    }
+    return groups;
+  }, [allSpecs, selectedSpecIds]);
+
+  // When spec selection changes, auto-select all groups from newly added specs
+  const handleToggleSpec = useCallback(
+    (specId: string) => {
+      setSelectedSpecIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(specId)) {
+          next.delete(specId);
+          // Remove groups belonging to this spec
+          const spec = allSpecs.find((s) => s.specId === specId);
+          if (spec) {
+            setSelectedGroupIds((gPrev) => {
+              const gNext = new Set(gPrev);
+              for (const g of spec.config.groups) gNext.delete(g.id);
+              return gNext;
+            });
+          }
+        } else {
+          next.add(specId);
+          // Auto-select all enabled groups from this spec
+          const spec = allSpecs.find((s) => s.specId === specId);
+          if (spec) {
+            setSelectedGroupIds((gPrev) => {
+              const gNext = new Set(gPrev);
+              for (const g of spec.config.groups) {
+                if (g.assertions.some((a) => a.enabled)) gNext.add(g.id);
+              }
+              return gNext;
+            });
+          }
+        }
+        return next;
+      });
+    },
+    [allSpecs],
+  );
+
+  const handleToggleGroup = useCallback((groupId: string) => {
+    setSelectedGroupIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  }, []);
+
+  const hasSpecsSelected = selectedGroupIds.size > 0;
+
+  // Build the combined SpecConfig from all selected specs/groups for the deterministic builder
+  const buildCombinedSpecConfig = useCallback((): BuildSpecConfig | null => {
+    if (!hasSpecsSelected) return null;
+
+    const allGroups: BuildSpecConfig["groups"] = [];
+    for (const spec of allSpecs) {
+      if (!selectedSpecIds.has(spec.specId)) continue;
+      for (const group of spec.config.groups) {
+        if (!selectedGroupIds.has(group.id)) continue;
+        allGroups.push(group as unknown as BuildSpecConfig["groups"][number]);
+      }
+    }
+    if (allGroups.length === 0) return null;
+
+    return {
+      version: "1.0.0",
+      description: "Combined spec from registry selection",
+      groups: allGroups,
+    };
+  }, [allSpecs, selectedSpecIds, selectedGroupIds, hasSpecsSelected]);
 
   // --- Batch mode state ---
   const [batchMode, setBatchMode] = useState(false);
@@ -280,7 +394,9 @@ export function AiGeneratePanel({
     return { ...base, description: description.trim() };
   }, [buildBaseRequest, description, selectedContextIds, inlineContext]);
 
-  const canGenerate = batchMode ? batchEntries.some((e) => e.prompt.trim()) : !!description.trim();
+  const canGenerate = batchMode
+    ? batchEntries.some((e) => e.prompt.trim())
+    : !!description.trim() || hasSpecsSelected;
 
   /** Fire a single generate-async request and return the task_run_id. */
   const fireGenerateRequest = async (request: Record<string, unknown>): Promise<string> => {
@@ -350,9 +466,28 @@ export function AiGeneratePanel({
         onNavigateToActiveRuns();
         return;
       }
-      // TODO: Specs selected → deterministic builder (instant, loads into builder)
-      // Deterministic spec workflow builder not yet implemented; fall through to AI generation.
-      // No specs or no deterministic builder → AI generation
+      // Specs selected → deterministic builder (instant, loads into builder)
+      if (hasSpecsSelected && onLoadSpecWorkflow) {
+        const specConfig = buildCombinedSpecConfig();
+        if (specConfig) {
+          const workflow = buildSpecWorkflow({
+            specConfig,
+            additionalInstructions: description.trim() || undefined,
+            maxIterations: maxIterations ? parseInt(maxIterations, 10) : 3,
+            elementSource: "control",
+          });
+          console.log(
+            "[AiGeneratePanel] Spec workflow built deterministically:",
+            workflow.name,
+            "—",
+            workflow.verification_steps.length,
+            "verification steps",
+          );
+          onLoadSpecWorkflow(workflow);
+          return;
+        }
+      }
+      // No specs selected → AI generation
       const taskRunId = await fireGenerateRequest(buildGenerateRequest());
       console.log("[AiGeneratePanel] Generation started:", taskRunId);
       if (description.trim()) {
@@ -415,9 +550,28 @@ export function AiGeneratePanel({
         onNavigateToActiveRuns();
         return;
       }
-      // TODO: Specs selected → deterministic builder + execute inline
-      // Deterministic spec workflow builder not yet implemented; fall through to AI generation.
-      // No specs or no deterministic builder → AI generation + auto_run
+      // Specs selected → deterministic builder + execute inline
+      if (hasSpecsSelected && onSaveAndRunSpecWorkflow) {
+        const specConfig = buildCombinedSpecConfig();
+        if (specConfig) {
+          const workflow = buildSpecWorkflow({
+            specConfig,
+            additionalInstructions: description.trim() || undefined,
+            maxIterations: maxIterations ? parseInt(maxIterations, 10) : 3,
+            elementSource: "control",
+          });
+          console.log(
+            "[AiGeneratePanel] Spec workflow built + run:",
+            workflow.name,
+            "—",
+            workflow.verification_steps.length,
+            "verification steps",
+          );
+          onSaveAndRunSpecWorkflow(workflow);
+          return;
+        }
+      }
+      // No specs selected → AI generation + auto_run
       const request = { ...buildGenerateRequest(), auto_run: true };
       const taskRunId = await fireGenerateRequest(request);
       console.log("[AiGeneratePanel] Generate & Run started:", taskRunId);
@@ -797,6 +951,141 @@ export function AiGeneratePanel({
               )}
             </div>
 
+            {/* Spec Selection */}
+            <div className="space-y-1">
+              <button
+                type="button"
+                onClick={() => setShowSpecs(!showSpecs)}
+                className="flex items-center gap-2 text-sm text-zinc-400 hover:text-zinc-200 transition-colors"
+              >
+                {showSpecs ? (
+                  <ChevronDown className="w-4 h-4" />
+                ) : (
+                  <ChevronRight className="w-4 h-4" />
+                )}
+                <Zap className="w-4 h-4" />
+                Spec Verification
+                {hasSpecsSelected && (
+                  <span className="text-xs ml-1 px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400">
+                    {selectedGroupIds.size} groups
+                  </span>
+                )}
+              </button>
+              {showSpecs && (
+                <div className="mt-3 space-y-3">
+                  <p className="text-[11px] text-zinc-500">
+                    Select specs to use the deterministic builder instead of AI generation. Instant,
+                    no tokens used.
+                  </p>
+
+                  {/* Spec list grouped by app */}
+                  <div className="max-h-[300px] overflow-y-auto space-y-3 pr-1">
+                    {(["Qontinui Runner", "Qontinui Web"] as const).map((appName) => {
+                      const appSpecs = allSpecs.filter((s) => s.appName === appName);
+                      if (appSpecs.length === 0) return null;
+                      return (
+                        <div key={appName}>
+                          <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1.5">
+                            {appName} ({appSpecs.length})
+                          </p>
+                          <div className="space-y-0.5">
+                            {appSpecs.map((spec) => {
+                              const isSelected = selectedSpecIds.has(spec.specId);
+                              const groupCount = spec.config.groups.filter((g) =>
+                                g.assertions.some((a) => a.enabled),
+                              ).length;
+                              return (
+                                <button
+                                  key={spec.specId}
+                                  onClick={() => handleToggleSpec(spec.specId)}
+                                  className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-left text-xs transition-colors ${
+                                    isSelected
+                                      ? "bg-emerald-500/10 text-emerald-300"
+                                      : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50"
+                                  }`}
+                                >
+                                  <div
+                                    className={`flex-shrink-0 w-4 h-4 rounded border flex items-center justify-center ${
+                                      isSelected
+                                        ? "border-emerald-500 bg-emerald-500/20 text-emerald-400"
+                                        : "border-zinc-600 bg-zinc-800"
+                                    }`}
+                                  >
+                                    {isSelected && <Check className="w-2.5 h-2.5" />}
+                                  </div>
+                                  <span className="truncate flex-1">{spec.specId}</span>
+                                  <span className="text-[10px] text-zinc-500 shrink-0">
+                                    {groupCount}g
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Group fine-tuning when specs are selected */}
+                  {availableGroups.length > 0 && (
+                    <div className="border-t border-zinc-700 pt-2">
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className="text-xs text-zinc-400">
+                          Groups ({selectedGroupIds.size}/{availableGroups.length})
+                        </span>
+                        <div className="flex gap-1">
+                          <button
+                            onClick={() =>
+                              setSelectedGroupIds(new Set(availableGroups.map((g) => g.groupId)))
+                            }
+                            className="text-[10px] px-1.5 py-0.5 text-zinc-400 hover:text-zinc-200 rounded hover:bg-zinc-800"
+                          >
+                            All
+                          </button>
+                          <button
+                            onClick={() => setSelectedGroupIds(new Set())}
+                            className="text-[10px] px-1.5 py-0.5 text-zinc-400 hover:text-zinc-200 rounded hover:bg-zinc-800"
+                          >
+                            None
+                          </button>
+                        </div>
+                      </div>
+                      <div className="max-h-[160px] overflow-y-auto space-y-0.5 pr-1">
+                        {availableGroups.map((g) => {
+                          const isSelected = selectedGroupIds.has(g.groupId);
+                          return (
+                            <button
+                              key={g.groupId}
+                              onClick={() => handleToggleGroup(g.groupId)}
+                              className={`w-full flex items-center gap-2 px-2 py-1 rounded text-left text-[11px] transition-colors ${
+                                isSelected
+                                  ? "bg-emerald-500/5 text-zinc-300"
+                                  : "text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30"
+                              }`}
+                            >
+                              <div
+                                className={`flex-shrink-0 w-3.5 h-3.5 rounded border flex items-center justify-center ${
+                                  isSelected
+                                    ? "border-emerald-500/60 bg-emerald-500/15 text-emerald-400"
+                                    : "border-zinc-600 bg-zinc-800"
+                                }`}
+                              >
+                                {isSelected && <Check className="w-2 h-2" />}
+                              </div>
+                              <span className="truncate flex-1">{g.groupName}</span>
+                              <span className="text-[10px] text-zinc-600 shrink-0">
+                                {g.assertionCount}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
             {/* Advanced Options */}
             <div className="space-y-1">
               <button
@@ -1165,10 +1454,16 @@ export function AiGeneratePanel({
           <button
             onClick={handleGenerate}
             disabled={!canGenerate || submittingAction !== null}
-            className={`flex items-center gap-2 px-6 py-2 rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${accentColors.bgSolid} text-white hover:opacity-90`}
+            className={`flex items-center gap-2 px-6 py-2 rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+              hasSpecsSelected && !batchMode
+                ? "bg-emerald-600 text-white hover:bg-emerald-700"
+                : `${accentColors.bgSolid} text-white hover:opacity-90`
+            }`}
           >
             {submittingAction === "generate" ? (
               <Loader2 className="w-4 h-4 animate-spin" />
+            ) : hasSpecsSelected && !batchMode ? (
+              <Zap className="w-4 h-4" />
             ) : (
               <Sparkles className="w-4 h-4" />
             )}
@@ -1176,12 +1471,18 @@ export function AiGeneratePanel({
               ? "Starting..."
               : batchMode
                 ? `Generate All (${batchEntries.filter((e) => e.prompt.trim()).length})`
-                : "Generate"}
+                : hasSpecsSelected
+                  ? `Build from Specs (${selectedGroupIds.size} groups)`
+                  : "Generate"}
           </button>
           <button
             onClick={handleGenerateAndRun}
             disabled={!canGenerate || submittingAction !== null}
-            className="flex items-center gap-2 px-6 py-2 rounded-md font-medium border border-zinc-600 bg-zinc-800 text-zinc-200 hover:bg-zinc-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className={`flex items-center gap-2 px-6 py-2 rounded-md font-medium border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+              hasSpecsSelected && !batchMode
+                ? "border-emerald-600 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20"
+                : "border-zinc-600 bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
+            }`}
           >
             {submittingAction === "generate-and-run" ? (
               <Loader2 className="w-4 h-4 animate-spin" />
@@ -1192,7 +1493,9 @@ export function AiGeneratePanel({
               ? "Starting..."
               : batchMode
                 ? `Generate & Run All (${batchEntries.filter((e) => e.prompt.trim()).length})`
-                : "Generate & Run"}
+                : hasSpecsSelected
+                  ? "Build & Run"
+                  : "Generate & Run"}
           </button>
         </div>
       </div>
