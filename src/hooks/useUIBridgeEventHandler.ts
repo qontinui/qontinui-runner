@@ -948,6 +948,7 @@ export function useUIBridgeEventHandler(): void {
                 /\bProxy\b/, // metaprogramming
                 /\bWebSocket\b/, // network access
                 /\bwindow\.open\b/, // popup/navigation
+                /\bwindow\.location\b/, // navigation/redirect
                 /\bdocument\.cookie\b/, // cookie access
                 /\bWorker\b/, // web workers
                 /\bSharedWorker\b/, // shared workers
