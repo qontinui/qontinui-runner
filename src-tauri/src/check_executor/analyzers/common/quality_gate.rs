@@ -632,8 +632,7 @@ mod tests {
 
     #[test]
     fn test_config_from_json() {
-        let json =
-            r#"{"max_circular_deps": 2, "max_god_classes": 10, "min_type_coverage": 90.0}"#;
+        let json = r#"{"max_circular_deps": 2, "max_god_classes": 10, "min_type_coverage": 90.0}"#;
         let config = QualityGateConfig::from_json(json).unwrap();
         assert_eq!(config.max_circular_deps, 2);
         assert_eq!(config.max_god_classes, 10);
@@ -664,15 +663,7 @@ mod tests {
         let mut results = QualityGateResults::new();
 
         results.add_gate("test1", true, 0, 5, "Passed".to_string(), "/test", "T001");
-        results.add_gate(
-            "test2",
-            false,
-            10,
-            5,
-            "Failed".to_string(),
-            "/test",
-            "T002",
-        );
+        results.add_gate("test2", false, 10, 5, "Failed".to_string(), "/test", "T002");
         results.add_gate("test3", true, 3, 5, "Passed".to_string(), "/test", "T003");
 
         assert_eq!(results.gates_passed(), 2);
