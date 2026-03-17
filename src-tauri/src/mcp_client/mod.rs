@@ -6,14 +6,36 @@
 pub mod types;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::database::CheckpointDb;
 pub use types::*;
+
+/// Handle for a stdio MCP server subprocess
+struct StdioHandle {
+    /// The child process
+    child: Child,
+    /// Stdin writer for sending JSON-RPC requests
+    stdin: tokio::sync::Mutex<ChildStdin>,
+    /// Stdout reader for receiving JSON-RPC responses
+    stdout: tokio::sync::Mutex<BufReader<ChildStdout>>,
+    /// Monotonically increasing request ID counter
+    next_id: AtomicU64,
+}
+
+impl StdioHandle {
+    /// Get the next JSON-RPC request ID
+    fn next_request_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+}
 
 /// MCP Client Manager
 ///
@@ -33,6 +55,8 @@ struct McpConnection {
     last_connect_attempt: Option<String>,
     last_connected: Option<String>,
     last_error: Option<String>,
+    /// Stdio process handle (only for stdio transport)
+    stdio_handle: Option<Arc<StdioHandle>>,
 }
 
 impl McpClientManager {
@@ -68,20 +92,16 @@ impl McpClientManager {
         server_id: &str,
         input: UpdateMcpServerInput,
     ) -> Result<McpServerConfig, String> {
-        // Disconnect if currently connected
-        let mut connections = self.connections.write().await;
-        connections.remove(server_id);
-        drop(connections);
+        // Disconnect if currently connected (kills stdio process if any)
+        self.disconnect(server_id).await?;
 
         self.db.update_mcp_server(server_id, input)
     }
 
     /// Delete an MCP server configuration
     pub async fn delete_server(&self, server_id: &str) -> Result<(), String> {
-        // Disconnect if currently connected
-        let mut connections = self.connections.write().await;
-        connections.remove(server_id);
-        drop(connections);
+        // Disconnect if currently connected (kills stdio process if any)
+        self.disconnect(server_id).await?;
 
         self.db.delete_mcp_server(server_id)
     }
@@ -169,15 +189,15 @@ impl McpClientManager {
         info!("Connecting to MCP server: {} ({})", config.name, server_id);
 
         let now = chrono::Utc::now().to_rfc3339();
-        let tools = match config.transport {
-            McpTransport::Http => self.connect_http(&config).await,
+        let result = match config.transport {
+            McpTransport::Http => self.connect_http(&config).await.map(|tools| (tools, None)),
             McpTransport::Stdio => self.connect_stdio(&config).await,
         };
 
         let mut connections = self.connections.write().await;
 
-        match tools {
-            Ok(tools) => {
+        match result {
+            Ok((tools, stdio_handle)) => {
                 info!(
                     "Connected to MCP server: {} with {} tools",
                     config.name,
@@ -200,6 +220,7 @@ impl McpClientManager {
                         last_connect_attempt: Some(now.clone()),
                         last_connected: Some(now),
                         last_error: None,
+                        stdio_handle,
                     },
                 );
 
@@ -217,6 +238,7 @@ impl McpClientManager {
                         last_connect_attempt: Some(now),
                         last_connected: None,
                         last_error: Some(e.clone()),
+                        stdio_handle: None,
                     },
                 );
 
@@ -228,7 +250,28 @@ impl McpClientManager {
     /// Disconnect from an MCP server
     pub async fn disconnect(&self, server_id: &str) -> Result<(), String> {
         let mut connections = self.connections.write().await;
-        connections.remove(server_id);
+        if let Some(mut conn) = connections.remove(server_id) {
+            // Kill stdio subprocess if present
+            if let Some(handle) = conn.stdio_handle.take() {
+                // Try to get exclusive access and kill the child
+                if let Ok(handle) = Arc::try_unwrap(handle) {
+                    let mut child = handle.child;
+                    if let Err(e) = child.kill().await {
+                        warn!(
+                            "Failed to kill stdio process for server {}: {}",
+                            server_id, e
+                        );
+                    } else {
+                        debug!("Killed stdio process for server {}", server_id);
+                    }
+                } else {
+                    warn!(
+                        "Could not get exclusive handle to kill stdio process for server {}",
+                        server_id
+                    );
+                }
+            }
+        }
         info!("Disconnected from MCP server: {}", server_id);
         Ok(())
     }
@@ -272,7 +315,17 @@ impl McpClientManager {
         let start = Instant::now();
         let result = match config.transport {
             McpTransport::Http => self.call_tool_http(config, tool_name, &arguments).await,
-            McpTransport::Stdio => self.call_tool_stdio(config, tool_name, &arguments).await,
+            McpTransport::Stdio => {
+                let handle = conn
+                    .stdio_handle
+                    .as_ref()
+                    .ok_or("Stdio handle missing for connected stdio server")?
+                    .clone();
+                let timeout_secs = config.timeout_seconds;
+                // Drop the read lock before the async call
+                drop(connections);
+                Self::call_tool_stdio_impl(&handle, tool_name, &arguments, timeout_secs).await
+            }
         };
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -454,34 +507,336 @@ impl McpClientManager {
     }
 
     // =========================================================================
-    // Stdio Transport Implementation (placeholder)
+    // Stdio Transport Implementation
     // =========================================================================
 
-    async fn connect_stdio(&self, config: &McpServerConfig) -> Result<Vec<McpToolInfo>, String> {
-        let _stdio_config = config
-            .stdio_config
-            .as_ref()
-            .ok_or("Stdio config missing for stdio transport")?;
-
-        // TODO: Implement stdio transport using rmcp crate
-        // For now, return an error indicating it's not yet implemented
-        warn!("Stdio transport not yet fully implemented for MCP client");
-        Err("Stdio transport is not yet implemented. Use HTTP transport instead.".to_string())
-    }
-
-    async fn call_tool_stdio(
+    /// Connect to an MCP server via stdio transport.
+    ///
+    /// Spawns the configured command as a subprocess, performs the MCP initialize
+    /// handshake over stdin/stdout using newline-delimited JSON-RPC 2.0, then
+    /// fetches the tool list. Returns the tools and the stdio handle for
+    /// subsequent tool calls.
+    async fn connect_stdio(
         &self,
         config: &McpServerConfig,
-        _tool_name: &str,
-        _arguments: &serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        let _stdio_config = config
+    ) -> Result<(Vec<McpToolInfo>, Option<Arc<StdioHandle>>), String> {
+        let stdio_config = config
             .stdio_config
             .as_ref()
             .ok_or("Stdio config missing for stdio transport")?;
 
-        // TODO: Implement stdio transport using rmcp crate
-        Err("Stdio transport is not yet implemented. Use HTTP transport instead.".to_string())
+        info!(
+            "Spawning stdio MCP server: {} {}",
+            stdio_config.command,
+            stdio_config.args.join(" ")
+        );
+
+        // Build the subprocess command
+        let mut cmd = tokio::process::Command::new(&stdio_config.command);
+        cmd.args(&stdio_config.args);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        // Set working directory if configured
+        if let Some(ref cwd) = stdio_config.cwd {
+            cmd.current_dir(cwd);
+        }
+
+        // Set environment variables
+        for (key, value) in &stdio_config.env {
+            cmd.env(key, value);
+        }
+
+        // Spawn the process
+        let mut child = cmd.spawn().map_err(|e| {
+            format!(
+                "Failed to spawn stdio process '{}': {}",
+                stdio_config.command, e
+            )
+        })?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or("Failed to capture stdin of stdio process")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("Failed to capture stdout of stdio process")?;
+
+        // Spawn a task to drain stderr and log it
+        if let Some(stderr) = child.stderr.take() {
+            let server_name = config.name.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            let trimmed = line.trim_end();
+                            if !trimmed.is_empty() {
+                                debug!("MCP server [{}] stderr: {}", server_name, trimmed);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Error reading stderr from MCP server [{}]: {}",
+                                server_name, e
+                            );
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
+        let handle = Arc::new(StdioHandle {
+            child,
+            stdin: tokio::sync::Mutex::new(stdin),
+            stdout: tokio::sync::Mutex::new(BufReader::new(stdout)),
+            // Start at 1 since we use 1 for the initialize request below
+            next_id: AtomicU64::new(1),
+        });
+
+        let timeout = std::time::Duration::from_secs(config.timeout_seconds);
+
+        // Step 1: Send initialize request
+        let init_id = handle.next_request_id();
+        let init_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": init_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "qontinui-runner",
+                    "version": "1.0.0"
+                }
+            }
+        });
+
+        let init_response = Self::stdio_request(&handle, &init_request, timeout).await?;
+
+        // Validate initialize response
+        if let Some(error) = init_response.get("error") {
+            return Err(format!("MCP initialize error: {}", error));
+        }
+
+        if let Some(result) = init_response.get("result") {
+            if let Some(server_info) = result.get("serverInfo") {
+                info!(
+                    "MCP server initialized: {} v{}",
+                    server_info
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown"),
+                    server_info
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                );
+            }
+        }
+
+        // Step 2: Send initialized notification (no id, no response expected)
+        let initialized_notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+
+        Self::stdio_send(&handle, &initialized_notification).await?;
+
+        // Step 3: Send tools/list request
+        let tools_id = handle.next_request_id();
+        let tools_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": tools_id,
+            "method": "tools/list",
+            "params": {}
+        });
+
+        let tools_response = Self::stdio_request(&handle, &tools_request, timeout).await?;
+
+        if let Some(error) = tools_response.get("error") {
+            return Err(format!("MCP tools/list error: {}", error));
+        }
+
+        let result = tools_response
+            .get("result")
+            .ok_or("Missing result in tools/list response")?;
+
+        let tools: Vec<McpToolInfo> = serde_json::from_value(
+            result
+                .get("tools")
+                .cloned()
+                .unwrap_or(serde_json::json!([])),
+        )
+        .map_err(|e| format!("Failed to parse tools: {}", e))?;
+
+        Ok((tools, Some(handle)))
+    }
+
+    /// Call a tool on a stdio-connected MCP server.
+    async fn call_tool_stdio_impl(
+        handle: &Arc<StdioHandle>,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value, String> {
+        let request_id = handle.next_request_id();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments
+            }
+        });
+
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let response = Self::stdio_request(handle, &request, timeout).await?;
+
+        if let Some(error) = response.get("error") {
+            return Err(format!("Tool error: {}", error));
+        }
+
+        let result = response
+            .get("result")
+            .ok_or("Missing result in tool call response")?;
+
+        // MCP tool results have a "content" array
+        if let Some(content) = result.get("content") {
+            if let Some(first) = content.as_array().and_then(|a| a.first()) {
+                if let Some(text) = first.get("text") {
+                    // Try to parse as JSON, fall back to string
+                    if let Ok(parsed) =
+                        serde_json::from_str::<serde_json::Value>(text.as_str().unwrap_or(""))
+                    {
+                        return Ok(parsed);
+                    }
+                    return Ok(text.clone());
+                }
+            }
+            return Ok(content.clone());
+        }
+
+        Ok(result.clone())
+    }
+
+    // =========================================================================
+    // Stdio JSON-RPC helpers
+    // =========================================================================
+
+    /// Send a JSON-RPC message (request or notification) over stdin.
+    /// Does NOT read a response — use `stdio_request` for request-response.
+    async fn stdio_send(
+        handle: &Arc<StdioHandle>,
+        message: &serde_json::Value,
+    ) -> Result<(), String> {
+        let mut line = serde_json::to_string(message)
+            .map_err(|e| format!("Failed to serialize JSON-RPC message: {}", e))?;
+        line.push('\n');
+
+        let mut stdin = handle.stdin.lock().await;
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to write to stdin: {}", e))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| format!("Failed to flush stdin: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Send a JSON-RPC request and wait for the response line with a timeout.
+    ///
+    /// Reads lines from stdout, skipping any that are not valid JSON-RPC
+    /// responses matching the request ID (e.g., server log lines or notifications).
+    async fn stdio_request(
+        handle: &Arc<StdioHandle>,
+        request: &serde_json::Value,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, String> {
+        let request_id = request.get("id").and_then(|v| v.as_u64());
+
+        // Send the request
+        Self::stdio_send(handle, request).await?;
+
+        // Read response with timeout
+        let read_fut = async {
+            let mut stdout = handle.stdout.lock().await;
+            let mut line = String::new();
+
+            loop {
+                line.clear();
+                let bytes_read = stdout
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|e| format!("Failed to read from stdout: {}", e))?;
+
+                if bytes_read == 0 {
+                    return Err(
+                        "MCP server process closed stdout (process may have exited)".to_string()
+                    );
+                }
+
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                // Try to parse as JSON
+                let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Not valid JSON — skip (could be a log line from the server)
+                        debug!("Skipping non-JSON line from MCP server stdout: {}", trimmed);
+                        continue;
+                    }
+                };
+
+                // Check if this is a JSON-RPC response matching our request ID
+                if let Some(expected_id) = request_id {
+                    if let Some(response_id) = parsed.get("id").and_then(|v| v.as_u64()) {
+                        if response_id == expected_id {
+                            return Ok(parsed);
+                        }
+                        // Response for a different request ID — skip
+                        debug!(
+                            "Skipping JSON-RPC response with mismatched id: expected {}, got {}",
+                            expected_id, response_id
+                        );
+                        continue;
+                    }
+                }
+
+                // If the parsed message is a notification (no "id" field) or we don't
+                // have a request ID to match against, check if it looks like a response
+                if parsed.get("result").is_some() || parsed.get("error").is_some() {
+                    // Looks like a response — return it if we had no specific ID to match
+                    if request_id.is_none() {
+                        return Ok(parsed);
+                    }
+                }
+
+                // Otherwise it's a notification or other message — skip
+                debug!("Skipping non-response JSON from MCP server: {}", trimmed);
+            }
+        };
+
+        tokio::time::timeout(timeout, read_fut).await.map_err(|_| {
+            format!(
+                "Timeout waiting for MCP server response after {}s",
+                timeout.as_secs()
+            )
+        })?
     }
 
     // =========================================================================

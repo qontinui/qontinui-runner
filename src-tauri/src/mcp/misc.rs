@@ -4788,11 +4788,21 @@ pub async fn run_workflow_verification_for_task(
 ) -> DeterministicVerificationResult {
     use crate::step_executor::{ExecutionStepConfig, StepExecutor};
 
+    // Get the task run to extract verification steps, config_id, and session count
+    let task_run = app_state
+        .checkpoint_db
+        .get_task_run(db_task_id)
+        .ok()
+        .flatten();
+
+    let config_id = task_run.as_ref().and_then(|t| t.config_id.clone());
+    let session_num = task_run.as_ref().map(|t| t.sessions_count as i32);
+
     // Try to get verification steps from the task's execution_steps_json
-    let verification_steps: Vec<ExecutionStepConfig> =
-        match app_state.checkpoint_db.get_task_run(db_task_id) {
-            Ok(Some(task)) => task
-                .execution_steps_json
+    let verification_steps: Vec<ExecutionStepConfig> = task_run
+        .as_ref()
+        .and_then(|task| {
+            task.execution_steps_json
                 .as_ref()
                 .and_then(|json| serde_json::from_str::<Vec<ExecutionStepConfig>>(json).ok())
                 .map(|steps| {
@@ -4801,9 +4811,8 @@ pub async fn run_workflow_verification_for_task(
                         .filter(|s| s.phase.as_deref() == Some("verification"))
                         .collect()
                 })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
+        })
+        .unwrap_or_default();
 
     // If no verification steps defined, fall back to basic deterministic verification
     if verification_steps.is_empty() {
@@ -4811,7 +4820,15 @@ pub async fn run_workflow_verification_for_task(
             "WORKFLOW-VERIFICATION: No verification_steps found for task {} - falling back to basic build checks",
             db_task_id
         );
-        return run_deterministic_verification(workspace_root, None).await;
+        return run_deterministic_verification(
+            workspace_root,
+            None,
+            Some(&app_state.checkpoint_db),
+            config_id.as_deref(),
+            Some(db_task_id),
+            session_num,
+        )
+        .await;
     }
 
     info!(
@@ -4881,11 +4898,15 @@ pub async fn run_workflow_verification_for_task(
 pub async fn run_deterministic_verification(
     workspace_root: &str,
     _verification_config: Option<&serde_json::Value>,
+    db: Option<&CheckpointDb>,
+    config_id: Option<&str>,
+    task_run_id: Option<&str>,
+    session_num: Option<i32>,
 ) -> DeterministicVerificationResult {
     let _verifier = DeterministicVerifier::new(workspace_root.to_string());
     let mut checks_run = Vec::new();
     let mut critical_failures = Vec::new();
-    let non_critical_failures: Vec<String> = Vec::new();
+    let mut non_critical_failures: Vec<String> = Vec::new();
     let mut raw_output = String::new();
 
     // For Phase 1: Run basic build checks
@@ -4986,20 +5007,69 @@ pub async fn run_deterministic_verification(
         raw_output.push_str("No package.json or Cargo.toml found. Skipping build verification.\n");
     }
 
-    // TODO Phase 2: Run verification_tests from database using execute_tests_for_trigger
-    // This will:
-    // 1. Get tests associated with the config/task
-    // 2. Execute each test
-    // 3. Track is_critical flag - only critical failures block completion
-    // 4. Non-critical failures are reported but don't fail verification
-    //
-    // Example integration:
-    // let test_results = execute_tests_for_trigger(db, config_id, &TriggerPoint::AfterWorkflow, Some(task_run_id));
-    // if test_results.critical_failure {
-    //     critical_failures.extend(test_results.results.iter()
-    //         .filter(|r| !matches!(r.status, TestStatus::Passed) && /* is_critical */)
-    //         .map(|r| format!("Test '{}' failed: {}", r.name, r.error.as_deref().unwrap_or("Unknown"))));
-    // }
+    // Phase 2: Run verification tests from database
+    if let (Some(db), Some(cfg_id)) = (db, config_id) {
+        use crate::database::TriggerPoint;
+        use crate::test_executor::task_integration::{
+            create_findings_for_failures, execute_tests_for_trigger,
+        };
+
+        let test_results =
+            execute_tests_for_trigger(db, cfg_id, &TriggerPoint::AfterWorkflow, task_run_id);
+
+        if test_results.total > 0 {
+            // Add test names to checks_run
+            for result in &test_results.results {
+                let criticality = db
+                    .get_verification_test(&result.test_id)
+                    .ok()
+                    .flatten()
+                    .map(|t| {
+                        if t.is_critical {
+                            "critical"
+                        } else {
+                            "non-critical"
+                        }
+                    })
+                    .unwrap_or("unknown");
+                checks_run.push(format!("test: {} ({})", result.test_name, criticality));
+            }
+
+            // Categorize failures as critical or non-critical
+            for result in &test_results.results {
+                if matches!(result.status, crate::test_executor::TestStatus::Passed) {
+                    continue;
+                }
+                let msg = format!(
+                    "Test '{}' failed: {}",
+                    result.test_name,
+                    result.error.as_deref().unwrap_or("Unknown error")
+                );
+                let is_critical = db
+                    .get_verification_test(&result.test_id)
+                    .ok()
+                    .flatten()
+                    .map(|t| t.is_critical)
+                    .unwrap_or(false);
+                if is_critical {
+                    critical_failures.push(msg);
+                } else {
+                    non_critical_failures.push(msg);
+                }
+            }
+
+            // Append test output to raw_output
+            if !test_results.ai_context.is_empty() {
+                raw_output.push_str("\n\n--- Verification Tests ---\n");
+                raw_output.push_str(&test_results.ai_context);
+            }
+
+            // Create findings for critical failures
+            if let (Some(trid), Some(sn)) = (task_run_id, session_num) {
+                create_findings_for_failures(db, trid, sn, &test_results, cfg_id);
+            }
+        }
+    }
 
     DeterministicVerificationResult {
         // Only CRITICAL failures block completion
