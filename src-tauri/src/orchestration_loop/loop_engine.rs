@@ -566,7 +566,10 @@ async fn run_pipeline_loop(
     supervisor: SupervisorClient,
     target_runner_id: &str,
 ) {
-    let pipeline = config.pipeline.as_ref().unwrap();
+    let Some(pipeline) = config.pipeline.as_ref() else {
+        error!("Pipeline loop called without pipeline config");
+        return;
+    };
     let mut current_workflow_id = config.workflow_id.clone();
     let mut rebuild_needed = pipeline.build.is_some(); // Build on first iteration if configured
 
