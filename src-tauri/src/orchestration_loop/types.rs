@@ -130,9 +130,10 @@ fn default_wait_for_fixer() -> bool {
 // --- State ---
 
 /// Current phase of the orchestration loop.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopPhase {
+    #[default]
     Idle,
     BuildingWorkflow,
     RunningWorkflow,
@@ -147,11 +148,6 @@ pub enum LoopPhase {
     Error,
 }
 
-impl Default for LoopPhase {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
 
 /// Runtime state of the orchestration loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
