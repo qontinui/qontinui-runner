@@ -1747,24 +1747,52 @@ function WorkflowBuilderContent({
     [setWorkflow],
   );
 
-  // Handle save + run for a deterministic spec workflow
+  // Handle save + run for a deterministic spec workflow.
+  // NOTE: We save the workflow directly via the API instead of calling
+  // saveWorkflow(), because saveWorkflow() closes over state.workflow which
+  // would still hold the old/empty workflow at this point (setWorkflow dispatches
+  // a reducer action that only takes effect on the next render).
   const handleSaveAndRunSpecWorkflow = useCallback(
     async (workflow: UnifiedWorkflow) => {
-      setWorkflow(workflow);
-      // Need a brief delay so state updates, then save and run
       try {
-        const savedWorkflow = await saveWorkflow();
-        if (!savedWorkflow) {
-          setExecutionError("Failed to save spec workflow. Cannot run.");
+        const body = {
+          name: workflow.name || "Untitled Workflow",
+          description: workflow.description,
+          category: workflow.category,
+          tags: workflow.tags,
+          setup_steps: workflow.setup_steps,
+          verification_steps: workflow.verification_steps,
+          agentic_steps: workflow.agentic_steps,
+          completion_steps: workflow.completion_steps ?? [],
+          max_iterations: workflow.max_iterations,
+          provider: workflow.provider,
+          model: workflow.model,
+          stop_on_failure: workflow.stop_on_failure,
+          reflection_mode: workflow.reflection_mode,
+        };
+
+        const response = await tracedFetch(`${getApiBase()}/unified-workflows`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+
+        const data = await response.json();
+        if (!data.success || !data.data) {
+          setExecutionError(data.error || "Failed to save spec workflow. Cannot run.");
           return;
         }
+
+        const savedWorkflow = data.data as UnifiedWorkflow;
+        // Update builder state with the saved workflow (now has a server-assigned ID)
+        setWorkflow(savedWorkflow);
         await executeWorkflowRun(savedWorkflow.id);
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Failed to save and run spec workflow";
         setExecutionError(msg);
       }
     },
-    [setWorkflow, saveWorkflow, executeWorkflowRun],
+    [setWorkflow, executeWorkflowRun],
   );
 
   // Handle stop execution

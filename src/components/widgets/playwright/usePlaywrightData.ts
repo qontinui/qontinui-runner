@@ -42,9 +42,47 @@ interface PlaywrightLogResponse {
 }
 
 /**
+ * Response shape from the screenshots/list API.
+ */
+interface ScreenshotInfo {
+  filename: string;
+  path: string;
+  size_bytes: number;
+  modified: string | null;
+}
+
+interface ScreenshotsListResponse {
+  success: boolean;
+  data?: {
+    annotated: ScreenshotInfo[];
+    playwright: ScreenshotInfo[];
+  };
+  error?: string;
+}
+
+/**
+ * Fetch playwright screenshot paths from the screenshots/list API.
+ * Returns an array of absolute file paths, or empty array on failure.
+ */
+async function fetchPlaywrightScreenshots(): Promise<string[]> {
+  try {
+    const response = await tracedFetch(`${getApiBase()}/screenshots/list`);
+    if (!response.ok) return [];
+    const json: ScreenshotsListResponse = await response.json();
+    if (!json.success || !json.data) return [];
+    return json.data.playwright.map((s) => s.path);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Parse log entries into PlaywrightData structure.
  */
-function parseLogEntries(response: PlaywrightLogResponse): PlaywrightData {
+function parseLogEntries(
+  response: PlaywrightLogResponse,
+  screenshots: string[] = [],
+): PlaywrightData {
   const { entries, is_running, total_duration_ms } = response;
 
   const tests: TestSpec[] = [];
@@ -115,7 +153,7 @@ function parseLogEntries(response: PlaywrightLogResponse): PlaywrightData {
     failedTests,
     skippedTests,
     consoleOutput,
-    screenshots: [], // TODO: Fetch from screenshots API
+    screenshots,
     isRunning: is_running,
     durationMs: total_duration_ms,
   };
@@ -133,7 +171,11 @@ export function usePlaywrightData(): PlaywrightData {
 
   const fetchData = useCallback(async () => {
     try {
-      const response = await tracedFetch(`${getApiBase()}/logs/playwright`);
+      // Fetch log data and screenshots in parallel
+      const [response, screenshots] = await Promise.all([
+        tracedFetch(`${getApiBase()}/logs/playwright`),
+        fetchPlaywrightScreenshots(),
+      ]);
 
       if (!response.ok) {
         // If endpoint doesn't exist yet, return defaults
@@ -145,7 +187,7 @@ export function usePlaywrightData(): PlaywrightData {
       }
 
       const json: PlaywrightLogResponse = await response.json();
-      const parsed = parseLogEntries(json);
+      const parsed = parseLogEntries(json, screenshots);
       setData(parsed);
     } catch {
       // Silently handle errors - API may not be available
@@ -177,7 +219,11 @@ export function usePlaywrightDataWithStatus(): {
 
   const fetchData = useCallback(async () => {
     try {
-      const response = await tracedFetch(`${getApiBase()}/logs/playwright`);
+      // Fetch log data and screenshots in parallel
+      const [response, screenshots] = await Promise.all([
+        tracedFetch(`${getApiBase()}/logs/playwright`),
+        fetchPlaywrightScreenshots(),
+      ]);
 
       if (!response.ok) {
         if (response.status === 404) {
@@ -189,7 +235,7 @@ export function usePlaywrightDataWithStatus(): {
       }
 
       const json: PlaywrightLogResponse = await response.json();
-      const parsed = parseLogEntries(json);
+      const parsed = parseLogEntries(json, screenshots);
       setData(parsed);
       setError(null);
     } catch (e) {
