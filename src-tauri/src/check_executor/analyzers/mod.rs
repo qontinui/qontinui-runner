@@ -49,8 +49,8 @@ pub fn run_native_analyzer(check_def: &CheckDefinition) -> Result<ParsedOutput, 
         // Code quality tools
         CheckTool::TodoScanner => common::todo_scanner::analyze(working_dir),
 
-        // Quality gate (TODO - requires all dependent analyzers)
-        // CheckTool::QualityGate => common::quality_gate::analyze(working_dir, check_def),
+        // Quality gate
+        CheckTool::QualityGate => common::quality_gate::analyze(working_dir, check_def),
 
         // Not a native analyzer - use command execution
         _ => Err(format!(
@@ -84,5 +84,6 @@ pub fn has_native_analyzer(tool: &CheckTool) -> bool {
             | CheckTool::RaceDetectorPy
             | CheckTool::RaceDetectorRust
             | CheckTool::RaceDetectorTs
+            | CheckTool::QualityGate
     )
 }
