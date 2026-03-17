@@ -594,11 +594,16 @@ impl HookExecutor {
         let title = context.substitute(title);
         let body = context.substitute(body);
 
-        // For now, just log - actual notification implementation depends on platform
         info!("Notification: {} - {}", title, body);
 
-        // TODO: Implement actual system notification
-        // Could use notify-rust on Linux, winrt on Windows, etc.
+        if let Err(e) = notify_rust::Notification::new()
+            .summary(&title)
+            .body(&body)
+            .appname("Qontinui Runner")
+            .show()
+        {
+            warn!("Failed to send system notification: {}", e);
+        }
     }
 
     /// Check if all conditions are met.

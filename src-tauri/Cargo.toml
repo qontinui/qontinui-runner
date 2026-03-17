@@ -75,6 +75,7 @@ portable-pty = "0.8"
 arboard = "3.4"
 xcap = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+notify-rust = "4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
