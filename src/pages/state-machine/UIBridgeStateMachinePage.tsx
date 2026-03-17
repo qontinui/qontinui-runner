@@ -7,7 +7,7 @@
  * Tabs: Discovery, Graph Editor, State View, Transitions, Pathfinding, Export
  */
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Network,
@@ -33,6 +33,7 @@ import {
   StateDetailPanel,
   PathfindingPanel,
 } from "@qontinui/workflow-ui/state-machine";
+import type { CaptureScreenshotMeta } from "@qontinui/workflow-ui/state-machine";
 
 import { useStateMachineConfig } from "@/hooks/useStateMachineConfig";
 import { useElementDrag } from "@/hooks/useElementDrag";
@@ -42,6 +43,7 @@ import { UIBridgeStateGraph } from "./UIBridgeStateGraph";
 import { UIBridgeDiscoveryPanel } from "./UIBridgeDiscoveryPanel";
 import { ExportPanel } from "./ExportPanel";
 import { ToastContainer } from "@/components/ToastContainer";
+import { StateExplorationResultsViewer } from "@/components/state-explorer/StateExplorationResultsViewer";
 
 const TABS = [
   { value: "discovery", label: "Discovery", icon: Search },
@@ -49,6 +51,7 @@ const TABS = [
   { value: "states", label: "State View", icon: Layers },
   { value: "transitions", label: "Transitions", icon: ArrowRightLeft },
   { value: "pathfinding", label: "Pathfinding", icon: Route },
+  { value: "exploration", label: "Exploration Results", icon: Network },
   { value: "export", label: "Export", icon: Download },
 ] as const;
 
@@ -59,7 +62,11 @@ export function UIBridgeStateMachinePage() {
   const { toasts, showToast, dismissToast } = useToast();
   const discovery = useUIBridgeDiscovery(sm, showToast);
 
-  const [activeTab, setActiveTab] = useState<TabValue>("discovery");
+  const [activeTab, setActiveTab] = useState<TabValue>(() => {
+    // Default to exploration tab when navigated via API (e.g., test verification)
+    const params = new URLSearchParams(window.location.search);
+    return (params.get("tab") as TabValue) || "discovery";
+  });
   const [selectedStateId, setSelectedStateId] = useState<string | null>(null);
   const [selectedTransitionId, setSelectedTransitionId] = useState<string | null>(null);
   const [showNewTransition, setShowNewTransition] = useState(false);
@@ -101,6 +108,47 @@ export function UIBridgeStateMachinePage() {
     };
   }, [activeConfigId]);
 
+  // Auto-switch to exploration tab when navigated via test-navigation API
+  useEffect(() => {
+    const handler = () => setActiveTab("exploration");
+    window.addEventListener("sm-show-exploration", handler);
+    return () => window.removeEventListener("sm-show-exploration", handler);
+  }, []);
+
+  // Capture screenshots for screenshot state view
+  const [captureScreenshots, setCaptureScreenshots] = useState<CaptureScreenshotMeta[] | undefined>();
+  const screenshotImageCache = useRef<Map<string, string>>(new Map());
+  useEffect(() => {
+    if (!activeConfigId) {
+      setCaptureScreenshots(undefined);
+      screenshotImageCache.current.clear();
+      return;
+    }
+    screenshotImageCache.current.clear();
+    setCaptureScreenshots(undefined);
+    let isCancelled = false;
+    invoke<CaptureScreenshotMeta[]>("sm_get_capture_screenshots", { configId: activeConfigId })
+      .then((screenshots) => {
+        if (isCancelled) return;
+        setCaptureScreenshots(screenshots.length > 0 ? screenshots : undefined);
+      })
+      .catch(() => {
+        // Command may not be available in older runner builds
+      });
+    return () => {
+      isCancelled = true;
+    };
+  }, [activeConfigId]);
+
+  // Load screenshot image on demand (returns data URL, cached in component)
+  const loadScreenshotImage = useCallback(async (screenshotId: string): Promise<string> => {
+    const cached = screenshotImageCache.current.get(screenshotId);
+    if (cached) return cached;
+    const dataUrl = await invoke<string>("sm_get_capture_screenshot_image", { screenshotId });
+    screenshotImageCache.current.set(screenshotId, dataUrl);
+    return dataUrl;
+  }, []);
+
   // Also sync from discovery co-occurrence data (available during exploration before save)
   const coocThumbs = discovery.cooccurrenceData?.elementThumbnails;
   useEffect(() => {
@@ -112,7 +160,7 @@ export function UIBridgeStateMachinePage() {
   // Derived state
   const states = sm.activeConfig?.states ?? [];
   const transitions = sm.activeConfig?.transitions ?? [];
-  const selectedState = states.find((s) => s.id === selectedStateId) ?? null;
+  const selectedState = states.find((s) => s.id === selectedStateId || s.state_id === selectedStateId) ?? null;
   const selectedTransition = transitions.find((t) => t.id === selectedTransitionId) ?? null;
 
   const showStatePanel = selectedState && !showNewTransition;
@@ -240,6 +288,7 @@ export function UIBridgeStateMachinePage() {
             <button
               key={value}
               onClick={() => setActiveTab(value)}
+              aria-label={value === "exploration" ? "exploration results navigation link or tab" : undefined}
               className={`inline-flex items-center justify-center gap-1.5 rounded-md px-2 py-1 text-sm font-medium whitespace-nowrap transition-[color,box-shadow] ${
                 activeTab === value
                   ? "bg-background shadow-sm text-foreground"
@@ -379,6 +428,8 @@ export function UIBridgeStateMachinePage() {
               setSelectedTransitionId(null);
             }}
             elementThumbnails={elementThumbnails}
+            captureScreenshots={captureScreenshots}
+            onLoadScreenshotImage={loadScreenshotImage}
           />
         </div>
       </div>
@@ -424,6 +475,15 @@ export function UIBridgeStateMachinePage() {
             onPathFound={handlePathFound}
           />
         </div>
+      </div>
+
+      {/* Exploration Results Tab — uses off-screen positioning instead of display:none
+           so that UI Bridge SDK can still scan severity elements when tab is inactive */}
+      <div
+        className="flex-1 overflow-y-auto"
+        style={activeTab !== "exploration" ? { position: "absolute", left: "-9999px", width: "1px", height: "1px", overflow: "hidden" } : undefined}
+      >
+        <StateExplorationResultsViewer />
       </div>
 
       {/* Export Tab */}

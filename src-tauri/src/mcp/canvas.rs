@@ -50,6 +50,7 @@ const ALLOWED_COMPONENTS: &[&str] = &[
     "DependencyGraph",
     "CostBreakdown",
     "MissionBrief",
+    "AcceptanceCriteria",
 ];
 
 /// In-memory canvas state.
@@ -190,7 +191,7 @@ async fn create_or_update_panel(
         id
     } else {
         // Try to find the currently running task run
-        match state.app_state.checkpoint_db.get_running_task_runs() {
+        match state.app_state.checkpoint_db.get_running_task_runs(None) {
             Ok(runs) if !runs.is_empty() => runs[0].id.clone(),
             _ => "unknown".to_string(),
         }
@@ -481,6 +482,7 @@ mod tests {
         assert!(ALLOWED_COMPONENTS.contains(&"Waterfall"));
         assert!(ALLOWED_COMPONENTS.contains(&"Sparkline"));
         assert!(ALLOWED_COMPONENTS.contains(&"WaffleChart"));
+        assert!(ALLOWED_COMPONENTS.contains(&"AcceptanceCriteria"));
         assert!(!ALLOWED_COMPONENTS.contains(&"arbitrary_html"));
     }
 

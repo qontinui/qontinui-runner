@@ -48,7 +48,7 @@ pub async fn get_task_runs_for_viewer(
 ) -> Result<AiDataResponse<Vec<TaskRun>>, String> {
     let limit = limit.unwrap_or(20);
 
-    match state.checkpoint_db.get_recent_task_runs(limit) {
+    match state.checkpoint_db.get_recent_task_runs(limit, None) {
         Ok(runs) => Ok(AiDataResponse::ok(runs)),
         Err(e) => Ok(AiDataResponse::err(e)),
     }

@@ -150,12 +150,15 @@ export function useDashboardState(): DashboardState {
     }
   }, [fetchRunningTasks, fetchActionLog, fetchScreenshots]);
 
-  // Initial fetch and polling
+  // Initial fetch and polling with backoff when idle/failed
+  // Use faster polling (2s) when tasks are running, slower (10s) when idle
+  const hasRunningTasks = runningTasks.length > 0;
   useEffect(() => {
     refresh();
-    const interval = setInterval(refresh, 2000);
+    const intervalMs = hasRunningTasks ? 2000 : 10000;
+    const interval = setInterval(refresh, intervalMs);
     return () => clearInterval(interval);
-  }, [refresh]);
+  }, [refresh, hasRunningTasks]);
 
   // Update elapsed time
   useEffect(() => {

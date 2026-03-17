@@ -16,6 +16,7 @@ import {
   Monitor,
   Activity,
   Workflow,
+  Wrench,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -79,6 +80,13 @@ export const STEP_ICON_CONFIG: Record<string, StepIconConfig> = {
     icon: Monitor,
     bgClass: "bg-emerald-500/10",
     textClass: "text-emerald-400",
+  },
+
+  // Fixup/validation steps
+  workflow_fixup: {
+    icon: Wrench,
+    bgClass: "bg-violet-500/10",
+    textClass: "text-violet-400",
   },
 
   // Workflow composition steps

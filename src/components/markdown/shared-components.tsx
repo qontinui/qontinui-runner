@@ -145,7 +145,7 @@ export function SyntaxHighlightedCodeBlock({ code, language }: { code: string; l
         {({ className, style, tokens, getLineProps, getTokenProps }) => (
           <pre
             className={cn(
-              "p-3 pt-6 rounded-md overflow-x-auto border-l-2 border-primary/30 text-xs",
+              "p-3 pt-6 rounded-md whitespace-pre-wrap [overflow-wrap:anywhere] border-l-2 border-primary/30 text-xs",
               className,
             )}
             style={{ ...style, backgroundColor: "hsl(var(--muted) / 0.5)" }}
@@ -188,7 +188,7 @@ export function SimpleCodeBlock({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="relative group my-2">
-      <pre className="bg-muted/50 p-3 rounded-md overflow-x-auto border-l-2 border-border text-xs font-mono">
+      <pre className="bg-muted/50 p-3 rounded-md whitespace-pre-wrap [overflow-wrap:anywhere] border-l-2 border-border text-xs font-mono">
         {children}
       </pre>
       <button

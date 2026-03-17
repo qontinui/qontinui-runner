@@ -734,10 +734,13 @@ fn estimate_tokens(text: &str) -> usize {
     text.len() / 4
 }
 
-/// Compute a text embedding synchronously using reqwest::blocking.
+/// Compute a text embedding synchronously using an isolated async runtime.
 ///
-/// Used in sync contexts (like build_compressed_iteration_history) where the async
-/// EmbeddingClient cannot be used (block_on panics inside a tokio runtime thread).
+/// Creates a fresh single-threaded tokio runtime on a dedicated OS thread,
+/// runs an async reqwest call inside it, then tears it down cleanly.
+/// This avoids the "cannot drop a runtime in a context where blocking is
+/// not allowed" panic that occurred when reqwest::blocking created its own
+/// internal runtime inside an existing tokio async context (observed on Windows).
 fn compute_embedding_sync(text: &str) -> Result<Vec<f32>, String> {
     #[derive(serde::Serialize)]
     struct Req {
@@ -750,34 +753,50 @@ fn compute_embedding_sync(text: &str) -> Result<Vec<f32>, String> {
     }
 
     let truncated = if text.len() > 2000 {
-        &text[..2000]
+        text[..2000].to_string()
     } else {
-        text
+        text.to_string()
     };
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    // Spawn a dedicated OS thread that creates its own single-threaded tokio
+    // runtime. This guarantees no tokio thread-local state leaks from the
+    // parent runtime, which was the root cause of the Windows crash.
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Failed to build isolated runtime: {}", e))?;
 
-    let response = client
-        .post("http://127.0.0.1:8001/api/embeddings/compute-text")
-        .json(&Req {
-            text: truncated.to_string(),
-            model: "minilm".to_string(),
+        rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+            let response = client
+                .post("http://127.0.0.1:8001/api/embeddings/compute-text")
+                .json(&Req {
+                    text: truncated,
+                    model: "minilm".to_string(),
+                })
+                .send()
+                .await
+                .map_err(|e| format!("Embedding API request failed: {}", e))?;
+
+            if !response.status().is_success() {
+                return Err(format!("Embedding API returned {}", response.status()));
+            }
+
+            let resp: Resp = response
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse embedding response: {}", e))?;
+
+            Ok(resp.embedding)
         })
-        .send()
-        .map_err(|e| format!("Embedding API request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!("Embedding API returned {}", response.status()));
-    }
-
-    let result: Resp = response
-        .json()
-        .map_err(|e| format!("Failed to parse embedding response: {}", e))?;
-
-    Ok(result.embedding)
+    })
+    .join()
+    .map_err(|_| "Embedding thread join failed".to_string())?
 }
 
 // =============================================================================
@@ -1468,8 +1487,8 @@ fn build_compressed_iteration_history(
         let query_text = workflow_name.unwrap_or("").to_string();
 
         // Try hybrid search (semantic), fall back to SQL-only
-        // Note: this is a sync function called from async context, so we use
-        // reqwest::blocking directly instead of the async EmbeddingClient.
+        // Note: compute_embedding_sync runs async reqwest on a dedicated
+        // thread with its own isolated runtime to avoid nested-runtime panics.
         let universal_fixes = if !query_text.trim().is_empty() {
             let query_embedding = compute_embedding_sync(&query_text);
 
@@ -1882,6 +1901,262 @@ fn build_impact_context(
     Some(section)
 }
 
+// =============================================================================
+// Agentic Phase Enrichment: Pre-read Files from Failure Context
+// =============================================================================
+
+/// Regex for extracting file paths from failure context text.
+///
+/// Matches patterns like:
+/// - `src/Foo.tsx(42,5)` (TypeScript-style errors)
+/// - `at src/bar.rs:123` (Rust/stack trace style)
+/// - `File: path/to/file.ext`
+/// - `src/foo/bar.ts:42:5` (colon-separated line:col)
+/// - `path/to/file.ext` (bare paths with common extensions)
+fn failure_file_path_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?:File:\s*|at\s+)?(?:^|\s|`|'|")((?:[a-zA-Z]:[/\\])?(?:[\w.@-]+[/\\])*[\w.@-]+\.(?:rs|ts|tsx|js|jsx|py|json|toml|yaml|yml|css|scss|html|vue|svelte|go|java|kt|rb|php|cs|cpp|c|h|hpp))\b"#
+        ).unwrap()
+    })
+}
+
+/// Extract file paths from failure context and pre-read their contents.
+///
+/// Parses verification failure output (typecheck errors, test failures, stack traces)
+/// to find referenced files, then reads their current contents so the AI has them
+/// immediately without needing tool calls.
+fn extract_and_preread_failure_files(
+    failure_context: &str,
+    project_path: Option<&str>,
+    max_files: usize,
+    max_lines_per_file: usize,
+    max_total_bytes: usize,
+) -> String {
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    if failure_context.is_empty() {
+        return String::new();
+    }
+
+    let re = failure_file_path_regex();
+    let mut seen = HashSet::new();
+    let mut valid_paths = Vec::new();
+
+    for cap in re.captures_iter(failure_context) {
+        let raw_path = cap.get(1).unwrap().as_str().to_string();
+        // Strip trailing line/col info like ":123:5" or "(42,5)"
+        let clean_path = raw_path
+            .split(|c: char| c == '(' || c == ':')
+            .next()
+            .unwrap_or(&raw_path);
+
+        if seen.contains(clean_path) {
+            continue;
+        }
+        seen.insert(clean_path.to_string());
+
+        // Try to resolve the path
+        if let Some(root) = project_path {
+            let candidate = Path::new(root).join(clean_path);
+            if candidate.is_file() {
+                valid_paths.push(candidate);
+                continue;
+            }
+        }
+        let abs = Path::new(clean_path);
+        if abs.is_absolute() && abs.is_file() {
+            valid_paths.push(abs.to_path_buf());
+        }
+    }
+
+    if valid_paths.is_empty() {
+        return String::new();
+    }
+
+    info!(
+        "AGENTIC-ENRICHMENT: Found {} referenced files in failure context, will pre-read up to {}",
+        valid_paths.len(),
+        max_files
+    );
+
+    let mut result = String::new();
+    let mut total_bytes = 0usize;
+
+    for (i, path) in valid_paths.iter().enumerate() {
+        if i >= max_files || total_bytes >= max_total_bytes {
+            break;
+        }
+
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                let truncated: String = content
+                    .lines()
+                    .take(max_lines_per_file)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                let remaining = max_total_bytes.saturating_sub(total_bytes);
+                let portion = if truncated.len() > remaining {
+                    &truncated[..remaining]
+                } else {
+                    &truncated
+                };
+
+                result.push_str(&format!("--- File: {} ---\n{}\n\n", path.display(), portion));
+                total_bytes += portion.len();
+
+                let was_truncated =
+                    truncated.len() < content.len() || portion.len() < truncated.len();
+                if was_truncated {
+                    result.push_str("(truncated)\n\n");
+                }
+            }
+            Err(e) => {
+                debug!("AGENTIC-ENRICHMENT: Could not read {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    if !result.is_empty() {
+        info!(
+            "AGENTIC-ENRICHMENT: Pre-read {} bytes from {} files",
+            total_bytes,
+            valid_paths.len().min(max_files)
+        );
+    }
+
+    result
+}
+
+// =============================================================================
+// Agentic Phase Enrichment: Pre-read Previously Edited Files
+// =============================================================================
+
+/// Pre-read files that were edited in previous iterations.
+///
+/// On iteration 2+, extracts file paths from observations (git diff output) of
+/// prior iterations, then reads the current state of those files. This gives the
+/// AI immediate access to files it previously modified without needing tool calls.
+fn preread_previously_edited_files(
+    checkpoint_db: &CheckpointDb,
+    execution_id: &str,
+    current_iteration: u32,
+    project_path: Option<&str>,
+    max_files: usize,
+    max_lines_per_file: usize,
+    max_total_bytes: usize,
+) -> String {
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    if current_iteration <= 1 {
+        return String::new();
+    }
+
+    // Load observations from all previous iterations
+    let all_observations = checkpoint_db
+        .list_task_knowledge(execution_id, Some("observation"), false)
+        .unwrap_or_default();
+
+    // Extract changed files from observation content (git diff stat lines)
+    let mut seen = HashSet::new();
+    let mut valid_paths = Vec::new();
+
+    for obs in all_observations
+        .iter()
+        .filter(|o| o.iteration < current_iteration)
+    {
+        for file_str in extract_changed_files_from_observation(&obs.content) {
+            if seen.contains(&file_str) {
+                continue;
+            }
+            seen.insert(file_str.clone());
+
+            // Resolve relative to project_path
+            if let Some(root) = project_path {
+                let candidate = Path::new(root).join(&file_str);
+                if candidate.is_file() {
+                    valid_paths.push(candidate);
+                    continue;
+                }
+            }
+            let abs = Path::new(&file_str);
+            if abs.is_absolute() && abs.is_file() {
+                valid_paths.push(abs.to_path_buf());
+            }
+        }
+    }
+
+    if valid_paths.is_empty() {
+        return String::new();
+    }
+
+    info!(
+        "AGENTIC-ENRICHMENT: Found {} previously edited files, will pre-read up to {}",
+        valid_paths.len(),
+        max_files
+    );
+
+    let mut result = String::new();
+    let mut total_bytes = 0usize;
+
+    for (i, path) in valid_paths.iter().enumerate() {
+        if i >= max_files || total_bytes >= max_total_bytes {
+            break;
+        }
+
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                let truncated: String = content
+                    .lines()
+                    .take(max_lines_per_file)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                let remaining = max_total_bytes.saturating_sub(total_bytes);
+                let portion = if truncated.len() > remaining {
+                    &truncated[..remaining]
+                } else {
+                    &truncated
+                };
+
+                result.push_str(&format!(
+                    "--- File: {} (previously edited) ---\n{}\n\n",
+                    path.display(),
+                    portion
+                ));
+                total_bytes += portion.len();
+
+                let was_truncated =
+                    truncated.len() < content.len() || portion.len() < truncated.len();
+                if was_truncated {
+                    result.push_str("(truncated)\n\n");
+                }
+            }
+            Err(e) => {
+                debug!(
+                    "AGENTIC-ENRICHMENT: Could not read previously edited file {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    if !result.is_empty() {
+        info!(
+            "AGENTIC-ENRICHMENT: Pre-read {} bytes from {} previously edited files",
+            total_bytes,
+            valid_paths.len().min(max_files)
+        );
+    }
+
+    result
+}
+
 /// Truncate a string to max_len characters, appending "..." if truncated.
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() > max_len {
@@ -2142,9 +2417,11 @@ impl SetupExecutor {
                     let step_model = step.model.clone().or_else(|| model_override.clone());
                     let step_provider = step.provider.clone().or_else(|| provider_override.clone());
 
-                    // Retry loop for interruption resilience
+                    // Retry loop for interruption resilience.
+                    // Uses the step's retry_count if configured, otherwise falls back to default.
                     let mut retry_count = 0u32;
-                    const MAX_INTERRUPTION_RETRIES: u32 = 2;
+                    let max_retries = step.retry_count.unwrap_or(2);
+                    let retry_delay_ms = step.retry_delay_ms.unwrap_or(10_000);
                     let resp_result = loop {
                         let doctor_handle = self.app_state.doctor_handle.lock().await.clone();
                         let start = std::time::Instant::now();
@@ -2165,13 +2442,14 @@ impl SetupExecutor {
                             Ok(resp) => break Ok((resp, start)),
                             Err(e) => {
                                 let duration_ms = start.elapsed().as_millis() as u64;
-                                if duration_ms < 5000 && retry_count < MAX_INTERRUPTION_RETRIES {
+                                if duration_ms < 5000 && retry_count < max_retries {
                                     retry_count += 1;
+                                    let delay_secs = retry_delay_ms as f64 / 1000.0;
                                     warn!(
-                                        "SETUP-PHASE: Step '{}' appears interrupted ({}ms < 5s), retry {}/{} after 10s delay",
-                                        step_name, duration_ms, retry_count, MAX_INTERRUPTION_RETRIES
+                                        "SETUP-PHASE: Step '{}' appears interrupted ({}ms < 5s), retry {}/{} after {}s delay",
+                                        step_name, duration_ms, retry_count, max_retries, delay_secs
                                     );
-                                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
                                     continue;
                                 }
                                 break Err(e);
@@ -3429,6 +3707,67 @@ impl AgenticExecutor {
             - Focus exclusively on the source code that the verification checks are testing. When all checks pass, your work is done.",
             enhanced_prompt
         );
+
+        // === Enrichment #1: Pre-read files referenced in failure context ===
+        // Extract file paths from verification failure output and pre-read their contents
+        // so the AI has them immediately without needing tool calls.
+        let enhanced_prompt = {
+            let preread = extract_and_preread_failure_files(
+                failure_context,
+                config.project_path.as_deref(),
+                15,
+                300,
+                60_000,
+            );
+            if !preread.is_empty() {
+                format!(
+                    "{}\n\n## Pre-loaded Source Files\n\nThese files were referenced in the verification failures above. Read them here instead of using tool calls.\n\n{}",
+                    enhanced_prompt, preread
+                )
+            } else {
+                enhanced_prompt
+            }
+        };
+
+        // === Enrichment #2: Pre-read previously edited files ===
+        // On iteration 2+, read the current state of files edited in prior iterations
+        // so the AI can see the cumulative changes without tool calls.
+        let enhanced_prompt = if iteration > 1 {
+            let preread = preread_previously_edited_files(
+                &self.checkpoint_db,
+                &config.execution_id,
+                iteration,
+                config.project_path.as_deref(),
+                10,
+                300,
+                40_000,
+            );
+            if !preread.is_empty() {
+                format!(
+                    "{}\n\n## Previously Edited Files (Current State)\n\nThese files were modified in prior iterations. Their current contents are shown below.\n\n{}",
+                    enhanced_prompt, preread
+                )
+            } else {
+                enhanced_prompt
+            }
+        } else {
+            enhanced_prompt
+        };
+
+        // Record activity heartbeat before AI session spawn
+        {
+            let persist_id = super::get_parent_task_id(&config.execution_id);
+            let now = chrono::Utc::now().to_rfc3339();
+            let ctx_json = serde_json::json!({
+                "last_activity": format!("agentic_session_spawn_iter_{}", iteration),
+                "last_activity_at": now,
+            });
+            if let Ok(json) = serde_json::to_string(&ctx_json) {
+                let _ = self
+                    .checkpoint_db
+                    .update_task_run_runtime_context(&persist_id, &json);
+            }
+        }
 
         // Use the unified AI session executor with timing
         // Step-level model override takes precedence over phase-level
@@ -4927,6 +5266,7 @@ impl Executor for AgenticExecutor {
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
+            acceptance_criteria: None,
         };
 
         let (outcome, _injected_steps) = self

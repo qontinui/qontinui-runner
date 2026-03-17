@@ -112,7 +112,7 @@ async fn sweep_once(
     let running_tasks = tokio::task::spawn_blocking(move || {
         let mut tasks: Vec<(String, String, u32)> = Vec::new();
 
-        match db_clone.get_running_task_runs() {
+        match db_clone.get_running_task_runs(None) {
             Ok(runs) => {
                 for run in runs {
                     tasks.push((run.id, run.task_name, run.sessions_count));
@@ -121,7 +121,7 @@ async fn sweep_once(
             Err(e) => warn!("Stale task sweep: failed to query running task runs: {}", e),
         }
 
-        match db_clone.get_running_ai_sessions() {
+        match db_clone.get_running_ai_sessions(None) {
             Ok(sessions) => {
                 for session in sessions {
                     tasks.push((session.id, session.task_name, session.sessions_count));

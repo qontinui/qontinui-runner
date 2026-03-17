@@ -943,7 +943,7 @@ pub async fn sync_all_pending_ai_tasks(
     }
 
     // Get recent task runs (limit to last 50)
-    let tasks = app_state.checkpoint_db.get_recent_task_runs(50)?;
+    let tasks = app_state.checkpoint_db.get_recent_task_runs(50, None)?;
 
     let mut synced_count = 0u32;
 

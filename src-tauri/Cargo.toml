@@ -74,7 +74,7 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 portable-pty = "0.8"
 arboard = "3.4"
 xcap = "0.4"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
 notify-rust = "4"
 
 [target.'cfg(windows)'.dependencies]

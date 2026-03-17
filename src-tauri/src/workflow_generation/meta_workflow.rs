@@ -156,6 +156,9 @@ pub fn build_meta_workflow_template(
     // Strip markdown formatting and grab the first meaningful line.
     let name_suffix = extract_workflow_name_from_description(&request.description);
 
+    // Read any referenced files from the description and inject their contents
+    let referenced_file_contents = read_referenced_files_from_description(&request.description);
+
     // Build the specification prompt (acceptance criteria)
     let specification_prompt = build_specification_meta_prompt(&request.description);
 
@@ -168,6 +171,7 @@ pub fn build_meta_workflow_template(
         request.prompt_template.as_deref(),
         request.category.as_deref(),
         historical_context,
+        &referenced_file_contents,
     );
     let verification_prompt = build_verification_review_prompt(historical_context);
     let fixer_prompt =
@@ -189,7 +193,10 @@ pub fn build_meta_workflow_template(
 
             // Step 1: Investigation (optional) — enriches task description with codebase context
             if request.investigate_codebase.unwrap_or(true) {
-                let investigation_prompt = build_investigation_setup_prompt(&request.description);
+                let investigation_prompt = build_investigation_setup_prompt(
+                    &request.description,
+                    &referenced_file_contents,
+                );
                 steps.push(json!({
                     "id": Uuid::new_v4().to_string(),
                     "name": "Investigate codebase for generation context",
@@ -227,6 +234,8 @@ pub fn build_meta_workflow_template(
             // input_path reads criteria.json produced by the non-required spec step.
             // If spec failed/skipped, criteria.json won't exist — the builder proceeds
             // without it since input_path reads are now gracefully degraded to warnings.
+            // retry_count ensures transient AI provider failures don't kill the entire
+            // generation pipeline (the builder step is the critical path).
             {
                 let builder_step = json!({
                     "id": Uuid::new_v4().to_string(),
@@ -236,7 +245,9 @@ pub fn build_meta_workflow_template(
                     "prompt_mode": "response",
                     "content": builder_prompt,
                     "output_path": "{{artifact_dir}}/workflow.json",
-                    "input_path": "{{artifact_dir}}/criteria.json"
+                    "input_path": "{{artifact_dir}}/criteria.json",
+                    "retry_count": 2,
+                    "retry_delay_ms": 5000
                 });
                 steps.push(builder_step);
             }
@@ -357,6 +368,8 @@ pub fn build_meta_workflow_template(
         dependency_graph: None,
         cost_annotations: None,
         quality_report: None,
+        acceptance_criteria: None,
+        ai_reviewed: true,
         model_overrides: std::collections::HashMap::new(),
         created_at: now.clone(),
         updated_at: now,
@@ -496,7 +509,24 @@ fn build_builder_prompt(
     custom_template: Option<&str>,
     category: Option<&str>,
     historical: Option<&HistoricalContext>,
+    referenced_file_contents: &str,
 ) -> String {
+    let file_section = if referenced_file_contents.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"
+
+## Referenced File Contents
+
+**The user's description references the file(s) below. These file contents are the task specification. Base the generated workflow primarily on their contents.**
+
+{referenced_file_contents}
+"#,
+            referenced_file_contents = referenced_file_contents,
+        )
+    };
+
     let mut prompt = format!(
         r#"You are a workflow generation AI. Your task is to create a UnifiedWorkflow JSON from a natural language description.
 
@@ -507,9 +537,10 @@ fn build_builder_prompt(
 ## Task Description
 
 {description}
-"#,
+{file_section}"#,
         schema_context = schema_context,
         description = description,
+        file_section = file_section,
     );
 
     // Add category hint if provided
@@ -529,6 +560,20 @@ fn build_builder_prompt(
     if let Some(template) = custom_template {
         prompt.push_str(&format!("\n## Custom Instructions\n\n{}\n", template));
     }
+
+    // Add project context so the AI knows the file tree and root path
+    prompt.push_str(
+        r#"
+## Project Context
+
+Project root: {{project_root}}
+
+### Project Structure
+{{project_structure}}
+
+Use this structure to write accurate file paths in verification commands and working_directory fields.
+"#,
+    );
 
     // === ENHANCED: Add historical patterns, similar workflows, and GT references ===
     if let Some(ctx) = historical {
@@ -573,12 +618,13 @@ These criteria define the observable success conditions for this workflow.
 2. The JSON must be a complete UnifiedWorkflow object
 3. Every step must have a unique UUID v4 `id` field
 4. Every step's `phase` field must match the array it's in
-5. Use descriptive `name` fields for each step
+5. Do NOT include a `name` field on steps — names are auto-generated from step content during validation
 6. Set reasonable `timeout_seconds` for each step
 7. The `category` should be appropriate for the task (e.g., "testing", "deployment", "monitoring")
 8. Include meaningful `description` and `tags`
 
 ### Quality checklist — ensure your output meets ALL of these:
+- Do NOT add `npm install`, `pip install`, `poetry install`, or other dependency-install steps — all projects already have dependencies installed
 - Every `command` step has a real, syntactically-valid command (no placeholders)
 - Every `command` step with `check_type` has a matching command (e.g. lint -> eslint/ruff, typecheck -> tsc/mypy)
 - Every `test` step has a valid `test_type` and either a `command` or `code` field
@@ -620,6 +666,13 @@ When the workflow uses the UI Bridge SDK for verification, choose the right tool
 - Get element state (value, checked, disabled, visible, etc.)
 - Take page snapshots
 - AI-powered semantic search and natural language actions
+
+**SDK CAN also do (error monitoring — use `command` steps with curl):**
+- Check app health: `curl -s $BASE/sdk/console/health` returns score 0-100 and error breakdown
+- Capture error baseline before changes: `curl -s -X POST $BASE/sdk/console/error-baselines/capture -H "Content-Type: application/json" -d '{{"label":"before-fix"}}'`
+- Compare after changes: `curl -s -X POST $BASE/sdk/console/error-baselines/compare -H "Content-Type: application/json" -d '{{"label":"before-fix"}}'` — returns new errors (regressions) and fixed errors
+- Track errors around an action: start session with `$BASE/sdk/console/error-sessions/start`, perform action, end with `$BASE/sdk/console/error-sessions/end`
+- When the workflow modifies UI code, include a console health check in verification to catch runtime errors introduced by the change
 
 **SDK CANNOT do (use `test` steps with Playwright instead):**
 - Keyboard shortcuts (Ctrl+Z, Delete, Ctrl+S, etc.)
@@ -800,7 +853,23 @@ Output the workflow JSON now:
 ///
 /// This prompt instructs the AI to analyze the codebase in context of the
 /// user's task and produce an enriched description for the builder agent.
-fn build_investigation_setup_prompt(description: &str) -> String {
+fn build_investigation_setup_prompt(description: &str, referenced_file_contents: &str) -> String {
+    let file_section = if referenced_file_contents.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"
+
+## Referenced File Contents
+
+**CRITICAL: The user's description references the file(s) below. These file contents ARE the task specification. Base your enriched description primarily on their contents — they define what the generated workflow should implement.**
+
+{referenced_file_contents}
+"#,
+            referenced_file_contents = referenced_file_contents,
+        )
+    };
+
     format!(
         r#"You are a codebase investigation AI preparing context for workflow generation.
 
@@ -812,24 +881,94 @@ Your output feeds into a Builder agent that creates a UnifiedWorkflow JSON speci
 ## User's Original Task Description
 
 {description}
-
+{file_section}
 ## Your Task
 
 Analyze the user's intent in context of the project structure (from discovery context) and produce an **enriched task description**:
 
-1. **Preserve the original intent** — do not change what the user wants to accomplish
-2. **Identify relevant components** — name specific files, directories, modules, and patterns relevant to the task
-3. **Note technical context** — mention frameworks, build tools, test runners, and conventions
-4. **Flag potential issues** — dead code paths, missing implementations, broken data flows
-5. **Specify concrete targets** — replace vague references with specific file paths and component names
-6. **Mention verification approaches** — suggest what should be checked to verify the work
-7. **Runtime verification for removals** — for tasks that involve removing pages/routes/components, note that the running application must be checked (not just source files) since build caches, SSR, and routing configurations may still serve removed content
+1. **Read referenced files first** — if referenced file contents are provided above, those files ARE the task specification. Base your enriched description primarily on their contents, not on keyword matches against the codebase
+2. **Preserve the original intent** — do not change what the user wants to accomplish
+3. **Identify relevant components** — name specific files, directories, modules, and patterns relevant to the task
+4. **Note technical context** — mention frameworks, build tools, test runners, and conventions
+5. **Flag potential issues** — dead code paths, missing implementations, broken data flows
+6. **Specify concrete targets** — replace vague references with specific file paths and component names
+7. **Mention verification approaches** — suggest what should be checked to verify the work
+8. **Runtime verification for removals** — for tasks that involve removing pages/routes/components, note that the running application must be checked (not just source files) since build caches, SSR, and routing configurations may still serve removed content
 
 CRITICAL: Do NOT run shell commands, make HTTP requests, use APIs, or interact with any system.
 Do NOT ask questions or request permission. You are a text-in, text-out analyst.
 Output ONLY the enriched task description as plain text. No JSON, no code blocks, no prefixes, no questions."#,
         description = description,
+        file_section = file_section,
     )
+}
+
+/// Public wrapper for `read_referenced_files_from_description` (used by generator.rs).
+pub fn read_referenced_files_from_description_pub(description: &str) -> String {
+    read_referenced_files_from_description(description)
+}
+
+/// Read referenced files from the user's description and return their contents.
+///
+/// Uses the same `extract_relative_paths` logic as the discovery tools to find
+/// file paths in the description, then reads them from disk. Walks up parent
+/// directories from the project root to find files in sibling directories.
+fn read_referenced_files_from_description(description: &str) -> String {
+    let paths = super::discovery_tools::extract_relative_paths_pub(description);
+    if paths.is_empty() {
+        return String::new();
+    }
+
+    let project_path = crate::mcp::shared::current_project_path()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().to_string());
+
+    let mut sections = Vec::new();
+
+    for file_path in &paths {
+        let base = std::path::Path::new(&project_path);
+        let mut full_path = base.join(file_path);
+
+        // Walk up parent directories if not found at project root
+        if !full_path.exists() {
+            let mut ancestor = base.parent();
+            while let Some(parent) = ancestor {
+                let candidate = parent.join(file_path);
+                if candidate.exists() {
+                    full_path = candidate;
+                    break;
+                }
+                ancestor = parent.parent();
+            }
+        }
+
+        if full_path.exists() && full_path.is_file() {
+            match std::fs::read_to_string(&full_path) {
+                Ok(content) => {
+                    let max_chars = 15_000;
+                    let display_content = if content.len() > max_chars {
+                        format!(
+                            "{}...\n\n(truncated at {} chars, total {} chars)",
+                            &content[..max_chars], max_chars, content.len()
+                        )
+                    } else {
+                        content
+                    };
+                    sections.push(format!(
+                        "### File: {}\n\n```\n{}\n```",
+                        file_path, display_content
+                    ));
+                    tracing::info!("Meta-workflow: read referenced file {} ({} bytes)", full_path.display(), display_content.len());
+                }
+                Err(e) => {
+                    tracing::warn!("Meta-workflow: failed to read {}: {}", full_path.display(), e);
+                }
+            }
+        } else {
+            tracing::debug!("Meta-workflow: referenced file not found: {}", full_path.display());
+        }
+    }
+
+    sections.join("\n\n")
 }
 
 /// Build the prompt for the hardener completion step.

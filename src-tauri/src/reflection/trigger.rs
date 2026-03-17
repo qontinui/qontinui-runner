@@ -90,6 +90,23 @@ pub fn should_launch_reflection(
             return Ok(false);
         }
 
+        // Guard 1b: Check if source task run is a fixer run
+        let is_fixer: bool = conn
+            .query_row(
+                "SELECT COALESCE(is_fixer, 0) FROM task_runs WHERE id = ?1",
+                rusqlite::params![source_id],
+                |row| row.get::<_, i32>(0).map(|v| v != 0),
+            )
+            .unwrap_or(false);
+
+        if is_fixer {
+            debug!(
+                "Skipping reflection for {} — source is a fixer run",
+                source_id
+            );
+            return Ok(false);
+        }
+
         // Guard 2: Check reflection_enabled setting
         let reflection_enabled: bool = conn
             .query_row(
@@ -791,6 +808,23 @@ pub fn should_launch_project_reflection(
             return Ok(false);
         }
 
+        // Guard 1b: Check if source task run is a fixer run
+        let is_fixer: bool = conn
+            .query_row(
+                "SELECT COALESCE(is_fixer, 0) FROM task_runs WHERE id = ?1",
+                rusqlite::params![source_id],
+                |row| row.get::<_, i32>(0).map(|v| v != 0),
+            )
+            .unwrap_or(false);
+
+        if is_fixer {
+            debug!(
+                "Skipping project reflection for {} — source is a fixer run",
+                source_id
+            );
+            return Ok(false);
+        }
+
         // Guard 2: Check project_reflection_enabled setting (default: true)
         let project_reflection_enabled: bool = conn
             .query_row(
@@ -1092,6 +1126,369 @@ pub fn launch_project_reflection(
 
     info!(
         "Project reflection '{}' spawned for source {}",
+        reflection_name, source_task_run_id
+    );
+
+    Ok(reflection_id)
+}
+
+// =============================================================================
+// UI Bridge Reflection
+// =============================================================================
+
+/// Check whether a UI Bridge reflection should be launched.
+///
+/// Similar guards to other reflection types, plus checks for UI Bridge
+/// activity in the source workflow (skips if workflow had no UI Bridge usage).
+pub fn should_launch_ui_bridge_reflection(
+    db: &CheckpointDb,
+    source_task_run_id: &str,
+) -> Result<bool, String> {
+    let source_id = source_task_run_id.to_string();
+
+    db.with_conn(|conn| {
+        // Guard 0: Block if a UI Bridge reflection for the SAME workflow is already running
+        let has_running: bool = conn
+            .query_row(
+                r#"SELECT COUNT(*) > 0 FROM task_runs r
+                   WHERE r.status = 'running'
+                     AND r.is_reflection = 1
+                     AND r.workflow_type = 'unified'
+                     AND r.workflow_name LIKE 'UI Bridge Reflection:%'
+                     AND r.reflection_source_task_run_id IN (
+                         SELECT s.id FROM task_runs s
+                         WHERE s.workflow_name = (
+                             SELECT workflow_name FROM task_runs WHERE id = ?1
+                         )
+                     )"#,
+                rusqlite::params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if has_running {
+            debug!("Skipping UI Bridge reflection — one for the same workflow is already running");
+            return Ok(false);
+        }
+
+        // Guard 1: Check if source task run is already a reflection run
+        let is_reflection: bool = conn
+            .query_row(
+                "SELECT COALESCE(is_reflection, 0) FROM task_runs WHERE id = ?1",
+                rusqlite::params![source_id],
+                |row| row.get::<_, i32>(0).map(|v| v != 0),
+            )
+            .map_err(|e| format!("Failed to check is_reflection: {}", e))?;
+
+        if is_reflection {
+            debug!(
+                "Skipping UI Bridge reflection for {} — source is already a reflection run",
+                source_id
+            );
+            return Ok(false);
+        }
+
+        // Guard 1b: Check if source task run is a fixer run
+        let is_fixer: bool = conn
+            .query_row(
+                "SELECT COALESCE(is_fixer, 0) FROM task_runs WHERE id = ?1",
+                rusqlite::params![source_id],
+                |row| row.get::<_, i32>(0).map(|v| v != 0),
+            )
+            .unwrap_or(false);
+
+        if is_fixer {
+            debug!(
+                "Skipping UI Bridge reflection for {} — source is a fixer run",
+                source_id
+            );
+            return Ok(false);
+        }
+
+        // Guard 2: Check ui_bridge_reflection_enabled setting (default: true)
+        let enabled: bool = conn
+            .query_row(
+                "SELECT COALESCE(json_extract(value, '$.ui_bridge_reflection_enabled'), 'true') FROM settings WHERE key = 'dev_mode'",
+                [],
+                |row| {
+                    let val: String = row.get(0)?;
+                    Ok(val == "true" || val == "1")
+                },
+            )
+            .unwrap_or(true);
+
+        if !enabled {
+            debug!("UI Bridge reflection disabled in settings");
+            return Ok(false);
+        }
+
+        // Guard 3: Check output threshold
+        let has_output: bool = conn
+            .query_row(
+                r#"SELECT COALESCE(
+                    (SELECT SUM(LENGTH(content)) FROM task_run_output_chunks WHERE task_run_id = ?1),
+                    0
+                ) + LENGTH(COALESCE((SELECT output_log FROM task_runs WHERE id = ?1), '')) > 100"#,
+                rusqlite::params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if !has_output {
+            debug!(
+                "Skipping UI Bridge reflection for {} — insufficient output",
+                source_id
+            );
+            return Ok(false);
+        }
+
+        // Guard 4: Check that the source workflow actually used or could have used UI Bridge.
+        // Look for UI Bridge step checkpoints, or AI output mentioning ui-bridge/ui_bridge.
+        let has_ui_bridge_activity: bool = conn
+            .query_row(
+                r#"SELECT (
+                    -- Check step checkpoints for UI Bridge steps
+                    (SELECT COUNT(*) FROM workflow_step_checkpoints
+                     WHERE task_run_id = ?1
+                       AND (step_type LIKE '%ui_bridge%' OR step_type LIKE '%ui-bridge%'
+                            OR step_name LIKE '%UI Bridge%' OR step_name LIKE '%ui_bridge%'
+                            OR step_name LIKE '%snapshot%' OR step_name LIKE '%discover%'))
+                    +
+                    -- Check if the workflow definition references UI Bridge
+                    (SELECT COUNT(*) FROM unified_workflows uw
+                     INNER JOIN task_runs tr ON tr.workflow_name = uw.name
+                     WHERE tr.id = ?1
+                       AND (uw.setup_steps LIKE '%ui_bridge%' OR uw.setup_steps LIKE '%ui-bridge%'
+                            OR uw.verification_steps LIKE '%ui_bridge%' OR uw.verification_steps LIKE '%ui-bridge%'
+                            OR uw.agentic_steps LIKE '%ui_bridge%' OR uw.agentic_steps LIKE '%ui-bridge%'
+                            OR uw.completion_steps LIKE '%ui_bridge%' OR uw.completion_steps LIKE '%ui-bridge%'))
+                ) > 0"#,
+                rusqlite::params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        // Also check if the AI output mentions UI Bridge (covers AI-driven usage)
+        let ai_mentions_ui_bridge: bool = if !has_ui_bridge_activity {
+            conn.query_row(
+                r#"SELECT COALESCE(
+                    (SELECT 1 FROM task_run_output_chunks
+                     WHERE task_run_id = ?1
+                       AND (content LIKE '%ui-bridge%' OR content LIKE '%ui_bridge%'
+                            OR content LIKE '%/control/snapshot%' OR content LIKE '%/control/discover%')
+                     LIMIT 1),
+                    0
+                ) > 0"#,
+                rusqlite::params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false)
+        } else {
+            true
+        };
+
+        if !has_ui_bridge_activity && !ai_mentions_ui_bridge {
+            debug!(
+                "Skipping UI Bridge reflection for {} — no UI Bridge activity detected",
+                source_id
+            );
+            return Ok(false);
+        }
+
+        // Guard 5: Convergence check using project-style convergence
+        // (last N UI Bridge reflections for same workflow produced zero fixes)
+        let converged = has_ui_bridge_converged(conn, &source_id)?;
+        if converged {
+            info!(
+                "Skipping UI Bridge reflection for {} — UI Bridge improvements have converged",
+                source_id
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
+    })
+}
+
+/// Check if UI Bridge reflection has converged — last N UI Bridge reflections
+/// for the same source workflow produced zero fixes.
+fn has_ui_bridge_converged(conn: &Connection, source_task_run_id: &str) -> Result<bool, String> {
+    let workflow_name: Option<String> = conn
+        .query_row(
+            "SELECT workflow_name FROM task_runs WHERE id = ?1",
+            rusqlite::params![source_task_run_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Failed to get workflow_name: {}", e))?;
+
+    let workflow_name = match workflow_name {
+        Some(name) => name,
+        None => return Ok(false),
+    };
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT tr.id,
+                   (SELECT COUNT(*) FROM reflection_fixes rf
+                    WHERE rf.reflection_task_run_id = tr.id
+                      AND rf.fix_type LIKE 'ui_bridge_%') as fix_count
+            FROM task_runs tr
+            WHERE tr.workflow_name LIKE 'UI Bridge Reflection:%'
+              AND tr.is_reflection = 1
+              AND tr.status IN ('complete', 'completed')
+              AND tr.reflection_source_task_run_id IN (
+                SELECT id FROM task_runs WHERE workflow_name = ?1
+              )
+            ORDER BY tr.completed_at DESC
+            LIMIT ?2
+            "#,
+        )
+        .map_err(|e| format!("Failed to prepare UI Bridge convergence query: {}", e))?;
+
+    let rows: Vec<u32> = stmt
+        .query_map(
+            rusqlite::params![workflow_name, CONVERGENCE_THRESHOLD],
+            |row| row.get::<_, u32>(1),
+        )
+        .map_err(|e| format!("Failed to query UI Bridge convergence: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.len() < CONVERGENCE_THRESHOLD as usize {
+        return Ok(false);
+    }
+
+    let all_empty = rows.iter().all(|count| *count == 0);
+
+    if all_empty {
+        debug!(
+            "UI Bridge reflection for '{}' has {} consecutive runs with zero fixes — converged",
+            workflow_name,
+            rows.len()
+        );
+    }
+
+    Ok(all_empty)
+}
+
+/// Launch a UI Bridge reflection workflow.
+///
+/// Analyzes UI Bridge usage in the source workflow, identifies improvements,
+/// and implements them directly.
+pub fn launch_ui_bridge_reflection(
+    deps: ReflectionDeps,
+    source_task_run_id: String,
+) -> Result<String, String> {
+    let db = &deps.app_state.checkpoint_db;
+
+    if !should_launch_ui_bridge_reflection(db, &source_task_run_id)? {
+        return Ok("skipped".to_string());
+    }
+
+    // Get source task run details
+    let source_id = source_task_run_id.clone();
+    let workflow_name = db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = ?1",
+            rusqlite::params![source_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|e| format!("Failed to get source task run: {}", e))
+    })?;
+
+    let reflection_id = uuid::Uuid::new_v4().to_string();
+    let reflection_name = format!("UI Bridge Reflection: {}", workflow_name);
+
+    info!(
+        "Launching UI Bridge reflection {} for source run {} (workflow: {})",
+        reflection_id, source_task_run_id, workflow_name
+    );
+
+    // Create the task run record
+    let input = crate::database::CreateTaskRunInput::new(&reflection_id, &reflection_name)
+        .with_prompt(format!(
+            "Analyze UI Bridge usage in '{}' and implement improvements.",
+            workflow_name
+        ))
+        .with_workflow_name(&reflection_name)
+        .with_workflow_type("unified")
+        .with_task_type("reflection")
+        .with_max_sessions(2)
+        .with_auto_continue(true)
+        .with_is_reflection(true)
+        .with_reflection_source_task_run_id(&source_task_run_id)
+        .with_parent_task_run_id(&source_task_run_id);
+
+    db.create_task_run(&input)?;
+
+    // Build the UI Bridge reflection workflow
+    let loop_config = super::workflow::build_ui_bridge_reflection_config(
+        &reflection_id,
+        &reflection_name,
+        &workflow_name,
+    );
+
+    let setup_steps =
+        super::workflow::build_ui_bridge_setup_steps(&source_task_run_id, &workflow_name);
+    let verification_steps =
+        super::workflow::build_ui_bridge_verification_steps(&source_task_run_id);
+    let mut completion_steps =
+        super::workflow::build_ui_bridge_completion_steps(&workflow_name);
+    let completion_prompt_steps = completion_steps.split_off(1);
+    let completion_automation_steps = completion_steps;
+
+    // Build LoopController
+    let reflection_fix_ctx = crate::mcp::shared::ReflectionFixContext {
+        source_task_run_id: source_task_run_id.clone(),
+        reflection_task_run_id: reflection_id.clone(),
+        project_path: crate::mcp::shared::current_project_path(),
+    };
+
+    let mut controller = crate::unified_workflow_executor::LoopController::new(
+        deps.app_state.clone(),
+        deps.config_storage.clone(),
+        deps.app_handle.clone(),
+        deps.pid_tracker.clone(),
+    )
+    .with_reflection_fix_ctx(reflection_fix_ctx);
+
+    if let Some(sm) = deps.session_manager {
+        controller = controller.with_session_manager(sm);
+    }
+
+    info!(
+        "Spawning UI Bridge reflection '{}' (id: {}) with {} setup steps",
+        reflection_name,
+        reflection_id,
+        setup_steps.len()
+    );
+
+    let exec_id = reflection_id.clone();
+    let wf_name = reflection_name.clone();
+    let url_lock = Some(deps.app_state.url_lock_manager.clone());
+    crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
+        deps.app_state.checkpoint_db.clone(),
+        exec_id,
+        wf_name,
+        url_lock,
+        Box::pin(async move {
+            controller
+                .run(
+                    loop_config,
+                    setup_steps,
+                    Vec::new(),
+                    verification_steps,
+                    Vec::new(),
+                    completion_automation_steps,
+                    completion_prompt_steps,
+                )
+                .await
+        }),
+    );
+
+    info!(
+        "UI Bridge reflection '{}' spawned for source {}",
         reflection_name, source_task_run_id
     );
 

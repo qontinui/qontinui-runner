@@ -28,6 +28,7 @@ pub mod build_errors;
 pub mod commands;
 pub mod health;
 pub mod manager;
+pub mod primary_proxy;
 pub(crate) mod process;
 pub mod stream_parser;
 pub mod types;

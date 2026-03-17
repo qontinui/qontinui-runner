@@ -499,7 +499,7 @@ pub fn get_recent_tasks_with_outcomes(
 pub fn get_current_running_task(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<serde_json::Value>, String> {
-    let running_tasks = state.checkpoint_db.get_running_task_runs()?;
+    let running_tasks = state.checkpoint_db.get_running_task_runs(None)?;
 
     // Return the first (most recently updated) running task with basic info
     if let Some(task) = running_tasks.first() {

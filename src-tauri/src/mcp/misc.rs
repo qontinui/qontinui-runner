@@ -3008,7 +3008,7 @@ pub async fn stop_ai_analysis(
         }
     };
 
-    let running_tasks = match db.get_running_task_runs() {
+    let running_tasks = match db.get_running_task_runs(None) {
         Ok(tasks) => tasks,
         Err(e) => {
             error!("MCP API: Failed to get running tasks: {}", e);
@@ -3103,7 +3103,7 @@ pub async fn restart_runner(
 /// use has_running_ai_tasks_async() or wrap this in spawn_blocking.
 #[allow(dead_code)]
 pub fn has_running_ai_tasks(db: &Arc<CheckpointDb>) -> bool {
-    match db.get_running_task_runs() {
+    match db.get_running_task_runs(None) {
         Ok(tasks) => !tasks.is_empty(),
         Err(e) => {
             warn!("Failed to check running tasks: {}", e);
@@ -3115,7 +3115,7 @@ pub fn has_running_ai_tasks(db: &Arc<CheckpointDb>) -> bool {
 /// Check if any AI analysis tasks are currently running (async version).
 /// Uses spawn_blocking to avoid blocking the async runtime.
 pub async fn has_running_ai_tasks_async(db: Arc<CheckpointDb>) -> bool {
-    match tokio::task::spawn_blocking(move || db.get_running_task_runs()).await {
+    match tokio::task::spawn_blocking(move || db.get_running_task_runs(None)).await {
         Ok(Ok(tasks)) => !tasks.is_empty(),
         Ok(Err(e)) => {
             warn!("Failed to check running tasks: {}", e);
@@ -5201,7 +5201,7 @@ pub async fn get_workflow_auto_continue() -> Json<ApiResponse<WorkflowAutoContin
 
     // Check if there are any running tasks
     let workflow_name = if let Ok(db) = CheckpointDb::new() {
-        db.get_running_task_runs()
+        db.get_running_task_runs(None)
             .ok()
             .and_then(|tasks| tasks.first().map(|t| t.task_name.clone()))
     } else {
@@ -5226,7 +5226,7 @@ pub async fn set_workflow_auto_continue(
 
             // Get the active workflow name if any
             let workflow_name = if let Ok(db) = CheckpointDb::new() {
-                db.get_running_task_runs()
+                db.get_running_task_runs(None)
                     .ok()
                     .and_then(|tasks| tasks.first().map(|t| t.task_name.clone()))
             } else {

@@ -57,7 +57,7 @@ pub struct RoutingConfig {
 }
 
 fn default_simple_model() -> String {
-    "claude-3-5-haiku-20241022".to_string()
+    "claude-haiku-4-5-20251001".to_string()
 }
 
 fn default_medium_model() -> String {

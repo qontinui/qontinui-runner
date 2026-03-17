@@ -3,6 +3,8 @@
 //! Provides REST endpoints for managing spawned child processes:
 //! listing, starting, stopping, restarting, and reading output.
 //! Also exposes process status and output for AI to query during workflow execution.
+//!
+//! When running as a secondary instance, these endpoints proxy to the primary runner.
 
 use axum::{
     extract::{Path, State},
@@ -12,12 +14,23 @@ use axum::{
 use std::sync::Arc;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::process_capture::primary_proxy;
 use crate::process_capture::types::{OutputLine, ProcessStatus};
 
 /// List all managed processes with their status.
 pub async fn list_processes(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<ProcessStatus>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        let statuses = primary_proxy::get_all_status().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(api_error(format!("Primary runner proxy error: {}", e))),
+            )
+        })?;
+        return Ok(Json(ApiResponse::success(statuses)));
+    }
+
     let manager = state.app_state.process_capture_manager.lock().await;
     let manager = manager.as_ref().ok_or_else(|| {
         (
@@ -35,6 +48,16 @@ pub async fn list_processes(
 pub async fn get_process_status(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<ProcessStatus>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        let statuses = primary_proxy::get_all_status().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(api_error(format!("Primary runner proxy error: {}", e))),
+            )
+        })?;
+        return Ok(Json(ApiResponse::success(statuses)));
+    }
+
     let manager = state.app_state.process_capture_manager.lock().await;
     let manager = manager.as_ref().ok_or_else(|| {
         (
@@ -52,6 +75,16 @@ pub async fn start_process(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        primary_proxy::start_process(&id).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(api_error(format!("Primary runner proxy error: {}", e))),
+            )
+        })?;
+        return Ok(Json(ApiResponse::success("started".to_string())));
+    }
+
     let manager = state.app_state.process_capture_manager.lock().await;
     let manager = manager.as_ref().ok_or_else(|| {
         (
@@ -75,6 +108,16 @@ pub async fn stop_process(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        primary_proxy::stop_process(&id).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(api_error(format!("Primary runner proxy error: {}", e))),
+            )
+        })?;
+        return Ok(Json(ApiResponse::success("stopped".to_string())));
+    }
+
     let manager = state.app_state.process_capture_manager.lock().await;
     let manager = manager.as_ref().ok_or_else(|| {
         (
@@ -98,6 +141,16 @@ pub async fn restart_process(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        primary_proxy::restart_process(&id).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(api_error(format!("Primary runner proxy error: {}", e))),
+            )
+        })?;
+        return Ok(Json(ApiResponse::success("restarted".to_string())));
+    }
+
     let manager = state.app_state.process_capture_manager.lock().await;
     let manager = manager.as_ref().ok_or_else(|| {
         (
@@ -126,6 +179,16 @@ pub async fn get_output(
         .get("tail")
         .and_then(|t| t.parse::<usize>().ok())
         .unwrap_or(100);
+
+    if primary_proxy::is_secondary() {
+        let output = primary_proxy::get_output(&id, tail).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(api_error(format!("Primary runner proxy error: {}", e))),
+            )
+        })?;
+        return Ok(Json(ApiResponse::success(output)));
+    }
 
     let manager = state.app_state.process_capture_manager.lock().await;
     let manager = manager.as_ref().ok_or_else(|| {

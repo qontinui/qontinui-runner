@@ -13,12 +13,14 @@
  * - Displays orchestrator agent messages with distinct styling
  */
 
-import { useMemo } from "react";
+import React, { useMemo, useState, useCallback } from "react";
 import {
   Bot,
   BookOpen,
   CheckCircle,
   CheckSquare,
+  ChevronDown,
+  ChevronRight,
   Cog,
   FileText,
   Info,
@@ -510,38 +512,107 @@ function OrchestratorLogBlock({ group }: { group: MessageGroup }) {
 }
 
 /**
+ * Module-level store for expanded AI response sections.
+ * Persists across re-renders to prevent collapse on parent updates.
+ */
+const expandedResponseStore = new Set<string>();
+
+/**
+ * Generate a stable key for a response group.
+ */
+function responseKey(group: MessageGroup): string {
+  let hash = 0;
+  const str = group.combinedText.slice(0, 200);
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = (hash << 5) - hash + char;
+    hash = hash & hash;
+  }
+  return `resp-${group.timestamp}-${hash}`;
+}
+
+/**
+ * Collapsible wrapper for AI output sections.
+ * Renders the "Analysis / Thinking" toggle header with collapsible content.
+ */
+function CollapsibleAiSection({
+  children,
+  sectionKey,
+  timestamp,
+  defaultExpanded = true,
+}: {
+  children: React.ReactNode;
+  sectionKey: string;
+  timestamp?: number;
+  defaultExpanded?: boolean;
+}) {
+  const [isExpanded, setIsExpanded] = useState(() =>
+    expandedResponseStore.has(sectionKey) ? true : defaultExpanded,
+  );
+
+  const toggleExpanded = useCallback(
+    (e: React.MouseEvent) => {
+      e.stopPropagation();
+      setIsExpanded((prev) => {
+        const next = !prev;
+        if (next) {
+          expandedResponseStore.add(sectionKey);
+        } else {
+          expandedResponseStore.delete(sectionKey);
+        }
+        return next;
+      });
+    },
+    [sectionKey],
+  );
+
+  return (
+    <div className="my-2 border border-border/50 rounded-md overflow-hidden">
+      <button
+        type="button"
+        onClick={toggleExpanded}
+        onMouseDown={(e) => e.stopPropagation()}
+        className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground bg-muted/30 hover:bg-muted/50 transition-colors cursor-pointer select-none"
+      >
+        {isExpanded ? (
+          <ChevronDown className="w-3.5 h-3.5" />
+        ) : (
+          <ChevronRight className="w-3.5 h-3.5" />
+        )}
+        <span className="font-medium">Analysis / Thinking</span>
+        {timestamp && (
+          <span className="ml-auto text-muted-foreground/60 text-[10px]">
+            {formatTimestamp(timestamp)}
+          </span>
+        )}
+        {!isExpanded && !timestamp && (
+          <span className="ml-auto text-muted-foreground/60 text-[10px]">Click to expand</span>
+        )}
+      </button>
+      {isExpanded && (
+        <div className="px-3 py-2 text-xs text-foreground bg-muted/10">{children}</div>
+      )}
+    </div>
+  );
+}
+
+/**
  * Renders an AI response message in log mode.
  */
 function ResponseLogBlock({
   group,
   isAnimated,
-  isFirst,
 }: {
   group: MessageGroup;
   isAnimated?: boolean;
   isFirst: boolean;
 }) {
-  const emeraldColors = getAccentColors("emerald");
-  const lineCount = group.combinedText.split("\n").length;
+  const key = responseKey(group);
 
   return (
-    <div>
-      {isFirst && (
-        <div
-          className={cn(
-            "flex items-center gap-2 text-xs font-semibold mb-2 mt-1",
-            emeraldColors.text,
-          )}
-        >
-          <Bot className="w-4 h-4" />
-          <span>RESPONSE</span>
-          <span className="text-muted-foreground font-normal">{lineCount} lines</span>
-        </div>
-      )}
-      <div className="py-0.5 pl-6">
-        <MarkdownViewer content={group.combinedText} isAnimated={isAnimated} />
-      </div>
-    </div>
+    <CollapsibleAiSection sectionKey={key} timestamp={group.timestamp}>
+      <MarkdownViewer content={group.combinedText} isAnimated={isAnimated} />
+    </CollapsibleAiSection>
   );
 }
 
@@ -683,20 +754,30 @@ function FindingBanner({ group }: { group: MessageGroup }) {
 function ChatBubble({ group, isAnimated }: { group: MessageGroup; isAnimated?: boolean }) {
   const isUser = group.source === "prompt" || group.source === "user_message";
   const isHint = group.source === "user_hint";
+  const isAi = !isUser && !isHint;
+
+  // AI messages use the collapsible "Analysis / Thinking" container
+  if (isAi) {
+    const key = responseKey(group);
+    return (
+      <div className="px-4 py-1">
+        <CollapsibleAiSection sectionKey={key} timestamp={group.timestamp}>
+          <MarkdownViewer content={group.combinedText} isAnimated={isAnimated} />
+        </CollapsibleAiSection>
+      </div>
+    );
+  }
+
   const blueColors = getAccentColors("blue");
   const purpleColors = getAccentColors("purple");
-  const greenColors = getAccentColors("green");
 
-  // Determine colors based on source
-  const avatarColors = isUser || isHint ? (isHint ? purpleColors : blueColors) : greenColors;
+  const avatarColors = isHint ? purpleColors : blueColors;
 
   const bubbleColors = isUser
     ? { bg: blueColors.bg, border: blueColors.border }
-    : isHint
-      ? { bg: purpleColors.bg, border: purpleColors.border }
-      : { bg: "bg-muted/50", border: "border-border" };
+    : { bg: purpleColors.bg, border: purpleColors.border };
 
-  const label = isHint ? "Hint" : isUser ? "You" : "AI";
+  const label = isHint ? "Hint" : "You";
 
   return (
     <div className={cn("flex gap-3 px-4 py-3", isUser ? "flex-row-reverse" : "flex-row")}>
@@ -708,7 +789,7 @@ function ChatBubble({ group, isAnimated }: { group: MessageGroup; isAnimated?: b
           avatarColors.text,
         )}
       >
-        {isUser || isHint ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+        <User className="w-4 h-4" />
       </div>
 
       {/* Message content */}

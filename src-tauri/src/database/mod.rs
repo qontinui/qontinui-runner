@@ -23,6 +23,9 @@ use tracing::{info, warn};
 pub struct CheckpointDb {
     pool: Pool<SqliteConnectionManager>,
     db_path: PathBuf,
+    /// The runner's API port, used to tag task_runs for instance-level filtering.
+    /// Set after the HTTP server binds. Defaults to 0 (unset).
+    runner_port: std::sync::atomic::AtomicU16,
 }
 
 /// Result of database optimization operations.
@@ -291,6 +294,17 @@ pub struct TaskRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_up_source_task_run_id: Option<String>,
 
+    // ========================================================================
+    // Fixer Fields
+    // ========================================================================
+    /// Whether this task run is a fixer run (aggregates reflection/follow-up fixes).
+    #[serde(default)]
+    pub is_fixer: bool,
+
+    /// The source task run ID that this fixer addresses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixer_source_task_run_id: Option<String>,
+
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -340,6 +354,9 @@ pub struct CreateTaskRunInput {
     pub reflection_source_task_run_id: Option<String>,
     pub is_follow_up: bool,
     pub follow_up_source_task_run_id: Option<String>,
+    pub is_fixer: bool,
+    pub fixer_source_task_run_id: Option<String>,
+    pub runner_port: Option<u16>,
 }
 
 impl CreateTaskRunInput {
@@ -368,6 +385,9 @@ impl CreateTaskRunInput {
             reflection_source_task_run_id: None,
             is_follow_up: false,
             follow_up_source_task_run_id: None,
+            is_fixer: false,
+            fixer_source_task_run_id: None,
+            runner_port: None,
         }
     }
 
@@ -488,6 +508,24 @@ impl CreateTaskRunInput {
     /// Set the source task run ID whose unfixed issues this run addresses.
     pub fn with_follow_up_source_task_run_id(mut self, source_id: impl Into<String>) -> Self {
         self.follow_up_source_task_run_id = Some(source_id.into());
+        self
+    }
+
+    /// Mark this task run as a fixer run.
+    pub fn with_is_fixer(mut self, is_fixer: bool) -> Self {
+        self.is_fixer = is_fixer;
+        self
+    }
+
+    /// Set the source task run ID that this fixer addresses.
+    pub fn with_fixer_source_task_run_id(mut self, source_id: impl Into<String>) -> Self {
+        self.fixer_source_task_run_id = Some(source_id.into());
+        self
+    }
+
+    /// Set the runner API port that created this task run.
+    pub fn with_runner_port(mut self, port: u16) -> Self {
+        self.runner_port = Some(port);
         self
     }
 }
@@ -1800,7 +1838,20 @@ impl CheckpointDb {
         Ok(Self {
             pool,
             db_path: db_path.clone(),
+            runner_port: std::sync::atomic::AtomicU16::new(0),
         })
+    }
+
+    /// Set the runner port for instance-level task_run filtering.
+    /// Called after the HTTP server binds to its port.
+    pub fn set_runner_port(&self, port: u16) {
+        self.runner_port.store(port, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Get the runner port (0 means unset).
+    pub fn get_runner_port(&self) -> Option<u16> {
+        let port = self.runner_port.load(std::sync::atomic::Ordering::Relaxed);
+        if port == 0 { None } else { Some(port) }
     }
 
     /// Create an in-memory database for testing or no-op logging.
@@ -1835,6 +1886,7 @@ impl CheckpointDb {
         Ok(Self {
             pool,
             db_path: PathBuf::from(":memory:"),
+            runner_port: std::sync::atomic::AtomicU16::new(0),
         })
     }
 
@@ -6535,6 +6587,126 @@ impl CheckpointDb {
             info!("Successfully migrated to version 110 (sm_element_thumbnails)");
         }
 
+        if current_version < 111 {
+            info!("Migrating to version 111 (capture screenshots for state view)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS sm_capture_screenshots (
+                    id TEXT PRIMARY KEY,
+                    config_id TEXT NOT NULL REFERENCES state_machine_configs(id) ON DELETE CASCADE,
+                    capture_index INTEGER NOT NULL,
+                    screenshot_webp BLOB NOT NULL,
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    element_bounds_json TEXT NOT NULL DEFAULT '{}',
+                    fingerprint_hashes_json TEXT NOT NULL DEFAULT '[]',
+                    captured_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_sm_screenshots_config ON sm_capture_screenshots(config_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (111, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 111: {}", e))?;
+
+            info!("Successfully migrated to version 111 (sm_capture_screenshots)");
+        }
+
+        // --- Migration 112: orchestration_loop_configs ---
+        if current_version < 112 {
+            info!("Migrating to version 112 (orchestration_loop_configs)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS orchestration_loop_configs (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    is_favorite BOOLEAN DEFAULT 0,
+                    config_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ol_configs_favorite ON orchestration_loop_configs(is_favorite);
+                CREATE INDEX IF NOT EXISTS idx_ol_configs_updated ON orchestration_loop_configs(updated_at);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (112, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 112: {}", e))?;
+
+            info!("Successfully migrated to version 112 (orchestration_loop_configs)");
+        }
+
+        // --- Migration 113: runner_port column on task_runs ---
+        if current_version < 113 {
+            info!("Migrating to version 113 (task_runs.runner_port)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE task_runs ADD COLUMN runner_port INTEGER;
+
+                CREATE INDEX IF NOT EXISTS idx_task_runs_runner_port ON task_runs(runner_port);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (113, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 113: {}", e))?;
+
+            info!("Successfully migrated to version 113 (task_runs.runner_port)");
+        }
+
+        // --- Migration 114: is_fixer and fixer_source_task_run_id columns on task_runs ---
+        if current_version < 114 {
+            info!("Migrating to version 114 (task_runs.is_fixer, fixer_source_task_run_id)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE task_runs ADD COLUMN is_fixer INTEGER DEFAULT 0;
+                ALTER TABLE task_runs ADD COLUMN fixer_source_task_run_id TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (114, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 114: {}", e))?;
+
+            info!("Successfully migrated to version 114 (task_runs.is_fixer)");
+        }
+
+        // Migration to version 115: Add acceptance_criteria to unified_workflows
+        if current_version < 115 {
+            info!("Migrating to version 115 (unified_workflows.acceptance_criteria)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN acceptance_criteria TEXT DEFAULT NULL;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (115, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 115: {}", e))?;
+
+            info!("Successfully migrated to version 115 (acceptance_criteria)");
+        }
+
+        if current_version < 116 {
+            info!("Migrating to version 116 (unified_workflows.ai_reviewed)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN ai_reviewed INTEGER DEFAULT 1;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (116, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 116: {}", e))?;
+
+            info!("Successfully migrated to version 116 (ai_reviewed)");
+        }
+
         // Repair migration: is_favorite column may be missing on databases created from
         // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
         // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,
@@ -7019,6 +7191,9 @@ impl CheckpointDb {
         // Default root_task_run_id to self if not provided (root-level task)
         let effective_root = input.root_task_run_id.as_deref().unwrap_or(&input.id);
 
+        // Auto-fill runner_port from CheckpointDb if not explicitly set on the input
+        let effective_runner_port = input.runner_port.or_else(|| self.get_runner_port());
+
         conn.execute(
             r#"
             INSERT INTO task_runs (id, task_name, prompt, task_type, status, sessions_count, max_sessions,
@@ -7028,8 +7203,10 @@ impl CheckpointDb {
                                    workspace_id, triggered_by, bridge_id,
                                    is_reflection, reflection_source_task_run_id,
                                    is_follow_up, follow_up_source_task_run_id,
+                                   is_fixer, fixer_source_task_run_id,
+                                   runner_port,
                                    created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?23)
+            VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?26)
             "#,
             params![
                 input.id,
@@ -7054,6 +7231,9 @@ impl CheckpointDb {
                 input.reflection_source_task_run_id,
                 input.is_follow_up as i32,
                 input.follow_up_source_task_run_id,
+                input.is_fixer as i32,
+                input.fixer_source_task_run_id,
+                effective_runner_port.map(|p| p as i64),
                 now
             ],
         )
@@ -7093,6 +7273,8 @@ impl CheckpointDb {
             reflection_source_task_run_id: input.reflection_source_task_run_id.clone(),
             is_follow_up: input.is_follow_up,
             follow_up_source_task_run_id: input.follow_up_source_task_run_id.clone(),
+            is_fixer: input.is_fixer,
+            fixer_source_task_run_id: input.fixer_source_task_run_id.clone(),
             created_at: now.clone(),
             updated_at: now,
             completed_at: None,
@@ -7321,6 +7503,7 @@ impl CheckpointDb {
                    parent_task_run_id, root_task_run_id, depth, bridge_id, result_data,
                    COALESCE(is_reflection, 0) as is_reflection, reflection_source_task_run_id,
                    COALESCE(is_follow_up, 0) as is_follow_up, follow_up_source_task_run_id,
+                   COALESCE(is_fixer, 0) as is_fixer, fixer_source_task_run_id,
                    created_at, updated_at, completed_at
             FROM task_runs
             WHERE id = ?1
@@ -7361,9 +7544,11 @@ impl CheckpointDb {
                     reflection_source_task_run_id: row.get(29)?,
                     is_follow_up: row.get::<_, i32>(30)? != 0,
                     follow_up_source_task_run_id: row.get(31)?,
-                    created_at: row.get(32)?,
-                    updated_at: row.get(33)?,
-                    completed_at: row.get(34)?,
+                    is_fixer: row.get::<_, i32>(32)? != 0,
+                    fixer_source_task_run_id: row.get(33)?,
+                    created_at: row.get(34)?,
+                    updated_at: row.get(35)?,
+                    completed_at: row.get(36)?,
                 })
             },
         );
@@ -7406,6 +7591,7 @@ impl CheckpointDb {
                        parent_task_run_id, root_task_run_id, depth, bridge_id, result_data,
                        COALESCE(is_reflection, 0) as is_reflection, reflection_source_task_run_id,
                        COALESCE(is_follow_up, 0) as is_follow_up, follow_up_source_task_run_id,
+                       COALESCE(is_fixer, 0) as is_fixer, fixer_source_task_run_id,
                        created_at, updated_at, completed_at
                 FROM task_runs
                 WHERE parent_task_run_id = ?1
@@ -7452,9 +7638,11 @@ impl CheckpointDb {
                     reflection_source_task_run_id: row.get(29)?,
                     is_follow_up: row.get::<_, i32>(30)? != 0,
                     follow_up_source_task_run_id: row.get(31)?,
-                    created_at: row.get(32)?,
-                    updated_at: row.get(33)?,
-                    completed_at: row.get(34)?,
+                    is_fixer: row.get::<_, i32>(32)? != 0,
+                    fixer_source_task_run_id: row.get(33)?,
+                    created_at: row.get(34)?,
+                    updated_at: row.get(35)?,
+                    completed_at: row.get(36)?,
                 })
             })
             .map_err(|e| format!("Failed to query child tasks: {}", e))?
@@ -7491,6 +7679,7 @@ impl CheckpointDb {
                        parent_task_run_id, root_task_run_id, depth, bridge_id, result_data,
                        COALESCE(is_reflection, 0) as is_reflection, reflection_source_task_run_id,
                        COALESCE(is_follow_up, 0) as is_follow_up, follow_up_source_task_run_id,
+                       COALESCE(is_fixer, 0) as is_fixer, fixer_source_task_run_id,
                        created_at, updated_at, completed_at
                 FROM task_runs
                 WHERE root_task_run_id = ?1 AND id != ?1
@@ -7537,9 +7726,11 @@ impl CheckpointDb {
                     reflection_source_task_run_id: row.get(29)?,
                     is_follow_up: row.get::<_, i32>(30)? != 0,
                     follow_up_source_task_run_id: row.get(31)?,
-                    created_at: row.get(32)?,
-                    updated_at: row.get(33)?,
-                    completed_at: row.get(34)?,
+                    is_fixer: row.get::<_, i32>(32)? != 0,
+                    fixer_source_task_run_id: row.get(33)?,
+                    created_at: row.get(34)?,
+                    updated_at: row.get(35)?,
+                    completed_at: row.get(36)?,
                 })
             })
             .map_err(|e| format!("Failed to query task hierarchy: {}", e))?
@@ -8275,7 +8466,7 @@ impl CheckpointDb {
     /// Get all running (incomplete) task runs.
     /// Note: output_log is empty for performance. Use get_full_task_output() to get output.
     /// Includes execution_steps_json and log_sources_json for re-execution on resume.
-    pub fn get_running_task_runs(&self) -> Result<Vec<TaskRun>, String> {
+    pub fn get_running_task_runs(&self, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -8290,13 +8481,14 @@ impl CheckpointDb {
                        task_type, config_id, workflow_name
                 FROM task_runs
                 WHERE status IN ('running', 'paused') AND (workflow_type IS NULL OR workflow_type != 'chat')
+                      AND (?1 IS NULL OR runner_port IS NULL OR runner_port = ?1)
                 ORDER BY updated_at DESC
                 "#,
             )
             .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
         let task_runs = stmt
-            .query_map([], |row| {
+            .query_map(params![runner_port.map(|p| p as i64)], |row| {
                 Ok(TaskRun {
                     id: row.get(0)?,
                     task_name: row.get(1)?,
@@ -8327,6 +8519,8 @@ impl CheckpointDb {
                     reflection_source_task_run_id: None, // Not queried for performance
                     is_follow_up: false,      // Not queried for performance
                     follow_up_source_task_run_id: None, // Not queried for performance
+                    is_fixer: false,          // Not queried for performance
+                    fixer_source_task_run_id: None, // Not queried for performance
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -8345,7 +8539,7 @@ impl CheckpointDb {
 
     /// Get all running unified workflow task runs for resume on startup.
     /// Returns task runs where status = 'running' AND workflow_type = 'unified'.
-    pub fn get_running_unified_workflows(&self) -> Result<Vec<TaskRun>, String> {
+    pub fn get_running_unified_workflows(&self, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -8357,16 +8551,20 @@ impl CheckpointDb {
                        goal_achieved, remaining_work, summary_generated_at,
                        workspace_id, triggered_by,
                        created_at, updated_at, completed_at,
-                       task_type, config_id, workflow_name
+                       task_type, config_id, workflow_name,
+                       COALESCE(is_reflection, 0) as is_reflection,
+                       COALESCE(is_follow_up, 0) as is_follow_up,
+                       COALESCE(is_fixer, 0) as is_fixer
                 FROM task_runs
                 WHERE status = 'running' AND workflow_type = 'unified'
+                      AND (?1 IS NULL OR runner_port IS NULL OR runner_port = ?1)
                 ORDER BY updated_at DESC
                 "#,
             )
             .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
         let task_runs = stmt
-            .query_map([], |row| {
+            .query_map(params![runner_port.map(|p| p as i64)], |row| {
                 Ok(TaskRun {
                     id: row.get(0)?,
                     task_name: row.get(1)?,
@@ -8393,10 +8591,12 @@ impl CheckpointDb {
                     depth: 0,                 // Not queried for performance
                     bridge_id: None,          // Not queried for performance
                     result_data: None,        // Not queried for performance
-                    is_reflection: false,     // Not queried for performance
+                    is_reflection: row.get::<_, i32>(23).unwrap_or(0) != 0,
                     reflection_source_task_run_id: None, // Not queried for performance
-                    is_follow_up: false,      // Not queried for performance
+                    is_follow_up: row.get::<_, i32>(24).unwrap_or(0) != 0,
                     follow_up_source_task_run_id: None, // Not queried for performance
+                    is_fixer: row.get::<_, i32>(25).unwrap_or(0) != 0,
+                    fixer_source_task_run_id: None, // Not queried for performance
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -8415,7 +8615,7 @@ impl CheckpointDb {
 
     /// Get all running AI session task runs for resume on startup.
     /// Returns task runs where status = 'running' AND workflow_type = 'chat'.
-    pub fn get_running_ai_sessions(&self) -> Result<Vec<TaskRun>, String> {
+    pub fn get_running_ai_sessions(&self, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -8430,13 +8630,14 @@ impl CheckpointDb {
                        task_type, config_id, workflow_name
                 FROM task_runs
                 WHERE status = 'running' AND workflow_type = 'chat'
+                      AND (?1 IS NULL OR runner_port IS NULL OR runner_port = ?1)
                 ORDER BY updated_at DESC
                 "#,
             )
             .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
         let task_runs = stmt
-            .query_map([], |row| {
+            .query_map(params![runner_port.map(|p| p as i64)], |row| {
                 Ok(TaskRun {
                     id: row.get(0)?,
                     task_name: row.get(1)?,
@@ -8467,6 +8668,8 @@ impl CheckpointDb {
                     reflection_source_task_run_id: None,
                     is_follow_up: false,
                     follow_up_source_task_run_id: None,
+                    is_fixer: false,
+                    fixer_source_task_run_id: None,
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -8485,7 +8688,7 @@ impl CheckpointDb {
 
     /// Get recent AI sessions (all statuses) for sidebar listing.
     /// Returns lightweight summaries ordered by most recently updated.
-    pub fn get_ai_sessions(&self, limit: u32) -> Result<Vec<AiSessionSummary>, String> {
+    pub fn get_ai_sessions(&self, limit: u32, runner_port: Option<u16>) -> Result<Vec<AiSessionSummary>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -8494,14 +8697,15 @@ impl CheckpointDb {
                 SELECT id, task_name, status, updated_at, created_at
                 FROM task_runs
                 WHERE workflow_type = 'chat'
+                      AND (?1 IS NULL OR runner_port IS NULL OR runner_port = ?1)
                 ORDER BY updated_at DESC
-                LIMIT ?1
+                LIMIT ?2
                 "#,
             )
             .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
         let sessions = stmt
-            .query_map(params![limit], |row| {
+            .query_map(params![runner_port.map(|p| p as i64), limit], |row| {
                 Ok(AiSessionSummary {
                     id: row.get(0)?,
                     task_name: row.get(1)?,
@@ -8523,6 +8727,7 @@ impl CheckpointDb {
     pub fn get_incomplete_task_run_for_workflow(
         &self,
         workflow_id: &str,
+        runner_port: Option<u16>,
     ) -> Result<Option<String>, String> {
         let conn = self.get_conn()?;
 
@@ -8533,10 +8738,11 @@ impl CheckpointDb {
             WHERE config_id = ?1
               AND status = 'running'
               AND workflow_type = 'unified'
+              AND (?2 IS NULL OR runner_port IS NULL OR runner_port = ?2)
             ORDER BY updated_at DESC
             LIMIT 1
             "#,
-            params![workflow_id],
+            params![workflow_id, runner_port.map(|p| p as i64)],
             |row| row.get(0),
         );
 
@@ -8624,7 +8830,7 @@ impl CheckpointDb {
 
     /// Get recent task runs (for display in UI).
     /// Note: output_log is empty for performance. Use get_full_task_output() to get output.
-    pub fn get_recent_task_runs(&self, limit: u32) -> Result<Vec<TaskRun>, String> {
+    pub fn get_recent_task_runs(&self, limit: u32, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -8636,15 +8842,16 @@ impl CheckpointDb {
                        workspace_id, triggered_by,
                        created_at, updated_at, completed_at
                 FROM task_runs
-                WHERE workflow_type IS NULL OR workflow_type != 'chat'
+                WHERE (workflow_type IS NULL OR workflow_type != 'chat')
+                      AND (?1 IS NULL OR runner_port IS NULL OR runner_port = ?1)
                 ORDER BY updated_at DESC
-                LIMIT ?1
+                LIMIT ?2
                 "#,
             )
             .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
         let task_runs = stmt
-            .query_map(params![limit], |row| {
+            .query_map(params![runner_port.map(|p| p as i64), limit], |row| {
                 Ok(TaskRun {
                     id: row.get(0)?,
                     task_name: row.get(1)?,
@@ -8681,6 +8888,8 @@ impl CheckpointDb {
                     reflection_source_task_run_id: None, // Not queried for performance
                     is_follow_up: false,      // Not queried for performance
                     follow_up_source_task_run_id: None, // Not queried for performance
+                    is_fixer: false,          // Not queried for performance
+                    fixer_source_task_run_id: None, // Not queried for performance
                     created_at: row.get(18)?,
                     updated_at: row.get(19)?,
                     completed_at: row.get(20)?,
@@ -8699,8 +8908,11 @@ impl CheckpointDb {
         &self,
         limit: u32,
         workflow_type: Option<&str>,
+        runner_port: Option<u16>,
     ) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
+
+        let port_param: Option<i64> = runner_port.map(|p| p as i64);
 
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(wt) =
             workflow_type
@@ -8714,11 +8926,13 @@ impl CheckpointDb {
                            created_at, updated_at, completed_at
                     FROM task_runs
                     WHERE workflow_type = ?1
+                          AND (?2 IS NULL OR runner_port IS NULL OR runner_port = ?2)
                     ORDER BY updated_at DESC
-                    LIMIT ?2
+                    LIMIT ?3
                     "#.to_string(),
                     vec![
                         Box::new(wt.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                        Box::new(port_param),
                         Box::new(limit),
                     ],
                 )
@@ -8731,10 +8945,14 @@ impl CheckpointDb {
                            workspace_id, triggered_by, workflow_type,
                            created_at, updated_at, completed_at
                     FROM task_runs
+                    WHERE (?1 IS NULL OR runner_port IS NULL OR runner_port = ?1)
                     ORDER BY updated_at DESC
-                    LIMIT ?1
+                    LIMIT ?2
                     "#.to_string(),
-                    vec![Box::new(limit) as Box<dyn rusqlite::types::ToSql>],
+                    vec![
+                        Box::new(port_param) as Box<dyn rusqlite::types::ToSql>,
+                        Box::new(limit),
+                    ],
                 )
         };
 
@@ -8783,6 +9001,8 @@ impl CheckpointDb {
                     reflection_source_task_run_id: None, // Not queried for performance
                     is_follow_up: false,  // Not queried for performance
                     follow_up_source_task_run_id: None, // Not queried for performance
+                    is_fixer: false,      // Not queried for performance
+                    fixer_source_task_run_id: None, // Not queried for performance
                     created_at: row.get(19)?,
                     updated_at: row.get(20)?,
                     completed_at: row.get(21)?,
@@ -12640,7 +12860,7 @@ impl CheckpointDb {
     pub fn get_running_task_step_data(
         &self,
     ) -> Result<Option<(TaskRun, Vec<TaskRunEvent>)>, String> {
-        let running = self.get_running_task_runs()?;
+        let running = self.get_running_task_runs(self.get_runner_port())?;
         let task = match running.into_iter().next() {
             Some(t) => t,
             None => return Ok(None),
@@ -13324,7 +13544,8 @@ impl CheckpointDb {
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                        stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                        completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
-                       quality_report, constraint_overrides
+                       quality_report, acceptance_criteria, constraint_overrides,
+                       COALESCE(ai_reviewed, 1) as ai_reviewed
                 FROM unified_workflows
                 ORDER BY is_favorite DESC, updated_at DESC
                 "#,
@@ -13415,10 +13636,14 @@ impl CheckpointDb {
                     quality_report: row
                         .get::<_, Option<String>>(37)?
                         .and_then(|s| serde_json::from_str(&s).ok()),
-                    constraint_overrides: row
+                    acceptance_criteria: row
                         .get::<_, Option<String>>(38)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    constraint_overrides: row
+                        .get::<_, Option<String>>(39)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -13447,7 +13672,8 @@ impl CheckpointDb {
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
-                   quality_report, constraint_overrides
+                   quality_report, acceptance_criteria, constraint_overrides,
+                   COALESCE(ai_reviewed, 1) as ai_reviewed
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -13527,7 +13753,9 @@ impl CheckpointDb {
                     dependency_graph: row.get::<_, Option<String>>(35)?.and_then(|s| serde_json::from_str(&s).ok()),
                     cost_annotations: row.get::<_, Option<String>>(36)?.and_then(|s| serde_json::from_str(&s).ok()),
                     quality_report: row.get::<_, Option<String>>(37)?.and_then(|s| serde_json::from_str(&s).ok()),
-                    constraint_overrides: row.get::<_, Option<String>>(38)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+                    acceptance_criteria: row.get::<_, Option<String>>(38)?.and_then(|s| serde_json::from_str(&s).ok()),
+                    constraint_overrides: row.get::<_, Option<String>>(39)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -13558,7 +13786,8 @@ impl CheckpointDb {
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
-                   quality_report, constraint_overrides
+                   quality_report, acceptance_criteria, constraint_overrides,
+                   COALESCE(ai_reviewed, 1) as ai_reviewed
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -13640,7 +13869,9 @@ impl CheckpointDb {
                     dependency_graph: row.get::<_, Option<String>>(35)?.and_then(|s| serde_json::from_str(&s).ok()),
                     cost_annotations: row.get::<_, Option<String>>(36)?.and_then(|s| serde_json::from_str(&s).ok()),
                     quality_report: row.get::<_, Option<String>>(37)?.and_then(|s| serde_json::from_str(&s).ok()),
-                    constraint_overrides: row.get::<_, Option<String>>(38)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+                    acceptance_criteria: row.get::<_, Option<String>>(38)?.and_then(|s| serde_json::from_str(&s).ok()),
+                    constraint_overrides: row.get::<_, Option<String>>(39)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -13708,8 +13939,8 @@ impl CheckpointDb {
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                 stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                 completion_prompts_first, dependency_graph, cost_annotations, quality_report,
-                constraint_overrides
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)
+                acceptance_criteria, constraint_overrides, ai_reviewed
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)
             "#,
             params![
                 id,
@@ -13749,7 +13980,9 @@ impl CheckpointDb {
                 request.dependency_graph.as_ref().map(|v| v.to_string()),
                 request.cost_annotations.as_ref().map(|v| v.to_string()),
                 request.quality_report.as_ref().map(|v| v.to_string()),
+                request.acceptance_criteria.as_ref().map(|v| v.to_string()),
                 serde_json::to_string(&request.constraint_overrides.clone().unwrap_or_default()).unwrap_or_else(|_| "{}".to_string()),
+                request.ai_reviewed.unwrap_or(true),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -13812,8 +14045,8 @@ impl CheckpointDb {
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                 stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                 completion_prompts_first, dependency_graph, cost_annotations, quality_report,
-                constraint_overrides
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)
+                acceptance_criteria, constraint_overrides, ai_reviewed
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)
             "#,
             params![
                 id,
@@ -13853,7 +14086,9 @@ impl CheckpointDb {
                 request.dependency_graph.as_ref().map(|v| v.to_string()),
                 request.cost_annotations.as_ref().map(|v| v.to_string()),
                 request.quality_report.as_ref().map(|v| v.to_string()),
+                request.acceptance_criteria.as_ref().map(|v| v.to_string()),
                 serde_json::to_string(&request.constraint_overrides.clone().unwrap_or_default()).unwrap_or_else(|_| "{}".to_string()),
+                request.ai_reviewed.unwrap_or(true),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -13978,6 +14213,11 @@ impl CheckpointDb {
             .quality_report
             .as_ref()
             .or(existing.quality_report.as_ref());
+        let acceptance_criteria = request
+            .acceptance_criteria
+            .as_ref()
+            .or(existing.acceptance_criteria.as_ref());
+        let _ai_reviewed = request.ai_reviewed.unwrap_or(existing.ai_reviewed);
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
         let setup_steps_json =
@@ -14037,8 +14277,10 @@ impl CheckpointDb {
                 dependency_graph = ?32,
                 cost_annotations = ?33,
                 quality_report = ?34,
-                constraint_overrides = ?35
-            WHERE id = ?36
+                acceptance_criteria = ?35,
+                constraint_overrides = ?36,
+                ai_reviewed = ?37
+            WHERE id = ?38
             "#,
             params![
                 name,
@@ -14075,7 +14317,9 @@ impl CheckpointDb {
                 dependency_graph.map(|v| v.to_string()),
                 cost_annotations.map(|v| v.to_string()),
                 quality_report.map(|v| v.to_string()),
+                acceptance_criteria.map(|v| v.to_string()),
                 serde_json::to_string(constraint_overrides).unwrap_or_else(|_| "{}".to_string()),
+                request.ai_reviewed.unwrap_or(existing.ai_reviewed),
                 id,
             ],
         )
@@ -14113,7 +14357,8 @@ impl CheckpointDb {
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
-                   quality_report, constraint_overrides
+                   quality_report, acceptance_criteria, constraint_overrides,
+                   COALESCE(ai_reviewed, 1) as ai_reviewed
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -14233,10 +14478,14 @@ impl CheckpointDb {
                     quality_report: row
                         .get::<_, Option<String>>(37)?
                         .and_then(|s| serde_json::from_str(&s).ok()),
-                    constraint_overrides: row
+                    acceptance_criteria: row
                         .get::<_, Option<String>>(38)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    constraint_overrides: row
+                        .get::<_, Option<String>>(39)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -14294,6 +14543,8 @@ impl CheckpointDb {
             dependency_graph: original.dependency_graph,
             cost_annotations: original.cost_annotations,
             quality_report: original.quality_report,
+            acceptance_criteria: original.acceptance_criteria,
+            ai_reviewed: Some(original.ai_reviewed),
         };
 
         self.create_unified_workflow(&create_request)
@@ -14347,7 +14598,8 @@ impl CheckpointDb {
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep,
                        max_sweep_iterations, stages, stop_on_failure, reflection_mode, model_overrides,
                        approval_gate, completion_prompts_first, is_favorite, dependency_graph,
-                       cost_annotations, quality_report, constraint_overrides
+                       cost_annotations, quality_report, acceptance_criteria, constraint_overrides,
+                       COALESCE(ai_reviewed, 1) as ai_reviewed
                 FROM unified_workflows
                 WHERE sync_pending = 1
                 "#,
@@ -14438,10 +14690,14 @@ impl CheckpointDb {
                     quality_report: row
                         .get::<_, Option<String>>(37)?
                         .and_then(|s| serde_json::from_str(&s).ok()),
-                    constraint_overrides: row
+                    acceptance_criteria: row
                         .get::<_, Option<String>>(38)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    constraint_overrides: row
+                        .get::<_, Option<String>>(39)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
                     targeted_error_ids: vec![],
                 })
             })
@@ -17049,7 +17305,8 @@ impl CheckpointDb {
                        generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                        stages, stop_on_failure, reflection_mode, sync_pending, example_status,
                        model_overrides, approval_gate, completion_prompts_first, is_favorite,
-                       dependency_graph, cost_annotations, quality_report, constraint_overrides
+                       dependency_graph, cost_annotations, quality_report, acceptance_criteria,
+                       constraint_overrides
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -17143,7 +17400,8 @@ impl CheckpointDb {
                     "dependency_graph": row.get::<_, Option<String>>(37)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     "cost_annotations": row.get::<_, Option<String>>(38)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     "quality_report": row.get::<_, Option<String>>(39)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
-                    "constraint_overrides": row.get::<_, Option<String>>(40)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).unwrap_or(serde_json::json!({})),
+                    "acceptance_criteria": row.get::<_, Option<String>>(40)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "constraint_overrides": row.get::<_, Option<String>>(41)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).unwrap_or(serde_json::json!({})),
                 }))
             })
             .map_err(|e| format!("Failed to export unified workflows: {}", e))?
@@ -17652,6 +17910,11 @@ impl CheckpointDb {
             let example_status = workflow["example_status"].as_str().unwrap_or("pending");
             let constraint_overrides = serde_json::to_string(&workflow["constraint_overrides"])
                 .unwrap_or_else(|_| "{}".to_string());
+            let acceptance_criteria = if workflow["acceptance_criteria"].is_null() {
+                None
+            } else {
+                Some(serde_json::to_string(&workflow["acceptance_criteria"]).unwrap_or_else(|_| "null".to_string()))
+            };
 
             let result = conn.execute(
                 r#"
@@ -17664,12 +17927,12 @@ impl CheckpointDb {
                     disabled_context_ids, auto_include_contexts, prompt_template,
                     generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                     stages, stop_on_failure, approval_gate, reflection_mode, completion_prompts_first,
-                    is_favorite, sync_pending, example_status, constraint_overrides
+                    is_favorite, sync_pending, example_status, acceptance_criteria, constraint_overrides
                 )
                 VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                    ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37
+                    ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38
                 )
                 "#,
                 params![
@@ -17709,6 +17972,7 @@ impl CheckpointDb {
                     is_favorite,
                     sync_pending,
                     example_status,
+                    acceptance_criteria,
                     constraint_overrides
                 ],
             );

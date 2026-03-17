@@ -810,6 +810,119 @@ impl LoopController {
                 }
             }
 
+            // Enrich reflection context with pre-loaded files and project structure
+            if config.reflection_mode || config.base_prompt.contains("{{referenced_files}}") {
+                crate::reflection::workflow::enrich_reflection_context(
+                    self.setup_executor.shared_variables(),
+                    config.project_path.as_deref(),
+                );
+                // Re-run substitution for the newly added variables
+                let enriched_vars = self.setup_executor.shared_variables().get_all();
+                for (name, value) in &enriched_vars {
+                    let pattern = format!("{{{{{}}}}}", name);
+                    if config.base_prompt.contains(&pattern) {
+                        config.base_prompt = config.base_prompt.replace(&pattern, value);
+                    }
+                }
+                // Also substitute enriched variables into stage step contents
+                for si in stage_idx..config.stages.len() {
+                    let s = &mut config.stages[si];
+                    for step in s
+                        .setup_automation_steps
+                        .iter_mut()
+                        .chain(s.setup_prompt_steps.iter_mut())
+                        .chain(s.verification_steps.iter_mut())
+                        .chain(s.agentic_steps.iter_mut())
+                        .chain(s.completion_automation_steps.iter_mut())
+                        .chain(s.completion_prompt_steps.iter_mut())
+                    {
+                        for (name, value) in &enriched_vars {
+                            let pattern = format!("{{{{{}}}}}", name);
+                            if let Some(ref mut content) = step.prompt_content {
+                                if content.contains(&pattern) {
+                                    *content = content.replace(&pattern, value);
+                                }
+                            }
+                            if let Some(ref mut cmd) = step.shell_command {
+                                if cmd.contains(&pattern) {
+                                    *cmd = cmd.replace(&pattern, value);
+                                }
+                            }
+                            if let Some(ref mut cmd) = step.check_command {
+                                if cmd.contains(&pattern) {
+                                    *cmd = cmd.replace(&pattern, value);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Always provide project context (tree + root) for all workflows
+            if self.setup_executor.shared_variables().get("project_root").is_none() {
+                crate::reflection::workflow::enrich_project_context(
+                    self.setup_executor.shared_variables(),
+                    config.project_path.as_deref(),
+                );
+                // Substitute the new variables into base_prompt
+                let project_vars = self.setup_executor.shared_variables().get_all();
+                for (name, value) in &project_vars {
+                    if name == "project_root" || name == "project_structure" {
+                        let pattern = format!("{{{{{}}}}}", name);
+                        if config.base_prompt.contains(&pattern) {
+                            config.base_prompt = config.base_prompt.replace(&pattern, value);
+                        }
+                    }
+                }
+            }
+
+            // ─── Validate critical shared variables ───
+            // After all setup steps and enrichment, check that critical template
+            // variables were actually populated. If a setup API call failed (e.g.,
+            // curl returned an error), the variable remains unset and the literal
+            // {{variable_name}} text ends up in the agentic prompt.
+            {
+                let base_url = crate::mcp::types::get_self_base_url_from_env();
+                let critical_vars = [
+                    "source_findings",
+                    "source_ai_output",
+                    "source_workflow_state",
+                ];
+                for var_name in &critical_vars {
+                    let pattern = format!("{{{{{}}}}}", var_name);
+                    if config.base_prompt.contains(&pattern) {
+                        let fallback = format!(
+                            "Data loading failed for '{}'. Use the runner API directly: GET {}/task-runs/{{execution_id}}/output",
+                            var_name, base_url
+                        );
+                        warn!(
+                            "Stage {}: Critical variable '{}' was not populated by setup — injecting fallback message",
+                            stage_num, var_name
+                        );
+                        config.base_prompt = config.base_prompt.replace(&pattern, &fallback);
+                    }
+                }
+                // Also check for any remaining unresolved {{...}} markers in the prompt
+                // and log warnings (but don't replace them — they may be intentional templates)
+                let remaining_markers: Vec<&str> = config
+                    .base_prompt
+                    .match_indices("{{")
+                    .filter_map(|(start, _)| {
+                        config.base_prompt[start..]
+                            .find("}}")
+                            .map(|end| &config.base_prompt[start..start + end + 2])
+                    })
+                    .collect();
+                if !remaining_markers.is_empty() {
+                    warn!(
+                        "Stage {}: {} unresolved template marker(s) remain in base_prompt: {:?}",
+                        stage_num,
+                        remaining_markers.len(),
+                        &remaining_markers[..remaining_markers.len().min(5)]
+                    );
+                }
+            }
+
             // Reborrow stage after mutable substitution
             let stage = &config.stages[stage_idx];
 
@@ -870,6 +983,7 @@ impl LoopController {
                     verification_history: std::collections::HashMap::new(),
                     routing_context: Default::default(),
                     project_path: config.project_path.clone(),
+                    acceptance_criteria: config.acceptance_criteria.clone(),
                 };
 
                 // Handle agentic-first: run the agentic phase before the verification loop.
@@ -1326,6 +1440,7 @@ impl LoopController {
         // - Project reflection: runs in BOTH dev and production modes (non-generation workflows)
         // - Workflow reflection: runs in dev mode only (non-generation workflows)
         // - Generation reflection: runs in dev mode only (generation workflows)
+        // - UI Bridge reflection: runs on NON-dev-mode workflows (real workflows that exercise UI Bridge)
         {
             let session_manager: Option<Arc<crate::claude_session::SessionManager>> = self
                 .app_handle
@@ -1406,6 +1521,47 @@ impl LoopController {
                 });
             }
 
+            // UI Bridge reflection (non-dev-mode workflows only, 15s delay)
+            // This is the inverse of other reflections: it runs on real workflows
+            // (user-triggered and auto-run generated), NOT on dev-mode workflows
+            // (reflections, follow-ups). Dev-mode workflows don't exercise UI Bridge
+            // at runtime — the real workflows do. The guard function additionally
+            // checks for actual UI Bridge activity before launching.
+            if !config.is_dev_mode {
+                let ub_deps = crate::reflection::trigger::ReflectionDeps {
+                    app_state: self.app_state.clone(),
+                    config_storage: self.config_storage.clone(),
+                    app_handle: self.app_handle.clone(),
+                    pid_tracker: self.pid_tracker.clone(),
+                    session_manager: session_manager.clone(),
+                };
+                let ub_source_id = config.execution_id.clone();
+                tokio::spawn(async move {
+                    // Delay: 15s (after workflow reflection's 10s, before follow-up's 20s)
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    match crate::reflection::trigger::launch_ui_bridge_reflection(
+                        ub_deps,
+                        ub_source_id.clone(),
+                    ) {
+                        Ok(id) if id == "skipped" => {
+                            debug!("UI Bridge reflection skipped for {}", ub_source_id);
+                        }
+                        Ok(id) => {
+                            info!(
+                                "Launched UI Bridge reflection {} for completed run {}",
+                                id, ub_source_id
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to launch UI Bridge reflection for {}: {}",
+                                ub_source_id, e
+                            );
+                        }
+                    }
+                });
+            }
+
             // Trigger follow-up workflow (20s delay, after reflections)
             if config.is_dev_mode {
                 let follow_up_deps = crate::follow_up::trigger::FollowUpDeps {
@@ -1413,7 +1569,7 @@ impl LoopController {
                     config_storage: self.config_storage.clone(),
                     app_handle: self.app_handle.clone(),
                     pid_tracker: self.pid_tracker.clone(),
-                    session_manager,
+                    session_manager: session_manager.clone(),
                 };
                 let follow_up_source_id = config.execution_id.clone();
                 tokio::spawn(async move {
@@ -1440,6 +1596,40 @@ impl LoopController {
                         }
                     }
                 });
+            }
+
+            // Trigger fixer workflow (30s delay, waits for all children to complete)
+            if config.is_dev_mode {
+                let fixer_deps = crate::fixer::trigger::FixerDeps {
+                    app_state: self.app_state.clone(),
+                    config_storage: self.config_storage.clone(),
+                    app_handle: self.app_handle.clone(),
+                    pid_tracker: self.pid_tracker.clone(),
+                    session_manager: session_manager.clone(),
+                };
+                let fixer_source_id = config.execution_id.clone();
+                // launch_fixer is sync — it spawns its own async task internally
+                // that waits for children before running the fixer workflow
+                match crate::fixer::trigger::launch_fixer(
+                    fixer_deps,
+                    fixer_source_id.clone(),
+                ) {
+                    Ok(id) if id == "skipped" => {
+                        debug!("Fixer skipped for {}", fixer_source_id);
+                    }
+                    Ok(id) => {
+                        info!(
+                            "Launched fixer {} for completed run {}",
+                            id, fixer_source_id
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to launch fixer for {}: {}",
+                            fixer_source_id, e
+                        );
+                    }
+                }
             }
         }
 
@@ -1627,6 +1817,11 @@ impl LoopController {
                 }
             );
 
+            self.record_activity(
+                &config.execution_id,
+                &format!("loop_iteration_{}_start", iteration),
+            );
+
             // Check if the task has been stopped externally (e.g., user clicked Stop button)
             if self.is_task_stopped(&config.execution_id) {
                 warn!("Task was stopped externally - exiting loop");
@@ -1739,6 +1934,11 @@ impl LoopController {
             self.persist_workflow_state(
                 &config.execution_id,
                 &UnifiedWorkflowState::verification_running(iteration),
+            );
+
+            self.record_activity(
+                &config.execution_id,
+                &format!("verification_start_iter_{}", iteration),
             );
 
             self.record_stage_transition(
@@ -2663,6 +2863,19 @@ impl LoopController {
             };
             iteration_results.push(iter_result);
 
+            // Clear failure_context from previous iterations to prevent unbounded
+            // memory growth. The context has already been persisted to the knowledge
+            // base (via record_verification_feedback) and used for the agentic prompt.
+            // Downstream consumers only use passed_checks/failed_checks/verification_passed.
+            let results_len = iteration_results.len();
+            if results_len > 1 {
+                for old in &mut iteration_results[..results_len - 1] {
+                    if !old.failure_context.is_empty() {
+                        old.failure_context = String::new();
+                    }
+                }
+            }
+
             // Log agentic outcome for debugging (including parsed confidence)
             info!(
                 "AGENTIC-OUTCOME: iteration={}, outcome={}, confidence={}",
@@ -3457,6 +3670,32 @@ impl LoopController {
     /// For composed run children (e.g., composed-run-X-workflow-N),
     /// state is persisted under the parent composed run ID since children don't have
     /// their own task_run records.
+    /// Record a workflow activity heartbeat for debugging stuck workflows.
+    /// Updates runtime_context_json with the current phase and timestamp.
+    fn record_activity(&self, execution_id: &str, activity: &str) {
+        let persist_id = super::get_parent_task_id(execution_id);
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Merge into existing runtime context or create new
+        let existing = self
+            .checkpoint_db
+            .get_task_run_runtime_context(&persist_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "{}".to_string());
+
+        let mut ctx: serde_json::Value =
+            serde_json::from_str(&existing).unwrap_or(serde_json::json!({}));
+        ctx["last_activity"] = serde_json::json!(activity);
+        ctx["last_activity_at"] = serde_json::json!(now);
+
+        if let Ok(json) = serde_json::to_string(&ctx) {
+            let _ = self
+                .checkpoint_db
+                .update_task_run_runtime_context(&persist_id, &json);
+        }
+    }
+
     fn persist_workflow_state(&self, execution_id: &str, state: &UnifiedWorkflowState) {
         // For composed run children (e.g., composed-run-X-workflow-N),
         // persist under the parent ID since children don't have their own task_run records.
@@ -3818,6 +4057,27 @@ impl Default for ResumeConfig {
     }
 }
 
+/// Maximum time (in seconds) a task can remain in "running" status without a
+/// matching workflow definition before it is automatically marked as failed.
+/// Tasks whose `updated_at` timestamp is older than this threshold are
+/// considered stale and will not be preserved indefinitely.
+const STALE_RUNNING_TASK_TIMEOUT_SECS: i64 = 3600; // 1 hour
+
+/// Check whether a task run has been stuck in "running" long enough to be
+/// considered stale. Returns `true` when the task's `updated_at` timestamp
+/// is more than [`STALE_RUNNING_TASK_TIMEOUT_SECS`] in the past.
+fn is_task_stale(task_run: &crate::database::TaskRun) -> bool {
+    let now = chrono::Utc::now();
+    if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&task_run.updated_at) {
+        let age = now.signed_duration_since(updated);
+        age.num_seconds() > STALE_RUNNING_TASK_TIMEOUT_SECS
+    } else {
+        // If we cannot parse the timestamp treat the task as stale so it
+        // does not stay in "running" forever.
+        true
+    }
+}
+
 /// Resume interrupted unified workflows on startup.
 ///
 /// This function should be called when the runner starts to handle any
@@ -3836,7 +4096,7 @@ pub async fn resume_interrupted_workflows(
     config: ResumeConfig,
 ) -> usize {
     // Get all running unified workflows
-    let running_workflows = match db.get_running_unified_workflows() {
+    let running_workflows = match db.get_running_unified_workflows(None) {
         Ok(workflows) => workflows,
         Err(e) => {
             warn!("Failed to query running unified workflows: {}", e);
@@ -3881,6 +4141,35 @@ pub async fn resume_interrupted_workflows(
                 processed_count += 1;
                 continue;
             }
+        }
+
+        // Programmatic workflows (follow-up, reflection, fixer) are built in-memory
+        // and never saved to the workflow library. They cannot be resumed from a DB
+        // definition, so fail them immediately instead of waiting for the stale timeout.
+        if task_run.is_follow_up || task_run.is_reflection || task_run.is_fixer {
+            let kind = if task_run.is_follow_up {
+                "follow-up"
+            } else if task_run.is_reflection {
+                "reflection"
+            } else {
+                "fixer"
+            };
+            info!(
+                "Marking interrupted {} workflow '{}' (id: {}) as failed — programmatic workflows cannot be resumed",
+                kind, task_run.task_name, task_run.id
+            );
+            if let Err(e) = db.fail_task_run(
+                &task_run.id,
+                &format!(
+                    "Interrupted {} workflow cannot be resumed (no persistent workflow definition)",
+                    kind
+                ),
+            ) {
+                error!("Failed to mark {} workflow {} as failed: {}", kind, task_run.id, e);
+            } else {
+                processed_count += 1;
+            }
+            continue;
         }
 
         // Check per-task auto_continue setting - this determines whether to resume on startup
@@ -4019,6 +4308,7 @@ pub async fn resume_interrupted_workflows(
                                 verification_history: std::collections::HashMap::new(),
                                 routing_context: Default::default(),
                                 project_path: crate::mcp::shared::current_project_path(),
+                                acceptance_criteria: workflow.acceptance_criteria.clone(),
                             };
 
                             controller
@@ -4038,15 +4328,48 @@ pub async fn resume_interrupted_workflows(
                     processed_count += 1;
                 }
                 Ok(None) => {
-                    warn!(
-                        "Workflow definition {} not found for task {} - preserving 'running' status for manual investigation",
-                        wf_id, task_run.id
-                    );
-                    // Don't mark as failed - the workflow definition might have been deleted
-                    // but the task_run should be manually resolved by the user
+                    if is_task_stale(task_run) {
+                        warn!(
+                            "Workflow definition {} not found for task {} and task has been running for over {} seconds - marking as failed",
+                            wf_id, task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
+                        );
+                        if let Err(e) = db.fail_task_run(
+                            &task_run.id,
+                            &format!(
+                                "Workflow definition '{}' not found and task exceeded stale timeout ({}s)",
+                                wf_id, STALE_RUNNING_TASK_TIMEOUT_SECS
+                            ),
+                        ) {
+                            error!("Failed to mark stale task {} as failed: {}", task_run.id, e);
+                        } else {
+                            processed_count += 1;
+                        }
+                    } else {
+                        warn!(
+                            "Workflow definition {} not found for task {} - preserving 'running' status (will auto-fail after {}s)",
+                            wf_id, task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
+                        );
+                    }
                 }
                 Err(e) => {
                     error!("Failed to fetch workflow {} for resume: {}", wf_id, e);
+                    if is_task_stale(task_run) {
+                        warn!(
+                            "Task {} has been running for over {} seconds and workflow fetch failed - marking as failed",
+                            task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
+                        );
+                        if let Err(e2) = db.fail_task_run(
+                            &task_run.id,
+                            &format!(
+                                "Failed to fetch workflow definition and task exceeded stale timeout ({}s): {}",
+                                STALE_RUNNING_TASK_TIMEOUT_SECS, e
+                            ),
+                        ) {
+                            error!("Failed to mark stale task {} as failed: {}", task_run.id, e2);
+                        } else {
+                            processed_count += 1;
+                        }
+                    }
                 }
             }
         } else if let Some(ref wf_name) = task_run.workflow_name {
@@ -4181,6 +4504,7 @@ pub async fn resume_interrupted_workflows(
                                 verification_history: std::collections::HashMap::new(),
                                 routing_context: Default::default(),
                                 project_path: crate::mcp::shared::current_project_path(),
+                                acceptance_criteria: workflow.acceptance_criteria.clone(),
                             };
 
                             controller
@@ -4200,23 +4524,76 @@ pub async fn resume_interrupted_workflows(
                     processed_count += 1;
                 }
                 Ok(None) => {
-                    warn!(
-                        "Workflow definition not found by name '{}' for task {} - preserving 'running' status",
-                        wf_name, task_run.id
-                    );
+                    if is_task_stale(task_run) {
+                        warn!(
+                            "Workflow definition not found by name '{}' for task {} and task has been running for over {} seconds - marking as failed",
+                            wf_name, task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
+                        );
+                        if let Err(e) = db.fail_task_run(
+                            &task_run.id,
+                            &format!(
+                                "Workflow definition '{}' not found and task exceeded stale timeout ({}s)",
+                                wf_name, STALE_RUNNING_TASK_TIMEOUT_SECS
+                            ),
+                        ) {
+                            error!("Failed to mark stale task {} as failed: {}", task_run.id, e);
+                        } else {
+                            processed_count += 1;
+                        }
+                    } else {
+                        warn!(
+                            "Workflow definition not found by name '{}' for task {} - preserving 'running' status (will auto-fail after {}s)",
+                            wf_name, task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
+                        );
+                    }
                 }
                 Err(e) => {
                     error!(
                         "Failed to fetch workflow by name '{}' for resume: {}",
                         wf_name, e
                     );
+                    if is_task_stale(task_run) {
+                        warn!(
+                            "Task {} has been running for over {} seconds and workflow name lookup failed - marking as failed",
+                            task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
+                        );
+                        if let Err(e2) = db.fail_task_run(
+                            &task_run.id,
+                            &format!(
+                                "Failed to look up workflow '{}' and task exceeded stale timeout ({}s): {}",
+                                wf_name, STALE_RUNNING_TASK_TIMEOUT_SECS, e
+                            ),
+                        ) {
+                            error!("Failed to mark stale task {} as failed: {}", task_run.id, e2);
+                        } else {
+                            processed_count += 1;
+                        }
+                    }
                 }
             }
         } else {
-            warn!(
-                "Could not extract workflow ID from task_id '{}' and no workflow_name set - preserving 'running' status",
-                task_run.id
-            );
+            if is_task_stale(task_run) {
+                warn!(
+                    "Could not extract workflow ID from task_id '{}' and no workflow_name set - task has been running for over {} seconds, marking as failed",
+                    task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
+                );
+                if let Err(e) = db.fail_task_run(
+                    &task_run.id,
+                    &format!(
+                        "No workflow definition could be resolved and task exceeded stale timeout ({}s)",
+                        STALE_RUNNING_TASK_TIMEOUT_SECS
+                    ),
+                ) {
+                    error!("Failed to mark stale task {} as failed: {}", task_run.id, e);
+                } else {
+                    processed_count += 1;
+                }
+            } else {
+                warn!(
+                    "Could not extract workflow ID from task_id '{}' and no workflow_name set - preserving 'running' status (will auto-fail after {}s)",
+                    task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
+                );
+            }
         }
     }
 

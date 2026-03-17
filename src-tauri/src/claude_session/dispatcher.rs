@@ -170,15 +170,19 @@ pub fn dispatch_line(
         // Persist the AI response delta to DB for chat session resilience.
         // This captures everything the AI said since the last persist point.
         if let Some(ref tx) = turn_persist_tx {
-            if let Ok(buf) = accumulated_output.lock() {
+            if let Ok(mut buf) = accumulated_output.lock() {
                 let persisted = persisted_output_len.load(Ordering::Relaxed);
                 if buf.len() > persisted {
                     let delta = buf[persisted..].to_string();
                     if !delta.trim().is_empty() {
-                        persisted_output_len.store(buf.len(), Ordering::Relaxed);
                         let _ = tx.send(delta);
                     }
                 }
+                // Drain buffer after persistence to prevent unbounded memory growth.
+                // The full output is persisted to DB via turn_persist_tx, so the
+                // in-memory copy is no longer needed.
+                buf.clear();
+                persisted_output_len.store(0, Ordering::Relaxed);
             }
         }
 

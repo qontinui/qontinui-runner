@@ -1,10 +1,15 @@
 //! Tauri IPC commands for process capture management.
+//!
+//! When running as a secondary instance (QONTINUI_INSTANCE_NAME is set),
+//! process management commands are proxied to the primary runner's HTTP API
+//! so that all runners have equal access to managed process state and logs.
 
 use std::sync::Arc;
 use tauri::State;
 
 use crate::commands::AppState;
 
+use super::primary_proxy;
 use super::types::*;
 
 /// Start a managed process by ID.
@@ -13,6 +18,9 @@ pub async fn start_managed_process(
     id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    if primary_proxy::is_secondary() {
+        return primary_proxy::start_process(&id).await;
+    }
     let manager = state.process_capture_manager.lock().await;
     let manager = manager
         .as_ref()
@@ -26,6 +34,9 @@ pub async fn stop_managed_process(
     id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    if primary_proxy::is_secondary() {
+        return primary_proxy::stop_process(&id).await;
+    }
     let manager = state.process_capture_manager.lock().await;
     let manager = manager
         .as_ref()
@@ -39,6 +50,9 @@ pub async fn restart_managed_process(
     id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    if primary_proxy::is_secondary() {
+        return primary_proxy::restart_process(&id).await;
+    }
     let manager = state.process_capture_manager.lock().await;
     let manager = manager
         .as_ref()
@@ -49,6 +63,9 @@ pub async fn restart_managed_process(
 /// Start all managed processes.
 #[tauri::command]
 pub async fn start_all_managed_processes(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    if primary_proxy::is_secondary() {
+        return primary_proxy::start_all().await;
+    }
     let manager = state.process_capture_manager.lock().await;
     let manager = manager
         .as_ref()
@@ -60,6 +77,9 @@ pub async fn start_all_managed_processes(state: State<'_, Arc<AppState>>) -> Res
 /// Stop all managed processes.
 #[tauri::command]
 pub async fn stop_all_managed_processes(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    if primary_proxy::is_secondary() {
+        return primary_proxy::stop_all().await;
+    }
     let manager = state.process_capture_manager.lock().await;
     let manager = manager
         .as_ref()
@@ -73,6 +93,9 @@ pub async fn stop_all_managed_processes(state: State<'_, Arc<AppState>>) -> Resu
 pub async fn get_managed_processes(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<ProcessStatus>, String> {
+    if primary_proxy::is_secondary() {
+        return primary_proxy::get_all_status().await;
+    }
     let manager = state.process_capture_manager.lock().await;
     let manager = manager
         .as_ref()
@@ -87,11 +110,15 @@ pub async fn get_process_output(
     tail: Option<usize>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<OutputLine>, String> {
+    let tail = tail.unwrap_or(500);
+    if primary_proxy::is_secondary() {
+        return primary_proxy::get_output(&id, tail).await;
+    }
     let manager = state.process_capture_manager.lock().await;
     let manager = manager
         .as_ref()
         .ok_or("Process capture manager not initialized")?;
-    manager.get_output(&id, tail.unwrap_or(500)).await
+    manager.get_output(&id, tail).await
 }
 
 /// Get all process configs.
@@ -99,6 +126,7 @@ pub async fn get_process_output(
 pub async fn get_process_configs(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<ProcessConfig>, String> {
+    // Configs are loaded from shared settings, so always read locally
     let manager = state.process_capture_manager.lock().await;
     let manager = manager
         .as_ref()

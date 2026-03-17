@@ -999,9 +999,27 @@ async fn handle_ai_search(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::POST, "/ai/search", Some(body)).await {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    match sdk_request(&state, Method::POST, "/ai/search", Some(body.clone())).await {
+        Ok(data) => {
+            // Unwrap ApiResponse {success, data} wrapper from control endpoint
+            if let Some(inner) = data.get("data") {
+                Json(inner.clone())
+            } else {
+                Json(data)
+            }
+        },
+        Err(_sdk_err) => {
+            // No SDK app connected — fall back to the runner's own UI via IPC
+            debug!("SDK ai/search unavailable, falling back to IPC control endpoint");
+            let payload = serde_json::json!({ "params": body });
+            match ui_bridge_request_sync(&state, "ai_search", payload).await {
+                Ok(data) => {
+                    // The control endpoint wraps in ApiResponse, extract the data
+                    Json(data)
+                }
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 

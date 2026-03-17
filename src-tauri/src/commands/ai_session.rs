@@ -54,7 +54,7 @@ pub async fn list_ai_sessions(
     session_manager: tauri::State<'_, Arc<SessionManager>>,
 ) -> Result<CommandResponse, String> {
     let db = app_state.checkpoint_db.clone();
-    let result = tokio::task::spawn_blocking(move || db.get_ai_sessions(50)).await;
+    let result = tokio::task::spawn_blocking(move || db.get_ai_sessions(50, None)).await;
 
     match result {
         Ok(Ok(sessions)) => {
@@ -771,6 +771,8 @@ pub async fn generate_workflow_from_session(
                         dependency_graph: workflow.dependency_graph.clone(),
                         cost_annotations: workflow.cost_annotations.clone(),
                         quality_report: workflow.quality_report.clone(),
+                        acceptance_criteria: workflow.acceptance_criteria.clone(),
+                        ai_reviewed: Some(workflow.ai_reviewed),
                     };
 
                     let db_save = app_state.checkpoint_db.clone();
@@ -955,7 +957,7 @@ pub async fn resume_ai_sessions(
     // Query running AI sessions
     let db_for_query = db.clone();
     let ai_sessions =
-        match tokio::task::spawn_blocking(move || db_for_query.get_running_ai_sessions()).await {
+        match tokio::task::spawn_blocking(move || db_for_query.get_running_ai_sessions(None)).await {
             Ok(Ok(sessions)) => sessions,
             Ok(Err(e)) => {
                 warn!("Failed to query running AI sessions: {}", e);

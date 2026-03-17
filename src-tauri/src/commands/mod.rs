@@ -91,6 +91,7 @@ pub mod setup_wizard; // First-launch setup wizard commands
 pub mod shell_commands; // Shell command management and execution
 pub mod state_explorer; // State explorer for AI-driven state machine exploration
 pub mod state_machine;
+pub mod orchestration_loop_configs; // Orchestration loop saved config CRUD
 pub mod state_machine_configs; // State machine config builder CRUD
 pub mod step_outputs; // Step output collection for test builder
 pub mod storage;
@@ -183,6 +184,8 @@ pub struct AppState {
     /// In-memory canvas state for A2UI panels.
     /// Agent sends structured JSON panels via HTTP; frontend renders them.
     pub canvas_state: Arc<tokio::sync::RwLock<crate::mcp::canvas::CanvasState>>,
+    /// Orchestration loop state for runner-side workflow loop management.
+    pub orchestration_loop: crate::orchestration_loop::loop_engine::SharedLoopState,
 }
 
 /// Standard response structure for command handlers.

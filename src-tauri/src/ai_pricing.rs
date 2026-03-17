@@ -48,6 +48,9 @@ const CLAUDE_OPUS_4_5_PRICING: ModelPricing = ModelPricing::new(15.0, 75.0);
 // Claude Sonnet 4 models (latest as of 2025)
 const CLAUDE_SONNET_4_PRICING: ModelPricing = ModelPricing::new(3.0, 15.0);
 
+// Claude Haiku 4.5 (latest as of 2025)
+const CLAUDE_HAIKU_4_5_PRICING: ModelPricing = ModelPricing::new(0.80, 4.0);
+
 // Gemini models (Google AI)
 const GEMINI_1_5_PRO_PRICING: ModelPricing = ModelPricing::new(1.25, 5.0);
 const GEMINI_1_5_FLASH_PRICING: ModelPricing = ModelPricing::new(0.075, 0.30);
@@ -93,6 +96,11 @@ pub fn get_pricing(model_id: &str) -> Option<ModelPricing> {
         || model_lower.contains("claude-3.5-sonnet")
     {
         return Some(CLAUDE_3_5_SONNET_PRICING);
+    }
+
+    // Claude Haiku 4.5
+    if model_lower.contains("haiku-4-5") || model_lower.contains("haiku-4.5") {
+        return Some(CLAUDE_HAIKU_4_5_PRICING);
     }
 
     // Claude 3.5 Haiku

@@ -68,6 +68,13 @@ interface OutputLine {
   line: string;
 }
 
+interface RunnerIdentity {
+  is_secondary: boolean;
+  instance_name: string | null;
+  primary_port: number | null;
+  port: number;
+}
+
 export function ProcessManagerTab() {
   const [processes, setProcesses] = useState<ProcessStatus[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -75,6 +82,7 @@ export function ProcessManagerTab() {
   const [editConfig, setEditConfig] = useState<ProcessConfig | undefined>();
   const [loading, setLoading] = useState(true);
   const unlistenRef = useRef<UnlistenFn | null>(null);
+  const [identity, setIdentity] = useState<RunnerIdentity | null>(null);
 
   // AI Fix session state
   const [aiFixActive, setAiFixActive] = useState(false);
@@ -105,6 +113,7 @@ export function ProcessManagerTab() {
 
   useEffect(() => {
     loadProcesses();
+    invoke<RunnerIdentity>("get_runner_identity").then(setIdentity).catch(() => {});
   }, [loadProcesses]);
 
   // Listen for state changes
@@ -466,6 +475,17 @@ Be concise and actionable.`;
           </button>
         </div>
       </div>
+
+      {/* Proxy notice for secondary runners */}
+      {identity?.is_secondary && (
+        <div className="px-4 py-1.5 bg-cyan-950/30 border-b border-cyan-800/30 flex items-center gap-2 text-xs text-cyan-300">
+          <span className="font-medium">Proxied</span>
+          <span className="text-cyan-400/60">&mdash;</span>
+          <span className="text-cyan-400/80">
+            Processes are managed by the primary runner on port {identity.primary_port}. Actions from this runner are forwarded automatically.
+          </span>
+        </div>
+      )}
 
       {/* Config Editor (shown when adding/editing) */}
       {showEditor && (

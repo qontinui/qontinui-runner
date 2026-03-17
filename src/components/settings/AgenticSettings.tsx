@@ -50,7 +50,7 @@ const DEFAULT_RETRY_SETTINGS = {
 
 const DEFAULT_ROUTING_SETTINGS = {
   enabled: false,
-  simple_model: "claude-3-5-haiku-20241022",
+  simple_model: "claude-haiku-4-5-20251001",
   medium_model: "claude-sonnet-4-20250514",
   complex_model: "claude-opus-4-20250514",
   file_count_thresholds: [3, 10] as [number, number],
@@ -66,7 +66,8 @@ const DEFAULT_SETTINGS: AgenticSettingsType = {
 };
 
 const MODEL_OPTIONS = [
-  { value: "claude-3-5-haiku-20241022", label: "Claude 3.5 Haiku (Fast/Cheap)" },
+  { value: "claude-haiku-4-5-20251001", label: "Claude 4.5 Haiku (Fast/Cheap)" },
+  { value: "claude-3-5-haiku-20241022", label: "Claude 3.5 Haiku (Legacy)" },
   { value: "claude-sonnet-4-20250514", label: "Claude Sonnet 4 (Balanced)" },
   { value: "claude-opus-4-20250514", label: "Claude Opus 4 (Powerful)" },
   { value: "claude-3-5-sonnet-20241022", label: "Claude 3.5 Sonnet (Legacy)" },

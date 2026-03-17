@@ -56,6 +56,10 @@ pub struct CanvasPanelManager {
     max_sessions: Option<u32>,
     setup_duration_ms: u64,
     setup_step_count: usize,
+    // Acceptance criteria tracking
+    acceptance_criteria: Option<Value>,
+    criterion_statuses: HashMap<String, (String, Option<String>)>, // id -> (status, last_error)
+    step_to_criterion: HashMap<String, String>,                    // step_name -> criterion_id
     // Mission Brief state for live updates
     brief_prompt: String,
     brief_model: String,
@@ -92,6 +96,9 @@ impl CanvasPanelManager {
             max_sessions: None,
             setup_duration_ms: 0,
             setup_step_count: 0,
+            acceptance_criteria: None,
+            criterion_statuses: HashMap::new(),
+            step_to_criterion: HashMap::new(),
             brief_prompt: String::new(),
             brief_model: String::from("default"),
             brief_reflection: false,
@@ -161,6 +168,46 @@ impl CanvasPanelManager {
         tokio::task::spawn_blocking(move || {
             let _ = db.clear_canvas_panels_for_task_run(&exec_id);
         });
+
+        // Initialize acceptance criteria tracking
+        self.acceptance_criteria = config.acceptance_criteria.clone();
+        self.criterion_statuses.clear();
+        self.step_to_criterion.clear();
+
+        if let Some(ref criteria) = self.acceptance_criteria {
+            // Initialize all criteria to "pending"
+            if let Some(criteria_array) = criteria.get("criteria").and_then(|c| c.as_array()) {
+                for criterion in criteria_array {
+                    if let Some(id) = criterion.get("id").and_then(|v| v.as_str()) {
+                        self.criterion_statuses
+                            .insert(id.to_string(), ("pending".to_string(), None));
+                    }
+                }
+            }
+
+            // Load step_name -> criterion_id mapping from the embedded step_mapping
+            if let Some(mapping) = criteria.get("step_mapping").and_then(|v| v.as_object()) {
+                for (step_name, cid_val) in mapping {
+                    if let Some(cid) = cid_val.as_str() {
+                        self.step_to_criterion
+                            .insert(step_name.clone(), cid.to_string());
+                    }
+                }
+            }
+
+            // Emit initial AcceptanceCriteria panel
+            let data = builders::build_acceptance_criteria(criteria, &self.criterion_statuses);
+            self.emit_panel(
+                "acceptance-criteria",
+                "AcceptanceCriteria",
+                "Acceptance Criteria",
+                data,
+                4, // Right after outcome (1), waterfall (2), step-durations (3)
+                "normal",
+                Some("Overview"),
+            )
+            .await;
+        }
 
         // Emit Mission Brief
         let data = builders::build_mission_brief(config);
@@ -273,6 +320,45 @@ impl CanvasPanelManager {
         };
 
         self.iteration_snapshots.push(snapshot.clone());
+
+        // Update acceptance criteria statuses from verification results
+        if self.acceptance_criteria.is_some() {
+            let mut criteria_changed = false;
+            for step_result in &result.step_results {
+                if let Some(criterion_id) = self.step_to_criterion.get(&step_result.step_name) {
+                    let new_status = if step_result.success {
+                        "passed".to_string()
+                    } else {
+                        "failed".to_string()
+                    };
+                    let last_error = if step_result.success {
+                        None
+                    } else {
+                        step_result.error.clone()
+                    };
+                    self.criterion_statuses
+                        .insert(criterion_id.clone(), (new_status, last_error));
+                    criteria_changed = true;
+                }
+            }
+
+            if criteria_changed {
+                if let Some(ref criteria) = self.acceptance_criteria {
+                    let data =
+                        builders::build_acceptance_criteria(criteria, &self.criterion_statuses);
+                    self.emit_panel(
+                        "acceptance-criteria",
+                        "AcceptanceCriteria",
+                        "Acceptance Criteria",
+                        data,
+                        4,
+                        "normal",
+                        Some("Overview"),
+                    )
+                    .await;
+                }
+            }
+        }
 
         // Verification Matrix (update in-place each iteration)
         let matrix_data =
@@ -564,6 +650,31 @@ impl CanvasPanelManager {
             Some("Overview"),
         )
         .await;
+
+        // Final acceptance criteria update: mark remaining pending as skipped
+        if let Some(ref criteria) = self.acceptance_criteria {
+            let mut changed = false;
+            for (_id, (status, _err)) in self.criterion_statuses.iter_mut() {
+                if status == "pending" || status == "running" {
+                    *status = "skipped".to_string();
+                    changed = true;
+                }
+            }
+            if changed {
+                let data =
+                    builders::build_acceptance_criteria(criteria, &self.criterion_statuses);
+                self.emit_panel(
+                    "acceptance-criteria",
+                    "AcceptanceCriteria",
+                    "Acceptance Criteria",
+                    data,
+                    4,
+                    "normal",
+                    Some("Overview"),
+                )
+                .await;
+            }
+        }
 
         // Final Mission Brief update
         self.brief_phase = Some("completed".to_string());

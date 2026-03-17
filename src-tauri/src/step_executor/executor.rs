@@ -1150,14 +1150,27 @@ impl VerificationPhaseResult {
                     String::new()
                 };
 
-                context.push_str(&format!(
-                    "#### {}{} ({})\n",
-                    category_prefix, result.step_name, result.step_type
-                ));
+                // Header: step name, type, and check subtype if present
+                if let Some(ref check_type) = result.config.check_type {
+                    context.push_str(&format!(
+                        "#### {}{} ({}, {})\n",
+                        category_prefix, result.step_name, result.step_type, check_type
+                    ));
+                } else {
+                    context.push_str(&format!(
+                        "#### {}{} ({})\n",
+                        category_prefix, result.step_name, result.step_type
+                    ));
+                }
 
                 // Include the command that was run (if available)
                 if let Some(ref cmd) = result.config.command {
                     context.push_str(&format!("**Command:** `{}`\n", cmd));
+                }
+
+                // Include the working directory where the command ran (if set)
+                if let Some(ref wd) = result.config.working_directory {
+                    context.push_str(&format!("**Working Directory:** `{}`\n", wd));
                 }
 
                 if let Some(error) = &result.error {
@@ -2745,6 +2758,21 @@ impl StepExecutor {
                                 .map(|p| p.to_string_lossy().to_string())
                                 .unwrap_or_else(|_| ".".to_string())
                         });
+                    // Resolve relative paths to absolute
+                    let working_dir = {
+                        let p = std::path::Path::new(&working_dir);
+                        if p.is_relative() {
+                            std::env::current_dir()
+                                .ok()
+                                .map(|cwd| {
+                                    let resolved = cwd.join(p);
+                                    resolved.canonicalize().unwrap_or(resolved).to_string_lossy().to_string()
+                                })
+                                .unwrap_or(working_dir)
+                        } else {
+                            working_dir
+                        }
+                    };
 
                     info!("Executing repository test: {} in {}", command, working_dir);
 
@@ -4123,7 +4151,24 @@ impl StepExecutor {
         };
 
         let step_name = step.name.as_deref().unwrap_or("Shell Command");
-        let working_directory = step.shell_command_working_directory.clone();
+        // Resolve relative paths to absolute so child processes get the correct CWD
+        let working_directory = step.shell_command_working_directory.clone().map(|wd| {
+            let p = std::path::Path::new(&wd);
+            if p.is_relative() {
+                match std::env::current_dir() {
+                    Ok(cwd) => {
+                        let resolved = cwd.join(p);
+                        match resolved.canonicalize() {
+                            Ok(abs) => abs.to_string_lossy().to_string(),
+                            Err(_) => resolved.to_string_lossy().to_string(),
+                        }
+                    }
+                    Err(_) => wd,
+                }
+            } else {
+                wd
+            }
+        });
         let fail_on_error = step.shell_command_fail_on_error.unwrap_or(true);
 
         // Detect if command uses PowerShell syntax
@@ -4470,11 +4515,30 @@ impl StepExecutor {
         let check_type = step.check_type.as_deref().unwrap_or("custom_command");
         let step_name = step.name.as_deref().unwrap_or("Check");
         // Note: Due to serde alias conflict, "working_directory" goes to shell_command_working_directory
-        // So we check both fields for backwards compatibility
+        // So we check both fields for backwards compatibility.
+        // Resolve relative paths to absolute so child processes get the correct CWD
+        // regardless of the runner process's own working directory.
         let working_directory = step
             .check_working_directory
             .clone()
-            .or_else(|| step.shell_command_working_directory.clone());
+            .or_else(|| step.shell_command_working_directory.clone())
+            .map(|wd| {
+                let p = std::path::Path::new(&wd);
+                if p.is_relative() {
+                    match std::env::current_dir() {
+                        Ok(cwd) => {
+                            let resolved = cwd.join(p);
+                            match resolved.canonicalize() {
+                                Ok(abs) => abs.to_string_lossy().to_string(),
+                                Err(_) => resolved.to_string_lossy().to_string(),
+                            }
+                        }
+                        Err(_) => wd,
+                    }
+                } else {
+                    wd
+                }
+            });
 
         // Handle http_status check type separately (doesn't need language detection)
         if check_type == "http_status" {

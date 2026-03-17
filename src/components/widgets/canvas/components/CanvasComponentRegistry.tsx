@@ -30,6 +30,7 @@ import { PhaseDistributionPanel } from "./PhaseDistributionPanel";
 import { DependencyGraphPanel } from "./DependencyGraphPanel";
 import { CostBreakdownPanel } from "./CostBreakdownPanel";
 import { MissionBriefPanel } from "./MissionBriefPanel";
+import { AcceptanceCriteriaPanel } from "./AcceptanceCriteriaPanel";
 
 /**
  * Props that all canvas panel components receive.
@@ -83,6 +84,7 @@ const COMPONENT_MAP: Record<string, ComponentType<CanvasPanelComponentProps>> = 
   DependencyGraph: DependencyGraphPanel,
   CostBreakdown: CostBreakdownPanel,
   MissionBrief: MissionBriefPanel,
+  AcceptanceCriteria: AcceptanceCriteriaPanel,
 };
 
 /**

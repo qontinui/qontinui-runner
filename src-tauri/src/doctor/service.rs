@@ -71,10 +71,16 @@ impl DoctorHandle {
             .map_err(|e| format!("Failed to send register command: {}", e))
     }
 
-    /// Register a process synchronously (for use from blocking threads).
+    /// Register a process synchronously (for use from blocking/sync contexts).
+    ///
+    /// Uses `try_send()` instead of `blocking_send()` to avoid panicking when
+    /// called inside `spawn_blocking()` (which already runs within a Tokio runtime).
+    /// The channel is bounded (64 slots) so `try_send` can fail if full, but
+    /// Doctor registration is best-effort — a missed registration just means
+    /// the process won't be health-monitored.
     pub fn register_blocking(&self, registration: ProcessRegistration) -> Result<(), String> {
         self.command_tx
-            .blocking_send(DoctorCommand::Register(registration))
+            .try_send(DoctorCommand::Register(registration))
             .map_err(|e| format!("Failed to send register command: {}", e))
     }
 
@@ -86,10 +92,13 @@ impl DoctorHandle {
             .map_err(|e| format!("Failed to send unregister command: {}", e))
     }
 
-    /// Unregister a process synchronously (for use from blocking threads).
+    /// Unregister a process synchronously (for use from blocking/sync contexts).
+    ///
+    /// Uses `try_send()` instead of `blocking_send()` to avoid panicking when
+    /// called inside `spawn_blocking()` (which already runs within a Tokio runtime).
     pub fn unregister_blocking(&self, pid: u32) -> Result<(), String> {
         self.command_tx
-            .blocking_send(DoctorCommand::Unregister { pid })
+            .try_send(DoctorCommand::Unregister { pid })
             .map_err(|e| format!("Failed to send unregister command: {}", e))
     }
 

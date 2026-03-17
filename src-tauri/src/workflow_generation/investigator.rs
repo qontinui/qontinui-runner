@@ -153,13 +153,14 @@ The following information was gathered by scanning the project:
 
 Analyze the user's intent in context of the project structure and produce an **enriched task description** that will be used to generate an automation workflow. Your enriched description should:
 
-1. **Preserve the original intent** — do not change what the user wants to accomplish
-2. **Identify relevant components** — name specific files, directories, modules, and patterns from the discovery data that are relevant to the task
-3. **Note technical context** — mention frameworks, build tools, test runners, and conventions visible in the project structure
-4. **Flag potential issues** — if you notice dead code paths, missing implementations, broken data flows, or gaps that the workflow should address, mention them
-5. **Specify concrete targets** — replace vague references ("the widget", "the API") with specific file paths and component names where possible
-6. **Mention verification approaches** — suggest what should be checked to verify the work is done correctly (e.g., specific test commands, URLs to check, files that should change)
-7. **Runtime verification for removals** — for tasks that involve removing pages/routes/components, explicitly note that the running application must be checked (not just source files) since build caches, SSR, and routing configurations may still serve removed content
+1. **Read referenced files first** — if the discovery context includes "Referenced File Contents", those files ARE the task specification. Base your enriched description primarily on their contents, not on keyword matches against the codebase. The user's prompt "read X" or "implement X" means "read that file and do what it says"
+2. **Preserve the original intent** — do not change what the user wants to accomplish
+3. **Identify relevant components** — name specific files, directories, modules, and patterns from the discovery data that are relevant to the task
+4. **Note technical context** — mention frameworks, build tools, test runners, and conventions visible in the project structure
+5. **Flag potential issues** — if you notice dead code paths, missing implementations, broken data flows, or gaps that the workflow should address, mention them
+6. **Specify concrete targets** — replace vague references ("the widget", "the API") with specific file paths and component names where possible
+7. **Mention verification approaches** — suggest what should be checked to verify the work is done correctly (e.g., specific test commands, URLs to check, files that should change)
+8. **Runtime verification for removals** — for tasks that involve removing pages/routes/components, explicitly note that the running application must be checked (not just source files) since build caches, SSR, and routing configurations may still serve removed content
 
 ## Output Format
 

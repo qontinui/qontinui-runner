@@ -162,6 +162,18 @@ function serializePanelData(panel: CanvasPanel): string {
         .join("\n");
     }
 
+    case "AcceptanceCriteria": {
+      const goal = (data.goal_summary as string) ?? "";
+      const criteria =
+        (data.criteria as Array<{ id: string; description: string; status: string; priority: string }>) ?? [];
+      const lines = [goal];
+      criteria.forEach((c) => {
+        const icon = c.status === "passed" ? "[x]" : c.status === "failed" ? "[!]" : "[ ]";
+        lines.push(`${icon} [${c.priority}] ${c.description}`);
+      });
+      return lines.join("\n");
+    }
+
     case "MissionBrief": {
       const name = (data.workflow_name as string) ?? "";
       const prompt = (data.prompt as string) ?? "";

@@ -1,7 +1,7 @@
 /**
  * RunnerInstancesSettings.tsx
  *
- * Dev-only settings panel for managing secondary runner instances.
+ * Settings panel for managing secondary runner instances.
  * Each instance runs on its own port and gets its own Tauri window.
  */
 

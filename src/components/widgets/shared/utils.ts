@@ -221,6 +221,8 @@ const STEP_TYPE_MAP: Record<string, StepType> = {
   check_group: "check",
   error_check: "check",
   log_check: "check",
+  workflow_fixup: "check",
+  ai_review: "check",
 
   // Command (unified: shell commands, API requests, MCP calls)
   shell: "shell",

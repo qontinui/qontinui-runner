@@ -206,6 +206,8 @@ fn build_calculator_workflow(
         dependency_graph: None,
         cost_annotations: None,
         quality_report: None,
+        acceptance_criteria: None,
+        ai_reviewed: None,
     }
 }
 
@@ -290,6 +292,8 @@ fn build_tdd_workflow(
         dependency_graph: None,
         cost_annotations: None,
         quality_report: None,
+        acceptance_criteria: None,
+        ai_reviewed: None,
     }
 }
 
@@ -375,5 +379,7 @@ fn build_pipeline_workflow(
         dependency_graph: None,
         cost_annotations: None,
         quality_report: None,
+        acceptance_criteria: None,
+        ai_reviewed: None,
     }
 }

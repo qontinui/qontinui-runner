@@ -427,7 +427,7 @@ async fn handle_relay_command(
 
         "chat_list_running" => {
             let db = api_state.app_state.checkpoint_db.clone();
-            match tokio::task::spawn_blocking(move || db.get_running_task_runs()).await {
+            match tokio::task::spawn_blocking(move || db.get_running_task_runs(None)).await {
                 Ok(Ok(runs)) => {
                     let run_list: Vec<Value> = runs
                         .iter()

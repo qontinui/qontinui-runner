@@ -407,6 +407,7 @@ pub fn create_router(
         .merge(crate::mcp::misc::routes())
         .merge(crate::mcp::models::routes())
         .merge(crate::mcp::monitors::routes())
+        .merge(crate::mcp::orchestration_loop_api::routes())
         .merge(crate::mcp::playwright::routes())
         .merge(crate::mcp::processes::routes())
         .merge(crate::mcp::prompts::routes())
@@ -508,6 +509,9 @@ pub async fn start_server(
 
                 // Store the actual bound port in AppState
                 api_ready_flag.api_port.store(try_port, Ordering::Relaxed);
+
+                // Set the port on the database for instance-level task_run filtering
+                api_ready_flag.checkpoint_db.set_runner_port(try_port);
 
                 // Signal that the API is ready for requests
                 api_ready_flag.api_ready.store(true, Ordering::Relaxed);

@@ -442,9 +442,20 @@ pub struct UnifiedWorkflow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_annotations: Option<Value>,
 
+    /// Acceptance criteria from the specification agent (JSON blob).
+    /// Used by the canvas panel manager to show a live requirements tracker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_criteria: Option<Value>,
+
     /// Quality report from the revision phase (JSON blob)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality_report: Option<Value>,
+
+    /// Whether the AI semantic review actually ran successfully during generation.
+    /// When false, the workflow passed through the pipeline without AI verification
+    /// (e.g., all verification iterations failed at infrastructure level).
+    #[serde(default = "default_ai_reviewed")]
+    pub ai_reviewed: bool,
 
     /// ISO 8601 timestamp of creation
     #[serde(default)]
@@ -526,6 +537,10 @@ fn default_max_iterations() -> u32 {
 }
 
 fn default_reflection_mode() -> bool {
+    true
+}
+
+fn default_ai_reviewed() -> bool {
     true
 }
 
@@ -623,6 +638,12 @@ pub struct CreateUnifiedWorkflowRequest {
     /// Quality report (JSON blob, set by generator)
     #[serde(default)]
     pub quality_report: Option<Value>,
+    /// Acceptance criteria (JSON blob, set by generator)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_criteria: Option<Value>,
+    /// Whether the AI semantic review ran successfully during generation
+    #[serde(default)]
+    pub ai_reviewed: Option<bool>,
 }
 
 /// Request body for updating a unified workflow
@@ -682,6 +703,11 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub cost_annotations: Option<Value>,
     /// Quality report (JSON blob, set by generator)
     pub quality_report: Option<Value>,
+    /// Acceptance criteria (JSON blob, set by generator)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_criteria: Option<Value>,
+    /// Whether the AI semantic review ran successfully during generation
+    pub ai_reviewed: Option<bool>,
 }
 
 /// Query parameters for searching unified workflows

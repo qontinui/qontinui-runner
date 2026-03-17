@@ -106,6 +106,23 @@ pub fn should_launch_follow_up(
             return Ok(false);
         }
 
+        // Guard 2b: Check if source task run is a fixer run
+        let is_fixer: bool = conn
+            .query_row(
+                "SELECT COALESCE(is_fixer, 0) FROM task_runs WHERE id = ?1",
+                rusqlite::params![source_id],
+                |row| row.get::<_, i32>(0).map(|v| v != 0),
+            )
+            .unwrap_or(false);
+
+        if is_fixer {
+            debug!(
+                "Skipping follow-up for {} — source is a fixer run",
+                source_id
+            );
+            return Ok(false);
+        }
+
         // Guard 3: Check follow_up_enabled setting (default true)
         // json_extract returns integers for JSON booleans (1/0), so use CAST to normalize
         let follow_up_enabled: bool = conn

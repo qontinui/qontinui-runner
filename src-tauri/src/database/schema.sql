@@ -258,6 +258,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     is_follow_up INTEGER DEFAULT 0,             -- Whether this is a follow-up run for unfixed issues
     follow_up_source_task_run_id TEXT,           -- Source task run whose unfixed issues this run addresses
 
+    -- Fixer (v114)
+    is_fixer INTEGER DEFAULT 0,                 -- Whether this is a fixer run (aggregates reflection/follow-up fixes)
+    fixer_source_task_run_id TEXT,               -- Source task run that this fixer addresses
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -916,6 +920,8 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     dependency_graph TEXT DEFAULT NULL,
     cost_annotations TEXT DEFAULT NULL,
     quality_report TEXT DEFAULT NULL,
+    acceptance_criteria TEXT DEFAULT NULL,
+    ai_reviewed INTEGER DEFAULT 1,
 
     -- Timestamps
     created_at TEXT NOT NULL,
@@ -2929,3 +2935,21 @@ CREATE TABLE IF NOT EXISTS cached_app_specs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cached_specs_app ON cached_app_specs(app_url);
+
+-- =============================================================================
+-- Capture Screenshots for State View (migration 111)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS sm_capture_screenshots (
+    id TEXT PRIMARY KEY,
+    config_id TEXT NOT NULL REFERENCES state_machine_configs(id) ON DELETE CASCADE,
+    capture_index INTEGER NOT NULL,
+    screenshot_webp BLOB NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    element_bounds_json TEXT NOT NULL DEFAULT '{}',
+    fingerprint_hashes_json TEXT NOT NULL DEFAULT '[]',
+    captured_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sm_screenshots_config ON sm_capture_screenshots(config_id);

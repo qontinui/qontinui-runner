@@ -244,7 +244,7 @@ pub fn analyze_all(conn: &Connection) -> Result<Vec<PromptInsight>, String> {
     let mut all_insights = Vec::new();
 
     for agent in &["specification", "builder", "verification", "hardener"] {
-        match analyze_reflection_fixes(conn, agent, 3) {
+        match analyze_reflection_fixes(conn, agent, 1) {
             Ok(insights) => all_insights.extend(insights),
             Err(e) => warn!("Failed to analyze reflection fixes for {}: {}", agent, e),
         }

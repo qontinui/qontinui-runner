@@ -362,6 +362,16 @@ export interface CooccurrenceExport {
   }>;
   /** Optional map of fingerprint hash → base64 PNG thumbnail of the element. */
   elementThumbnails?: Record<string, string>;
+  /** Optional array of full capture screenshots with element bounds for screenshot state view. */
+  captureScreenshots?: Array<{
+    captureIndex: number;
+    screenshotBase64: string;
+    width: number;
+    height: number;
+    elementBoundsJson: string;
+    fingerprintHashesJson: string;
+    capturedAt: string;
+  }>;
 }
 
 // =============================================================================

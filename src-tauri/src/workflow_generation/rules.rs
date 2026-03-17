@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::reflection::types::ReflectionFix;
 use crate::str_utils::truncate_str;
 
 /// A single generation rule stored in the database.
@@ -484,14 +485,134 @@ pub fn truncate_to_title(description: &str) -> String {
 }
 
 // ============================================================================
+// Direct Rule Creation from Reflection Fixes
+// ============================================================================
+
+/// Create generation rules directly from reflection fixes — no accumulation
+/// threshold or effectiveness history required.
+///
+/// Every fix with a qualifying fix_type at high or medium confidence becomes a
+/// generation rule immediately. This ensures that reflection insights improve
+/// future workflow generation from the very first occurrence.
+///
+/// Deduplication is by content hash: if a rule with the same content already
+/// exists, it is skipped.
+///
+/// Returns the number of newly created rules.
+pub fn create_rules_from_reflection_fixes(
+    conn: &Connection,
+    fixes: &[ReflectionFix],
+) -> Result<u32, String> {
+    let qualifying_types = [
+        "instruction_clarification",
+        "workflow_step_rewrite",
+        "context_addition",
+    ];
+
+    let mut created = 0u32;
+
+    for fix in fixes {
+        // Only promote qualifying fix types at high or medium confidence
+        if !qualifying_types.contains(&fix.fix_type.as_str()) {
+            continue;
+        }
+        match fix.confidence.as_str() {
+            "high" | "medium" => {}
+            _ => continue,
+        }
+
+        let rule_content = &fix.fix_description;
+        if rule_content.is_empty() {
+            continue;
+        }
+
+        // Dedup: check if a rule with the same content hash already exists
+        let content_hash = simple_content_hash(rule_content);
+        let existing_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM generation_rules WHERE provenance = 'reflection' AND content LIKE ?1",
+                rusqlite::params![format!("%{}%", &content_hash)],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if existing_count > 0 {
+            continue;
+        }
+
+        // Also dedup by source_fix_id (insert_rule already handles this, but
+        // checking early avoids unnecessary work)
+        if let Some(ref fix_id) = Some(&fix.id) {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM generation_rules WHERE source_fix_id = ?1",
+                    rusqlite::params![fix_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if exists > 0 {
+                continue;
+            }
+        }
+
+        // Determine agent and section from the fix's source_agent or by inference
+        let (rule_agent, rule_section) = if let Some(ref agent) = fix.source_agent {
+            map_insight_to_rule_location(agent, &fix.fix_type)
+        } else {
+            let inferred_agent = infer_agent_from_fix(rule_content);
+            let inferred_section = infer_section_from_fix(rule_content, &inferred_agent);
+            (inferred_agent, inferred_section)
+        };
+
+        let rule_number = next_rule_number(conn, &rule_agent, &rule_section);
+        let title = truncate_to_title(rule_content);
+        let tagged_content = format!("{}\n<!-- hash:{} -->", rule_content, content_hash);
+
+        let input = InsertRuleInput {
+            agent: rule_agent,
+            section: rule_section,
+            rule_number,
+            title,
+            content: tagged_content,
+            condition: None,
+            provenance: "reflection".to_string(),
+            source_fix_id: Some(fix.id.clone()),
+        };
+
+        match insert_rule(conn, &input) {
+            Ok(rule) => {
+                created += 1;
+                tracing::info!(
+                    "Created generation rule {} from reflection fix {} (type: {}, confidence: {})",
+                    rule.id,
+                    fix.id,
+                    fix.fix_type,
+                    fix.confidence
+                );
+            }
+            Err(e) => warn!("Failed to create rule from reflection fix {}: {}", fix.id, e),
+        }
+    }
+
+    if created > 0 {
+        tracing::info!(
+            "Created {} generation rules directly from reflection fixes",
+            created
+        );
+    }
+
+    Ok(created)
+}
+
+// ============================================================================
 // Auto-Rule Generation from Insights
 // ============================================================================
 
-/// Promote high-confidence prompt insights into auto-generated rules.
+/// Promote prompt insights into auto-generated rules.
 ///
 /// An insight is promoted when:
-/// - `confidence > 0.8`
-/// - `evidence_count >= 5`
+/// - `confidence > 0.3`
+/// - `evidence_count >= 1`
 /// - No existing rule with similar content (content-hash dedup)
 ///
 /// Returns the number of newly created rules.
@@ -502,8 +623,9 @@ pub fn promote_insights_to_rules(
     let mut created = 0u32;
 
     for insight in insights {
-        // Only promote high-confidence insights with sufficient evidence
-        if insight.confidence <= 0.8 || insight.evidence_count < 5 {
+        // Promote insights with reasonable confidence and any evidence.
+        // Thresholds kept low so that projects with few runs still benefit.
+        if insight.confidence <= 0.3 || insight.evidence_count < 1 {
             continue;
         }
 
@@ -741,7 +863,7 @@ mod tests {
             insight_type: "recurring_failure".to_string(),
             description: "Low confidence insight".to_string(),
             evidence_count: 6,
-            confidence: 0.5,
+            confidence: 0.2,
             suggested_rule: Some("test rule".to_string()),
         }];
 
@@ -756,7 +878,7 @@ mod tests {
             agent: "builder".to_string(),
             insight_type: "recurring_failure".to_string(),
             description: "Low evidence insight".to_string(),
-            evidence_count: 3,
+            evidence_count: 0,
             confidence: 0.9,
             suggested_rule: Some("test rule".to_string()),
         }];
@@ -839,6 +961,121 @@ mod tests {
             ("schema_context".to_string(), "important_rules".to_string()),
         );
     }
+
+    // ========================================================================
+    // Tests for create_rules_from_reflection_fixes
+    // ========================================================================
+
+    fn make_test_fix(fix_type: &str, confidence: &str, description: &str) -> ReflectionFix {
+        ReflectionFix {
+            id: format!("fix-{}", uuid::Uuid::new_v4()),
+            source_task_run_id: "src-1".into(),
+            reflection_task_run_id: "ref-1".into(),
+            source_finding_id: None,
+            source_knowledge_id: None,
+            fix_type: fix_type.into(),
+            fix_description: description.into(),
+            file_changed: None,
+            old_value: None,
+            new_value: None,
+            confidence: confidence.into(),
+            content_hash: None,
+            status: "applied".into(),
+            effectiveness: None,
+            effectiveness_evidence: None,
+            applied_at: "2026-01-01T00:00:00Z".into(),
+            evaluated_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            source_agent: Some("builder".into()),
+            reasoning: None,
+            alternatives_considered: None,
+            reflection_scope: None,
+            project_path: None,
+            applicability_context: None,
+        }
+    }
+
+    #[test]
+    fn test_create_rules_from_reflection_fixes_qualifying() {
+        let conn = setup_rules_db();
+        let fixes = vec![
+            make_test_fix(
+                "instruction_clarification",
+                "high",
+                "Always include error handling in shell commands",
+            ),
+            make_test_fix(
+                "context_addition",
+                "medium",
+                "Add workspace path to context for file operations",
+            ),
+        ];
+
+        let created =
+            create_rules_from_reflection_fixes(&conn, &fixes).expect("create rules failed");
+        assert_eq!(created, 2, "Expected 2 rules from qualifying fixes");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM generation_rules WHERE provenance = 'reflection'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_create_rules_skips_low_confidence() {
+        let conn = setup_rules_db();
+        let fixes = vec![make_test_fix(
+            "instruction_clarification",
+            "low",
+            "Uncertain fix",
+        )];
+
+        let created =
+            create_rules_from_reflection_fixes(&conn, &fixes).expect("create rules failed");
+        assert_eq!(created, 0, "Expected 0 rules for low-confidence fix");
+    }
+
+    #[test]
+    fn test_create_rules_skips_non_qualifying_types() {
+        let conn = setup_rules_db();
+        let fixes = vec![make_test_fix(
+            "selector_fix",
+            "high",
+            "Fixed CSS selector",
+        )];
+
+        let created =
+            create_rules_from_reflection_fixes(&conn, &fixes).expect("create rules failed");
+        assert_eq!(created, 0, "Expected 0 rules for non-qualifying fix type");
+    }
+
+    #[test]
+    fn test_create_rules_dedup() {
+        let conn = setup_rules_db();
+        let fixes = vec![make_test_fix(
+            "instruction_clarification",
+            "high",
+            "Always include error handling in shell commands",
+        )];
+
+        let first =
+            create_rules_from_reflection_fixes(&conn, &fixes).expect("first create failed");
+        assert_eq!(first, 1);
+
+        // Second call with same content should be deduped
+        let fixes2 = vec![make_test_fix(
+            "instruction_clarification",
+            "high",
+            "Always include error handling in shell commands",
+        )];
+        let second =
+            create_rules_from_reflection_fixes(&conn, &fixes2).expect("second create failed");
+        assert_eq!(second, 0, "Expected 0 rules on duplicate");
+    }
 }
 
 // ============================================================================
@@ -847,7 +1084,7 @@ mod tests {
 
 /// Ensure seed rules are present in the database.
 /// These are hardcoded quality rules that prevent known anti-patterns.
-/// Uses stable `source_fix_id` values for dedup — safe to call repeatedly.
+/// Deduplicates by matching on provenance='seed' and title — safe to call repeatedly.
 pub fn ensure_seed_rules(conn: &Connection) {
     let seed_rules = [
         InsertRuleInput {
@@ -858,7 +1095,7 @@ pub fn ensure_seed_rules(conn: &Connection) {
             content: "NEVER use `echo EXIT:$?`, `echo $?`, or similar patterns to capture exit codes. Let the command's natural exit code propagate. Use `command && echo PASS || echo FAIL` only when explicit text output is needed for parsing.".to_string(),
             condition: None,
             provenance: "seed".to_string(),
-            source_fix_id: Some("seed-no-echo-exit".to_string()),
+            source_fix_id: None,
         },
         InsertRuleInput {
             agent: "builder".to_string(),
@@ -868,7 +1105,7 @@ pub fn ensure_seed_rules(conn: &Connection) {
             content: "When using grep to count occurrences, always use `grep -c PATTERN || true` to handle the zero-match case (grep returns exit code 1 when no matches are found). For distinguishing 'not found' from 'error', use `command 2>&1 | grep PATTERN; test $? -ne 2`.".to_string(),
             condition: None,
             provenance: "seed".to_string(),
-            source_fix_id: Some("seed-safe-grep-pipeline".to_string()),
+            source_fix_id: None,
         },
         InsertRuleInput {
             agent: "builder".to_string(),
@@ -878,11 +1115,26 @@ pub fn ensure_seed_rules(conn: &Connection) {
             content: "If ANY step uses `python` or `python3` commands, a prior setup step MUST verify Python availability (`python3 --version || python --version`). Do not assume Python is installed.".to_string(),
             condition: None,
             provenance: "seed".to_string(),
-            source_fix_id: Some("seed-declare-python-dep".to_string()),
+            source_fix_id: None,
         },
     ];
 
     for input in &seed_rules {
+        // Dedup: skip if a seed rule with the same title already exists
+        let already_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM generation_rules WHERE provenance = 'seed' AND title = ?1",
+                params![input.title],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if already_exists {
+            tracing::debug!("Seed rule already exists, skipping: {}", input.title);
+            continue;
+        }
+
         match insert_rule(conn, input) {
             Ok(rule) => {
                 tracing::debug!("Seed rule ensured: {} ({})", rule.title, rule.id);

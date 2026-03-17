@@ -271,24 +271,7 @@ fn validate_steps(steps: &[Value], expected_phase: &str, errors: &mut Vec<Valida
             });
         }
 
-        // Validate step name
-        if let Some(name) = step.get("name").and_then(|v| v.as_str()) {
-            if name.trim().is_empty() {
-                errors.push(ValidationError {
-                    kind: ValidationErrorKind::Structural,
-                    field: format!("{}_steps[{}].name", expected_phase, i),
-                    message: "Step name cannot be empty".to_string(),
-                    step_name: sname.clone(),
-                });
-            }
-        } else {
-            errors.push(ValidationError {
-                kind: ValidationErrorKind::MissingRequiredField,
-                field: format!("{}_steps[{}].name", expected_phase, i),
-                message: "Step missing required 'name' field".to_string(),
-                step_name: sname.clone(),
-            });
-        }
+        // Step name is optional — fix_workflow() auto-generates it if missing
 
         // Validate phase matches array (compare against base phase, not prefixed path)
         if let Some(phase) = step.get("phase").and_then(|v| v.as_str()) {
@@ -826,6 +809,44 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
                     }
                 }
 
+                // Auto-generate name for steps missing it
+                let has_name = map
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if !has_name {
+                    let step_type = map.get("type").and_then(|v| v.as_str()).unwrap_or("step");
+                    let generated_name = if let Some(prompt_text) =
+                        map.get("prompt").and_then(|v| v.as_str())
+                    {
+                        // Use first meaningful words of prompt
+                        let words: Vec<&str> = prompt_text
+                            .split_whitespace()
+                            .filter(|w| w.len() > 1)
+                            .take(6)
+                            .collect();
+                        if words.is_empty() {
+                            format!("{} step ({})", phase, step_type)
+                        } else {
+                            words.join(" ")
+                        }
+                    } else if let Some(cmd) = map.get("command").and_then(|v| v.as_str()) {
+                        // Use command basename
+                        let base = cmd.split_whitespace().next().unwrap_or(cmd);
+                        let base = base.rsplit('/').next().unwrap_or(base);
+                        format!("Run {}", base)
+                    } else {
+                        format!("{} step ({})", phase, step_type)
+                    };
+                    tracing::info!(
+                        "Auto-generating name '{}' for unnamed step in {} phase",
+                        generated_name,
+                        phase
+                    );
+                    map.insert("name".to_string(), Value::String(generated_name));
+                }
+
                 // Infer and set mode on command steps that are missing it
                 let is_command = map.get("type").and_then(|v| v.as_str()) == Some("command");
                 if is_command && !map.contains_key("mode") {
@@ -931,6 +952,42 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
                         }
                     }
 
+                    // Auto-generate name for steps missing it (stages)
+                    let has_name = map
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                    if !has_name {
+                        let step_type = map.get("type").and_then(|v| v.as_str()).unwrap_or("step");
+                        let generated_name = if let Some(prompt_text) =
+                            map.get("prompt").and_then(|v| v.as_str())
+                        {
+                            let words: Vec<&str> = prompt_text
+                                .split_whitespace()
+                                .filter(|w| w.len() > 1)
+                                .take(6)
+                                .collect();
+                            if words.is_empty() {
+                                format!("{} step ({})", phase, step_type)
+                            } else {
+                                words.join(" ")
+                            }
+                        } else if let Some(cmd) = map.get("command").and_then(|v| v.as_str()) {
+                            let base = cmd.split_whitespace().next().unwrap_or(cmd);
+                            let base = base.rsplit('/').next().unwrap_or(base);
+                            format!("Run {}", base)
+                        } else {
+                            format!("{} step ({})", phase, step_type)
+                        };
+                        tracing::info!(
+                            "Auto-generating name '{}' for unnamed step in stage {} phase",
+                            generated_name,
+                            phase
+                        );
+                        map.insert("name".to_string(), Value::String(generated_name));
+                    }
+
                     // Infer and set mode on command steps that are missing it
                     let is_command = map.get("type").and_then(|v| v.as_str()) == Some("command");
                     if is_command && !map.contains_key("mode") {
@@ -963,6 +1020,45 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
                     }
                 }
             }
+        }
+    }
+
+    // Strip AI-hallucinated model/provider from generated workflows and stages.
+    // The AI builder sometimes sets model names like "claude-sonnet-4" or "claude-opus-4"
+    // which are not valid CLI model identifiers. The runner should use the user's
+    // configured model/provider settings, not AI-generated ones.
+    if workflow.model.is_some() {
+        tracing::info!(
+            "Stripping AI-generated model '{}' from workflow '{}' — runner will use user's configured model",
+            workflow.model.as_deref().unwrap_or("?"),
+            workflow.name
+        );
+        workflow.model = None;
+    }
+    if workflow.provider.is_some() {
+        tracing::info!(
+            "Stripping AI-generated provider '{}' from workflow '{}' — runner will use user's configured provider",
+            workflow.provider.as_deref().unwrap_or("?"),
+            workflow.name
+        );
+        workflow.provider = None;
+    }
+    for stage in workflow.stages.iter_mut() {
+        if stage.model.is_some() {
+            tracing::info!(
+                "Stripping AI-generated model '{}' from stage '{}' — runner will use user's configured model",
+                stage.model.as_deref().unwrap_or("?"),
+                stage.name
+            );
+            stage.model = None;
+        }
+        if stage.provider.is_some() {
+            tracing::info!(
+                "Stripping AI-generated provider '{}' from stage '{}' — runner will use user's configured provider",
+                stage.provider.as_deref().unwrap_or("?"),
+                stage.name
+            );
+            stage.provider = None;
         }
     }
 

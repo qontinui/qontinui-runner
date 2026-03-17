@@ -80,6 +80,14 @@ impl StepHandler for SaveWorkflowArtifactHandler {
             request.generated_by_task_run_id = Some(task_run_id.clone());
         }
 
+        // Default ai_reviewed to false for meta-workflow-generated artifacts.
+        // The AI fixer agent writes the workflow JSON but doesn't have access to
+        // verification pass/fail status, so if ai_reviewed is absent from the JSON,
+        // we conservatively mark it as not reviewed rather than defaulting to true.
+        if request.ai_reviewed.is_none() {
+            request.ai_reviewed = Some(false);
+        }
+
         // Save to database
         let workflow = match context
             .app_state

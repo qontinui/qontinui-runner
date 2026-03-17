@@ -170,6 +170,7 @@ impl StepHandler for WorkflowStepHandler {
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
+            acceptance_criteria: None,
         };
 
         // 8. Create LoopController and get session manager

@@ -326,7 +326,7 @@ pub async fn collect_step_outputs(
         // Get the most recent task run
         let running_tasks = state
             .checkpoint_db
-            .get_running_task_runs()
+            .get_running_task_runs(None)
             .map_err(|e| format!("Failed to get running tasks: {}", e))?;
 
         if let Some(task) = running_tasks.first() {
@@ -335,7 +335,7 @@ pub async fn collect_step_outputs(
             // Try to get the most recent completed task
             let recent_tasks = state
                 .checkpoint_db
-                .get_recent_task_runs(1)
+                .get_recent_task_runs(1, None)
                 .map_err(|e| format!("Failed to list task runs: {}", e))?;
 
             if let Some(task) = recent_tasks.first() {

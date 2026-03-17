@@ -375,6 +375,13 @@ impl ClaudeSession {
                                 if let Ok(mut buf) = shared_output_for_thread.lock() {
                                     *buf = all_text.clone();
                                 }
+                                // When DB persistence is active, clear local buffer after
+                                // sync to prevent unbounded memory growth. The shared_output_buf
+                                // has the latest snapshot, and the full history is persisted
+                                // to DB via turn_persist_tx.
+                                if persist_tx_for_stdout.is_some() {
+                                    all_text.clear();
+                                }
                             }
                         }
                         Err(e) => {
@@ -403,9 +410,14 @@ impl ClaudeSession {
                 &progress_tx,
             );
 
-            // Final sync
-            if let Ok(mut buf) = shared_output_for_thread.lock() {
-                *buf = all_text.clone();
+            // Final sync — only overwrite shared_output_buf if all_text still
+            // has content. When DB persistence is active, all_text is cleared
+            // after each sync (to prevent OOM), so the shared buffer already
+            // holds the last valid snapshot and must not be overwritten with empty.
+            if !all_text.is_empty() {
+                if let Ok(mut buf) = shared_output_for_thread.lock() {
+                    *buf = all_text.clone();
+                }
             }
 
             all_text
@@ -876,7 +888,14 @@ impl ClaudeSession {
         loop {
             let state = self.state_tracker.get();
             if state == SessionState::Closed {
-                let output = self.get_output();
+                // Use shared_output_buf rather than accumulated_output, which is
+                // drained after each turn for memory efficiency. The shared buffer
+                // contains the last synced snapshot from the stdout reader thread.
+                let output = self
+                    .shared_output_buf
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_default();
                 // Consider it successful if we got output
                 let success = !output.is_empty();
                 return Ok((success, output));
@@ -942,7 +961,7 @@ impl ClaudeSession {
         // Set persisted_output_len to MAX first to prevent the dispatcher from
         // also sending a delta for the same content (race with stdout thread).
         if let Some(ref tx) = self.turn_persist_tx {
-            if let Ok(buf) = self.accumulated_output.lock() {
+            if let Ok(mut buf) = self.accumulated_output.lock() {
                 let persisted = self.persisted_output_len.swap(usize::MAX, Ordering::SeqCst);
                 if buf.len() > persisted {
                     let delta = buf[persisted..].to_string();
@@ -950,6 +969,7 @@ impl ClaudeSession {
                         let _ = tx.send(delta);
                     }
                 }
+                buf.clear(); // Free memory on close
             }
             // Note: the sender is dropped when the ClaudeSession struct is dropped,
             // which terminates the persister thread after it processes pending messages.

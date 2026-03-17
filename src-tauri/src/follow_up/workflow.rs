@@ -32,7 +32,7 @@ pub fn build_follow_up_config(
         stages: Vec::new(),
         stop_on_failure: false,
         constraint_overrides: std::collections::HashMap::new(),
-        reflection_mode: false,
+        reflection_mode: true,
         provider_override: None,
         model_override: None,
         model_overrides: std::collections::HashMap::new(),
@@ -45,6 +45,7 @@ pub fn build_follow_up_config(
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
         project_path: crate::mcp::shared::current_project_path(),
+        acceptance_criteria: None,
     }
 }
 
@@ -129,6 +130,31 @@ The setup phase loaded the following data into runtime variables:
 - `{{{{source_ai_output}}}}` — The complete AI conversation output from the source run (CRITICAL — read this end-to-end)
 - `{{{{source_workflow_state}}}}` — Workflow execution state (phases, iterations, timing)
 - `{{{{source_findings}}}}` — Categorized findings from the source run
+- `{{{{referenced_files}}}}` — File paths referenced in findings and AI output (validated as existing)
+- `{{{{referenced_file_contents}}}}` — Pre-loaded contents of referenced files (read these instead of using tools)
+- `{{{{project_structure}}}}` — Condensed directory tree of the project
+
+## Working Directory
+
+The project root is: {{{{project_root}}}}
+All relative file paths in findings are relative to this directory.
+
+## Efficiency Guidelines
+
+You have been given pre-loaded data and file contents. Follow these rules:
+
+1. **Start with pre-loaded files.** The referenced file contents below contain the source files mentioned in findings. Read them FIRST before making any tool calls.
+2. **Never read the same file twice.** If you already have a file's contents (pre-loaded or via tool), do NOT read it again.
+3. **Use the project structure** below to navigate instead of running find, ls, or blind searches.
+4. **Use targeted grep** with specific patterns rather than exploratory find/ls commands.
+
+## Pre-loaded File Contents
+
+{{{{referenced_file_contents}}}}
+
+## Project Structure
+
+{{{{project_structure}}}}
 
 ## Your Task
 

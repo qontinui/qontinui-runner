@@ -380,6 +380,8 @@ pub async fn get_unified_workflow(
                 dependency_graph: workflow.dependency_graph.clone(),
                 cost_annotations: workflow.cost_annotations.clone(),
                 quality_report: workflow.quality_report.clone(),
+                acceptance_criteria: workflow.acceptance_criteria.clone(),
+                ai_reviewed: Some(workflow.ai_reviewed),
             };
             if let Err(e) = state
                 .app_state
@@ -790,6 +792,8 @@ pub async fn import_unified_workflow(
         dependency_graph: workflow.dependency_graph.clone(),
         cost_annotations: workflow.cost_annotations.clone(),
         quality_report: workflow.quality_report.clone(),
+        acceptance_criteria: workflow.acceptance_criteria.clone(),
+        ai_reviewed: Some(workflow.ai_reviewed),
     };
 
     // Use the database's create function but with our custom ID
@@ -1016,6 +1020,8 @@ pub async fn generate_unified_workflow_async_handler(
         dependency_graph: meta_workflow.dependency_graph.clone(),
         cost_annotations: meta_workflow.cost_annotations.clone(),
         quality_report: meta_workflow.quality_report.clone(),
+        acceptance_criteria: meta_workflow.acceptance_criteria.clone(),
+        ai_reviewed: Some(meta_workflow.ai_reviewed),
     };
 
     let saved_workflow = match state
@@ -1145,6 +1151,7 @@ pub async fn generate_unified_workflow_async_handler(
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
+            acceptance_criteria: saved_workflow.acceptance_criteria.clone(),
         };
 
         // Clone state fields for the background task
@@ -1395,7 +1402,7 @@ pub async fn run_unified_workflow(
         match state
             .app_state
             .checkpoint_db
-            .get_incomplete_task_run_for_workflow(&id)
+            .get_incomplete_task_run_for_workflow(&id, None)
         {
             Ok(Some(existing_id)) => {
                 info!(
@@ -1508,6 +1515,7 @@ pub async fn run_unified_workflow(
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
+            acceptance_criteria: workflow.acceptance_criteria.clone(),
         };
 
         let checkpoint_db = state.app_state.checkpoint_db.clone();
@@ -1815,6 +1823,8 @@ pub async fn execute_inline_workflow(
         dependency_graph: None,
         cost_annotations: None,
         quality_report: None,
+        acceptance_criteria: None,
+        ai_reviewed: true,
         model_overrides: std::collections::HashMap::new(),
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -1942,6 +1952,7 @@ pub async fn execute_inline_workflow(
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
+            acceptance_criteria: workflow.acceptance_criteria.clone(),
         };
 
         // Spawn in background (non-blocking) — same pattern as run_unified_workflow
@@ -2380,6 +2391,7 @@ pub async fn run_composed_workflow(
                 verification_history: std::collections::HashMap::new(),
                 routing_context: Default::default(),
                 project_path: crate::mcp::shared::current_project_path(),
+                acceptance_criteria: None,
             };
 
             // Run the LoopController once with all stages

@@ -61,6 +61,8 @@ pub struct DiscoveryInput {
     pub target_urls: Vec<String>,
     /// Extracted API endpoint paths (/api/..., /v1/..., etc.)
     pub api_endpoints: Vec<String>,
+    /// Extracted relative file paths (e.g., "docs/spec.md", "src\foo.rs")
+    pub referenced_files: Vec<String>,
 }
 
 /// Result of the discovery phase.
@@ -96,6 +98,7 @@ const TOOL_LIST_MCP: &str = "list_mcp_servers";
 const TOOL_LIST_SHELL_COMMANDS: &str = "list_shell_commands";
 const TOOL_DATABASE_STATS: &str = "database_stats";
 const TOOL_ARCHITECTURE_SPECS: &str = "architecture_specs";
+const TOOL_READ_REFERENCED_FILES: &str = "read_referenced_files";
 
 /// Keywords that trigger each tool.
 struct ToolTrigger {
@@ -115,6 +118,8 @@ enum ToolDataReq {
     WebApp,
     /// Requires an API endpoint or URL + API keywords
     ApiEndpoint,
+    /// Requires at least one referenced file path
+    ReferencedFile,
 }
 
 const TOOL_TRIGGERS: &[ToolTrigger] = &[
@@ -247,6 +252,11 @@ const TOOL_TRIGGERS: &[ToolTrigger] = &[
         ],
         needs_data: ToolDataReq::KeywordsOnly,
     },
+    ToolTrigger {
+        name: TOOL_READ_REFERENCED_FILES,
+        keywords: &[], // triggers when relative file paths are detected
+        needs_data: ToolDataReq::ReferencedFile,
+    },
 ];
 
 // ============================================================================
@@ -266,11 +276,15 @@ pub fn parse_description(description: &str) -> DiscoveryInput {
     // Extract API endpoints
     let api_endpoints = extract_api_endpoints(description);
 
+    // Extract relative file paths (e.g., "docs/spec.md", "src\foo.rs")
+    let referenced_files = extract_relative_paths(description);
+
     debug!(
-        "Parsed description: {} paths, {} URLs, {} API endpoints",
+        "Parsed description: {} paths, {} URLs, {} API endpoints, {} referenced files",
         project_paths.len(),
         target_urls.len(),
-        api_endpoints.len()
+        api_endpoints.len(),
+        referenced_files.len()
     );
 
     DiscoveryInput {
@@ -279,6 +293,7 @@ pub fn parse_description(description: &str) -> DiscoveryInput {
         project_paths,
         target_urls,
         api_endpoints,
+        referenced_files,
     }
 }
 
@@ -393,6 +408,76 @@ fn extract_api_endpoints(text: &str) -> Vec<String> {
     endpoints
 }
 
+/// Public wrapper for `extract_relative_paths` (used by meta_workflow.rs).
+pub fn extract_relative_paths_pub(text: &str) -> Vec<String> {
+    extract_relative_paths(text)
+}
+
+/// Extract relative file paths from text.
+///
+/// Matches tokens that look like relative paths — containing a path separator
+/// (`\` or `/`) AND ending with a file extension. Excludes absolute paths
+/// (already handled by `extract_paths`) and API endpoints.
+fn extract_relative_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    // Common file extensions for prompts/specs/code
+    let extensions: &[&str] = &[
+        ".md", ".txt", ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".toml",
+        ".json", ".yaml", ".yml", ".html", ".css", ".sql", ".sh", ".bat",
+        ".cfg", ".ini", ".xml", ".csv", ".env", ".svelte", ".vue",
+    ];
+
+    for word in text.split_whitespace() {
+        let word = word.trim_matches(|c: char| {
+            c == '"' || c == '\'' || c == '(' || c == ')' || c == ',' || c == ';'
+        });
+
+        // Skip absolute paths (handled by extract_paths)
+        if word.len() > 2
+            && word.chars().nth(1) == Some(':')
+            && matches!(word.chars().nth(2), Some('\\') | Some('/'))
+        {
+            continue;
+        }
+        if word.starts_with("/home/")
+            || word.starts_with("/Users/")
+            || word.starts_with("/opt/")
+            || word.starts_with("/var/")
+            || word.starts_with("/tmp/")
+        {
+            continue;
+        }
+        // Skip URLs
+        if word.starts_with("http://") || word.starts_with("https://") {
+            continue;
+        }
+        // Skip API endpoints
+        if word.starts_with("/api/") || word.starts_with("/v1/") || word.starts_with("/v2/") {
+            continue;
+        }
+
+        // Must contain a path separator
+        if !word.contains('\\') && !word.contains('/') {
+            continue;
+        }
+
+        // Must end with a known file extension
+        let lower = word.to_lowercase();
+        let has_extension = extensions.iter().any(|ext| lower.ends_with(ext));
+        if !has_extension {
+            continue;
+        }
+
+        // Normalize backslashes to forward slashes
+        let normalized = word.replace('\\', "/");
+        if !paths.contains(&normalized) {
+            paths.push(normalized);
+        }
+    }
+
+    paths
+}
+
 // ============================================================================
 // Tool selection
 // ============================================================================
@@ -410,6 +495,7 @@ pub fn select_tools(input: &DiscoveryInput, mode: &str) -> Vec<&'static str> {
         let data_ok = match trigger.needs_data {
             ToolDataReq::KeywordsOnly => true,
             ToolDataReq::ProjectPath => !input.project_paths.is_empty(),
+            ToolDataReq::ReferencedFile => !input.referenced_files.is_empty(),
             ToolDataReq::WebApp => {
                 !input.target_urls.is_empty()
                     || trigger
@@ -608,6 +694,7 @@ fn execute_tool(
         TOOL_LIST_SHELL_COMMANDS => execute_list_shell_commands(config),
         TOOL_DATABASE_STATS => execute_database_stats(config),
         TOOL_ARCHITECTURE_SPECS => execute_architecture_specs(config),
+        TOOL_READ_REFERENCED_FILES => execute_read_referenced_files(input),
         _ => Err(format!("Unknown tool: {}", name)),
     }
 }
@@ -635,6 +722,10 @@ fn summarize_input(tool_name: &str, input: &DiscoveryInput) -> String {
         }
         TOOL_UI_BRIDGE_SPECS => "runner + cached specs".to_string(),
         TOOL_ARCHITECTURE_SPECS => "cached architecture specs".to_string(),
+        TOOL_READ_REFERENCED_FILES => {
+            let files: Vec<&str> = input.referenced_files.iter().map(|s| s.as_str()).collect();
+            format!("files: {:?}", &files[..files.len().min(5)])
+        }
         _ => "default".to_string(),
     }
 }
@@ -708,6 +799,91 @@ fn execute_scan_workspace(input: &DiscoveryInput) -> Result<String, String> {
         Err("No workspace paths to scan".to_string())
     } else {
         Ok(sections.join("\n"))
+    }
+}
+
+/// Read referenced files from the project directory.
+///
+/// When a user's description references a file path like "docs/spec.md" or
+/// "qontinui-dev-notes\prompts\state-view-results-viewer.md", this tool reads
+/// those files and injects their contents into the discovery context. This is
+/// critical for prompts like "read X and implement what it describes" where
+/// the file IS the task specification.
+fn execute_read_referenced_files(input: &DiscoveryInput) -> Result<String, String> {
+    if input.referenced_files.is_empty() {
+        return Ok(String::new());
+    }
+
+    let project_path = crate::mcp::shared::current_project_path()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().to_string());
+    let mut sections = Vec::new();
+
+    for file_path in &input.referenced_files {
+        // Try resolving relative to the project root, then walk up parent dirs
+        let base = std::path::Path::new(&project_path);
+        let mut full_path = base.join(file_path);
+        if !full_path.exists() {
+            // Walk up parent directories (project root may be nested)
+            let mut ancestor = base.parent();
+            while let Some(parent) = ancestor {
+                let candidate = parent.join(file_path);
+                if candidate.exists() {
+                    full_path = candidate;
+                    break;
+                }
+                ancestor = parent.parent();
+            }
+        }
+
+        if full_path.exists() && full_path.is_file() {
+            match std::fs::read_to_string(&full_path) {
+                Ok(content) => {
+                    // Cap individual file content to avoid blowing up context
+                    let max_chars = 15_000;
+                    let truncated = if content.len() > max_chars {
+                        format!(
+                            "{}...\n\n(truncated at {} chars, total {} chars)",
+                            &content[..max_chars],
+                            max_chars,
+                            content.len()
+                        )
+                    } else {
+                        content
+                    };
+
+                    sections.push(format!(
+                        "### Referenced File: {}\n\n**Full path:** {}\n\n```\n{}\n```",
+                        file_path,
+                        full_path.display(),
+                        truncated,
+                    ));
+                    info!("Read referenced file: {} ({} bytes)", full_path.display(), truncated.len());
+                }
+                Err(e) => {
+                    warn!("Failed to read referenced file {}: {}", full_path.display(), e);
+                    sections.push(format!(
+                        "### Referenced File: {} (READ FAILED)\n\nError: {}",
+                        file_path, e
+                    ));
+                }
+            }
+        } else {
+            debug!("Referenced file not found: {}", full_path.display());
+            sections.push(format!(
+                "### Referenced File: {} (NOT FOUND)\n\nFile does not exist at: {}",
+                file_path,
+                full_path.display()
+            ));
+        }
+    }
+
+    if sections.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(format!(
+            "## Referenced File Contents\n\n**IMPORTANT: These files were explicitly referenced in the user's prompt. Their contents define the task specification. Read them carefully before interpreting the task.**\n\n{}",
+            sections.join("\n\n")
+        ))
     }
 }
 
@@ -1675,6 +1851,7 @@ mod tests {
             project_paths: vec![r"C:\Users\jspin\project".to_string()],
             target_urls: vec![],
             api_endpoints: vec![],
+            referenced_files: vec![],
         };
         let tools = select_tools(&input, "auto");
         assert!(tools.contains(&TOOL_SCAN_WORKSPACE));
@@ -1689,6 +1866,7 @@ mod tests {
             project_paths: vec![],
             target_urls: vec![],
             api_endpoints: vec![],
+            referenced_files: vec![],
         };
         let tools = select_tools(&input, "auto");
         assert!(tools.contains(&TOOL_LIST_CHECKS));
@@ -1702,6 +1880,7 @@ mod tests {
             project_paths: vec![],
             target_urls: vec!["http://localhost:3001".to_string()],
             api_endpoints: vec![],
+            referenced_files: vec![],
         };
         let tools = select_tools(&input, "auto");
         assert!(tools.contains(&TOOL_SCAN_APPS));
@@ -1717,6 +1896,7 @@ mod tests {
             project_paths: vec![],
             target_urls: vec!["http://localhost:8000".to_string()],
             api_endpoints: vec!["/api/v1/users".to_string()],
+            referenced_files: vec![],
         };
         let tools = select_tools(&input, "auto");
         assert!(tools.contains(&TOOL_TEST_API));
@@ -1730,6 +1910,7 @@ mod tests {
             project_paths: vec![],
             target_urls: vec![],
             api_endpoints: vec![],
+            referenced_files: vec![],
         };
         let tools = select_tools(&input, "auto");
         assert!(tools.contains(&TOOL_LIST_MCP));
@@ -1743,6 +1924,7 @@ mod tests {
             project_paths: vec![],
             target_urls: vec![],
             api_endpoints: vec![],
+            referenced_files: vec![],
         };
         let tools = select_tools(&input, "auto");
         assert!(tools.contains(&TOOL_LIST_SHELL_COMMANDS));
@@ -1756,6 +1938,7 @@ mod tests {
             project_paths: vec![],
             target_urls: vec![],
             api_endpoints: vec![],
+            referenced_files: vec![],
         };
         let tools = select_tools(&input, "auto");
         assert!(tools.contains(&TOOL_DATABASE_STATS));
@@ -1769,6 +1952,7 @@ mod tests {
             project_paths: vec![],
             target_urls: vec![],
             api_endpoints: vec![],
+            referenced_files: vec![],
         };
         let tools = select_tools(&input, "auto");
         assert!(tools.is_empty());
@@ -1783,6 +1967,7 @@ mod tests {
             project_paths: vec![],
             target_urls: vec![],
             api_endpoints: vec![],
+            referenced_files: vec![],
         };
         let tools = select_tools(&input, "enabled");
         // All KeywordsOnly tools should be included
@@ -1802,6 +1987,7 @@ mod tests {
             project_paths: vec![r"C:\project".to_string()],
             target_urls: vec!["http://localhost:3001".to_string()],
             api_endpoints: vec![],
+            referenced_files: vec![],
         };
         let tools = select_tools(&input, "enabled");
         // Should include data-dependent tools when data is present
@@ -1863,6 +2049,7 @@ mod tests {
             project_paths: vec![],
             target_urls: vec![],
             api_endpoints: vec![],
+            referenced_files: vec![],
         };
         let config = DiscoveryConfig::default();
         let result = execute_tool("nonexistent_tool", &input, &config);

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Maximum time to wait for Python executor to send READY signal
 /// Increased to 30 seconds to accommodate slow Python startup on Windows
@@ -213,7 +213,7 @@ impl ExecutorLifecycle {
     /// Returns the current state
     pub async fn get_state(&self) -> ExecutorState {
         let state = self.state.read().await.clone();
-        debug!(
+        trace!(
             "[LIFECYCLE] get_state() called, returning: {}",
             state.name()
         );

@@ -1,0 +1,198 @@
+//! Types for the orchestration loop.
+
+use serde::{Deserialize, Serialize};
+
+// --- Configuration ---
+
+/// Configuration for an orchestration loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestrationLoopConfig {
+    /// Target runner port to execute workflows on.
+    /// If None, targets self (this runner's own port).
+    pub target_runner_port: Option<u16>,
+
+    /// Target runner ID (for supervisor restart calls). If None, uses "primary".
+    pub target_runner_id: Option<String>,
+
+    /// Supervisor port for restart/build operations.
+    #[serde(default = "default_supervisor_port")]
+    pub supervisor_port: u16,
+
+    /// Workflow ID to execute each iteration.
+    /// Required for simple mode; optional in pipeline mode if build phase is configured.
+    #[serde(default)]
+    pub workflow_id: String,
+
+    /// Maximum number of iterations.
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
+
+    /// How to decide when to stop.
+    #[serde(default)]
+    pub exit_strategy: ExitStrategy,
+
+    /// What to do between iterations.
+    #[serde(default)]
+    pub between_iterations: BetweenIterations,
+
+    /// When true, a failed workflow iteration doesn't count as a terminal failure.
+    /// Instead, the loop waits for the fixer workflow to complete, then re-runs.
+    /// The loop only exits on success or max_iterations.
+    #[serde(default)]
+    pub retry_on_failure: bool,
+
+    /// Whether to wait for the fixer workflow before starting next iteration.
+    /// Only applies when retry_on_failure is true.
+    #[serde(default = "default_wait_for_fixer")]
+    pub wait_for_fixer: bool,
+
+    /// Pipeline mode configuration. When present, enables build/reflect/fix phases.
+    pub pipeline: Option<PipelineConfig>,
+}
+
+/// Pipeline mode configuration for build → execute → reflect → fix cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineConfig {
+    /// Generate workflow from description (optional — if absent, uses workflow_id).
+    pub build: Option<BuildPhaseConfig>,
+    /// Implement fixes via Claude CLI after reflection finds issues.
+    pub implement_fixes: Option<ImplementFixesConfig>,
+}
+
+/// Configuration for the build (workflow generation) phase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildPhaseConfig {
+    /// Human description of the desired workflow.
+    pub description: String,
+    /// Additional context to pass to the generator.
+    pub context: Option<String>,
+    /// Context IDs to include.
+    pub context_ids: Option<Vec<String>>,
+}
+
+/// Configuration for the implement-fixes phase (Claude CLI).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplementFixesConfig {
+    /// Model to use (e.g., "claude-opus-4-6"). Defaults to claude-opus-4-6.
+    pub model: Option<String>,
+    /// Timeout in seconds for the fix agent. Defaults to 600.
+    pub timeout_secs: Option<u64>,
+    /// Additional context to include in the fix prompt.
+    pub additional_context: Option<String>,
+}
+
+/// How to evaluate whether the loop should exit.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExitStrategy {
+    /// Exit when reflection finds 0 new fixes.
+    #[default]
+    Reflection,
+    /// Exit when workflow verification passes on first iteration.
+    WorkflowVerification,
+    /// Always run max_iterations times.
+    FixedIterations,
+}
+
+/// Action to take between iterations.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BetweenIterations {
+    /// Restart the target runner between iterations.
+    RestartRunner {
+        #[serde(default)]
+        rebuild: bool,
+    },
+    /// Only restart if the workflow signaled a restart is needed.
+    RestartOnSignal {
+        #[serde(default)]
+        rebuild: bool,
+    },
+    /// Wait for the target runner to be healthy (no restart).
+    WaitHealthy,
+    /// No action between iterations.
+    #[default]
+    None,
+}
+
+fn default_max_iterations() -> u32 {
+    5
+}
+
+fn default_supervisor_port() -> u16 {
+    9875
+}
+
+fn default_wait_for_fixer() -> bool {
+    true
+}
+
+// --- State ---
+
+/// Current phase of the orchestration loop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopPhase {
+    Idle,
+    BuildingWorkflow,
+    RunningWorkflow,
+    Reflecting,
+    ImplementingFixes,
+    EvaluatingExit,
+    WaitingForFixer,
+    BetweenIterations,
+    WaitingForRunner,
+    Complete,
+    Stopped,
+    Error,
+}
+
+impl Default for LoopPhase {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+/// Runtime state of the orchestration loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestrationLoopStatus {
+    pub running: bool,
+    pub phase: LoopPhase,
+    pub current_iteration: u32,
+    pub max_iterations: u32,
+    pub workflow_id: String,
+    pub target_runner_port: u16,
+    pub target_runner_id: Option<String>,
+    pub is_pipeline: bool,
+    pub started_at: Option<String>,
+    pub error: Option<String>,
+    pub iteration_results: Vec<IterationResult>,
+}
+
+/// Result of a single iteration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IterationResult {
+    pub iteration: u32,
+    pub started_at: String,
+    pub completed_at: String,
+    pub task_run_id: String,
+    pub reflection_task_run_id: Option<String>,
+    pub fix_count: Option<u32>,
+    pub exit_check: ExitCheckResult,
+    /// Pipeline mode: ID of the workflow generated during the build phase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_workflow_id: Option<String>,
+    /// Pipeline mode: whether fixes were implemented during this iteration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixes_implemented: Option<bool>,
+    /// Pipeline mode: whether a rebuild was triggered for the next iteration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebuild_triggered: Option<bool>,
+}
+
+/// Result of evaluating whether the loop should exit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExitCheckResult {
+    pub should_exit: bool,
+    pub reason: String,
+}

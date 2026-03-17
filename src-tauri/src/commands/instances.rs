@@ -5,6 +5,7 @@ use tauri::State;
 use tracing::info;
 
 use super::CommandResponse;
+use crate::commands::AppState;
 use crate::instance_manager::InstanceManager;
 use crate::settings::{self, RunnerInstanceConfig};
 
@@ -103,4 +104,24 @@ pub async fn stop_runner_instance(
         message: Some("Instance stopped".into()),
         data: None,
     })
+}
+
+/// Get identity info about this runner instance: whether it's secondary and what primary it proxies to.
+#[tauri::command]
+pub async fn get_runner_identity(
+    app_state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let is_secondary = crate::process_capture::primary_proxy::is_secondary();
+    let instance_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
+    let primary_port = crate::process_capture::primary_proxy::primary_port();
+    let own_port = app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    Ok(serde_json::json!({
+        "is_secondary": is_secondary,
+        "instance_name": instance_name,
+        "primary_port": primary_port,
+        "port": own_port,
+    }))
 }

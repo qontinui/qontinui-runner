@@ -193,15 +193,38 @@ pub fn resolve_working_directory(wd: &str) -> PathBuf {
         return normalize_path_separators(path);
     }
 
-    // Cache workspace root (used in multiple fallback stages)
-    let workspace_root = crate::mcp::shared::get_workspace_paths_internal()
-        .ok()
-        .map(|(root, _, _)| root);
+    // Get workspace paths: workspace_root is parent of runner_dir
+    let workspace_paths = crate::mcp::shared::get_workspace_paths_internal().ok();
+    let workspace_root = workspace_paths.as_ref().map(|(root, _, _)| root.clone());
+    // runner_dir = workspace_root/qontinui-runner (the runner project directory)
+    let runner_dir = workspace_root
+        .as_ref()
+        .map(|root| root.join("qontinui-runner"));
 
-    // Try to resolve relative to workspace root (most reliable for project-relative paths)
+    // Try runner_dir first — working directories like ".." are typically relative
+    // to the runner project, not the workspace root. E.g. ".." from runner_dir
+    // goes to workspace_root, whereas ".." from workspace_root escapes the workspace.
+    if let Some(ref runner) = runner_dir {
+        if runner.exists() {
+            let resolved = runner.join(&path);
+            if resolved.exists() {
+                // Canonicalize to resolve ".." components — embedded ".." in paths
+                // can break npx/cmd.exe module resolution on Windows
+                if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                    return normalize_path_separators(canonical);
+                }
+                return normalize_path_separators(resolved);
+            }
+        }
+    }
+
+    // Try workspace root next (for paths like "workflow-ui" or "qontinui-schemas")
     if let Some(ref root) = workspace_root {
         let resolved = root.join(&path);
         if resolved.exists() {
+            if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                return normalize_path_separators(canonical);
+            }
             return normalize_path_separators(resolved);
         }
     }
@@ -210,13 +233,28 @@ pub fn resolve_working_directory(wd: &str) -> PathBuf {
     if let Ok(cwd) = std::env::current_dir() {
         let resolved = cwd.join(&path);
         if resolved.exists() {
+            if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                return normalize_path_separators(canonical);
+            }
             return normalize_path_separators(resolved);
         }
     }
 
     // Neither resolved to an existing path, but we MUST return an absolute path.
-    // Prefer workspace-root-based path (even unverified) over a relative path,
+    // Prefer runner-dir-based path, then workspace-root-based, over a relative path,
     // since relative paths cause OS error 267 on Windows.
+    if let Some(runner) = runner_dir {
+        if runner.exists() {
+            let absolute = runner.join(&path);
+            tracing::warn!(
+                "resolve_working_directory: '{}' not found at '{}', returning unverified runner-relative path",
+                wd,
+                absolute.display()
+            );
+            return normalize_path_separators(absolute);
+        }
+    }
+
     if let Some(root) = workspace_root {
         let absolute = root.join(&path);
         tracing::warn!(
@@ -248,10 +286,15 @@ pub fn resolve_working_directory(wd: &str) -> PathBuf {
 /// Normalize path separators to the platform-native separator.
 /// On Windows, converts forward slashes to backslashes to avoid mixed-separator
 /// paths that can cause issues with CreateProcessW and cmd.exe.
+/// Also strips the UNC `\\?\` prefix that `std::fs::canonicalize` adds on Windows,
+/// since cmd.exe and npx do not handle UNC paths correctly.
 fn normalize_path_separators(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
-        PathBuf::from(path.to_string_lossy().replace('/', "\\"))
+        let s = path.to_string_lossy().replace('/', "\\");
+        // Strip \\?\ UNC prefix from canonicalized paths — cmd.exe chokes on them
+        let s = s.strip_prefix("\\\\?\\").unwrap_or(&s);
+        PathBuf::from(s)
     }
     #[cfg(not(windows))]
     {

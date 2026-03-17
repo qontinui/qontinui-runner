@@ -211,10 +211,15 @@ pub fn execute_check(check_def: &CheckDefinition) -> CheckExecutionResult {
     );
 
     // Detect project type and check if tool is applicable
-    let working_dir = check_def
-        .working_directory
-        .clone()
-        .unwrap_or_else(|| ".".to_string());
+    let working_dir = {
+        let raw = check_def
+            .working_directory
+            .clone()
+            .unwrap_or_else(|| ".".to_string());
+        crate::paths::resolve_working_directory(&raw)
+            .to_string_lossy()
+            .to_string()
+    };
     let project_type = detect_project_type(&working_dir);
 
     if !is_tool_applicable(&check_def.tool, &project_type) {
@@ -275,10 +280,15 @@ pub fn execute_check(check_def: &CheckDefinition) -> CheckExecutionResult {
     debug!("Running command: {} {:?}", program, args);
 
     // Set up the working directory
-    let working_dir = check_def
-        .working_directory
-        .clone()
-        .unwrap_or_else(|| ".".to_string());
+    let working_dir = {
+        let raw = check_def
+            .working_directory
+            .clone()
+            .unwrap_or_else(|| ".".to_string());
+        crate::paths::resolve_working_directory(&raw)
+            .to_string_lossy()
+            .to_string()
+    };
 
     // Execute the command
     // On Windows, we need to run commands through cmd.exe because tools like

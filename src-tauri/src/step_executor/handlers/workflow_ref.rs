@@ -219,6 +219,7 @@ impl StepHandler for WorkflowRefHandler {
             verification_history: HashMap::new(),
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
+            acceptance_criteria: None,
         };
 
         // 9. Create LoopController with session manager

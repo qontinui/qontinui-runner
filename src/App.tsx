@@ -171,6 +171,7 @@ import { ProcessManagerTab } from "./components/process-manager";
 import { ReflectionDashboard } from "./components/reflection-dashboard/ReflectionDashboard";
 import { ArchitectureView } from "./components/architecture-view/ArchitectureView";
 import { GeneratorEvalPage } from "./pages/GeneratorEvalPage";
+import { OrchestrationLoopPanel } from "./components/orchestration-loop/OrchestrationLoopPanel";
 import { SpecsPage } from "./pages/specs/SpecsPage";
 import { UIBridgeIntegrationPage } from "./pages/ui-bridge-integration/UIBridgeIntegrationPage";
 import { TerminalPage } from "./components/terminal";
@@ -256,6 +257,7 @@ type MainTabId =
   | "settings-instances"
   | "settings-debug"
   | "settings-updates"
+  | "orchestration-loop"
   | "terminal"
   | "help";
 
@@ -327,6 +329,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "settings-instances",
   "settings-debug",
   "settings-updates",
+  "orchestration-loop",
   "terminal",
   "help",
 ];
@@ -510,6 +513,11 @@ function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
         section: "tools",
         breadcrumb: ["Tools", "Generator Eval"],
       },
+      "orchestration-loop": {
+        name: "Orchestration Loop",
+        section: "tools",
+        breadcrumb: ["Tools", "Orchestration Loop"],
+      },
 
       // OTHER
       "error-monitor": {
@@ -640,11 +648,16 @@ function AppContent() {
           settings: "settings",
           "unified-workflow-builder": "unified-workflow-builder",
           "error-monitor": "error-monitor",
+          "state-machine": "state-machine",
         };
 
         const tabId = pageToTab[page];
         if (tabId) {
           setActiveTab(tabId);
+          // When navigating to state-machine, auto-show the exploration tab
+          if (page === "state-machine") {
+            setTimeout(() => window.dispatchEvent(new Event("sm-show-exploration")), 200);
+          }
           // _taskRunId and _selectRun reserved for future run selection via RunSelectionContext
         } else {
           console.warn(`[APP] Unknown page for navigation: ${page}`);
@@ -1149,6 +1162,13 @@ function AppContent() {
         return (
           <div className="h-full overflow-hidden">
             <GeneratorEvalPage />
+          </div>
+        );
+
+      case "orchestration-loop":
+        return (
+          <div className="h-full overflow-hidden">
+            <OrchestrationLoopPanel />
           </div>
         );
 

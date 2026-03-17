@@ -526,7 +526,7 @@ export function AiOutputTab({
       {/* Scrollable Output Container */}
       <div
         ref={containerRef}
-        className="flex-1 min-h-0 overflow-auto bg-background/50 rounded-lg border border-border p-4 font-mono text-sm"
+        className="flex-1 min-h-0 overflow-auto bg-background/50 rounded-lg border border-border p-4 text-sm"
       >
         {currentLoop && (
           <AiMessageDisplay

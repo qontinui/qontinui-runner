@@ -694,8 +694,13 @@ impl DeterministicVerifier {
         };
         let command = command.as_str();
 
+        // Resolve relative working directory to absolute path (prevents resolving
+        // against the runner process CWD instead of the workspace root)
+        let resolved_wd = crate::paths::resolve_working_directory(&self.working_directory);
+        let resolved_wd_str = resolved_wd.to_string_lossy().to_string();
+
         // Build enhanced PATH to ensure npm/npx tools are found
-        let enhanced_path = build_enhanced_path(&self.working_directory);
+        let enhanced_path = build_enhanced_path(&resolved_wd_str);
 
         // Run command using appropriate shell with enhanced PATH.
         // On Windows, detect bash-syntax commands (piped Python, heredocs, etc.)
@@ -707,20 +712,20 @@ impl DeterministicVerifier {
                 info!("Using Git Bash for verification command: {}", bash_path);
                 crate::process_helpers::no_window(&bash_path)
                     .args(["-c", command])
-                    .current_dir(&self.working_directory)
+                    .current_dir(&resolved_wd)
                     .env("PATH", &enhanced_path)
                     .output()
             } else {
                 crate::process_helpers::cmd_no_window()
                     .args(["/C", command])
-                    .current_dir(&self.working_directory)
+                    .current_dir(&resolved_wd)
                     .env("PATH", &enhanced_path)
                     .output()
             }
         } else {
             crate::process_helpers::no_window("sh")
                 .args(["-c", command])
-                .current_dir(&self.working_directory)
+                .current_dir(&resolved_wd)
                 .env("PATH", &enhanced_path)
                 .output()
         };

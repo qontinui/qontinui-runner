@@ -50,12 +50,39 @@ const server = http.createServer((req, res) => {
         data: { success: true, fireAndForget: true, action, timestamp: Date.now() },
         timestamp: Date.now()
       }));
+
+      // Also trigger internal navigation for the runner's own SPA routing
+      if (action === 'pageNavigate' && body) {
+        try {
+          const parsed = JSON.parse(body);
+          if (parsed.url) {
+            const urlPath = new URL(parsed.url).pathname.replace(/^\//, '');
+            if (urlPath) {
+              const navReq = http.request({
+                hostname: RUNNER_HOST,
+                port: RUNNER_PORT,
+                path: '/navigate',
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 5000
+              }, () => {});
+              navReq.on('error', () => {}); // ignore errors
+              navReq.end(JSON.stringify({ page: urlPath }));
+            }
+          }
+        } catch { /* ignore parse errors */ }
+      }
     });
     return;
   }
 
-  // Proxy /control/* to runner's /ui-bridge/control/*
-  const targetPath = '/ui-bridge' + req.url;
+  // Proxy requests to runner's /ui-bridge/control/*
+  // SDK handler sends paths like /ai/search, /elements, /snapshot etc.
+  // These need to be mapped to /ui-bridge/control/ai/search, /ui-bridge/control/elements, etc.
+  const urlPath = req.url.split('?')[0];
+  const query = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+  const controlPath = urlPath.startsWith('/control/') ? urlPath : '/control' + urlPath;
+  const targetPath = '/ui-bridge' + controlPath + query;
 
   let body = '';
   let bodySize = 0;
@@ -79,9 +106,36 @@ const server = http.createServer((req, res) => {
       timeout: 15000
     };
 
+    const isAiEndpoint = urlPath.includes('/ai/');
     const proxyReq = http.request(options, proxyRes => {
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
-      proxyRes.pipe(res);
+      if (isAiEndpoint) {
+        // For AI endpoints, unwrap the ApiResponse {success, data} wrapper
+        // so callers get {results, bestMatch, ...} directly
+        let responseBody = '';
+        proxyRes.on('data', chunk => { responseBody += chunk; });
+        proxyRes.on('end', () => {
+          try {
+            const json = JSON.parse(responseBody);
+            if (json.success && json.data && typeof json.data === 'object' && !Array.isArray(json.data)) {
+              const unwrapped = JSON.stringify(json.data);
+              const headers = { ...proxyRes.headers };
+              headers['content-length'] = Buffer.byteLength(unwrapped);
+              delete headers['transfer-encoding'];
+              res.writeHead(proxyRes.statusCode, headers);
+              res.end(unwrapped);
+            } else {
+              res.writeHead(proxyRes.statusCode, proxyRes.headers);
+              res.end(responseBody);
+            }
+          } catch {
+            res.writeHead(proxyRes.statusCode, proxyRes.headers);
+            res.end(responseBody);
+          }
+        });
+      } else {
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(res);
+      }
     });
 
     proxyReq.on('error', err => {

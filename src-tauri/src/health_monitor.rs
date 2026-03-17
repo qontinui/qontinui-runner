@@ -16,8 +16,10 @@ const HEALTH_CHECK_INTERVAL_SECS: u64 = 60;
 /// Memory threshold in MB to trigger a warning
 const MEMORY_WARNING_THRESHOLD_MB: u64 = 1024; // 1 GB
 
-/// Thread count threshold to trigger a warning
-const THREAD_WARNING_THRESHOLD: usize = 100;
+/// Thread count threshold to trigger a warning.
+/// Set to 150 to avoid false positives — the runner legitimately uses 100-130
+/// threads during normal operation (tokio runtime, bridges, background tasks).
+const THREAD_WARNING_THRESHOLD: usize = 150;
 
 /// Flag to control the health monitor
 static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);

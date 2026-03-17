@@ -147,6 +147,7 @@ pub fn launch_generated_workflow(
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
         project_path: crate::mcp::shared::current_project_path(),
+        acceptance_criteria: workflow.acceptance_criteria.clone(),
     };
 
     // 6. Spawn the workflow

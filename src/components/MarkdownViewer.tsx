@@ -206,6 +206,61 @@ function preprocessThinkingSections(content: string): string {
   return result.join("\n");
 }
 
+/**
+ * Try to parse a string as JSON. Returns pretty-printed JSON or null if not valid.
+ */
+function tryPrettyJson(text: string): string | null {
+  const trimmed = text.trim();
+  if (
+    trimmed.length < 40 ||
+    (trimmed[0] !== "{" && trimmed[0] !== "[")
+  ) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    return JSON.stringify(parsed, null, 2);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pre-process content to detect raw JSON blobs (outside of code fences)
+ * and wrap them in ```json code blocks for proper formatting.
+ */
+function preprocessRawJson(content: string): string {
+  const lines = content.split("\n");
+  const result: string[] = [];
+  let inCodeFence = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+
+    // Track code fence boundaries
+    if (trimmed.startsWith("```")) {
+      inCodeFence = !inCodeFence;
+      result.push(lines[i]);
+      continue;
+    }
+
+    if (inCodeFence) {
+      result.push(lines[i]);
+      continue;
+    }
+
+    // Try to pretty-print raw JSON lines
+    const pretty = tryPrettyJson(trimmed);
+    if (pretty) {
+      result.push("```json", pretty, "```");
+    } else {
+      result.push(lines[i]);
+    }
+  }
+
+  return result.join("\n");
+}
+
 const REMARK_PLUGINS = [remarkGfm];
 const REHYPE_PLUGINS = [rehypeRaw];
 
@@ -277,8 +332,8 @@ export function MarkdownViewer({ content, className, isAnimated = false }: Markd
       },
     );
 
-    // Wrap thinking sections
-    processed = preprocessThinkingSections(processed);
+    // Detect raw JSON and wrap in code blocks
+    processed = preprocessRawJson(processed);
 
     return processed;
   }, [content]);
@@ -286,7 +341,7 @@ export function MarkdownViewer({ content, className, isAnimated = false }: Markd
   return (
     <div
       className={cn(
-        "text-xs bg-background p-3 overflow-x-auto max-w-none",
+        "text-xs bg-background p-3 max-w-none [overflow-wrap:anywhere]",
         isAnimated && "animate-in fade-in-0 slide-in-from-top-1 duration-200",
         className,
       )}

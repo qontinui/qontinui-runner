@@ -99,6 +99,18 @@ pub enum FixType {
     ProjectTestPattern,
     /// Recurring friction: common failures, flaky areas, known quirks
     ProjectRecurringIssue,
+
+    // --- UI Bridge-scoped fix types (UI Bridge reflection) ---
+    /// Element discovery: labeling, grouping, hierarchy, semantic roles
+    UiBridgeDiscovery,
+    /// Snapshot format: structure, AI-friendliness, noise reduction
+    UiBridgeSnapshot,
+    /// Action reliability: feedback, error recovery, new actions
+    UiBridgeAction,
+    /// SDK integration: new endpoints, capabilities, configuration
+    UiBridgeSdkFeature,
+    /// Prompt/workflow guidance: better instructions for AI to use UI Bridge
+    UiBridgePromptGuidance,
 }
 
 impl FixType {
@@ -114,6 +126,11 @@ impl FixType {
             Self::ProjectArchitecture => "project_architecture",
             Self::ProjectTestPattern => "project_test_pattern",
             Self::ProjectRecurringIssue => "project_recurring_issue",
+            Self::UiBridgeDiscovery => "ui_bridge_discovery",
+            Self::UiBridgeSnapshot => "ui_bridge_snapshot",
+            Self::UiBridgeAction => "ui_bridge_action",
+            Self::UiBridgeSdkFeature => "ui_bridge_sdk_feature",
+            Self::UiBridgePromptGuidance => "ui_bridge_prompt_guidance",
         }
     }
 
@@ -129,6 +146,11 @@ impl FixType {
             "project_architecture" | "proj_arch" => Some(Self::ProjectArchitecture),
             "project_test_pattern" | "proj_test" => Some(Self::ProjectTestPattern),
             "project_recurring_issue" | "proj_issue" => Some(Self::ProjectRecurringIssue),
+            "ui_bridge_discovery" | "ub_discovery" => Some(Self::UiBridgeDiscovery),
+            "ui_bridge_snapshot" | "ub_snapshot" => Some(Self::UiBridgeSnapshot),
+            "ui_bridge_action" | "ub_action" => Some(Self::UiBridgeAction),
+            "ui_bridge_sdk_feature" | "ub_sdk_feature" => Some(Self::UiBridgeSdkFeature),
+            "ui_bridge_prompt_guidance" | "ub_prompt" => Some(Self::UiBridgePromptGuidance),
             _ => None,
         }
     }
@@ -141,6 +163,18 @@ impl FixType {
                 | Self::ProjectArchitecture
                 | Self::ProjectTestPattern
                 | Self::ProjectRecurringIssue
+        )
+    }
+
+    /// Returns true if this is a UI Bridge-scoped fix type (from UI Bridge reflection).
+    pub fn is_ui_bridge_scoped(&self) -> bool {
+        matches!(
+            self,
+            Self::UiBridgeDiscovery
+                | Self::UiBridgeSnapshot
+                | Self::UiBridgeAction
+                | Self::UiBridgeSdkFeature
+                | Self::UiBridgePromptGuidance
         )
     }
 }

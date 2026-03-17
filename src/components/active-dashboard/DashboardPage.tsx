@@ -18,6 +18,7 @@ import { ActiveRunsBar } from "./ActiveRunsBar";
 import { ShortcutsModal } from "./ShortcutsModal";
 import { CompletionSummary } from "./CompletionSummary";
 import { ApprovalDialog } from "./ApprovalDialog";
+import { OrchestrationLoopBanner } from "./OrchestrationLoopBanner";
 import { registerAllWidgets } from "@/components/widgets";
 import { useFlowExecutionData } from "@/components/widgets/flow-execution";
 import { windowManager } from "../../managers";
@@ -499,6 +500,9 @@ export function DashboardPage({
             onPlayPause={handlePlayPause}
             onStop={handleStop}
           />
+
+          {/* Orchestration Loop Banner - shown when this runner is orchestrating */}
+          <OrchestrationLoopBanner />
 
           {/* Main Content Area */}
           <div className="flex-1 overflow-hidden">

@@ -1157,6 +1157,53 @@ pub fn generate_workflow(
     artifact_builder.quality_report = serde_json::to_value(&quality_report).ok();
     workflow.quality_report = serde_json::to_value(&quality_report).ok();
 
+    // ── AI Review Status ────────────────────────────────────────────────
+    // Determine whether the AI semantic review actually ran and completed.
+    // The workflow is considered "not AI reviewed" if:
+    // 1. Verification was skipped entirely (max_fix_iters == 0), OR
+    // 2. No iterations ran, OR
+    // 3. All verification iterations failed with infrastructure errors
+    //    (indicated by [INFRASTRUCTURE_ERROR] sentinel in issue text)
+    //
+    // Additionally, track whether verification actually *passed* (zero issues
+    // on the final iteration) vs merely *ran* (found issues it couldn't fix).
+    let verification_passed = iterations
+        .last()
+        .map(|iter| iter.issues.is_empty())
+        .unwrap_or(false);
+
+    let ai_reviewed = if max_fix_iters == 0 {
+        false
+    } else if iterations.is_empty() {
+        false
+    } else {
+        // Check if at least one iteration ran without infrastructure errors
+        iterations.iter().any(|iter| {
+            // An iteration counts as "AI reviewed" if:
+            // - It found zero issues (verification passed), OR
+            // - It found issues that are NOT all infrastructure errors
+            iter.issues.is_empty()
+                || iter
+                    .issues
+                    .iter()
+                    .any(|issue| !issue.starts_with("[INFRASTRUCTURE_ERROR]"))
+        })
+    };
+    workflow.ai_reviewed = ai_reviewed;
+    if !ai_reviewed {
+        warn!(
+            "Workflow '{}' was NOT AI-reviewed — all {} verification iteration(s) failed at infrastructure level",
+            workflow.name,
+            iterations.len()
+        );
+    } else if !verification_passed {
+        warn!(
+            "Workflow '{}' was AI-reviewed but verification never passed — {} iteration(s) ran with unresolved issues",
+            workflow.name,
+            iterations.len()
+        );
+    }
+
     // ── Quality Gate: Confidence Scoring ────────────────────────────────
     let confidence_score = {
         let mut score: f32 = 1.0;
@@ -1204,6 +1251,24 @@ pub fn generate_workflow(
                 let hardening_penalty = (summary.converted_count as f32 * 0.03).min(0.25);
                 score *= 1.0 - hardening_penalty;
             }
+        }
+
+        // Factor 5: AI review not completed (all verification failed at infra level)
+        if !ai_reviewed {
+            score *= 0.7;
+        }
+
+        // Factor 6: AI review ran but verification never passed (issues remain unfixed)
+        // This is distinct from Factor 5 (infra failure) — the AI ran and found issues
+        // but couldn't resolve them across all iterations.
+        if ai_reviewed && !verification_passed && max_fix_iters > 0 {
+            let remaining_issues = iterations
+                .last()
+                .map(|iter| iter.issues.len())
+                .unwrap_or(0);
+            // Scale penalty by number of remaining issues: 1 issue = 15%, 5+ = 50%
+            let penalty = (remaining_issues as f32 * 0.10).min(0.50);
+            score *= 1.0 - penalty;
         }
 
         score.clamp(0.0, 1.0)
@@ -1397,6 +1462,43 @@ pub fn generate_workflow(
 
     let artifact = artifact_builder.build(pipeline_start.elapsed().as_millis() as u64);
 
+    // Persist acceptance criteria on the workflow so they survive save/load
+    // and are available to the canvas panel manager at execution time.
+    // Also embed a step_name → criterion_id mapping so the canvas panel manager
+    // can correlate verification step results with criteria.
+    if let Some(ref criteria) = acceptance_criteria {
+        if let Ok(mut criteria_json) = serde_json::to_value(criteria) {
+            // Build step_name → criterion_id mapping from raw verification steps
+            let mut step_mapping = serde_json::Map::new();
+            let all_steps = workflow
+                .verification_steps
+                .iter()
+                .chain(workflow.stages.iter().flat_map(|s| s.verification_steps.iter()));
+            for step in all_steps {
+                let step_name = step
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if step_name.is_empty() {
+                    continue;
+                }
+                // Extract criterion_id (single string)
+                if let Some(cid) = step.get("criterion_id").and_then(|v| v.as_str()) {
+                    if !cid.is_empty() {
+                        step_mapping.insert(
+                            step_name.to_string(),
+                            serde_json::Value::String(cid.to_string()),
+                        );
+                    }
+                }
+            }
+            if !step_mapping.is_empty() {
+                criteria_json["step_mapping"] = serde_json::Value::Object(step_mapping);
+            }
+            workflow.acceptance_criteria = Some(criteria_json);
+        }
+    }
+
     let response = GenerateWorkflowResponse {
         workflow: Some(workflow),
         validation_errors,
@@ -1488,6 +1590,19 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
             .unwrap_or_default()
     );
 
+    // Read referenced files from the description and inline their contents
+    let referenced_files = super::meta_workflow::read_referenced_files_from_description_pub(&request.description);
+    let file_contents_section = if referenced_files.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "## Referenced File Contents\n\n\
+             **The user's description references the file(s) below. These file contents are the task specification. \
+             Base the generated workflow primarily on their contents.**\n\n{}",
+            referenced_files
+        )
+    };
+
     // Combine all context sections: schema + discovery + user contexts + prompt
     let mut sections = vec![schema_context];
     if !discovery_context.is_empty() {
@@ -1495,6 +1610,9 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
     }
     if !context_section.is_empty() {
         sections.push(context_section.clone());
+    }
+    if !file_contents_section.is_empty() {
+        sections.push(file_contents_section);
     }
     if request.include_ui_bridge_instructions.unwrap_or(true) {
         sections.push(UI_BRIDGE_INSTRUCTIONS.to_string());
@@ -1658,11 +1776,19 @@ fn run_verification_agent(
 
     if !ai_result.success {
         warn!(
-            "Verification agent failed: {}",
+            "Verification agent failed at infrastructure level: {}",
             ai_result.error.as_deref().unwrap_or("unknown")
         );
-        // Treat AI failure as "no issues found" — don't block the pipeline
-        return (vec![], prompt);
+        // Return a sentinel issue so callers know verification didn't actually pass.
+        // The issue text starts with [INFRASTRUCTURE_ERROR] so callers can distinguish
+        // AI infrastructure failures from semantic verification failures.
+        return (
+            vec![format!(
+                "[INFRASTRUCTURE_ERROR] AI verification agent failed: {}",
+                ai_result.error.as_deref().unwrap_or("unknown")
+            )],
+            prompt,
+        );
     }
 
     (parse_verification_response(&ai_result.output), prompt)

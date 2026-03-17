@@ -1293,6 +1293,31 @@ fn run_claude_session_inline(
                                     _ => {}
                                 }
                             }
+
+                            // Direct promotion: create a generation rule immediately
+                            // for qualifying fix types at high/medium confidence.
+                            {
+                                use crate::workflow_generation::rules as gen_rules;
+                                let fixes_slice = [fix];
+                                match gen_rules::create_rules_from_reflection_fixes(
+                                    &conn,
+                                    &fixes_slice,
+                                ) {
+                                    Ok(n) if n > 0 => {
+                                        info!(
+                                            "Created {} generation rule(s) directly from reflection fix",
+                                            n
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to create generation rules from reflection fix: {}",
+                                            e
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!("Failed to store reflection fix: {}", e);

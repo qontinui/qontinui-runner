@@ -91,6 +91,7 @@ import {
   Cpu,
   Plug,
   Network,
+  Repeat,
 } from "lucide-react";
 
 // Import shared navigation structure and state management
@@ -177,6 +178,7 @@ const ICON_MAP: Record<IconName, LucideIcon> = {
   Workflow,
   Cpu,
   Network,
+  Repeat,
 };
 
 function getIconComponent(iconName: IconName): LucideIcon {

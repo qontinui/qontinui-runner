@@ -1,5 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Increase recursion limit for large serde_json::json! macros in database export
+#![recursion_limit = "256"]
 // Allow dead code: many modules are in active development with planned integrations
 #![allow(dead_code)]
 // Allow complex types: API response types are intentionally detailed
@@ -41,6 +43,7 @@ mod execution_core;
 mod executor;
 mod exploration;
 mod findings;
+mod fixer;
 mod follow_up;
 mod health_monitor;
 mod heartbeat;
@@ -58,6 +61,7 @@ mod mcp_api;
 mod mcp_client;
 mod mcp_embedded;
 mod middleware;
+mod orchestration_loop;
 mod orchestrator;
 mod paths;
 mod playwright;
@@ -79,6 +83,7 @@ mod settings;
 mod skills;
 mod spec_utils;
 mod state_explorer;
+mod orchestration_loop_configs;
 mod state_machine_configs;
 mod step_event_builder;
 mod step_executor;
@@ -442,6 +447,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         canvas_state: Arc::new(tokio::sync::RwLock::new(
             crate::mcp::canvas::CanvasState::new(),
         )),
+        orchestration_loop: std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::orchestration_loop::loop_engine::LoopState::new(),
+        )),
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -707,6 +715,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::state_machine_configs::sm_import_config,
             commands::state_machine_configs::sm_save_thumbnails,
             commands::state_machine_configs::sm_get_thumbnails,
+            commands::state_machine_configs::sm_save_capture_screenshots,
+            commands::state_machine_configs::sm_get_capture_screenshots,
+            commands::state_machine_configs::sm_get_capture_screenshot_image,
+            commands::state_machine_configs::sm_move_pending_screenshots,
+            commands::state_machine_configs::sm_delete_capture_screenshots,
             // State Explorer commands
             commands::state_explorer::start_exploration,
             commands::state_explorer::get_exploration_strategies,
@@ -1104,6 +1117,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             process_capture::commands::delete_process_config,
             process_capture::commands::get_process_sessions_from_db,
             process_capture::commands::get_process_session_output_from_db,
+            // Orchestration loop commands (runner-side workflow loop)
+            orchestration_loop::commands::start_orchestration_loop,
+            orchestration_loop::commands::stop_orchestration_loop,
+            orchestration_loop::commands::get_orchestration_loop_status,
+            orchestration_loop::commands::signal_orchestration_restart,
+            // Orchestration loop saved config CRUD
+            commands::orchestration_loop_configs::ol_list_configs,
+            commands::orchestration_loop_configs::ol_get_config,
+            commands::orchestration_loop_configs::ol_save_config,
+            commands::orchestration_loop_configs::ol_update_config,
+            commands::orchestration_loop_configs::ol_delete_config,
+            commands::orchestration_loop_configs::ol_toggle_favorite,
             // Embedded terminal commands (PTY-backed shell sessions)
             commands::terminal::terminal_create,
             commands::terminal::terminal_write,
@@ -1121,6 +1146,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::instances::delete_runner_instance,
             commands::instances::launch_runner_instance,
             commands::instances::stop_runner_instance,
+            commands::instances::get_runner_identity,
             // Claude Code transcript import commands
             commands::transcript::transcript_list_sessions,
             commands::transcript::transcript_read_session,

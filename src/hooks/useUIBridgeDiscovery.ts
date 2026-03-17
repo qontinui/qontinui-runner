@@ -14,6 +14,7 @@ import type { StateMachineState, StateMachineStateCreate } from "@qontinui/share
 import type { UseStateMachineConfigReturn } from "./useStateMachineConfig";
 import type { ShowToastFn } from "./useToast";
 import { instanceStorage } from "@/lib/instance-storage";
+import { consumePendingCaptureScreenshots } from "./useSdkUIBridge";
 
 // Discovery result from the fingerprint-based discovery Tauri command.
 // Must match the Rust structs serialized with #[serde(rename_all = "camelCase")].
@@ -56,6 +57,8 @@ interface PersistedDiscoveryState {
   dataSource: "explore" | "record" | null;
   discoveryResult: FingerprintDiscoveryResult | null;
   configName: string;
+  /** Session ID for pending screenshots saved to DB during exploration */
+  pendingScreenshotSessionId?: string;
 }
 
 function loadPersistedState(): PersistedDiscoveryState | null {
@@ -105,6 +108,7 @@ export function useUIBridgeDiscovery(
   showToast?: ShowToastFn,
 ) {
   const [initial] = useState(() => loadPersistedState());
+  const [pendingScreenshotSessionId] = useState(initial?.pendingScreenshotSessionId);
 
   const [cooccurrenceData, setCooccurrenceDataState] = useState<CooccurrenceExport | null>(
     initial?.cooccurrenceData ?? null,
@@ -203,117 +207,54 @@ export function useUIBridgeDiscovery(
       }
 
       setIsSaving(true);
+      let savedConfigId: string | null = null;
+
       try {
+        // Step 1: Create config + states (critical — must succeed)
         const config = await smConfig.createConfig({
           name: saveName.trim(),
           description: `Discovered from ${cooccurrenceData.presenceMatrix?.length ?? 0} captures via ${dataSource || "unknown"}`,
         });
+        savedConfigId = config.id;
 
-        // Create states via direct Tauri IPC to avoid React state batching issue.
-        // createConfig sets activeConfig asynchronously, so calling smConfig.createState
-        // immediately would fail because activeConfig hasn't updated yet.
-        const fpDetails = cooccurrenceData.fingerprintDetails ?? {};
-        for (const state of result.states) {
-          // Build element labels and positions from fingerprint details so they
-          // survive across sessions (stored in extra_metadata).
-          const elementLabels: Record<string, string> = {};
-          const elementPositions: Record<string, { top: number; left: number }> = {};
-          const elementTags: Record<string, { tagName: string; role: string; zone: string }> = {};
-          for (const eid of state.elementIds) {
-            // Element IDs are "prefix:hash" but fingerprintDetails is keyed by hash only
-            const colonIdx = eid.indexOf(":");
-            const hash = colonIdx > 0 ? eid.slice(colonIdx + 1) : eid;
-            const fp = fpDetails[hash] ?? fpDetails[eid];
-            if (fp) {
-              elementLabels[eid] = fp.accessibleName || fp.role || fp.tagName || eid.slice(0, 12);
-              if (fp.relativePosition) {
-                elementPositions[eid] = fp.relativePosition;
-              }
-              elementTags[eid] = {
-                tagName: fp.tagName || "",
-                role: fp.role || "",
-                zone: fp.positionZone || "",
-              };
-            }
-          }
-
-          const request: StateMachineStateCreate = {
-            state_id: state.stateId,
-            name: state.name,
-            description: state.landmarkContext || "",
-            element_ids: state.elementIds,
-            confidence: state.confidence,
-            extra_metadata: {
-              elementLabels,
-              elementPositions,
-              elementTags,
-            },
-          };
-          try {
-            await invoke<StateMachineState>("sm_create_state", {
-              configId: config.id,
-              request,
-            });
-          } catch (stateErr) {
-            console.warn(
-              `[useUIBridgeDiscovery] Failed to create state "${state.name}":`,
-              stateErr,
-            );
-          }
-        }
+        await createStatesForConfig(config.id, result.states, cooccurrenceData);
 
         showToast?.(
           `Saved config "${saveName.trim()}" with ${result.states.length} states`,
           "success",
         );
-
-        const savedConfigId = config.id;
-
-        // Save thumbnails to database (survives across sessions).
-        // Thumbnails may be in cooccurrenceData.elementThumbnails (if exploration just finished)
-        // or in the separate localStorage key (if data was loaded from persistence without thumbnails).
-        let thumbnails = cooccurrenceData.elementThumbnails;
-        if (!thumbnails || Object.keys(thumbnails).length === 0) {
-          try {
-            const stored = localStorage.getItem("qontinui-runner-sm-thumbnails");
-            if (stored) thumbnails = JSON.parse(stored);
-          } catch {
-            /* */
-          }
-        }
-        if (thumbnails && Object.keys(thumbnails).length > 0) {
-          try {
-            await invoke<number>("sm_save_thumbnails", {
-              configId: savedConfigId,
-              thumbnails,
-            });
-          } catch (err) {
-            console.warn("[useUIBridgeDiscovery] Failed to save thumbnails:", err);
-          }
-        }
-
-        // Refresh configs list from DB so the dropdown shows the new config
-        // immediately, even before onConfigCreated runs.
-        await smConfig.loadConfigs();
-
-        // Clear discovery state
-        setCooccurrenceDataState(null);
-        setDataSource(null);
-        setDiscoveryResult(null);
-        setConfigName("");
-        clearPersistedState();
-
-        return savedConfigId;
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Failed to save";
+        const message = err instanceof Error ? err.message : "Failed to save config";
         showToast?.(message, "error");
-        console.warn("[useUIBridgeDiscovery]", message);
-        return null;
-      } finally {
+        console.warn("[useUIBridgeDiscovery] Config creation failed:", message);
         setIsSaving(false);
+        return null;
       }
+
+      // Step 2: Refresh the dropdown IMMEDIATELY after config creation.
+      // This must happen before any optional work so the user sees the new config.
+      try {
+        await smConfig.loadConfigs();
+      } catch {
+        // Non-fatal: user can click Refresh manually
+      }
+
+      // Step 3: Save optional assets (thumbnails, screenshots).
+      // These are fire-and-forget — failures must never block or hide the config.
+      saveThumbnailsForConfig(savedConfigId, cooccurrenceData);
+      saveScreenshotsForConfig(savedConfigId, cooccurrenceData, pendingScreenshotSessionId);
+
+      // Step 4: Clear discovery state
+      setCooccurrenceDataState(null);
+      setDataSource(null);
+      setDiscoveryResult(null);
+      setConfigName("");
+      clearPersistedState();
+      setIsSaving(false);
+
+      return savedConfigId;
     },
-    [cooccurrenceData, dataSource, configName, discoveryResult, smConfig, showToast],
+    [cooccurrenceData, dataSource, configName, discoveryResult, smConfig, showToast, pendingScreenshotSessionId],
   );
 
   const reset = useCallback(() => {
@@ -337,6 +278,164 @@ export function useUIBridgeDiscovery(
     saveConfig,
     reset,
   };
+}
+
+// =============================================================================
+// Extracted helpers — each does ONE thing, failures are isolated
+// =============================================================================
+
+/** Create states for a config via direct Tauri IPC. */
+async function createStatesForConfig(
+  configId: string,
+  states: FingerprintDiscoveryResult["states"],
+  cooccurrenceData: CooccurrenceExport,
+): Promise<void> {
+  const fpDetails = cooccurrenceData.fingerprintDetails ?? {};
+  for (const state of states) {
+    const elementLabels: Record<string, string> = {};
+    const elementPositions: Record<string, { top: number; left: number }> = {};
+    const elementTags: Record<string, { tagName: string; role: string; zone: string }> = {};
+    for (const eid of state.elementIds) {
+      const colonIdx = eid.indexOf(":");
+      const hash = colonIdx > 0 ? eid.slice(colonIdx + 1) : eid;
+      const fp = fpDetails[hash] ?? fpDetails[eid];
+      if (fp) {
+        elementLabels[eid] = fp.accessibleName || fp.role || fp.tagName || eid.slice(0, 12);
+        if (fp.relativePosition) {
+          elementPositions[eid] = fp.relativePosition;
+        }
+        elementTags[eid] = {
+          tagName: fp.tagName || "",
+          role: fp.role || "",
+          zone: fp.positionZone || "",
+        };
+      }
+    }
+
+    const request: StateMachineStateCreate = {
+      state_id: state.stateId,
+      name: state.name,
+      description: state.landmarkContext || "",
+      element_ids: state.elementIds,
+      confidence: state.confidence,
+      extra_metadata: { elementLabels, elementPositions, elementTags },
+    };
+    try {
+      await invoke<StateMachineState>("sm_create_state", { configId, request });
+    } catch (err) {
+      console.warn(`[useUIBridgeDiscovery] Failed to create state "${state.name}":`, err);
+    }
+  }
+}
+
+/** Save element thumbnails for a config (fire-and-forget). */
+function saveThumbnailsForConfig(
+  configId: string,
+  cooccurrenceData: CooccurrenceExport,
+): void {
+  let thumbnails = cooccurrenceData.elementThumbnails;
+  if (!thumbnails || Object.keys(thumbnails).length === 0) {
+    try {
+      const stored = localStorage.getItem("qontinui-runner-sm-thumbnails");
+      if (stored) thumbnails = JSON.parse(stored);
+    } catch {
+      /* */
+    }
+  }
+  if (thumbnails && Object.keys(thumbnails).length > 0) {
+    invoke<number>("sm_save_thumbnails", { configId, thumbnails }).catch((err) => {
+      console.warn("[useUIBridgeDiscovery] Failed to save thumbnails:", err);
+    });
+  }
+}
+
+/**
+ * Save capture screenshots for a config (fire-and-forget).
+ *
+ * Tries multiple sources in order:
+ * 1. In-memory from cooccurrenceData (exploration just completed, same page)
+ * 2. Module-level pending variable (exploration completed, page navigated)
+ * 3. DB pending rows from incremental saves during exploration
+ * 4. Fallback: capture a fresh screenshot now
+ */
+function saveScreenshotsForConfig(
+  configId: string,
+  cooccurrenceData: CooccurrenceExport,
+  pendingSessionId?: string,
+): void {
+  const fromMemory = cooccurrenceData.captureScreenshots || consumePendingCaptureScreenshots();
+  if (fromMemory && fromMemory.length > 0) {
+    invoke<number>("sm_save_capture_screenshots", {
+      configId,
+      screenshots: fromMemory,
+    }).catch((err) => {
+      console.warn("[useUIBridgeDiscovery] Failed to save capture screenshots:", err);
+    });
+    return;
+  }
+
+  if (pendingSessionId) {
+    invoke<number>("sm_move_pending_screenshots", {
+      fromConfigId: `pending-${pendingSessionId}`,
+      toConfigId: configId,
+    })
+      .then((moved) => {
+        if (moved === 0) captureFallbackScreenshot(configId, cooccurrenceData);
+      })
+      .catch(() => {
+        captureFallbackScreenshot(configId, cooccurrenceData);
+      });
+    return;
+  }
+
+  captureFallbackScreenshot(configId, cooccurrenceData);
+}
+
+/** Capture a fresh screenshot and save it for the given config. */
+async function captureFallbackScreenshot(
+  configId: string,
+  cooccurrenceData: CooccurrenceExport,
+): Promise<void> {
+  try {
+    const { getApiBase, tracedFetch } = await import("@/lib/runner-api");
+    const ssResp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/screenshot?runner=true`);
+    const ssJson = await ssResp.json();
+    if (!ssJson.success || !ssJson.data?.screenshot) return;
+
+    const dpr = ssJson.data.scaleFactor || 1;
+    const imgW = (ssJson.data.width || 1920) * dpr;
+    const imgH = (ssJson.data.height || 1080) * dpr;
+
+    const boundsMap: Record<string, { x: number; y: number; width: number; height: number }> = {};
+    const fpDetails = cooccurrenceData.fingerprintDetails ?? {};
+    const allHashes = cooccurrenceData.allFingerprints ?? [];
+    for (const hash of allHashes) {
+      const fp = fpDetails[hash];
+      if (fp?.relativePosition) {
+        boundsMap[hash] = {
+          x: fp.relativePosition.left * imgW,
+          y: fp.relativePosition.top * imgH,
+          width: imgW * 0.05,
+          height: imgH * 0.03,
+        };
+      }
+    }
+
+    await invoke<number>("sm_save_capture_screenshots", {
+      configId,
+      screenshots: [{
+        captureIndex: 0,
+        screenshotBase64: ssJson.data.screenshot,
+        width: Math.round(imgW),
+        height: Math.round(imgH),
+        elementBoundsJson: JSON.stringify(boundsMap),
+        fingerprintHashesJson: JSON.stringify(allHashes),
+        capturedAt: new Date().toISOString(),
+      }],
+    });
+  } catch (err) {
+    console.warn("[useUIBridgeDiscovery] Fallback screenshot failed:", err);
+  }
 }
 
 /**

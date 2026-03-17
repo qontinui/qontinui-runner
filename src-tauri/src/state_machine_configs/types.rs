@@ -154,3 +154,34 @@ pub struct SmImportRequest {
     pub name: Option<String>,
     pub config: serde_json::Value,
 }
+
+// =============================================================================
+// Capture Screenshots
+// =============================================================================
+
+/// Metadata for a capture screenshot (returned without image data).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmCaptureScreenshotMeta {
+    pub id: String,
+    pub config_id: String,
+    pub capture_index: i64,
+    pub width: i64,
+    pub height: i64,
+    pub element_bounds_json: String,
+    pub fingerprint_hashes_json: String,
+    pub captured_at: String,
+}
+
+/// Full capture screenshot data for saving (includes base64 PNG that gets converted to WebP).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmCaptureScreenshotSave {
+    pub capture_index: i64,
+    pub screenshot_base64: String,
+    pub width: i64,
+    pub height: i64,
+    pub element_bounds_json: String,
+    pub fingerprint_hashes_json: String,
+    pub captured_at: String,
+}

@@ -337,6 +337,8 @@ pub async fn generate_workflow_standalone(
                         dependency_graph: workflow.dependency_graph.clone(),
                         cost_annotations: workflow.cost_annotations.clone(),
                         quality_report: workflow.quality_report.clone(),
+                        acceptance_criteria: workflow.acceptance_criteria.clone(),
+                        ai_reviewed: Some(workflow.ai_reviewed),
                     };
 
                     let save_result = tokio::task::spawn_blocking(move || {

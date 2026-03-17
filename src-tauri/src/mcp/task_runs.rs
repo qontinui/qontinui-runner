@@ -35,9 +35,10 @@ pub async fn list_task_runs(
     let limit = query.limit.unwrap_or(50);
     let workflow_type = query.workflow_type;
     let db = state.app_state.checkpoint_db.clone();
+    let port = state.app_state.api_port.load(std::sync::atomic::Ordering::Relaxed);
 
     tokio::task::spawn_blocking(move || {
-        db.get_recent_task_runs_filtered(limit, workflow_type.as_deref())
+        db.get_recent_task_runs_filtered(limit, workflow_type.as_deref(), Some(port))
     })
     .await
     .map_err(|e| {
@@ -54,8 +55,9 @@ pub async fn list_running_task_runs(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<Vec<TaskRun>>, (StatusCode, String)> {
     let db = state.app_state.checkpoint_db.clone();
+    let port = state.app_state.api_port.load(std::sync::atomic::Ordering::Relaxed);
 
-    tokio::task::spawn_blocking(move || db.get_running_task_runs())
+    tokio::task::spawn_blocking(move || db.get_running_task_runs(Some(port)))
         .await
         .map_err(|e| {
             error!("spawn_blocking error in list_running_task_runs: {}", e);
@@ -1277,6 +1279,7 @@ pub async fn resume_task_run(
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
         project_path: crate::mcp::shared::current_project_path(),
+        acceptance_criteria: workflow.acceptance_criteria.clone(),
     };
 
     // Spawn the workflow execution in background with panic protection
@@ -1940,7 +1943,7 @@ pub async fn get_current_execution_steps(
     let running_tasks = state
         .app_state
         .checkpoint_db
-        .get_running_task_runs()
+        .get_running_task_runs(Some(state.app_state.api_port.load(std::sync::atomic::Ordering::Relaxed)))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // If no running task, return empty

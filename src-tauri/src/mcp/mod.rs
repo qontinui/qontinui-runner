@@ -41,6 +41,7 @@ pub mod mcp_servers;
 pub mod misc;
 pub mod models;
 pub mod monitors;
+pub mod orchestration_loop_api;
 pub mod playwright;
 pub mod processes;
 pub mod prompt_snippets;

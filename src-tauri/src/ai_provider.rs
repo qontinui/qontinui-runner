@@ -153,9 +153,16 @@ fn is_retryable_error(error_msg: &str) -> bool {
         return true;
     }
 
+    // HTTP 403 from Claude API can be a transient auth token refresh issue
+    // (e.g., subscription token expired mid-workflow). Retry with backoff
+    // so we don't waste an entire workflow iteration on a temporary auth failure.
+    if lower.contains("(403)") || lower.contains("forbidden") {
+        return true;
+    }
+
     // Permanent errors — return false explicitly for clarity
-    // HTTP 400, 401, 403 are auth/validation errors
-    if lower.contains("(400)") || lower.contains("(401)") || lower.contains("(403)") {
+    // HTTP 400, 401 are validation/credential errors (not transient)
+    if lower.contains("(400)") || lower.contains("(401)") {
         return false;
     }
     // Missing configuration or client errors
@@ -478,7 +485,10 @@ pub fn run_prompt_with_model_override(
         return retry_with_fallback("AI prompt", primary, Some(fallback));
     }
 
-    primary()
+    // No fallback configured — still retry on transient errors.
+    // Without this, a single transient failure (e.g., a 2-second timeout from
+    // the specification agent) kills the entire workflow generation pipeline.
+    retry_with_backoff("AI prompt", primary)
 }
 
 /// Try the primary operation first; if it fails with a retryable error and a fallback
@@ -867,12 +877,35 @@ fn process_cli_output(output: std::process::Output) -> AiResponse {
             AiResponse::success(stdout)
         }
     } else {
-        error!(
-            "Claude CLI failed (exit code {:?}): {}",
-            output.status.code(),
-            stderr
-        );
-        AiResponse::error_with_output(stdout, format!("Claude CLI failed: {}", stderr))
+        let exit_code = output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+
+        // Include stdout in error when stderr is empty (common on Windows where
+        // PowerShell piping may redirect child stderr to its own error stream)
+        let diagnostic = if stderr.trim().is_empty() && !stdout.trim().is_empty() {
+            format!(
+                "Claude CLI failed (exit {}): stdout: {}",
+                exit_code,
+                if stdout.len() > 500 {
+                    truncate_str(&stdout, 500)
+                } else {
+                    &stdout
+                }
+            )
+        } else if stderr.trim().is_empty() {
+            format!(
+                "Claude CLI failed (exit {}) with no output. Check that 'claude' is in PATH and authenticated.",
+                exit_code
+            )
+        } else {
+            format!("Claude CLI failed (exit {}): {}", exit_code, stderr)
+        };
+
+        error!("{}", diagnostic);
+        AiResponse::error_with_output(stdout, diagnostic)
     }
 }
 
@@ -1460,9 +1493,15 @@ mod tests {
     }
 
     #[test]
+    fn test_retryable_403_auth_errors() {
+        // 403 errors are retryable because they can be transient token refresh issues
+        assert!(is_retryable_error("Claude API error (403): forbidden"));
+        assert!(is_retryable_error("Access forbidden"));
+    }
+
+    #[test]
     fn test_not_retryable_auth_errors() {
         assert!(!is_retryable_error("Claude API error (401): unauthorized"));
-        assert!(!is_retryable_error("Claude API error (403): forbidden"));
         assert!(!is_retryable_error("Claude API error (400): bad request"));
     }
 

@@ -226,6 +226,10 @@ pub struct LoopConfig {
     /// Project/workspace path for project-scoped learning.
     /// When set, project reflection knowledge is loaded into AI context.
     pub project_path: Option<String>,
+    /// Acceptance criteria from the specification agent (for canvas panel).
+    /// When present, the canvas panel manager emits an AcceptanceCriteria panel
+    /// and tracks criterion status as verification results come in.
+    pub acceptance_criteria: Option<serde_json::Value>,
 }
 
 impl LoopConfig {

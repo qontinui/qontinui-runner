@@ -283,9 +283,7 @@ Each stage has its own setup, verification, agentic, and completion steps with i
       "verification_steps": [...],
       "agentic_steps": [...],
       "completion_steps": [],
-      "max_iterations": 5,
-      "provider": "claude_cli",
-      "model": "claude-sonnet-4"
+      "max_iterations": 5
     }}
   ],
   "stop_on_failure": false
@@ -298,18 +296,13 @@ Each stage has its own setup, verification, agentic, and completion steps with i
 - Later stages see full output from all prior stages in AI context
 - When using `stages`, leave top-level step arrays empty (setup_steps: [], etc.)
 - `stop_on_failure` defaults to false — workflow continues even if a stage fails
-- Per-stage `provider`/`model` override the workflow-level defaults
-
-### Difficulty-based model selection per stage
-- Simple stages (file checks, status checks, log reading): faster model (claude-sonnet-4, gemini-2.0-flash)
-- Complex stages (implementation, debugging, refactoring): capable model (claude-opus-4, gemini-2.5-pro)
-- Research/analysis stages: mid-tier model (claude-sonnet-4)
+- Do NOT set `provider` or `model` on stages — the runner uses the user's configured AI provider/model settings automatically. Hardcoding model names causes CLI errors because model identifiers vary by provider and version.
 
 ## Step Types
 
 ### Common Fields (all steps)
 - `id`: UUID v4 string (required)
-- `name`: Display name (required)
+- `name`: Display name (optional — auto-generated if omitted)
 - `phase`: Which phase this step belongs to (required)
 - `required`: boolean (optional, default true) — If false, step failure does not fail the workflow
 - `depends_on`: string[] (optional) — Step IDs that must complete before this step runs. Creates a DAG execution order.

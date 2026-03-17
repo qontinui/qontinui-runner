@@ -745,6 +745,35 @@ pub fn build_phase_distribution(
     })
 }
 
+/// Build the Acceptance Criteria panel (AcceptanceCriteria).
+/// Shows specification-derived criteria with live status tracking.
+pub fn build_acceptance_criteria(
+    acceptance_criteria: &Value,
+    criterion_statuses: &HashMap<String, (String, Option<String>)>,
+) -> Value {
+    // Clone the source criteria and overlay current statuses
+    let mut result = acceptance_criteria.clone();
+
+    // Update each criterion's status from the live tracking map
+    if let Some(criteria_array) = result.get_mut("criteria").and_then(|c| c.as_array_mut()) {
+        for criterion in criteria_array.iter_mut() {
+            if let Some(id) = criterion.get("id").and_then(|v| v.as_str()) {
+                if let Some((status, last_error)) = criterion_statuses.get(id) {
+                    criterion["status"] = json!(status);
+                    if let Some(err) = last_error {
+                        criterion["last_error"] = json!(err);
+                    }
+                } else {
+                    // Default to pending if not tracked
+                    criterion["status"] = json!("pending");
+                }
+            }
+        }
+    }
+
+    result
+}
+
 // ─── Helpers ───
 
 fn format_duration_ms(ms: u64) -> String {

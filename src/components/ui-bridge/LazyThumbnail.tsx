@@ -80,6 +80,14 @@ export function LazyThumbnail({
   const [isLoading, setIsLoading] = useState(false);
   const [hasError, setHasError] = useState(false);
 
+  // Keep a ref to the cache so the IntersectionObserver callback always
+  // reads/writes the latest Map reference, avoiding stale closures.
+  const cacheRef = useRef(thumbnailCache);
+  cacheRef.current = thumbnailCache;
+
+  const onLoadRef = useRef(onLoad);
+  onLoadRef.current = onLoad;
+
   // Crop the thumbnail
   const loadThumbnail = useCallback(async () => {
     // Skip if already loaded, loading, or no screenshot
@@ -88,7 +96,7 @@ export function LazyThumbnail({
     }
 
     // Check cache again (might have been populated by another instance)
-    const cached = thumbnailCache?.get(elementId);
+    const cached = cacheRef.current?.get(elementId);
     if (cached) {
       setThumbnail(cached);
       return;
@@ -102,11 +110,11 @@ export function LazyThumbnail({
       if (result) {
         setThumbnail(result);
         // Store in cache if provided
-        if (thumbnailCache) {
-          thumbnailCache.set(elementId, result);
+        if (cacheRef.current) {
+          cacheRef.current.set(elementId, result);
         }
         // Notify parent
-        onLoad?.(elementId, result);
+        onLoadRef.current?.(elementId, result);
       } else {
         setHasError(true);
       }
@@ -116,7 +124,7 @@ export function LazyThumbnail({
     } finally {
       setIsLoading(false);
     }
-  }, [elementId, bounds, screenshotBase64, maxSize, thumbnail, isLoading, thumbnailCache, onLoad]);
+  }, [elementId, bounds, screenshotBase64, maxSize, thumbnail, isLoading]);
 
   // Set up IntersectionObserver
   useEffect(() => {
@@ -139,8 +147,8 @@ export function LazyThumbnail({
 
   // Update thumbnail if cache changes externally
   useEffect(() => {
-    if (thumbnailCache && !thumbnail) {
-      const cached = thumbnailCache.get(elementId);
+    if (cacheRef.current && !thumbnail) {
+      const cached = cacheRef.current.get(elementId);
       if (cached) {
         setThumbnail(cached);
       }

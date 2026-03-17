@@ -6,10 +6,390 @@
 //! - Verification phase: Verify no destructive changes
 //! - Completion phase: Record patterns and evaluate effectiveness
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
+use regex::Regex;
+use tracing::info;
+
+use crate::orchestrator::context_propagation::SharedVariableStore;
 use crate::step_executor::ExecutionStepConfig;
 use crate::unified_workflow_executor::LoopConfig;
+
+// =============================================================================
+// Reflection Context Enrichment
+// =============================================================================
+
+/// Regex for extracting file paths from findings/output text.
+fn file_path_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Match patterns like:
+        // - File: path/to/file.rs
+        // - src/foo/bar.ts
+        // - paths ending in common extensions
+        Regex::new(
+            r#"(?:File:\s*)?(?:^|\s|`|'|")((?:[a-zA-Z]:[/\\])?(?:[\w.@-]+[/\\])*[\w.@-]+\.(?:rs|ts|tsx|js|jsx|py|json|toml|yaml|yml|md|css|scss|html|vue|svelte))\b"#
+        ).unwrap()
+    })
+}
+
+/// Enrich shared variables with project root and file tree only.
+///
+/// This is a lightweight version of `enrich_reflection_context` that ONLY sets
+/// `project_root` and `project_structure` if they aren't already set. It does
+/// NOT extract referenced files or pre-read file contents.
+///
+/// Use this for all workflows that need basic project orientation (paths, tree)
+/// without the heavier reflection-specific enrichment.
+pub fn enrich_project_context(
+    shared_vars: &SharedVariableStore,
+    project_path: Option<&str>,
+) {
+    // Skip if already set
+    if shared_vars.get("project_root").is_some() {
+        return;
+    }
+
+    info!("Enriching project context with root and file tree");
+
+    let project_root = determine_project_root(shared_vars, project_path);
+    shared_vars.set(
+        "project_root",
+        project_root
+            .as_deref()
+            .unwrap_or("Unknown - no project path available")
+            .to_string(),
+    );
+
+    if let Some(ref root) = project_root {
+        let tree = generate_file_tree(root);
+        if tree.is_empty() {
+            shared_vars.set(
+                "project_structure",
+                format!("Could not read directory tree for: {}", root),
+            );
+        } else {
+            shared_vars.set("project_structure", tree);
+        }
+    } else {
+        shared_vars.set(
+            "project_structure",
+            "No project path available — cannot generate directory tree.".to_string(),
+        );
+    }
+}
+
+/// Enrich shared variables with pre-loaded file contents and project structure
+/// for reflection workflows. This makes reflection dramatically more efficient
+/// by pre-loading everything the AI needs.
+///
+/// Sets these variables in the shared store:
+/// - `referenced_files` - Newline-separated list of validated file paths
+/// - `referenced_file_contents` - Pre-read contents of referenced files
+/// - `project_structure` - Condensed directory tree
+/// - `project_root` - The project root directory
+pub fn enrich_reflection_context(
+    shared_vars: &SharedVariableStore,
+    project_path: Option<&str>,
+) {
+    info!("Enriching reflection context with pre-loaded files and project structure");
+
+    // Determine project root
+    let project_root = determine_project_root(shared_vars, project_path);
+    shared_vars.set(
+        "project_root",
+        project_root
+            .as_deref()
+            .unwrap_or("Unknown - no project path available")
+            .to_string(),
+    );
+    info!(
+        "  project_root = {:?}",
+        project_root.as_deref().unwrap_or("(none)")
+    );
+
+    // A. Extract file paths from findings/output
+    let referenced_paths = extract_referenced_files(shared_vars, project_root.as_deref());
+    if referenced_paths.is_empty() {
+        shared_vars.set(
+            "referenced_files",
+            "No referenced files found in findings or AI output.".to_string(),
+        );
+        shared_vars.set(
+            "referenced_file_contents",
+            "No referenced files to pre-load.".to_string(),
+        );
+    } else {
+        info!("  Found {} referenced files", referenced_paths.len());
+        shared_vars.set(
+            "referenced_files",
+            referenced_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        // C. Pre-read referenced files
+        let contents = pre_read_files(&referenced_paths);
+        if contents.is_empty() {
+            shared_vars.set(
+                "referenced_file_contents",
+                "Could not read any of the referenced files.".to_string(),
+            );
+        } else {
+            shared_vars.set("referenced_file_contents", contents);
+        }
+    }
+
+    // B. Generate scoped file tree
+    if let Some(ref root) = project_root {
+        let tree = generate_file_tree(root);
+        if tree.is_empty() {
+            shared_vars.set(
+                "project_structure",
+                format!("Could not read directory tree for: {}", root),
+            );
+        } else {
+            shared_vars.set("project_structure", tree);
+        }
+    } else {
+        shared_vars.set(
+            "project_structure",
+            "No project path available — cannot generate directory tree.".to_string(),
+        );
+    }
+}
+
+/// Determine the project root from explicit path or workflow state.
+fn determine_project_root(
+    shared_vars: &SharedVariableStore,
+    project_path: Option<&str>,
+) -> Option<String> {
+    // Prefer explicit project_path
+    if let Some(p) = project_path {
+        if !p.is_empty() {
+            return Some(p.to_string());
+        }
+    }
+
+    // Fall back: extract from source_workflow_state (look for working_directory)
+    if let Some(state) = shared_vars.get("source_workflow_state") {
+        // Try JSON parse
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&state) {
+            if let Some(wd) = val
+                .get("working_directory")
+                .and_then(|v| v.as_str())
+            {
+                if !wd.is_empty() {
+                    return Some(wd.to_string());
+                }
+            }
+            if let Some(wd) = val
+                .get("project_path")
+                .and_then(|v| v.as_str())
+            {
+                if !wd.is_empty() {
+                    return Some(wd.to_string());
+                }
+            }
+        }
+        // Try plain text pattern: working_directory: /path or "working_directory":"/path"
+        static WD_RE: OnceLock<Regex> = OnceLock::new();
+        let wd_re = WD_RE.get_or_init(|| {
+            Regex::new(r#"(?:working_directory|project_path)["\s:]+["']?([^\s"',}]+)"#).unwrap()
+        });
+        if let Some(cap) = wd_re.captures(&state) {
+            let wd = cap.get(1).unwrap().as_str();
+            if !wd.is_empty() {
+                return Some(wd.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract file paths from source_findings and source_ai_output, validate they exist.
+fn extract_referenced_files(
+    shared_vars: &SharedVariableStore,
+    project_root: Option<&str>,
+) -> Vec<PathBuf> {
+    let re = file_path_regex();
+    let mut seen = HashSet::new();
+    let mut valid_paths = Vec::new();
+
+    // Gather text to search
+    let mut texts = Vec::new();
+    if let Some(findings) = shared_vars.get("source_findings") {
+        texts.push(findings);
+    }
+    if let Some(output) = shared_vars.get("source_ai_output") {
+        texts.push(output);
+    }
+
+    for text in &texts {
+        for cap in re.captures_iter(text) {
+            let raw_path = cap.get(1).unwrap().as_str().to_string();
+            if seen.contains(&raw_path) {
+                continue;
+            }
+            seen.insert(raw_path.clone());
+
+            // Try to resolve the path
+            if let Some(resolved) = resolve_file_path(&raw_path, project_root) {
+                valid_paths.push(resolved);
+            }
+        }
+    }
+
+    valid_paths
+}
+
+/// Try to resolve a file path: project_root + relative, then absolute.
+fn resolve_file_path(raw_path: &str, project_root: Option<&str>) -> Option<PathBuf> {
+    // Try relative to project root first
+    if let Some(root) = project_root {
+        let candidate = Path::new(root).join(raw_path);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    // Try as absolute path
+    let abs = Path::new(raw_path);
+    if abs.is_absolute() && abs.is_file() {
+        return Some(abs.to_path_buf());
+    }
+
+    None
+}
+
+/// Pre-read up to 10 files, max 300 lines each, max 50KB total.
+fn pre_read_files(paths: &[PathBuf]) -> String {
+    let mut result = String::new();
+    let mut total_bytes = 0usize;
+    let max_total_bytes = 50 * 1024; // 50KB
+    let max_files = 10;
+    let max_lines = 300;
+
+    for (i, path) in paths.iter().enumerate() {
+        if i >= max_files {
+            break;
+        }
+        if total_bytes >= max_total_bytes {
+            break;
+        }
+
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                // Limit to max_lines lines
+                let truncated: String = content
+                    .lines()
+                    .take(max_lines)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                // Check total size budget
+                let remaining = max_total_bytes.saturating_sub(total_bytes);
+                let portion = if truncated.len() > remaining {
+                    &truncated[..remaining]
+                } else {
+                    &truncated
+                };
+
+                result.push_str(&format!("--- File: {} ---\n{}\n\n", path.display(), portion));
+                total_bytes += portion.len();
+
+                let was_truncated = truncated.len() < content.len() || portion.len() < truncated.len();
+                if was_truncated {
+                    result.push_str("(truncated)\n\n");
+                }
+            }
+            Err(e) => {
+                info!("  Could not read {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    result
+}
+
+/// Generate a condensed indented file tree for the project.
+/// Depth limit: 4, max entries: 500.
+fn generate_file_tree(root: &str) -> String {
+    let root_path = Path::new(root);
+    if !root_path.is_dir() {
+        return String::new();
+    }
+
+    let mut lines = Vec::new();
+    let root_name = root_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| root.to_string());
+    lines.push(format!("{}/", root_name));
+
+    walk_dir_tree(root_path, 1, 4, &mut lines, 500);
+
+    if lines.len() >= 500 {
+        lines.push("... (truncated at 500 entries)".to_string());
+    }
+
+    lines.join("\n")
+}
+
+/// Directories to exclude from the file tree.
+const EXCLUDED_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".next",
+    "dist",
+    "build",
+    ".dev-logs",
+    ".cache",
+    ".turbo",
+];
+
+/// Recursively walk the directory tree with depth and entry limits.
+fn walk_dir_tree(dir: &Path, depth: usize, max_depth: usize, lines: &mut Vec<String>, max_entries: usize) {
+    if depth > max_depth || lines.len() >= max_entries {
+        return;
+    }
+
+    let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+        Err(_) => return,
+    };
+
+    // Sort entries for deterministic output
+    entries.sort_by_key(|e| e.file_name());
+
+    let indent = "  ".repeat(depth);
+
+    for entry in entries {
+        if lines.len() >= max_entries {
+            return;
+        }
+
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+
+        if path.is_dir() {
+            if EXCLUDED_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            lines.push(format!("{}{}/", indent, name));
+            walk_dir_tree(&path, depth + 1, max_depth, lines, max_entries);
+        } else {
+            lines.push(format!("{}{}", indent, name));
+        }
+    }
+}
 
 /// Build the LoopConfig for a reflection workflow.
 pub fn build_reflection_config(
@@ -46,6 +426,7 @@ pub fn build_reflection_config(
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
         project_path: crate::mcp::shared::current_project_path(),
+        acceptance_criteria: None,
     }
 }
 
@@ -282,12 +663,37 @@ The setup phase loaded the following data into runtime variables:
 - `{{source_workflow_state}}` — Workflow execution state (phases, iterations, timing)
 - `{{previous_fixes}}` — Previous reflection fixes for this workflow (for effectiveness comparison)
 - `{{already_tried_summary}}` — Structured summary of ALL prior fixes grouped by type, with effectiveness labels and DO NOT retry warnings
+- `{{referenced_files}}` — File paths referenced in findings and AI output (validated as existing)
+- `{{referenced_file_contents}}` — Pre-loaded contents of referenced files (read these instead of using tools)
+- `{{project_structure}}` — Condensed directory tree of the project
 
 ## CRITICAL: Already-Tried Context
 
 Review the already-tried summary (`{{already_tried_summary}}`) BEFORE proposing any fixes.
 Do NOT re-attempt approaches marked as FAILED or REGRESSION. If a fix type has low effectiveness
-across prior attempts, try a fundamentally different strategy rather than variations of the same approach."#;
+across prior attempts, try a fundamentally different strategy rather than variations of the same approach.
+
+## Working Directory
+
+The project root is: {{project_root}}
+All relative file paths in findings are relative to this directory.
+
+## Efficiency Guidelines
+
+You have been given pre-loaded data and file contents. Follow these rules:
+
+1. **Start with pre-loaded files.** The referenced file contents below contain the source files mentioned in findings. Read them FIRST before making any tool calls.
+2. **Never read the same file twice.** If you already have a file's contents (pre-loaded or via tool), do NOT read it again.
+3. **Use the project structure** below to navigate instead of running find, ls, or blind searches.
+4. **Use targeted grep** with specific patterns rather than exploratory find/ls commands.
+
+## Pre-loaded File Contents
+
+{{referenced_file_contents}}
+
+## Project Structure
+
+{{project_structure}}"#;
 
     let marker_section = r#"
 ## Recording Fixes
@@ -604,6 +1010,7 @@ pub fn build_project_reflection_config(
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
         project_path,
+        acceptance_criteria: None,
     }
 }
 
@@ -775,12 +1182,37 @@ The setup phase loaded the following data into runtime variables:
 - `{{{{source_workflow_state}}}}` — Workflow execution state
 - `{{{{previous_fixes}}}}` — Previous project reflection knowledge (for deduplication)
 - `{{{{already_tried_summary}}}}` — Structured summary of ALL prior fixes grouped by type, with effectiveness labels and DO NOT retry warnings
+- `{{{{referenced_files}}}}` — File paths referenced in findings and AI output (validated as existing)
+- `{{{{referenced_file_contents}}}}` — Pre-loaded contents of referenced files (read these instead of using tools)
+- `{{{{project_structure}}}}` — Condensed directory tree of the project
 
 ## CRITICAL: Already-Tried Context
 
 Review the already-tried summary (`{{{{already_tried_summary}}}}`) BEFORE proposing any fixes.
 Do NOT re-attempt approaches marked as FAILED or REGRESSION. If a fix type has low effectiveness
 across prior attempts, try a fundamentally different strategy rather than variations of the same approach.
+
+## Working Directory
+
+The project root is: {{{{project_root}}}}
+All relative file paths in findings are relative to this directory.
+
+## Efficiency Guidelines
+
+You have been given pre-loaded data and file contents. Follow these rules:
+
+1. **Start with pre-loaded files.** The referenced file contents below contain the source files mentioned in findings. Read them FIRST before making any tool calls.
+2. **Never read the same file twice.** If you already have a file's contents (pre-loaded or via tool), do NOT read it again.
+3. **Use the project structure** below to navigate instead of running find, ls, or blind searches.
+4. **Use targeted grep** with specific patterns rather than exploratory find/ls commands.
+
+## Pre-loaded File Contents
+
+{{{{referenced_file_contents}}}}
+
+## Project Structure
+
+{{{{project_structure}}}}
 
 ## Recording Project Knowledge
 
@@ -901,6 +1333,511 @@ fn build_api_step(
         step.phase = Some("completion".to_string());
     }
     step
+}
+
+// =============================================================================
+// UI Bridge Reflection Workflow
+// =============================================================================
+// Analyzes how the UI Bridge was used (or not used) in a workflow run,
+// identifies improvements, and automatically implements them. Runs in dev mode only.
+
+/// Build the LoopConfig for a UI Bridge reflection workflow.
+pub fn build_ui_bridge_reflection_config(
+    execution_id: &str,
+    workflow_name: &str,
+    source_workflow_name: &str,
+) -> LoopConfig {
+    LoopConfig {
+        max_iterations: 2,
+        base_prompt: build_ui_bridge_agentic_prompt(source_workflow_name),
+        workflow_name: workflow_name.to_string(),
+        workflow_id: format!("ui-bridge-reflection-{}", execution_id),
+        execution_id: execution_id.to_string(),
+        targeted_error_ids: Vec::new(),
+        starting_iteration: 0,
+        run_agentic_first: true,
+        artifact_dir: None,
+        is_dev_mode: false, // CRITICAL: Prevents cascade reflection
+        enable_sweep: false,
+        max_sweep_iterations: 5,
+        stages: Vec::new(),
+        stop_on_failure: false,
+        constraint_overrides: std::collections::HashMap::new(),
+        reflection_mode: true,
+        provider_override: None,
+        model_override: None,
+        model_overrides: std::collections::HashMap::new(),
+        stage_index: None,
+        max_sessions: Some(2),
+        auto_run_generated: false,
+        approval_gate: false,
+        max_context_tokens: 100_000,
+        cross_workflow_learning: false,
+        verification_history: std::collections::HashMap::new(),
+        routing_context: Default::default(),
+        project_path: crate::mcp::shared::current_project_path(),
+        acceptance_criteria: None,
+    }
+}
+
+/// Build setup steps for UI Bridge reflection (loads source run data + UI Bridge logs).
+pub fn build_ui_bridge_setup_steps(
+    source_task_run_id: &str,
+    source_workflow_name: &str,
+) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url_from_env();
+
+    vec![
+        // Step 1: Load AI conversation output (primary data source)
+        build_api_step(
+            "Load AI output",
+            "GET",
+            &format!(
+                "{}/task-runs/{}/output?tail_chars=50000",
+                base_url, source_task_run_id
+            ),
+            None,
+            Some("source_ai_output"),
+            true,
+        ),
+        // Step 2: Load workflow execution state (phases, steps, timing)
+        build_api_step(
+            "Load workflow state",
+            "GET",
+            &format!(
+                "{}/task-runs/{}/workflow-state",
+                base_url, source_task_run_id
+            ),
+            None,
+            Some("source_workflow_state"),
+            true,
+        ),
+        // Step 3: Load findings from source run
+        build_api_step(
+            "Load source findings",
+            "GET",
+            &format!("{}/findings/task/{}", base_url, source_task_run_id),
+            None,
+            Some("source_findings"),
+            true,
+        ),
+        // Step 4: Load step checkpoints (includes UI Bridge step results)
+        build_api_step(
+            "Load step checkpoints",
+            "GET",
+            &format!(
+                "{}/task-runs/{}/checkpoints",
+                base_url, source_task_run_id
+            ),
+            None,
+            Some("source_checkpoints"),
+            true,
+        ),
+        // Step 5: Load previous UI Bridge reflection fixes for deduplication
+        build_api_step(
+            "Load previous UI Bridge fixes",
+            "GET",
+            &format!(
+                "{}/reflection-fixes?workflow_name={}&status=applied",
+                base_url,
+                urlencoding::encode(source_workflow_name)
+            ),
+            None,
+            Some("previous_fixes"),
+            true,
+        ),
+        // Step 6: Load already-tried summary
+        build_api_step(
+            "Load already-tried summary",
+            "GET",
+            &format!(
+                "{}/reflection/already-tried-summary?workflow_name={}",
+                base_url,
+                urlencoding::encode(source_workflow_name)
+            ),
+            None,
+            Some("already_tried_summary"),
+            true,
+        ),
+    ]
+}
+
+/// Build verification steps for UI Bridge reflection.
+pub fn build_ui_bridge_verification_steps(source_task_run_id: &str) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url_from_env();
+
+    vec![
+        // HTTP health check
+        {
+            let mut step = ExecutionStepConfig {
+                step_type: "command".to_string(),
+                command_mode: Some("check".to_string()),
+                name: Some("Verify source data accessible".to_string()),
+                check_type: Some("http_status".to_string()),
+                check_url: Some(format!(
+                    "{}/task-runs/{}/knowledge",
+                    base_url, source_task_run_id
+                )),
+                expected_status: Some(200),
+                ..Default::default()
+            };
+            step.phase = Some("verification".to_string());
+            step
+        },
+        // Verify implementations compile/typecheck
+        build_verification_prompt_step(
+            "Verify UI Bridge improvements",
+            r#"Verify that any code changes made to the UI Bridge SDK, runner, or workflow prompts are safe:
+
+1. If TypeScript files were modified in ui-bridge/, run: cd ui-bridge && npm run build
+2. If Rust files were modified in qontinui-runner/, run: cd qontinui-runner/src-tauri && cargo check
+3. If markdown command files were modified, verify they are syntactically correct
+4. Confirm all REFLECTION_FIX markers were emitted for changes made
+
+Report any compilation errors or issues found."#,
+        ),
+    ]
+}
+
+/// Build completion steps for UI Bridge reflection.
+///
+/// Includes: effectiveness evaluation, implementation workflow generation from the
+/// plan produced by the agentic phase, and a summary.
+pub fn build_ui_bridge_completion_steps(
+    source_workflow_name: &str,
+) -> Vec<ExecutionStepConfig> {
+    let base_url = crate::mcp::types::get_self_base_url_from_env();
+
+    vec![
+        // Step 1: Batch evaluate previous fixes (automation)
+        build_api_step(
+            "Evaluate fix effectiveness",
+            "POST",
+            &format!(
+                "{}/reflection/evaluate?workflow_name={}",
+                base_url,
+                urlencoding::encode(source_workflow_name)
+            ),
+            None,
+            Some("evaluation_results"),
+            false,
+        ),
+        // Step 2: Load this reflection's own output so the completion phase can
+        // find the [UI_BRIDGE_IMPLEMENTATION_PLAN] block produced by the agentic phase.
+        // This is needed because completion runs in a new AI session without the
+        // agentic phase's conversation context.
+        build_api_step(
+            "Load reflection output for plan extraction",
+            "GET",
+            &format!(
+                "{}/task-runs/{{{{execution_id}}}}/output?tail_chars=60000",
+                base_url
+            ),
+            None,
+            Some("reflection_output"),
+            false,
+        ),
+        // Step 3: Generate implementation workflow from the plan (prompt step)
+        {
+            let mut step = build_prompt_step(
+                "Generate implementation workflow",
+                &format!(r#"Generate an implementation workflow from the UI Bridge improvement plan.
+
+## The Reflection Output
+
+The agentic phase's output has been loaded into `{{{{reflection_output}}}}`. Search it for the `[UI_BRIDGE_IMPLEMENTATION_PLAN]...[/UI_BRIDGE_IMPLEMENTATION_PLAN]` block.
+
+## Instructions
+
+1. **Extract the plan**: Find the `[UI_BRIDGE_IMPLEMENTATION_PLAN]...[/UI_BRIDGE_IMPLEMENTATION_PLAN]` block from `{{{{reflection_output}}}}`. If no plan block exists (e.g., no improvements identified), skip this step and report "No implementation plan — no improvements needed."
+
+2. **Generate the workflow**: Call the workflow generator API with the full plan text as the description:
+
+```bash
+curl -s -X POST '{base_url}/unified-workflows/generate-async' \
+  -H 'Content-Type: application/json' \
+  -d '{{
+    "description": "<INSERT THE FULL IMPLEMENTATION PLAN TEXT HERE>",
+    "category": "ui-bridge-improvement",
+    "tags": ["ui-bridge", "reflection", "auto-generated"],
+    "generate_specification": true,
+    "verification_depth": "thorough",
+    "investigation_codebase": true,
+    "reflection_mode": true,
+    "include_ui_bridge_instructions": true,
+    "discover_ui_bridge_specs": true,
+    "auto_run": true,
+    "inline_context": "This workflow implements UI Bridge improvements identified by the UI Bridge reflection system. The improvements are prioritized P0-P2. Each improvement has acceptance criteria that must be verified. On completion, run /review-plan to review the implementation."
+  }}'
+```
+
+3. **Record the result**: Save the returned `task_run_id` and `meta_workflow_id` for tracking.
+
+4. **If the generator returns an error**, fall back to recording the plan as a dev note:
+   - Write the full plan to `qontinui-dev-notes/ui-bridge-implementation-plan.md`
+   - Report that manual implementation is needed
+
+## Output
+
+Report:
+- Whether a workflow was generated
+- The task_run_id of the generated workflow (if successful)
+- The number of improvements in the plan
+- Whether auto_run was triggered"#,
+                    base_url = base_url,
+                ),
+            );
+            step.phase = Some("completion".to_string());
+            step
+        },
+        // Step 3: AI summary (prompt step)
+        {
+            let mut step = build_prompt_step(
+                "Summarize UI Bridge reflection",
+                r#"Summarize the UI Bridge reflection:
+
+1. List improvements analyzed and quick wins implemented directly
+2. Batch effectiveness results: {{evaluation_results}}
+3. Implementation workflow status: was one generated? What task_run_id?
+4. Expected impact on next workflow run's UI Bridge effectiveness
+5. Number of improvements in the implementation plan by priority (P0/P1/P2)
+
+Keep the summary concise — this is for internal tracking."#,
+            );
+            step.phase = Some("completion".to_string());
+            step
+        },
+    ]
+}
+
+/// Build the agentic prompt for UI Bridge reflection.
+///
+/// This prompt instructs the AI to analyze UI Bridge usage patterns in the source
+/// workflow, identify improvements, implement quick wins directly, and produce a
+/// structured implementation plan for larger improvements that will be used to
+/// generate a follow-up implementation workflow.
+fn build_ui_bridge_agentic_prompt(source_workflow_name: &str) -> String {
+    format!(
+        r#"You are a UI Bridge reflection agent analyzing the completed workflow run for "{}".
+
+Your goal is to understand how the UI Bridge was used (both deterministic steps and AI-driven interactions) in the workflow, identify what could be improved, and either implement improvements directly or produce a structured implementation plan for a follow-up workflow.
+
+## UI Bridge Statement of Purpose
+
+All improvements must align with the UI Bridge's core purpose and principles. Read this before designing any changes:
+
+**Mission**: UI Bridge makes any React application semantically observable and programmatically controllable by AI agents, automation workflows, and developers — without brittle selectors, external browser drivers, or manual test instrumentation.
+
+**Core Principle**: The application knows itself better than any external tool can. By embedding observability into the React rendering lifecycle, UI Bridge captures semantic meaning, component relationships, and application state that external tools can only approximate.
+
+**Vision**: The ultimate UI Bridge gives an AI everything it needs to see to understand, develop, and debug an application — efficiently. Any capability that helps an AI see more, understand more, or act more precisely is a welcome addition.
+
+**Five Core Capabilities**:
+1. **Discovery and Control** — Element registry with semantic IDs, uniform action API with structured feedback
+2. **Semantic Page Specs** — Declarative JSON specs that define page purpose, visual design, architecture, and domain logic correctness. Specs can reference any code available to the AI (backend libraries, data models). An AI reads a spec to understand what functionality *should* do, uses UI Bridge to see what it *currently* does, and the gap is the work. This enables autonomous workflows to develop entire applications.
+3. **Model-Based State Machine** — Automatic pathfinding to any place in the UI. Say "navigate to dashboard" instead of writing sequential click scripts. Supports multiple active states, multi-target pathfinding, and fingerprint-based state discovery. Reduces complexity from exponential to polynomial.
+4. **Observation and Readiness** — Multi-signal idle detection, render logs, console/network/navigation event capture, visual captures, design inspection
+5. **AI-Native Bridge** — Fuzzy search, semantic snapshots, natural language assertions, change summarization, pixel comparison, layout/component diffs
+
+**Design Principles**:
+1. **Semantic over structural** — Elements identified by purpose and meaning, not CSS paths
+2. **Embedded, not bolted on** — SDK lives inside the app via React hooks
+3. **AI-native by default** — Concise structured responses, fuzzy matching, error messages that guide the AI
+4. **Readiness, not timeouts** — Composable readiness signals, not arbitrary sleeps
+5. **Layered abstraction** — Element-level → component-level → workflow-level
+6. **Cross-platform uniformity** — Same HTTP API across browser, desktop, mobile
+7. **Observable by design** — Every action returns state before/after, errors, timing
+8. **Declarative correctness** — Specs define what the app should do; the state machine defines how to reach any part of it
+
+**Architectural Commitments**:
+- The element registry is the source of truth
+- HTTP is the primary consumer interface; IPC/MCP/clients are adapters
+- The SDK must remain lightweight in the host app
+- Server adapters are thin wrappers; business logic lives in core SDK
+- AI features are additive, not required
+- Specs are the contract between intent and implementation
+- The state machine abstracts navigation; consumers declare where, not how
+
+## Tool Access
+
+You have full tool access (file read/write, bash, grep, etc.). Use these to implement quick wins directly and to read code when designing larger improvements.
+
+## Data Available
+
+The setup phase loaded the following data into runtime variables:
+- `{{{{source_ai_output}}}}` — The complete AI conversation output (CRITICAL — read this end-to-end)
+- `{{{{source_workflow_state}}}}` — Workflow execution state (phases, iterations, timing)
+- `{{{{source_findings}}}}` — Categorized findings from the workflow run
+- `{{{{source_checkpoints}}}}` — Step-by-step execution results (includes UI Bridge step outcomes)
+- `{{{{previous_fixes}}}}` — Previous UI Bridge reflection fixes (for deduplication)
+- `{{{{already_tried_summary}}}}` — Structured summary of ALL prior fixes with effectiveness labels
+- `{{{{referenced_files}}}}` — File paths referenced in findings and AI output (validated as existing)
+- `{{{{referenced_file_contents}}}}` — Pre-loaded contents of referenced files (read these instead of using tools)
+- `{{{{project_structure}}}}` — Condensed directory tree of the project
+
+## CRITICAL: Already-Tried Context
+
+Review `{{{{already_tried_summary}}}}` BEFORE proposing any fixes.
+Do NOT re-attempt approaches marked as FAILED or REGRESSION.
+
+## Working Directory
+
+The project root is: {{{{project_root}}}}
+All relative file paths in findings are relative to this directory.
+
+## Efficiency Guidelines
+
+You have been given pre-loaded data and file contents. Follow these rules:
+
+1. **Start with pre-loaded files.** The referenced file contents below contain the source files mentioned in findings. Read them FIRST before making any tool calls.
+2. **Never read the same file twice.** If you already have a file's contents (pre-loaded or via tool), do NOT read it again.
+3. **Use the project structure** below to navigate instead of running find, ls, or blind searches.
+4. **Use targeted grep** with specific patterns rather than exploratory find/ls commands.
+
+## Pre-loaded File Contents
+
+{{{{referenced_file_contents}}}}
+
+## Project Structure
+
+{{{{project_structure}}}}
+
+## Phase 1: Analysis
+
+Read ALL the data carefully, then answer these questions with specific evidence:
+
+### Q1: UI Bridge Usage Map
+Create a map of every moment the UI Bridge was used or could have been used:
+- **Deterministic steps**: workflow steps with step_type containing "ui_bridge" (click, type, snapshot, discover, etc.)
+- **AI-driven usage**: places in the AI conversation where curl/HTTP calls to UI Bridge endpoints were made
+- **Missed opportunities**: places where the AI used screenshots, logs, guesswork, or Playwright instead of querying UI Bridge
+
+### Q2: What Failed?
+For each UI Bridge failure (deterministic or AI-driven):
+- What endpoint was called and what was the error/unexpected response?
+- Was the element not discovered, stale, wrong ID, action unsupported?
+- Did the AI retry or fall back to another approach?
+- Could the UI Bridge SDK have prevented this with better design?
+
+### Q3: What Was Missing?
+- Did the AI need information the UI Bridge doesn't expose? (React state, relationships, layout)
+- Were element IDs unstable or unpredictable?
+- Was the snapshot too noisy/large for effective AI parsing?
+- Were higher-level composite actions needed?
+
+### Q4: What Would Have Made the Workflow More Effective?
+- Fewer round-trips? Better element labeling? Semantic grouping?
+- Auto-discovery before snapshots? Better idle detection?
+- Richer error messages from failed actions?
+
+## Phase 2: Implementation (Quick Wins)
+
+Implement improvements that can be completed in this session. These are typically:
+
+1. **Prompt/guidance improvements** (qontinui-claude-config/.claude/commands/):
+   - Update ui-bridge.md, ufix.md, test-ui-bridge.md with better guidance
+   - Add UI Bridge usage examples to workflow prompts
+
+2. **Error message improvements** in SDK or runner:
+   - Better error messages from action execution
+   - Clearer feedback when elements aren't found
+
+3. **Small SDK changes** (ui-bridge/packages/ui-bridge/src/):
+   - Label improvements, noise reduction in snapshots
+   - Small discovery tweaks
+
+After implementing, test compilation:
+- TypeScript: `cd ui-bridge && npm run build`
+- Rust: `cd qontinui-runner/src-tauri && cargo check`
+
+## Phase 3: Implementation Plan (All Improvements)
+
+For ALL improvements — including architectural changes, multi-file features, new endpoints, and breaking API changes — produce a structured implementation plan. This plan will be used to generate a follow-up implementation workflow with acceptance criteria, verification steps, and agentic fix loops.
+
+**IMPORTANT**: Do NOT hold back improvements because they seem "too large". The statement of purpose above guides architectural decisions. Every improvement that aligns with the purpose should be planned.
+
+Write the implementation plan as a `[UI_BRIDGE_IMPLEMENTATION_PLAN]` block in your output using this exact format:
+
+```
+[UI_BRIDGE_IMPLEMENTATION_PLAN]
+# UI Bridge Improvement Implementation Plan
+
+## Summary
+One paragraph describing the overall improvements needed and their expected impact.
+
+## Improvements
+
+### 1. [Improvement Title]
+**Category**: SDK / Runner / Prompt / Architecture / New Feature
+**Priority**: P0 / P1 / P2
+**Evidence**: [Specific reference to what was observed in the workflow data]
+**Description**: [2-3 sentences describing the improvement]
+**Acceptance Criteria**:
+- [ ] [Testable criterion 1]
+- [ ] [Testable criterion 2]
+- [ ] [Testable criterion 3]
+**Files to Modify**:
+- `path/to/file.ts` — [what changes]
+- `path/to/file.rs` — [what changes]
+**Verification Method**: command / ui_bridge / test / manual
+**Verification Command**: [If method is command, the shell command to verify]
+
+### 2. [Next Improvement]
+...
+
+## Testing Strategy
+How to verify all improvements work together. Include:
+- Compilation checks (TypeScript, Rust)
+- A workflow to re-run that exercises the UI Bridge
+- Specific UI Bridge endpoints to call to verify improvements
+
+## Dependencies
+Any ordering constraints between improvements (e.g., "Improvement 3 depends on 1").
+[/UI_BRIDGE_IMPLEMENTATION_PLAN]
+```
+
+**Guidelines for the plan:**
+- Every improvement MUST have testable acceptance criteria
+- Acceptance criteria should be verifiable by a workflow (commands, UI Bridge assertions, or tests)
+- Include BOTH the quick wins you already implemented AND the larger improvements
+- For already-implemented quick wins, note "Status: Implemented" and focus criteria on verification
+- Order improvements by priority (P0 first)
+- Be specific about files and what changes — the plan will be given to a workflow generator
+
+## Recording Fixes
+
+Use `[REFLECTION_FIX:...]` markers for every improvement (quick wins you implemented directly):
+
+### Fix Types
+
+| Type | Shortcut | Use for |
+|------|----------|---------|
+| `ui_bridge_discovery` | `ub_discovery` | Element discovery improvements: labeling, grouping, hierarchy, semantic roles |
+| `ui_bridge_snapshot` | `ub_snapshot` | Snapshot format: structure, AI-friendliness, noise reduction |
+| `ui_bridge_action` | `ub_action` | Action reliability: feedback, error recovery, new actions |
+| `ui_bridge_sdk_feature` | `ub_sdk_feature` | SDK integration: new endpoints, capabilities, configuration |
+| `ui_bridge_prompt_guidance` | `ub_prompt` | Prompt/workflow guidance: better instructions for AI to use UI Bridge |
+
+### Marker Format
+
+```
+[REFLECTION_FIX:ui_bridge_discovery:high]
+Description: Added semantic grouping to element discovery so AI can identify form sections
+Reasoning: AI output showed 3 attempts to find the right form field among 47 discovered elements
+File: ui-bridge/packages/ui-bridge/src/discovery/scanner.ts
+Old: // previous code snippet
+New: // new code snippet
+[/REFLECTION_FIX]
+```
+
+**confidence** must be: `high`, `medium`, or `low`
+
+## Deduplication
+
+Check `{{{{previous_fixes}}}}` before emitting. Only emit genuinely new insights.
+Do NOT re-emit existing fixes."#,
+        source_workflow_name
+    )
 }
 
 /// Helper: Build a prompt step.
