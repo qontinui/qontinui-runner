@@ -532,40 +532,4 @@ impl SupervisorClient {
         Ok(())
     }
 
-    /// Stop a runner by ID.
-    pub async fn stop_runner(&self, runner_id: &str) -> Result<(), String> {
-        let url = format!("{}/runners/{}/stop", self.base_url, runner_id);
-        let resp = self
-            .client
-            .post(&url)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to stop runner: {}", e))?;
-
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Supervisor returned error: {}", body));
-        }
-
-        Ok(())
-    }
-
-    /// Restart the runner using the legacy single-runner endpoint (backward compat).
-    pub async fn restart_runner_legacy(&self, rebuild: bool) -> Result<(), String> {
-        let url = format!("{}/runner/restart", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&serde_json::json!({ "rebuild": rebuild }))
-            .send()
-            .await
-            .map_err(|e| format!("Failed to restart runner: {}", e))?;
-
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Supervisor returned error: {}", body));
-        }
-
-        Ok(())
-    }
 }

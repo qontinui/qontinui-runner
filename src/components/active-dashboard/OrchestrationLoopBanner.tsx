@@ -41,6 +41,7 @@ const PHASE_COLORS: Record<string, string> = {
   evaluating_exit: "text-cyan-400",
   between_iterations: "text-muted-foreground",
   waiting_for_runner: "text-yellow-400",
+  waiting_for_fixer: "text-cyan-500",
   complete: "text-green-400",
   error: "text-red-400",
 };
