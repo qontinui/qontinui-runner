@@ -32,6 +32,7 @@ pub mod findings_api;
 pub mod generation_rules_api;
 pub mod generator_eval;
 pub mod goals;
+pub mod gui_config;
 pub mod hooks;
 pub mod interaction_recording;
 pub mod log_sources;

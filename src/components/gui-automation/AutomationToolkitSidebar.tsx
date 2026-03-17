@@ -19,8 +19,9 @@ import {
   AlertCircle,
   Wrench,
   FolderOpen,
+  RefreshCw,
+  ChevronRight,
 } from "lucide-react";
-import { Card, CardHeader, CardTitle, CardContent } from "../ui/Card";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "../ui/Tabs";
 import { getAccentColors } from "@/design-system";
 import { cn } from "../../lib/utils";
@@ -51,6 +52,8 @@ interface AutomationToolkitSidebarProps {
   onRunMacro: (macro: SavedMacro) => Promise<void>;
   runningMacroId?: string | null;
   onLog?: (level: LogLevel, message: string) => void;
+  onCollapse?: () => void;
+  onRefreshMacros?: () => void;
 }
 
 export function AutomationToolkitSidebar({
@@ -62,6 +65,8 @@ export function AutomationToolkitSidebar({
   onRunMacro,
   runningMacroId,
   onLog,
+  onCollapse,
+  onRefreshMacros,
 }: AutomationToolkitSidebarProps) {
   // Quick Actions state
   const [clickAction, setClickAction] = useState<"click" | "double_click" | "right_click">("click");
@@ -252,14 +257,37 @@ export function AutomationToolkitSidebar({
   };
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>
-          <Wrench className="w-5 h-5 text-primary" />
-          Automation Toolkit
-        </CardTitle>
-      </CardHeader>
-      <CardContent>
+    <div className="h-full flex flex-col">
+      {/* Panel header */}
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+        <div className="flex items-center gap-2 text-sm font-semibold">
+          <Wrench className="w-4 h-4 text-primary" />
+          Toolkit
+        </div>
+        <div className="flex items-center gap-1">
+          {onRefreshMacros && (
+            <button
+              onClick={onRefreshMacros}
+              className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+              title="Refresh macros"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+            </button>
+          )}
+          {onCollapse && (
+            <button
+              onClick={onCollapse}
+              className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+              title="Collapse toolkit"
+            >
+              <ChevronRight className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Panel content */}
+      <div className="flex-1 overflow-auto scrollbar-dark px-4 py-3">
         <Tabs defaultValue="quick-actions" className="w-full">
           <TabsList className="grid w-full grid-cols-2">
             <TabsTrigger value="quick-actions">Quick Actions</TabsTrigger>
@@ -586,7 +614,7 @@ export function AutomationToolkitSidebar({
             </div>
           </TabsContent>
         </Tabs>
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   );
 }

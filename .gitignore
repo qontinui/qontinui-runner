@@ -111,8 +111,5 @@ web-extraction*.png
 # Claude Code temp directories
 tmpclaude-*
 
-# Generated architecture spec cache files
-*.architecture.uibridge.json
-
 # Template artifact directories
 src-tauri/{{artifact_dir}}/

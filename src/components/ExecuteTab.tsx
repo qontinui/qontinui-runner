@@ -1,17 +1,15 @@
 /**
  * ExecuteTab.tsx
  *
- * Redesigned execution page for GUI automation featuring:
- * - New header with config status indicator (animated ping, active badge)
- * - Two-column layout: WorkflowRunner (2/3) + AutomationToolkit sidebar (1/3)
- * - Tabbed interface for Quick Actions & Macros
- * - Searchable workflow dropdown
- * - Status preview showing workflow execution state
- * - Modern visual styling with large start button (h-16)
+ * GUI automation execution page matching the runner's modern layout:
+ * - Compact header with config status
+ * - Two-panel layout: WorkflowRunner (main) + collapsible Toolkit sidebar
+ * - Bottom status bar with Start/Stop execution controls
  */
 
-import { useState, useEffect, useCallback } from "react";
-import { RefreshCw } from "lucide-react";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import { Play, Square, ChevronLeft } from "lucide-react";
+import { instanceStorage } from "@/lib/instance-storage";
 import { PageTutorialMenu } from "./tutorial";
 import { useExecution } from "../contexts/ExecutionContext";
 import {
@@ -24,6 +22,8 @@ import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
+const TOOLKIT_OPEN_KEY = "qontinui-gui-automation-toolkit-open";
+
 interface ExecuteTabProps {
   onLog: (level: LogLevel, message: string) => void;
   onNavigateToActive: () => void;
@@ -32,19 +32,30 @@ interface ExecuteTabProps {
 export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
   const execution = useExecution();
 
-  // Data state
+  // Toolkit sidebar visibility — persisted
+  const [isToolkitOpen, setIsToolkitOpen] = useState<boolean>(() => {
+    return instanceStorage.getJSON(TOOLKIT_OPEN_KEY, true);
+  });
+
+  const toggleToolkit = useCallback(() => {
+    setIsToolkitOpen((prev) => {
+      const next = !prev;
+      instanceStorage.setJSON(TOOLKIT_OPEN_KEY, next);
+      return next;
+    });
+  }, []);
+
+  // Macro state
   const [macros, setMacros] = useState<SavedMacro[]>([]);
   const [macrosLoading, setMacrosLoading] = useState(true);
   const [runningMacroId, setRunningMacroId] = useState<string | null>(null);
 
-  // Fetch macros
   const fetchMacros = useCallback(async () => {
     setMacrosLoading(true);
     try {
       const macrosRes = await tracedFetch(`${getApiBase()}/macros`).catch(() => ({ ok: false }));
       const macrosData = macrosRes.ok ? await (macrosRes as Response).json() : { success: false };
 
-      // Sort by modified_at descending (most recent first)
       if (macrosData.success) {
         const sorted = [...(macrosData.data || [])].sort(
           (a: SavedMacro, b: SavedMacro) =>
@@ -63,7 +74,6 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
     fetchMacros();
   }, [fetchMacros]);
 
-  // Run macro handler
   const runMacro = async (macro: SavedMacro) => {
     setRunningMacroId(macro.id);
     try {
@@ -98,9 +108,17 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
     }
   };
 
+  const selectedWorkflow = useMemo(
+    () => execution.workflows.find((w) => w.id === execution.selectedWorkflow),
+    [execution.workflows, execution.selectedWorkflow],
+  );
+
+  const canStart =
+    execution.configLoaded && !!execution.selectedWorkflow && !execution.executionActive;
+
   return (
-    <div className="h-full flex flex-col overflow-hidden">
-      {/* Header with config status */}
+    <div className="h-full flex flex-col bg-background">
+      {/* Header */}
       <GuiAutomationHeader
         config={execution.config}
         configLoaded={execution.configLoaded}
@@ -109,69 +127,115 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
         onLog={onLog}
       />
 
-      {/* Main content area */}
-      <div className="flex-1 min-h-0 overflow-auto scrollbar-dark">
-        <div className="p-6">
-          {/* Header row with refresh button */}
-          <div className="flex items-center justify-between mb-6">
-            <div className="flex items-center gap-2">
-              <PageTutorialMenu page="run" variant="compact" />
-            </div>
-            <button
-              onClick={fetchMacros}
-              disabled={macrosLoading}
-              className="p-2 text-muted-foreground hover:text-foreground rounded-lg hover:bg-muted/50 transition-colors"
-              title="Refresh macros"
+      {/* Main content — two panels */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Main panel */}
+        <div className="flex-1 overflow-auto scrollbar-dark p-4">
+          <WorkflowRunnerPanel
+            workflows={execution.workflows}
+            automationEnabledCategories={execution.automationEnabledCategories}
+            selectedWorkflow={execution.selectedWorkflow}
+            configLoaded={execution.configLoaded}
+            onWorkflowSelect={(id) => {
+              execution.selectWorkflowWithPersistence(id);
+            }}
+            selectedMonitors={execution.selectedMonitors}
+            onMonitorSelectionChange={(indices) => {
+              if (indices.length > 0) {
+                execution.selectMonitorsWithPersistence(indices);
+              }
+            }}
+            autoMinimize={execution.autoMinimize}
+            onAutoMinimizeChange={execution.setAutoMinimize}
+            states={execution.config?.states}
+            resolvedInitialStates={execution.resolvedInitialStates}
+            initialStatesOverride={execution.initialStatesOverride}
+            onInitialStatesOverrideChange={execution.setInitialStatesOverride}
+            executionActive={execution.executionActive}
+          />
+        </div>
+
+        {/* Right: Toolkit sidebar (collapsible) */}
+        {isToolkitOpen ? (
+          <div
+            className="flex-shrink-0 border-l border-border overflow-auto scrollbar-dark"
+            style={{ width: 320 }}
+          >
+            <AutomationToolkitSidebar
+              config={execution.config}
+              configLoaded={execution.configLoaded}
+              selectedMonitors={execution.selectedMonitors}
+              macros={macros}
+              macrosLoading={macrosLoading}
+              onRunMacro={runMacro}
+              runningMacroId={runningMacroId}
+              onLog={onLog}
+              onCollapse={toggleToolkit}
+              onRefreshMacros={fetchMacros}
+            />
+          </div>
+        ) : (
+          <button
+            onClick={toggleToolkit}
+            className="flex-shrink-0 flex flex-col items-center justify-center gap-2 w-8 border-l border-white/10
+                       text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors"
+            title="Expand toolkit"
+          >
+            <ChevronLeft className="w-4 h-4" />
+            <span
+              className="text-xs font-medium"
+              style={{ writingMode: "vertical-rl", transform: "rotate(180deg)" }}
             >
-              <RefreshCw className={`w-4 h-4 ${macrosLoading ? "animate-spin" : ""}`} />
-            </button>
-          </div>
+              Toolkit
+            </span>
+          </button>
+        )}
+      </div>
 
-          {/* Two-column layout */}
-          <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Main Panel - 2/3 width */}
-            <div className="lg:col-span-2">
-              <WorkflowRunnerPanel
-                workflows={execution.workflows}
-                automationEnabledCategories={execution.automationEnabledCategories}
-                selectedWorkflow={execution.selectedWorkflow}
-                configLoaded={execution.configLoaded}
-                onWorkflowSelect={(id) => {
-                  execution.selectWorkflowWithPersistence(id);
-                }}
-                selectedMonitors={execution.selectedMonitors}
-                onMonitorSelectionChange={(indices) => {
-                  if (indices.length > 0) {
-                    execution.selectMonitorsWithPersistence(indices);
-                  }
-                }}
-                autoMinimize={execution.autoMinimize}
-                onAutoMinimizeChange={execution.setAutoMinimize}
-                states={execution.config?.states}
-                resolvedInitialStates={execution.resolvedInitialStates}
-                initialStatesOverride={execution.initialStatesOverride}
-                onInitialStatesOverrideChange={execution.setInitialStatesOverride}
-                executionActive={execution.executionActive}
-                onStartExecution={execution.startExecution}
-                onStopExecution={execution.stopExecution}
-                onNavigateToActive={onNavigateToActive}
-              />
+      {/* Bottom bar */}
+      <div className="flex items-center justify-between px-4 py-3 border-t border-border bg-card/50">
+        <div className="flex items-center gap-3 text-body-sm text-muted-foreground">
+          {execution.executionActive ? (
+            <div className="flex items-center gap-2">
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-500 opacity-75" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-amber-500" />
+              </span>
+              <span className="text-amber-400">
+                Running{selectedWorkflow ? `: ${selectedWorkflow.name}` : ""}
+              </span>
             </div>
+          ) : selectedWorkflow ? (
+            <span>Ready: {selectedWorkflow.name}</span>
+          ) : execution.configLoaded ? (
+            <span>Select a workflow to run</span>
+          ) : (
+            <span>Load a configuration to begin</span>
+          )}
+        </div>
 
-            {/* Sidebar - 1/3 width */}
-            <div className="lg:col-span-1">
-              <AutomationToolkitSidebar
-                config={execution.config}
-                configLoaded={execution.configLoaded}
-                selectedMonitors={execution.selectedMonitors}
-                macros={macros}
-                macrosLoading={macrosLoading}
-                onRunMacro={runMacro}
-                runningMacroId={runningMacroId}
-                onLog={onLog}
-              />
-            </div>
-          </div>
+        <div className="flex items-center gap-2">
+          <PageTutorialMenu page="run" variant="compact" />
+          <button
+            onClick={execution.stopExecution}
+            disabled={!execution.executionActive}
+            className="btn-danger flex items-center gap-2"
+          >
+            <Square className="w-4 h-4" />
+            Stop
+          </button>
+          <button
+            onClick={() => {
+              execution.startExecution();
+              onNavigateToActive();
+            }}
+            disabled={!canStart}
+            className="btn-primary flex items-center gap-2"
+            data-tutorial-id="start-execution-button"
+          >
+            <Play className="w-4 h-4" />
+            Start
+          </button>
         </div>
       </div>
     </div>

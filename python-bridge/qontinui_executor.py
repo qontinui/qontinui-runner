@@ -1839,6 +1839,12 @@ class QontinuiExecutor:
         elif cmd_type == "clear_state_machine":
             return self._handle_clear_state_machine()
 
+        # GUI Config Pipeline commands
+        elif cmd_type == "gui_config_capture_elements":
+            return self._handle_gui_config_capture_elements(params)
+        elif cmd_type == "gui_config_build":
+            return self._handle_gui_config_build(params)
+
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
 
@@ -5269,6 +5275,236 @@ class QontinuiExecutor:
             "State machine cleared" if was_loaded else "No state machine was loaded",
         )
         return {"success": True, "was_loaded": was_loaded}
+
+    # =========================================================================
+    # GUI Config Pipeline commands
+    # =========================================================================
+
+    def _handle_gui_config_capture_elements(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Extract element images from a screenshot using UI Bridge position data.
+
+        Expects the Rust caller to provide both the UI Bridge snapshot and screenshot.
+
+        Args:
+            params:
+                - snapshot: UI Bridge control snapshot JSON (elements with rects)
+                - screenshot_base64: Base64-encoded PNG screenshot
+                - window_offset_x: X offset from screenshot origin to content area
+                - window_offset_y: Y offset from screenshot origin to content area
+                - scale_factor: DPI scale factor (default 1.0)
+                - category_filter: Optional list of categories to include
+                - min_element_size: Minimum element dimension in pixels (default 4)
+                - padding: Extra pixels around each crop (default 0)
+
+        Returns:
+            Dictionary with element_images mapping and metadata.
+        """
+        import sys
+
+        try:
+            if not QONTINUI_AVAILABLE:
+                return {"success": False, "error": "Qontinui library not available"}
+
+            snapshot = params.get("snapshot")
+            screenshot_b64 = params.get("screenshot_base64")
+            if not snapshot or not screenshot_b64:
+                return {"success": False, "error": "snapshot and screenshot_base64 are required"}
+
+            import base64
+            import io
+
+            from PIL import Image
+
+            from qontinui.discovery.element_image_pipeline import (
+                ElementImagePipeline,
+                ExtractionConfig,
+            )
+
+            # Decode screenshot
+            screenshot = Image.open(io.BytesIO(base64.b64decode(screenshot_b64)))
+
+            # Build config
+            cat_filter = params.get("category_filter")
+            config = ExtractionConfig(
+                min_element_size=params.get("min_element_size", 4),
+                padding=params.get("padding", 0),
+                scale_factor=params.get("scale_factor", 1.0),
+                category_filter=set(cat_filter) if cat_filter else None,
+            )
+
+            pipeline = ElementImagePipeline(config)
+            offset = (
+                params.get("window_offset_x", 0),
+                params.get("window_offset_y", 0),
+            )
+            result = pipeline.extract(snapshot, screenshot, window_offset=offset)
+
+            # Build response — element images as a dict
+            element_images = {}
+            for img in result.images:
+                element_images[img.element_id] = {
+                    "base64_png": img.base64_png,
+                    "width": img.width,
+                    "height": img.height,
+                    "sha256": img.sha256,
+                    "label": img.label,
+                    "type": img.element_type,
+                    "bbox": list(img.bbox),
+                }
+
+            return {
+                "success": True,
+                "element_count": len(result.images),
+                "skipped_count": len(result.skipped),
+                "screenshot_size": [result.screenshot_width, result.screenshot_height],
+                "viewport_size": [result.viewport_width, result.viewport_height],
+                "element_images": element_images,
+                "skipped": result.skipped,
+            }
+
+        except Exception as e:
+            print(
+                f"[error   ] EXECUTOR: gui_config_capture_elements failed: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            return {"success": False, "error": str(e)}
+
+    def _handle_gui_config_build(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Build a QontinuiConfig from element images and state/transition definitions.
+
+        Args:
+            params:
+                - name: Config name
+                - states: List of state dicts with id, name, element_ids
+                - transitions: List of transition dicts
+                - element_images: Dict of element_id -> image data
+                - description: Optional description
+                - similarity: Default similarity threshold (default 0.85)
+
+        Returns:
+            Dictionary with the complete QontinuiConfig.
+        """
+        import sys
+
+        try:
+            if not QONTINUI_AVAILABLE:
+                return {"success": False, "error": "Qontinui library not available"}
+
+            import base64
+            import io
+
+            from PIL import Image
+
+            from qontinui.discovery.element_image_pipeline import (
+                ElementRect,
+                ExtractedElementImage,
+            )
+            from qontinui.state_machine.config_bridge import (
+                ConfigBridge,
+                UIBridgeStateInput,
+                UIBridgeTransitionInput,
+            )
+
+            name = params.get("name", "Untitled Config")
+            states_raw = params.get("states", [])
+            transitions_raw = params.get("transitions", [])
+            element_images_raw = params.get("element_images", {})
+            description = params.get("description", "")
+            similarity = float(params.get("similarity", 0.85))
+
+            if not states_raw:
+                return {"success": False, "error": "states is required"}
+            if not element_images_raw:
+                return {"success": False, "error": "element_images is required"}
+
+            # Convert raw states
+            ui_states = [
+                UIBridgeStateInput(
+                    id=s["id"],
+                    name=s["name"],
+                    element_ids=s.get("element_ids", []),
+                    description=s.get("description", ""),
+                    is_initial=s.get("is_initial", False),
+                    is_final=s.get("is_final", False),
+                )
+                for s in states_raw
+            ]
+
+            # Convert raw transitions
+            ui_transitions = [
+                UIBridgeTransitionInput(
+                    id=t["id"],
+                    name=t["name"],
+                    from_states=t.get("from_states", []),
+                    activate_states=t.get("activate_states", []),
+                    exit_states=t.get("exit_states", []),
+                    stays_visible=t.get("stays_visible", False),
+                )
+                for t in transitions_raw
+            ]
+
+            # Reconstruct ExtractedElementImage objects
+            all_element_images: dict[str, ExtractedElementImage] = {}
+            for eid, data in element_images_raw.items():
+                b64 = data.get("base64_png", "")
+                if not b64:
+                    continue
+                img = Image.open(io.BytesIO(base64.b64decode(b64)))
+                bbox = data.get("bbox", [0, 0, img.width, img.height])
+                all_element_images[eid] = ExtractedElementImage(
+                    element_id=eid,
+                    label=data.get("label", eid),
+                    element_type=data.get("type", "unknown"),
+                    image=img,
+                    bbox=(int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])),
+                    base64_png=b64,
+                    sha256=data.get("sha256", ""),
+                    viewport_rect=ElementRect(
+                        x=0, y=0, width=float(img.width), height=float(img.height)
+                    ),
+                )
+
+            # Group images by state
+            state_images: dict[str, list[ExtractedElementImage]] = {}
+            for s in ui_states:
+                state_images[s.id] = [
+                    all_element_images[eid]
+                    for eid in s.element_ids
+                    if eid in all_element_images
+                ]
+
+            # Build config
+            bridge = ConfigBridge(default_similarity=similarity)
+            config = bridge.build_config(
+                name=name,
+                states=ui_states,
+                transitions=ui_transitions,
+                state_images=state_images,
+                description=description,
+            )
+
+            return {
+                "success": True,
+                "config": config,
+                "stats": {
+                    "image_count": len(config.get("images", [])),
+                    "state_count": len(config.get("states", [])),
+                    "transition_count": len(config.get("transitions", [])),
+                },
+            }
+
+        except Exception as e:
+            print(
+                f"[error   ] EXECUTOR: gui_config_build failed: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            return {"success": False, "error": str(e)}
 
     def __del__(self):
         """Clean up resources on exit."""
