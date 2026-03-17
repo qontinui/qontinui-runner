@@ -415,20 +415,34 @@ impl RunnerClient {
     }
 
     /// Wait for the fixer workflow associated with a source task run to complete.
-    /// Returns Ok(true) if fixer completed, Ok(false) if timed out or no fixer found.
+    /// Returns Ok(true) if fixer completed, Ok(false) if timed out or no fixer found,
+    /// or Err("Loop stopped") if the stop signal is received.
     pub async fn wait_for_fixer_complete(
         &self,
         source_task_run_id: &str,
         timeout_secs: u64,
+        stop_rx: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<bool, String> {
         let deadline = std::time::Duration::from_secs(timeout_secs);
         let poll = std::time::Duration::from_secs(5);
         let start = std::time::Instant::now();
 
-        // Wait a bit for the fixer to be created
-        tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+        // Short initial delay (5s) to let the fixer be created, but abort on stop signal.
+        let mut stop_rx_clone = stop_rx.clone();
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            _ = stop_rx_clone.changed() => {
+                if *stop_rx.borrow() {
+                    return Err("Loop stopped".to_string());
+                }
+            }
+        }
 
         loop {
+            if *stop_rx.borrow() {
+                return Err("Loop stopped".to_string());
+            }
+
             if start.elapsed() > deadline {
                 return Ok(false);
             }
@@ -468,7 +482,15 @@ impl RunnerClient {
                 }
             }
 
-            tokio::time::sleep(poll).await;
+            let mut stop_rx_clone2 = stop_rx.clone();
+            tokio::select! {
+                _ = tokio::time::sleep(poll) => {}
+                _ = stop_rx_clone2.changed() => {
+                    if *stop_rx.borrow() {
+                        return Err("Loop stopped".to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -478,21 +500,39 @@ impl RunnerClient {
     }
 
     /// Wait for the runner to become healthy.
-    pub async fn wait_for_healthy(&self, timeout_secs: u64) -> bool {
+    /// Returns false if the timeout elapses or the stop signal is received.
+    pub async fn wait_for_healthy(
+        &self,
+        timeout_secs: u64,
+        stop_rx: &tokio::sync::watch::Receiver<bool>,
+    ) -> bool {
         let deadline = Duration::from_secs(timeout_secs);
         let poll = Duration::from_secs(2);
+        let start = std::time::Instant::now();
 
-        let result = tokio::time::timeout(deadline, async {
-            loop {
-                if self.is_healthy().await {
-                    return true;
-                }
-                tokio::time::sleep(poll).await;
+        loop {
+            if *stop_rx.borrow() {
+                return false;
             }
-        })
-        .await;
 
-        result.unwrap_or(false)
+            if start.elapsed() > deadline {
+                return false;
+            }
+
+            if self.is_healthy().await {
+                return true;
+            }
+
+            let mut stop_rx_clone = stop_rx.clone();
+            tokio::select! {
+                _ = tokio::time::sleep(poll) => {}
+                _ = stop_rx_clone.changed() => {
+                    if *stop_rx.borrow() {
+                        return false;
+                    }
+                }
+            }
+        }
     }
 }
 

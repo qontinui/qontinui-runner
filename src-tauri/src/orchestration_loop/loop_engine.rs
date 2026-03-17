@@ -183,7 +183,7 @@ async fn run_loop(
     // Wait for target runner to be healthy before starting
     if !runner.is_healthy().await {
         info!("Waiting for target runner on port {} to be healthy...", target_port);
-        if !runner.wait_for_healthy(120).await {
+        if !runner.wait_for_healthy(120, &stop_rx).await {
             set_error(&loop_state, "Target runner not healthy after 120s").await;
             return;
         }
@@ -269,9 +269,15 @@ async fn run_loop(
             }
 
             info!("Waiting for fixer workflow to complete for task_run_id={}", task_run_id);
-            match runner.wait_for_fixer_complete(&task_run_id, 600).await {
+            match runner.wait_for_fixer_complete(&task_run_id, 600, &stop_rx).await {
                 Ok(true) => info!("Fixer workflow completed for {}", task_run_id),
                 Ok(false) => info!("No fixer workflow found or timed out for {}", task_run_id),
+                Err(e) if e == "Loop stopped" => {
+                    let mut state = loop_state.lock().await;
+                    state.phase = LoopPhase::Stopped;
+                    state.running = false;
+                    return;
+                }
                 Err(e) => warn!("Error waiting for fixer: {}", e),
             }
         }
@@ -386,6 +392,7 @@ async fn run_loop(
                 &config,
                 &target_runner_id,
                 &loop_state,
+                &stop_rx,
             )
             .await
             {
@@ -473,6 +480,7 @@ async fn handle_between_iterations(
     config: &OrchestrationLoopConfig,
     target_runner_id: &str,
     loop_state: &SharedLoopState,
+    stop_rx: &watch::Receiver<bool>,
 ) -> Result<(), String> {
     {
         let mut state = loop_state.lock().await;
@@ -495,7 +503,7 @@ async fn handle_between_iterations(
             }
 
             info!("Waiting for target runner to be healthy...");
-            if !runner.wait_for_healthy(120).await {
+            if !runner.wait_for_healthy(120, stop_rx).await {
                 return Err("Target runner not healthy after restart".to_string());
             }
             info!("Target runner is healthy");
@@ -523,7 +531,7 @@ async fn handle_between_iterations(
                 }
 
                 info!("Waiting for target runner to be healthy...");
-                if !runner.wait_for_healthy(120).await {
+                if !runner.wait_for_healthy(120, stop_rx).await {
                     return Err("Target runner not healthy after restart".to_string());
                 }
                 info!("Target runner is healthy");
@@ -534,7 +542,7 @@ async fn handle_between_iterations(
                     let mut state = loop_state.lock().await;
                     state.phase = LoopPhase::WaitingForRunner;
                 }
-                if !runner.wait_for_healthy(120).await {
+                if !runner.wait_for_healthy(120, stop_rx).await {
                     return Err("Target runner not healthy".to_string());
                 }
             }
@@ -545,7 +553,7 @@ async fn handle_between_iterations(
                 state.phase = LoopPhase::WaitingForRunner;
             }
             info!("Waiting for target runner to be healthy...");
-            if !runner.wait_for_healthy(120).await {
+            if !runner.wait_for_healthy(120, stop_rx).await {
                 return Err("Target runner not healthy".to_string());
             }
         }
@@ -842,6 +850,7 @@ async fn run_pipeline_loop(
                 &config,
                 target_runner_id,
                 &loop_state,
+                &stop_rx,
             )
             .await
             {
