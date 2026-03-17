@@ -38,17 +38,37 @@ pub fn should_launch_fixer(
     db: &CheckpointDb,
     source_task_run_id: &str,
 ) -> Result<bool, String> {
+    should_launch_fixer_excluding(db, source_task_run_id, None)
+}
+
+/// Same as `should_launch_fixer` but excludes a specific task run ID from the
+/// "is another fixer running?" check. Used for the re-check after the fixer's
+/// own task run has been created (to avoid self-blocking).
+pub fn should_launch_fixer_excluding(
+    db: &CheckpointDb,
+    source_task_run_id: &str,
+    exclude_fixer_id: Option<&str>,
+) -> Result<bool, String> {
     let source_id = source_task_run_id.to_string();
+    let exclude_id = exclude_fixer_id.map(|s| s.to_string());
 
     db.with_conn(|conn| {
-        // Guard 0: Check if a fixer workflow is already running for this source
-        let has_running: bool = conn
-            .query_row(
+        // Guard 0: Check if a fixer workflow is already running (exclude self if provided)
+        let has_running: bool = if let Some(ref eid) = exclude_id {
+            conn.query_row(
+                "SELECT COUNT(*) > 0 FROM task_runs WHERE status = 'running' AND is_fixer = 1 AND workflow_type = 'unified' AND id != ?1",
+                rusqlite::params![eid],
+                |row| row.get(0),
+            )
+            .unwrap_or(false)
+        } else {
+            conn.query_row(
                 "SELECT COUNT(*) > 0 FROM task_runs WHERE status = 'running' AND is_fixer = 1 AND workflow_type = 'unified'",
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or(false);
+            .unwrap_or(false)
+        };
 
         if has_running {
             debug!("Skipping fixer — another fixer workflow is already running");
@@ -293,7 +313,8 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
         }
 
         // Re-check guards after waiting (state may have changed)
-        match should_launch_fixer(&db_clone, &source_id_clone) {
+        // Exclude own ID to avoid self-blocking (our task run is status='running')
+        match should_launch_fixer_excluding(&db_clone, &source_id_clone, Some(&fixer_id_clone)) {
             Ok(true) => {}
             _ => {
                 info!("Fixer guards no longer pass after waiting — skipping");

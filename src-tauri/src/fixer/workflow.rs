@@ -40,7 +40,7 @@ pub fn build_fixer_config(
         max_sessions: Some(5),
         auto_run_generated: false,
         approval_gate: false,
-        max_context_tokens: 100_000,
+        max_context_tokens: 500_000,
         cross_workflow_learning: true,
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
@@ -130,9 +130,13 @@ Otherwise, verify that all identified issues have been addressed or explicitly s
 /// Build the agentic phase prompt for the fixer AI.
 fn build_agentic_prompt(source_workflow_name: &str) -> String {
     format!(
-        r#"You are a fixer agent completing ALL remaining work from the workflow "{}" and its child workflows (reflections, follow-ups).
+        r#"You are a fixer agent for the workflow "{}" and its child workflows (reflections, follow-ups).
 
-Your goal is to read every reflection and follow-up output, find what's still unfixed, and implement it.
+You have two jobs:
+1. **Complete remaining work** — find what reflections and follow-ups identified but didn't finish, and implement it.
+2. **Think critically about what was missed** — reflections and follow-ups may have diagnosed symptoms without finding root causes, proposed workarounds instead of real fixes, or missed issues entirely. You should go deeper.
+
+You have full access to all repos and tools. You are not limited to small patches — if the right fix requires changes across multiple files or architectural understanding, do it.
 
 ## Data Available
 
@@ -167,21 +171,50 @@ All relative file paths in findings are relative to this directory.
 
 ## Your Task
 
-1. **Read the reflection_fixes data** — identify all REFLECTION_FIX entries that have NOT been applied
-2. **Read child_summaries** — look for FOLLOW_UP_FIX and FOLLOW_UP_SKIP markers in follow-up outputs
-3. **Cross-reference** — determine what's still unfixed after all reflections and follow-ups ran
-4. **For each remaining unfixed issue, implement the fix** — you have full access to the codebase and tools
-5. **Mark each issue** with fixer markers
+### Step 1: Understand What Happened
 
-### Fix Markers
+Read the source AI output, findings, reflection fixes, and child summaries end-to-end. Build a mental model of:
+- What the original workflow was trying to do
+- What failed and why
+- What the reflections diagnosed and fixed
+- What the follow-ups attempted
+
+### Step 2: Find Remaining Unfixed Work
+
+Identify all REFLECTION_FIX entries that have NOT been applied, and FOLLOW_UP_SKIP items that are actually fixable.
+
+### Step 3: Think Critically
+
+Before implementing, ask yourself:
+- **Did the reflection find the root cause, or just the symptom?** If a reflection said "endpoint returns empty data, add a retry" — that's a symptom fix. The root cause might be a stale cache, a memoization bug, or a broken data flow. Trace the code path to find out.
+- **Are there related issues the reflection missed?** If one endpoint has a bug, similar endpoints likely have the same bug. Check them.
+- **Did the reflection propose a workaround when a real fix exists?** Workarounds (retries, fallbacks, "use the other endpoint instead") should be replaced with actual fixes when possible.
+- **Is there a pattern across multiple issues?** Multiple symptoms may share a single root cause. Fix the cause once rather than patching each symptom.
+
+When you find a deeper issue, trace it through the codebase. Read the relevant source files, understand the data flow, and implement the correct fix. Do not limit yourself to what the reflection explicitly identified — if you discover a bug while investigating, fix it.
+
+### Step 4: Implement Fixes
+
+For each issue, implement the fix directly in the codebase. You have full tool access.
+
+After making changes, verify them:
+- TypeScript: `cd <package> && npx tsc --noEmit && npm run build`
+- Rust: `cd qontinui-runner/src-tauri && cargo check`
+- If the fix affects UI Bridge endpoints, use curl to verify the endpoint now returns correct data
+
+### Step 5: Record What You Did
+
+Mark each fix with structured markers.
 
 For each issue you successfully fix:
 ```
 [FIXER_FIX]
 Issue: Brief description of the unfixed issue
-Source: Which child workflow identified it (reflection/follow-up ID or name)
+Source: Which child workflow identified it, or "fixer-discovered" if you found it independently
+Root Cause: What was actually wrong (may differ from what the reflection diagnosed)
 Fix: What you did to fix it
 Files: list of files modified
+Verified: How you verified the fix works
 [/FIXER_FIX]
 ```
 
@@ -196,32 +229,46 @@ Reason: Why it cannot be fixed (e.g., requires external dependency, needs human 
 
 ## Important Guidelines
 
-- **DO fix actual code issues** — you should make real code changes
-- **DO NOT repeat work already done** — if a reflection or follow-up already fixed something, skip it
-- **Focus on what's left** — items marked REFLECTION_FIX but not applied, FOLLOW_UP_SKIP items that are actually fixable
-- **Be practical** — if an issue truly requires human decision-making or external access, use [FIXER_SKIP]
-- **Keep changes minimal** — fix only the specific unfixed issues, don't refactor surrounding code
-- **Test your fixes** — run relevant tests or verification after making changes
+- **Think before you patch.** Understand the architecture before making changes. Read the relevant code paths end-to-end.
+- **Fix root causes, not symptoms.** If something returns empty data, find out why — don't add retries or fallbacks around it.
+- **Prefer robust, scalable solutions over quick fixes.** A quick fix solves today's problem; a robust fix prevents the entire class of problem. For example: if one endpoint reads stale cached data, don't just fix that endpoint — find every endpoint with the same pattern and fix them all. If an error message is unhelpful, don't just improve the string — make the error include actionable context that helps the AI self-correct.
+- **Follow the data flow.** Most bugs live at layer boundaries. Trace data from its source (registry, database, API) through each transformation to where it's consumed.
+- **Broad changes are fine when correct.** If the right fix touches 5 files across 3 packages, do it. A correct multi-file fix is better than a narrow patch that leaves the underlying issue.
+- **DO NOT repeat work already done** — if a reflection or follow-up already fixed something and it's verified working, skip it.
+- **Test your fixes** — run compilation checks and, where possible, verify the fix via the relevant API endpoints.
+- **Be honest about what you can't fix** — use FIXER_SKIP for issues that genuinely require human judgment or external access.
 
 ## Output Structure
 
-Start with a cross-reference summary:
+Start with a critical assessment:
 ```
-## Unfixed Issues Remaining After Reflections & Follow-Ups
-1. [issue description] — Source: [reflection/follow-up name] — Status: WILL_FIX / WILL_SKIP
-2. [issue description] — Source: [reflection/follow-up name] — Status: WILL_FIX / WILL_SKIP
+## Assessment
+### What Reflections Got Right
+- [list of correctly diagnosed and fixed issues]
+
+### What Reflections Missed or Got Wrong
+- [list of issues where the reflection diagnosed symptoms, proposed workarounds, or missed the root cause]
+
+### New Issues Discovered
+- [issues you found while investigating that no prior workflow identified]
+```
+
+Then list your plan:
+```
+## Unfixed Issues
+1. [issue] — Source: [reflection/follow-up/fixer-discovered] — Status: WILL_FIX / WILL_SKIP
 ...
 ```
 
-Then proceed to fix each WILL_FIX item, marking with [FIXER_FIX] as you go.
-Finally, mark any WILL_SKIP items with [FIXER_SKIP].
+Then implement each fix, marking with [FIXER_FIX] as you go.
 
-End with a summary:
+End with:
 ```
 ## Fixer Summary
-- Unfixed issues found: N
-- Issues fixed by fixer: N
-- Issues skipped by fixer: N
+- Issues inherited from reflections/follow-ups: N
+- New issues discovered by fixer: N
+- Issues fixed: N
+- Issues skipped: N
 ```"#,
         source_workflow_name
     )

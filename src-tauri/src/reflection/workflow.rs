@@ -1348,7 +1348,7 @@ pub fn build_ui_bridge_reflection_config(
     source_workflow_name: &str,
 ) -> LoopConfig {
     LoopConfig {
-        max_iterations: 2,
+        max_iterations: 5,
         base_prompt: build_ui_bridge_agentic_prompt(source_workflow_name),
         workflow_name: workflow_name.to_string(),
         workflow_id: format!("ui-bridge-reflection-{}", execution_id),
@@ -1368,11 +1368,11 @@ pub fn build_ui_bridge_reflection_config(
         model_override: None,
         model_overrides: std::collections::HashMap::new(),
         stage_index: None,
-        max_sessions: Some(2),
+        max_sessions: Some(5),
         auto_run_generated: false,
         approval_gate: false,
-        max_context_tokens: 100_000,
-        cross_workflow_learning: false,
+        max_context_tokens: 500_000,
+        cross_workflow_learning: true,
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
         project_path: crate::mcp::shared::current_project_path(),
@@ -1719,35 +1719,72 @@ For each UI Bridge failure (deterministic or AI-driven):
 - Did the AI retry or fall back to another approach?
 - Could the UI Bridge SDK have prevented this with better design?
 
-### Q3: What Was Missing?
+### Q3: Infrastructure Health Check
+Before assuming failures are workflow-level issues, check whether the SDK infrastructure itself is working:
+- **Web relay health**: `curl http://localhost:3001/api/ui-bridge/health` — is a browser tab connected? Are there SSE listeners?
+- **Runner health**: `curl http://localhost:9876/ui-bridge/health` — is the app responsive?
+- **Element registration**: Do snapshots return elements? If 0 elements despite a connected browser, the issue is in the SDK, not the workflow.
+- **Command round-trip**: Are commands sent via SSE/WebSocket getting responses from the browser? Check response times — if snapshot takes >2s, the browser may not be responding (timeout + fallback to empty cache).
+- **Component lifecycle**: Are expected components registered? Components only exist when their page is mounted.
+
+If infrastructure issues are found, trace the root cause through the SDK code. The data flow is:
+1. External caller → API route handler (Next.js catch-all or Tauri handler)
+2. → Server relay-handlers.ts (relay.queueCommand or cached snapshot)
+3. → SSE/WebSocket → Browser CommandRelayListener (useCommandRelay.ts)
+4. → commandHandlers.ts executeCommand() → reads from global registry
+5. → Response sent back via POST /commands
+
+Common root causes to check:
+- **Stale React memoization**: `useMemo`/`useCallback` in useUIBridge.ts capture arrays at mount time. If the dependency (context) doesn't change when registry contents change, the memoized value is stale. The global registry (`getGlobalRegistry()`) is the live source of truth.
+- **AutoRegisterProvider not scanning**: Check if `enabled` prop is true, if MutationObserver is attached to document.body, and if the debounce timer has fired.
+- **Relay command timeout**: SSE timeout is 8s. If the browser doesn't respond in time, relay-handlers falls back to cached (possibly empty) data silently.
+
+### Q4: What Was Missing?
 - Did the AI need information the UI Bridge doesn't expose? (React state, relationships, layout)
 - Were element IDs unstable or unpredictable?
 - Was the snapshot too noisy/large for effective AI parsing?
 - Were higher-level composite actions needed?
 
-### Q4: What Would Have Made the Workflow More Effective?
+### Q5: What Would Have Made the Workflow More Effective?
 - Fewer round-trips? Better element labeling? Semantic grouping?
 - Auto-discovery before snapshots? Better idle detection?
 - Richer error messages from failed actions?
 
-## Phase 2: Implementation (Quick Wins)
+## Phase 2: Implementation
 
-Implement improvements that can be completed in this session. These are typically:
+Implement improvements directly in this session, starting with the most impactful. You have full tool access and can make changes across all repos.
 
-1. **Prompt/guidance improvements** (qontinui-claude-config/.claude/commands/):
-   - Update ui-bridge.md, ufix.md, test-ui-bridge.md with better guidance
-   - Add UI Bridge usage examples to workflow prompts
+### Priority 1: SDK Code Fixes
+If Phase 1 Q3 (Infrastructure Health Check) identified SDK bugs or architectural issues, fix them first. These are the highest-impact fixes because they unblock everything else. Examples:
+- Stale data bugs (memoization, caching, closure captures)
+- Missing or broken endpoints
+- Data inconsistencies between endpoints (e.g., component list vs detail returning different data)
+- Relay communication failures
+- Registry lifecycle issues
 
-2. **Error message improvements** in SDK or runner:
-   - Better error messages from action execution
-   - Clearer feedback when elements aren't found
+**How to trace SDK bugs**: Follow the data flow from the API endpoint through relay-handlers.ts, through the SSE/WebSocket relay, to commandHandlers.ts, to the registry. Check each layer for stale data, missing error handling, or broken wiring. The key files are:
+- `ui-bridge/packages/ui-bridge/src/server/relay-handlers.ts` — server-side handlers
+- `ui-bridge/packages/ui-bridge/src/react/commandHandlers.ts` — browser-side command execution
+- `ui-bridge/packages/ui-bridge/src/react/useCommandRelay.ts` — browser relay listener
+- `ui-bridge/packages/ui-bridge/src/react/useUIBridge.ts` — React hook (memoized values)
+- `ui-bridge/packages/ui-bridge/src/core/registry.ts` — element/component/workflow registry (source of truth)
+- `ui-bridge/packages/ui-bridge/src/control/action-executor.ts` — action execution
 
-3. **Small SDK changes** (ui-bridge/packages/ui-bridge/src/):
-   - Label improvements, noise reduction in snapshots
-   - Small discovery tweaks
+### Priority 2: Error Message Improvements
+- Better error messages from action execution
+- Clearer feedback when elements aren't found
+- Actionable messages that tell the AI what to do next (e.g., which page to navigate to)
+
+### Priority 3: Prompt/Guidance Improvements
+- Update ui-bridge.md, ufix.md, test-ui-bridge.md with better guidance
+- Add UI Bridge usage examples to workflow prompts
+
+### Priority 4: SDK Feature Improvements
+- Label improvements, noise reduction in snapshots
+- Discovery tweaks, new endpoints
 
 After implementing, test compilation:
-- TypeScript: `cd ui-bridge && npm run build`
+- TypeScript: `cd ui-bridge/packages/ui-bridge && npx tsc --noEmit && npm run build`
 - Rust: `cd qontinui-runner/src-tauri && cargo check`
 
 ## Phase 3: Implementation Plan (All Improvements)
@@ -1812,10 +1849,12 @@ Use `[REFLECTION_FIX:...]` markers for every improvement (quick wins you impleme
 
 | Type | Shortcut | Use for |
 |------|----------|---------|
+| `ui_bridge_sdk_code_fix` | `ub_code_fix` | **SDK bug fixes**: stale data, broken endpoints, memoization bugs, relay issues, registry inconsistencies. Use this for any fix to the SDK source code that corrects incorrect behavior. |
 | `ui_bridge_discovery` | `ub_discovery` | Element discovery improvements: labeling, grouping, hierarchy, semantic roles |
 | `ui_bridge_snapshot` | `ub_snapshot` | Snapshot format: structure, AI-friendliness, noise reduction |
 | `ui_bridge_action` | `ub_action` | Action reliability: feedback, error recovery, new actions |
 | `ui_bridge_sdk_feature` | `ub_sdk_feature` | SDK integration: new endpoints, capabilities, configuration |
+| `ui_bridge_relay` | `ub_relay` | Relay/transport fixes: SSE, WebSocket, command queueing, timeout handling, caching |
 | `ui_bridge_prompt_guidance` | `ub_prompt` | Prompt/workflow guidance: better instructions for AI to use UI Bridge |
 
 ### Marker Format
