@@ -6060,7 +6060,7 @@ class QontinuiExecutor:
         import sys
 
         try:
-            conn = http.client.HTTPConnection("127.0.0.1", api_port, timeout=10)
+            conn = http.client.HTTPConnection("localhost", api_port, timeout=10)
             conn.request(
                 "POST",
                 f"/ui-bridge/control/element/{target}/action",
