@@ -1845,13 +1845,18 @@ impl CheckpointDb {
     /// Set the runner port for instance-level task_run filtering.
     /// Called after the HTTP server binds to its port.
     pub fn set_runner_port(&self, port: u16) {
-        self.runner_port.store(port, std::sync::atomic::Ordering::Relaxed);
+        self.runner_port
+            .store(port, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get the runner port (0 means unset).
     pub fn get_runner_port(&self) -> Option<u16> {
         let port = self.runner_port.load(std::sync::atomic::Ordering::Relaxed);
-        if port == 0 { None } else { Some(port) }
+        if port == 0 {
+            None
+        } else {
+            Some(port)
+        }
     }
 
     /// Create an in-memory database for testing or no-op logging.
@@ -8539,7 +8544,10 @@ impl CheckpointDb {
 
     /// Get all running unified workflow task runs for resume on startup.
     /// Returns task runs where status = 'running' AND workflow_type = 'unified'.
-    pub fn get_running_unified_workflows(&self, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
+    pub fn get_running_unified_workflows(
+        &self,
+        runner_port: Option<u16>,
+    ) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -8615,7 +8623,10 @@ impl CheckpointDb {
 
     /// Get all running AI session task runs for resume on startup.
     /// Returns task runs where status = 'running' AND workflow_type = 'chat'.
-    pub fn get_running_ai_sessions(&self, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
+    pub fn get_running_ai_sessions(
+        &self,
+        runner_port: Option<u16>,
+    ) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -8688,7 +8699,11 @@ impl CheckpointDb {
 
     /// Get recent AI sessions (all statuses) for sidebar listing.
     /// Returns lightweight summaries ordered by most recently updated.
-    pub fn get_ai_sessions(&self, limit: u32, runner_port: Option<u16>) -> Result<Vec<AiSessionSummary>, String> {
+    pub fn get_ai_sessions(
+        &self,
+        limit: u32,
+        runner_port: Option<u16>,
+    ) -> Result<Vec<AiSessionSummary>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -8830,7 +8845,11 @@ impl CheckpointDb {
 
     /// Get recent task runs (for display in UI).
     /// Note: output_log is empty for performance. Use get_full_task_output() to get output.
-    pub fn get_recent_task_runs(&self, limit: u32, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
+    pub fn get_recent_task_runs(
+        &self,
+        limit: u32,
+        runner_port: Option<u16>,
+    ) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -13643,7 +13662,11 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(39)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
+                    ai_reviewed: row
+                        .get::<_, Option<i32>>(40)
+                        .unwrap_or(Some(1))
+                        .unwrap_or(1)
+                        != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -14485,7 +14508,11 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(39)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
+                    ai_reviewed: row
+                        .get::<_, Option<i32>>(40)
+                        .unwrap_or(Some(1))
+                        .unwrap_or(1)
+                        != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -14697,7 +14724,11 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(39)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
+                    ai_reviewed: row
+                        .get::<_, Option<i32>>(40)
+                        .unwrap_or(Some(1))
+                        .unwrap_or(1)
+                        != 0,
                     targeted_error_ids: vec![],
                 })
             })
@@ -17913,7 +17944,10 @@ impl CheckpointDb {
             let acceptance_criteria = if workflow["acceptance_criteria"].is_null() {
                 None
             } else {
-                Some(serde_json::to_string(&workflow["acceptance_criteria"]).unwrap_or_else(|_| "null".to_string()))
+                Some(
+                    serde_json::to_string(&workflow["acceptance_criteria"])
+                        .unwrap_or_else(|_| "null".to_string()),
+                )
             };
 
             let result = conn.execute(

@@ -148,7 +148,6 @@ pub enum LoopPhase {
     Error,
 }
 
-
 /// Runtime state of the orchestration loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestrationLoopStatus {

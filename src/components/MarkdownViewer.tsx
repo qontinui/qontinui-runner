@@ -66,23 +66,6 @@ function hashContent(content: string): string {
 }
 
 /**
- * Patterns that indicate "thinking" or analysis text that can be collapsed.
- */
-const THINKING_PATTERNS = [
-  /^(Let me |I'll |I will |Now I |Looking at |I can see |I understand |Wait,|Actually,|Hmm,)/i,
-  /^(The issue is |The problem is |This means |This should |I think |I believe |I suspect )/i,
-  /^(Let me check|Let me look|Let me verify|Let me examine|Let me investigate)/i,
-  /^(Now let me |First, let me |Next, let me )/i,
-];
-
-/**
- * Check if text starts with a thinking pattern.
- */
-function isThinkingText(text: string): boolean {
-  return THINKING_PATTERNS.some((pattern) => pattern.test(text.trim()));
-}
-
-/**
  * Collapsible thinking section.
  */
 function ThinkingSection({
@@ -156,65 +139,11 @@ function formatFindingBody(body: string): string {
 }
 
 /**
- * Pre-process content to wrap thinking sections.
- */
-function preprocessThinkingSections(content: string): string {
-  const lines = content.split("\n");
-  const result: string[] = [];
-  let inThinkingBlock = false;
-  let thinkingLines: string[] = [];
-
-  for (const line of lines) {
-    const trimmedLine = line.trim();
-
-    if (!inThinkingBlock && isThinkingText(trimmedLine) && trimmedLine.length > 20) {
-      inThinkingBlock = true;
-      thinkingLines = [line];
-    } else if (inThinkingBlock) {
-      if (
-        trimmedLine === "" ||
-        trimmedLine.startsWith("#") ||
-        trimmedLine.startsWith("```") ||
-        trimmedLine.startsWith("[FINDING") ||
-        trimmedLine.startsWith("- ") ||
-        trimmedLine.match(/^\d+\.\s/)
-      ) {
-        if (thinkingLines.length > 0) {
-          const contentHash = hashContent(thinkingLines.join("\n"));
-          result.push(
-            `<div data-thinking-section="true" data-content-id="${contentHash}">\n\n${thinkingLines.join("\n")}\n\n</div>`,
-          );
-          thinkingLines = [];
-        }
-        inThinkingBlock = false;
-        result.push(line);
-      } else {
-        thinkingLines.push(line);
-      }
-    } else {
-      result.push(line);
-    }
-  }
-
-  if (thinkingLines.length > 0) {
-    const contentHash = hashContent(thinkingLines.join("\n"));
-    result.push(
-      `<div data-thinking-section="true" data-content-id="${contentHash}">\n\n${thinkingLines.join("\n")}\n\n</div>`,
-    );
-  }
-
-  return result.join("\n");
-}
-
-/**
  * Try to parse a string as JSON. Returns pretty-printed JSON or null if not valid.
  */
 function tryPrettyJson(text: string): string | null {
   const trimmed = text.trim();
-  if (
-    trimmed.length < 40 ||
-    (trimmed[0] !== "{" && trimmed[0] !== "[")
-  ) {
+  if (trimmed.length < 40 || (trimmed[0] !== "{" && trimmed[0] !== "[")) {
     return null;
   }
   try {

@@ -6,15 +6,7 @@
     "component": "UIBridgeStateMachinePage",
     "pageId": "state-machine",
     "pageUrl": "/state-machine",
-    "tags": [
-      "runner",
-      "state-machine",
-      "builder",
-      "graph",
-      "config",
-      "ui-bridge",
-      "discovery"
-    ]
+    "tags": ["runner", "state-machine", "builder", "graph", "config", "ui-bridge", "discovery"]
   },
   "groups": [
     {

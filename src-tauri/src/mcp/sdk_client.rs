@@ -1007,7 +1007,7 @@ async fn handle_ai_search(
             } else {
                 Json(data)
             }
-        },
+        }
         Err(_sdk_err) => {
             // No SDK app connected — fall back to the runner's own UI via IPC
             debug!("SDK ai/search unavailable, falling back to IPC control endpoint");

@@ -182,7 +182,10 @@ async fn run_loop(
 
     // Wait for target runner to be healthy before starting
     if !runner.is_healthy().await {
-        info!("Waiting for target runner on port {} to be healthy...", target_port);
+        info!(
+            "Waiting for target runner on port {} to be healthy...",
+            target_port
+        );
         if !runner.wait_for_healthy(120, &stop_rx).await {
             set_error(&loop_state, "Target runner not healthy after 120s").await;
             return;
@@ -222,13 +225,13 @@ async fn run_loop(
             state.restart_signaled = false; // Reset for this iteration
         }
 
-        info!(
-            "=== Iteration {}/{} ===",
-            iteration, config.max_iterations
-        );
+        info!("=== Iteration {}/{} ===", iteration, config.max_iterations);
 
         // --- Phase 1: Execute workflow ---
-        info!("Starting workflow '{}' on target runner", config.workflow_id);
+        info!(
+            "Starting workflow '{}' on target runner",
+            config.workflow_id
+        );
         let task_run_id = match runner.start_workflow(&config.workflow_id).await {
             Ok(id) => {
                 info!("Workflow started: task_run_id={}", id);
@@ -250,11 +253,7 @@ async fn run_loop(
                 return;
             }
             Err(e) => {
-                set_error(
-                    &loop_state,
-                    &format!("Workflow polling failed: {}", e),
-                )
-                .await;
+                set_error(&loop_state, &format!("Workflow polling failed: {}", e)).await;
                 return;
             }
         };
@@ -268,8 +267,14 @@ async fn run_loop(
                 state.phase = LoopPhase::WaitingForFixer;
             }
 
-            info!("Waiting for fixer workflow to complete for task_run_id={}", task_run_id);
-            match runner.wait_for_fixer_complete(&task_run_id, 600, &stop_rx).await {
+            info!(
+                "Waiting for fixer workflow to complete for task_run_id={}",
+                task_run_id
+            );
+            match runner
+                .wait_for_fixer_complete(&task_run_id, 600, &stop_rx)
+                .await
+            {
                 Ok(true) => info!("Fixer workflow completed for {}", task_run_id),
                 Ok(false) => info!("No fixer workflow found or timed out for {}", task_run_id),
                 Err(e) if e == "Loop stopped" => {
@@ -294,7 +299,9 @@ async fn run_loop(
             }
             ExitStrategy::WorkflowVerification => {
                 // Check actual workflow status
-                let status = runner.get_task_run_status_pub(&task_run_id).await
+                let status = runner
+                    .get_task_run_status_pub(&task_run_id)
+                    .await
                     .unwrap_or_else(|_| "unknown".to_string());
                 let passed = matches!(status.as_str(), "completed" | "complete");
 
@@ -396,11 +403,7 @@ async fn run_loop(
             )
             .await
             {
-                set_error(
-                    &loop_state,
-                    &format!("Between-iterations failed: {}", e),
-                )
-                .await;
+                set_error(&loop_state, &format!("Between-iterations failed: {}", e)).await;
                 return;
             }
         }
@@ -638,11 +641,7 @@ async fn run_pipeline_loop(
                         rebuild_needed = false;
                     }
                     Err(e) => {
-                        set_error(
-                            &loop_state,
-                            &format!("Workflow generation failed: {}", e),
-                        )
-                        .await;
+                        set_error(&loop_state, &format!("Workflow generation failed: {}", e)).await;
                         return;
                     }
                 }
@@ -740,7 +739,10 @@ async fn run_pipeline_loop(
         let fixes = match runner.get_reflection_fixes(&reflection_id).await {
             Ok(f) => f,
             Err(e) => {
-                warn!("Failed to get reflection fixes: {}, falling back to count", e);
+                warn!(
+                    "Failed to get reflection fixes: {}, falling back to count",
+                    e
+                );
                 Vec::new()
             }
         };
@@ -776,16 +778,11 @@ async fn run_pipeline_loop(
                     state.phase = LoopPhase::ImplementingFixes;
                 }
 
-                let model = fix_config
-                    .model
-                    .as_deref()
-                    .unwrap_or("claude-opus-4-6");
+                let model = fix_config.model.as_deref().unwrap_or("claude-opus-4-6");
                 let timeout = fix_config.timeout_secs.unwrap_or(600);
 
-                let prompt = fix_agent::build_fix_prompt(
-                    &fixes,
-                    fix_config.additional_context.as_deref(),
-                );
+                let prompt =
+                    fix_agent::build_fix_prompt(&fixes, fix_config.additional_context.as_deref());
 
                 info!("Implementing {} fixes via Claude CLI...", fix_count);
                 match fix_agent::run_fix_agent(&prompt, model, timeout, &stop_rx).await {

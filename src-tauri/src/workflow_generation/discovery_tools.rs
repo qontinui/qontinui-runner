@@ -422,9 +422,9 @@ fn extract_relative_paths(text: &str) -> Vec<String> {
     let mut paths = Vec::new();
     // Common file extensions for prompts/specs/code
     let extensions: &[&str] = &[
-        ".md", ".txt", ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".toml",
-        ".json", ".yaml", ".yml", ".html", ".css", ".sql", ".sh", ".bat",
-        ".cfg", ".ini", ".xml", ".csv", ".env", ".svelte", ".vue",
+        ".md", ".txt", ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".toml", ".json", ".yaml",
+        ".yml", ".html", ".css", ".sql", ".sh", ".bat", ".cfg", ".ini", ".xml", ".csv", ".env",
+        ".svelte", ".vue",
     ];
 
     for word in text.split_whitespace() {
@@ -814,8 +814,12 @@ fn execute_read_referenced_files(input: &DiscoveryInput) -> Result<String, Strin
         return Ok(String::new());
     }
 
-    let project_path = crate::mcp::shared::current_project_path()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().to_string());
+    let project_path = crate::mcp::shared::current_project_path().unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+    });
     let mut sections = Vec::new();
 
     for file_path in &input.referenced_files {
@@ -857,10 +861,18 @@ fn execute_read_referenced_files(input: &DiscoveryInput) -> Result<String, Strin
                         full_path.display(),
                         truncated,
                     ));
-                    info!("Read referenced file: {} ({} bytes)", full_path.display(), truncated.len());
+                    info!(
+                        "Read referenced file: {} ({} bytes)",
+                        full_path.display(),
+                        truncated.len()
+                    );
                 }
                 Err(e) => {
-                    warn!("Failed to read referenced file {}: {}", full_path.display(), e);
+                    warn!(
+                        "Failed to read referenced file {}: {}",
+                        full_path.display(),
+                        e
+                    );
                     sections.push(format!(
                         "### Referenced File: {} (READ FAILED)\n\nError: {}",
                         file_path, e

@@ -29,7 +29,9 @@ from typing import Any
 
 # CRITICAL: Configure logging to use stderr FIRST before any other imports
 logging.basicConfig(
-    stream=sys.stderr, level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s"
+    stream=sys.stderr,
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
 # CRITICAL: Check for --disable-console-logging flag BEFORE any imports
@@ -99,15 +101,25 @@ from services.ui_bridge_explorer_service import UIBridgeExplorerService  # noqa:
 _ML_SERVICES_AVAILABLE = True
 try:
     from gui_automation import GUIAutomation  # noqa: E402
-    from services.accessibility_capture_service import AccessibilityCaptureService  # noqa: E402
+    from services.accessibility_capture_service import (
+        AccessibilityCaptureService,
+    )  # noqa: E402
     from services.ai_builder_generator import AiBuilderGeneratorService  # noqa: E402
-    from services.ai_shell_command_generator import AiShellCommandGeneratorService  # noqa: E402
+    from services.ai_shell_command_generator import (
+        AiShellCommandGeneratorService,
+    )  # noqa: E402
     from services.ai_test_generator import AiTestGeneratorService  # noqa: E402
     from services.input_monitor_service import InputMonitorService  # noqa: E402
-    from services.integration_testing_service import IntegrationTestingService  # noqa: E402
+    from services.integration_testing_service import (
+        IntegrationTestingService,
+    )  # noqa: E402
     from services.model_manager import get_model_manager  # noqa: E402
-    from services.pattern_matching_service import get_pattern_matching_service  # noqa: E402
-    from services.playwright_collector_service import PlaywrightCollectorService  # noqa: E402
+    from services.pattern_matching_service import (
+        get_pattern_matching_service,
+    )  # noqa: E402
+    from services.playwright_collector_service import (
+        PlaywrightCollectorService,
+    )  # noqa: E402
     from services.screenshot_service import ScreenshotService  # noqa: E402
     from services.test_analysis_service import TestAnalysisService  # noqa: E402
     from services.uitars_extraction_service import (  # noqa: E402
@@ -208,26 +220,33 @@ class QontinuiExecutor:
 
         # Initialize WebSocketHandler with command handler
         self.websocket_handler = WebSocketHandler(
-            emit_log_fn=self.event_manager.emit_log, on_command_fn=self._handle_websocket_command
+            emit_log_fn=self.event_manager.emit_log,
+            on_command_fn=self._handle_websocket_command,
         )
 
         # Initialize TestResultsHandler for QA dashboard submission
         if TestResultsHandler is not None:
-            self.test_results_handler = TestResultsHandler(emit_log_fn=self.event_manager.emit_log)
+            self.test_results_handler = TestResultsHandler(
+                emit_log_fn=self.event_manager.emit_log
+            )
         else:
             self.test_results_handler = None
 
         # Initialize CaptureManager
         self.capture_manager = CaptureManager(
-            emit_log_fn=self.event_manager.emit_log, emit_event_fn=self.event_manager.emit_event
+            emit_log_fn=self.event_manager.emit_log,
+            emit_event_fn=self.event_manager.emit_event,
         )
 
         # Initialize TrainingExportCoordinator
-        self.training_export = TrainingExportCoordinator(emit_log_fn=self.event_manager.emit_log)
+        self.training_export = TrainingExportCoordinator(
+            emit_log_fn=self.event_manager.emit_log
+        )
 
         # Initialize ExecutorCore
         self.executor_core = ExecutorCore(
-            emit_log_fn=self.event_manager.emit_log, emit_event_fn=self.event_manager.emit_event
+            emit_log_fn=self.event_manager.emit_log,
+            emit_event_fn=self.event_manager.emit_event,
         )
 
         # Execution tree for hierarchical tracking
@@ -319,10 +338,14 @@ class QontinuiExecutor:
             from qontinui.reporting import get_event_registry
 
             event_registry = get_event_registry()
-            logger.debug(f"[INIT] Event registry has_listeners: {event_registry.has_listeners}")
+            logger.debug(
+                f"[INIT] Event registry has_listeners: {event_registry.has_listeners}"
+            )
             logger.debug("[INIT] EventTranslator initialized and callbacks registered")
 
-        logger.info(f"QontinuiExecutor initialized (library_available={QONTINUI_AVAILABLE})")
+        logger.info(
+            f"QontinuiExecutor initialized (library_available={QONTINUI_AVAILABLE})"
+        )
 
         # Auto-reload persisted state machine (non-fatal if it fails)
         with contextlib.suppress(Exception):
@@ -331,7 +354,10 @@ class QontinuiExecutor:
     def _get_sm_persistence(self) -> Any:
         """Lazy-initialize StateMachinePersistence."""
         if self._sm_persistence is None:
-            from state_machine_persistence import StateMachinePersistence, get_app_data_dir
+            from state_machine_persistence import (
+                StateMachinePersistence,
+                get_app_data_dir,
+            )
 
             db_path = get_app_data_dir() / "state_machine.db"
             self._sm_persistence = StateMachinePersistence(db_path)
@@ -377,7 +403,9 @@ class QontinuiExecutor:
         """Forward events to WebSocket backend."""
         import sys
 
-        print(f"[FWD_TO_WS] Called: event_type={event_type}", file=sys.stderr, flush=True)
+        print(
+            f"[FWD_TO_WS] Called: event_type={event_type}", file=sys.stderr, flush=True
+        )
         # Handle image recognition events
         if event_type == "image_recognition":
             screenshot_base64 = data.get("screenshot_base64")
@@ -515,8 +543,12 @@ class QontinuiExecutor:
             run_dir.mkdir(parents=True, exist_ok=True)
 
             # Initialize ScreenshotService
-            self.screenshot_service = ScreenshotService(storage_dir=run_dir, enabled=True)
-            self.event_manager.emit_log("info", f"ScreenshotService initialized: {run_dir}")
+            self.screenshot_service = ScreenshotService(
+                storage_dir=run_dir, enabled=True
+            )
+            self.event_manager.emit_log(
+                "info", f"ScreenshotService initialized: {run_dir}"
+            )
 
             # Create state memory adapter
             state_memory_adapter = StateMemoryAdapter(self.executor_core.state_executor)
@@ -544,7 +576,9 @@ class QontinuiExecutor:
                             action_type=record.action_type,
                             success=record.success,
                             pattern_id=match_summary.get("image_id"),
-                            pattern_name=match_summary.get("image_id"),  # Using image_id as name
+                            pattern_name=match_summary.get(
+                                "image_id"
+                            ),  # Using image_id as name
                             active_states=list(record.active_states_before),
                             match_count=1 if match_summary.get("found") else 0,
                             best_match_score=match_summary.get("confidence"),
@@ -560,7 +594,9 @@ class QontinuiExecutor:
                             ),
                             match_width=None,  # Not available in current record
                             match_height=None,
-                            duration_ms=int(record.duration_ms) if record.duration_ms else None,
+                            duration_ms=(
+                                int(record.duration_ms) if record.duration_ms else None
+                            ),
                             result_data={
                                 "config": record.config,
                                 "clicked_location": record.clicked_location,
@@ -569,7 +605,8 @@ class QontinuiExecutor:
                         )
                     except Exception as e:
                         self.event_manager.emit_log(
-                            "debug", f"Failed to report action for historical indexing: {e}"
+                            "debug",
+                            f"Failed to report action for historical indexing: {e}",
                         )
 
             self.unified_data_collector = UnifiedDataCollector(
@@ -587,7 +624,9 @@ class QontinuiExecutor:
                 )
 
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to initialize unified data services: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to initialize unified data services: {e}"
+            )
             self.event_manager.emit_log("debug", f"Traceback: {traceback.format_exc()}")
             self.screenshot_service = None
             self.unified_data_collector = None
@@ -606,7 +645,9 @@ class QontinuiExecutor:
         import os
         import tempfile
 
-        debug_log_path = os.path.join(tempfile.gettempdir(), "qontinui_load_config_debug.log")
+        debug_log_path = os.path.join(
+            tempfile.gettempdir(), "qontinui_load_config_debug.log"
+        )
         try:
             with open(debug_log_path, "a") as f:
                 from datetime import datetime
@@ -624,8 +665,12 @@ class QontinuiExecutor:
         try:
             with open(debug_log_path, "a") as f:
                 f.write(f"executor_core.load_configuration returned: {success}\n")
-                f.write(f"executor_core.action_executor: {self.executor_core.action_executor}\n")
-                f.write(f"executor_core.state_executor: {self.executor_core.state_executor}\n")
+                f.write(
+                    f"executor_core.action_executor: {self.executor_core.action_executor}\n"
+                )
+                f.write(
+                    f"executor_core.state_executor: {self.executor_core.state_executor}\n"
+                )
                 f.flush()
         except Exception:
             pass
@@ -656,7 +701,9 @@ class QontinuiExecutor:
             # Inject self as workflow executor for navigation
             if QONTINUI_AVAILABLE:
                 navigation_api.set_workflow_executor(self)
-                self.event_manager.emit_log("info", "Runner injected as workflow_executor")
+                self.event_manager.emit_log(
+                    "info", "Runner injected as workflow_executor"
+                )
 
         return success  # type: ignore[no-any-return]
 
@@ -676,7 +723,9 @@ class QontinuiExecutor:
             if self.input_monitor_service is None:
                 dev_logs_dir = Path(__file__).parent.parent.parent / ".dev-logs"
                 dev_logs_dir.mkdir(parents=True, exist_ok=True)
-                self.input_monitor_service = InputMonitorService(storage_dir=dev_logs_dir)
+                self.input_monitor_service = InputMonitorService(
+                    storage_dir=dev_logs_dir
+                )
                 self.event_manager.emit_log(
                     "info", f"InputMonitorService initialized: {dev_logs_dir}"
                 )
@@ -684,7 +733,8 @@ class QontinuiExecutor:
             self.input_monitor_service.start_monitoring(session_id=session_id, fps=30)
             self._input_capture_session_id = session_id
             self.event_manager.emit_log(
-                "info", f"Input capture started for execution validation: session={session_id}"
+                "info",
+                f"Input capture started for execution validation: session={session_id}",
             )
             return True
         except Exception as e:
@@ -744,7 +794,8 @@ class QontinuiExecutor:
             # Run async workflow in sync context
             loop = self._get_or_create_async_loop()
             future = asyncio.run_coroutine_threadsafe(
-                self.gui_automation.execute_workflow(workflow_id, transition_context), loop
+                self.gui_automation.execute_workflow(workflow_id, transition_context),
+                loop,
             )
             success = future.result(timeout=600)  # 10 minute timeout for workflows
             return {"success": success}
@@ -812,18 +863,23 @@ class QontinuiExecutor:
                 encoding="utf-8",
             ) as f:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                f.write(f"[{timestamp}] [PYTHON_EXECUTOR] Set self.target_monitor = {monitor}\n")
+                f.write(
+                    f"[{timestamp}] [PYTHON_EXECUTOR] Set self.target_monitor = {monitor}\n"
+                )
         except Exception:
             pass
         if monitor is not None:
-            self.event_manager.emit_log("info", f"[PYTHON_EXECUTOR] Using monitor index: {monitor}")
+            self.event_manager.emit_log(
+                "info", f"[PYTHON_EXECUTOR] Using monitor index: {monitor}"
+            )
             # Apply monitor setting to FrameworkSettings so qontinui core uses this monitor
             if QONTINUI_AVAILABLE:
                 try:
                     settings = get_settings()
                     settings.monitor.default_screen_index = monitor
                     self.event_manager.emit_log(
-                        "debug", f"Set FrameworkSettings.monitor.default_screen_index = {monitor}"
+                        "debug",
+                        f"Set FrameworkSettings.monitor.default_screen_index = {monitor}",
                     )
 
                     # Set target monitor on state_executor for coordinate conversion
@@ -837,11 +893,15 @@ class QontinuiExecutor:
                         # Write to debug file
                         try:
                             with open(
-                                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
+                                os.path.join(
+                                    tempfile.gettempdir(), "qontinui_monitor_debug.log"
+                                ),
                                 "a",
                                 encoding="utf-8",
                             ) as f:
-                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                                timestamp = datetime.now().strftime(
+                                    "%Y-%m-%d %H:%M:%S.%f"
+                                )[:-3]
                                 f.write(
                                     f"[{timestamp}] [PYTHON_EXECUTOR] Set target monitor: {monitor}\n"
                                 )
@@ -851,11 +911,15 @@ class QontinuiExecutor:
                         # Debug: Log why we couldn't set monitor
                         try:
                             with open(
-                                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
+                                os.path.join(
+                                    tempfile.gettempdir(), "qontinui_monitor_debug.log"
+                                ),
                                 "a",
                                 encoding="utf-8",
                             ) as f:
-                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                                timestamp = datetime.now().strftime(
+                                    "%Y-%m-%d %H:%M:%S.%f"
+                                )[:-3]
                                 f.write(
                                     f"[{timestamp}] [PYTHON_EXECUTOR] WARNING: Cannot set monitor - executor_core or state_executor is None\n"
                                 )
@@ -885,18 +949,23 @@ class QontinuiExecutor:
             f"[WS_SESSION_CHECK] is_enabled={ws_is_enabled}, ws_config_exists={ws_config_exists}, ws_config.enabled={ws_config_enabled}, ws_enabled={self.websocket_handler.ws_enabled}",
         )
         if ws_is_enabled or (ws_config_exists and ws_config_enabled):
-            self.event_manager.emit_log("info", "[WS_SESSION_CHECK] Starting WebSocket session...")
+            self.event_manager.emit_log(
+                "info", "[WS_SESSION_CHECK] Starting WebSocket session..."
+            )
             result = self.websocket_handler.start_session(config_snapshot=self.config)
             self.event_manager.emit_log(
                 "info", f"[WS_SESSION_CHECK] start_session result: {result}"
             )
         else:
             self.event_manager.emit_log(
-                "warning", "[WS_SESSION_CHECK] WebSocket session NOT started - conditions not met"
+                "warning",
+                "[WS_SESSION_CHECK] WebSocket session NOT started - conditions not met",
             )
 
         # Start execution in background thread
-        thread = threading.Thread(target=self._run_workflow, args=(workflow_id,), daemon=True)
+        thread = threading.Thread(
+            target=self._run_workflow, args=(workflow_id,), daemon=True
+        )
         thread.start()
 
         self.event_manager.emit_event(
@@ -916,14 +985,20 @@ class QontinuiExecutor:
         test_run_id = None
 
         try:
-            self.event_manager.emit_log("info", f"Starting workflow execution: {workflow_id}")
+            self.event_manager.emit_log(
+                "info", f"Starting workflow execution: {workflow_id}"
+            )
 
             # Reset navigation state
             if self.gui_automation:
                 self.gui_automation.reset_navigation_state()
 
             # Get workflow config for test results
-            workflow = self.executor_core.workflows.get(workflow_id) if self.executor_core else None
+            workflow = (
+                self.executor_core.workflows.get(workflow_id)
+                if self.executor_core
+                else None
+            )
             workflow_name = workflow_id
             if workflow:
                 if isinstance(workflow, dict):
@@ -978,7 +1053,9 @@ class QontinuiExecutor:
 
             # End WebSocket session
             if self.websocket_handler.is_enabled():
-                self.websocket_handler.end_session(status="completed" if success else "failed")
+                self.websocket_handler.end_session(
+                    status="completed" if success else "failed"
+                )
 
             # Complete test run for QA dashboard
             if test_run_id and self.test_results_handler.is_enabled():
@@ -1037,12 +1114,15 @@ class QontinuiExecutor:
                 self.gui_automation.set_paused(False)
 
             self.event_manager.emit_event(
-                EventType.EXECUTION_COMPLETED, {"success": False, "reason": "User stopped"}
+                EventType.EXECUTION_COMPLETED,
+                {"success": False, "reason": "User stopped"},
             )
 
             # Export training data if enabled
             if self.training_export.is_enabled():
-                self.event_manager.emit_log("info", "Exporting training data on stop...")
+                self.event_manager.emit_log(
+                    "info", "Exporting training data on stop..."
+                )
                 self.training_export.export_data()
 
     def pause_execution(self):
@@ -1067,7 +1147,9 @@ class QontinuiExecutor:
             if self.gui_automation:
                 self.gui_automation.set_paused(False)
 
-            self.event_manager.emit_event(EventType.EXECUTION_RESUMED, {"paused": False})
+            self.event_manager.emit_event(
+                EventType.EXECUTION_RESUMED, {"paused": False}
+            )
 
     def navigate_to_state(self, target_state_id: str) -> dict[str, Any]:
         """Navigate to a target state via navigation API."""
@@ -1105,7 +1187,9 @@ class QontinuiExecutor:
                 result = navigation_api.open_state(target_state_id)
 
                 # Update node status
-                success = result.get("success", False) if isinstance(result, dict) else result
+                success = (
+                    result.get("success", False) if isinstance(result, dict) else result
+                )
                 nav_node.status = "completed" if success else "failed"
                 if not success:
                     nav_node.error = (
@@ -1116,7 +1200,9 @@ class QontinuiExecutor:
 
                 # Emit completion
                 self.event_manager.emit_tree_event(
-                    "workflow_completed" if success else "workflow_failed", nav_node, None
+                    "workflow_completed" if success else "workflow_failed",
+                    nav_node,
+                    None,
                 )
 
                 return {
@@ -1170,7 +1256,9 @@ class QontinuiExecutor:
 
             if not command_name:
                 print(
-                    "[error   ] EXECUTOR: No command name in message", file=sys.stderr, flush=True
+                    "[error   ] EXECUTOR: No command name in message",
+                    file=sys.stderr,
+                    flush=True,
                 )
                 return
 
@@ -1187,7 +1275,11 @@ class QontinuiExecutor:
                 flush=True,
             )
             result = self.handle_command(command_dict)
-            print(f"[info    ] EXECUTOR: Command result: {result}", file=sys.stderr, flush=True)
+            print(
+                f"[info    ] EXECUTOR: Command result: {result}",
+                file=sys.stderr,
+                flush=True,
+            )
 
             # Send result back through WebSocket to frontend
             if self.websocket_handler and self.websocket_handler.is_connected:
@@ -1251,7 +1343,9 @@ class QontinuiExecutor:
 
         # Don't log high-frequency commands to avoid flooding the logs
         if cmd_type not in ("ping", "status"):
-            self.event_manager.emit_log("info", f"handle_command: received '{cmd_type}'")
+            self.event_manager.emit_log(
+                "info", f"handle_command: received '{cmd_type}'"
+            )
 
         if cmd_type == "load":
             config_path = params.get("config_path")
@@ -1349,7 +1443,9 @@ class QontinuiExecutor:
                 future = asyncio.run_coroutine_threadsafe(
                     self.gui_automation.execute_action(action_data), loop
                 )
-                success = future.result(timeout=120)  # 2 minute timeout for single actions
+                success = future.result(
+                    timeout=120
+                )  # 2 minute timeout for single actions
 
                 self.event_manager.emit_log(
                     "info" if success else "warning",
@@ -1392,7 +1488,10 @@ class QontinuiExecutor:
             return self.capture_manager.update_settings(settings)  # type: ignore[no-any-return]
 
         elif cmd_type == "manual_capture_status":
-            return {"success": True, "is_running": self.capture_manager.is_manual_capture_running()}
+            return {
+                "success": True,
+                "is_running": self.capture_manager.is_manual_capture_running(),
+            }
 
         elif cmd_type == "set_input_capture_enabled":
             # Enable/disable input capture for coordinate validation during execution
@@ -1454,14 +1553,18 @@ class QontinuiExecutor:
                 file=sys.stderr,
                 flush=True,
             )
-            self.event_manager.emit_log("info", f"[WS_CONFIGURE] Result: success={success}")
+            self.event_manager.emit_log(
+                "info", f"[WS_CONFIGURE] Result: success={success}"
+            )
             return {"success": success}
 
         elif cmd_type == "ws_connect":
             import sys
             import threading
 
-            print("[info    ] WS_DEBUG: ws_connect received!", file=sys.stderr, flush=True)
+            print(
+                "[info    ] WS_DEBUG: ws_connect received!", file=sys.stderr, flush=True
+            )
 
             # Run connection in background thread to avoid blocking the command loop.
             # A blocking ws_connect prevents the executor from responding to health
@@ -1844,6 +1947,8 @@ class QontinuiExecutor:
             return self._handle_gui_config_capture_elements(params)
         elif cmd_type == "gui_config_build":
             return self._handle_gui_config_build(params)
+        elif cmd_type == "gui_config_capture_multi_state":
+            return self._handle_gui_config_capture_multi_state(params)
 
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
@@ -2150,7 +2255,9 @@ class QontinuiExecutor:
                             buffer = io.BytesIO()
                             cropped_pil.save(buffer, format="PNG", compress_level=6)
                             buffer.seek(0)
-                            image_base64_out = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                            image_base64_out = base64.b64encode(
+                                buffer.getvalue()
+                            ).decode("utf-8")
 
                     segments.append(
                         {
@@ -2276,7 +2383,9 @@ class QontinuiExecutor:
             else:
                 return {
                     "success": False,
-                    "error": result.get("error", "Unknown error during Playwright analysis"),
+                    "error": result.get(
+                        "error", "Unknown error during Playwright analysis"
+                    ),
                 }
 
         except TimeoutError:
@@ -2293,7 +2402,9 @@ class QontinuiExecutor:
                 "traceback": traceback.format_exc(),
             }
 
-    def _handle_analyze_page_playwright_script(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_analyze_page_playwright_script(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """
         Analyze page by running a Playwright script.
 
@@ -2347,7 +2458,9 @@ class QontinuiExecutor:
             else:
                 return {
                     "success": False,
-                    "error": result.get("error", "Unknown error during Playwright script analysis"),
+                    "error": result.get(
+                        "error", "Unknown error during Playwright script analysis"
+                    ),
                 }
 
         except TimeoutError:
@@ -2410,7 +2523,9 @@ class QontinuiExecutor:
             else:
                 return {
                     "success": False,
-                    "error": result.get("error", "Unknown error during Vision analysis"),
+                    "error": result.get(
+                        "error", "Unknown error during Vision analysis"
+                    ),
                 }
 
         except Exception as e:
@@ -2508,7 +2623,9 @@ class QontinuiExecutor:
             )
         return self._ai_shell_command_generator_service  # type: ignore[no-any-return]
 
-    def _handle_generate_shell_command_with_ai(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_generate_shell_command_with_ai(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """
         Handle AI shell command generation.
 
@@ -2532,7 +2649,9 @@ class QontinuiExecutor:
 
         # Debug log file
         debug_log = os.path.join(
-            os.environ.get("USERPROFILE", "C:\\Users\\Joshua"), ".qontinui", "ai-shell-debug.log"
+            os.environ.get("USERPROFILE", "C:\\Users\\Joshua"),
+            ".qontinui",
+            "ai-shell-debug.log",
         )
         os.makedirs(os.path.dirname(debug_log), exist_ok=True)
 
@@ -2582,7 +2701,9 @@ class QontinuiExecutor:
             debug(
                 f"service.generate_command() returned: success={result.get('success')}, error={result.get('error')!r}"
             )
-            debug(f"command (first 200 chars): {str(result.get('command', ''))[:200]!r}")
+            debug(
+                f"command (first 200 chars): {str(result.get('command', ''))[:200]!r}"
+            )
 
             return result
 
@@ -2607,7 +2728,9 @@ class QontinuiExecutor:
             )
         return self._ai_builder_generator_service  # type: ignore[no-any-return]
 
-    def _handle_generate_context_with_ai(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_generate_context_with_ai(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle AI context generation for knowledge base entries."""
         user_prompt = params.get("user_prompt", "")
         ai_provider = params.get("ai_provider", "claude_cli")
@@ -2632,7 +2755,9 @@ class QontinuiExecutor:
                 "traceback": traceback.format_exc(),
             }
 
-    def _handle_generate_api_request_with_ai(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_generate_api_request_with_ai(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle AI API request template generation."""
         user_prompt = params.get("user_prompt", "")
         base_url = params.get("base_url")
@@ -2659,7 +2784,9 @@ class QontinuiExecutor:
                 "traceback": traceback.format_exc(),
             }
 
-    def _handle_generate_task_prompt_with_ai(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_generate_task_prompt_with_ai(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle AI task prompt generation/improvement."""
         user_prompt = params.get("user_prompt", "")
         mode = params.get("mode", "generate")
@@ -2717,7 +2844,9 @@ class QontinuiExecutor:
                 "traceback": traceback.format_exc(),
             }
 
-    def _handle_generate_test_and_agentic_step(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_generate_test_and_agentic_step(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle AI test and agentic step generation."""
         user_prompt = params.get("user_prompt", "")
         page_context = params.get("page_context")
@@ -2902,7 +3031,9 @@ class QontinuiExecutor:
                 file=sys.stderr,
                 flush=True,
             )
-            self.event_manager.emit_log("error", f"Failed to run vision extraction: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to run vision extraction: {e}"
+            )
             return {"success": False, "error": str(e)}
 
     def _start_async_loop(self):
@@ -2930,7 +3061,9 @@ class QontinuiExecutor:
         # Start background thread if needed
         if self._async_thread is None or not self._async_thread.is_alive():
             self._async_loop = None  # Reset loop since thread died
-            self._async_thread = threading.Thread(target=self._start_async_loop, daemon=True)
+            self._async_thread = threading.Thread(
+                target=self._start_async_loop, daemon=True
+            )
             self._async_thread.start()
 
             # Wait for loop to be ready
@@ -2970,7 +3103,9 @@ class QontinuiExecutor:
                 flush=True,
             )
 
-            future = asyncio.run_coroutine_threadsafe(service.start_extraction(config), loop)
+            future = asyncio.run_coroutine_threadsafe(
+                service.start_extraction(config), loop
+            )
             # Wait for result with timeout (extraction may take a while to initialize)
             result = future.result(timeout=60)
 
@@ -2992,7 +3127,9 @@ class QontinuiExecutor:
 
         except Exception as e:
             print(
-                f"[error   ] EXECUTOR: Failed to start extraction: {e}", file=sys.stderr, flush=True
+                f"[error   ] EXECUTOR: Failed to start extraction: {e}",
+                file=sys.stderr,
+                flush=True,
             )
 
             print(
@@ -3039,7 +3176,9 @@ class QontinuiExecutor:
             return {"success": True, **status}
 
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to get extraction status: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to get extraction status: {e}"
+            )
             return {"success": False, "error": str(e)}
 
     def _get_playwright_collector_service(self) -> PlaywrightCollectorService:
@@ -3050,7 +3189,9 @@ class QontinuiExecutor:
             )
         return self._playwright_collector_service  # type: ignore[no-any-return]
 
-    def _handle_start_playwright_collection(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_start_playwright_collection(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle start Playwright collection command."""
         import sys
 
@@ -3072,13 +3213,17 @@ class QontinuiExecutor:
             return result
 
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to start Playwright collection: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to start Playwright collection: {e}"
+            )
             import traceback
 
             traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
-    def _handle_get_playwright_collection_status(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_get_playwright_collection_status(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle get Playwright collection status command."""
         try:
             if self._playwright_collector_service is None:
@@ -3089,21 +3234,29 @@ class QontinuiExecutor:
                 }
 
             job_id = params.get("job_id")
-            result: dict[str, Any] = self._playwright_collector_service.get_job_status(job_id)
+            result: dict[str, Any] = self._playwright_collector_service.get_job_status(
+                job_id
+            )
             return result
 
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to get Playwright collection status: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to get Playwright collection status: {e}"
+            )
             return {"success": False, "error": str(e)}
 
-    def _handle_get_playwright_collection_results(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_get_playwright_collection_results(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle get Playwright collection results command."""
         try:
             if self._playwright_collector_service is None:
                 return {"success": False, "error": "No Playwright collection service"}
 
             job_id = params.get("job_id")
-            result: dict[str, Any] = self._playwright_collector_service.get_results(job_id)
+            result: dict[str, Any] = self._playwright_collector_service.get_results(
+                job_id
+            )
             return result
 
         except Exception as e:
@@ -3118,11 +3271,15 @@ class QontinuiExecutor:
             if self._playwright_collector_service is None:
                 return {"success": False, "error": "No collection in progress"}
 
-            result: dict[str, Any] = self._playwright_collector_service.stop_collection()
+            result: dict[str, Any] = (
+                self._playwright_collector_service.stop_collection()
+            )
             return result
 
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to stop Playwright collection: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to stop Playwright collection: {e}"
+            )
             return {"success": False, "error": str(e)}
 
     # =========================================================================
@@ -3137,7 +3294,9 @@ class QontinuiExecutor:
             )
         return self._ui_bridge_explorer_service
 
-    def _handle_start_ui_bridge_exploration(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_start_ui_bridge_exploration(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle start UI Bridge exploration command.
 
         Starts an exploration job in the background and returns a job ID.
@@ -3167,11 +3326,15 @@ class QontinuiExecutor:
         except Exception as e:
             import traceback
 
-            self.event_manager.emit_log("error", f"[UI Bridge] Start exploration failed: {e}")
+            self.event_manager.emit_log(
+                "error", f"[UI Bridge] Start exploration failed: {e}"
+            )
             traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
-    def _handle_get_ui_bridge_exploration_status(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_get_ui_bridge_exploration_status(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle get UI Bridge exploration status command.
 
         Returns the current status of an exploration job.
@@ -3192,11 +3355,15 @@ class QontinuiExecutor:
         except Exception as e:
             import traceback
 
-            self.event_manager.emit_log("error", f"[UI Bridge] Get exploration status failed: {e}")
+            self.event_manager.emit_log(
+                "error", f"[UI Bridge] Get exploration status failed: {e}"
+            )
             traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
-    def _handle_get_ui_bridge_exploration_results(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_get_ui_bridge_exploration_results(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle get UI Bridge exploration results command.
 
         Returns the results of a completed exploration job.
@@ -3217,11 +3384,15 @@ class QontinuiExecutor:
         except Exception as e:
             import traceback
 
-            self.event_manager.emit_log("error", f"[UI Bridge] Get exploration results failed: {e}")
+            self.event_manager.emit_log(
+                "error", f"[UI Bridge] Get exploration results failed: {e}"
+            )
             traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
-    def _handle_stop_ui_bridge_exploration(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_stop_ui_bridge_exploration(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle stop UI Bridge exploration command.
 
         Stops the current exploration job.
@@ -3241,11 +3412,15 @@ class QontinuiExecutor:
         except Exception as e:
             import traceback
 
-            self.event_manager.emit_log("error", f"[UI Bridge] Stop exploration failed: {e}")
+            self.event_manager.emit_log(
+                "error", f"[UI Bridge] Stop exploration failed: {e}"
+            )
             traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
-    def _handle_discover_states_from_renders(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_discover_states_from_renders(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle discover states from render logs command.
 
         Runs co-occurrence analysis on existing render logs to discover states.
@@ -3291,7 +3466,9 @@ class QontinuiExecutor:
             )
 
             # Import and call the qontinui library function
-            from qontinui.discovery.ui_bridge_adapter import discover_states_from_renders
+            from qontinui.discovery.ui_bridge_adapter import (
+                discover_states_from_renders,
+            )
 
             result = discover_states_from_renders(render_logs)
 
@@ -3315,7 +3492,9 @@ class QontinuiExecutor:
             traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
-    def _handle_discover_states_from_fingerprints(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_discover_states_from_fingerprints(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle discover states from fingerprint co-occurrence data.
 
         Uses the FingerprintStateDiscovery class to analyze element fingerprints
@@ -3420,7 +3599,9 @@ class QontinuiExecutor:
 
             # Map raw transitions to state transitions
             # We need to find which state each transition's fingerprints belong to
-            state_transitions = self._map_transitions_to_states(raw_transitions, discovered_states)
+            state_transitions = self._map_transitions_to_states(
+                raw_transitions, discovered_states
+            )
 
             # Get statistics
             stats = discovery.get_statistics()
@@ -3526,7 +3707,9 @@ class QontinuiExecutor:
 
         return result
 
-    def _handle_run_ui_bridge_exploration(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_run_ui_bridge_exploration(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle automatic UI Bridge exploration.
 
         Uses the UIBridgeExplorer to systematically explore interactive elements
@@ -3618,7 +3801,9 @@ class QontinuiExecutor:
 
             # Run exploration in event loop
             async def run_exploration():
-                async with UIBridgeExplorer(config, on_progress=on_progress) as explorer:
+                async with UIBridgeExplorer(
+                    config, on_progress=on_progress
+                ) as explorer:
                     return await explorer.explore()
 
             # Get or create event loop
@@ -3648,7 +3833,9 @@ class QontinuiExecutor:
 
             # Include state discovery result if available
             if result.state_discovery_result:
-                response_data["state_discovery_result"] = result.state_discovery_result.to_dict()
+                response_data["state_discovery_result"] = (
+                    result.state_discovery_result.to_dict()
+                )
 
             # Include cooccurrence export if available
             if result.cooccurrence_export:
@@ -3695,7 +3882,8 @@ class QontinuiExecutor:
             # Check if UI-TARS is available
             if not service.is_available():
                 self.event_manager.emit_log(
-                    "warning", "[UI-TARS] UI-TARS not available, will run simulated extraction"
+                    "warning",
+                    "[UI-TARS] UI-TARS not available, will run simulated extraction",
                 )
 
             # Start extraction
@@ -3710,7 +3898,9 @@ class QontinuiExecutor:
             return result
 
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to start UI-TARS extraction: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to start UI-TARS extraction: {e}"
+            )
             import traceback
 
             traceback.print_exc(file=sys.stderr)
@@ -3725,7 +3915,9 @@ class QontinuiExecutor:
             return self._uitars_extraction_service.stop_extraction()
 
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to stop UI-TARS extraction: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to stop UI-TARS extraction: {e}"
+            )
             return {"success": False, "error": str(e)}
 
     def _handle_get_uitars_extraction_status(self) -> dict[str, Any]:
@@ -3747,7 +3939,9 @@ class QontinuiExecutor:
             return {"success": True, **status}
 
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to get UI-TARS extraction status: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to get UI-TARS extraction status: {e}"
+            )
             return {"success": False, "error": str(e)}
 
     def _handle_get_uitars_extraction_results(self) -> dict[str, Any]:
@@ -3767,7 +3961,9 @@ class QontinuiExecutor:
             return {"success": True, **results}
 
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to get UI-TARS extraction results: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to get UI-TARS extraction results: {e}"
+            )
             return {"success": False, "error": str(e)}
 
     def _handle_execute_workflow(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -3869,7 +4065,9 @@ class QontinuiExecutor:
                     self.websocket_handler.send_message(json.dumps(completion_event))
 
             except Exception as e:
-                self.event_manager.emit_log("error", f"Remote workflow execution failed: {e}")
+                self.event_manager.emit_log(
+                    "error", f"Remote workflow execution failed: {e}"
+                )
 
         threading.Thread(target=_run_workflow_background, daemon=True).start()
 
@@ -3930,15 +4128,21 @@ class QontinuiExecutor:
 
             # Create verification service with current config
             verification_service = VerificationService(
-                state_executor=self.executor_core.state_executor if self.executor_core else None,
-                action_executor=self.executor_core.action_executor if self.executor_core else None,
+                state_executor=(
+                    self.executor_core.state_executor if self.executor_core else None
+                ),
+                action_executor=(
+                    self.executor_core.action_executor if self.executor_core else None
+                ),
                 config=self.config,
             )
 
             # Set screenshot directory if capture is requested
             capture_screenshot = params.get("capture_screenshot", False)
             if capture_screenshot:
-                dev_logs_dir = Path(__file__).parent.parent.parent / ".dev-logs" / "verification"
+                dev_logs_dir = (
+                    Path(__file__).parent.parent.parent / ".dev-logs" / "verification"
+                )
                 verification_service.set_screenshot_directory(dev_logs_dir)
 
             # Detect states (async method called from sync context)
@@ -4038,8 +4242,12 @@ class QontinuiExecutor:
 
             # Create verification service with current config
             verification_service = VerificationService(
-                state_executor=self.executor_core.state_executor if self.executor_core else None,
-                action_executor=self.executor_core.action_executor if self.executor_core else None,
+                state_executor=(
+                    self.executor_core.state_executor if self.executor_core else None
+                ),
+                action_executor=(
+                    self.executor_core.action_executor if self.executor_core else None
+                ),
                 config=self.config,
             )
 
@@ -4090,7 +4298,9 @@ class QontinuiExecutor:
                 "unexpected_results": [],
             }
 
-    def _handle_verification_capture_screenshot(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_verification_capture_screenshot(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle verification_capture_screenshot command for AI Verification Agent.
 
         This command captures a screenshot specifically for verification documentation.
@@ -4131,8 +4341,12 @@ class QontinuiExecutor:
 
             # Create verification service
             verification_service = VerificationService(
-                state_executor=self.executor_core.state_executor if self.executor_core else None,
-                action_executor=self.executor_core.action_executor if self.executor_core else None,
+                state_executor=(
+                    self.executor_core.state_executor if self.executor_core else None
+                ),
+                action_executor=(
+                    self.executor_core.action_executor if self.executor_core else None
+                ),
                 config=self.config,
             )
 
@@ -4184,7 +4398,9 @@ class QontinuiExecutor:
                 file=sys.stderr,
                 flush=True,
             )
-            self.event_manager.emit_log("error", f"Failed to capture verification screenshot: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to capture verification screenshot: {e}"
+            )
             return {
                 "success": False,
                 "error": str(e),
@@ -4268,7 +4484,9 @@ class QontinuiExecutor:
             "note": "Query Rust get_execution_options command for accurate flakiness data",
         }
 
-    def _handle_start_interaction_recording(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_start_interaction_recording(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Start interaction recording (video + input capture).
 
         This combines video recording and input monitoring for capturing user
@@ -4299,7 +4517,9 @@ class QontinuiExecutor:
 
         try:
             # Generate session ID if not provided
-            session_id = params.get("session_id") or f"interaction-{uuid.uuid4().hex[:8]}"
+            session_id = (
+                params.get("session_id") or f"interaction-{uuid.uuid4().hex[:8]}"
+            )
             fps = params.get("fps", 30)
             output_dir = params.get("output_dir")
 
@@ -4314,7 +4534,9 @@ class QontinuiExecutor:
 
             # Initialize InputMonitorService if not already done
             if self.input_monitor_service is None:
-                self.input_monitor_service = InputMonitorService(storage_dir=interactions_dir)
+                self.input_monitor_service = InputMonitorService(
+                    storage_dir=interactions_dir
+                )
                 self.event_manager.emit_log(
                     "info", f"InputMonitorService initialized: {interactions_dir}"
                 )
@@ -4349,7 +4571,9 @@ class QontinuiExecutor:
             }
 
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to start interaction recording: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to start interaction recording: {e}"
+            )
             import traceback
 
             traceback.print_exc(file=sys.stderr)
@@ -4418,7 +4642,9 @@ class QontinuiExecutor:
             }
 
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to stop interaction recording: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to stop interaction recording: {e}"
+            )
             import traceback
 
             traceback.print_exc(file=sys.stderr)
@@ -4443,7 +4669,11 @@ class QontinuiExecutor:
                 "is_recording": False,
             }
 
-        duration = time.time() - self._interaction_start_time if self._interaction_start_time else 0
+        duration = (
+            time.time() - self._interaction_start_time
+            if self._interaction_start_time
+            else 0
+        )
         events_count = 0
         if self.input_monitor_service:
             events_count = len(self.input_monitor_service.get_events())
@@ -4492,7 +4722,9 @@ class QontinuiExecutor:
 
         try:
             # Generate session ID if not provided
-            session_id = params.get("session_id") or f"click-capture-{uuid.uuid4().hex[:8]}"
+            session_id = (
+                params.get("session_id") or f"click-capture-{uuid.uuid4().hex[:8]}"
+            )
             output_dir = params.get("output_dir")
             application_hint = params.get("application_hint")
 
@@ -4507,14 +4739,19 @@ class QontinuiExecutor:
 
             # Initialize InputMonitorService if not already done
             if self.input_monitor_service is None:
-                self.input_monitor_service = InputMonitorService(storage_dir=capture_dir)
+                self.input_monitor_service = InputMonitorService(
+                    storage_dir=capture_dir
+                )
                 self.event_manager.emit_log(
-                    "info", f"InputMonitorService initialized for click capture: {capture_dir}"
+                    "info",
+                    f"InputMonitorService initialized for click capture: {capture_dir}",
                 )
 
             # Start input monitoring (captures clicks)
             self.input_monitor_service.start_monitoring(session_id=session_id, fps=30)
-            self.event_manager.emit_log("info", f"Click capture started for session: {session_id}")
+            self.event_manager.emit_log(
+                "info", f"Click capture started for session: {session_id}"
+            )
 
             # Update state
             self._click_capture_active = True
@@ -4584,7 +4821,9 @@ class QontinuiExecutor:
                 events_file = self.input_monitor_service.stop_monitoring()
                 # Filter for click events only
                 all_events = self.input_monitor_service.get_events()
-                click_events = [e for e in all_events if e.get("event_type") == "mouse_click"]
+                click_events = [
+                    e for e in all_events if e.get("event_type") == "mouse_click"
+                ]
                 events_count = len(click_events)
 
             # Calculate duration
@@ -4662,12 +4901,16 @@ class QontinuiExecutor:
             }
 
         duration = (
-            time.time() - self._click_capture_start_time if self._click_capture_start_time else 0
+            time.time() - self._click_capture_start_time
+            if self._click_capture_start_time
+            else 0
         )
         events_count = 0
         if self.input_monitor_service:
             all_events = self.input_monitor_service.get_events()
-            click_events = [e for e in all_events if e.get("event_type") == "mouse_click"]
+            click_events = [
+                e for e in all_events if e.get("event_type") == "mouse_click"
+            ]
             events_count = len(click_events)
 
         return {
@@ -4735,11 +4978,17 @@ class QontinuiExecutor:
 
         try:
             # Import qontinui library modules
-            from qontinui.discovery.click_analysis import CaptureProcessor, ClickTemplateCandidate
+            from qontinui.discovery.click_analysis import (
+                CaptureProcessor,
+                ClickTemplateCandidate,
+            )
 
             events_path = Path(events_file)
             if not events_path.exists():
-                return {"success": False, "error": f"Events file not found: {events_file}"}
+                return {
+                    "success": False,
+                    "error": f"Events file not found: {events_file}",
+                }
 
             # Load click events from JSONL
             click_events = []
@@ -4764,7 +5013,8 @@ class QontinuiExecutor:
                 }
 
             self.event_manager.emit_log(
-                "info", f"Processing {len(click_events)} click events from {events_file}"
+                "info",
+                f"Processing {len(click_events)} click events from {events_file}",
             )
 
             processor = CaptureProcessor()
@@ -4783,7 +5033,9 @@ class QontinuiExecutor:
                 # Take a screenshot now and process all clicks against it
                 screenshot = self._capture_screenshot_for_processing()
                 if screenshot is not None:
-                    click_locations = [(e.get("x", 0), e.get("y", 0)) for e in click_events]
+                    click_locations = [
+                        (e.get("x", 0), e.get("y", 0)) for e in click_events
+                    ]
                     candidates = processor.process_screenshot_with_clicks(
                         screenshot=screenshot,
                         click_locations=click_locations,
@@ -4794,7 +5046,9 @@ class QontinuiExecutor:
             # Convert candidates to dictionaries
             candidate_dicts = [c.to_dict() for c in candidates]
 
-            self.event_manager.emit_log("info", f"Extracted {len(candidates)} template candidates")
+            self.event_manager.emit_log(
+                "info", f"Extracted {len(candidates)} template candidates"
+            )
 
             result = {
                 "success": True,
@@ -4812,10 +5066,14 @@ class QontinuiExecutor:
             return result
 
         except ImportError as e:
-            self.event_manager.emit_log("error", f"Failed to import qontinui library: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to import qontinui library: {e}"
+            )
             return {"success": False, "error": f"qontinui library not available: {e}"}
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to process click capture: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to process click capture: {e}"
+            )
             import traceback
 
             traceback.print_exc(file=sys.stderr)
@@ -4851,7 +5109,9 @@ class QontinuiExecutor:
             response.raise_for_status()
             return {"success": True}
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to send candidates to web API: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to send candidates to web API: {e}"
+            )
             return {"success": False, "error": str(e)}
 
     def _handle_generate_state_machine(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -5004,7 +5264,9 @@ class QontinuiExecutor:
                 output_file.parent.mkdir(parents=True, exist_ok=True)
                 with open(output_file, "w") as f:
                     json.dump(state_machine_dict, f, indent=2)
-                self.event_manager.emit_log("info", f"State machine config saved to: {output_path}")
+                self.event_manager.emit_log(
+                    "info", f"State machine config saved to: {output_path}"
+                )
 
             # Emit completion event
             self.event_manager.emit_event_wrapper(
@@ -5028,10 +5290,14 @@ class QontinuiExecutor:
             }
 
         except ImportError as e:
-            self.event_manager.emit_log("error", f"Failed to import qontinui library: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to import qontinui library: {e}"
+            )
             return {"success": False, "error": f"qontinui library not available: {e}"}
         except Exception as e:
-            self.event_manager.emit_log("error", f"Failed to generate state machine: {e}")
+            self.event_manager.emit_log(
+                "error", f"Failed to generate state machine: {e}"
+            )
             import traceback
 
             traceback.print_exc(file=sys.stderr)
@@ -5107,7 +5373,10 @@ class QontinuiExecutor:
 
         try:
             from element_resolver import ElementResolver
-            from ui_bridge_http_client import ResolvingUIBridgeClient, UIBridgeHTTPClient
+            from ui_bridge_http_client import (
+                ResolvingUIBridgeClient,
+                UIBridgeHTTPClient,
+            )
 
             from qontinui.state_machine.ui_bridge_runtime import UIBridgeRuntime
 
@@ -5280,15 +5549,58 @@ class QontinuiExecutor:
     # GUI Config Pipeline commands
     # =========================================================================
 
-    def _handle_gui_config_capture_elements(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _fetch_ui_bridge_snapshot(self, api_port: int) -> dict[str, Any] | None:
+        """Fetch a UI Bridge snapshot via HTTP.
+
+        Returns the snapshot dict (with 'elements' key) or None on failure.
+        On failure, logs the error and returns None.
+        """
+        import http.client
+        import json as _json
+        import sys
+
+        try:
+            conn = http.client.HTTPConnection("localhost", api_port, timeout=30)
+            conn.request("GET", "/ui-bridge/control/snapshot")
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8")
+            conn.close()
+            if resp.status != 200:
+                print(
+                    f"[warn    ] EXECUTOR: UI Bridge snapshot returned status {resp.status}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return None
+            snapshot_response = _json.loads(body)
+        except Exception as e:
+            print(
+                f"[warn    ] EXECUTOR: Failed to fetch UI Bridge snapshot: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+
+        # The HTTP endpoint wraps in {success, data: {elements, ...}}
+        snapshot = snapshot_response.get("data", snapshot_response)
+        element_count = len(snapshot.get("elements", []))
+        print(
+            f"[info    ] EXECUTOR: Got {element_count} elements from UI Bridge",
+            file=sys.stderr,
+            flush=True,
+        )
+        return snapshot
+
+    def _handle_gui_config_capture_elements(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Extract element images from a screenshot using UI Bridge position data.
 
-        Expects the Rust caller to provide both the UI Bridge snapshot and screenshot.
+        Fetches the UI Bridge snapshot and captures a screenshot autonomously.
 
         Args:
             params:
-                - snapshot: UI Bridge control snapshot JSON (elements with rects)
-                - screenshot_base64: Base64-encoded PNG screenshot
+                - api_port: Runner API port for UI Bridge snapshot callback
                 - window_offset_x: X offset from screenshot origin to content area
                 - window_offset_y: Y offset from screenshot origin to content area
                 - scale_factor: DPI scale factor (default 1.0)
@@ -5305,23 +5617,27 @@ class QontinuiExecutor:
             if not QONTINUI_AVAILABLE:
                 return {"success": False, "error": "Qontinui library not available"}
 
-            snapshot = params.get("snapshot")
-            screenshot_b64 = params.get("screenshot_base64")
-            if not snapshot or not screenshot_b64:
-                return {"success": False, "error": "snapshot and screenshot_base64 are required"}
-
-            import base64
-            import io
-
-            from PIL import Image
-
             from qontinui.discovery.element_image_pipeline import (
                 ElementImagePipeline,
                 ExtractionConfig,
             )
 
-            # Decode screenshot
-            screenshot = Image.open(io.BytesIO(base64.b64decode(screenshot_b64)))
+            api_port = params.get("api_port", 9876)
+            snapshot = self._fetch_ui_bridge_snapshot(api_port)
+            if snapshot is None:
+                return {"success": False, "error": "Failed to fetch UI Bridge snapshot"}
+            if not snapshot.get("elements"):
+                return {"success": False, "error": "UI Bridge snapshot has no elements"}
+
+            from qontinui.hal.factory import HALFactory
+
+            screen_capture = HALFactory.get_screen_capture()
+            screenshot = screen_capture.capture_screen(monitor=None)
+            print(
+                f"[info    ] EXECUTOR: Screenshot captured: {screenshot.width}x{screenshot.height}",
+                file=sys.stderr,
+                flush=True,
+            )
 
             # Build config
             cat_filter = params.get("category_filter")
@@ -5369,6 +5685,7 @@ class QontinuiExecutor:
                 flush=True,
             )
             import traceback
+
             traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
@@ -5503,8 +5820,267 @@ class QontinuiExecutor:
                 flush=True,
             )
             import traceback
+
             traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
+
+    def _handle_gui_config_capture_multi_state(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Orchestrate multi-state GUI config capture.
+
+        Walks through a sequence of interactions, capturing screenshots and
+        UI Bridge snapshots at each step. Diffs element sets to find only NEW
+        elements per state, crops images, and builds a complete QontinuiConfig.
+
+        Args:
+            params:
+                - api_port: Runner API port for UI Bridge
+                - window_offset_x/y: Window content area offset
+                - scale_factor: DPI scale
+                - name: Config name
+                - interactions: List of {action_type, target, state_name, wait_seconds}
+                - min_element_size: Minimum element dimension (default 4)
+                - description: Optional config description
+                - similarity: Default similarity threshold (default 0.85)
+
+        Returns:
+            Dictionary with complete QontinuiConfig and capture stats.
+        """
+        import sys
+
+        try:
+            if not QONTINUI_AVAILABLE:
+                return {"success": False, "error": "Qontinui library not available"}
+
+            import time
+
+            from qontinui.discovery.element_image_pipeline import (
+                ElementImagePipeline,
+                ExtractionConfig,
+                ExtractedElementImage,
+            )
+            from qontinui.hal.factory import HALFactory
+            from qontinui.state_machine.config_bridge import (
+                ConfigBridge,
+                UIBridgeStateInput,
+                UIBridgeTransitionInput,
+            )
+
+            api_port = params.get("api_port", 9876)
+            window_offset = (
+                params.get("window_offset_x", 0),
+                params.get("window_offset_y", 0),
+            )
+            scale = params.get("scale_factor", 1.0)
+            interactions = params.get("interactions", [])
+            min_size = params.get("min_element_size", 4)
+            name = params.get("name", "Untitled Multi-State Config")
+            description = params.get("description", "")
+            similarity = float(params.get("similarity", 0.85))
+
+            if not interactions:
+                return {"success": False, "error": "interactions list is required"}
+
+            config = ExtractionConfig(
+                min_element_size=min_size,
+                padding=0,
+                scale_factor=scale,
+            )
+            pipeline = ElementImagePipeline(config)
+            screen_capture = HALFactory.get_screen_capture()
+
+            seen_ids: set[str] = set()
+            ui_states: list[UIBridgeStateInput] = []
+            ui_transitions: list[UIBridgeTransitionInput] = []
+            state_images: dict[str, list[ExtractedElementImage]] = {}
+
+            for i, interaction in enumerate(interactions):
+                action_type = interaction.get("action_type", "initial")
+                target = interaction.get("target")
+                state_name = interaction.get("state_name", f"State {i}")
+                wait_seconds = float(interaction.get("wait_seconds", 1.0))
+
+                print(
+                    f"[info    ] EXECUTOR: Multi-state step {i}: {action_type}"
+                    f" target={target} state={state_name}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+                # 1. Perform action (if not initial)
+                if action_type != "initial" and target:
+                    self._perform_ui_bridge_action(api_port, action_type, target)
+                    time.sleep(wait_seconds)
+
+                # 2. Fetch UI Bridge snapshot
+                snapshot = self._fetch_ui_bridge_snapshot(api_port)
+                if snapshot is None:
+                    continue
+                elements = snapshot.get("elements", [])
+                if not elements:
+                    print(
+                        f"[warn    ] EXECUTOR: No elements at step {i}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+
+                # 3. Capture screenshot
+                screenshot = screen_capture.capture_screen(monitor=None)
+
+                # 4. Diff: find only NEW element IDs
+                current_ids: set[str] = set()
+                for el in elements:
+                    eid = el.get("id", "")
+                    rect = el.get("state", {}).get("rect", {})
+                    w = rect.get("width", 0)
+                    h = rect.get("height", 0)
+                    visible = el.get("state", {}).get("visible", True)
+                    if visible and w >= min_size and h >= min_size and eid:
+                        current_ids.add(eid)
+
+                new_ids = current_ids - seen_ids
+                seen_ids |= current_ids
+
+                if not new_ids:
+                    print(
+                        f"[info    ] EXECUTOR: No new elements at step {i}, skipping",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+
+                print(
+                    f"[info    ] EXECUTOR: Step {i}: {len(new_ids)} new elements"
+                    f" (total seen: {len(seen_ids)})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+                # 5. Filter snapshot to only new elements, run pipeline
+                filtered_elements = [
+                    el for el in elements if el.get("id", "") in new_ids
+                ]
+                filtered_snapshot = {**snapshot, "elements": filtered_elements}
+
+                result = pipeline.extract(
+                    filtered_snapshot, screenshot, window_offset=window_offset
+                )
+
+                # 6. Record state
+                state_id = f"state-{i}"
+                ui_states.append(
+                    UIBridgeStateInput(
+                        id=state_id,
+                        name=state_name,
+                        element_ids=list(new_ids),
+                        is_initial=(i == 0),
+                    )
+                )
+                state_images[state_id] = result.images
+
+                # 7. Record transition (if not initial and we have a previous state)
+                if action_type != "initial" and len(ui_states) >= 2:
+                    prev_state = ui_states[-2]
+                    ui_transitions.append(
+                        UIBridgeTransitionInput(
+                            id=f"transition-{i}",
+                            name=f"{action_type.title()} {target or ''}".strip(),
+                            from_states=[prev_state.id],
+                            activate_states=[state_id],
+                            exit_states=[],
+                            actions=[
+                                {
+                                    "type": action_type,
+                                    "target": target,
+                                }
+                            ],
+                        )
+                    )
+
+            if not ui_states:
+                return {
+                    "success": False,
+                    "error": "No states captured — no new elements found at any step",
+                }
+
+            # 8. Build final config
+            bridge = ConfigBridge(default_similarity=similarity)
+            gui_config = bridge.build_config(
+                name=name,
+                states=ui_states,
+                transitions=ui_transitions,
+                state_images=state_images,
+                description=description,
+            )
+
+            print(
+                f"[info    ] EXECUTOR: Multi-state capture complete: "
+                f"{len(ui_states)} states, {len(ui_transitions)} transitions",
+                file=sys.stderr,
+                flush=True,
+            )
+
+            return {
+                "success": True,
+                "config": gui_config,
+                "stats": {
+                    "state_count": len(ui_states),
+                    "transition_count": len(ui_transitions),
+                    "image_count": len(gui_config.get("images", [])),
+                    "total_elements_seen": len(seen_ids),
+                    "interactions_processed": len(interactions),
+                },
+            }
+
+        except Exception as e:
+            print(
+                f"[error   ] EXECUTOR: gui_config_capture_multi_state failed: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+            return {"success": False, "error": str(e)}
+
+    def _perform_ui_bridge_action(
+        self, api_port: int, action_type: str, target: str
+    ) -> None:
+        """Perform a UI action via the runner's UI Bridge HTTP API.
+
+        Args:
+            api_port: Runner API port
+            action_type: Action to perform (click, scroll, etc.)
+            target: Element ID to act on
+        """
+        import http.client
+        import json as _json
+        import sys
+
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", api_port, timeout=10)
+            conn.request(
+                "POST",
+                f"/ui-bridge/control/element/{target}/action",
+                _json.dumps({"action": action_type}).encode(),
+                {"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            print(
+                f"[info    ] EXECUTOR: UI action {action_type} on {target}: {resp.status}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"[warn    ] EXECUTOR: UI action failed: {action_type} on {target}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def __del__(self):
         """Clean up resources on exit."""
@@ -5677,7 +6253,9 @@ class QontinuiExecutor:
         result = service.find_path(from_state, to_state)
         return result
 
-    def _handle_testing_traverse_to_state(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_testing_traverse_to_state(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Handle traverse to state command for integration testing."""
         service = self._get_integration_testing_service()
         target_state = params.get("target_state", "")
@@ -5859,7 +6437,9 @@ class QontinuiExecutor:
                     },
                 )
 
-            path = manager.download(model_id, progress_callback=on_progress, force=force)
+            path = manager.download(
+                model_id, progress_callback=on_progress, force=force
+            )
 
             return {
                 "success": True,
@@ -5947,7 +6527,9 @@ class QontinuiExecutor:
             }
 
         except Exception as e:
-            logger.exception(f"Failed to get model status {params.get('model_id')}: {e}")
+            logger.exception(
+                f"Failed to get model status {params.get('model_id')}: {e}"
+            )
             return {"success": False, "error": str(e)}
 
     def _handle_models_disk_usage(self) -> dict[str, Any]:
@@ -6179,7 +6761,9 @@ class QontinuiExecutor:
             logger.exception(f"Failed to get accessibility snapshot: {e}")
             return {"success": False, "error": str(e)}
 
-    def _handle_get_accessibility_ai_context(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_get_accessibility_ai_context(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Get AI-friendly context from the current accessibility snapshot.
 
         Args:
@@ -6203,7 +6787,9 @@ class QontinuiExecutor:
             logger.exception(f"Failed to get accessibility AI context: {e}")
             return {"success": False, "error": str(e)}
 
-    def _handle_find_accessibility_elements(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_find_accessibility_elements(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Find elements matching criteria in the accessibility tree.
 
         Args:
@@ -6343,7 +6929,9 @@ class QontinuiExecutor:
             logger.exception(f"Failed to list browser targets: {e}")
             return {"success": False, "error": str(e)}
 
-    def _handle_auto_connect_accessibility(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_auto_connect_accessibility(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Automatically connect to the first available CDP target.
 
         Args:
@@ -6644,7 +7232,9 @@ class QontinuiExecutor:
                 return {"success": False, "error": f"No AWAS manifest found at {url}"}
 
             # Get actions (filtered if requested)
-            actions = manifest.get_read_only_actions() if read_only_only else manifest.actions
+            actions = (
+                manifest.get_read_only_actions() if read_only_only else manifest.actions
+            )
 
             # Build action summaries
             action_summaries = []
@@ -6776,7 +7366,9 @@ def main():
                     "generate_api_request_with_ai",
                     "generate_task_prompt_with_ai",
                 ):
-                    logger.debug(f"[RESPONSE] {cmd_name}: success={response['success']}")
+                    logger.debug(
+                        f"[RESPONSE] {cmd_name}: success={response['success']}"
+                    )
                     if response_data:
                         logger.debug(
                             f"[RESPONSE] data keys: {list(response_data.keys()) if isinstance(response_data, dict) else type(response_data)}"

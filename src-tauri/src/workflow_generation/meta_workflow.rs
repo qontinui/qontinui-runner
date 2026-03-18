@@ -919,8 +919,12 @@ fn read_referenced_files_from_description(description: &str) -> String {
         return String::new();
     }
 
-    let project_path = crate::mcp::shared::current_project_path()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().to_string());
+    let project_path = crate::mcp::shared::current_project_path().unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+    });
 
     let mut sections = Vec::new();
 
@@ -948,7 +952,9 @@ fn read_referenced_files_from_description(description: &str) -> String {
                     let display_content = if content.len() > max_chars {
                         format!(
                             "{}...\n\n(truncated at {} chars, total {} chars)",
-                            &content[..max_chars], max_chars, content.len()
+                            &content[..max_chars],
+                            max_chars,
+                            content.len()
                         )
                     } else {
                         content
@@ -957,14 +963,25 @@ fn read_referenced_files_from_description(description: &str) -> String {
                         "### File: {}\n\n```\n{}\n```",
                         file_path, display_content
                     ));
-                    tracing::info!("Meta-workflow: read referenced file {} ({} bytes)", full_path.display(), display_content.len());
+                    tracing::info!(
+                        "Meta-workflow: read referenced file {} ({} bytes)",
+                        full_path.display(),
+                        display_content.len()
+                    );
                 }
                 Err(e) => {
-                    tracing::warn!("Meta-workflow: failed to read {}: {}", full_path.display(), e);
+                    tracing::warn!(
+                        "Meta-workflow: failed to read {}: {}",
+                        full_path.display(),
+                        e
+                    );
                 }
             }
         } else {
-            tracing::debug!("Meta-workflow: referenced file not found: {}", full_path.display());
+            tracing::debug!(
+                "Meta-workflow: referenced file not found: {}",
+                full_path.display()
+            );
         }
     }
 

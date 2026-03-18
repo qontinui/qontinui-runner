@@ -116,7 +116,9 @@ export function UIBridgeStateMachinePage() {
   }, []);
 
   // Capture screenshots for screenshot state view
-  const [captureScreenshots, setCaptureScreenshots] = useState<CaptureScreenshotMeta[] | undefined>();
+  const [captureScreenshots, setCaptureScreenshots] = useState<
+    CaptureScreenshotMeta[] | undefined
+  >();
   const screenshotImageCache = useRef<Map<string, string>>(new Map());
   useEffect(() => {
     if (!activeConfigId) {
@@ -160,7 +162,8 @@ export function UIBridgeStateMachinePage() {
   // Derived state
   const states = sm.activeConfig?.states ?? [];
   const transitions = sm.activeConfig?.transitions ?? [];
-  const selectedState = states.find((s) => s.id === selectedStateId || s.state_id === selectedStateId) ?? null;
+  const selectedState =
+    states.find((s) => s.id === selectedStateId || s.state_id === selectedStateId) ?? null;
   const selectedTransition = transitions.find((t) => t.id === selectedTransitionId) ?? null;
 
   const showStatePanel = selectedState && !showNewTransition;
@@ -288,7 +291,9 @@ export function UIBridgeStateMachinePage() {
             <button
               key={value}
               onClick={() => setActiveTab(value)}
-              aria-label={value === "exploration" ? "exploration results navigation link or tab" : undefined}
+              aria-label={
+                value === "exploration" ? "exploration results navigation link or tab" : undefined
+              }
               className={`inline-flex items-center justify-center gap-1.5 rounded-md px-2 py-1 text-sm font-medium whitespace-nowrap transition-[color,box-shadow] ${
                 activeTab === value
                   ? "bg-background shadow-sm text-foreground"
@@ -481,7 +486,17 @@ export function UIBridgeStateMachinePage() {
            so that UI Bridge SDK can still scan severity elements when tab is inactive */}
       <div
         className="flex-1 overflow-y-auto"
-        style={activeTab !== "exploration" ? { position: "absolute", left: "-9999px", width: "1px", height: "1px", overflow: "hidden" } : undefined}
+        style={
+          activeTab !== "exploration"
+            ? {
+                position: "absolute",
+                left: "-9999px",
+                width: "1px",
+                height: "1px",
+                overflow: "hidden",
+              }
+            : undefined
+        }
       >
         <StateExplorationResultsViewer />
       </div>

@@ -590,10 +590,30 @@ export function useUIBridgeEventHandler(): void {
           }
 
           case "get_snapshot": {
+            console.log("[UIBridgeEventHandler] get_snapshot: creating snapshot...");
             const snapshot: BridgeSnapshot = await currentBridge.createSnapshotAsync();
+            console.log(
+              `[UIBridgeEventHandler] get_snapshot: snapshot created (${snapshot.elements.length} elements)`,
+            );
 
-            // Enrich with page context, modals, and toasts from trackers if available
+            // Enrich with page context, modals, and toasts from trackers if available.
+            // Each enrichment is wrapped individually so one failure doesn't break the snapshot.
             const uiBridgeGlobal = getUIBridgeGlobal();
+            const elementPairs = currentBridge.elements.map((e) => ({
+              id: e.id,
+              element: e.element,
+            }));
+
+            // Safe getter: catches errors from any individual enrichment
+            const safeGet = <T>(fn: () => T): T | undefined => {
+              try {
+                return fn();
+              } catch (e) {
+                console.warn("[UIBridgeEventHandler] Enrichment failed:", e);
+                return undefined;
+              }
+            };
+
             const navTracker = uiBridgeGlobal?.navigationTracker as
               | { getSnapshotPageContext: () => unknown }
               | undefined;
@@ -623,28 +643,33 @@ export function useUIBridgeEventHandler(): void {
             const shortcutTracker = uiBridgeGlobal?.shortcutTracker as
               | { getSnapshotShortcutContext: () => unknown }
               | undefined;
-            const elementPairs = currentBridge.elements.map((e) => ({
-              id: e.id,
-              element: e.element,
-            }));
+
+            console.log("[UIBridgeEventHandler] get_snapshot: enriching...");
             const enrichedSnapshot = {
               ...snapshot,
-              page: navTracker?.getSnapshotPageContext(),
-              modalStack: modalDet?.getSnapshotModalContext(),
-              toasts: toastCap?.getSnapshotToastContext(),
-              relationships: relTracker?.getSnapshotRelationshipContext(elementPairs),
-              dragDrop: dndDetector?.getSnapshotDragDropContext(elementPairs),
-              undoRedo: undoTracker?.getSnapshotUndoContext(),
-              shortcuts: shortcutTracker?.getSnapshotShortcutContext(),
+              page: safeGet(() => navTracker?.getSnapshotPageContext()),
+              modalStack: safeGet(() => modalDet?.getSnapshotModalContext()),
+              toasts: safeGet(() => toastCap?.getSnapshotToastContext()),
+              relationships: safeGet(() =>
+                relTracker?.getSnapshotRelationshipContext(elementPairs),
+              ),
+              dragDrop: safeGet(() => dndDetector?.getSnapshotDragDropContext(elementPairs)),
+              undoRedo: safeGet(() => undoTracker?.getSnapshotUndoContext()),
+              shortcuts: safeGet(() => shortcutTracker?.getSnapshotShortcutContext()),
             };
 
-            await sendResponse({
+            const response = {
               requestId,
               type,
               success: true,
               data: enrichedSnapshot,
               timestamp: Date.now(),
-            });
+            };
+
+            await sendResponse(response);
+            console.log(
+              `[UIBridgeEventHandler] get_snapshot: response sent (${enrichedSnapshot.elements.length} elements)`,
+            );
             break;
           }
 

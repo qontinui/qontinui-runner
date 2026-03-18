@@ -661,8 +661,7 @@ impl CanvasPanelManager {
                 }
             }
             if changed {
-                let data =
-                    builders::build_acceptance_criteria(criteria, &self.criterion_statuses);
+                let data = builders::build_acceptance_criteria(criteria, &self.criterion_statuses);
                 self.emit_panel(
                     "acceptance-criteria",
                     "AcceptanceCriteria",

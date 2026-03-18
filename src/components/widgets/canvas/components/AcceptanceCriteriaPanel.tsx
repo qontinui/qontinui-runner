@@ -6,13 +6,7 @@
  * and a progress bar tracking pass/fail/pending.
  */
 
-import {
-  CircleDashed,
-  Loader2,
-  CheckCircle2,
-  XCircle,
-  MinusCircle,
-} from "lucide-react";
+import { CircleDashed, Loader2, CheckCircle2, XCircle, MinusCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui";
 import type { CanvasPanelComponentProps } from "./CanvasComponentRegistry";
@@ -28,16 +22,14 @@ interface Criterion {
   last_error?: string;
 }
 
-const STATUS_CONFIG: Record<
-  string,
-  { icon: typeof CircleDashed; classes: string; label: string }
-> = {
-  pending: { icon: CircleDashed, classes: "text-muted-foreground", label: "Pending" },
-  running: { icon: Loader2, classes: "text-blue-400 animate-spin", label: "Running" },
-  passed: { icon: CheckCircle2, classes: "text-green-500", label: "Passed" },
-  failed: { icon: XCircle, classes: "text-red-500", label: "Failed" },
-  skipped: { icon: MinusCircle, classes: "text-muted-foreground", label: "Skipped" },
-};
+const STATUS_CONFIG: Record<string, { icon: typeof CircleDashed; classes: string; label: string }> =
+  {
+    pending: { icon: CircleDashed, classes: "text-muted-foreground", label: "Pending" },
+    running: { icon: Loader2, classes: "text-blue-400 animate-spin", label: "Running" },
+    passed: { icon: CheckCircle2, classes: "text-green-500", label: "Passed" },
+    failed: { icon: XCircle, classes: "text-red-500", label: "Failed" },
+    skipped: { icon: MinusCircle, classes: "text-muted-foreground", label: "Skipped" },
+  };
 
 const PRIORITY_CONFIG: Record<string, { classes: string }> = {
   critical: { classes: "bg-red-500/10 text-red-400 border-red-500/30" },

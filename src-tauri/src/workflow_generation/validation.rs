@@ -817,28 +817,27 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
                     .unwrap_or(false);
                 if !has_name {
                     let step_type = map.get("type").and_then(|v| v.as_str()).unwrap_or("step");
-                    let generated_name = if let Some(prompt_text) =
-                        map.get("prompt").and_then(|v| v.as_str())
-                    {
-                        // Use first meaningful words of prompt
-                        let words: Vec<&str> = prompt_text
-                            .split_whitespace()
-                            .filter(|w| w.len() > 1)
-                            .take(6)
-                            .collect();
-                        if words.is_empty() {
-                            format!("{} step ({})", phase, step_type)
+                    let generated_name =
+                        if let Some(prompt_text) = map.get("prompt").and_then(|v| v.as_str()) {
+                            // Use first meaningful words of prompt
+                            let words: Vec<&str> = prompt_text
+                                .split_whitespace()
+                                .filter(|w| w.len() > 1)
+                                .take(6)
+                                .collect();
+                            if words.is_empty() {
+                                format!("{} step ({})", phase, step_type)
+                            } else {
+                                words.join(" ")
+                            }
+                        } else if let Some(cmd) = map.get("command").and_then(|v| v.as_str()) {
+                            // Use command basename
+                            let base = cmd.split_whitespace().next().unwrap_or(cmd);
+                            let base = base.rsplit('/').next().unwrap_or(base);
+                            format!("Run {}", base)
                         } else {
-                            words.join(" ")
-                        }
-                    } else if let Some(cmd) = map.get("command").and_then(|v| v.as_str()) {
-                        // Use command basename
-                        let base = cmd.split_whitespace().next().unwrap_or(cmd);
-                        let base = base.rsplit('/').next().unwrap_or(base);
-                        format!("Run {}", base)
-                    } else {
-                        format!("{} step ({})", phase, step_type)
-                    };
+                            format!("{} step ({})", phase, step_type)
+                        };
                     tracing::info!(
                         "Auto-generating name '{}' for unnamed step in {} phase",
                         generated_name,
@@ -960,26 +959,25 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
                         .unwrap_or(false);
                     if !has_name {
                         let step_type = map.get("type").and_then(|v| v.as_str()).unwrap_or("step");
-                        let generated_name = if let Some(prompt_text) =
-                            map.get("prompt").and_then(|v| v.as_str())
-                        {
-                            let words: Vec<&str> = prompt_text
-                                .split_whitespace()
-                                .filter(|w| w.len() > 1)
-                                .take(6)
-                                .collect();
-                            if words.is_empty() {
-                                format!("{} step ({})", phase, step_type)
+                        let generated_name =
+                            if let Some(prompt_text) = map.get("prompt").and_then(|v| v.as_str()) {
+                                let words: Vec<&str> = prompt_text
+                                    .split_whitespace()
+                                    .filter(|w| w.len() > 1)
+                                    .take(6)
+                                    .collect();
+                                if words.is_empty() {
+                                    format!("{} step ({})", phase, step_type)
+                                } else {
+                                    words.join(" ")
+                                }
+                            } else if let Some(cmd) = map.get("command").and_then(|v| v.as_str()) {
+                                let base = cmd.split_whitespace().next().unwrap_or(cmd);
+                                let base = base.rsplit('/').next().unwrap_or(base);
+                                format!("Run {}", base)
                             } else {
-                                words.join(" ")
-                            }
-                        } else if let Some(cmd) = map.get("command").and_then(|v| v.as_str()) {
-                            let base = cmd.split_whitespace().next().unwrap_or(cmd);
-                            let base = base.rsplit('/').next().unwrap_or(base);
-                            format!("Run {}", base)
-                        } else {
-                            format!("{} step ({})", phase, step_type)
-                        };
+                                format!("{} step ({})", phase, step_type)
+                            };
                         tracing::info!(
                             "Auto-generating name '{}' for unnamed step in stage {} phase",
                             generated_name,

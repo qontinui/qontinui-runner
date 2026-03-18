@@ -113,7 +113,9 @@ export function ProcessManagerTab() {
 
   useEffect(() => {
     loadProcesses();
-    invoke<RunnerIdentity>("get_runner_identity").then(setIdentity).catch(() => {});
+    invoke<RunnerIdentity>("get_runner_identity")
+      .then(setIdentity)
+      .catch(() => {});
   }, [loadProcesses]);
 
   // Listen for state changes
@@ -482,7 +484,8 @@ Be concise and actionable.`;
           <span className="font-medium">Proxied</span>
           <span className="text-cyan-400/60">&mdash;</span>
           <span className="text-cyan-400/80">
-            Processes are managed by the primary runner on port {identity.primary_port}. Actions from this runner are forwarded automatically.
+            Processes are managed by the primary runner on port {identity.primary_port}. Actions
+            from this runner are forwarded automatically.
           </span>
         </div>
       )}

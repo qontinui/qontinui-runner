@@ -35,7 +35,10 @@ pub async fn list_task_runs(
     let limit = query.limit.unwrap_or(50);
     let workflow_type = query.workflow_type;
     let db = state.app_state.checkpoint_db.clone();
-    let port = state.app_state.api_port.load(std::sync::atomic::Ordering::Relaxed);
+    let port = state
+        .app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     tokio::task::spawn_blocking(move || {
         db.get_recent_task_runs_filtered(limit, workflow_type.as_deref(), Some(port))
@@ -55,7 +58,10 @@ pub async fn list_running_task_runs(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<Vec<TaskRun>>, (StatusCode, String)> {
     let db = state.app_state.checkpoint_db.clone();
-    let port = state.app_state.api_port.load(std::sync::atomic::Ordering::Relaxed);
+    let port = state
+        .app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     tokio::task::spawn_blocking(move || db.get_running_task_runs(Some(port)))
         .await
@@ -1943,7 +1949,12 @@ pub async fn get_current_execution_steps(
     let running_tasks = state
         .app_state
         .checkpoint_db
-        .get_running_task_runs(Some(state.app_state.api_port.load(std::sync::atomic::Ordering::Relaxed)))
+        .get_running_task_runs(Some(
+            state
+                .app_state
+                .api_port
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // If no running task, return empty

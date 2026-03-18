@@ -19,9 +19,7 @@ pub async fn start_orchestration_loop(
 
 /// Stop the orchestration loop.
 #[tauri::command]
-pub async fn stop_orchestration_loop(
-    state: State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+pub async fn stop_orchestration_loop(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     loop_engine::stop_loop(state.orchestration_loop.clone()).await
 }
 
@@ -35,8 +33,6 @@ pub async fn get_orchestration_loop_status(
 
 /// Signal that a restart is needed between iterations.
 #[tauri::command]
-pub async fn signal_orchestration_restart(
-    state: State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+pub async fn signal_orchestration_restart(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     loop_engine::signal_restart(state.orchestration_loop.clone()).await
 }

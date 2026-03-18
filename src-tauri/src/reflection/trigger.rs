@@ -1433,8 +1433,7 @@ pub fn launch_ui_bridge_reflection(
         super::workflow::build_ui_bridge_setup_steps(&source_task_run_id, &workflow_name);
     let verification_steps =
         super::workflow::build_ui_bridge_verification_steps(&source_task_run_id);
-    let mut completion_steps =
-        super::workflow::build_ui_bridge_completion_steps(&workflow_name);
+    let mut completion_steps = super::workflow::build_ui_bridge_completion_steps(&workflow_name);
     let completion_prompt_steps = completion_steps.split_off(1);
     let completion_automation_steps = completion_steps;
 

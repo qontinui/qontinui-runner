@@ -85,25 +85,35 @@ export function OrchestrationLoopBanner() {
   const phase = status.phase;
   const phaseColor = PHASE_COLORS[phase] || "text-muted-foreground";
   const phaseLabel = PHASE_LABELS[phase] || phase.replace(/_/g, " ");
-  const progressPct = status.max_iterations > 0
-    ? Math.min(100, Math.round((status.current_iteration / status.max_iterations) * 100))
-    : 0;
+  const progressPct =
+    status.max_iterations > 0
+      ? Math.min(100, Math.round((status.current_iteration / status.max_iterations) * 100))
+      : 0;
   const lastResult = status.iteration_results[status.iteration_results.length - 1];
   const lastFixCount = lastResult?.fix_count;
 
   const handleStop = async () => {
-    try { await invoke("stop_orchestration_loop"); } catch { /* ignore */ }
+    try {
+      await invoke("stop_orchestration_loop");
+    } catch {
+      /* ignore */
+    }
   };
 
   const handleSignal = async () => {
-    try { await invoke("signal_orchestration_restart"); } catch { /* ignore */ }
+    try {
+      await invoke("signal_orchestration_restart");
+    } catch {
+      /* ignore */
+    }
   };
 
-  const targetLabel = status.target_runner_port > 0
-    ? status.target_runner_id
-      ? `${status.target_runner_id} (:${status.target_runner_port})`
-      : `:${status.target_runner_port}`
-    : "self";
+  const targetLabel =
+    status.target_runner_port > 0
+      ? status.target_runner_id
+        ? `${status.target_runner_id} (:${status.target_runner_port})`
+        : `:${status.target_runner_port}`
+      : "self";
 
   return (
     <div className="px-3 py-1.5 border-b border-border bg-muted/30 flex items-center gap-3 text-xs">
@@ -114,9 +124,7 @@ export function OrchestrationLoopBanner() {
       </span>
 
       {/* Phase */}
-      <span className={cn("font-mono font-semibold", phaseColor)}>
-        {phaseLabel}
-      </span>
+      <span className={cn("font-mono font-semibold", phaseColor)}>{phaseLabel}</span>
 
       {/* Iteration */}
       <span className="text-muted-foreground">
@@ -126,7 +134,10 @@ export function OrchestrationLoopBanner() {
       {/* Progress bar */}
       <div className="w-20 bg-muted rounded-full h-1 shrink-0">
         <div
-          className={cn("h-1 rounded-full transition-all duration-500", phase === "complete" ? "bg-green-500" : phase === "error" ? "bg-red-500" : "bg-primary")}
+          className={cn(
+            "h-1 rounded-full transition-all duration-500",
+            phase === "complete" ? "bg-green-500" : phase === "error" ? "bg-red-500" : "bg-primary",
+          )}
           style={{ width: `${Math.max(3, progressPct)}%` }}
         />
       </div>
@@ -138,7 +149,9 @@ export function OrchestrationLoopBanner() {
 
       {/* Last fix count */}
       {lastFixCount !== null && lastFixCount !== undefined && (
-        <span className={cn("font-mono", lastFixCount === 0 ? "text-green-400" : "text-yellow-400")}>
+        <span
+          className={cn("font-mono", lastFixCount === 0 ? "text-green-400" : "text-yellow-400")}
+        >
           {lastFixCount} fixes
         </span>
       )}
@@ -153,10 +166,18 @@ export function OrchestrationLoopBanner() {
       <div className="ml-auto flex items-center gap-1.5">
         {status.running && (
           <>
-            <button onClick={handleSignal} className="px-1.5 py-0.5 rounded text-yellow-400 hover:bg-yellow-500/10" title="Signal restart">
+            <button
+              onClick={handleSignal}
+              className="px-1.5 py-0.5 rounded text-yellow-400 hover:bg-yellow-500/10"
+              title="Signal restart"
+            >
               <Zap className="w-3 h-3" />
             </button>
-            <button onClick={handleStop} className="px-1.5 py-0.5 rounded text-red-400 hover:bg-red-500/10" title="Stop loop">
+            <button
+              onClick={handleStop}
+              className="px-1.5 py-0.5 rounded text-red-400 hover:bg-red-500/10"
+              title="Stop loop"
+            >
               <Square className="w-3 h-3" />
             </button>
           </>

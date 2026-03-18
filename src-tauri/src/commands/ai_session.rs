@@ -957,7 +957,8 @@ pub async fn resume_ai_sessions(
     // Query running AI sessions
     let db_for_query = db.clone();
     let ai_sessions =
-        match tokio::task::spawn_blocking(move || db_for_query.get_running_ai_sessions(None)).await {
+        match tokio::task::spawn_blocking(move || db_for_query.get_running_ai_sessions(None)).await
+        {
             Ok(Ok(sessions)) => sessions,
             Ok(Err(e)) => {
                 warn!("Failed to query running AI sessions: {}", e);

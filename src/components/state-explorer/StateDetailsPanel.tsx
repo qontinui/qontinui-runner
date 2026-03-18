@@ -10,12 +10,7 @@
  */
 
 import { useState } from "react";
-import {
-  CheckCircle,
-  ChevronDown,
-  ChevronRight,
-  Layers,
-} from "lucide-react";
+import { CheckCircle, ChevronDown, ChevronRight, Layers } from "lucide-react";
 import type { StateMachineState } from "@qontinui/shared-types";
 import type { FingerprintDetail, CaptureScreenshotMeta } from "@qontinui/workflow-ui/state-machine";
 import { STATE_COLORS, getElementLabel } from "@qontinui/workflow-utils";
@@ -114,9 +109,7 @@ export function StateDetailsPanel({
             className="w-2.5 h-2.5 rounded-full shrink-0"
             style={{ backgroundColor: stateColor?.border }}
           />
-          <h4 className="text-sm font-semibold text-text-primary truncate">
-            {selectedState.name}
-          </h4>
+          <h4 className="text-sm font-semibold text-text-primary truncate">{selectedState.name}</h4>
           <span
             className={`text-[10px] px-1.5 py-0.5 rounded-full shrink-0 ${
               Math.round(selectedState.confidence * 100) >= 80
@@ -210,10 +203,7 @@ export function StateDetailsPanel({
           </h5>
           <ul className="space-y-0.5">
             {selectedState.acceptance_criteria.map((ac, i) => (
-              <li
-                key={i}
-                className="flex items-start gap-1 text-[10px] text-text-muted"
-              >
+              <li key={i} className="flex items-start gap-1 text-[10px] text-text-muted">
                 <CheckCircle className="size-3 text-green-500 mt-0.5 shrink-0" />
                 <span>{ac}</span>
               </li>

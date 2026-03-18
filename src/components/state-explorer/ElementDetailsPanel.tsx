@@ -8,7 +8,7 @@
  * Used within the three-panel screenshot mode layout alongside StateDetailsPanel.
  */
 
-import { Info, Layers } from "lucide-react";
+import { Info } from "lucide-react";
 import type { StateMachineState } from "@qontinui/shared-types";
 import type { FingerprintDetail, CaptureScreenshotMeta } from "@qontinui/workflow-ui/state-machine";
 import { STATE_COLORS } from "@qontinui/workflow-utils";
@@ -182,9 +182,7 @@ export function ElementDetailsPanel({
                   <span className="text-text-primary truncate">{s.name}</span>
                   <span
                     className={`ml-auto shrink-0 ${
-                      Math.round(s.confidence * 100) >= 80
-                        ? "text-green-400"
-                        : "text-amber-400"
+                      Math.round(s.confidence * 100) >= 80 ? "text-green-400" : "text-amber-400"
                     }`}
                   >
                     {Math.round(s.confidence * 100)}%

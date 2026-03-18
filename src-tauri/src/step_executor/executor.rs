@@ -2766,7 +2766,11 @@ impl StepExecutor {
                                 .ok()
                                 .map(|cwd| {
                                     let resolved = cwd.join(p);
-                                    resolved.canonicalize().unwrap_or(resolved).to_string_lossy().to_string()
+                                    resolved
+                                        .canonicalize()
+                                        .unwrap_or(resolved)
+                                        .to_string_lossy()
+                                        .to_string()
                                 })
                                 .unwrap_or(working_dir)
                         } else {

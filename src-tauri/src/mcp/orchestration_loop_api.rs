@@ -48,9 +48,7 @@ async fn stop(
 }
 
 /// GET /orchestration-loop/status
-async fn status(
-    State(state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<OrchestrationLoopStatus>> {
+async fn status(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<OrchestrationLoopStatus>> {
     let loop_state = state.app_state.orchestration_loop.clone();
     let status = loop_engine::get_status(loop_state).await;
     Json(ApiResponse::success(status))
@@ -62,14 +60,12 @@ async fn signal_restart(
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
     let loop_state = state.app_state.orchestration_loop.clone();
 
-    loop_engine::signal_restart(loop_state)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::CONFLICT,
-                Json(api_error(format!("Failed to signal restart: {}", e))),
-            )
-        })?;
+    loop_engine::signal_restart(loop_state).await.map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(api_error(format!("Failed to signal restart: {}", e))),
+        )
+    })?;
 
     Ok(Json(ApiResponse::success("restart signaled".to_string())))
 }

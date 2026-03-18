@@ -43,10 +43,7 @@ fn file_path_regex() -> &'static Regex {
 ///
 /// Use this for all workflows that need basic project orientation (paths, tree)
 /// without the heavier reflection-specific enrichment.
-pub fn enrich_project_context(
-    shared_vars: &SharedVariableStore,
-    project_path: Option<&str>,
-) {
+pub fn enrich_project_context(shared_vars: &SharedVariableStore, project_path: Option<&str>) {
     // Skip if already set
     if shared_vars.get("project_root").is_some() {
         return;
@@ -90,10 +87,7 @@ pub fn enrich_project_context(
 /// - `referenced_file_contents` - Pre-read contents of referenced files
 /// - `project_structure` - Condensed directory tree
 /// - `project_root` - The project root directory
-pub fn enrich_reflection_context(
-    shared_vars: &SharedVariableStore,
-    project_path: Option<&str>,
-) {
+pub fn enrich_reflection_context(shared_vars: &SharedVariableStore, project_path: Option<&str>) {
     info!("Enriching reflection context with pre-loaded files and project structure");
 
     // Determine project root
@@ -179,18 +173,12 @@ fn determine_project_root(
     if let Some(state) = shared_vars.get("source_workflow_state") {
         // Try JSON parse
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&state) {
-            if let Some(wd) = val
-                .get("working_directory")
-                .and_then(|v| v.as_str())
-            {
+            if let Some(wd) = val.get("working_directory").and_then(|v| v.as_str()) {
                 if !wd.is_empty() {
                     return Some(wd.to_string());
                 }
             }
-            if let Some(wd) = val
-                .get("project_path")
-                .and_then(|v| v.as_str())
-            {
+            if let Some(wd) = val.get("project_path").and_then(|v| v.as_str()) {
                 if !wd.is_empty() {
                     return Some(wd.to_string());
                 }
@@ -300,10 +288,15 @@ fn pre_read_files(paths: &[PathBuf]) -> String {
                     &truncated
                 };
 
-                result.push_str(&format!("--- File: {} ---\n{}\n\n", path.display(), portion));
+                result.push_str(&format!(
+                    "--- File: {} ---\n{}\n\n",
+                    path.display(),
+                    portion
+                ));
                 total_bytes += portion.len();
 
-                let was_truncated = truncated.len() < content.len() || portion.len() < truncated.len();
+                let was_truncated =
+                    truncated.len() < content.len() || portion.len() < truncated.len();
                 if was_truncated {
                     result.push_str("(truncated)\n\n");
                 }
@@ -356,7 +349,13 @@ const EXCLUDED_DIRS: &[&str] = &[
 ];
 
 /// Recursively walk the directory tree with depth and entry limits.
-fn walk_dir_tree(dir: &Path, depth: usize, max_depth: usize, lines: &mut Vec<String>, max_entries: usize) {
+fn walk_dir_tree(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    lines: &mut Vec<String>,
+    max_entries: usize,
+) {
     if depth > max_depth || lines.len() >= max_entries {
         return;
     }
@@ -1425,10 +1424,7 @@ pub fn build_ui_bridge_setup_steps(
         build_api_step(
             "Load step checkpoints",
             "GET",
-            &format!(
-                "{}/task-runs/{}/checkpoints",
-                base_url, source_task_run_id
-            ),
+            &format!("{}/task-runs/{}/checkpoints", base_url, source_task_run_id),
             None,
             Some("source_checkpoints"),
             true,
@@ -1503,9 +1499,7 @@ Report any compilation errors or issues found."#,
 ///
 /// Includes: effectiveness evaluation, implementation workflow generation from the
 /// plan produced by the agentic phase, and a summary.
-pub fn build_ui_bridge_completion_steps(
-    source_workflow_name: &str,
-) -> Vec<ExecutionStepConfig> {
+pub fn build_ui_bridge_completion_steps(source_workflow_name: &str) -> Vec<ExecutionStepConfig> {
     let base_url = crate::mcp::types::get_self_base_url_from_env();
 
     vec![
@@ -1541,7 +1535,8 @@ pub fn build_ui_bridge_completion_steps(
         {
             let mut step = build_prompt_step(
                 "Generate implementation workflow",
-                &format!(r#"Generate an implementation workflow from the UI Bridge improvement plan.
+                &format!(
+                    r#"Generate an implementation workflow from the UI Bridge improvement plan.
 
 ## The Reflection Output
 

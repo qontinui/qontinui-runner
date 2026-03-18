@@ -1172,9 +1172,7 @@ pub fn generate_workflow(
         .map(|iter| iter.issues.is_empty())
         .unwrap_or(false);
 
-    let ai_reviewed = if max_fix_iters == 0 {
-        false
-    } else if iterations.is_empty() {
+    let ai_reviewed = if max_fix_iters == 0 || iterations.is_empty() {
         false
     } else {
         // Check if at least one iteration ran without infrastructure errors
@@ -1262,10 +1260,7 @@ pub fn generate_workflow(
         // This is distinct from Factor 5 (infra failure) — the AI ran and found issues
         // but couldn't resolve them across all iterations.
         if ai_reviewed && !verification_passed && max_fix_iters > 0 {
-            let remaining_issues = iterations
-                .last()
-                .map(|iter| iter.issues.len())
-                .unwrap_or(0);
+            let remaining_issues = iterations.last().map(|iter| iter.issues.len()).unwrap_or(0);
             // Scale penalty by number of remaining issues: 1 issue = 15%, 5+ = 50%
             let penalty = (remaining_issues as f32 * 0.10).min(0.50);
             score *= 1.0 - penalty;
@@ -1470,15 +1465,14 @@ pub fn generate_workflow(
         if let Ok(mut criteria_json) = serde_json::to_value(criteria) {
             // Build step_name → criterion_id mapping from raw verification steps
             let mut step_mapping = serde_json::Map::new();
-            let all_steps = workflow
-                .verification_steps
-                .iter()
-                .chain(workflow.stages.iter().flat_map(|s| s.verification_steps.iter()));
+            let all_steps = workflow.verification_steps.iter().chain(
+                workflow
+                    .stages
+                    .iter()
+                    .flat_map(|s| s.verification_steps.iter()),
+            );
             for step in all_steps {
-                let step_name = step
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let step_name = step.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 if step_name.is_empty() {
                     continue;
                 }
@@ -1591,7 +1585,8 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
     );
 
     // Read referenced files from the description and inline their contents
-    let referenced_files = super::meta_workflow::read_referenced_files_from_description_pub(&request.description);
+    let referenced_files =
+        super::meta_workflow::read_referenced_files_from_description_pub(&request.description);
     let file_contents_section = if referenced_files.is_empty() {
         String::new()
     } else {

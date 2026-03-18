@@ -7,7 +7,6 @@
  */
 
 import { useState, useCallback, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import {
   BarChart3,
   CheckCircle,
@@ -24,9 +23,8 @@ import {
   Image,
   RefreshCw,
   ArrowLeft,
-  Eye,
 } from "lucide-react";
-import { getSeverityColors, getStatusColors, getAccentColors } from "@/design-system";
+import { getStatusColors } from "@/design-system";
 import { useStateExplorer } from "../../hooks/useStateExplorer";
 import type {
   ExplorationResult,
@@ -63,12 +61,7 @@ interface ReportSummary {
 // - get_exploration_report: fetches detailed report for a specific run
 // - get_exploration_analysis_prompt: fetches AI analysis_prompt text for a run
 
-type ExplorationStrategy =
-  | "exhaustive"
-  | "smoke_test"
-  | "regression"
-  | "random_walk"
-  | "targeted";
+type ExplorationStrategy = "exhaustive" | "smoke_test" | "regression" | "random_walk" | "targeted";
 
 const STRATEGY_CONFIG: Record<ExplorationStrategy, { label: string; color: string }> = {
   exhaustive: { label: "Exhaustive", color: "bg-blue-500/20 text-blue-400" },
@@ -83,11 +76,7 @@ function StrategyBadge({ strategy }: { strategy: string }) {
     label: strategy,
     color: "bg-muted text-muted-foreground",
   };
-  return (
-    <span className={`px-2 py-0.5 text-xs rounded-full ${config.color}`}>
-      {config.label}
-    </span>
-  );
+  return <span className={`px-2 py-0.5 text-xs rounded-full ${config.color}`}>{config.label}</span>;
 }
 
 // -- Component --
@@ -127,13 +116,28 @@ export function StateExplorationResultsViewer() {
   return (
     <div className="h-full flex flex-col" data-testid="state-exploration-results-viewer">
       {/* Semantic landmark buttons for AI search discoverability */}
-      <div style={{ position: "absolute", opacity: 0, pointerEvents: "none", width: 1, height: 1, overflow: "hidden" }}>
+      <div
+        style={{
+          position: "absolute",
+          opacity: 0,
+          pointerEvents: "none",
+          width: 1,
+          height: 1,
+          overflow: "hidden",
+        }}
+      >
         <button aria-label="pass rate percentage or coverage summary" tabIndex={-1} />
         <button aria-label="exploration history run list" tabIndex={-1} />
         <button aria-label="state detail confidence score elements discrepancies" tabIndex={-1} />
         <button aria-label="exploration results navigation link or tab" tabIndex={-1} />
-        <button aria-label="element details panel with tag name role bounding box coordinates" tabIndex={-1} />
-        <button aria-label="state details panel with confidence element count screenshot count" tabIndex={-1} />
+        <button
+          aria-label="element details panel with tag name role bounding box coordinates"
+          tabIndex={-1}
+        />
+        <button
+          aria-label="state details panel with confidence element count screenshot count"
+          tabIndex={-1}
+        />
         <button aria-label="screenshot thumbnail filmstrip capture navigator" tabIndex={-1} />
       </div>
       {/* Header */}
@@ -150,9 +154,7 @@ export function StateExplorationResultsViewer() {
               </button>
             )}
             <BarChart3 className="size-5 text-brand-primary" />
-            <h2 className="text-lg font-semibold text-text-primary">
-              Exploration Results
-            </h2>
+            <h2 className="text-lg font-semibold text-text-primary">Exploration Results</h2>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -217,7 +219,7 @@ export function StateExplorationResultsViewer() {
 
 function SummaryDashboard({
   summary,
-  report,
+  report: _report,
   history,
   historyLoading,
   onSelectRun,
@@ -261,9 +263,7 @@ function SummaryDashboard({
           <div className="p-4 bg-card rounded-lg border border-border">
             <div className="text-sm text-muted-foreground mb-1">State Coverage</div>
             <div className="text-3xl font-bold text-foreground">
-              {summary
-                ? `${summary.state_coverage.visited}/${summary.state_coverage.total}`
-                : "—"}
+              {summary ? `${summary.state_coverage.visited}/${summary.state_coverage.total}` : "—"}
             </div>
             <div className="text-xs text-muted-foreground mt-1">
               coverage summary of visited states
@@ -290,8 +290,15 @@ function SummaryDashboard({
         <p className="text-xs text-muted-foreground mb-3">
           Grouped by severity: critical, warning, and info levels
         </p>
-        <div role="list" aria-label="discrepancy severity groups critical warning info" className="grid grid-cols-3 gap-4">
-          <div className="flex items-center gap-3 p-3 rounded-lg bg-red-500/10 border border-red-500/20" data-testid="severity-critical">
+        <div
+          role="list"
+          aria-label="discrepancy severity groups critical warning info"
+          className="grid grid-cols-3 gap-4"
+        >
+          <div
+            className="flex items-center gap-3 p-3 rounded-lg bg-red-500/10 border border-red-500/20"
+            data-testid="severity-critical"
+          >
             <XCircle className="w-5 h-5 text-red-400" />
             <div>
               <div className="text-2xl font-bold text-red-400">
@@ -300,7 +307,10 @@ function SummaryDashboard({
               <div className="text-xs text-red-400/80">Critical</div>
             </div>
           </div>
-          <div className="flex items-center gap-3 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20" data-testid="severity-warning">
+          <div
+            className="flex items-center gap-3 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20"
+            data-testid="severity-warning"
+          >
             <AlertTriangle className="w-5 h-5 text-amber-400" />
             <div>
               <div className="text-2xl font-bold text-amber-400">
@@ -309,7 +319,10 @@ function SummaryDashboard({
               <div className="text-xs text-amber-400/80">Warning</div>
             </div>
           </div>
-          <div className="flex items-center gap-3 p-3 rounded-lg bg-blue-500/10 border border-blue-500/20" data-testid="severity-info">
+          <div
+            className="flex items-center gap-3 p-3 rounded-lg bg-blue-500/10 border border-blue-500/20"
+            data-testid="severity-info"
+          >
             <Info className="w-5 h-5 text-blue-400" />
             <div>
               <div className="text-2xl font-bold text-blue-400">
@@ -322,7 +335,11 @@ function SummaryDashboard({
       </div>
 
       {/* Recent Exploration History */}
-      <div role="region" aria-label="exploration history run list" className="p-4 bg-card rounded-lg border border-border">
+      <div
+        role="region"
+        aria-label="exploration history run list"
+        className="p-4 bg-card rounded-lg border border-border"
+      >
         <div className="flex items-center justify-between mb-3">
           <h3 className="font-medium flex items-center gap-2">
             <Clock className="w-4 h-4" />
@@ -450,9 +467,7 @@ function HistoryRow({
       {item.summary && (
         <div className="mt-1 text-xs text-muted-foreground truncate">{item.summary}</div>
       )}
-      <div className="mt-1 text-xs text-muted-foreground font-mono">
-        Run ID: {item.run_id}
-      </div>
+      <div className="mt-1 text-xs text-muted-foreground font-mono">Run ID: {item.run_id}</div>
     </button>
   );
 }
@@ -528,9 +543,7 @@ function DetailView({
       {/* Report Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h3 className="text-lg font-semibold">
-            {report.config_name || report.config_path}
-          </h3>
+          <h3 className="text-lg font-semibold">{report.config_name || report.config_path}</h3>
           <div className="text-sm text-muted-foreground mt-1 flex items-center gap-2">
             <StrategyBadge strategy={report.strategy} />
             <span>Started: {new Date(report.started_at).toLocaleString()}</span>
@@ -556,9 +569,7 @@ function DetailView({
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <div className="p-3 bg-card rounded-lg border border-border">
             <div className="text-sm text-muted-foreground">Pass Rate</div>
-            <div className="text-2xl font-bold">
-              {Math.round(summary.overall_pass_rate * 100)}%
-            </div>
+            <div className="text-2xl font-bold">{Math.round(summary.overall_pass_rate * 100)}%</div>
           </div>
           <div className="p-3 bg-card rounded-lg border border-border">
             <div className="text-sm text-muted-foreground">States</div>
@@ -593,26 +604,17 @@ function DetailView({
 
           {/* Critical */}
           {grouped.critical.length > 0 && (
-            <DiscrepancySeverityGroup
-              severity="critical"
-              items={grouped.critical}
-            />
+            <DiscrepancySeverityGroup severity="critical" items={grouped.critical} />
           )}
 
           {/* Warning */}
           {grouped.warning.length > 0 && (
-            <DiscrepancySeverityGroup
-              severity="warning"
-              items={grouped.warning}
-            />
+            <DiscrepancySeverityGroup severity="warning" items={grouped.warning} />
           )}
 
           {/* Info */}
           {grouped.info.length > 0 && (
-            <DiscrepancySeverityGroup
-              severity="info"
-              items={grouped.info}
-            />
+            <DiscrepancySeverityGroup severity="info" items={grouped.info} />
           )}
         </div>
       )}
@@ -806,9 +808,7 @@ function StateDetailCard({
           <ChevronRight className="w-4 h-4 text-muted-foreground" />
         )}
         {statusIcon(state.status)}
-        <span className="flex-1 text-left font-medium">
-          {state.state_name || state.state_id}
-        </span>
+        <span className="flex-1 text-left font-medium">{state.state_name || state.state_id}</span>
         {state.detection_confidence > 0 && (
           <span className="text-xs text-muted-foreground">
             Confidence: {Math.round(state.detection_confidence * 100)}%
@@ -821,17 +821,13 @@ function StateDetailCard({
           {/* Detection confidence score */}
           <div className="text-sm">
             <span className="text-muted-foreground">Detection confidence score: </span>
-            <span className="font-medium">
-              {Math.round(state.detection_confidence * 100)}%
-            </span>
+            <span className="font-medium">{Math.round(state.detection_confidence * 100)}%</span>
           </div>
 
           {/* Found elements */}
           {state.expected_elements_found.length > 0 && (
             <div className="space-y-1">
-              <h4 className="text-xs font-medium text-muted-foreground">
-                Found/Missing Elements
-              </h4>
+              <h4 className="text-xs font-medium text-muted-foreground">Found/Missing Elements</h4>
               {state.expected_elements_found.map((el, idx) => (
                 <div key={idx} className="flex items-center gap-2 text-xs">
                   {el.found ? (
@@ -850,9 +846,7 @@ function StateDetailCard({
 
           {/* Discrepancies for this state */}
           {state.error && (
-            <div className="p-2 bg-red-500/10 rounded text-sm text-red-400">
-              {state.error}
-            </div>
+            <div className="p-2 bg-red-500/10 rounded text-sm text-red-400">{state.error}</div>
           )}
 
           {/* Screenshot viewer area with filmstrip thumbnail navigation */}
@@ -899,11 +893,7 @@ function StateDetailCard({
 function deriveSummary(report: ExplorationResult | null): ReportSummary | null {
   if (!report) return null;
 
-  const totalStates = report.total_states || 1;
-  const passRate =
-    report.states_visited > 0
-      ? report.states_passed / report.states_visited
-      : 0;
+  const passRate = report.states_visited > 0 ? report.states_passed / report.states_visited : 0;
 
   // Derive discrepancy counts from state/transition failures
   const criticalCount = report.states_failed;
@@ -937,9 +927,10 @@ function deriveDiscrepancies(report: ExplorationResult): DiscrepancyItem[] {
         severity: "critical",
         description: `State "${state.state_name || state.state_id}" ${state.status}: ${state.error || "verification failed"}`,
         state_id: state.state_id,
-        suggested_action: state.status === "error"
-          ? "Check state configuration and element selectors"
-          : "Review expected elements and update state definition",
+        suggested_action:
+          state.status === "error"
+            ? "Check state configuration and element selectors"
+            : "Review expected elements and update state definition",
       });
     }
   }
@@ -969,7 +960,9 @@ function deriveDiscrepancies(report: ExplorationResult): DiscrepancyItem[] {
   return items;
 }
 
-function groupDiscrepanciesBySeverity(items: DiscrepancyItem[]): Record<"critical" | "warning" | "info", DiscrepancyItem[]> {
+function groupDiscrepanciesBySeverity(
+  items: DiscrepancyItem[],
+): Record<"critical" | "warning" | "info", DiscrepancyItem[]> {
   return {
     critical: items.filter((i) => i.severity === "critical"),
     warning: items.filter((i) => i.severity === "warning"),

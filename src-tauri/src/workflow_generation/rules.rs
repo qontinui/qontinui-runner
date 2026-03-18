@@ -590,7 +590,10 @@ pub fn create_rules_from_reflection_fixes(
                     fix.confidence
                 );
             }
-            Err(e) => warn!("Failed to create rule from reflection fix {}: {}", fix.id, e),
+            Err(e) => warn!(
+                "Failed to create rule from reflection fix {}: {}",
+                fix.id, e
+            ),
         }
     }
 
@@ -1042,11 +1045,7 @@ mod tests {
     #[test]
     fn test_create_rules_skips_non_qualifying_types() {
         let conn = setup_rules_db();
-        let fixes = vec![make_test_fix(
-            "selector_fix",
-            "high",
-            "Fixed CSS selector",
-        )];
+        let fixes = vec![make_test_fix("selector_fix", "high", "Fixed CSS selector")];
 
         let created =
             create_rules_from_reflection_fixes(&conn, &fixes).expect("create rules failed");
@@ -1062,8 +1061,7 @@ mod tests {
             "Always include error handling in shell commands",
         )];
 
-        let first =
-            create_rules_from_reflection_fixes(&conn, &fixes).expect("first create failed");
+        let first = create_rules_from_reflection_fixes(&conn, &fixes).expect("first create failed");
         assert_eq!(first, 1);
 
         // Second call with same content should be deduped

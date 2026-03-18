@@ -10,9 +10,7 @@ use crate::orchestration_loop_configs::{
 };
 
 #[tauri::command]
-pub async fn ol_list_configs(
-    app_state: State<'_, Arc<AppState>>,
-) -> Result<Vec<OlConfig>, String> {
+pub async fn ol_list_configs(app_state: State<'_, Arc<AppState>>) -> Result<Vec<OlConfig>, String> {
     let conn = app_state.checkpoint_db.get_conn()?;
     storage::list_configs(&conn)
 }
@@ -33,7 +31,10 @@ pub async fn ol_save_config(
 ) -> Result<OlConfig, String> {
     let conn = app_state.checkpoint_db.get_conn()?;
     let config = storage::insert_config(&conn, &request)?;
-    info!("Saved orchestration loop config: {} ({})", config.name, config.id);
+    info!(
+        "Saved orchestration loop config: {} ({})",
+        config.name, config.id
+    );
     Ok(config)
 }
 
@@ -45,7 +46,10 @@ pub async fn ol_update_config(
 ) -> Result<OlConfig, String> {
     let conn = app_state.checkpoint_db.get_conn()?;
     let config = storage::update_config(&conn, &id, &request)?;
-    info!("Updated orchestration loop config: {} ({})", config.name, config.id);
+    info!(
+        "Updated orchestration loop config: {} ({})",
+        config.name, config.id
+    );
     Ok(config)
 }
 

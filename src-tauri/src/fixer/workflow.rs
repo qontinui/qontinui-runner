@@ -100,13 +100,12 @@ pub fn build_setup_steps(source_task_run_id: &str) -> Vec<ExecutionStepConfig> {
 
 /// Build verification steps for the fixer workflow.
 pub fn build_verification_steps() -> Vec<ExecutionStepConfig> {
-    vec![
-        {
-            let mut step = ExecutionStepConfig {
-                step_type: "prompt".to_string(),
-                name: Some("Verify fixer fix attempts".to_string()),
-                prompt_content: Some(
-                    r#"Verify that the fixer analysis is complete.
+    vec![{
+        let mut step = ExecutionStepConfig {
+            step_type: "prompt".to_string(),
+            name: Some("Verify fixer fix attempts".to_string()),
+            prompt_content: Some(
+                r#"Verify that the fixer analysis is complete.
 DO NOT use any UI Bridge SDK tools — they are not available in fixer mode.
 Base your verification ONLY on the data already loaded in runtime variables and your own output.
 
@@ -117,14 +116,13 @@ Check:
 
 If no unfixed issues were found across all child outputs, that is acceptable — confirm this.
 Otherwise, verify that all identified issues have been addressed or explicitly skipped."#
-                        .to_string(),
-                ),
-                ..Default::default()
-            };
-            step.phase = Some("verification".to_string());
-            step
-        },
-    ]
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        step.phase = Some("verification".to_string());
+        step
+    }]
 }
 
 /// Build the agentic phase prompt for the fixer AI.

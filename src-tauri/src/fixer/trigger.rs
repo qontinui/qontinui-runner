@@ -34,10 +34,7 @@ pub struct FixerDeps {
 /// - The source task run is itself a fixer, reflection, or follow-up run
 /// - Fixer is disabled in settings
 /// - The source run has insufficient output
-pub fn should_launch_fixer(
-    db: &CheckpointDb,
-    source_task_run_id: &str,
-) -> Result<bool, String> {
+pub fn should_launch_fixer(db: &CheckpointDb, source_task_run_id: &str) -> Result<bool, String> {
     should_launch_fixer_excluding(db, source_task_run_id, None)
 }
 
@@ -296,18 +293,12 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
                     source_id_clone
                 );
                 // Mark the fixer run as failed
-                let _ = db_clone.update_task_run_status(
-                    &fixer_id_clone,
-                    "failed",
-                );
+                let _ = db_clone.update_task_run_status(&fixer_id_clone, "failed");
                 return;
             }
             Err(e) => {
                 warn!("Fixer error waiting for children: {}", e);
-                let _ = db_clone.update_task_run_status(
-                    &fixer_id_clone,
-                    "failed",
-                );
+                let _ = db_clone.update_task_run_status(&fixer_id_clone, "failed");
                 return;
             }
         }
@@ -318,10 +309,7 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
             Ok(true) => {}
             _ => {
                 info!("Fixer guards no longer pass after waiting — skipping");
-                let _ = db_clone.update_task_run_status(
-                    &fixer_id_clone,
-                    "stopped",
-                );
+                let _ = db_clone.update_task_run_status(&fixer_id_clone, "stopped");
                 return;
             }
         }
@@ -461,7 +449,11 @@ mod tests {
     fn test_guard_skips_when_fixer_already_running() {
         let conn = setup_test_db();
         insert_completed_run(&conn, "source-1", "my-workflow");
-        add_output_chunks(&conn, "source-1", &["some meaningful output that is long enough to pass the threshold check"]);
+        add_output_chunks(
+            &conn,
+            "source-1",
+            &["some meaningful output that is long enough to pass the threshold check"],
+        );
 
         conn.execute(
             "INSERT INTO task_runs (id, task_name, status, is_fixer, workflow_type, created_at, updated_at) \

@@ -1948,10 +1948,7 @@ fn extract_and_preread_failure_files(
     for cap in re.captures_iter(failure_context) {
         let raw_path = cap.get(1).unwrap().as_str().to_string();
         // Strip trailing line/col info like ":123:5" or "(42,5)"
-        let clean_path = raw_path
-            .split(|c: char| c == '(' || c == ':')
-            .next()
-            .unwrap_or(&raw_path);
+        let clean_path = raw_path.split(['(', ':']).next().unwrap_or(&raw_path);
 
         if seen.contains(clean_path) {
             continue;
@@ -2005,7 +2002,11 @@ fn extract_and_preread_failure_files(
                     &truncated
                 };
 
-                result.push_str(&format!("--- File: {} ---\n{}\n\n", path.display(), portion));
+                result.push_str(&format!(
+                    "--- File: {} ---\n{}\n\n",
+                    path.display(),
+                    portion
+                ));
                 total_bytes += portion.len();
 
                 let was_truncated =
@@ -2015,7 +2016,11 @@ fn extract_and_preread_failure_files(
                 }
             }
             Err(e) => {
-                debug!("AGENTIC-ENRICHMENT: Could not read {}: {}", path.display(), e);
+                debug!(
+                    "AGENTIC-ENRICHMENT: Could not read {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
     }
@@ -2449,7 +2454,10 @@ impl SetupExecutor {
                                         "SETUP-PHASE: Step '{}' appears interrupted ({}ms < 5s), retry {}/{} after {}s delay",
                                         step_name, duration_ms, retry_count, max_retries, delay_secs
                                     );
-                                    tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        retry_delay_ms,
+                                    ))
+                                    .await;
                                     continue;
                                 }
                                 break Err(e);

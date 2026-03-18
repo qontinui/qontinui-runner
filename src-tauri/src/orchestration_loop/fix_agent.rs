@@ -31,10 +31,7 @@ pub fn should_rebuild(fixes: &[serde_json::Value]) -> bool {
 }
 
 /// Build a prompt for Claude CLI to implement fixes.
-pub fn build_fix_prompt(
-    fixes: &[serde_json::Value],
-    additional_context: Option<&str>,
-) -> String {
+pub fn build_fix_prompt(fixes: &[serde_json::Value], additional_context: Option<&str>) -> String {
     let mut prompt = String::from("# Implement Reflection Fixes\n\n");
     prompt.push_str("The following issues were found during workflow reflection. Fix them.\n\n");
 

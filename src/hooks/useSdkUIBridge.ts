@@ -38,7 +38,9 @@ import { cropThumbnails } from "@/lib/thumbnail-cropper";
 let pendingCaptureScreenshots: CooccurrenceExport["captureScreenshots"] | undefined;
 
 /** Retrieve and consume pending capture screenshots saved during exploration. */
-export function consumePendingCaptureScreenshots(): CooccurrenceExport["captureScreenshots"] | undefined {
+export function consumePendingCaptureScreenshots():
+  | CooccurrenceExport["captureScreenshots"]
+  | undefined {
   const data = pendingCaptureScreenshots;
   pendingCaptureScreenshots = undefined;
   return data;
@@ -1247,13 +1249,17 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
                   // Store full screenshot for screenshot state view (deduplicated)
                   const currentHashes = new Set(Object.keys(session.elementBoundsMap));
                   const prevHashes = session.prevCaptureHashes;
-                  const hashesChanged = !prevHashes ||
+                  const hashesChanged =
+                    !prevHashes ||
                     currentHashes.size !== prevHashes.size ||
-                    [...currentHashes].some(h => !prevHashes.has(h));
+                    [...currentHashes].some((h) => !prevHashes.has(h));
                   if (hashesChanged) {
                     if (!session.captureScreenshots) session.captureScreenshots = [];
                     // Build element bounds with DPR-scaled coordinates
-                    const boundsMap: Record<string, { x: number; y: number; width: number; height: number }> = {};
+                    const boundsMap: Record<
+                      string,
+                      { x: number; y: number; width: number; height: number }
+                    > = {};
                     for (const [hash, bounds] of Object.entries(session.elementBoundsMap)) {
                       boundsMap[hash] = {
                         x: (bounds as { x: number }).x * dpr,
@@ -1278,12 +1284,18 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
                     pendingCaptureScreenshots = [...session.captureScreenshots];
                     // Save screenshot to DB immediately with a pending config ID
                     // so it survives process restarts and page navigation
-                    import("@tauri-apps/api/core").then(({ invoke }) => {
-                      invoke("sm_save_capture_screenshots", {
-                        configId: `pending-${session.sessionId}`,
-                        screenshots: [screenshotEntry],
-                      }).catch(() => { /* non-fatal */ });
-                    }).catch(() => { /* non-fatal */ });
+                    import("@tauri-apps/api/core")
+                      .then(({ invoke }) => {
+                        invoke("sm_save_capture_screenshots", {
+                          configId: `pending-${session.sessionId}`,
+                          screenshots: [screenshotEntry],
+                        }).catch(() => {
+                          /* non-fatal */
+                        });
+                      })
+                      .catch(() => {
+                        /* non-fatal */
+                      });
                   }
                 }
               }
@@ -1550,7 +1562,11 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
           const { instanceStorage } = await import("@/lib/instance-storage");
           // Strip thumbnails and capture screenshots from the persisted discovery data
           // (they're saved separately to the DB and would make this JSON too large for localStorage)
-          const { elementThumbnails: _thumbs, captureScreenshots: _screenshots, ...resultWithoutThumbs } = result;
+          const {
+            elementThumbnails: _thumbs,
+            captureScreenshots: _screenshots,
+            ...resultWithoutThumbs
+          } = result;
           instanceStorage.setJSON("qontinui-runner-sm-discovery", {
             cooccurrenceData: resultWithoutThumbs,
             dataSource: "explore",

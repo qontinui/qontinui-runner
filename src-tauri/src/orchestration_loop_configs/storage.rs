@@ -69,8 +69,8 @@ pub fn get_config(conn: &Connection, id: &str) -> Result<Option<OlConfig>, Strin
 pub fn insert_config(conn: &Connection, req: &CreateOlConfigRequest) -> Result<OlConfig, String> {
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
-    let config_str =
-        serde_json::to_string(&req.config_json).map_err(|e| format!("Failed to serialize config: {}", e))?;
+    let config_str = serde_json::to_string(&req.config_json)
+        .map_err(|e| format!("Failed to serialize config: {}", e))?;
 
     conn.execute(
         "INSERT INTO orchestration_loop_configs (id, name, description, is_favorite, config_json, created_at, updated_at)
@@ -135,7 +135,8 @@ pub fn update_config(
     }
     param_values.push(Box::new(id.to_string()));
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
     conn.execute(&sql, params_ref.as_slice())
         .map_err(|e| format!("Failed to update config: {}", e))?;
 

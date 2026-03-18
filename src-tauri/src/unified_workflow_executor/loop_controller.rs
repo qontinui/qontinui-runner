@@ -859,7 +859,12 @@ impl LoopController {
             }
 
             // Always provide project context (tree + root) for all workflows
-            if self.setup_executor.shared_variables().get("project_root").is_none() {
+            if self
+                .setup_executor
+                .shared_variables()
+                .get("project_root")
+                .is_none()
+            {
                 crate::reflection::workflow::enrich_project_context(
                     self.setup_executor.shared_variables(),
                     config.project_path.as_deref(),
@@ -1610,10 +1615,7 @@ impl LoopController {
                 let fixer_source_id = config.execution_id.clone();
                 // launch_fixer is sync — it spawns its own async task internally
                 // that waits for children before running the fixer workflow
-                match crate::fixer::trigger::launch_fixer(
-                    fixer_deps,
-                    fixer_source_id.clone(),
-                ) {
+                match crate::fixer::trigger::launch_fixer(fixer_deps, fixer_source_id.clone()) {
                     Ok(id) if id == "skipped" => {
                         debug!("Fixer skipped for {}", fixer_source_id);
                     }
@@ -1624,10 +1626,7 @@ impl LoopController {
                         );
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to launch fixer for {}: {}",
-                            fixer_source_id, e
-                        );
+                        warn!("Failed to launch fixer for {}: {}", fixer_source_id, e);
                     }
                 }
             }
@@ -4165,7 +4164,10 @@ pub async fn resume_interrupted_workflows(
                     kind
                 ),
             ) {
-                error!("Failed to mark {} workflow {} as failed: {}", kind, task_run.id, e);
+                error!(
+                    "Failed to mark {} workflow {} as failed: {}",
+                    kind, task_run.id, e
+                );
             } else {
                 processed_count += 1;
             }
@@ -4571,29 +4573,27 @@ pub async fn resume_interrupted_workflows(
                     }
                 }
             }
-        } else {
-            if is_task_stale(task_run) {
-                warn!(
-                    "Could not extract workflow ID from task_id '{}' and no workflow_name set - task has been running for over {} seconds, marking as failed",
-                    task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
-                );
-                if let Err(e) = db.fail_task_run(
-                    &task_run.id,
-                    &format!(
-                        "No workflow definition could be resolved and task exceeded stale timeout ({}s)",
-                        STALE_RUNNING_TASK_TIMEOUT_SECS
-                    ),
-                ) {
-                    error!("Failed to mark stale task {} as failed: {}", task_run.id, e);
-                } else {
-                    processed_count += 1;
-                }
+        } else if is_task_stale(task_run) {
+            warn!(
+                "Could not extract workflow ID from task_id '{}' and no workflow_name set - task has been running for over {} seconds, marking as failed",
+                task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
+            );
+            if let Err(e) = db.fail_task_run(
+                &task_run.id,
+                &format!(
+                    "No workflow definition could be resolved and task exceeded stale timeout ({}s)",
+                    STALE_RUNNING_TASK_TIMEOUT_SECS
+                ),
+            ) {
+                error!("Failed to mark stale task {} as failed: {}", task_run.id, e);
             } else {
-                warn!(
-                    "Could not extract workflow ID from task_id '{}' and no workflow_name set - preserving 'running' status (will auto-fail after {}s)",
-                    task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
-                );
+                processed_count += 1;
             }
+        } else {
+            warn!(
+                "Could not extract workflow ID from task_id '{}' and no workflow_name set - preserving 'running' status (will auto-fail after {}s)",
+                task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
+            );
         }
     }
 
