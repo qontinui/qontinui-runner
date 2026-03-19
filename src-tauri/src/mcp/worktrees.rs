@@ -66,7 +66,7 @@ pub struct BranchInfo {
 
 /// GET /worktrees — List all managed worktrees.
 pub async fn list_worktrees_handler(
-    State(state): State<Arc<ApiState>>,
+    State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let repo = crate::mcp::shared::current_project_path()
         .ok_or_else(|| {

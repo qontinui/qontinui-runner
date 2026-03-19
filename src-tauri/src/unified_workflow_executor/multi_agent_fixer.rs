@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::step_executor::{StepExecutionConfig, StepExecutionResult, VerificationPhaseResult};
+use crate::step_executor::{StepExecutionResult, VerificationPhaseResult};
 
 // =============================================================================
 // Types

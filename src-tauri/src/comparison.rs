@@ -3,9 +3,7 @@
 //! Launches N copies of the same workflow in isolated worktrees,
 //! waits for all to complete, then triggers AI comparison analysis.
 
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, error};
 
 use crate::database::CheckpointDb;
 
