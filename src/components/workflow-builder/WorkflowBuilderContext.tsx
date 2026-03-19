@@ -905,6 +905,10 @@ function RunnerWorkflowBuilderInner({
         stages: workflow.stages,
         stop_on_failure: workflow.stop_on_failure,
         reflection_mode: workflow.reflection_mode,
+        use_worktree: workflow.use_worktree,
+        multi_agent_mode: workflow.multi_agent_mode,
+        workflow_architecture: workflow.workflow_architecture,
+        multi_agent_pipeline_config: workflow.multi_agent_pipeline_config,
         model_overrides: workflow.model_overrides,
       };
 

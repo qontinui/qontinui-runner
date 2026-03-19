@@ -220,6 +220,13 @@ impl StepHandler for WorkflowRefHandler {
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
             acceptance_criteria: None,
+            multi_agent_mode: false,
+            use_worktree: false,
+            worktree_path: None,
+            worktree_branch: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
         };
 
         // 9. Create LoopController with session manager

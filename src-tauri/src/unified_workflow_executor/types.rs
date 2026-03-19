@@ -230,6 +230,31 @@ pub struct LoopConfig {
     /// When present, the canvas panel manager emits an AcceptanceCriteria panel
     /// and tracks criterion status as verification results come in.
     pub acceptance_criteria: Option<serde_json::Value>,
+    /// Enable multi-agent fixer mode for the agentic phase.
+    ///
+    /// When true, verification failures are triaged by a fast classification agent,
+    /// then fixed by specialized agents (quick-fix for lint/compilation, feature-fix
+    /// for missing functionality) with targeted verification between each fix.
+    /// Falls back to the standard monolithic session if triage fails.
+    ///
+    /// Default: false (standard single-session agentic phase).
+    pub multi_agent_mode: bool,
+    /// Run the workflow in an isolated git worktree.
+    pub use_worktree: bool,
+    /// Worktree path (set at runtime, not user-configurable).
+    pub worktree_path: Option<String>,
+    /// Worktree branch name (set at runtime).
+    pub worktree_branch: Option<String>,
+    /// Workflow execution architecture override (from autoresearch).
+    /// When set to "agentic_verification", the loop controller uses the agentic
+    /// verification loop instead of the traditional verification-agentic loop.
+    pub workflow_architecture: Option<crate::autoresearch::agentic_verification::WorkflowArchitecture>,
+    /// Configuration for the agentic verification loop (only used when
+    /// workflow_architecture = AgenticVerification).
+    pub agentic_verification_config: Option<crate::autoresearch::agentic_verification::AgenticVerificationConfig>,
+    /// Configuration for the multi-agent pipeline architecture (only used when
+    /// workflow_architecture = MultiAgentPipeline).
+    pub multi_agent_pipeline_config: Option<crate::autoresearch::agentic_verification::MultiAgentPipelineConfig>,
 }
 
 impl LoopConfig {

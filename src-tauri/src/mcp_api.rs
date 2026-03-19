@@ -398,6 +398,7 @@ pub fn create_router(
         .merge(crate::mcp::extraction::routes())
         .merge(crate::mcp::findings_api::routes())
         .merge(crate::mcp::generation_rules_api::routes())
+        .merge(crate::mcp::meta_optimizer_api::routes())
         .merge(crate::mcp::generator_eval::routes())
         .merge(crate::mcp::hooks::routes())
         .merge(crate::mcp::interaction_recording::routes())
@@ -437,6 +438,7 @@ pub fn create_router(
         .merge(crate::mcp::unified_workflows::routes())
         .merge(crate::mcp::verification_tests::routes())
         .merge(crate::mcp::websocket::routes())
+        .merge(crate::mcp::worktrees::routes())
         .route("/cloud-relay/start", post(cloud_relay_start))
         .route("/cloud-relay/status", get(cloud_relay_status))
         .layer(axum::middleware::from_fn(

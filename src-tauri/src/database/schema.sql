@@ -262,6 +262,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     is_fixer INTEGER DEFAULT 0,                 -- Whether this is a fixer run (aggregates reflection/follow-up fixes)
     fixer_source_task_run_id TEXT,               -- Source task run that this fixer addresses
 
+    -- Meta-Optimizer (v119)
+    is_meta_optimizer INTEGER DEFAULT 0,        -- Whether this is a meta-optimizer run
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -1177,6 +1180,7 @@ CREATE TABLE IF NOT EXISTS learning_outcomes (
     error_type TEXT,
     error_message TEXT,
     feedback TEXT,  -- JSON array
+    workflow_architecture TEXT,  -- 'traditional', 'agentic_verification', 'multi_agent_pipeline'
     context_embedding BLOB,  -- Embedding of task context (384-dim MiniLM as f32 BLOB)
     created_at TEXT NOT NULL
 );
@@ -2881,8 +2885,8 @@ INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (103, datetime
 -- Adds reasoning and alternatives_considered to reflection_fixes for structured
 -- decision context capture. Separates "why" from "what" in fix descriptions.
 
-ALTER TABLE reflection_fixes ADD COLUMN reasoning TEXT;
-ALTER TABLE reflection_fixes ADD COLUMN alternatives_considered TEXT;
+-- Columns reasoning and alternatives_considered are already in the CREATE TABLE above.
+-- ALTER TABLE statements removed to avoid "duplicate column" errors on fresh databases.
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (104, datetime('now'));
 
@@ -2892,8 +2896,8 @@ INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (104, datetime
 -- Adds applicability_context and fix_description_embedding to reflection_fixes
 -- for universal cross-project pattern retrieval via hybrid semantic search.
 
-ALTER TABLE reflection_fixes ADD COLUMN applicability_context TEXT;
-ALTER TABLE reflection_fixes ADD COLUMN fix_description_embedding BLOB;
+-- Columns applicability_context and fix_description_embedding are already in the CREATE TABLE above.
+-- ALTER TABLE statements removed to avoid "duplicate column" errors on fresh databases.
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (105, datetime('now'));
 
@@ -2953,3 +2957,162 @@ CREATE TABLE IF NOT EXISTS sm_capture_screenshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sm_screenshots_config ON sm_capture_screenshots(config_id);
+
+-- =============================================================================
+-- Autoresearch Tables (migration 118)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS autoresearch_campaigns (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    current_control_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    experiment_count INTEGER NOT NULL DEFAULT 0,
+    accepted_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS autoresearch_experiments (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES autoresearch_campaigns(id) ON DELETE CASCADE,
+    experiment_number INTEGER NOT NULL,
+    config_json TEXT NOT NULL,
+    trials_json TEXT NOT NULL,
+    aggregate_json TEXT NOT NULL,
+    accepted INTEGER NOT NULL DEFAULT 0,
+    reason TEXT,
+    p_value REAL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_autoresearch_exp_campaign ON autoresearch_experiments(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_autoresearch_exp_number ON autoresearch_experiments(campaign_id, experiment_number);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (118, datetime('now'));
+
+-- =============================================================================
+-- Meta-Optimizer Tables (migration 119)
+-- =============================================================================
+
+-- Persists PipelineAgentTrace data (currently in-memory only during pipeline execution).
+-- Each row records one pipeline agent invocation with its inputs, outputs, and metrics.
+CREATE TABLE IF NOT EXISTS pipeline_agent_traces (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    agent_type TEXT NOT NULL,              -- 'spec_analyst', 'locator', 'implementer', 'verifier'
+    agent_id TEXT NOT NULL,                -- Unique agent instance ID (e.g. 'implementer_0')
+    run_id TEXT NOT NULL,                  -- Pipeline run / execution ID
+    input_snapshot TEXT NOT NULL DEFAULT '{}',   -- JSON: serialized input data
+    output_snapshot TEXT NOT NULL DEFAULT '{}',  -- JSON: serialized output data
+    config_json TEXT NOT NULL DEFAULT '{}',      -- JSON: serialized PipelineAgentConfig
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    tokens_in INTEGER NOT NULL DEFAULT 0,
+    tokens_out INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0.0,
+    downstream_success INTEGER,            -- NULL until backfilled; 0/1
+    output_quality_score REAL,             -- NULL until scored
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_task_run ON pipeline_agent_traces(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_agent_type ON pipeline_agent_traces(agent_type);
+CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_run_id ON pipeline_agent_traces(run_id);
+
+-- Stores prompt variants for pipeline agents. The optimizer creates new variants;
+-- humans activate them from the UI. Only one variant per agent_type can be active.
+CREATE TABLE IF NOT EXISTS prompt_registry (
+    id TEXT PRIMARY KEY,
+    agent_type TEXT NOT NULL,              -- 'spec_analyst', 'locator', 'implementer', 'verifier'
+    variant_name TEXT NOT NULL,
+    prompt_content TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    is_active INTEGER NOT NULL DEFAULT 0,  -- Only one active per agent_type
+    source_recommendation_id TEXT,         -- FK to meta_optimizer_recommendations
+    performance_metrics TEXT DEFAULT '{}', -- JSON: {success_rate, avg_cost, sample_size, ...}
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(agent_type, variant_name, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prompt_registry_agent_type ON prompt_registry(agent_type);
+CREATE INDEX IF NOT EXISTS idx_prompt_registry_active ON prompt_registry(agent_type, is_active);
+
+-- All optimizer outputs (recommendations). Never auto-applied — human reviews from UI.
+CREATE TABLE IF NOT EXISTS meta_optimizer_recommendations (
+    id TEXT PRIMARY KEY,
+    optimizer_type TEXT NOT NULL,           -- 'pipeline_prompt', 'architecture', 'generation_template'
+    recommendation_type TEXT NOT NULL,      -- 'prompt_rewrite', 'config_change', 'rule_update', 'rule_create'
+    target_agent TEXT,                      -- Which agent/component this targets
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    current_value TEXT DEFAULT '{}',        -- JSON: what is currently in place
+    recommended_value TEXT DEFAULT '{}',    -- JSON: what the optimizer recommends
+    evidence TEXT DEFAULT '{}',            -- JSON: data supporting the recommendation
+    confidence REAL NOT NULL DEFAULT 0.0,  -- 0.0 to 1.0
+    status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'applied', 'rejected', 'superseded', 'rolled_back'
+    applied_at TEXT,
+    outcome_after_apply TEXT,              -- JSON: measured impact after application
+    optimizer_run_id TEXT,                 -- FK to meta_optimizer_runs
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_meta_optimizer_recs_type ON meta_optimizer_recommendations(optimizer_type);
+CREATE INDEX IF NOT EXISTS idx_meta_optimizer_recs_status ON meta_optimizer_recommendations(status);
+CREATE INDEX IF NOT EXISTS idx_meta_optimizer_recs_run ON meta_optimizer_recommendations(optimizer_run_id);
+
+-- Tracks meta-optimizer execution runs.
+CREATE TABLE IF NOT EXISTS meta_optimizer_runs (
+    id TEXT PRIMARY KEY,
+    optimizer_type TEXT NOT NULL,           -- 'pipeline_prompt', 'architecture', 'generation_template'
+    trigger_type TEXT NOT NULL DEFAULT 'threshold', -- 'threshold' or 'manual'
+    runs_analyzed INTEGER NOT NULL DEFAULT 0,
+    recommendations_produced INTEGER NOT NULL DEFAULT 0,
+    task_run_id TEXT,                       -- FK to task_runs (the optimizer's own task run)
+    status TEXT NOT NULL DEFAULT 'running', -- 'running', 'complete', 'failed'
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_meta_optimizer_runs_type ON meta_optimizer_runs(optimizer_type);
+
+-- Progress tracking snapshots for measuring meta-optimizer impact
+CREATE TABLE IF NOT EXISTS meta_optimizer_snapshots (
+    id TEXT PRIMARY KEY,
+    snapshot_type TEXT NOT NULL,         -- 'baseline', 'periodic', 'post_apply'
+    period_start TEXT NOT NULL,
+    period_end TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,          -- JSON: {success_rate, avg_duration_secs, avg_iterations, avg_cost_cents, total_runs, ...}
+    breakdown_json TEXT DEFAULT '{}',    -- JSON: per-architecture or per-agent breakdown
+    recommendation_id TEXT,             -- FK for post_apply snapshots
+    runs_included INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_meta_optimizer_snapshots_type ON meta_optimizer_snapshots(snapshot_type);
+CREATE INDEX IF NOT EXISTS idx_meta_optimizer_snapshots_rec ON meta_optimizer_snapshots(recommendation_id);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (119, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (120, datetime('now'));
+
+-- =============================================================================
+-- Canary Rollouts Table (migration 121)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS canary_rollouts (
+    id TEXT PRIMARY KEY,
+    recommendation_id TEXT NOT NULL,
+    percentage INTEGER NOT NULL DEFAULT 10,
+    status TEXT NOT NULL DEFAULT 'active',    -- 'active', 'promoted', 'rolled_back'
+    start_date TEXT NOT NULL,
+    end_date TEXT,
+    baseline_run_count INTEGER DEFAULT 0,
+    canary_run_count INTEGER DEFAULT 0,
+    baseline_metrics_json TEXT DEFAULT '{}',
+    canary_metrics_json TEXT DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_canary_status ON canary_rollouts(status);
+CREATE INDEX IF NOT EXISTS idx_canary_rec ON canary_rollouts(recommendation_id);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (121, datetime('now'));

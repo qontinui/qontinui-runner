@@ -9,6 +9,7 @@ pub mod embedding_client;
 pub mod embedding_jobs;
 pub mod embeddings;
 pub mod hybrid_search;
+pub mod pipeline_traces;
 pub mod query_builder;
 
 use chrono::Utc;
@@ -305,6 +306,13 @@ pub struct TaskRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fixer_source_task_run_id: Option<String>,
 
+    // ========================================================================
+    // Meta-Optimizer Fields
+    // ========================================================================
+    /// Whether this task run is a meta-optimizer run.
+    #[serde(default)]
+    pub is_meta_optimizer: bool,
+
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -356,6 +364,7 @@ pub struct CreateTaskRunInput {
     pub follow_up_source_task_run_id: Option<String>,
     pub is_fixer: bool,
     pub fixer_source_task_run_id: Option<String>,
+    pub is_meta_optimizer: bool,
     pub runner_port: Option<u16>,
 }
 
@@ -387,6 +396,7 @@ impl CreateTaskRunInput {
             follow_up_source_task_run_id: None,
             is_fixer: false,
             fixer_source_task_run_id: None,
+            is_meta_optimizer: false,
             runner_port: None,
         }
     }
@@ -520,6 +530,12 @@ impl CreateTaskRunInput {
     /// Set the source task run ID that this fixer addresses.
     pub fn with_fixer_source_task_run_id(mut self, source_id: impl Into<String>) -> Self {
         self.fixer_source_task_run_id = Some(source_id.into());
+        self
+    }
+
+    /// Mark this task run as a meta-optimizer run.
+    pub fn with_is_meta_optimizer(mut self, is_meta_optimizer: bool) -> Self {
+        self.is_meta_optimizer = is_meta_optimizer;
         self
     }
 
@@ -1845,18 +1861,13 @@ impl CheckpointDb {
     /// Set the runner port for instance-level task_run filtering.
     /// Called after the HTTP server binds to its port.
     pub fn set_runner_port(&self, port: u16) {
-        self.runner_port
-            .store(port, std::sync::atomic::Ordering::Relaxed);
+        self.runner_port.store(port, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get the runner port (0 means unset).
     pub fn get_runner_port(&self) -> Option<u16> {
         let port = self.runner_port.load(std::sync::atomic::Ordering::Relaxed);
-        if port == 0 {
-            None
-        } else {
-            Some(port)
-        }
+        if port == 0 { None } else { Some(port) }
     }
 
     /// Create an in-memory database for testing or no-op logging.
@@ -1951,6 +1962,18 @@ impl CheckpointDb {
     {
         let conn = self.get_conn_string()?;
         f(&conn)
+    }
+
+    /// Execute a parameterized SQL statement (INSERT, UPDATE, DELETE).
+    /// Returns the number of rows affected.
+    pub fn execute_sql(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::types::ToSql],
+    ) -> Result<usize, String> {
+        let conn = self.get_conn_string()?;
+        conn.execute(sql, params)
+            .map_err(|e| format!("SQL execution failed: {}", e))
     }
 
     /// Get a connection (legacy API returning String error).
@@ -6712,6 +6735,254 @@ impl CheckpointDb {
             info!("Successfully migrated to version 116 (ai_reviewed)");
         }
 
+        if current_version < 117 {
+            info!("Migrating to version 117 (worktrees table + workflow worktree/multi_agent columns)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS worktrees (
+                    id TEXT PRIMARY KEY,
+                    worktree_path TEXT NOT NULL,
+                    branch_name TEXT NOT NULL,
+                    source_branch TEXT NOT NULL,
+                    source_commit TEXT NOT NULL,
+                    repo_path TEXT NOT NULL,
+                    task_run_id TEXT,
+                    workflow_name TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status);
+                CREATE INDEX IF NOT EXISTS idx_worktrees_task_run_id ON worktrees(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_worktrees_repo_path ON worktrees(repo_path);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (117, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 117: {}", e))?;
+
+            // Add multi_agent_mode and use_worktree to unified_workflows (idempotent)
+            let cols_to_add = [
+                ("multi_agent_mode", "INTEGER DEFAULT 1"),
+                ("use_worktree", "INTEGER DEFAULT 0"),
+            ];
+            for (col_name, col_def) in &cols_to_add {
+                let has_col: bool = conn
+                    .prepare("PRAGMA table_info(unified_workflows)")
+                    .and_then(|mut stmt| {
+                        stmt.query_map([], |row| row.get::<_, String>(1))
+                            .map(|rows| {
+                                rows.filter_map(|r| r.ok())
+                                    .any(|name| name == *col_name)
+                            })
+                    })
+                    .unwrap_or(false);
+                if !has_col {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE unified_workflows ADD COLUMN {} {};",
+                        col_name, col_def
+                    ))
+                    .map_err(|e| format!("Failed to add {}: {}", col_name, e))?;
+                }
+            }
+
+            info!("Successfully migrated to version 117 (worktrees + workflow columns)");
+        }
+
+        if current_version < 118 {
+            info!("Migrating to version 118 (autoresearch tables)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS autoresearch_campaigns (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    config_json TEXT NOT NULL,
+                    current_control_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    experiment_count INTEGER NOT NULL DEFAULT 0,
+                    accepted_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS autoresearch_experiments (
+                    id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES autoresearch_campaigns(id) ON DELETE CASCADE,
+                    experiment_number INTEGER NOT NULL,
+                    config_json TEXT NOT NULL,
+                    trials_json TEXT NOT NULL,
+                    aggregate_json TEXT NOT NULL,
+                    accepted INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT,
+                    p_value REAL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_autoresearch_exp_campaign ON autoresearch_experiments(campaign_id);
+                CREATE INDEX IF NOT EXISTS idx_autoresearch_exp_number ON autoresearch_experiments(campaign_id, experiment_number);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (118, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 118: {}", e))?;
+
+            info!("Successfully migrated to version 118 (autoresearch tables)");
+        }
+
+        // --- Migration 119: Meta-Optimizer tables and is_meta_optimizer column on task_runs ---
+        if current_version < 119 {
+            info!("Migrating to version 119 (meta-optimizer tables, task_runs.is_meta_optimizer)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE task_runs ADD COLUMN is_meta_optimizer INTEGER DEFAULT 0;
+
+                CREATE TABLE IF NOT EXISTS pipeline_agent_traces (
+                    id TEXT PRIMARY KEY,
+                    task_run_id TEXT NOT NULL,
+                    agent_type TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    input_snapshot TEXT NOT NULL DEFAULT '{}',
+                    output_snapshot TEXT NOT NULL DEFAULT '{}',
+                    config_json TEXT NOT NULL DEFAULT '{}',
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    tokens_in INTEGER NOT NULL DEFAULT 0,
+                    tokens_out INTEGER NOT NULL DEFAULT 0,
+                    cost_usd REAL NOT NULL DEFAULT 0.0,
+                    downstream_success INTEGER,
+                    output_quality_score REAL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_task_run ON pipeline_agent_traces(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_agent_type ON pipeline_agent_traces(agent_type);
+                CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_run_id ON pipeline_agent_traces(run_id);
+
+                CREATE TABLE IF NOT EXISTS prompt_registry (
+                    id TEXT PRIMARY KEY,
+                    agent_type TEXT NOT NULL,
+                    variant_name TEXT NOT NULL,
+                    prompt_content TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    source_recommendation_id TEXT,
+                    performance_metrics TEXT DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(agent_type, variant_name, version)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_prompt_registry_agent_type ON prompt_registry(agent_type);
+                CREATE INDEX IF NOT EXISTS idx_prompt_registry_active ON prompt_registry(agent_type, is_active);
+
+                CREATE TABLE IF NOT EXISTS meta_optimizer_recommendations (
+                    id TEXT PRIMARY KEY,
+                    optimizer_type TEXT NOT NULL,
+                    recommendation_type TEXT NOT NULL,
+                    target_agent TEXT,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    current_value TEXT DEFAULT '{}',
+                    recommended_value TEXT DEFAULT '{}',
+                    evidence TEXT DEFAULT '{}',
+                    confidence REAL NOT NULL DEFAULT 0.0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    applied_at TEXT,
+                    outcome_after_apply TEXT,
+                    optimizer_run_id TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_meta_optimizer_recs_type ON meta_optimizer_recommendations(optimizer_type);
+                CREATE INDEX IF NOT EXISTS idx_meta_optimizer_recs_status ON meta_optimizer_recommendations(status);
+                CREATE INDEX IF NOT EXISTS idx_meta_optimizer_recs_run ON meta_optimizer_recommendations(optimizer_run_id);
+
+                CREATE TABLE IF NOT EXISTS meta_optimizer_runs (
+                    id TEXT PRIMARY KEY,
+                    optimizer_type TEXT NOT NULL,
+                    trigger_type TEXT NOT NULL DEFAULT 'threshold',
+                    runs_analyzed INTEGER NOT NULL DEFAULT 0,
+                    recommendations_produced INTEGER NOT NULL DEFAULT 0,
+                    task_run_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_meta_optimizer_runs_type ON meta_optimizer_runs(optimizer_type);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (119, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 119: {}", e))?;
+
+            info!("Successfully migrated to version 119 (meta-optimizer tables)");
+        }
+
+        // --- Migration 120: workflow_architecture column and meta_optimizer_snapshots table ---
+        if current_version < 120 {
+            info!("Migrating to version 120 (workflow_architecture, meta_optimizer_snapshots)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE learning_outcomes ADD COLUMN workflow_architecture TEXT;
+
+                CREATE TABLE IF NOT EXISTS meta_optimizer_snapshots (
+                    id TEXT PRIMARY KEY,
+                    snapshot_type TEXT NOT NULL,
+                    period_start TEXT NOT NULL,
+                    period_end TEXT NOT NULL,
+                    metrics_json TEXT NOT NULL,
+                    breakdown_json TEXT DEFAULT '{}',
+                    recommendation_id TEXT,
+                    runs_included INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_meta_optimizer_snapshots_type ON meta_optimizer_snapshots(snapshot_type);
+                CREATE INDEX IF NOT EXISTS idx_meta_optimizer_snapshots_rec ON meta_optimizer_snapshots(recommendation_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (120, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 120: {}", e))?;
+
+            info!("Successfully migrated to version 120 (workflow_architecture, meta_optimizer_snapshots)");
+        }
+
+        // --- Migration 121: Canary rollouts table ---
+        if current_version < 121 {
+            info!("Migrating to version 121 (canary_rollouts table)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS canary_rollouts (
+                    id TEXT PRIMARY KEY,
+                    recommendation_id TEXT NOT NULL,
+                    percentage INTEGER NOT NULL DEFAULT 10,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    start_date TEXT NOT NULL,
+                    end_date TEXT,
+                    baseline_run_count INTEGER DEFAULT 0,
+                    canary_run_count INTEGER DEFAULT 0,
+                    baseline_metrics_json TEXT DEFAULT '{}',
+                    canary_metrics_json TEXT DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_canary_status ON canary_rollouts(status);
+                CREATE INDEX IF NOT EXISTS idx_canary_rec ON canary_rollouts(recommendation_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (121, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 121: {}", e))?;
+
+            info!("Successfully migrated to version 121 (canary_rollouts)");
+        }
+
         // Repair migration: is_favorite column may be missing on databases created from
         // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
         // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,
@@ -7209,9 +7480,10 @@ impl CheckpointDb {
                                    is_reflection, reflection_source_task_run_id,
                                    is_follow_up, follow_up_source_task_run_id,
                                    is_fixer, fixer_source_task_run_id,
+                                   is_meta_optimizer,
                                    runner_port,
                                    created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?26)
+            VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?27)
             "#,
             params![
                 input.id,
@@ -7238,6 +7510,7 @@ impl CheckpointDb {
                 input.follow_up_source_task_run_id,
                 input.is_fixer as i32,
                 input.fixer_source_task_run_id,
+                input.is_meta_optimizer as i32,
                 effective_runner_port.map(|p| p as i64),
                 now
             ],
@@ -7280,6 +7553,7 @@ impl CheckpointDb {
             follow_up_source_task_run_id: input.follow_up_source_task_run_id.clone(),
             is_fixer: input.is_fixer,
             fixer_source_task_run_id: input.fixer_source_task_run_id.clone(),
+            is_meta_optimizer: input.is_meta_optimizer,
             created_at: now.clone(),
             updated_at: now,
             completed_at: None,
@@ -7509,6 +7783,7 @@ impl CheckpointDb {
                    COALESCE(is_reflection, 0) as is_reflection, reflection_source_task_run_id,
                    COALESCE(is_follow_up, 0) as is_follow_up, follow_up_source_task_run_id,
                    COALESCE(is_fixer, 0) as is_fixer, fixer_source_task_run_id,
+                   COALESCE(is_meta_optimizer, 0) as is_meta_optimizer,
                    created_at, updated_at, completed_at
             FROM task_runs
             WHERE id = ?1
@@ -7551,9 +7826,10 @@ impl CheckpointDb {
                     follow_up_source_task_run_id: row.get(31)?,
                     is_fixer: row.get::<_, i32>(32)? != 0,
                     fixer_source_task_run_id: row.get(33)?,
-                    created_at: row.get(34)?,
-                    updated_at: row.get(35)?,
-                    completed_at: row.get(36)?,
+                    is_meta_optimizer: row.get::<_, i32>(34).unwrap_or(0) != 0,
+                    created_at: row.get(35)?,
+                    updated_at: row.get(36)?,
+                    completed_at: row.get(37)?,
                 })
             },
         );
@@ -7597,6 +7873,7 @@ impl CheckpointDb {
                        COALESCE(is_reflection, 0) as is_reflection, reflection_source_task_run_id,
                        COALESCE(is_follow_up, 0) as is_follow_up, follow_up_source_task_run_id,
                        COALESCE(is_fixer, 0) as is_fixer, fixer_source_task_run_id,
+                       COALESCE(is_meta_optimizer, 0) as is_meta_optimizer,
                        created_at, updated_at, completed_at
                 FROM task_runs
                 WHERE parent_task_run_id = ?1
@@ -7645,9 +7922,10 @@ impl CheckpointDb {
                     follow_up_source_task_run_id: row.get(31)?,
                     is_fixer: row.get::<_, i32>(32)? != 0,
                     fixer_source_task_run_id: row.get(33)?,
-                    created_at: row.get(34)?,
-                    updated_at: row.get(35)?,
-                    completed_at: row.get(36)?,
+                    is_meta_optimizer: row.get::<_, i32>(34).unwrap_or(0) != 0,
+                    created_at: row.get(35)?,
+                    updated_at: row.get(36)?,
+                    completed_at: row.get(37)?,
                 })
             })
             .map_err(|e| format!("Failed to query child tasks: {}", e))?
@@ -7685,6 +7963,7 @@ impl CheckpointDb {
                        COALESCE(is_reflection, 0) as is_reflection, reflection_source_task_run_id,
                        COALESCE(is_follow_up, 0) as is_follow_up, follow_up_source_task_run_id,
                        COALESCE(is_fixer, 0) as is_fixer, fixer_source_task_run_id,
+                       COALESCE(is_meta_optimizer, 0) as is_meta_optimizer,
                        created_at, updated_at, completed_at
                 FROM task_runs
                 WHERE root_task_run_id = ?1 AND id != ?1
@@ -7733,9 +8012,10 @@ impl CheckpointDb {
                     follow_up_source_task_run_id: row.get(31)?,
                     is_fixer: row.get::<_, i32>(32)? != 0,
                     fixer_source_task_run_id: row.get(33)?,
-                    created_at: row.get(34)?,
-                    updated_at: row.get(35)?,
-                    completed_at: row.get(36)?,
+                    is_meta_optimizer: row.get::<_, i32>(34).unwrap_or(0) != 0,
+                    created_at: row.get(35)?,
+                    updated_at: row.get(36)?,
+                    completed_at: row.get(37)?,
                 })
             })
             .map_err(|e| format!("Failed to query task hierarchy: {}", e))?
@@ -8526,6 +8806,7 @@ impl CheckpointDb {
                     follow_up_source_task_run_id: None, // Not queried for performance
                     is_fixer: false,          // Not queried for performance
                     fixer_source_task_run_id: None, // Not queried for performance
+                    is_meta_optimizer: false,      // Not queried for performance
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -8544,10 +8825,7 @@ impl CheckpointDb {
 
     /// Get all running unified workflow task runs for resume on startup.
     /// Returns task runs where status = 'running' AND workflow_type = 'unified'.
-    pub fn get_running_unified_workflows(
-        &self,
-        runner_port: Option<u16>,
-    ) -> Result<Vec<TaskRun>, String> {
+    pub fn get_running_unified_workflows(&self, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -8605,6 +8883,7 @@ impl CheckpointDb {
                     follow_up_source_task_run_id: None, // Not queried for performance
                     is_fixer: row.get::<_, i32>(25).unwrap_or(0) != 0,
                     fixer_source_task_run_id: None, // Not queried for performance
+                    is_meta_optimizer: false,      // Not queried for performance
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -8623,10 +8902,7 @@ impl CheckpointDb {
 
     /// Get all running AI session task runs for resume on startup.
     /// Returns task runs where status = 'running' AND workflow_type = 'chat'.
-    pub fn get_running_ai_sessions(
-        &self,
-        runner_port: Option<u16>,
-    ) -> Result<Vec<TaskRun>, String> {
+    pub fn get_running_ai_sessions(&self, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -8681,6 +8957,7 @@ impl CheckpointDb {
                     follow_up_source_task_run_id: None,
                     is_fixer: false,
                     fixer_source_task_run_id: None,
+                    is_meta_optimizer: false,
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -8699,11 +8976,7 @@ impl CheckpointDb {
 
     /// Get recent AI sessions (all statuses) for sidebar listing.
     /// Returns lightweight summaries ordered by most recently updated.
-    pub fn get_ai_sessions(
-        &self,
-        limit: u32,
-        runner_port: Option<u16>,
-    ) -> Result<Vec<AiSessionSummary>, String> {
+    pub fn get_ai_sessions(&self, limit: u32, runner_port: Option<u16>) -> Result<Vec<AiSessionSummary>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -8845,11 +9118,7 @@ impl CheckpointDb {
 
     /// Get recent task runs (for display in UI).
     /// Note: output_log is empty for performance. Use get_full_task_output() to get output.
-    pub fn get_recent_task_runs(
-        &self,
-        limit: u32,
-        runner_port: Option<u16>,
-    ) -> Result<Vec<TaskRun>, String> {
+    pub fn get_recent_task_runs(&self, limit: u32, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -8909,6 +9178,7 @@ impl CheckpointDb {
                     follow_up_source_task_run_id: None, // Not queried for performance
                     is_fixer: false,          // Not queried for performance
                     fixer_source_task_run_id: None, // Not queried for performance
+                    is_meta_optimizer: false,      // Not queried for performance
                     created_at: row.get(18)?,
                     updated_at: row.get(19)?,
                     completed_at: row.get(20)?,
@@ -9022,6 +9292,7 @@ impl CheckpointDb {
                     follow_up_source_task_run_id: None, // Not queried for performance
                     is_fixer: false,      // Not queried for performance
                     fixer_source_task_run_id: None, // Not queried for performance
+                    is_meta_optimizer: false,      // Not queried for performance
                     created_at: row.get(19)?,
                     updated_at: row.get(20)?,
                     completed_at: row.get(21)?,
@@ -13662,11 +13933,9 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(39)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    ai_reviewed: row
-                        .get::<_, Option<i32>>(40)
-                        .unwrap_or(Some(1))
-                        .unwrap_or(1)
-                        != 0,
+                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
+                    multi_agent_mode: true,
+                    use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -13779,6 +14048,8 @@ impl CheckpointDb {
                     acceptance_criteria: row.get::<_, Option<String>>(38)?.and_then(|s| serde_json::from_str(&s).ok()),
                     constraint_overrides: row.get::<_, Option<String>>(39)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
                     ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
+                    multi_agent_mode: true,
+                    use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -13895,6 +14166,8 @@ impl CheckpointDb {
                     acceptance_criteria: row.get::<_, Option<String>>(38)?.and_then(|s| serde_json::from_str(&s).ok()),
                     constraint_overrides: row.get::<_, Option<String>>(39)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
                     ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
+                    multi_agent_mode: true,
+                    use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -14508,11 +14781,9 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(39)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    ai_reviewed: row
-                        .get::<_, Option<i32>>(40)
-                        .unwrap_or(Some(1))
-                        .unwrap_or(1)
-                        != 0,
+                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
+                    multi_agent_mode: true,
+                    use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -14724,11 +14995,9 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(39)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    ai_reviewed: row
-                        .get::<_, Option<i32>>(40)
-                        .unwrap_or(Some(1))
-                        .unwrap_or(1)
-                        != 0,
+                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
+                    multi_agent_mode: true,
+                    use_worktree: false,
                     targeted_error_ids: vec![],
                 })
             })
@@ -15481,6 +15750,7 @@ impl CheckpointDb {
         error_type: Option<&str>,
         error_message: Option<&str>,
         feedback: Option<&serde_json::Value>,
+        workflow_architecture: Option<&str>,
     ) -> Result<String, String> {
         let conn = self.get_conn()?;
         let id = format!("lo-{}", uuid::Uuid::new_v4());
@@ -15494,8 +15764,9 @@ impl CheckpointDb {
             r#"
             INSERT INTO learning_outcomes (
                 id, task_id, status, duration_secs, iterations, strategy,
-                tools_used, files_modified, error_type, error_message, feedback, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                tools_used, files_modified, error_type, error_message, feedback,
+                workflow_architecture, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             "#,
             params![
                 id,
@@ -15509,6 +15780,7 @@ impl CheckpointDb {
                 error_type,
                 error_message,
                 feedback_json,
+                workflow_architecture,
                 now
             ],
         )
@@ -17944,10 +18216,7 @@ impl CheckpointDb {
             let acceptance_criteria = if workflow["acceptance_criteria"].is_null() {
                 None
             } else {
-                Some(
-                    serde_json::to_string(&workflow["acceptance_criteria"])
-                        .unwrap_or_else(|_| "null".to_string()),
-                )
+                Some(serde_json::to_string(&workflow["acceptance_criteria"]).unwrap_or_else(|_| "null".to_string()))
             };
 
             let result = conn.execute(
@@ -21866,6 +22135,143 @@ impl MigrationResult {
             + self.scheduler_tasks_migrated
             + self.workflows_migrated
             + self.checkpoints_migrated
+    }
+}
+
+// =============================================================================
+// Worktree CRUD operations
+// =============================================================================
+
+impl CheckpointDb {
+    /// Insert a worktree record.
+    pub fn insert_worktree(
+        &self,
+        record: &crate::worktree::WorktreeRecord,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().map_err(|e| e.to_string())?;
+        conn.execute(
+            r#"INSERT INTO worktrees (id, worktree_path, branch_name, source_branch, source_commit, repo_path, task_run_id, workflow_name, status, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+            rusqlite::params![
+                record.id,
+                record.worktree_path,
+                record.branch_name,
+                record.source_branch,
+                record.source_commit,
+                record.repo_path,
+                record.task_run_id,
+                record.workflow_name,
+                record.status.to_string(),
+                record.created_at,
+                record.updated_at,
+            ],
+        )
+        .map_err(|e| format!("Failed to insert worktree: {}", e))?;
+        Ok(())
+    }
+
+    /// Update the status of a worktree.
+    pub fn update_worktree_status(
+        &self,
+        id: &str,
+        status: &crate::worktree::WorktreeStatus,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE worktrees SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![status.to_string(), id],
+        )
+        .map_err(|e| format!("Failed to update worktree status: {}", e))?;
+        Ok(())
+    }
+
+    /// List worktrees, optionally filtered by status.
+    pub fn list_worktrees(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<crate::worktree::WorktreeRecord>, String> {
+        let conn = self.pool.get().map_err(|e| e.to_string())?;
+
+        let (query, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(s) = status {
+            (
+                "SELECT id, worktree_path, branch_name, source_branch, source_commit, repo_path, task_run_id, workflow_name, status, created_at, updated_at FROM worktrees WHERE status = ?1 ORDER BY created_at DESC",
+                vec![Box::new(s.to_string())],
+            )
+        } else {
+            (
+                "SELECT id, worktree_path, branch_name, source_branch, source_commit, repo_path, task_run_id, workflow_name, status, created_at, updated_at FROM worktrees ORDER BY created_at DESC",
+                vec![],
+            )
+        };
+
+        let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(crate::worktree::WorktreeRecord {
+                    id: row.get(0)?,
+                    worktree_path: row.get(1)?,
+                    branch_name: row.get(2)?,
+                    source_branch: row.get(3)?,
+                    source_commit: row.get(4)?,
+                    repo_path: row.get(5)?,
+                    task_run_id: row.get(6)?,
+                    workflow_name: row.get(7)?,
+                    status: crate::worktree::WorktreeStatus::from_str(
+                        &row.get::<_, String>(8)?,
+                    ),
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(results)
+    }
+
+    /// Get a single worktree by ID.
+    pub fn get_worktree(&self, id: &str) -> Result<Option<crate::worktree::WorktreeRecord>, String> {
+        let conn = self.pool.get().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, worktree_path, branch_name, source_branch, source_commit, repo_path, task_run_id, workflow_name, status, created_at, updated_at FROM worktrees WHERE id = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let result = stmt
+            .query_row(rusqlite::params![id], |row| {
+                Ok(crate::worktree::WorktreeRecord {
+                    id: row.get(0)?,
+                    worktree_path: row.get(1)?,
+                    branch_name: row.get(2)?,
+                    source_branch: row.get(3)?,
+                    source_commit: row.get(4)?,
+                    repo_path: row.get(5)?,
+                    task_run_id: row.get(6)?,
+                    workflow_name: row.get(7)?,
+                    status: crate::worktree::WorktreeStatus::from_str(
+                        &row.get::<_, String>(8)?,
+                    ),
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                })
+            })
+            .optional()
+            .map_err(|e| e.to_string())?;
+
+        Ok(result)
+    }
+
+    /// Delete a worktree record.
+    pub fn delete_worktree(&self, id: &str) -> Result<(), String> {
+        let conn = self.pool.get().map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM worktrees WHERE id = ?1", rusqlite::params![id])
+            .map_err(|e| format!("Failed to delete worktree: {}", e))?;
+        Ok(())
     }
 }
 

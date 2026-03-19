@@ -75,6 +75,8 @@ pub struct TaskOutcome {
     pub completed_at: String,
     /// Tags for categorization
     pub tags: Vec<String>,
+    /// Workflow architecture type (traditional, agentic_verification, multi_agent_pipeline)
+    pub workflow_architecture: Option<String>,
 }
 
 impl TaskOutcome {
@@ -93,6 +95,7 @@ impl TaskOutcome {
             metrics: HashMap::new(),
             completed_at: chrono::Utc::now().to_rfc3339(),
             tags: Vec::new(),
+            workflow_architecture: None,
         }
     }
 
@@ -111,6 +114,7 @@ impl TaskOutcome {
             metrics: HashMap::new(),
             completed_at: chrono::Utc::now().to_rfc3339(),
             tags: Vec::new(),
+            workflow_architecture: None,
         }
     }
 

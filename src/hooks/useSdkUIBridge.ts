@@ -38,9 +38,7 @@ import { cropThumbnails } from "@/lib/thumbnail-cropper";
 let pendingCaptureScreenshots: CooccurrenceExport["captureScreenshots"] | undefined;
 
 /** Retrieve and consume pending capture screenshots saved during exploration. */
-export function consumePendingCaptureScreenshots():
-  | CooccurrenceExport["captureScreenshots"]
-  | undefined {
+export function consumePendingCaptureScreenshots(): CooccurrenceExport["captureScreenshots"] | undefined {
   const data = pendingCaptureScreenshots;
   pendingCaptureScreenshots = undefined;
   return data;
@@ -1247,55 +1245,54 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
                   }
 
                   // Store full screenshot for screenshot state view (deduplicated)
-                  const currentHashes = new Set(Object.keys(session.elementBoundsMap));
-                  const prevHashes = session.prevCaptureHashes;
-                  const hashesChanged =
-                    !prevHashes ||
-                    currentHashes.size !== prevHashes.size ||
-                    [...currentHashes].some((h) => !prevHashes.has(h));
-                  if (hashesChanged) {
-                    if (!session.captureScreenshots) session.captureScreenshots = [];
-                    // Build element bounds with DPR-scaled coordinates
-                    const boundsMap: Record<
-                      string,
-                      { x: number; y: number; width: number; height: number }
-                    > = {};
-                    for (const [hash, bounds] of Object.entries(session.elementBoundsMap)) {
-                      boundsMap[hash] = {
-                        x: (bounds as { x: number }).x * dpr,
-                        y: (bounds as { y: number }).y * dpr,
-                        width: (bounds as { width: number }).width * dpr,
-                        height: (bounds as { height: number }).height * dpr,
+                  // Use only elements from the CURRENT snapshot (mapped), not the
+                  // accumulated session.elementBoundsMap which spans all pages.
+                  const currentPageHashes = new Set<string>();
+                  const currentPageBounds: Record<string, { x: number; y: number; width: number; height: number }> = {};
+                  for (const el of mapped) {
+                    if (
+                      el.fingerprint?.hash &&
+                      el.bounds &&
+                      el.bounds.width > 0 &&
+                      el.bounds.height > 0
+                    ) {
+                      currentPageHashes.add(el.fingerprint.hash);
+                      currentPageBounds[el.fingerprint.hash] = {
+                        x: el.bounds.x * dpr,
+                        y: el.bounds.y * dpr,
+                        width: el.bounds.width * dpr,
+                        height: el.bounds.height * dpr,
                       };
                     }
+                  }
+                  const prevHashes = session.prevCaptureHashes;
+                  const hashesChanged = !prevHashes ||
+                    currentPageHashes.size !== prevHashes.size ||
+                    [...currentPageHashes].some(h => !prevHashes.has(h));
+                  if (hashesChanged && currentPageHashes.size > 0) {
+                    if (!session.captureScreenshots) session.captureScreenshots = [];
                     const screenshotEntry = {
                       captureIndex: session.captureScreenshots.length,
                       screenshotBase64: ssJson.data.screenshot,
                       width: Math.round((ssJson.data.width || 1920) * dpr),
                       height: Math.round((ssJson.data.height || 1080) * dpr),
-                      elementBoundsJson: JSON.stringify(boundsMap),
-                      fingerprintHashesJson: JSON.stringify([...currentHashes]),
+                      elementBoundsJson: JSON.stringify(currentPageBounds),
+                      fingerprintHashesJson: JSON.stringify([...currentPageHashes]),
                       capturedAt: new Date().toISOString(),
                     };
                     session.captureScreenshots.push(screenshotEntry);
-                    session.prevCaptureHashes = currentHashes;
+                    session.prevCaptureHashes = currentPageHashes;
                     // Also persist to module-level variable so screenshots survive
                     // page navigation during self-connect exploration
                     pendingCaptureScreenshots = [...session.captureScreenshots];
                     // Save screenshot to DB immediately with a pending config ID
                     // so it survives process restarts and page navigation
-                    import("@tauri-apps/api/core")
-                      .then(({ invoke }) => {
-                        invoke("sm_save_capture_screenshots", {
-                          configId: `pending-${session.sessionId}`,
-                          screenshots: [screenshotEntry],
-                        }).catch(() => {
-                          /* non-fatal */
-                        });
-                      })
-                      .catch(() => {
-                        /* non-fatal */
-                      });
+                    import("@tauri-apps/api/core").then(({ invoke }) => {
+                      invoke("sm_save_capture_screenshots", {
+                        configId: `pending-${session.sessionId}`,
+                        screenshots: [screenshotEntry],
+                      }).catch(() => { /* non-fatal */ });
+                    }).catch(() => { /* non-fatal */ });
                   }
                 }
               }
@@ -1562,11 +1559,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
           const { instanceStorage } = await import("@/lib/instance-storage");
           // Strip thumbnails and capture screenshots from the persisted discovery data
           // (they're saved separately to the DB and would make this JSON too large for localStorage)
-          const {
-            elementThumbnails: _thumbs,
-            captureScreenshots: _screenshots,
-            ...resultWithoutThumbs
-          } = result;
+          const { elementThumbnails: _thumbs, captureScreenshots: _screenshots, ...resultWithoutThumbs } = result;
           instanceStorage.setJSON("qontinui-runner-sm-discovery", {
             cooccurrenceData: resultWithoutThumbs,
             dataSource: "explore",

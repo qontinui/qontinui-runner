@@ -210,6 +210,97 @@ impl LoopController {
         }
 
         // =====================================================================
+        // CREATE WORKTREE (if enabled)
+        // =====================================================================
+        if config.use_worktree {
+            if let Some(project_path) = config.project_path.clone() {
+                let repo_path = std::path::Path::new(&project_path);
+                match crate::worktree::create_worktree(
+                    repo_path,
+                    &config.execution_id,
+                    &config.workflow_name,
+                ) {
+                    Ok(result) => {
+                        info!(
+                            "WORKTREE: Created isolated worktree at {} (branch: {})",
+                            result.worktree_path.display(),
+                            result.branch_name
+                        );
+                        // Override project_path to point to the worktree
+                        let wt_path = result.worktree_path.to_string_lossy().to_string();
+                        config.project_path = Some(wt_path.clone());
+                        config.worktree_path = Some(wt_path.clone());
+                        config.worktree_branch = Some(result.branch_name.clone());
+
+                        // Track the worktree in the database
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let record = crate::worktree::WorktreeRecord {
+                            id: config.execution_id.clone(),
+                            worktree_path: wt_path.clone(),
+                            branch_name: result.branch_name.clone(),
+                            source_branch: result.source_branch.clone(),
+                            source_commit: result.source_commit.clone(),
+                            repo_path: project_path.clone(),
+                            task_run_id: Some(config.execution_id.clone()),
+                            workflow_name: Some(config.workflow_name.clone()),
+                            status: crate::worktree::WorktreeStatus::Active,
+                            created_at: now.clone(),
+                            updated_at: now,
+                        };
+                        if let Err(e) = self.checkpoint_db.insert_worktree(&record) {
+                            warn!("WORKTREE: Failed to track worktree in database: {}", e);
+                        }
+
+                        // Update working directories in all steps to use the worktree
+                        let original_path = project_path.clone();
+                        let update_steps = |steps: &mut Vec<ExecutionStepConfig>| {
+                            for step in steps.iter_mut() {
+                                // Update shell command working directory
+                                if let Some(ref wd) = step.shell_command_working_directory {
+                                    if wd.contains(&original_path) {
+                                        step.shell_command_working_directory =
+                                            Some(wd.replace(&original_path, &wt_path));
+                                    }
+                                }
+                                // Update check working directory
+                                if let Some(ref wd) = step.check_working_directory {
+                                    if wd.contains(&original_path) {
+                                        step.check_working_directory =
+                                            Some(wd.replace(&original_path, &wt_path));
+                                    }
+                                }
+                            }
+                        };
+                        update_steps(&mut setup_automation_steps);
+                        update_steps(&mut setup_prompt_steps);
+                        update_steps(&mut verification_steps);
+                        update_steps(&mut agentic_steps);
+                        update_steps(&mut completion_automation_steps);
+                        update_steps(&mut completion_prompt_steps);
+                        for stage in &mut config.stages {
+                            update_steps(&mut stage.setup_automation_steps);
+                            update_steps(&mut stage.setup_prompt_steps);
+                            update_steps(&mut stage.verification_steps);
+                            update_steps(&mut stage.agentic_steps);
+                            update_steps(&mut stage.completion_automation_steps);
+                            update_steps(&mut stage.completion_prompt_steps);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "WORKTREE: Failed to create worktree ({}). Running in main directory.",
+                            e
+                        );
+                        config.use_worktree = false;
+                    }
+                }
+            } else {
+                warn!("WORKTREE: No project_path set, cannot create worktree.");
+                config.use_worktree = false;
+            }
+        }
+
+        // =====================================================================
         // APPLY VARIABLE SUBSTITUTION to all step fields
         // =====================================================================
         if let Some(ref artifact_dir) = config.artifact_dir {
@@ -567,6 +658,11 @@ impl LoopController {
                     step_results: all_step_results,
                     duration_ms: start.elapsed().as_millis() as u64,
                     loop_result: last_loop_result,
+                worktree_path: config.worktree_path.clone(),
+                worktree_branch: config.worktree_branch.clone(),
+                workflow_architecture: config.workflow_architecture.clone(),
+                agentic_verification_config: config.agentic_verification_config.clone(),
+                multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
                 };
             }
 
@@ -612,6 +708,11 @@ impl LoopController {
                             step_results: all_step_results,
                             duration_ms: start.elapsed().as_millis() as u64,
                             loop_result: last_loop_result,
+                worktree_path: config.worktree_path.clone(),
+                worktree_branch: config.worktree_branch.clone(),
+                workflow_architecture: config.workflow_architecture.clone(),
+                agentic_verification_config: config.agentic_verification_config.clone(),
+                multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
                         };
                     }
                 }
@@ -744,6 +845,11 @@ impl LoopController {
                             step_results: all_step_results,
                             duration_ms: start.elapsed().as_millis() as u64,
                             loop_result: last_loop_result,
+                worktree_path: config.worktree_path.clone(),
+                worktree_branch: config.worktree_branch.clone(),
+                workflow_architecture: config.workflow_architecture.clone(),
+                agentic_verification_config: config.agentic_verification_config.clone(),
+                multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
                         };
                     }
                     // stop_on_failure=false: skip to next stage
@@ -989,6 +1095,13 @@ impl LoopController {
                     routing_context: Default::default(),
                     project_path: config.project_path.clone(),
                     acceptance_criteria: config.acceptance_criteria.clone(),
+            multi_agent_mode: false,
+            use_worktree: false,
+            worktree_path: None,
+            worktree_branch: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
                 };
 
                 // Handle agentic-first: run the agentic phase before the verification loop.
@@ -1117,8 +1230,41 @@ impl LoopController {
                     0,
                 );
 
-                let loop_result = self
-                    .run_verification_agentic_loop(
+                let loop_result = if matches!(
+                    stage_loop_config.workflow_architecture,
+                    Some(crate::autoresearch::agentic_verification::WorkflowArchitecture::AgenticVerification)
+                ) {
+                    info!(
+                        "  Stage {}: Using AGENTIC VERIFICATION architecture",
+                        stage_num
+                    );
+                    self.run_agentic_verification_loop(
+                        &mut stage_loop_config,
+                        has_agentic,
+                        &stage.agentic_steps,
+                        &mut all_step_results,
+                        logger,
+                    )
+                    .await
+                } else if matches!(
+                    stage_loop_config.workflow_architecture,
+                    Some(crate::autoresearch::agentic_verification::WorkflowArchitecture::MultiAgentPipeline)
+                ) {
+                    info!(
+                        "  Stage {}: Using MULTI-AGENT PIPELINE architecture",
+                        stage_num
+                    );
+                    self.run_multi_agent_pipeline_loop(
+                        &mut stage_loop_config,
+                        &stage.verification_steps,
+                        has_agentic,
+                        &stage.agentic_steps,
+                        &mut all_step_results,
+                        logger,
+                    )
+                    .await
+                } else {
+                    self.run_verification_agentic_loop(
                         &mut stage_loop_config,
                         &stage.verification_steps,
                         has_agentic,
@@ -1129,7 +1275,8 @@ impl LoopController {
                         logger,
                         initial_dynamic_steps,
                     )
-                    .await;
+                    .await
+                };
 
                 info!(
                     "  Stage {}: Loop result: {}",
@@ -1226,6 +1373,11 @@ impl LoopController {
                         step_results: all_step_results,
                         duration_ms: start.elapsed().as_millis() as u64,
                         loop_result: Some(loop_result),
+                        worktree_path: config.worktree_path.clone(),
+                        worktree_branch: config.worktree_branch.clone(),
+                workflow_architecture: config.workflow_architecture.clone(),
+                agentic_verification_config: config.agentic_verification_config.clone(),
+                multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
                     };
                 }
 
@@ -1248,9 +1400,11 @@ impl LoopController {
         }
 
         // ─── Workflow-level Completion ───
-        // Use the last loop result for determining success
-        let overall_passed =
-            any_stage_passed || (!config.stop_on_failure && last_loop_result.is_some());
+        // A workflow passes only if at least one stage's verification actually passed.
+        // Previously, stop_on_failure=false + any loop having run was enough to mark
+        // overall_passed=true, which caused tasks to be marked "completed" even when
+        // all stages failed verification (zombie "running" tasks if completion errored).
+        let overall_passed = any_stage_passed;
         let total_iterations = last_loop_result
             .as_ref()
             .map(|r| r.iterations_run)
@@ -1345,18 +1499,45 @@ impl LoopController {
 
             info!("=== WORKFLOW COMPLETED SUCCESSFULLY ===");
         } else {
-            info!("=== WORKFLOW: No stages passed verification ===");
+            let fail_reason = if let Some(ref lr) = last_loop_result {
+                if lr.max_iterations_reached {
+                    format!(
+                        "Verification failed after {} iterations (max_iterations={} exhausted)",
+                        lr.iterations_run, config.max_iterations
+                    )
+                } else if lr.was_stopped {
+                    format!("Workflow stopped after {} iterations", lr.iterations_run)
+                } else if lr.unfixable_errors {
+                    format!(
+                        "Unfixable errors detected after {} iterations",
+                        lr.iterations_run
+                    )
+                } else if lr.critical_failure {
+                    format!(
+                        "Critical failure during verification after {} iterations",
+                        lr.iterations_run
+                    )
+                } else {
+                    format!(
+                        "No stages passed verification after {} iterations",
+                        lr.iterations_run
+                    )
+                }
+            } else {
+                "No stages passed verification (no iterations ran)".to_string()
+            };
+            info!("=== WORKFLOW FAILED: {} ===", fail_reason);
             self.persist_workflow_state(
                 &config.execution_id,
                 &UnifiedWorkflowState::failed_in_phase(
-                    "No stages passed verification",
+                    &fail_reason,
                     "verification",
-                    None,
+                    last_loop_result.as_ref().map(|r| r.iterations_run),
                 ),
             );
             self.mark_task_failed(
                 &config.execution_id,
-                "No stages passed verification",
+                &fail_reason,
                 Some(&config.workflow_id),
             )
             .await;
@@ -1431,6 +1612,12 @@ impl LoopController {
                 files_modified: Vec::new(),
                 error_type: None,
                 error_message: None,
+                workflow_architecture: config.workflow_architecture.as_ref().map(|a| {
+                    serde_json::to_value(a)
+                        .ok()
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| format!("{:?}", a).to_lowercase())
+                }),
             };
             tokio::spawn(async move {
                 if let Err(e) = db.with_conn(|conn| {
@@ -1629,6 +1816,28 @@ impl LoopController {
                         warn!("Failed to launch fixer for {}: {}", fixer_source_id, e);
                     }
                 }
+
+                // Trigger meta-optimizer (threshold-based, most runs it's a fast no-op)
+                let meta_deps = crate::meta_optimizer::types::MetaOptimizerDeps {
+                    app_state: self.app_state.clone(),
+                    config_storage: self.config_storage.clone(),
+                    app_handle: self.app_handle.clone(),
+                    pid_tracker: self.pid_tracker.clone(),
+                    session_manager: session_manager.clone(),
+                };
+                match crate::meta_optimizer::trigger::check_and_launch_optimizers(
+                    meta_deps,
+                    config.execution_id.clone(),
+                ) {
+                    Ok(ids) => {
+                        for id in &ids {
+                            info!("Launched meta-optimizer {}", id);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Meta-optimizer trigger failed: {}", e);
+                    }
+                }
             }
         }
 
@@ -1684,6 +1893,11 @@ impl LoopController {
             step_results: all_step_results,
             duration_ms: start.elapsed().as_millis() as u64,
             loop_result: last_loop_result,
+            worktree_path: config.worktree_path.clone(),
+            worktree_branch: config.worktree_branch.clone(),
+                workflow_architecture: config.workflow_architecture.clone(),
+                agentic_verification_config: config.agentic_verification_config.clone(),
+                multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
         }
     }
 
@@ -1923,6 +2137,62 @@ impl LoopController {
                 false,
                 false, // Don't check for completion marker - verification is the authority
             );
+
+            // -----------------------------------------------------------------
+            // ENVIRONMENT READINESS CHECK (before verification)
+            // -----------------------------------------------------------------
+            // Check that the runtime environment (runner API, SDK connection, app health)
+            // is ready before running verification assertions. If issues are found, attempt
+            // automated recovery (reconnect SDK, refresh page). This prevents wasting
+            // agentic iterations on environment problems vs actual code issues.
+            {
+                let env_result = super::phases::check_environment_readiness(
+                    iteration,
+                    &config.workflow_name,
+                )
+                .await;
+
+                if !env_result.ready {
+                    // Log environment issue to task output
+                    let _ = self.checkpoint_db.append_task_output_ex(
+                        &config.execution_id,
+                        &format!(
+                            "\n--- Environment Check (Iteration {}): NOT READY ---\n{}\n",
+                            iteration, env_result.summary
+                        ),
+                        false,
+                        false,
+                    );
+
+                    // Merge env failure context with any existing health regression from the
+                    // previous iteration (don't clobber — both are valuable diagnostic context).
+                    if let Some(env_ctx) = env_result.env_failure_context {
+                        pending_health_regression = Some(match pending_health_regression.take() {
+                            Some(existing) => format!("{}\n\n{}", env_ctx, existing),
+                            None => env_ctx,
+                        });
+                    }
+
+                    warn!(
+                        "ENV-DOCTOR: Environment not ready for iteration {} — \
+                         verification will likely fail due to environment, not code issues",
+                        iteration
+                    );
+                } else {
+                    if env_result.recovery_attempted {
+                        let _ = self.checkpoint_db.append_task_output_ex(
+                            &config.execution_id,
+                            &format!(
+                                "\n--- Environment Check (Iteration {}): RECOVERED ---\n{}\n",
+                                iteration, env_result.summary
+                            ),
+                            false,
+                            false,
+                        );
+                    }
+                    debug!("ENV-DOCTOR: {}", env_result.summary);
+                }
+            }
 
             // -----------------------------------------------------------------
             // VERIFICATION PHASE
@@ -2453,9 +2723,14 @@ impl LoopController {
                 failure_context
             };
 
-            // Inject health regression warning from previous iteration's agentic phase
+            // Inject environment/health context BEFORE verification failures so the AI
+            // sees the environmental framing first. This includes:
+            // - Environment doctor results (SDK disconnected, app crashed, etc.)
+            // - Health regression warnings from previous iteration's agentic phase
+            // By placing this first, the AI knows to fix environment issues before
+            // attempting code changes when verification failures are due to env problems.
             let failure_context = if let Some(warning) = pending_health_regression.take() {
-                format!("{}\n\n{}", failure_context, warning)
+                format!("{}\n\n{}", warning, failure_context)
             } else {
                 failure_context
             };
@@ -2599,17 +2874,48 @@ impl LoopController {
             let pre_agentic_health = fetch_pre_agentic_health_baseline().await;
 
             let agentic_phase_start = std::time::Instant::now();
-            let (agentic_outcome, new_injected_steps) = self
-                .agentic_executor
-                .run_agentic(
+
+            // Multi-agent mode: triage failures and spawn specialized fix agents
+            // instead of one monolithic AI session.
+            let (agentic_outcome, new_injected_steps) = if config.multi_agent_mode
+                && verification_result.failed_steps > 0
+            {
+                info!(
+                    "MULTI-AGENT: Engaging multi-agent fixer (iteration {}, {} failed steps)",
+                    iteration, verification_result.failed_steps
+                );
+
+                let ma_result = self.run_multi_agent_fix(
                     config,
                     iteration,
                     &failure_context,
-                    has_agentic_steps,
-                    agentic_steps,
+                    &verification_result,
+                    &all_verification_steps,
                     logger,
-                )
-                .await;
+                ).await;
+
+                match ma_result {
+                    Some((outcome, steps)) => (outcome, steps),
+                    None => {
+                        // Multi-agent triage/fix failed, fall back to standard session
+                        warn!("MULTI-AGENT: Falling back to standard agentic session");
+                        self.agentic_executor
+                            .run_agentic(config, iteration, &failure_context, has_agentic_steps, agentic_steps, logger)
+                            .await
+                    }
+                }
+            } else {
+                self.agentic_executor
+                    .run_agentic(
+                        config,
+                        iteration,
+                        &failure_context,
+                        has_agentic_steps,
+                        agentic_steps,
+                        logger,
+                    )
+                    .await
+            };
 
             // Restore reflection_mode if we forced it for this iteration only
             if reflection_was_forced {
@@ -2755,6 +3061,41 @@ impl LoopController {
                     true,  // increment session count
                     false, // Don't check for completion marker - verification is the authority
                 );
+            }
+
+            // Sync session to web backend (best-effort, non-blocking).
+            // The frontend-driven sync only fires for UI-initiated tasks; workflow-
+            // executor sessions must sync themselves to keep the backend up to date.
+            {
+                let exec_id = config.execution_id.clone();
+                let session_num = iteration;
+                let duration_secs = (agentic_duration_ms / 1000) as i64;
+                let output_summary = agentic_outcome
+                    .output()
+                    .map(|o| truncate_str(o, 5000).to_string());
+                tokio::spawn(async move {
+                    let sync_service =
+                        crate::commands::task_sync::AITaskSyncService::new();
+                    // Start
+                    if let Err(e) = sync_service
+                        .sync_session_started(&exec_id, session_num)
+                        .await
+                    {
+                        debug!("Failed to sync session start to backend: {}", e);
+                    }
+                    // End
+                    if let Err(e) = sync_service
+                        .sync_session_ended(
+                            &exec_id,
+                            session_num,
+                            duration_secs,
+                            output_summary.as_deref(),
+                        )
+                        .await
+                    {
+                        debug!("Failed to sync session end to backend: {}", e);
+                    }
+                });
             }
 
             // Record findings from AI output as knowledge entries
@@ -3361,6 +3702,1092 @@ impl LoopController {
         loop_result
     }
 
+    // =========================================================================
+    // Agentic Verification Loop — alternative architecture
+    // =========================================================================
+
+    /// Run the agentic verification loop: Verification Agent → Worker Agent → repeat.
+    ///
+    /// Unlike the traditional loop that uses pre-defined deterministic verification steps,
+    /// this architecture uses a verification *agent* that reasons about whether the goal
+    /// has been achieved, and a worker agent that takes actions based on the verifier's
+    /// feedback.
+    ///
+    /// Returns a standard LoopResult for compatibility with the existing result pipeline.
+    async fn run_agentic_verification_loop(
+        &self,
+        config: &mut LoopConfig,
+        has_agentic_steps: bool,
+        agentic_steps: &[ExecutionStepConfig],
+        _all_step_results: &mut Vec<crate::step_executor::StepExecutionResult>,
+        logger: &StepEventLogger,
+    ) -> LoopResult {
+        use crate::autoresearch::agentic_verification::*;
+
+        let av_config = config
+            .agentic_verification_config
+            .clone()
+            .unwrap_or_default();
+
+        let goal = if av_config.goal.is_empty() {
+            config.base_prompt.clone()
+        } else {
+            av_config.goal.clone()
+        };
+
+        let max_iterations = if av_config.max_iterations > 0 {
+            av_config.max_iterations
+        } else {
+            config.max_iterations
+        };
+
+        info!(
+            "AGENTIC-VERIFICATION: Starting loop (max_iterations={}, confidence_threshold={}, consecutive_passes_required={})",
+            max_iterations, av_config.confidence_threshold, av_config.required_consecutive_passes
+        );
+
+        let mut iteration_results: Vec<AgenticVerificationIterationResult> = Vec::new();
+        let mut consecutive_passes: u32 = 0;
+        let mut iteration: u32 = 0;
+
+        // Save original model/provider overrides so we can restore after each iteration
+        let original_model_override = config.model_override.clone();
+        let original_provider_override = config.provider_override.clone();
+
+        loop {
+            iteration += 1;
+
+            // Check stop signal
+            if self.is_task_stopped(&config.execution_id) {
+                info!(
+                    "AGENTIC-VERIFICATION: Stopped by user at iteration {}",
+                    iteration
+                );
+                let av_result = AgenticVerificationResult {
+                    iterations_run: iteration,
+                    goal_achieved: false,
+                    unreachable: false,
+                    was_stopped: true,
+                    max_iterations_reached: false,
+                    iteration_results,
+                    final_verdict: None,
+                };
+                self.canvas_manager.lock().await.on_agentic_verification_exit(&av_result).await;
+                return av_result.to_loop_result();
+            }
+
+            // Check max iterations
+            if iteration > max_iterations {
+                info!(
+                    "AGENTIC-VERIFICATION: Max iterations ({}) reached",
+                    max_iterations
+                );
+                let av_result = AgenticVerificationResult {
+                    iterations_run: iteration - 1,
+                    goal_achieved: false,
+                    unreachable: false,
+                    was_stopped: false,
+                    max_iterations_reached: true,
+                    iteration_results: iteration_results.clone(),
+                    final_verdict: iteration_results.last().map(|r| r.verdict.clone()),
+                };
+                self.canvas_manager.lock().await.on_agentic_verification_exit(&av_result).await;
+                return av_result.to_loop_result();
+            }
+
+            // Update routing context
+            config.set_routing_context(iteration, 0);
+
+            // Record activity
+            self.record_activity(
+                &config.execution_id,
+                &format!("agentic_verification_iteration_{}", iteration),
+            );
+
+            // ── STEP 1: Verification Agent ──────────────────────────────
+            // The verification agent assesses the current state against the goal.
+            // On the first iteration (if verify_first is false), we skip directly
+            // to the worker agent.
+
+            let should_verify = iteration > 1 || av_config.verify_first;
+
+            let verdict = if should_verify {
+                info!(
+                    "AGENTIC-VERIFICATION: Running verification agent (iteration {})",
+                    iteration
+                );
+
+                let verifier_start = std::time::Instant::now();
+
+                let verifier_system = AgenticVerificationPrompts::verifier_system_prompt(
+                    &goal,
+                    av_config.verifier.system_preamble.as_deref(),
+                );
+
+                // Build context for the verifier: include previous iteration results
+                let mut verifier_context = verifier_system;
+                if let Some(last_result) = iteration_results.last() {
+                    verifier_context.push_str(&format!(
+                        "\n\n## Previous Iteration ({}) Summary\nWorker action: {}\n",
+                        last_result.iteration,
+                        last_result.worker_summary.as_deref().unwrap_or("(none)"),
+                    ));
+                }
+
+                // Fetch live UI Bridge data for the verifier
+                let ui_context = fetch_verifier_ui_context(
+                    av_config.verifier.use_screenshots,
+                    av_config.verifier.include_console_errors,
+                    av_config.verifier.include_app_health,
+                )
+                .await;
+                if !ui_context.is_empty() {
+                    verifier_context.push_str(&ui_context);
+                }
+
+                // Apply verifier model/provider overrides
+                config.model_override = av_config.verifier.model.clone().or_else(|| original_model_override.clone());
+                config.provider_override = av_config.verifier.provider.clone().or_else(|| original_provider_override.clone());
+
+                // Run verifier through the agentic executor with a verification prompt
+                let verifier_prompt = ExecutionStepConfig {
+                    step_type: "prompt".to_string(),
+                    name: Some(format!(
+                        "Verification Agent (iteration {})",
+                        iteration
+                    )),
+                    prompt_content: Some(verifier_context),
+                    ..ExecutionStepConfig::default()
+                };
+
+                let (outcome, _injected) = self
+                    .agentic_executor
+                    .run_agentic(
+                        config,
+                        iteration,
+                        "", // No failure context — the verifier generates its own
+                        true,
+                        &[verifier_prompt],
+                        logger,
+                    )
+                    .await;
+
+                let verifier_duration = verifier_start.elapsed().as_millis() as u64;
+
+                // Parse the verdict from the AI output
+                let verdict = match &outcome {
+                    AgenticOutcome::Success { output, .. }
+                    | AgenticOutcome::Failed { output, .. } => {
+                        parse_verification_verdict(output)
+                            .unwrap_or_else(|| {
+                                info!("AGENTIC-VERIFICATION: Failed to parse structured verdict, using heuristic");
+                                heuristic_verdict(output)
+                            })
+                    }
+                    AgenticOutcome::Error { error } => {
+                        warn!("AGENTIC-VERIFICATION: Verifier error: {}", error);
+                        VerificationVerdict {
+                            status: VerificationStatus::Fail,
+                            confidence: 0.0,
+                            observations: format!("Verification agent error: {}", error),
+                            next_priority: Some("Retry verification".to_string()),
+                            issues: vec![VerificationIssue {
+                                description: error.clone(),
+                                severity: "critical".to_string(),
+                                suggestion: None,
+                            }],
+                            unreachable: false,
+                            unreachable_reason: None,
+                        }
+                    }
+                    AgenticOutcome::Skipped => {
+                        VerificationVerdict {
+                            status: VerificationStatus::Fail,
+                            confidence: 0.0,
+                            observations: "Verification agent was skipped".to_string(),
+                            next_priority: Some("Configure verification agent".to_string()),
+                            issues: vec![],
+                            unreachable: false,
+                            unreachable_reason: None,
+                        }
+                    }
+                };
+
+                info!(
+                    "AGENTIC-VERIFICATION: Verdict: status={}, confidence={:.0}%, issues={}  ({}ms)",
+                    verdict.status,
+                    verdict.confidence * 100.0,
+                    verdict.issues.len(),
+                    verifier_duration,
+                );
+
+                // Emit verdict to task output
+                if let Err(e) = self.checkpoint_db.append_task_output_ex(
+                    &config.execution_id,
+                    &format!(
+                        "\n--- Verification Agent (iteration {}) ---\nStatus: {}\nConfidence: {:.0}%\nObservations: {}\n",
+                        iteration,
+                        verdict.status,
+                        verdict.confidence * 100.0,
+                        verdict.observations,
+                    ),
+                    false,
+                    false,
+                ) {
+                    warn!("Failed to append verifier output: {}", e);
+                }
+
+                Some((verdict, verifier_duration))
+            } else {
+                None
+            };
+
+            // ── STEP 2: Check if goal achieved ──────────────────────────
+            if let Some((ref v, _)) = verdict {
+                if v.status == VerificationStatus::Pass
+                    && v.confidence >= av_config.confidence_threshold
+                {
+                    consecutive_passes += 1;
+                    if consecutive_passes >= av_config.required_consecutive_passes {
+                        info!(
+                            "AGENTIC-VERIFICATION: Goal achieved after {} iterations ({} consecutive passes)",
+                            iteration, consecutive_passes
+                        );
+                        iteration_results.push(AgenticVerificationIterationResult {
+                            iteration,
+                            verdict: v.clone(),
+                            worker_ran: false,
+                            worker_summary: None,
+                            verifier_duration_ms: verdict.as_ref().map(|(_, d)| *d).unwrap_or(0),
+                            worker_duration_ms: 0,
+                        });
+                        // Canvas: emit iteration panel and exit summary
+                        {
+                            let verifier_ms = verdict.as_ref().map(|(_, d)| *d).unwrap_or(0);
+                            self.canvas_manager.lock().await.on_agentic_verification_iteration(
+                                iteration, v, None, verifier_ms, 0,
+                            ).await;
+                        }
+                        let av_result = AgenticVerificationResult {
+                            iterations_run: iteration,
+                            goal_achieved: true,
+                            unreachable: false,
+                            was_stopped: false,
+                            max_iterations_reached: false,
+                            iteration_results,
+                            final_verdict: Some(v.clone()),
+                        };
+                        self.canvas_manager.lock().await.on_agentic_verification_exit(&av_result).await;
+                        return av_result.to_loop_result();
+                    }
+                } else {
+                    consecutive_passes = 0;
+                }
+
+                // Check unreachable
+                if v.status == VerificationStatus::Unreachable || v.unreachable {
+                    info!(
+                        "AGENTIC-VERIFICATION: Goal deemed unreachable: {}",
+                        v.unreachable_reason.as_deref().unwrap_or("(no reason given)")
+                    );
+                    // Canvas: emit iteration panel for unreachable verdict
+                    {
+                        let verifier_ms = verdict.as_ref().map(|(_, d)| *d).unwrap_or(0);
+                        self.canvas_manager.lock().await.on_agentic_verification_iteration(
+                            iteration, v, None, verifier_ms, 0,
+                        ).await;
+                    }
+                    iteration_results.push(AgenticVerificationIterationResult {
+                        iteration,
+                        verdict: v.clone(),
+                        worker_ran: false,
+                        worker_summary: None,
+                        verifier_duration_ms: verdict.as_ref().map(|(_, d)| *d).unwrap_or(0),
+                        worker_duration_ms: 0,
+                    });
+                    let av_result = AgenticVerificationResult {
+                        iterations_run: iteration,
+                        goal_achieved: false,
+                        unreachable: true,
+                        was_stopped: false,
+                        max_iterations_reached: false,
+                        iteration_results,
+                        final_verdict: Some(v.clone()),
+                    };
+                    self.canvas_manager.lock().await.on_agentic_verification_exit(&av_result).await;
+                    return av_result.to_loop_result();
+                }
+            }
+
+            // ── STEP 3: Worker Agent ────────────────────────────────────
+            // The worker agent receives the verifier's feedback and takes action.
+
+            info!(
+                "AGENTIC-VERIFICATION: Running worker agent (iteration {})",
+                iteration
+            );
+
+            let worker_start = std::time::Instant::now();
+
+            // Apply worker model/provider overrides
+            config.model_override = av_config.worker.model.clone().or_else(|| original_model_override.clone());
+            config.provider_override = av_config.worker.provider.clone().or_else(|| original_provider_override.clone());
+
+            // Build worker context from the verification verdict
+            let worker_failure_context = if let Some((ref v, _)) = verdict {
+                AgenticVerificationPrompts::worker_context_from_verdict(
+                    &goal,
+                    v,
+                    iteration,
+                    max_iterations,
+                )
+            } else {
+                // First iteration without verify_first — just provide the goal
+                format!(
+                    "## Goal\n{}\n\nThis is the first iteration. Assess the current state and take action toward the goal.\n",
+                    goal
+                )
+            };
+
+            let (worker_outcome, _injected_steps) = self
+                .agentic_executor
+                .run_agentic(
+                    config,
+                    iteration,
+                    &worker_failure_context,
+                    has_agentic_steps,
+                    agentic_steps,
+                    logger,
+                )
+                .await;
+
+            let worker_duration = worker_start.elapsed().as_millis() as u64;
+
+            let worker_summary = match &worker_outcome {
+                AgenticOutcome::Success { output, .. } => {
+                    // Extract first 500 chars as summary
+                    let summary = if output.len() > 500 {
+                        format!("{}...", &output[..500])
+                    } else {
+                        output.clone()
+                    };
+                    Some(summary)
+                }
+                AgenticOutcome::Failed { output, error, .. } => {
+                    Some(format!("Failed: {} (output: {}...)", error, &output[..output.len().min(200)]))
+                }
+                AgenticOutcome::Error { error } => {
+                    Some(format!("Error: {}", error))
+                }
+                AgenticOutcome::Skipped => None,
+            };
+
+            info!(
+                "AGENTIC-VERIFICATION: Worker completed in {}ms",
+                worker_duration
+            );
+
+            // ── Record iteration result ─────────────────────────────────
+            let iter_result = AgenticVerificationIterationResult {
+                iteration,
+                verdict: verdict
+                    .as_ref()
+                    .map(|(v, _)| v.clone())
+                    .unwrap_or(VerificationVerdict {
+                        status: VerificationStatus::Partial,
+                        confidence: 0.0,
+                        observations: "No verification performed (first iteration)".to_string(),
+                        next_priority: None,
+                        issues: vec![],
+                        unreachable: false,
+                        unreachable_reason: None,
+                    }),
+                worker_ran: true,
+                worker_summary,
+                verifier_duration_ms: verdict.as_ref().map(|(_, d)| *d).unwrap_or(0),
+                worker_duration_ms: worker_duration,
+            };
+            iteration_results.push(iter_result);
+
+            // Canvas: emit iteration panel and update tracker
+            {
+                let last = iteration_results.last().expect("just pushed");
+                let mut cm = self.canvas_manager.lock().await;
+                cm.on_agentic_verification_iteration(
+                    iteration,
+                    &last.verdict,
+                    last.worker_summary.as_deref(),
+                    last.verifier_duration_ms,
+                    last.worker_duration_ms,
+                ).await;
+                cm.on_agentic_verification_tracker(&iteration_results).await;
+            }
+
+            // Restore original model/provider overrides for next iteration
+            config.model_override = original_model_override.clone();
+            config.provider_override = original_provider_override.clone();
+
+            // Increment session count in DB
+            if let Err(e) = self.checkpoint_db.append_task_output_ex(
+                &config.execution_id,
+                "",
+                true,  // increment_session
+                false, // check_completion_marker
+            ) {
+                warn!("Failed to increment session count: {}", e);
+            }
+        }
+    }
+
+    /// Multi-Agent Pipeline architecture: specialized agents in a DAG-structured pipeline.
+    ///
+    /// Instead of a monolithic verify→fix loop, this architecture:
+    /// 1. Analyzes specs into acceptance criteria with dependency ordering (Spec Analyst)
+    /// 2. Builds an execution DAG from criteria dependencies (deterministic)
+    /// 3. Captures UI state via UI Bridge (Snapshot Agent)
+    /// 4. Maps criteria to code locations (Locator Agent)
+    /// 5. Assigns independent DAG subtrees to parallel Implementer agents
+    /// 6. Verifies each subtree with isolated Verifier agents
+    /// 7. Runs integration verification to catch cross-subtree regressions
+    ///
+    /// Each agent produces a typed, serialized trace (PipelineAgentTrace) that
+    /// enables per-agent autoresearch benchmarking and replay.
+    async fn run_multi_agent_pipeline_loop(
+        &self,
+        config: &mut LoopConfig,
+        verification_steps: &[ExecutionStepConfig],
+        has_agentic_steps: bool,
+        agentic_steps: &[ExecutionStepConfig],
+        _all_step_results: &mut Vec<crate::step_executor::StepExecutionResult>,
+        logger: &StepEventLogger,
+    ) -> LoopResult {
+        use crate::autoresearch::agentic_verification::*;
+
+        let pipeline_config = config
+            .multi_agent_pipeline_config
+            .clone()
+            .unwrap_or_default();
+
+        // Load active prompt variants from the registry (populated by meta-optimizer).
+        // If a variant exists for an agent type, it can be used to customize that agent's behavior.
+        // Currently a no-op until the meta-optimizer populates the registry.
+        let mut active_prompt_variants: std::collections::HashMap<String, String> = {
+            let mut variants = std::collections::HashMap::new();
+            for agent_type in &["spec_analyst", "locator", "implementer", "verifier"] {
+                if let Ok(Some(variant)) = crate::meta_optimizer::prompt_registry::get_active_prompt(
+                    &self.checkpoint_db,
+                    agent_type,
+                ) {
+                    debug!("MULTI-AGENT-PIPELINE: Using prompt variant '{}' v{} for {}",
+                        variant.variant_name, variant.version, agent_type);
+                    variants.insert(agent_type.to_string(), variant.prompt_content);
+                }
+            }
+            variants
+        };
+        if !active_prompt_variants.is_empty() {
+            info!("MULTI-AGENT-PIPELINE: {} active prompt variant(s) loaded from registry",
+                active_prompt_variants.len());
+        }
+
+        // Check for active canary rollouts targeting pipeline agents.
+        // If a canary is active, probabilistically decide whether this run uses the canary config.
+        let active_canary: Option<(String, String)> = { // (canary_id, recommendation_id)
+            match crate::meta_optimizer::canary::get_active_canaries(&self.checkpoint_db) {
+                Ok(canaries) => {
+                    canaries.into_iter().find_map(|c| {
+                        if crate::meta_optimizer::canary::should_apply_canary(
+                            &self.checkpoint_db,
+                            &c.recommendation_id,
+                        ) {
+                            info!("MULTI-AGENT-PIPELINE: Canary rollout {} active for this run ({}%)",
+                                c.id, c.percentage);
+                            Some((c.id, c.recommendation_id))
+                        } else {
+                            None
+                        }
+                    })
+                }
+                Err(_) => None,
+            }
+        };
+        let is_canary_run = active_canary.is_some();
+
+        // For canary runs, load the recommendation's prompt overrides and inject them
+        // into the active_prompt_variants map, replacing any existing variants for those agents.
+        // For baseline runs (non-canary), the existing prompt variants remain as-is.
+        if let Some((_, ref rec_id)) = active_canary {
+            match crate::meta_optimizer::canary::get_canary_prompt_overrides(
+                &self.checkpoint_db,
+                rec_id,
+            ) {
+                Ok(overrides) => {
+                    for (agent_type, prompt_content) in overrides {
+                        info!("MULTI-AGENT-PIPELINE: Canary injecting prompt override for {}", agent_type);
+                        active_prompt_variants.insert(agent_type, prompt_content);
+                    }
+                }
+                Err(e) => {
+                    warn!("MULTI-AGENT-PIPELINE: Failed to load canary prompt overrides: {}", e);
+                }
+            }
+        }
+
+        info!(
+            "MULTI-AGENT-PIPELINE: Starting (max_parallel={}, max_retries={}, dag_strategy={}, level_strategy={}, max_total_iterations={})",
+            pipeline_config.max_parallel_implementers,
+            pipeline_config.max_retries_per_subtree,
+            pipeline_config.dag_strategy,
+            pipeline_config.level_strategy,
+            pipeline_config.max_total_iterations,
+        );
+
+        let mut total_iterations: u32 = 0;
+        let mut agent_traces: Vec<PipelineAgentTrace> = Vec::new();
+
+        // ── Phase 1: Spec Analysis ──────────────────────────────────────
+        // The Spec Analyst agent parses spec files into structured acceptance
+        // criteria with dependency metadata. For now, we derive criteria from
+        // the verification steps (which are already built from specs).
+        info!("MULTI-AGENT-PIPELINE: Phase 1 — Spec Analysis");
+
+        let analyst_start = std::time::Instant::now();
+        let criteria: Vec<PipelineAcceptanceCriterion> = verification_steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| {
+                let step_name = step.name.clone().unwrap_or_else(|| format!("step_{}", i));
+                PipelineAcceptanceCriterion {
+                id: format!("criterion_{}", i),
+                spec_assertion_id: step_name.clone(),
+                spec_group_id: step.id.clone().unwrap_or_default(),
+                description: step_name,
+                criterion_type: "deterministic".to_string(),
+                verification_method: step.step_type.clone(),
+                depends_on: vec![],
+                target_elements: vec![],
+                estimated_complexity: "simple".to_string(),
+                severity: "critical".to_string(),
+                enabled: true,
+            }})
+            .collect();
+        let analyst_duration = analyst_start.elapsed().as_millis() as u64;
+
+        agent_traces.push(PipelineAgentTrace {
+            agent_type: "spec_analyst".to_string(),
+            agent_id: "spec_analyst_0".to_string(),
+            run_id: config.execution_id.clone(),
+            input_snapshot: serde_json::json!({
+                "verification_step_count": verification_steps.len(),
+            }),
+            output_snapshot: serde_json::json!({
+                "criteria_count": criteria.len(),
+            }),
+            config: pipeline_config.spec_analyst.clone(),
+            duration_ms: analyst_duration,
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            downstream_success: None,
+            output_quality_score: None,
+        });
+
+        if criteria.is_empty() {
+            info!("MULTI-AGENT-PIPELINE: No criteria derived — nothing to do");
+            return LoopResult {
+                iterations_run: 0,
+                verification_passed: true,
+                max_iterations_reached: false,
+                critical_failure: false,
+                was_stopped: false,
+                unfixable_errors: false,
+                iteration_results: vec![],
+            };
+        }
+
+        info!(
+            "MULTI-AGENT-PIPELINE: Spec Analyst produced {} criteria in {}ms",
+            criteria.len(),
+            analyst_duration
+        );
+
+        // ── Phase 2: DAG Construction (deterministic) ───────────────────
+        info!("MULTI-AGENT-PIPELINE: Phase 2 — DAG Construction (strategy={})", pipeline_config.dag_strategy);
+
+        // Build a single subtree containing all criteria (flat DAG for initial impl).
+        // The DAG builder will be enhanced to parse depends_on from analyst output.
+        let dag = ExecutionDAG {
+            nodes: criteria
+                .iter()
+                .map(|c| {
+                    (
+                        c.id.clone(),
+                        DAGNode {
+                            criterion_id: c.id.clone(),
+                            dependencies: c.depends_on.clone(),
+                            dependents: vec![],
+                            level: 0,
+                            subtree_id: "subtree_0".to_string(),
+                        },
+                    )
+                })
+                .collect(),
+            roots: criteria.iter().map(|c| c.id.clone()).collect(),
+            levels: vec![criteria.iter().map(|c| c.id.clone()).collect()],
+            subtrees: vec![DAGSubtree {
+                id: "subtree_0".to_string(),
+                root_criteria: criteria.iter().map(|c| c.id.clone()).collect(),
+                all_criteria: criteria.iter().map(|c| c.id.clone()).collect(),
+                max_level: 0,
+                estimated_complexity: "moderate".to_string(),
+            }],
+        };
+
+        info!(
+            "MULTI-AGENT-PIPELINE: DAG has {} subtree(s), {} level(s), {} total nodes",
+            dag.subtrees.len(),
+            dag.levels.len(),
+            dag.nodes.len()
+        );
+
+        // ── Phase 3: Snapshot ───────────────────────────────────────────
+        info!("MULTI-AGENT-PIPELINE: Phase 3 — UI Snapshot (delegated to verification steps)");
+
+        // ── Phase 4: Location (placeholder — full impl will use Locator Agent) ──
+        info!("MULTI-AGENT-PIPELINE: Phase 4 — Code Location (skipped in initial impl)");
+
+        // ── Phase 5: Implementation + Verification per subtree ──────────
+        info!("MULTI-AGENT-PIPELINE: Phase 5 — Implementation + Verification");
+
+        let mut subtree_results: Vec<SubtreeResult> = Vec::new();
+
+        for subtree in &dag.subtrees {
+            if self.is_task_stopped(&config.execution_id) {
+                info!("MULTI-AGENT-PIPELINE: Stopped by user");
+                let result = MultiAgentPipelineResult {
+                    total_iterations,
+                    goal_achieved: false,
+                    was_stopped: true,
+                    max_iterations_reached: false,
+                    subtree_results,
+                    integration_result: None,
+                    agent_traces,
+                    dag: dag.clone(),
+                    total_criteria: criteria.len() as u32,
+                    passed_criteria: 0,
+                    total_tokens: 0,
+                    total_cost_usd: 0.0,
+                };
+                return result.to_loop_result();
+            }
+
+            info!(
+                "MULTI-AGENT-PIPELINE: Processing subtree '{}' ({} criteria)",
+                subtree.id,
+                subtree.all_criteria.len()
+            );
+
+            let mut subtree_level_results: Vec<SubtreeLevelResult> = Vec::new();
+            let mut subtree_all_passed = true;
+            let mut retries_used: u32 = 0;
+
+            // Process levels within this subtree
+            for (level_idx, level_criteria_ids) in dag.levels.iter().enumerate() {
+                // Filter to criteria in this subtree
+                let level_criteria: Vec<&str> = level_criteria_ids
+                    .iter()
+                    .filter(|id| subtree.all_criteria.contains(id))
+                    .map(|s| s.as_str())
+                    .collect();
+
+                if level_criteria.is_empty() {
+                    continue;
+                }
+
+                // Retry loop for this level: implementer + verifier, with retries on failure
+                let mut level_attempt: u32 = 0;
+                let mut level_passed = false;
+                let mut level_criterion_results: Vec<PipelineCriterionResult> = Vec::new();
+                let mut last_implementer_trace: Option<PipelineAgentTrace> = None;
+                let mut last_verifier_trace: Option<PipelineAgentTrace> = None;
+                let mut prior_failure_feedback: Option<String> = None;
+
+                loop {
+                    if total_iterations >= pipeline_config.max_total_iterations {
+                        info!(
+                            "MULTI-AGENT-PIPELINE: Total iteration budget ({}) exhausted",
+                            pipeline_config.max_total_iterations
+                        );
+                        subtree_all_passed = false;
+                        break;
+                    }
+
+                    total_iterations += 1;
+                    level_attempt += 1;
+
+                    // Build failure context, including feedback from prior attempt if retrying
+                    let mut failure_context = format!(
+                        "Multi-Agent Pipeline: Implement criteria at level {} for subtree '{}'. Criteria: {}",
+                        level_idx,
+                        subtree.id,
+                        level_criteria.join(", ")
+                    );
+                    if let Some(ref feedback) = prior_failure_feedback {
+                        failure_context.push_str(&format!(
+                            "\n\n## Previous Attempt Failed (attempt {}/{})\n{}",
+                            level_attempt - 1,
+                            pipeline_config.max_retries_per_subtree + 1,
+                            feedback
+                        ));
+                    }
+
+                    // Inject active prompt variant for implementer if available
+                    if let Some(variant_prompt) = active_prompt_variants.get("implementer") {
+                        failure_context.push_str(&format!(
+                            "\n\n## Agent Instructions (from optimized prompt)\n{}",
+                            variant_prompt
+                        ));
+                    }
+
+                    // ── Implementer phase ────────────────────────────────────
+                    let implementer_start = std::time::Instant::now();
+
+                    let (agentic_outcome, _new_steps) = if has_agentic_steps {
+                        self.agentic_executor
+                            .run_agentic(
+                                config,
+                                total_iterations,
+                                &failure_context,
+                                has_agentic_steps,
+                                agentic_steps,
+                                logger,
+                            )
+                            .await
+                    } else {
+                        (crate::unified_workflow_executor::AgenticOutcome::Skipped, vec![])
+                    };
+
+                    let implementer_duration = implementer_start.elapsed().as_millis() as u64;
+
+                    let implementer_trace = PipelineAgentTrace {
+                        agent_type: "implementer".to_string(),
+                        agent_id: format!("impl_{}_{}_{}", subtree.id, level_idx, level_attempt),
+                        run_id: config.execution_id.clone(),
+                        input_snapshot: serde_json::json!({
+                            "subtree_id": subtree.id,
+                            "level": level_idx,
+                            "attempt": level_attempt,
+                            "criteria": level_criteria,
+                            "has_prior_feedback": prior_failure_feedback.is_some(),
+                        }),
+                        output_snapshot: serde_json::json!({
+                            "outcome": format!("{:?}", agentic_outcome),
+                        }),
+                        config: pipeline_config.implementer.clone(),
+                        duration_ms: implementer_duration,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        cost_usd: 0.0,
+                        downstream_success: None,
+                        output_quality_score: None,
+                    };
+                    agent_traces.push(implementer_trace.clone());
+                    last_implementer_trace = Some(implementer_trace);
+
+                    // ── Verifier phase ───────────────────────────────────────
+                    let verifier_start = std::time::Instant::now();
+
+                    let level_verification_steps: Vec<ExecutionStepConfig> = verification_steps
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| level_criteria.contains(&format!("criterion_{}", i).as_str()))
+                        .map(|(_, step)| step.clone())
+                        .collect();
+
+                    let (verification_result, _step_results) = self
+                        .verification_executor
+                        .run_verification(
+                            &level_verification_steps,
+                            &config.execution_id,
+                            total_iterations,
+                            &config.workflow_name,
+                            logger,
+                            config.stage_index,
+                        )
+                        .await;
+
+                    level_criterion_results = Vec::new();
+                    level_passed = verification_result.all_passed;
+
+                    for step_result in &verification_result.step_results {
+                        let details = step_result
+                            .verification_details
+                            .as_ref()
+                            .and_then(|vd| vd.stdout.as_ref())
+                            .or(step_result.error.as_ref())
+                            .map(|s| s.chars().take(500).collect::<String>())
+                            .unwrap_or_default();
+
+                        level_criterion_results.push(PipelineCriterionResult {
+                            criterion_id: step_result.step_name.clone(),
+                            passed: step_result.success,
+                            method_used: step_result.step_type.clone(),
+                            confidence: if step_result.success { 1.0 } else { 0.0 },
+                            details,
+                            duration_ms: step_result.duration_ms,
+                        });
+                    }
+
+                    let verifier_duration = verifier_start.elapsed().as_millis() as u64;
+
+                    let verifier_trace = PipelineAgentTrace {
+                        agent_type: "verifier".to_string(),
+                        agent_id: format!("verify_{}_{}_{}", subtree.id, level_idx, level_attempt),
+                        run_id: config.execution_id.clone(),
+                        input_snapshot: serde_json::json!({
+                            "subtree_id": subtree.id,
+                            "level": level_idx,
+                            "attempt": level_attempt,
+                            "criteria_count": level_criterion_results.len(),
+                        }),
+                        output_snapshot: serde_json::json!({
+                            "passed": level_passed,
+                            "results": level_criterion_results.len(),
+                        }),
+                        config: pipeline_config.verifier.clone(),
+                        duration_ms: verifier_duration,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        cost_usd: 0.0,
+                        downstream_success: Some(level_passed),
+                        output_quality_score: None,
+                    };
+                    agent_traces.push(verifier_trace.clone());
+                    last_verifier_trace = Some(verifier_trace);
+
+                    // Record canary run outcome if this is a canary run
+                    if let Some((ref canary_id, _)) = active_canary {
+                        let _ = crate::meta_optimizer::canary::record_canary_run(
+                            &self.checkpoint_db,
+                            canary_id,
+                            is_canary_run,
+                            level_passed,
+                            0.0, // cost tracked separately via token usage
+                            (implementer_duration + verifier_duration) as f64,
+                        );
+                    }
+
+                    info!(
+                        "MULTI-AGENT-PIPELINE: Subtree '{}' level {} attempt {} — {} (impl={}ms, verify={}ms)",
+                        subtree.id,
+                        level_idx,
+                        level_attempt,
+                        if level_passed { "PASSED" } else { "FAILED" },
+                        implementer_duration,
+                        verifier_duration,
+                    );
+
+                    if level_passed {
+                        break; // Level succeeded, move to next level
+                    }
+
+                    // Check if we have retries remaining
+                    retries_used += 1;
+                    if retries_used >= pipeline_config.max_retries_per_subtree {
+                        info!(
+                            "MULTI-AGENT-PIPELINE: Level {} exhausted retries ({}/{})",
+                            level_idx,
+                            retries_used,
+                            pipeline_config.max_retries_per_subtree
+                        );
+                        subtree_all_passed = false;
+                        break; // No more retries, move on
+                    }
+
+                    // Build feedback from failed criteria for the next attempt
+                    let failed_criteria: Vec<String> = level_criterion_results
+                        .iter()
+                        .filter(|c| !c.passed)
+                        .map(|c| format!("- {} ({}): {}", c.criterion_id, c.method_used, c.details))
+                        .collect();
+                    prior_failure_feedback = Some(format!(
+                        "The following criteria failed:\n{}",
+                        failed_criteria.join("\n")
+                    ));
+
+                    info!(
+                        "MULTI-AGENT-PIPELINE: Level {} failed, retrying ({}/{} retries used)",
+                        level_idx,
+                        retries_used,
+                        pipeline_config.max_retries_per_subtree
+                    );
+                } // end retry loop
+
+                if !level_passed {
+                    subtree_all_passed = false;
+                }
+
+                subtree_level_results.push(SubtreeLevelResult {
+                    level: level_idx as u32,
+                    implementer_trace: last_implementer_trace.unwrap_or_else(|| PipelineAgentTrace {
+                        agent_type: "implementer".to_string(),
+                        agent_id: format!("impl_{}_{}", subtree.id, level_idx),
+                        run_id: config.execution_id.clone(),
+                        input_snapshot: serde_json::json!(null),
+                        output_snapshot: serde_json::json!(null),
+                        config: pipeline_config.implementer.clone(),
+                        duration_ms: 0,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        cost_usd: 0.0,
+                        downstream_success: None,
+                        output_quality_score: None,
+                    }),
+                    verifier_trace: last_verifier_trace.unwrap_or_else(|| PipelineAgentTrace {
+                        agent_type: "verifier".to_string(),
+                        agent_id: format!("verify_{}_{}", subtree.id, level_idx),
+                        run_id: config.execution_id.clone(),
+                        input_snapshot: serde_json::json!(null),
+                        output_snapshot: serde_json::json!(null),
+                        config: pipeline_config.verifier.clone(),
+                        duration_ms: 0,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        cost_usd: 0.0,
+                        downstream_success: None,
+                        output_quality_score: None,
+                    }),
+                    retries: level_attempt.saturating_sub(1),
+                    passed: level_passed,
+                    criterion_results: level_criterion_results,
+                });
+            }
+
+            subtree_results.push(SubtreeResult {
+                subtree_id: subtree.id.clone(),
+                level_results: subtree_level_results,
+                retries_used,
+                all_passed: subtree_all_passed,
+                regressions: vec![],
+            });
+        }
+
+        // ── Phase 6: Integration Verification ───────────────────────────
+        let integration_result = if pipeline_config.integration_verification {
+            info!("MULTI-AGENT-PIPELINE: Phase 6 — Integration Verification (full spec check)");
+
+            let (int_verification_result, _int_step_results) = self
+                .verification_executor
+                .run_verification(
+                    verification_steps,
+                    &config.execution_id,
+                    total_iterations + 1, // integration is an extra verification pass
+                    &config.workflow_name,
+                    logger,
+                    config.stage_index,
+                )
+                .await;
+
+            let mut integration_criteria: Vec<PipelineCriterionResult> = Vec::new();
+            for step_result in &int_verification_result.step_results {
+                let details = step_result
+                    .verification_details
+                    .as_ref()
+                    .and_then(|vd| vd.stdout.as_ref())
+                    .or(step_result.error.as_ref())
+                    .map(|s| s.chars().take(500).collect::<String>())
+                    .unwrap_or_default();
+
+                integration_criteria.push(PipelineCriterionResult {
+                    criterion_id: step_result.step_name.clone(),
+                    passed: step_result.success,
+                    method_used: step_result.step_type.clone(),
+                    confidence: if step_result.success { 1.0 } else { 0.0 },
+                    details,
+                    duration_ms: step_result.duration_ms,
+                });
+            }
+
+            let int_passed = int_verification_result.all_passed;
+            let int_total = integration_criteria.len();
+            let int_ok = integration_criteria.iter().filter(|c| c.passed).count();
+            info!(
+                "MULTI-AGENT-PIPELINE: Integration verification — {}/{} passed ({})",
+                int_ok,
+                int_total,
+                if int_passed { "ALL PASS" } else { "FAILURES" },
+            );
+
+            Some(integration_criteria)
+        } else {
+            None
+        };
+
+        // ── Build final result ──────────────────────────────────────────
+        let goal_achieved = if let Some(ref int_results) = integration_result {
+            int_results.iter().all(|c| c.passed)
+        } else {
+            subtree_results.iter().all(|s| s.all_passed)
+        };
+
+        let passed_criteria = if let Some(ref int_results) = integration_result {
+            int_results.iter().filter(|c| c.passed).count() as u32
+        } else {
+            subtree_results
+                .iter()
+                .flat_map(|s| s.level_results.iter())
+                .flat_map(|l| l.criterion_results.iter())
+                .filter(|c| c.passed)
+                .count() as u32
+        };
+
+        // Backfill downstream_success on all traces
+        for trace in &mut agent_traces {
+            trace.downstream_success = Some(goal_achieved);
+        }
+
+        let result = MultiAgentPipelineResult {
+            total_iterations,
+            goal_achieved,
+            was_stopped: false,
+            max_iterations_reached: total_iterations >= pipeline_config.max_total_iterations,
+            subtree_results,
+            integration_result,
+            agent_traces,
+            dag,
+            total_criteria: criteria.len() as u32,
+            passed_criteria,
+            total_tokens: 0,
+            total_cost_usd: 0.0,
+        };
+
+        info!(
+            "MULTI-AGENT-PIPELINE: {}",
+            result.summary()
+        );
+
+        // Persist agent traces for meta-optimizer analysis
+        if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_traces(
+            &self.checkpoint_db,
+            &config.execution_id,
+            &result.agent_traces,
+        ) {
+            warn!("Failed to persist pipeline agent traces: {}", e);
+        }
+
+        // Store the full pipeline result in task run result_data for autoresearch retrieval
+        if let Ok(result_json) = serde_json::to_string(&result) {
+            if let Err(e) = self.checkpoint_db.update_task_run_result_data(
+                &config.execution_id,
+                &result_json,
+            ) {
+                warn!("Failed to store pipeline result_data: {}", e);
+            }
+        }
+
+        result.to_loop_result()
+    }
+
     async fn mark_task_completed(&self, execution_id: &str, workflow_id: Option<&str>) {
         if let Err(e) = self.checkpoint_db.complete_task_run(execution_id) {
             error!("Failed to mark task {} as completed: {}", execution_id, e);
@@ -3420,6 +4847,72 @@ impl LoopController {
                     Ok(())
                 });
             });
+
+            // Parse meta-optimizer recommendations from completed output
+            {
+                let db = self.checkpoint_db.clone();
+                let eid = execution_id.to_string();
+                tokio::spawn(async move {
+                    // Check if this task run is a meta-optimizer run
+                    let task_run = match db.get_task_run(&eid) {
+                        Ok(Some(tr)) => tr,
+                        _ => return,
+                    };
+                    if !task_run.is_meta_optimizer {
+                        return;
+                    }
+
+                    // Look up the optimizer_run record by task_run_id
+                    let (optimizer_run_id, optimizer_type) = match db.with_conn({
+                        let eid = eid.clone();
+                        move |conn| {
+                            conn.query_row(
+                                "SELECT id, optimizer_type FROM meta_optimizer_runs WHERE task_run_id = ?1",
+                                rusqlite::params![eid],
+                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                            )
+                            .map_err(|e| format!("Failed to find optimizer run for task {}: {}", eid, e))
+                        }
+                    }) {
+                        Ok((id, ot)) => (id, ot),
+                        Err(e) => {
+                            warn!("Could not find optimizer run for meta-optimizer task {}: {}", eid, e);
+                            return;
+                        }
+                    };
+
+                    // Parse recommendations from the output
+                    let output = &task_run.output_log;
+                    match crate::meta_optimizer::parser::save_parsed_recommendations(
+                        &db,
+                        &optimizer_type,
+                        Some(&optimizer_run_id),
+                        output,
+                    ) {
+                        Ok(count) => {
+                            info!(
+                                "Meta-optimizer {}: parsed {} recommendation(s) from task {}",
+                                optimizer_type, count, eid
+                            );
+                            // Complete the optimizer run record
+                            if let Err(e) = crate::meta_optimizer::recommendations::complete_optimizer_run(
+                                &db,
+                                &optimizer_run_id,
+                                0, // runs_analyzed is not tracked here
+                                count as i64,
+                            ) {
+                                warn!("Failed to complete optimizer run {}: {}", optimizer_run_id, e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to parse meta-optimizer recommendations for task {}: {}",
+                                eid, e
+                            );
+                        }
+                    }
+                });
+            }
 
             // Check workflow chain triggers
             if let Some(wf_id) = workflow_id {
@@ -3778,6 +5271,168 @@ impl LoopController {
     /// The sweep exits when:
     /// - The AI outputs `[NO_MORE_STEPS]` (all work is complete)
     /// - Max sweep iterations are reached
+    ///
+    /// Multi-agent fix: triage verification failures, then spawn specialized
+    /// fix agents for each failure group with targeted verification between fixes.
+    ///
+    /// Returns Some((outcome, injected_steps)) on success, None if triage fails
+    /// and we should fall back to the standard monolithic session.
+    async fn run_multi_agent_fix(
+        &self,
+        config: &LoopConfig,
+        iteration: u32,
+        failure_context: &str,
+        verification_result: &crate::step_executor::VerificationPhaseResult,
+        all_verification_steps: &[crate::step_executor::ExecutionStepConfig],
+        logger: &StepEventLogger,
+    ) -> Option<(super::types::AgenticOutcome, Vec<crate::step_executor::ExecutionStepConfig>)> {
+        use super::multi_agent_fixer::*;
+
+        // Step 1: Triage — classify failures
+        let triage_prompt = build_triage_prompt(failure_context, &verification_result.step_results);
+
+        let triage_result = match self.agentic_executor.run_triage_prompt(
+            &triage_prompt,
+            config.resolve_model_for_phase("verification"), // Use fast model for triage
+        ).await {
+            Ok(response) => {
+                match parse_triage_response(&response) {
+                    Ok(result) => {
+                        info!(
+                            "MULTI-AGENT: Triage classified {} failure group(s): {}",
+                            result.groups.len(),
+                            result.summary
+                        );
+                        result
+                    }
+                    Err(e) => {
+                        warn!("MULTI-AGENT: Triage parse failed ({}), using deterministic fallback", e);
+                        deterministic_triage(&verification_result.step_results)
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("MULTI-AGENT: Triage prompt failed ({}), using deterministic fallback", e);
+                deterministic_triage(&verification_result.step_results)
+            }
+        };
+
+        if triage_result.groups.is_empty() {
+            warn!("MULTI-AGENT: Triage produced no failure groups, falling back");
+            return None;
+        }
+
+        // Step 2: Execute fix agents in dependency order
+        let mut all_outputs = Vec::new();
+        let mut fixed_groups: Vec<String> = Vec::new();
+
+        for group_id in &triage_result.execution_order {
+            let group = match triage_result.groups.iter().find(|g| &g.id == group_id) {
+                Some(g) => g,
+                None => continue,
+            };
+
+            // Skip cascading failures whose dependencies haven't been fixed
+            if group.failure_type == FailureType::Cascading {
+                let deps_fixed = group.blocked_by.iter().all(|dep| fixed_groups.contains(dep));
+                if !deps_fixed {
+                    info!(
+                        "MULTI-AGENT: Skipping cascading group '{}' (dependencies not yet fixed)",
+                        group.id
+                    );
+                    continue;
+                }
+            }
+
+            // Build focused prompt based on failure type
+            let group_failure_context = extract_group_failure_context(group, &verification_result.step_results);
+
+            let working_dir = config.project_path.as_deref();
+
+            let prompt = match group.failure_type {
+                FailureType::LintFormat | FailureType::Compilation => {
+                    build_quick_fix_prompt(group, &group_failure_context, working_dir)
+                }
+                _ => {
+                    build_feature_fix_prompt(
+                        group,
+                        &group_failure_context,
+                        &config.base_prompt,
+                        working_dir,
+                    )
+                }
+            };
+
+            // Run the focused fix agent
+            let agent_label = format!("fix-{}", group.id);
+            let (success, output, duration_ms) = self.agentic_executor.run_focused_session(
+                &config.execution_id,
+                &config.workflow_name,
+                iteration,
+                &agent_label,
+                &prompt,
+                config.resolve_model_for_phase("agentic"),
+                logger,
+            ).await;
+
+            info!(
+                "MULTI-AGENT: Fix agent '{}' completed in {}ms (success={})",
+                group.id, duration_ms, success
+            );
+
+            // Run targeted verification for this group's steps
+            let targeted_result = self.verification_executor.run_targeted_verification(
+                all_verification_steps,
+                &group.step_indices,
+                &config.execution_id,
+                iteration,
+                &config.workflow_name,
+            ).await;
+
+            let group_passed = targeted_result.all_passed;
+            if group_passed {
+                info!("MULTI-AGENT: Group '{}' — targeted verification PASSED", group.id);
+                fixed_groups.push(group.id.clone());
+            } else {
+                info!(
+                    "MULTI-AGENT: Group '{}' — targeted verification FAILED ({}/{} passed)",
+                    group.id, targeted_result.passed_steps, targeted_result.total_steps
+                );
+            }
+
+            all_outputs.push(format!(
+                "## Fix Agent: {} ({})\nSuccess: {}\nVerification: {}\n\n{}",
+                group.id,
+                group.failure_type,
+                success,
+                if group_passed { "PASSED" } else { "FAILED" },
+                &output[..output.len().min(2000)],
+            ));
+        }
+
+        // Build aggregate outcome
+        let combined_output = format!(
+            "# Multi-Agent Fix Results (iteration {})\n\nGroups fixed: {}/{}\n\n{}",
+            iteration,
+            fixed_groups.len(),
+            triage_result.groups.len(),
+            all_outputs.join("\n---\n\n"),
+        );
+
+        let outcome = if !combined_output.is_empty() {
+            super::types::AgenticOutcome::Success {
+                output: combined_output,
+                parsed: None,
+            }
+        } else {
+            super::types::AgenticOutcome::Error {
+                error: "Multi-agent fix produced no output".to_string(),
+            }
+        };
+
+        Some((outcome, Vec::new()))
+    }
+
     /// - The task is stopped externally
     /// - An AI session fails
     // Note: Sweep results are intentionally not added to all_step_results.
@@ -3963,6 +5618,16 @@ pub struct WorkflowResult {
     pub duration_ms: u64,
     /// Loop result (if the loop ran)
     pub loop_result: Option<LoopResult>,
+    /// Worktree info (if workflow ran in a worktree)
+    pub worktree_path: Option<String>,
+    /// Worktree branch name (if workflow ran in a worktree)
+    pub worktree_branch: Option<String>,
+    /// Workflow architecture used (traditional, agentic_verification, or multi_agent_pipeline).
+    pub workflow_architecture: Option<crate::autoresearch::agentic_verification::WorkflowArchitecture>,
+    /// Agentic verification config (if agentic verification was used).
+    pub agentic_verification_config: Option<crate::autoresearch::agentic_verification::AgenticVerificationConfig>,
+    /// Multi-agent pipeline config (if multi-agent pipeline was used).
+    pub multi_agent_pipeline_config: Option<crate::autoresearch::agentic_verification::MultiAgentPipelineConfig>,
 }
 
 impl WorkflowResult {
@@ -4310,6 +5975,13 @@ pub async fn resume_interrupted_workflows(
                                 verification_history: std::collections::HashMap::new(),
                                 routing_context: Default::default(),
                                 project_path: crate::mcp::shared::current_project_path(),
+            multi_agent_mode: false,
+            use_worktree: false,
+            worktree_path: None,
+            worktree_branch: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
                                 acceptance_criteria: workflow.acceptance_criteria.clone(),
                             };
 
@@ -4505,6 +6177,13 @@ pub async fn resume_interrupted_workflows(
                                 cross_workflow_learning: true,
                                 verification_history: std::collections::HashMap::new(),
                                 routing_context: Default::default(),
+            multi_agent_mode: false,
+            use_worktree: false,
+            worktree_path: None,
+            worktree_branch: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
                                 project_path: crate::mcp::shared::current_project_path(),
                                 acceptance_criteria: workflow.acceptance_criteria.clone(),
                             };
@@ -4896,6 +6575,325 @@ pub fn extract_prompt_steps_with_phase(
             Some(config)
         })
         .collect()
+}
+
+// =============================================================================
+// Verifier UI Context (Snapshot, Console Errors, App Health)
+// =============================================================================
+
+/// Fetch live UI Bridge data for the agentic verification loop's verifier.
+///
+/// Concurrently fetches the UI snapshot, console errors, and app health status.
+/// Each fetch is gated by its corresponding config flag and is best-effort:
+/// failures are silently ignored (the SDK app may not be connected).
+async fn fetch_verifier_ui_context(
+    use_screenshots: bool,
+    include_console_errors: bool,
+    include_app_health: bool,
+) -> String {
+    if !use_screenshots && !include_console_errors && !include_app_health {
+        return String::new();
+    }
+
+    let port = MCP_API_PORT;
+
+    // Build futures for each data source (no-ops when disabled)
+    let snapshot_fut = async {
+        if !use_screenshots {
+            return None;
+        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()?;
+        let url = format!(
+            "http://127.0.0.1:{}/ui-bridge/sdk/control/snapshot",
+            port
+        );
+        let resp = client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<serde_json::Value>().await.ok()
+    };
+
+    let console_fut = async {
+        if !include_console_errors {
+            return Vec::new();
+        }
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let control_url = format!(
+            "http://127.0.0.1:{}/ui-bridge/control/console-errors?limit=50",
+            port
+        );
+        let sdk_url = format!(
+            "http://127.0.0.1:{}/ui-bridge/sdk/console-errors?limit=50",
+            port
+        );
+        let (control_result, sdk_result) = tokio::join!(
+            client.get(&control_url).send(),
+            client.get(&sdk_url).send(),
+        );
+        let mut all_errors: Vec<serde_json::Value> = Vec::new();
+        for result in [control_result, sdk_result] {
+            if let Ok(response) = result {
+                if response.status().is_success() {
+                    if let Ok(body) = response.json::<serde_json::Value>().await {
+                        if let Some(errors) = body.get("errors").and_then(|v| v.as_array()) {
+                            all_errors.extend(errors.iter().cloned());
+                        } else if let Some(data) = body.get("data") {
+                            if let Some(errors) = data.get("errors").and_then(|v| v.as_array()) {
+                                all_errors.extend(errors.iter().cloned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        all_errors
+    };
+
+    let health_fut = async {
+        if !include_app_health {
+            return None;
+        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()?;
+        let url = format!("http://127.0.0.1:{}/ui-bridge/sdk/health", port);
+        let resp = client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = resp.json().await.ok()?;
+        body.get("data").cloned()
+    };
+
+    // Fetch all concurrently
+    let (snapshot, console_errors, health) =
+        tokio::join!(snapshot_fut, console_fut, health_fut);
+
+    let mut sections = String::new();
+
+    // ── Format snapshot ──
+    if let Some(snap) = snapshot {
+        sections.push_str("\n\n## Current UI State (Snapshot)\n");
+
+        // Page context
+        if let Some(page) = snap.get("pageContext") {
+            if let Some(url) = page.get("url").and_then(|v| v.as_str()) {
+                sections.push_str(&format!("**Page URL:** {}\n", url));
+            }
+            if let Some(title) = page.get("title").and_then(|v| v.as_str()) {
+                sections.push_str(&format!("**Page Title:** {}\n", title));
+            }
+            if let Some(route) = page.get("route").and_then(|v| v.as_str()) {
+                sections.push_str(&format!("**Route:** {}\n", route));
+            }
+        }
+
+        // Viewport
+        if let Some(viewport) = snap.get("viewport") {
+            if let (Some(w), Some(h)) = (
+                viewport.get("width").and_then(|v| v.as_u64()),
+                viewport.get("height").and_then(|v| v.as_u64()),
+            ) {
+                sections.push_str(&format!("**Viewport:** {}x{}\n", w, h));
+            }
+        }
+
+        // Error summary
+        if let Some(errors) = snap.get("errorSummary") {
+            let count = errors
+                .get("count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if count > 0 {
+                sections.push_str(&format!("**Errors:** {} error(s) detected\n", count));
+                if let Some(items) = errors.get("errors").and_then(|v| v.as_array()) {
+                    for item in items.iter().take(5) {
+                        if let Some(msg) = item.get("message").and_then(|v| v.as_str()) {
+                            sections.push_str(&format!("  - {}\n", msg));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Modals
+        if let Some(modals) = snap.get("modals").and_then(|v| v.as_array()) {
+            if !modals.is_empty() {
+                sections.push_str(&format!("**Active Modals:** {}\n", modals.len()));
+                for modal in modals.iter().take(3) {
+                    if let Some(title) = modal.get("title").and_then(|v| v.as_str()) {
+                        sections.push_str(&format!("  - {}\n", title));
+                    }
+                }
+            }
+        }
+
+        // Toasts
+        if let Some(toasts) = snap.get("toasts").and_then(|v| v.as_array()) {
+            if !toasts.is_empty() {
+                sections.push_str(&format!("**Active Toasts:** {}\n", toasts.len()));
+                for toast in toasts.iter().take(3) {
+                    let msg = toast
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no message)");
+                    let level = toast
+                        .get("type")
+                        .or_else(|| toast.get("level"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("info");
+                    sections.push_str(&format!("  - [{}] {}\n", level, msg));
+                }
+            }
+        }
+
+        // Interactive elements (summarized)
+        if let Some(elements) = snap.get("elements").and_then(|v| v.as_array()) {
+            let interactive: Vec<_> = elements
+                .iter()
+                .filter(|el| {
+                    let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    matches!(
+                        el_type,
+                        "button"
+                            | "input"
+                            | "select"
+                            | "textarea"
+                            | "link"
+                            | "checkbox"
+                            | "radio"
+                    )
+                })
+                .collect();
+
+            if !interactive.is_empty() {
+                sections.push_str(&format!(
+                    "**Interactive Elements:** {} total\n",
+                    interactive.len()
+                ));
+                for el in interactive.iter().take(20) {
+                    let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                    let label = el
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| {
+                            el.get("state")
+                                .and_then(|s| s.get("text"))
+                                .and_then(|v| v.as_str())
+                        })
+                        .unwrap_or("(unlabeled)");
+                    let state = el.get("state");
+                    let visible = state
+                        .and_then(|s| s.get("visible"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let enabled = state
+                        .and_then(|s| s.get("enabled"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let state_flags = match (visible, enabled) {
+                        (true, true) => "",
+                        (true, false) => " [disabled]",
+                        (false, true) => " [hidden]",
+                        (false, false) => " [hidden, disabled]",
+                    };
+                    sections.push_str(&format!("  - [{}] {}{}\n", el_type, label, state_flags));
+                }
+                if interactive.len() > 20 {
+                    sections.push_str(&format!(
+                        "  - ... and {} more\n",
+                        interactive.len() - 20
+                    ));
+                }
+            }
+        }
+    }
+
+    // ── Format console errors ──
+    if !console_errors.is_empty() {
+        sections.push_str(&format!(
+            "\n\n## Console Errors ({} total)\n",
+            console_errors.len()
+        ));
+        for (i, err) in console_errors.iter().take(10).enumerate() {
+            let msg = err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .or_else(|| err.as_str())
+                .unwrap_or("(unknown error)");
+            let source = err.get("source").and_then(|v| v.as_str()).unwrap_or("");
+            if source.is_empty() {
+                sections.push_str(&format!("{}. {}\n", i + 1, msg));
+            } else {
+                sections.push_str(&format!("{}. {} ({})\n", i + 1, msg, source));
+            }
+        }
+        if console_errors.len() > 10 {
+            sections.push_str(&format!(
+                "... and {} more errors\n",
+                console_errors.len() - 10
+            ));
+        }
+    }
+
+    // ── Format app health ──
+    if let Some(health_data) = health {
+        sections.push_str("\n\n## App Health\n");
+        let status = health_data
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let score = health_data
+            .get("score")
+            .and_then(|v| v.as_u64())
+            .map(|s| format!("{}", s))
+            .unwrap_or_else(|| "N/A".to_string());
+        sections.push_str(&format!("**Status:** {} (score: {})\n", status, score));
+
+        if let Some(summary) = health_data.get("summary").and_then(|v| v.as_str()) {
+            sections.push_str(&format!("**Summary:** {}\n", summary));
+        }
+        if let Some(top_issue) = health_data.get("topIssue") {
+            if let Some(msg) = top_issue.get("message").and_then(|v| v.as_str()) {
+                let severity = top_issue
+                    .get("severity")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("error");
+                sections.push_str(&format!("**Top Issue:** [{}] {}\n", severity, msg));
+            }
+        }
+        if let Some(breakdown) = health_data.get("breakdown").and_then(|v| v.as_object()) {
+            sections.push_str("**Breakdown:**\n");
+            for (category, detail) in breakdown {
+                let cat_status = detail
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let cat_score = detail
+                    .get("score")
+                    .and_then(|v| v.as_u64())
+                    .map(|s| format!("{}", s))
+                    .unwrap_or_else(|| "?".to_string());
+                sections.push_str(&format!(
+                    "  - {}: {} (score: {})\n",
+                    category, cat_status, cat_score
+                ));
+            }
+        }
+    }
+
+    sections
 }
 
 // =============================================================================

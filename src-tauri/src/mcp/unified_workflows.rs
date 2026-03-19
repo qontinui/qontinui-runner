@@ -1148,6 +1148,13 @@ pub async fn generate_unified_workflow_async_handler(
             approval_gate: saved_workflow.approval_gate,
             max_context_tokens: 100_000,
             cross_workflow_learning: true,
+            multi_agent_mode: saved_workflow.multi_agent_mode,
+            use_worktree: saved_workflow.use_worktree,
+            worktree_path: None,
+            worktree_branch: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
@@ -1225,6 +1232,11 @@ pub struct RunUnifiedWorkflowRequest {
     /// When true, creates a new execution_id instead of resuming.
     #[serde(default)]
     force_fresh_start: bool,
+    /// Optional config overrides for autoresearch experiments.
+    /// Applied to the LoopConfig before execution: model, max_iterations,
+    /// multi_agent_mode, max_context_tokens.
+    #[serde(default)]
+    overrides: Option<serde_json::Value>,
 }
 
 /// Response body for running a unified workflow (non-blocking)
@@ -1486,7 +1498,7 @@ pub async fn run_unified_workflow(
         // For error-fix workflows, run agentic first
         let run_agentic_first = !workflow.targeted_error_ids.is_empty();
 
-        let loop_config = crate::unified_workflow_executor::LoopConfig {
+        let mut loop_config = crate::unified_workflow_executor::LoopConfig {
             max_iterations: workflow.max_iterations,
             base_prompt: combined_prompt,
             workflow_name: workflow.name.clone(),
@@ -1511,12 +1523,57 @@ pub async fn run_unified_workflow(
             auto_run_generated: false,
             approval_gate: workflow.approval_gate,
             max_context_tokens: 100_000,
+            multi_agent_mode: workflow.multi_agent_mode,
+            use_worktree: workflow.use_worktree,
+            worktree_path: None,
+            worktree_branch: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
             cross_workflow_learning: true,
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
             acceptance_criteria: workflow.acceptance_criteria.clone(),
         };
+
+        // Apply autoresearch overrides if present
+        if let Some(ref overrides) = request.overrides {
+            if let Some(model) = overrides.get("model").and_then(|v| v.as_str()) {
+                loop_config.model_override = Some(model.to_string());
+            }
+            if let Some(max_iter) = overrides.get("max_iterations").and_then(|v| v.as_u64()) {
+                loop_config.max_iterations = max_iter as u32;
+            }
+            if let Some(multi) = overrides.get("multi_agent_mode").and_then(|v| v.as_bool()) {
+                loop_config.multi_agent_mode = multi;
+            }
+            if let Some(tokens) = overrides.get("max_context_tokens").and_then(|v| v.as_u64()) {
+                loop_config.max_context_tokens = tokens as usize;
+            }
+            if let Some(arch) = overrides.get("workflow_architecture") {
+                if let Ok(parsed) = serde_json::from_value::<crate::autoresearch::agentic_verification::WorkflowArchitecture>(arch.clone()) {
+                    loop_config.workflow_architecture = Some(parsed);
+                }
+            }
+            if let Some(av_config) = overrides.get("agentic_verification_config") {
+                if let Ok(parsed) = serde_json::from_value::<crate::autoresearch::agentic_verification::AgenticVerificationConfig>(av_config.clone()) {
+                    loop_config.agentic_verification_config = Some(parsed);
+                }
+            }
+            if let Some(map_config) = overrides.get("multi_agent_pipeline_config") {
+                if let Ok(parsed) = serde_json::from_value::<crate::autoresearch::agentic_verification::MultiAgentPipelineConfig>(map_config.clone()) {
+                    loop_config.multi_agent_pipeline_config = Some(parsed);
+                }
+            }
+            if let Some(wt) = overrides.get("use_worktree").and_then(|v| v.as_bool()) {
+                loop_config.use_worktree = wt;
+            }
+            info!(
+                "Applied autoresearch overrides to loop_config: {}",
+                overrides
+            );
+        }
 
         let checkpoint_db = state.app_state.checkpoint_db.clone();
         let execution_id_for_guard = execution_id.clone();
@@ -1825,6 +1882,8 @@ pub async fn execute_inline_workflow(
         quality_report: None,
         acceptance_criteria: None,
         ai_reviewed: true,
+        multi_agent_mode: true,
+        use_worktree: false,
         model_overrides: std::collections::HashMap::new(),
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -1946,6 +2005,13 @@ pub async fn execute_inline_workflow(
             stage_index: None,
             max_sessions: Some(workflow.max_iterations),
             auto_run_generated: false,
+            multi_agent_mode: workflow.multi_agent_mode,
+            use_worktree: workflow.use_worktree,
+            worktree_path: None,
+            worktree_branch: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
             approval_gate: workflow.approval_gate,
             max_context_tokens: 100_000,
             cross_workflow_learning: true,
@@ -2384,6 +2450,13 @@ pub async fn run_composed_workflow(
                 model_overrides: std::collections::HashMap::new(),
                 stage_index: None,
                 max_sessions: Some(10), // Default budget for composed workflows
+                multi_agent_mode: true,
+                use_worktree: false,
+                worktree_path: None,
+                worktree_branch: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
                 auto_run_generated: false,
                 approval_gate: false,
                 max_context_tokens: 100_000,

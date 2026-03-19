@@ -63,6 +63,7 @@ mod canvas_panels;
 pub mod conditional_routing;
 pub mod convergence;
 mod loop_controller;
+pub mod multi_agent_fixer;
 pub mod output_parser;
 mod phase_configs;
 mod phases;

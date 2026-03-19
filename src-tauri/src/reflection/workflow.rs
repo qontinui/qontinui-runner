@@ -76,6 +76,14 @@ pub fn enrich_project_context(shared_vars: &SharedVariableStore, project_path: O
             "No project path available — cannot generate directory tree.".to_string(),
         );
     }
+
+    // Set runner API URL so prompts don't hardcode port 9876
+    if shared_vars.get("runner_api_url").is_none() {
+        shared_vars.set(
+            "runner_api_url",
+            crate::mcp::types::get_self_base_url_from_env(),
+        );
+    }
 }
 
 /// Enrich shared variables with pre-loaded file contents and project structure
@@ -312,7 +320,7 @@ fn pre_read_files(paths: &[PathBuf]) -> String {
 
 /// Generate a condensed indented file tree for the project.
 /// Depth limit: 4, max entries: 500.
-fn generate_file_tree(root: &str) -> String {
+pub fn generate_file_tree(root: &str) -> String {
     let root_path = Path::new(root);
     if !root_path.is_dir() {
         return String::new();
@@ -426,6 +434,13 @@ pub fn build_reflection_config(
         routing_context: Default::default(),
         project_path: crate::mcp::shared::current_project_path(),
         acceptance_criteria: None,
+            multi_agent_mode: false,
+            use_worktree: false,
+            worktree_path: None,
+            worktree_branch: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
     }
 }
 
@@ -820,7 +835,7 @@ New: Added workspace_root variable to setup phase
 ### API Fallback
 
 If you need to make HTTP calls directly (e.g., to evaluate previous fix effectiveness),
-use the `api_request` MCP tool to call the runner API at http://localhost:9876.
+use the `api_request` MCP tool to call the runner API at {{runner_api_url}}.
 
 ## Analysis Steps
 
@@ -907,7 +922,7 @@ New: Added rule: use prompt steps when the task requires AI reasoning/analysis; 
 ### API Fallback
 
 If you need to make HTTP calls directly (e.g., to evaluate previous fix effectiveness),
-use the `api_request` MCP tool to call the runner API at http://localhost:9876.
+use the `api_request` MCP tool to call the runner API at {{runner_api_url}}.
 
 ## Analysis Steps
 
@@ -1009,6 +1024,13 @@ pub fn build_project_reflection_config(
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
         project_path,
+            multi_agent_mode: false,
+            use_worktree: false,
+            worktree_path: None,
+            worktree_branch: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
         acceptance_criteria: None,
     }
 }
@@ -1374,6 +1396,13 @@ pub fn build_ui_bridge_reflection_config(
         cross_workflow_learning: true,
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
+            multi_agent_mode: false,
+            use_worktree: false,
+            worktree_path: None,
+            worktree_branch: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
         project_path: crate::mcp::shared::current_project_path(),
         acceptance_criteria: None,
     }
@@ -1717,7 +1746,7 @@ For each UI Bridge failure (deterministic or AI-driven):
 ### Q3: Infrastructure Health Check
 Before assuming failures are workflow-level issues, check whether the SDK infrastructure itself is working:
 - **Web relay health**: `curl http://localhost:3001/api/ui-bridge/health` — is a browser tab connected? Are there SSE listeners?
-- **Runner health**: `curl http://localhost:9876/ui-bridge/health` — is the app responsive?
+- **Runner health**: `curl {{runner_api_url}}/ui-bridge/health` — is the app responsive?
 - **Element registration**: Do snapshots return elements? If 0 elements despite a connected browser, the issue is in the SDK, not the workflow.
 - **Command round-trip**: Are commands sent via SSE/WebSocket getting responses from the browser? Check response times — if snapshot takes >2s, the browser may not be responding (timeout + fallback to empty cache).
 - **Component lifecycle**: Are expected components registered? Components only exist when their page is mounted.

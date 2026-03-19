@@ -293,6 +293,7 @@ pub fn record_task_outcome(
         None, // error_type - not in TaskOutcome
         error_message.as_deref(),
         feedback_json.as_ref(),
+        outcome.workflow_architecture.as_deref(),
     )?;
 
     Ok(())
@@ -379,6 +380,7 @@ pub fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), S
             None,
             None,
             None,
+            None,
         )?;
     }
 
@@ -396,6 +398,7 @@ pub fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), S
             None,
             Some("verification"),
             Some("Verification failed"),
+            None,
             None,
         )?;
     }

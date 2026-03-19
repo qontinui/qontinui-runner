@@ -14,9 +14,10 @@
 use crate::ai_router::{TaskContext, TaskRouter};
 use crate::config_facade::ai_keychain;
 use crate::doctor::{DoctorHandle, ProcessRegistration, ProcessType};
-use crate::settings::{self, AiProvider, CliExecutionMode};
+use crate::settings::{self, AccountSelectionMode, AiProvider, CliExecutionMode};
 use crate::str_utils::truncate_str;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -25,6 +26,34 @@ const MAX_AI_RETRIES: u32 = 3;
 
 /// Base backoff delay in milliseconds (doubles each retry: 2s, 4s, 8s).
 const BASE_BACKOFF_MS: u64 = 2000;
+
+/// Cached resolved config dir for least-usage account selection.
+/// Set by `set_resolved_config_dir` at startup or when usage is checked.
+static RESOLVED_CONFIG_DIR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Set the resolved config directory (called after usage check).
+pub fn set_resolved_config_dir(dir: Option<String>) {
+    if let Ok(mut cached) = RESOLVED_CONFIG_DIR.lock() {
+        info!("Setting resolved config dir: {:?}", dir);
+        *cached = dir;
+    }
+}
+
+/// Get the effective config directory, considering account selection mode.
+pub fn get_effective_config_dir(cli_settings: &settings::ClaudeCliSettings) -> Option<String> {
+    match cli_settings.account_selection_mode {
+        AccountSelectionMode::LeastUsage => {
+            if let Ok(cached) = RESOLVED_CONFIG_DIR.lock() {
+                if cached.is_some() {
+                    return cached.clone();
+                }
+            }
+            // Fallback to manual config_dir if no resolved dir
+            cli_settings.config_dir.clone()
+        }
+        AccountSelectionMode::Manual => cli_settings.config_dir.clone(),
+    }
+}
 
 /// Result of running an AI prompt
 #[derive(Debug, Clone)]
@@ -620,7 +649,8 @@ fn run_claude_cli(
     };
 
     let claude_program = settings.custom_path.as_deref().unwrap_or("claude");
-    let config_dir = settings.config_dir.as_deref();
+    let effective_dir = get_effective_config_dir(settings);
+    let config_dir = effective_dir.as_deref();
 
     info!(
         "Running Claude CLI (mode: {:?}, program: {}, config_dir: {:?}, model_override: {:?}, prompt_len: {})",

@@ -95,6 +95,7 @@ export type UpdateStatus = "idle" | "checking" | "downloading" | "installing" | 
 export type AiProvider = "claude_cli" | "claude_api" | "gemini_cli" | "gemini_api";
 export type CliExecutionMode = "auto" | "windows_native" | "wsl" | "native";
 export type GeminiAuthMethod = "oauth" | "api_key";
+export type AccountSelectionMode = "manual" | "least_usage";
 
 export interface ClaudeCliSettings {
   execution_mode: CliExecutionMode;
@@ -102,6 +103,18 @@ export interface ClaudeCliSettings {
   timeout_seconds: number;
   /** Custom CLAUDE_CONFIG_DIR for multi-account support */
   config_dir?: string;
+  /** How to select which account to use when multiple config dirs exist */
+  account_selection_mode?: AccountSelectionMode;
+}
+
+export interface AccountUsageInfo {
+  config_dir: string;
+  label: string;
+  utilization: number;
+  rate_limit_type: string | null;
+  resets_at: number | null;
+  status: string | null;
+  error: string | null;
 }
 
 export interface ClaudeApiSettings {

@@ -4132,6 +4132,7 @@ dependencies = [
  "dirs 5.0.1",
  "erased-serde",
  "flate2",
+ "futures",
  "futures-util",
  "glob",
  "glob-match",

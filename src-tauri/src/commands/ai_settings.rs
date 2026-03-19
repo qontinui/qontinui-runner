@@ -9,8 +9,8 @@ use crate::ai_router::RoutingConfig;
 use crate::config_facade::ai_keychain;
 use crate::orchestrator::{CompressionConfig, RetryConfig};
 use crate::settings::{
-    self, AiProvider, AiSettings, ClaudeApiSettings, ClaudeCliSettings, CliExecutionMode,
-    GeminiApiSettings, GeminiAuthMethod, GeminiCliSettings,
+    self, AccountSelectionMode, AiProvider, AiSettings, ClaudeApiSettings, ClaudeCliSettings,
+    CliExecutionMode, GeminiApiSettings, GeminiAuthMethod, GeminiCliSettings,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -101,14 +101,15 @@ pub fn save_ai_settings(
     custom_path: Option<String>,
     timeout_seconds: u64,
     config_dir: Option<String>,
+    account_selection_mode: Option<String>,
     model: String,
     max_tokens: u32,
     auto_refine_video_after_iterations: Option<u32>,
     interactive_sessions_enabled: Option<bool>,
 ) -> Result<CommandResponse, String> {
     info!(
-        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, video_after_iterations={:?}, interactive={:?}",
-        provider, execution_mode, timeout_seconds, config_dir, auto_refine_video_after_iterations, interactive_sessions_enabled
+        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, account_selection={:?}, video_after_iterations={:?}, interactive={:?}",
+        provider, execution_mode, timeout_seconds, config_dir, account_selection_mode, auto_refine_video_after_iterations, interactive_sessions_enabled
     );
 
     let ai_provider = match provider.as_str() {
@@ -130,6 +131,11 @@ pub fn save_ai_settings(
     // Get existing settings to preserve Gemini configuration when saving Claude settings
     let existing_settings = settings::get_ai_settings();
 
+    let selection_mode = match account_selection_mode.as_deref() {
+        Some("least_usage") => AccountSelectionMode::LeastUsage,
+        _ => AccountSelectionMode::Manual,
+    };
+
     let ai_settings = AiSettings {
         provider: ai_provider,
         claude_cli: ClaudeCliSettings {
@@ -137,6 +143,7 @@ pub fn save_ai_settings(
             custom_path,
             timeout_seconds,
             config_dir,
+            account_selection_mode: selection_mode,
         },
         claude_api: ClaudeApiSettings { model, max_tokens },
         // Preserve existing Gemini settings
@@ -755,6 +762,224 @@ pub fn save_agentic_settings(
 }
 
 // ============================================================================
+// Multi-Account Usage Check
+// ============================================================================
+
+/// Usage information for a single Claude account
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AccountUsageInfo {
+    pub config_dir: String,
+    pub label: String,
+    pub utilization: f64,
+    pub rate_limit_type: Option<String>,
+    pub resets_at: Option<u64>,
+    pub status: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Read the OAuth access token from a Claude config directory's credentials file.
+fn read_oauth_token(config_dir: &str) -> Result<String, String> {
+    let creds_path = std::path::PathBuf::from(config_dir).join(".credentials.json");
+    let content = std::fs::read_to_string(&creds_path)
+        .map_err(|e| format!("Cannot read {}: {}", creds_path.display(), e))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("Invalid credentials JSON: {}", e))?;
+    json["claudeAiOauth"]["accessToken"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "No accessToken in credentials".to_string())
+}
+
+/// Probe a single account for its weekly rate limit utilization.
+///
+/// Makes a minimal API call (1 token, cheapest model) and reads the
+/// `anthropic-ratelimit-unified-7d-utilization` response header, which
+/// always contains the exact weekly usage fraction regardless of threshold.
+async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
+    let label = std::path::Path::new(&config_dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| config_dir.clone());
+
+    let token = match read_oauth_token(&config_dir) {
+        Ok(t) => t,
+        Err(e) => {
+            return AccountUsageInfo {
+                config_dir,
+                label,
+                utilization: 1.0,
+                rate_limit_type: None,
+                resets_at: None,
+                status: None,
+                error: Some(e),
+            };
+        }
+    };
+
+    // Make a minimal API call — Haiku with max_tokens=1 is the cheapest possible
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &token)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await;
+
+    match response {
+        Ok(resp) => {
+            let headers = resp.headers();
+
+            // Parse weekly (7-day) utilization from response headers
+            let utilization_7d = headers
+                .get("anthropic-ratelimit-unified-7d-utilization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0);
+
+            let status_7d = headers
+                .get("anthropic-ratelimit-unified-7d-status")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            let resets_at_7d = headers
+                .get("anthropic-ratelimit-unified-7d-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+
+            // Also grab 5-hour utilization for context
+            let utilization_5h = headers
+                .get("anthropic-ratelimit-unified-5h-utilization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<f64>().ok());
+
+            info!(
+                "Account '{}': 7d={:.0}% 5h={:.0}% status={:?}",
+                label,
+                utilization_7d * 100.0,
+                utilization_5h.unwrap_or(0.0) * 100.0,
+                status_7d
+            );
+
+            let error = if resp.status().is_success() {
+                None
+            } else {
+                let status_code = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                Some(format!("API error ({}): {}", status_code, body))
+            };
+
+            AccountUsageInfo {
+                config_dir,
+                label,
+                utilization: utilization_7d,
+                rate_limit_type: Some("seven_day".to_string()),
+                resets_at: resets_at_7d,
+                status: status_7d,
+                error,
+            }
+        }
+        Err(e) => AccountUsageInfo {
+            config_dir,
+            label,
+            utilization: 1.0,
+            rate_limit_type: None,
+            resets_at: None,
+            status: None,
+            error: Some(format!("Network error: {}", e)),
+        },
+    }
+}
+
+/// Check usage for all configured Claude accounts.
+///
+/// Probes each account by making a minimal API call (Haiku, 1 token) and
+/// reading the `anthropic-ratelimit-unified-7d-utilization` response header.
+/// This gives the exact weekly utilization for every account.
+#[tauri::command]
+pub async fn check_accounts_usage(
+    config_dirs: Vec<String>,
+) -> Result<CommandResponse, String> {
+    info!(
+        "Checking usage for {} Claude accounts",
+        config_dirs.len()
+    );
+
+    // Probe all accounts concurrently
+    let futures: Vec<_> = config_dirs
+        .into_iter()
+        .map(|dir| async move { probe_account_usage(dir).await })
+        .collect();
+
+    let results = futures::future::join_all(futures).await;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!("Checked {} accounts", results.len())),
+        data: Some(
+            serde_json::to_value(&results)
+                .map_err(|e| format!("Failed to serialize usage results: {}", e))?,
+        ),
+    })
+}
+
+/// Resolve the effective config_dir based on account selection mode.
+///
+/// - Manual mode: returns the configured config_dir as-is
+/// - LeastUsage mode: probes all accounts and returns the one with lowest utilization
+pub async fn resolve_active_config_dir() -> Option<String> {
+    let ai_settings = settings::get_ai_settings();
+    let cli_settings = &ai_settings.claude_cli;
+
+    match cli_settings.account_selection_mode {
+        AccountSelectionMode::Manual => cli_settings.config_dir.clone(),
+        AccountSelectionMode::LeastUsage => {
+            let config_dirs = settings::get_claude_config_dirs();
+            if config_dirs.is_empty() {
+                info!("No config dirs configured, falling back to manual config_dir");
+                return cli_settings.config_dir.clone();
+            }
+
+            let futures: Vec<_> = config_dirs
+                .into_iter()
+                .map(|dir| async move { probe_account_usage(dir).await })
+                .collect();
+
+            let results = futures::future::join_all(futures).await;
+
+            let best = results
+                .iter()
+                .filter(|r| r.error.is_none())
+                .min_by(|a, b| {
+                    a.utilization
+                        .partial_cmp(&b.utilization)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+            match best {
+                Some(account) => {
+                    info!(
+                        "Auto-selected account '{}' with {:.0}% utilization",
+                        account.label,
+                        account.utilization * 100.0
+                    );
+                    Some(account.config_dir.clone())
+                }
+                None => {
+                    info!("All account probes failed, falling back to manual config_dir");
+                    cli_settings.config_dir.clone()
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Claude CLI Auth Status
 // ============================================================================
 
@@ -779,9 +1004,10 @@ pub struct CliAuthStatus {
 
 /// Find the Claude CLI credentials file, respecting config_dir settings.
 fn find_claude_credentials_path() -> Option<std::path::PathBuf> {
-    // 1. Check config_dir from runner AI settings
+    // 1. Check effective config_dir from runner AI settings (respects least-usage mode)
     let ai_settings = settings::get_ai_settings();
-    if let Some(ref dir) = ai_settings.claude_cli.config_dir {
+    let effective_dir = crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
+    if let Some(ref dir) = effective_dir {
         let path = std::path::PathBuf::from(dir).join(".credentials.json");
         if path.exists() {
             return Some(path);
@@ -937,9 +1163,8 @@ pub async fn refresh_claude_cli_auth() -> Result<CommandResponse, String> {
         .as_deref()
         .unwrap_or("claude");
 
-    let config_env = ai_settings
-        .claude_cli
-        .config_dir
+    let effective_dir = crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
+    let config_env = effective_dir
         .as_ref()
         .map(|dir| format!("$env:CLAUDE_CONFIG_DIR = '{}'; ", dir))
         .unwrap_or_default();

@@ -533,6 +533,25 @@
           "source": "manual",
           "reviewed": true,
           "enabled": true
+        },
+        {
+          "id": "sm-discovery-exploration-progress",
+          "description": "During automated exploration, progress feedback shows the number of interactions completed and the current element being explored",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Progress:"
+            },
+            "label": "Exploration progress display"
+          },
+          "expected": "While exploration is running, a progress section should show 'Progress: X / Y interactions' where X is the current count and Y is the total. If available, 'Current: [element name]' shows the element currently being explored (truncated). A 'Cancel' button should also be visible to abort exploration.",
+          "precondition": "Discovery tab is active, Explore sub-tab selected, exploration is in progress",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         }
       ],
       "source": "manual"
@@ -592,7 +611,7 @@
             },
             "label": "Discover States button"
           },
-          "expected": "Clicking 'Discover States' should: (1) show a spinning Loader2 icon while discovering, (2) run fingerprint-based state discovery via the ui_bridge_discover_states_from_fingerprints IPC command, (3) auto-save the config with name '[AppName] — [timestamp]', (4) on success, show 'Discovery Complete' banner and switch to Graph Editor tab with the new config loaded.",
+          "expected": "Clicking 'Discover States' should: (1) show a spinning Loader2 icon while discovering (button text changes to 'Saving...' during save phase), (2) run fingerprint-based state discovery, (3) on success, auto-save the config with an auto-generated name '[AppName] — [timestamp]' and switch to the Graph Editor tab with the new config loaded. If auto-save fails or the user returns to the Discovery tab, a 'Discovery Complete' banner shows with state count, statistics badges, a state preview list, and a manual 'Save Configuration' form as a fallback.",
           "precondition": "Discovery tab is active, co-occurrence data collected, no discovery result yet",
           "source": "manual",
           "reviewed": true,
@@ -629,7 +648,7 @@
             },
             "label": "Save Configuration button"
           },
-          "expected": "The save form appears after discovery with: a 'Configuration Name' label, a text input with 'e.g., My App States' placeholder, and a full-width 'Save Configuration' button (disabled when name is empty). Clicking Save persists the config and switches to the Graph Editor tab.",
+          "expected": "The save form appears after discovery with: a 'Configuration Name' label (text-sm font-medium), a text input with 'e.g., My App States' placeholder and focus:ring-2 ring-brand-primary, and a full-width 'Save Configuration' button with Save icon (disabled when name is empty or saving in progress, shows Loader2 spinner when saving). Clicking Save persists the config via createConfig + createStatesForConfig IPC calls, shows toast 'Saved config \"[name]\" with N states', then calls onConfigCreated which switches to the Graph Editor tab with the new config loaded.",
           "precondition": "Discovery has completed and result is visible",
           "source": "manual",
           "reviewed": true,
@@ -858,6 +877,25 @@
           "source": "manual",
           "reviewed": true,
           "enabled": true
+        },
+        {
+          "id": "sm-graph-stats-panel",
+          "description": "A stats panel in the bottom-left of the graph canvas shows the state count, transition count, and initial state name",
+          "category": "data-display",
+          "severity": "info",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "generic"
+            },
+            "label": "Graph stats panel"
+          },
+          "expected": "A bottom-left panel should display 'X states | Y transitions' where X and Y match the config's actual counts. If an initial state exists, a Play icon and the initial state name should also appear.",
+          "precondition": "A config is selected with states, Graph Editor tab is active",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         }
       ],
       "source": "manual"
@@ -868,6 +906,24 @@
       "description": "The State View tab shows all states using the shared StateViewPanel component. It supports three view modes: List (collapsible text list), Spatial (force-directed canvas), and Screenshot (three-panel viewer with bounding box overlays). State selection syncs with the graph tab's selectedStateId. No 'Add State' button — states come from Discovery.",
       "category": "semantic",
       "assertions": [
+        {
+          "id": "sm-states-heading",
+          "description": "The states panel shows a 'States' heading with a count badge showing the total number of states",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "hasText",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "States"
+            },
+            "label": "States panel heading"
+          },
+          "precondition": "A config is selected, State View tab is active",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
         {
           "id": "sm-states-search-filter",
           "description": "A search input with 'Filter states...' placeholder allows users to filter the state list by name",
@@ -1080,6 +1136,24 @@
             "label": "Transition detail placeholder"
           },
           "precondition": "A config is selected, Transitions tab is active, no transition selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-transitions-empty-filter",
+          "description": "When no transitions match the search or filter criteria, the list shows 'No transitions match filters.'",
+          "category": "data-display",
+          "severity": "info",
+          "assertionType": "hasText",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No transitions match filters."
+            },
+            "label": "Empty filtered transitions message"
+          },
+          "precondition": "A config is selected with transitions, Transitions tab is active, search or filter criteria entered that match no transitions",
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -1935,6 +2009,25 @@
           "enabled": true
         },
         {
+          "id": "sm-export-description",
+          "description": "The export panel shows a description explaining the JSON format compatibility",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "containsText",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "UIBridgeRuntime.from_dict()"
+            },
+            "label": "Export format description"
+          },
+          "expected": "UIBridgeRuntime.from_dict()",
+          "precondition": "A config is selected, Export tab is active",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
           "id": "sm-export-save-button",
           "description": "A 'Save to File' button exports the active config as a JSON file through Tauri's save dialog",
           "category": "semantic",
@@ -2070,6 +2163,123 @@
           },
           "expected": "The data summary card should show: (1) capture count > 0 (matching the presence matrix length), (2) fingerprint count > 0, (3) source badge showing 'via explore' or 'via record' matching the collection method. The capture count should be >= fingerprint count since multiple captures can share a fingerprint.",
           "precondition": "Co-occurrence data has been collected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "sm-state-model-rules",
+      "name": "State Model Rules (qontinui/multistate)",
+      "description": "The state machine follows the multistate model (qontinui/multistate), which extends model-based GUI automation theory. These rules define how states, elements, and screenshots relate to each other. The multistate formal model is Ω = (S, T, G, ω, Td) where S is the set of states, T the transitions, G state groups, ω the occlusion function, and Td dynamic transition generation. All state machine features — discovery, graph editing, state view, screenshots, and export — must conform to these rules. Source: https://qontinui.github.io/multistate/",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "sm-rule-multi-state-activation",
+          "description": "Multiple states are active simultaneously. The visible screen is described as a set of active states SΞ. A screenshot captures the current screen, which contains elements from multiple co-active states (e.g., a toolbar state, a sidebar state, and a content state all active at once). The same state can be active across many different screens — this is why the same elements appear on multiple pages without belonging to multiple states. States can transition independently without affecting other active states.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Active state set" },
+          "expected": "The state machine viewer should support and display multiple co-active states. The screenshot view should show bounding boxes from multiple states simultaneously. State transitions should not force all other states to deactivate.",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-rule-element-single-ownership",
+          "description": "An image/element belongs to exactly one state. Images do not cross state boundaries. If the same visual element appears on multiple screens, it is because the state that owns it is active on all those screens. The element is not shared across states — it has one owner. This is a fundamental invariant of the model.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Element-to-state assignment" },
+          "expected": "In the graph editor and state view, every element should appear in exactly one state. No element should be listed under multiple states. The discovery algorithm must assign each fingerprint hash to exactly one state.",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-rule-co-occurrence-state-definition",
+          "description": "States are defined through co-occurrence analysis. Elements that always appear together form a state. States are the minimal co-occurring sets derived from observing which elements appear on which screens. Example: images 1,2,3 appear on screens A and B; images 1,2,3,4,5 appear on screens C, D, and E. This produces two states: State 1 owns images 1,2,3 (they co-occur on all 5 screens), State 2 owns images 4,5 (they co-occur only on screens C,D,E). A state is formally a collection of related GUI elements chosen to model a distinct configuration of the user interface.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Discovered state element sets" },
+          "expected": "Discovered states should contain elements that consistently co-occur across captures. Elements that appear on different subsets of screens should be assigned to different states.",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-rule-image-signals-presence",
+          "description": "Images signal a state's presence, not its absence. Individual images can reliably confirm a state is active, but a missing image does NOT prove the state is inactive. A state is only deactivated by an explicit transition, never by image disappearance. When a state is active, a specific action performed on one of its objects should give the same expected result every time.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "State activation logic" },
+          "expected": "The state machine should not mark a state as inactive simply because one of its elements was not found. State deactivation should only occur through transition execution.",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-rule-screenshot-visible-elements-only",
+          "description": "A screenshot contains elements from whichever states were active at capture time. The elementBoundsJson for a screenshot must contain ONLY the elements that were actually visible on screen when the screenshot was taken. These elements may belong to multiple different co-active states — that is expected. But elements from a page that was NOT being viewed must NOT appear in the screenshot's element data.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Screenshot element bounds" },
+          "expected": "In the Screenshot State View, bounding boxes should only outline elements actually visible in the screenshot image. No bounding boxes should float over blank areas or elements not visually present. Bounding box positions must be actual pixel positions from the capture moment, not averaged or estimated positions.",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-rule-screenshot-state-association",
+          "description": "A screenshot is associated with a state if the state's elements are visible in it. Using the co-occurrence example: State 1 (images 1,2,3) is associated with screenshots from screens A,B,C,D,E. State 2 (images 4,5) is associated with screenshots from screens C,D,E only. A single screenshot will typically match multiple co-active states. A state whose elements were never visible in a screenshot should not match that screenshot.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Screenshot-to-state matching" },
+          "expected": "In the Screenshot State View, the screenshots column should only show screenshots where the selected state's elements are present. Multiple states matching the same screenshot is expected (co-active states). States from a different page should show no matching screenshots.",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-rule-bounding-box-accuracy",
+          "description": "Element bounding boxes must be actual pixel positions in their specific screenshot. A bounding box records where the element physically appeared at that specific moment. Averaged positions from co-occurrence statistics or estimated positions from relative viewport percentages are not valid bounding box data for a specific screenshot.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Bounding box coordinates" },
+          "expected": "Bounding boxes on the screenshot canvas should precisely outline the visual elements they represent. The coordinates in elementBoundsJson should come from the actual element bounds at capture time, not from averaged relativePosition data.",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-rule-occlusion",
+          "description": "When a state opens and obscures another (e.g., a modal dialog over the main window), the covered state is registered as hidden but remains active. The multistate model defines an occlusion function ω: S × S × ℝ → [0,1] that models state visibility. Occlusion is transitive: if s1 occludes s2 and s2 occludes s3, then s1 occludes s3. Blocking states (is_blocking=true) represent modal-like states that prevent interaction with occluded states.",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Occlusion handling" },
+          "expected": "States marked as blocking should be recognized as modal/overlay states. The graph editor should support the staysVisible transition property for modeling occlusion relationships.",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sm-rule-transition-phased-execution",
+          "description": "Transitions follow a phased execution model: VALIDATE → OUTGOING → ACTIVATE → INCOMING → EXIT. Activation is a pure memory operation that cannot fail (infallible). If incoming verification fails, the system rolls back to the original state and skips the exit phase. Transitions can activate multiple states atomically and exit multiple states atomically. Each activated state becomes a potential path node for future navigation.",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Transition execution model" },
+          "expected": "Transitions in the graph editor should support multiple activate and exit states. The transition detail panel should allow specifying both activate and exit state sets.",
           "source": "manual",
           "reviewed": true,
           "enabled": true

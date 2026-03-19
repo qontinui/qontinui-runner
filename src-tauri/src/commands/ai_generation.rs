@@ -906,7 +906,10 @@ fn parse_ai_description_response(content: &str) -> Result<ElementAiDescription, 
 // Helper Functions
 // ============================================================================
 
-/// Build provider-specific settings based on AI configuration
+/// Build provider-specific settings based on AI configuration.
+///
+/// For Claude CLI, uses the effective config_dir which respects the
+/// account_selection_mode (manual or least-usage auto-selection).
 pub fn build_provider_settings(ai_settings: &crate::settings::AiSettings) -> serde_json::Value {
     use crate::settings;
 
@@ -918,11 +921,13 @@ pub fn build_provider_settings(ai_settings: &crate::settings::AiSettings) -> ser
                 settings::CliExecutionMode::Wsl => "wsl",
                 settings::CliExecutionMode::Native => "native",
             };
+            let effective_config_dir =
+                crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
             serde_json::json!({
                 "execution_mode": execution_mode,
                 "custom_path": ai_settings.claude_cli.custom_path,
                 "timeout_seconds": ai_settings.claude_cli.timeout_seconds,
-                "config_dir": ai_settings.claude_cli.config_dir,
+                "config_dir": effective_config_dir,
             })
         }
         settings::AiProvider::ClaudeApi => {

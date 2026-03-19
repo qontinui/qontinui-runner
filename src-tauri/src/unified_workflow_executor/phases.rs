@@ -346,6 +346,341 @@ async fn fetch_network_failures_from_ui_bridge(since: u64) -> Vec<serde_json::Va
 }
 
 // =============================================================================
+// Environment Readiness Doctor
+// =============================================================================
+
+/// Result of the environment readiness check run before each verification iteration.
+#[derive(Debug)]
+pub struct EnvironmentReadinessResult {
+    /// Whether the environment is ready for verification.
+    pub ready: bool,
+    /// Whether automated recovery was attempted and succeeded.
+    pub recovery_attempted: bool,
+    /// Summary of what was checked and any issues found.
+    pub summary: String,
+    /// If the environment is NOT ready, this contains context for the agentic phase
+    /// so it knows the issue is environmental, not a code problem.
+    pub env_failure_context: Option<String>,
+}
+
+/// Check environment readiness and attempt automated recovery before verification.
+///
+/// This "environment doctor" runs before each verification iteration to ensure:
+/// 1. The runner API is responsive
+/// 2. The UI Bridge SDK app is connected and reporting elements
+/// 3. The app is healthy (not crashed or showing error overlays)
+///
+/// If issues are detected, it attempts automated recovery (reconnect SDK, refresh page)
+/// before returning. This separates "is the environment working?" from "did the code
+/// change work?" — preventing wasted agentic iterations on environment problems.
+pub async fn check_environment_readiness(
+    iteration: u32,
+    workflow_name: &str,
+) -> EnvironmentReadinessResult {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return EnvironmentReadinessResult {
+                ready: false,
+                recovery_attempted: false,
+                summary: format!("Failed to create HTTP client: {}", e),
+                env_failure_context: Some(
+                    "## Environment Issue\n\nCannot create HTTP client to check environment readiness."
+                        .to_string(),
+                ),
+            };
+        }
+    };
+
+    let base_url = format!("http://127.0.0.1:{}", MCP_API_PORT);
+    let mut issues: Vec<String> = Vec::new();
+
+    // ── Check 1: Runner API health ──
+    let runner_ok = match client
+        .get(format!("{}/health", base_url))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => true,
+        Ok(resp) => {
+            issues.push(format!("Runner API returned status {}", resp.status()));
+            false
+        }
+        Err(e) => {
+            issues.push(format!("Runner API unreachable: {}", e));
+            false
+        }
+    };
+
+    if !runner_ok {
+        // If the runner itself is down, nothing else will work
+        let summary = format!(
+            "ENV-DOCTOR (iter {}): Runner API is not responding — {}",
+            iteration,
+            issues.join("; ")
+        );
+        warn!("{}", summary);
+        return EnvironmentReadinessResult {
+            ready: false,
+            recovery_attempted: false,
+            summary,
+            env_failure_context: Some(format!(
+                "## Environment Issue — Runner Not Responding\n\n\
+                 The runner API at {} is not responding. The verification steps \
+                 will fail because they depend on the runner's UI Bridge endpoints.\n\n\
+                 Issues: {}",
+                base_url,
+                issues.join(", ")
+            )),
+        };
+    }
+
+    // ── Check 2: SDK connection status ──
+    let sdk_connected = match client
+        .get(format!("{}/ui-bridge/sdk/status", base_url))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                let connected = body
+                    .get("data")
+                    .and_then(|d| d.get("connected"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !connected {
+                    issues.push("SDK app is not connected".to_string());
+                }
+                connected
+            } else {
+                issues.push("SDK status response not parseable".to_string());
+                false
+            }
+        }
+        _ => {
+            issues.push("SDK status endpoint not available".to_string());
+            false
+        }
+    };
+
+    // ── Check 3: SDK app health (only if connected) ──
+    let mut app_healthy = true;
+    if sdk_connected {
+        if let Some(health) = fetch_health_from_ui_bridge().await {
+            let status = health
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            if status == "broken" {
+                let summary = health
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                issues.push(format!("SDK app is broken: {}", summary));
+                app_healthy = false;
+            }
+        }
+    }
+
+    // ── If everything is fine, return immediately ──
+    if issues.is_empty() {
+        return EnvironmentReadinessResult {
+            ready: true,
+            recovery_attempted: false,
+            summary: format!(
+                "ENV-DOCTOR (iter {}): Environment ready (runner OK, SDK connected, app healthy)",
+                iteration
+            ),
+            env_failure_context: None,
+        };
+    }
+
+    // ── Automated Recovery ──
+    info!(
+        "ENV-DOCTOR (iter {}): Issues detected: {:?} — attempting recovery for '{}'",
+        iteration, issues, workflow_name
+    );
+    let mut recovery_actions: Vec<String> = Vec::new();
+
+    // Recovery 1: If SDK not connected, try reconnecting
+    if !sdk_connected {
+        info!("ENV-DOCTOR: Attempting SDK reconnect...");
+        // Try to get the last known connected URL from connections list
+        let reconnect_url = match client
+            .get(format!("{}/ui-bridge/sdk/connections", base_url))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    body.get("data")
+                        .and_then(|d| d.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|c| c.get("url"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                }
+                else { None }
+            }
+            _ => None,
+        };
+
+        if let Some(url) = reconnect_url {
+            let connect_body = serde_json::json!({ "url": url });
+            match client
+                .post(format!("{}/ui-bridge/sdk/connect", base_url))
+                .json(&connect_body)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    recovery_actions.push(format!("Reconnected SDK to {}", url));
+                    info!("ENV-DOCTOR: SDK reconnect succeeded to {}", url);
+                    // Wait for WebSocket to stabilize
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+                Ok(resp) => {
+                    recovery_actions.push(format!(
+                        "SDK reconnect failed (status {})",
+                        resp.status()
+                    ));
+                    warn!("ENV-DOCTOR: SDK reconnect failed with status {}", resp.status());
+                }
+                Err(e) => {
+                    recovery_actions.push(format!("SDK reconnect failed: {}", e));
+                    warn!("ENV-DOCTOR: SDK reconnect failed: {}", e);
+                }
+            }
+        } else {
+            recovery_actions.push("No previous SDK connection URL found for reconnect".to_string());
+            warn!("ENV-DOCTOR: No previous connection URL found, cannot auto-reconnect");
+        }
+    }
+
+    // Recovery 2: If app is broken (but connected), try page refresh
+    if sdk_connected && !app_healthy {
+        info!("ENV-DOCTOR: App is broken, attempting page refresh...");
+        match client
+            .post(format!("{}/ui-bridge/sdk/page/refresh", base_url))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                recovery_actions.push("Refreshed page to recover from broken state".to_string());
+                info!("ENV-DOCTOR: Page refresh succeeded, waiting for stabilization...");
+                // Wait for page to reload and WebSocket to reconnect
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            _ => {
+                recovery_actions.push("Page refresh failed".to_string());
+                warn!("ENV-DOCTOR: Page refresh failed");
+            }
+        }
+    }
+
+    // ── Post-recovery verification ──
+    let post_recovery_ok = if !recovery_actions.is_empty() {
+        // Re-check SDK status after recovery attempts
+        let recheck = match client
+            .get(format!("{}/ui-bridge/sdk/status", base_url))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    body.get("data")
+                        .and_then(|d| d.get("connected"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+
+        // Also recheck health
+        let recheck_healthy = if recheck {
+            fetch_health_from_ui_bridge()
+                .await
+                .map(|h| {
+                    h.get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        != "broken"
+                })
+                .unwrap_or(true) // No health data = assume OK
+        } else {
+            false
+        };
+
+        recheck && recheck_healthy
+    } else {
+        false
+    };
+
+    if post_recovery_ok {
+        let summary = format!(
+            "ENV-DOCTOR (iter {}): Recovery succeeded — {} (original issues: {})",
+            iteration,
+            recovery_actions.join("; "),
+            issues.join("; ")
+        );
+        info!("{}", summary);
+        EnvironmentReadinessResult {
+            ready: true,
+            recovery_attempted: true,
+            summary,
+            env_failure_context: None,
+        }
+    } else {
+        let summary = format!(
+            "ENV-DOCTOR (iter {}): Environment NOT ready — issues: {}, recovery: {}",
+            iteration,
+            issues.join("; "),
+            if recovery_actions.is_empty() {
+                "none attempted".to_string()
+            } else {
+                recovery_actions.join("; ")
+            }
+        );
+        warn!("{}", summary);
+        EnvironmentReadinessResult {
+            ready: false,
+            recovery_attempted: !recovery_actions.is_empty(),
+            summary,
+            env_failure_context: Some(format!(
+                "## Environment Issue (Pre-Verification)\n\n\
+                 The environment is not ready for UI Bridge verification assertions.\n\n\
+                 **Issues detected:**\n{}\n\n\
+                 **Recovery actions taken:**\n{}\n\n\
+                 **Impact:** Verification steps that query UI Bridge SDK endpoints will fail \
+                 due to environment issues, NOT due to code problems. The agentic phase should \
+                 focus on fixing the environment (ensuring the app is running, SDK is connected, \
+                 and the correct page is loaded) before making code changes.",
+                issues
+                    .iter()
+                    .map(|i| format!("- {}", i))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                if recovery_actions.is_empty() {
+                    "- None attempted".to_string()
+                } else {
+                    recovery_actions
+                        .iter()
+                        .map(|a| format!("- {}", a))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            )),
+        }
+    }
+}
+
+// =============================================================================
 // Execution Timing Context
 // =============================================================================
 
@@ -3110,6 +3445,65 @@ impl VerificationExecutor {
         };
         result.into_outcome(duration_ms)
     }
+
+    /// Run a subset of verification steps by their indices.
+    ///
+    /// Used by the multi-agent fixer to run targeted verification after each
+    /// fix agent completes, providing fast feedback without running all steps.
+    pub async fn run_targeted_verification(
+        &self,
+        all_steps: &[ExecutionStepConfig],
+        step_indices: &[usize],
+        execution_id: &str,
+        iteration: u32,
+        workflow_name: &str,
+    ) -> VerificationPhaseResult {
+        let targeted_steps: Vec<ExecutionStepConfig> = step_indices
+            .iter()
+            .filter_map(|&idx| all_steps.get(idx).cloned())
+            .collect();
+
+        if targeted_steps.is_empty() {
+            return VerificationPhaseResult {
+                iteration,
+                all_passed: true,
+                total_steps: 0,
+                passed_steps: 0,
+                failed_steps: 0,
+                skipped_steps: 0,
+                total_duration_ms: 0,
+                step_results: vec![],
+                critical_failure: false,
+                console_errors: None,
+                app_health: None,
+                browser_events: None,
+                network_failures: None,
+            };
+        }
+
+        info!(
+            "MULTI-AGENT: Running targeted verification for {} step(s) (iteration {})",
+            targeted_steps.len(),
+            iteration
+        );
+
+        let result = self
+            .executor
+            .execute_verification_steps_with_events(
+                &targeted_steps,
+                execution_id,
+                iteration,
+                Some(workflow_name),
+            )
+            .await;
+
+        info!(
+            "MULTI-AGENT: Targeted verification: passed={}/{}, failed={}",
+            result.passed_steps, result.total_steps, result.failed_steps
+        );
+
+        result
+    }
 }
 
 // =============================================================================
@@ -4056,6 +4450,100 @@ impl AgenticExecutor {
         }
 
         (outcome, injected_steps)
+    }
+
+    /// Run a focused AI session with a custom prompt.
+    ///
+    /// Unlike `run_agentic()`, this doesn't build the prompt from config.base_prompt.
+    /// It runs the provided prompt directly. Used by the multi-agent fixer to spawn
+    /// specialized fix agents with narrow, targeted prompts.
+    ///
+    /// Returns (success, output, duration_ms).
+    pub async fn run_focused_session(
+        &self,
+        execution_id: &str,
+        workflow_name: &str,
+        iteration: u32,
+        agent_label: &str,
+        prompt: &str,
+        model_override: Option<String>,
+        logger: &StepEventLogger,
+    ) -> (bool, String, u64) {
+        let start = std::time::Instant::now();
+        let parent_task_id = super::types::get_parent_task_id(execution_id);
+
+        info!(
+            "MULTI-AGENT: Running focused session '{}' (iteration {})",
+            agent_label, iteration
+        );
+
+        let mut ai_config = crate::unified_ai_session::AiSessionConfig::agentic(
+            execution_id,
+            workflow_name,
+            iteration,
+        )
+        .with_model_override(model_override);
+
+        // Create a fresh CLI session for each focused agent
+        let cli_session_id = uuid::Uuid::new_v4().to_string();
+        ai_config.cli_session_ctx = Some(crate::claude_session::runner::CliSessionContext {
+            cli_session_id,
+            is_resume: false,
+        });
+        ai_config.db_flush_ctx = Some(crate::claude_session::runner::DbFlushContext {
+            db: self.checkpoint_db.clone(),
+            task_run_id: parent_task_id.clone(),
+            iteration: iteration as i32,
+        });
+
+        let result = self
+            .ai_executor
+            .execute(&ai_config, prompt, logger)
+            .await;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        info!(
+            "MULTI-AGENT: Focused session '{}' completed in {}ms (success={})",
+            agent_label, duration_ms, result.success
+        );
+
+        (result.success, result.output, duration_ms)
+    }
+
+    /// Run a triage prompt in response mode (fast, no session state).
+    ///
+    /// Used by the multi-agent fixer to classify verification failures
+    /// before spawning specialized fix agents.
+    pub async fn run_triage_prompt(
+        &self,
+        prompt: &str,
+        model_override: Option<String>,
+    ) -> Result<String, String> {
+        let step = ExecutionStepConfig {
+            step_type: "prompt".to_string(),
+            name: Some("Multi-agent triage".to_string()),
+            prompt_content: Some(prompt.to_string()),
+            prompt_mode: Some("response".to_string()),
+            model: model_override.clone(),
+            ..Default::default()
+        };
+
+        let result = execute_prompt_response_mode(
+            &step,
+            &self.checkpoint_db,
+            None,
+            None,
+            model_override,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        Ok(result.output)
     }
 
     /// Get progress marker context from previous checkpoints.
@@ -5275,6 +5763,13 @@ impl Executor for AgenticExecutor {
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
             acceptance_criteria: None,
+            multi_agent_mode: false,
+            use_worktree: false,
+            worktree_path: None,
+            worktree_branch: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
         };
 
         let (outcome, _injected_steps) = self

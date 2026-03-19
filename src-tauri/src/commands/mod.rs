@@ -77,6 +77,7 @@ pub mod learning; // Learning insights dashboard commands
 pub mod library_sync; // Sync library items (checks, macros, etc.) to web backend
 pub mod logging;
 pub mod mcp; // MCP client management and tool calling
+pub mod meta_optimizer; // Meta-optimizer recommendations and prompt registry
 pub mod mobile; // Mobile development feedback (ADB, screenshots, logcat)
 pub mod mobile_settings; // Mobile settings (ADB path, device config)
 pub mod orchestration_loop_configs; // Orchestration loop saved config CRUD

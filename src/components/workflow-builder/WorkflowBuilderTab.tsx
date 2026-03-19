@@ -87,6 +87,7 @@ import { AddStepDropdown, AddStepButton } from "./AddStepDropdown";
 import { StepConfigPanel } from "./StepConfigPanel";
 import { PromptLibraryPicker } from "./PromptLibraryPicker";
 import { ShellCommandLibraryPicker } from "./ShellCommandLibraryPicker";
+import { PipelineConfigPanel } from "./PipelineConfigPanel";
 import { CheckLibraryPicker } from "./CheckLibraryPicker";
 import { CheckGroupLibraryPicker } from "./CheckGroupLibraryPicker";
 import { TestLibraryPicker } from "./TestLibraryPicker";
@@ -425,6 +426,16 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
               className={`${inputClass} resize-none`}
             />
           </div>
+        );
+
+      case "pipeline_config":
+        if (workflow.workflow_architecture !== "multi_agent_pipeline") return null;
+        return (
+          <PipelineConfigPanel
+            key={def.key}
+            config={workflow.multi_agent_pipeline_config as Record<string, unknown> | undefined}
+            onChange={(c) => updateWorkflow({ multi_agent_pipeline_config: c })}
+          />
         );
 
       case "model_select": {
@@ -1769,6 +1780,8 @@ function WorkflowBuilderContent({
           model: workflow.model,
           stop_on_failure: workflow.stop_on_failure,
           reflection_mode: workflow.reflection_mode,
+          use_worktree: workflow.use_worktree,
+          multi_agent_mode: workflow.multi_agent_mode,
         };
 
         const response = await tracedFetch(`${getApiBase()}/unified-workflows`, {

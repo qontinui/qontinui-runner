@@ -451,6 +451,20 @@ pub struct UnifiedWorkflow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality_report: Option<Value>,
 
+    /// Enable multi-agent fixer mode for the agentic phase.
+    /// When true, verification failures are triaged and fixed by specialized agents
+    /// (quick-fix for lint/compilation, feature-fix for missing functionality).
+    /// Default: true.
+    #[serde(default = "default_multi_agent_mode")]
+    pub multi_agent_mode: bool,
+
+    /// Run the workflow in an isolated git worktree.
+    /// When true, a new branch and worktree are created before execution.
+    /// Changes stay on the worktree branch and can be merged back after review.
+    /// Default: false.
+    #[serde(default)]
+    pub use_worktree: bool,
+
     /// Whether the AI semantic review actually ran successfully during generation.
     /// When false, the workflow passed through the pipeline without AI verification
     /// (e.g., all verification iterations failed at infrastructure level).
@@ -541,6 +555,10 @@ fn default_reflection_mode() -> bool {
 }
 
 fn default_ai_reviewed() -> bool {
+    true
+}
+
+fn default_multi_agent_mode() -> bool {
     true
 }
 

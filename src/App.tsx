@@ -172,6 +172,8 @@ import { ReflectionDashboard } from "./components/reflection-dashboard/Reflectio
 import { ArchitectureView } from "./components/architecture-view/ArchitectureView";
 import { GeneratorEvalPage } from "./pages/GeneratorEvalPage";
 import { OrchestrationLoopPanel } from "./components/orchestration-loop/OrchestrationLoopPanel";
+import { AutoresearchPage } from "./pages/AutoresearchPage";
+import { MetaOptimizerPage } from "./pages/MetaOptimizerPage";
 import { SpecsPage } from "./pages/specs/SpecsPage";
 import { UIBridgeIntegrationPage } from "./pages/ui-bridge-integration/UIBridgeIntegrationPage";
 import { TerminalPage } from "./components/terminal";
@@ -215,6 +217,8 @@ type MainTabId =
   | "reflection"
   | "architecture"
   | "generator-eval"
+  | "autoresearch"
+  | "meta-optimizer"
   // Observe group - new structure
   | "run-recap"
   | "run-actions"
@@ -287,6 +291,8 @@ const VALID_TAB_IDS: MainTabId[] = [
   "reflection",
   "architecture",
   "generator-eval",
+  "autoresearch",
+  "meta-optimizer",
   // New observe tabs
   "run-recap",
   "run-actions",
@@ -527,6 +533,16 @@ function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
         name: "Generator Eval",
         section: "tools",
         breadcrumb: ["Tools", "Generator Eval"],
+      },
+      autoresearch: {
+        name: "Autoresearch",
+        section: "observe",
+        breadcrumb: ["Observe", "Autoresearch"],
+      },
+      "meta-optimizer": {
+        name: "Meta-Optimizer",
+        section: "observe",
+        breadcrumb: ["Observe", "Meta-Optimizer"],
       },
       "orchestration-loop": {
         name: "Orchestration Loop",
@@ -1208,6 +1224,20 @@ function AppContent() {
         return (
           <div className="h-full overflow-hidden">
             <GeneratorEvalPage />
+          </div>
+        );
+
+      case "autoresearch":
+        return (
+          <div className="h-full overflow-hidden">
+            <AutoresearchPage />
+          </div>
+        );
+
+      case "meta-optimizer":
+        return (
+          <div className="h-full overflow-hidden">
+            <MetaOptimizerPage />
           </div>
         );
 

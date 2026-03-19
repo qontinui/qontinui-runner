@@ -826,6 +826,10 @@ mod tests {
             dependency_graph: None,
             cost_annotations: None,
             quality_report: None,
+            acceptance_criteria: None,
+            multi_agent_mode: true,
+            use_worktree: false,
+            ai_reviewed: true,
             created_at: String::new(),
             updated_at: String::new(),
         }

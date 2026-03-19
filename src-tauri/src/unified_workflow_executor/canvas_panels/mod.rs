@@ -632,6 +632,179 @@ impl CanvasPanelManager {
         self.emit_mission_brief_update().await;
     }
 
+    /// Called after each iteration of the agentic verification loop.
+    ///
+    /// Emits an iteration digest panel (Markdown) and updates the Mission Brief progress.
+    pub async fn on_agentic_verification_iteration(
+        &mut self,
+        iteration: u32,
+        verdict: &crate::autoresearch::agentic_verification::VerificationVerdict,
+        worker_summary: Option<&str>,
+        verifier_duration_ms: u64,
+        worker_duration_ms: u64,
+    ) {
+        // Build status emoji/indicator
+        let status_indicator = match verdict.status {
+            crate::autoresearch::agentic_verification::VerificationStatus::Pass => "PASS",
+            crate::autoresearch::agentic_verification::VerificationStatus::Partial => "PARTIAL",
+            crate::autoresearch::agentic_verification::VerificationStatus::Fail => "FAIL",
+            crate::autoresearch::agentic_verification::VerificationStatus::Unreachable => "UNREACHABLE",
+        };
+
+        // Build iteration digest as Markdown
+        let mut md = format!(
+            "**Status:** {} | **Confidence:** {:.0}%\n\n**Observations:**\n{}\n",
+            status_indicator,
+            verdict.confidence * 100.0,
+            verdict.observations,
+        );
+
+        if !verdict.issues.is_empty() {
+            md.push_str("\n**Issues:**\n");
+            for issue in &verdict.issues {
+                md.push_str(&format!(
+                    "- [{}] {}{}\n",
+                    issue.severity,
+                    issue.description,
+                    issue.suggestion.as_ref().map(|s| format!(" *({})*", s)).unwrap_or_default(),
+                ));
+            }
+        }
+
+        if let Some(ref next) = verdict.next_priority {
+            md.push_str(&format!("\n**Next priority:** {}\n", next));
+        }
+
+        if let Some(summary) = worker_summary {
+            md.push_str(&format!(
+                "\n**Worker:** {}\n",
+                truncate_str(summary, 300),
+            ));
+        }
+
+        md.push_str(&format!(
+            "\n*Verifier: {}ms | Worker: {}ms*",
+            verifier_duration_ms, worker_duration_ms,
+        ));
+
+        let group = if let Some(ref prefix) = self.stage_prefix {
+            format!("Stage {} · Iteration {}", prefix, iteration)
+        } else {
+            format!("Iteration {}", iteration)
+        };
+
+        let priority = 20 + (self.max_iterations.saturating_sub(iteration)) as i32;
+
+        self.emit_panel(
+            &format!("av-iter-{}", iteration),
+            "Markdown",
+            &format!("Iteration {}", iteration),
+            serde_json::json!({ "markdown": md }),
+            priority,
+            "compact",
+            Some(&group),
+        )
+        .await;
+
+        // Update Mission Brief progress
+        self.brief_current_iteration = iteration;
+        self.brief_phase = Some("agentic-verification".to_string());
+        self.brief_activity = Some(format!(
+            "Iteration {} — {} ({:.0}%)",
+            iteration, status_indicator, verdict.confidence * 100.0,
+        ));
+        self.emit_mission_brief_update().await;
+    }
+
+    /// Emit a tracker panel showing verdict status across all iterations
+    /// of the agentic verification loop.
+    pub async fn on_agentic_verification_tracker(
+        &mut self,
+        iteration_results: &[crate::autoresearch::agentic_verification::AgenticVerificationIterationResult],
+    ) {
+        if iteration_results.is_empty() {
+            return;
+        }
+
+        let mut rows = String::from("| Iteration | Status | Confidence | Worker | Durations |\n");
+        rows.push_str("|-----------|--------|------------|--------|-----------|\n");
+
+        for r in iteration_results {
+            let worker_label = if r.worker_ran { "ran" } else { "skipped" };
+            rows.push_str(&format!(
+                "| {} | {} | {:.0}% | {} | V:{}ms W:{}ms |\n",
+                r.iteration,
+                r.verdict.status,
+                r.verdict.confidence * 100.0,
+                worker_label,
+                r.verifier_duration_ms,
+                r.worker_duration_ms,
+            ));
+        }
+
+        self.emit_panel(
+            "av-tracker",
+            "Markdown",
+            "Verification Tracker",
+            serde_json::json!({ "markdown": rows }),
+            10,
+            "compact",
+            Some("Progress"),
+        )
+        .await;
+    }
+
+    /// Called when the agentic verification loop exits.
+    pub async fn on_agentic_verification_exit(
+        &mut self,
+        result: &crate::autoresearch::agentic_verification::AgenticVerificationResult,
+    ) {
+        let reason = if result.goal_achieved {
+            "Goal achieved"
+        } else if result.unreachable {
+            "Goal unreachable"
+        } else if result.was_stopped {
+            "Stopped by user"
+        } else if result.max_iterations_reached {
+            "Max iterations reached"
+        } else {
+            "Unknown"
+        };
+
+        let severity = if result.goal_achieved {
+            "success"
+        } else if result.unreachable || result.was_stopped {
+            "warning"
+        } else {
+            "error"
+        };
+
+        let confidence_note = result
+            .final_verdict
+            .as_ref()
+            .map(|v| format!(" (confidence: {:.0}%)", v.confidence * 100.0))
+            .unwrap_or_default();
+
+        let data = serde_json::json!({
+            "severity": severity,
+            "message": format!("{}{} — {} iterations", reason, confidence_note, result.iterations_run),
+        });
+
+        self.emit_panel(
+            "av-exit",
+            "Alert",
+            "Agentic Verification Result",
+            data,
+            9,
+            "compact",
+            Some("Progress"),
+        )
+        .await;
+
+        // Final tracker update
+        self.on_agentic_verification_tracker(&result.iteration_results).await;
+    }
+
     /// Called when the workflow completes (success or failure).
     pub async fn on_workflow_complete(
         &mut self,

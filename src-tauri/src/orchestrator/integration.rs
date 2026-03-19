@@ -377,6 +377,13 @@ pub struct OrchestratorState {
     /// Error IDs targeted by this workflow (for auto-resolution on success).
     /// When the workflow completes successfully, these errors will be marked as resolved.
     pub targeted_error_ids: Vec<i64>,
+
+    // ========================================================================
+    // Meta-Optimizer Tracking
+    // ========================================================================
+    /// Workflow architecture used for this run (for learning outcome tracking).
+    /// Set from LoopConfig.workflow_architecture when available.
+    pub workflow_architecture: Option<String>,
 }
 
 impl OrchestratorState {
@@ -406,7 +413,13 @@ impl OrchestratorState {
             iteration_timings: Vec::new(),
             current_iteration_started_at: None,
             targeted_error_ids: Vec::new(),
+            workflow_architecture: None,
         }
+    }
+
+    /// Set the workflow architecture for learning outcome tracking.
+    pub fn set_workflow_architecture(&mut self, arch: Option<String>) {
+        self.workflow_architecture = arch;
     }
 
     /// Set the error IDs targeted by this workflow.
@@ -2143,6 +2156,7 @@ impl Orchestrator {
             None, // error_type
             error_message.as_deref(),
             feedback_json.as_ref(),
+            state.workflow_architecture.as_deref(),
         ) {
             warn!("Failed to record learning outcome: {}", e);
         } else {

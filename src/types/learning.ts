@@ -83,6 +83,8 @@ export interface TaskOutcome {
   completed_at: string;
   /** Tags for categorization */
   tags: string[];
+  /** Workflow architecture type */
+  workflow_architecture?: string;
 }
 
 /** A pattern identified from task analysis */
@@ -235,6 +237,7 @@ export interface LearningOutcomeRecord {
   error_type: string | null;
   error_message: string | null;
   feedback: Record<string, unknown> | null;
+  workflow_architecture?: string | null;
   created_at: string;
 }
 

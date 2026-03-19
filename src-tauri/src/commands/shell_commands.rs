@@ -1076,11 +1076,13 @@ pub async fn generate_shell_command_with_ai(
                 settings::CliExecutionMode::Wsl => "wsl",
                 settings::CliExecutionMode::Native => "native",
             };
+            let effective_config_dir =
+                crate::ai_provider::get_effective_config_dir(&ai_settings.claude_cli);
             serde_json::json!({
                 "execution_mode": execution_mode,
                 "custom_path": ai_settings.claude_cli.custom_path,
                 "timeout_seconds": ai_settings.claude_cli.timeout_seconds,
-                "config_dir": ai_settings.claude_cli.config_dir,
+                "config_dir": effective_config_dir,
             })
         }
         settings::AiProvider::ClaudeApi => {

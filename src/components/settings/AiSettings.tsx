@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   Bot,
   Check,
@@ -16,6 +17,9 @@ import {
   AlertTriangle,
   RefreshCw,
   ShieldCheck,
+  Plus,
+  FolderSearch,
+  Users,
 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { getAccentColors, getStatusColors } from "@/design-system";
@@ -26,6 +30,8 @@ import type {
   CliExecutionMode,
   GeminiAuthMethod,
   AiConnectionTestResult,
+  AccountSelectionMode,
+  AccountUsageInfo,
   LogFunction,
 } from "./types";
 
@@ -37,6 +43,16 @@ interface TauriResult<T> {
 
 interface HasApiKeyData {
   has_key: boolean;
+}
+
+interface ClaudeConfigDirsData {
+  dirs: string[];
+}
+
+interface DiscoveredDir {
+  path: string;
+  label: string;
+  source: string;
 }
 
 interface CliAuthStatus {
@@ -59,6 +75,7 @@ const DEFAULT_AI_SETTINGS: AiSettingsType = {
     execution_mode: "auto",
     timeout_seconds: 600,
     config_dir: undefined,
+    account_selection_mode: "manual",
   },
   claude_api: {
     model: "claude-sonnet-4-20250514",
@@ -180,6 +197,12 @@ export function AiSettings({ onLog }: AiSettingsProps) {
   const [cliAuth, setCliAuth] = useState<CliAuthStatus | null>(null);
   const [refreshingAuth, setRefreshingAuth] = useState(false);
 
+  // Multi-account state
+  const [claudeConfigDirs, setClaudeConfigDirs] = useState<string[]>([]);
+  const [accountUsages, setAccountUsages] = useState<AccountUsageInfo[]>([]);
+  const [checkingUsage, setCheckingUsage] = useState(false);
+  const [detectingDirs, setDetectingDirs] = useState(false);
+
   const checkCliAuth = useCallback(async () => {
     try {
       const result = await invoke<TauriResult<CliAuthStatus>>("check_claude_cli_auth");
@@ -211,11 +234,110 @@ export function AiSettings({ onLog }: AiSettingsProps) {
     }
   };
 
+  const loadClaudeConfigDirs = async () => {
+    try {
+      const result = await invoke<TauriResult<ClaudeConfigDirsData>>("get_claude_config_dirs");
+      if (result?.success && result.data) {
+        setClaudeConfigDirs(result.data.dirs);
+      }
+    } catch (err) {
+      console.error("Failed to load Claude config dirs:", err);
+    }
+  };
+
+  const saveClaudeConfigDirs = useCallback(
+    async (dirs: string[]) => {
+      try {
+        const result = await invoke<TauriResult<ClaudeConfigDirsData>>(
+          "save_claude_config_dirs",
+          { dirs },
+        );
+        if (result?.success && result.data) {
+          setClaudeConfigDirs(result.data.dirs);
+          onLog("success", `Saved ${result.data.dirs.length} Claude account directories`);
+        } else {
+          onLog("error", "Failed to save Claude account dirs");
+        }
+      } catch (err) {
+        console.error("Failed to save Claude config dirs:", err);
+        onLog("error", `Failed to save Claude account dirs: ${err}`);
+      }
+    },
+    [onLog],
+  );
+
+  const handleRemoveClaudeDir = useCallback(
+    (path: string) => {
+      const updated = claudeConfigDirs.filter((d) => d !== path);
+      saveClaudeConfigDirs(updated);
+      // Clear usage for removed dir
+      setAccountUsages((prev) => prev.filter((a) => a.config_dir !== path));
+    },
+    [claudeConfigDirs, saveClaudeConfigDirs],
+  );
+
+  const handleAddClaudeDir = useCallback(async () => {
+    const selected = await open({ directory: true, multiple: false });
+    if (selected) {
+      const path = selected as string;
+      if (!claudeConfigDirs.includes(path)) {
+        saveClaudeConfigDirs([...claudeConfigDirs, path]);
+      }
+    }
+  }, [claudeConfigDirs, saveClaudeConfigDirs]);
+
+  const handleAutoDetectClaudeDirs = useCallback(async () => {
+    setDetectingDirs(true);
+    try {
+      const found = await invoke<DiscoveredDir[]>("discover_claude_config_dirs");
+      const newPaths = found.map((d) => d.path);
+      const merged = [...new Set([...claudeConfigDirs, ...newPaths])];
+      await saveClaudeConfigDirs(merged);
+    } catch (err) {
+      console.error("Failed to auto-detect Claude config dirs:", err);
+      onLog("error", `Auto-detect failed: ${err}`);
+    } finally {
+      setDetectingDirs(false);
+    }
+  }, [claudeConfigDirs, saveClaudeConfigDirs, onLog]);
+
+  const checkAccountsUsage = async (dirs?: string[]) => {
+    const dirsToCheck = dirs || claudeConfigDirs;
+    if (dirsToCheck.length === 0) {
+      onLog("warning", "No Claude accounts configured. Add directories below.");
+      return;
+    }
+    try {
+      setCheckingUsage(true);
+      const result = await invoke<TauriResult<AccountUsageInfo[]>>("check_accounts_usage", {
+        configDirs: dirsToCheck,
+      });
+      if (result?.success && result.data) {
+        setAccountUsages(result.data);
+        const best = result.data
+          .filter((a) => !a.error)
+          .sort((a, b) => a.utilization - b.utilization)[0];
+        if (best) {
+          onLog(
+            "success",
+            `Checked ${result.data.length} accounts. Least used: ${best.label} (${Math.round(best.utilization * 100)}%)`,
+          );
+        }
+      }
+    } catch (err) {
+      console.error("Failed to check accounts usage:", err);
+      onLog("error", `Failed to check accounts usage: ${err}`);
+    } finally {
+      setCheckingUsage(false);
+    }
+  };
+
   useEffect(() => {
     loadSettings();
     checkApiKey();
     checkGeminiApiKey();
     checkCliAuth();
+    loadClaudeConfigDirs();
 
     // Listen for startup auth-expired events
     const unlisten = listen<CliAuthStatus>("cli-auth-expired", (event) => {
@@ -247,6 +369,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               result.data.claude_cli?.timeout_seconds ||
               DEFAULT_AI_SETTINGS.claude_cli.timeout_seconds,
             config_dir: result.data.claude_cli?.config_dir,
+            account_selection_mode:
+              result.data.claude_cli?.account_selection_mode ||
+              DEFAULT_AI_SETTINGS.claude_cli.account_selection_mode,
           },
           claude_api: {
             model: result.data.claude_api?.model || DEFAULT_AI_SETTINGS.claude_api.model,
@@ -330,6 +455,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         customPath: settings.claude_cli.custom_path || null,
         timeoutSeconds: settings.claude_cli.timeout_seconds,
         configDir: settings.claude_cli.config_dir || null,
+        accountSelectionMode: settings.claude_cli.account_selection_mode || "manual",
         model: settings.claude_api.model,
         maxTokens: settings.claude_api.max_tokens,
         autoRefineVideoAfterIterations: settings.auto_refine_video_after_iterations,
@@ -714,27 +840,271 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               </p>
             </div>
 
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium">Config Directory (Optional)</label>
-              <input
-                type="text"
-                value={settings.claude_cli.config_dir || ""}
-                onChange={(e) =>
-                  setSettings((prev) => ({
-                    ...prev,
-                    claude_cli: {
-                      ...prev.claude_cli,
-                      config_dir: e.target.value || undefined,
-                    },
-                  }))
-                }
-                placeholder="e.g., C:\Users\Name\.claude-work"
-                className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
-              />
+            {/* Claude Accounts */}
+            <div className="space-y-3 border-t border-border/50 pt-4 mt-2">
+              <div className="flex items-center gap-2">
+                <Users className="w-4 h-4 text-primary" />
+                <label className="text-xs font-medium">Claude Accounts</label>
+              </div>
+
               <p className="text-[10px] text-muted-foreground">
-                Set CLAUDE_CONFIG_DIR to use a different Claude account. Useful for multi-account
-                setups (e.g., work vs personal).
+                Manage Claude Code config directories. Each directory represents a separate account
+                and must contain a <code>projects/</code> subdirectory.
               </p>
+
+              {/* Account list */}
+              <div className="space-y-1.5">
+                {claudeConfigDirs.length === 0 ? (
+                  <div className="text-xs text-muted-foreground text-center py-3 bg-muted/20 rounded-lg">
+                    No accounts configured. Add directories or use Auto-Detect.
+                  </div>
+                ) : (
+                  claudeConfigDirs.map((dir) => {
+                    const usage = accountUsages.find((a) => a.config_dir === dir);
+                    const label =
+                      dir
+                        .split(/[\\/]/)
+                        .filter(Boolean)
+                        .pop() || dir;
+                    const isSelected =
+                      settings.claude_cli.account_selection_mode !== "least_usage" &&
+                      settings.claude_cli.config_dir === dir;
+                    const isBest =
+                      settings.claude_cli.account_selection_mode === "least_usage" &&
+                      accountUsages.length > 0 &&
+                      accountUsages
+                        .filter((a) => !a.error)
+                        .sort((a, b) => a.utilization - b.utilization)[0]?.config_dir === dir;
+
+                    return (
+                      <div
+                        key={dir}
+                        className={`p-2.5 rounded-lg group transition-colors ${
+                          isBest
+                            ? `${getAccentColors("green").bg} ring-1 ring-green-500/30`
+                            : isSelected
+                              ? "bg-primary/10 ring-1 ring-primary/30"
+                              : "bg-muted/30 hover:bg-muted/40"
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          {/* Manual mode: click to select */}
+                          {settings.claude_cli.account_selection_mode !== "least_usage" && (
+                            <input
+                              type="radio"
+                              name="manual_account"
+                              checked={settings.claude_cli.config_dir === dir}
+                              onChange={() =>
+                                setSettings((prev) => ({
+                                  ...prev,
+                                  claude_cli: {
+                                    ...prev.claude_cli,
+                                    config_dir: dir,
+                                  },
+                                }))
+                              }
+                              className="accent-primary shrink-0"
+                            />
+                          )}
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs font-medium truncate">{label}</span>
+                              {isBest && (
+                                <span
+                                  className={`text-[10px] px-1.5 py-0.5 rounded-full ${getAccentColors("green").bg} ${getAccentColors("green").text} font-medium shrink-0`}
+                                >
+                                  Auto-selected
+                                </span>
+                              )}
+                              {isSelected && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/20 text-primary font-medium shrink-0">
+                                  Selected
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-[10px] text-muted-foreground truncate">{dir}</div>
+                          </div>
+
+                          {/* Usage indicator */}
+                          {usage && !usage.error && (
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <div className="w-16 h-1.5 bg-muted/50 rounded-full overflow-hidden">
+                                <div
+                                  className={`h-full rounded-full transition-all ${
+                                    usage.utilization >= 0.8
+                                      ? "bg-red-500"
+                                      : usage.utilization >= 0.5
+                                        ? "bg-yellow-500"
+                                        : "bg-green-500"
+                                  }`}
+                                  style={{
+                                    width: `${Math.max(Math.round(usage.utilization * 100), 2)}%`,
+                                  }}
+                                />
+                              </div>
+                              <span
+                                className={`text-[10px] font-mono w-8 text-right ${
+                                  usage.utilization >= 0.8
+                                    ? getAccentColors("red").text
+                                    : usage.utilization >= 0.5
+                                      ? getAccentColors("yellow").text
+                                      : getAccentColors("green").text
+                                }`}
+                              >
+                                {Math.round(usage.utilization * 100)}%
+                              </span>
+                            </div>
+                          )}
+                          {usage?.error && (
+                            <span
+                              className={`text-[10px] ${getAccentColors("red").text} shrink-0`}
+                            >
+                              Error
+                            </span>
+                          )}
+
+                          <button
+                            onClick={() => handleRemoveClaudeDir(dir)}
+                            className="text-zinc-500 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100 shrink-0"
+                            title="Remove account"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+
+                        {/* Expanded usage details */}
+                        {usage?.resets_at && !usage.error && (
+                          <div className="text-[10px] text-muted-foreground mt-1 ml-6">
+                            Weekly limit resets{" "}
+                            {new Date(usage.resets_at * 1000).toLocaleString()}
+                          </div>
+                        )}
+                        {usage?.error && (
+                          <div
+                            className={`text-[10px] ${getAccentColors("red").text} mt-1 ml-6 truncate`}
+                          >
+                            {usage.error}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+
+              {/* Account management buttons */}
+              <div className="flex flex-wrap gap-2">
+                <button
+                  className="px-2.5 py-1.5 text-xs rounded-md bg-muted/50 hover:bg-muted/70 transition-colors flex items-center gap-1.5"
+                  onClick={handleAddClaudeDir}
+                >
+                  <Plus className="w-3 h-3" />
+                  Add Directory
+                </button>
+                <button
+                  className="px-2.5 py-1.5 text-xs rounded-md bg-muted/50 hover:bg-muted/70 transition-colors flex items-center gap-1.5"
+                  onClick={handleAutoDetectClaudeDirs}
+                  disabled={detectingDirs}
+                >
+                  <FolderSearch
+                    className={`w-3 h-3 ${detectingDirs ? "animate-pulse" : ""}`}
+                  />
+                  {detectingDirs ? "Detecting..." : "Auto-Detect"}
+                </button>
+                {claudeConfigDirs.length > 0 && (
+                  <button
+                    onClick={() => checkAccountsUsage()}
+                    disabled={checkingUsage}
+                    className="px-2.5 py-1.5 text-xs rounded-md bg-primary/10 hover:bg-primary/20 text-primary transition-colors flex items-center gap-1.5 disabled:opacity-50"
+                  >
+                    <RefreshCw
+                      className={`w-3 h-3 ${checkingUsage ? "animate-spin" : ""}`}
+                    />
+                    {checkingUsage ? "Checking..." : "Check Usage"}
+                  </button>
+                )}
+              </div>
+
+              {/* Account selection mode */}
+              {claudeConfigDirs.length > 1 && (
+                <div className="space-y-2 pt-2">
+                  <label className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
+                    Selection Mode
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      onClick={() =>
+                        setSettings((prev) => ({
+                          ...prev,
+                          claude_cli: {
+                            ...prev.claude_cli,
+                            account_selection_mode: "manual",
+                          },
+                        }))
+                      }
+                      className={`p-2.5 rounded-lg text-left transition-colors ${
+                        settings.claude_cli.account_selection_mode !== "least_usage"
+                          ? "bg-primary/10 ring-1 ring-primary/30"
+                          : "bg-muted/30 hover:bg-muted/50"
+                      }`}
+                    >
+                      <div className="text-xs font-medium">Manual</div>
+                      <div className="text-[10px] text-muted-foreground">
+                        Select account above
+                      </div>
+                    </button>
+                    <button
+                      onClick={() =>
+                        setSettings((prev) => ({
+                          ...prev,
+                          claude_cli: {
+                            ...prev.claude_cli,
+                            account_selection_mode: "least_usage",
+                          },
+                        }))
+                      }
+                      className={`p-2.5 rounded-lg text-left transition-colors ${
+                        settings.claude_cli.account_selection_mode === "least_usage"
+                          ? "bg-primary/10 ring-1 ring-primary/30"
+                          : "bg-muted/30 hover:bg-muted/50"
+                      }`}
+                    >
+                      <div className="text-xs font-medium">Least Usage</div>
+                      <div className="text-[10px] text-muted-foreground">
+                        Auto-select on startup
+                      </div>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Manual mode: allow custom dir not in list */}
+              {settings.claude_cli.account_selection_mode !== "least_usage" && (
+                <div className="space-y-1">
+                  <label className="text-[10px] text-muted-foreground">
+                    Or enter a custom config directory:
+                  </label>
+                  <input
+                    type="text"
+                    value={
+                      claudeConfigDirs.includes(settings.claude_cli.config_dir || "")
+                        ? ""
+                        : settings.claude_cli.config_dir || ""
+                    }
+                    onChange={(e) =>
+                      setSettings((prev) => ({
+                        ...prev,
+                        claude_cli: {
+                          ...prev.claude_cli,
+                          config_dir: e.target.value || undefined,
+                        },
+                      }))
+                    }
+                    placeholder="Leave empty to use selection above"
+                    className="w-full px-2.5 py-1.5 text-xs bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                  />
+                </div>
+              )}
             </div>
 
             <div className="space-y-1.5">

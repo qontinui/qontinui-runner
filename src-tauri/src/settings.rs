@@ -35,6 +35,15 @@ pub enum CliExecutionMode {
     Native,        // Native *nix execution
 }
 
+/// Account selection strategy for multi-account Claude CLI setups
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountSelectionMode {
+    #[default]
+    Manual,     // Use the explicitly configured config_dir
+    LeastUsage, // Auto-select the account with lowest utilization
+}
+
 /// Settings for Claude Code CLI execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeCliSettings {
@@ -45,6 +54,9 @@ pub struct ClaudeCliSettings {
     /// e.g., "C:\\Users\\Name\\.claude-work" or "/home/user/.claude-personal"
     #[serde(default)]
     pub config_dir: Option<String>,
+    /// How to select which account to use when multiple config dirs exist
+    #[serde(default)]
+    pub account_selection_mode: AccountSelectionMode,
 }
 
 impl Default for ClaudeCliSettings {
@@ -54,6 +66,7 @@ impl Default for ClaudeCliSettings {
             custom_path: None,
             timeout_seconds: 600,
             config_dir: None,
+            account_selection_mode: AccountSelectionMode::Manual,
         }
     }
 }

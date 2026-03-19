@@ -10,6 +10,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod action_service;
+mod autoresearch;
 mod ai_pricing;
 mod ai_provider;
 mod ai_router;
@@ -45,6 +46,7 @@ mod exploration;
 mod findings;
 mod fixer;
 mod follow_up;
+mod meta_optimizer;
 mod health_monitor;
 mod heartbeat;
 mod instance_manager;
@@ -107,9 +109,11 @@ mod unified_ai_session;
 mod unified_workflow_executor;
 mod unified_workflows;
 mod video_recorder;
+mod comparison;
 mod workflow_generation;
 mod workflow_queue;
 mod workflow_state;
+mod worktree;
 mod zombie_sweep;
 
 use commands::AppState;
@@ -280,13 +284,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut dirs_to_scan: Vec<std::path::PathBuf> = vec![cwd.clone()];
 
-            // Also scan parent directory's immediate children (sibling projects)
+            // Also scan parent directory (Tauri runs from src-tauri/, spec may be in project root)
             if let Some(parent) = cwd.parent() {
-                if let Ok(entries) = std::fs::read_dir(parent) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() && path != cwd {
-                            dirs_to_scan.push(path);
+                dirs_to_scan.push(parent.to_path_buf());
+
+                // Also scan grandparent's immediate children (sibling projects)
+                // e.g. cwd = qontinui-runner/src-tauri → grandparent = qontinui-root
+                if let Some(grandparent) = parent.parent() {
+                    if let Ok(entries) = std::fs::read_dir(grandparent) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() && path != cwd && path != parent.to_path_buf() {
+                                dirs_to_scan.push(path);
+                            }
                         }
                     }
                 }
@@ -469,6 +479,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .manage(session_manager) // For interactive AI session commands
         .manage(terminal_manager) // For embedded PTY terminal sessions
         .manage(checkpoint_db.clone()) // For error_monitor commands that need direct db access
+        .manage(std::sync::Arc::new(
+            tokio::sync::Mutex::new(autoresearch::engine::ResearchEngine::new()),
+        ) as autoresearch::commands::SharedResearchEngine) // Autoresearch experiment engine
         .invoke_handler(tauri::generate_handler![
             // Interactive AI session commands (send messages, interrupt, query state)
             commands::ai_session::list_ai_sessions,
@@ -636,6 +649,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_settings::has_ai_api_key,
             commands::ai_settings::test_ai_connection,
             commands::ai_settings::check_claude_cli_auth,
+            commands::ai_settings::check_accounts_usage,
             commands::ai_settings::refresh_claude_cli_auth,
             commands::ai_settings::get_agentic_settings,
             commands::ai_settings::save_agentic_settings,
@@ -1122,6 +1136,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             orchestration_loop::commands::stop_orchestration_loop,
             orchestration_loop::commands::get_orchestration_loop_status,
             orchestration_loop::commands::signal_orchestration_restart,
+            // Autoresearch commands (autonomous workflow optimization loop)
+            autoresearch::commands::start_autoresearch,
+            autoresearch::commands::stop_autoresearch,
+            autoresearch::commands::get_autoresearch_status,
+            autoresearch::commands::get_autoresearch_results,
+            autoresearch::commands::get_autoresearch_results_tsv,
+            autoresearch::commands::get_autoresearch_campaign_history,
+            autoresearch::commands::get_autoresearch_campaign_experiments,
+            autoresearch::commands::list_unified_workflows,
+            autoresearch::commands::list_worktree_records,
+            autoresearch::commands::get_worktree_diff,
+            autoresearch::commands::merge_worktree_branch,
+            autoresearch::commands::remove_worktree_branch,
+            autoresearch::commands::compare_worktree_branches,
+            autoresearch::commands::rerun_autoresearch_campaign,
+            autoresearch::commands::compare_autoresearch_campaigns,
             // Orchestration loop saved config CRUD
             commands::orchestration_loop_configs::ol_list_configs,
             commands::orchestration_loop_configs::ol_get_config,
@@ -1160,6 +1190,33 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal_analysis::analyze_cross_tab,
             commands::terminal_analysis::analyze_page_architecture,
             commands::terminal_analysis::get_latest_plan_content,
+            // Meta-optimizer commands (recommendation review, prompt registry, manual trigger)
+            commands::meta_optimizer::get_meta_optimizer_recommendations,
+            commands::meta_optimizer::apply_meta_optimizer_recommendation,
+            commands::meta_optimizer::reject_meta_optimizer_recommendation,
+            commands::meta_optimizer::rollback_meta_optimizer_recommendation,
+            commands::meta_optimizer::get_prompt_variants,
+            commands::meta_optimizer::activate_prompt_variant,
+            commands::meta_optimizer::get_meta_optimizer_runs,
+            commands::meta_optimizer::trigger_meta_optimizer,
+            commands::meta_optimizer::get_meta_optimizer_progress,
+            commands::meta_optimizer::capture_meta_optimizer_baseline,
+            commands::meta_optimizer::get_meta_optimizer_snapshots,
+            commands::meta_optimizer::get_agent_effectiveness,
+            commands::meta_optimizer::get_meta_optimizer_failure_analysis,
+            // Regression detection
+            commands::meta_optimizer::get_recommendation_outcomes,
+            commands::meta_optimizer::reevaluate_recommendation_outcome,
+            // Cost-effectiveness
+            commands::meta_optimizer::get_agent_cost_effectiveness,
+            // Cross-agent interaction
+            commands::meta_optimizer::get_agent_interaction_matrix,
+            commands::meta_optimizer::get_agent_cascade_effect,
+            // Canary rollout
+            commands::meta_optimizer::start_canary_rollout,
+            commands::meta_optimizer::get_canary_rollouts,
+            commands::meta_optimizer::promote_canary_rollout,
+            commands::meta_optimizer::rollback_canary_rollout,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
@@ -1423,6 +1480,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         "Claude CLI auth valid ({} minutes remaining)",
                         status.minutes_until_expiry.unwrap_or(0)
                     );
+                }
+
+                // If least-usage mode is enabled, resolve the best account
+                let ai_settings = settings::get_ai_settings();
+                if matches!(
+                    ai_settings.claude_cli.account_selection_mode,
+                    settings::AccountSelectionMode::LeastUsage
+                ) {
+                    info!("Least-usage account selection enabled, resolving best account...");
+                    if let Some(dir) =
+                        commands::ai_settings::resolve_active_config_dir().await
+                    {
+                        info!("Resolved least-usage account: {}", dir);
+                        ai_provider::set_resolved_config_dir(Some(dir));
+                    }
                 }
             });
 

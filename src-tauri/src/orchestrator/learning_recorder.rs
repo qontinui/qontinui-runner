@@ -24,6 +24,7 @@ pub struct WorkflowOutcome {
     pub files_modified: Vec<String>,
     pub error_type: Option<String>,
     pub error_message: Option<String>,
+    pub workflow_architecture: Option<String>,
 }
 
 /// Record a learning outcome from a completed workflow execution.
@@ -64,8 +65,9 @@ pub fn record_learning_outcome(
     conn.execute(
         r#"INSERT INTO learning_outcomes
             (id, task_id, status, duration_secs, iterations, strategy,
-             tools_used, files_modified, error_type, error_message, feedback, created_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+             tools_used, files_modified, error_type, error_message, feedback,
+             workflow_architecture, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
         params![
             id,
             outcome.task_run_id,
@@ -78,6 +80,7 @@ pub fn record_learning_outcome(
             outcome.error_type,
             outcome.error_message,
             "[]", // feedback starts empty, populated later via feedback.rs
+            outcome.workflow_architecture.as_deref(),
             now,
         ],
     )
