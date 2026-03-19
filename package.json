@@ -37,6 +37,7 @@
     "dagre": "^0.8.5",
     "date-fns": "^4.1.0",
     "diff": "^8.0.2",
+    "html2canvas": "^1.4.1",
     "html5-qrcode": "^2.3.8",
     "lucide-react": "^0.562.0",
     "postcss": "^8.5",

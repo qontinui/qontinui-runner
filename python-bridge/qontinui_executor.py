@@ -363,6 +363,17 @@ class QontinuiExecutor:
             self._sm_persistence = StateMachinePersistence(db_path)
         return self._sm_persistence
 
+    @staticmethod
+    def _get_runner_api_port() -> int:
+        """Get the runner API port from QONTINUI_PORT env var, defaulting to 9876."""
+        return int(os.environ.get("QONTINUI_PORT", "9876"))
+
+    @staticmethod
+    def _get_runner_api_base() -> str:
+        """Get the runner API base URL using 127.0.0.1 (more robust than localhost)."""
+        port = int(os.environ.get("QONTINUI_PORT", "9876"))
+        return f"http://127.0.0.1:{port}"
+
     def _try_reload_state_machine(self) -> None:
         """Attempt to reload a persisted state machine on startup."""
         persistence = self._get_sm_persistence()
@@ -377,7 +388,7 @@ class QontinuiExecutor:
 
         from qontinui.state_machine.ui_bridge_runtime import UIBridgeRuntime
 
-        inner_client = UIBridgeHTTPClient("http://localhost:9876")
+        inner_client = UIBridgeHTTPClient(self._get_runner_api_base())
         resolver = ElementResolver(persistence)
         client = ResolvingUIBridgeClient(inner_client, resolver)
 
@@ -2940,7 +2951,7 @@ class QontinuiExecutor:
         for ctx_id in context_ids:
             try:
                 response = requests.get(
-                    f"http://localhost:9876/contexts/{ctx_id}",
+                    f"{self._get_runner_api_base()}/contexts/{ctx_id}",
                     timeout=5,
                 )
                 if response.status_code == 200:
@@ -3718,7 +3729,7 @@ class QontinuiExecutor:
 
         Args:
             params: Command parameters:
-                - runner_url: URL of the qontinui-runner (default: http://localhost:9876)
+                - runner_url: URL of the qontinui-runner (default: http://127.0.0.1:{QONTINUI_PORT})
                 - config: Optional exploration configuration
                     - max_depth: Maximum navigation depth (default: 2)
                     - max_elements_per_page: Max elements per page (default: 20)
@@ -3757,7 +3768,7 @@ class QontinuiExecutor:
                 }
 
             # Get parameters
-            runner_url = params.get("runner_url", "http://localhost:9876")
+            runner_url = params.get("runner_url", self._get_runner_api_base())
             user_config = params.get("config", {})
 
             self.event_manager.emit_log(
@@ -4027,7 +4038,7 @@ class QontinuiExecutor:
 
                 # Forward to the local Rust MCP API's execute-inline endpoint
                 resp = requests.post(
-                    "http://localhost:9876/unified-workflows/execute-inline",
+                    f"{self._get_runner_api_base()}/unified-workflows/execute-inline",
                     json={
                         "name": workflow.get("name", "Remote Workflow"),
                         "description": workflow.get("description", ""),
@@ -5383,7 +5394,7 @@ class QontinuiExecutor:
             persistence = self._get_sm_persistence()
 
             # Create HTTP client with resolving wrapper
-            inner_client = UIBridgeHTTPClient("http://localhost:9876")
+            inner_client = UIBridgeHTTPClient(self._get_runner_api_base())
             resolver = ElementResolver(persistence)
             client = ResolvingUIBridgeClient(inner_client, resolver)
 
@@ -5560,7 +5571,7 @@ class QontinuiExecutor:
         import sys
 
         try:
-            conn = http.client.HTTPConnection("localhost", api_port, timeout=30)
+            conn = http.client.HTTPConnection("127.0.0.1", api_port, timeout=30)
             conn.request("GET", "/ui-bridge/control/snapshot")
             resp = conn.getresponse()
             body = resp.read().decode("utf-8")
@@ -5594,19 +5605,19 @@ class QontinuiExecutor:
     def _handle_gui_config_capture_elements(
         self, params: dict[str, Any]
     ) -> dict[str, Any]:
-        """Extract element images from a screenshot using UI Bridge position data.
+        """Extract element images using UI Bridge DOM capture.
 
-        Fetches the UI Bridge snapshot and captures a screenshot autonomously.
+        Captures element images directly from the webview DOM via html2canvas,
+        bypassing MSS screen capture entirely. This produces correct images
+        regardless of window z-order (other windows can cover the runner).
 
         Args:
             params:
-                - api_port: Runner API port for UI Bridge snapshot callback
-                - window_offset_x: X offset from screenshot origin to content area
-                - window_offset_y: Y offset from screenshot origin to content area
-                - scale_factor: DPI scale factor (default 1.0)
+                - api_port: Runner API port for UI Bridge
                 - category_filter: Optional list of categories to include
                 - min_element_size: Minimum element dimension in pixels (default 4)
-                - padding: Extra pixels around each crop (default 0)
+                - scale_factor: DPI scale factor (default 1.0, used for filtering only)
+                - padding: Extra pixels around each crop (default 0, unused with DOM capture)
 
         Returns:
             Dictionary with element_images mapping and metadata.
@@ -5629,17 +5640,15 @@ class QontinuiExecutor:
             if not snapshot.get("elements"):
                 return {"success": False, "error": "UI Bridge snapshot has no elements"}
 
-            from qontinui.hal.factory import HALFactory
+            # Capture element images directly from the DOM
+            captures = self._fetch_ui_bridge_element_captures(api_port)
+            if captures is None:
+                return {
+                    "success": False,
+                    "error": "Failed to capture element images via UI Bridge",
+                }
 
-            screen_capture = HALFactory.get_screen_capture()
-            screenshot = screen_capture.capture_screen(monitor=None)
-            print(
-                f"[info    ] EXECUTOR: Screenshot captured: {screenshot.width}x{screenshot.height}",
-                file=sys.stderr,
-                flush=True,
-            )
-
-            # Build config
+            # Build config (filters still apply)
             cat_filter = params.get("category_filter")
             config = ExtractionConfig(
                 min_element_size=params.get("min_element_size", 4),
@@ -5649,11 +5658,7 @@ class QontinuiExecutor:
             )
 
             pipeline = ElementImagePipeline(config)
-            offset = (
-                params.get("window_offset_x", 0),
-                params.get("window_offset_y", 0),
-            )
-            result = pipeline.extract(snapshot, screenshot, window_offset=offset)
+            result = pipeline.extract_from_captures(snapshot, captures)
 
             # Build response — element images as a dict
             element_images = {}
@@ -5827,22 +5832,24 @@ class QontinuiExecutor:
     def _handle_gui_config_capture_multi_state(
         self, params: dict[str, Any]
     ) -> dict[str, Any]:
-        """Orchestrate multi-state GUI config capture.
+        """Orchestrate multi-state GUI config capture using UI Bridge DOM capture.
 
-        Walks through a sequence of interactions, capturing screenshots and
-        UI Bridge snapshots at each step. Diffs element sets to find only NEW
-        elements per state, crops images, and builds a complete QontinuiConfig.
+        Walks through a sequence of interactions, capturing element images
+        directly from the DOM via html2canvas at each step. Diffs element sets
+        to find only NEW elements per state, and builds a complete QontinuiConfig.
+
+        No MSS screen capture is used — element images come from the live DOM,
+        so other windows covering the runner do not affect the result.
 
         Args:
             params:
                 - api_port: Runner API port for UI Bridge
-                - window_offset_x/y: Window content area offset
-                - scale_factor: DPI scale
                 - name: Config name
                 - interactions: List of {action_type, target, state_name, wait_seconds}
                 - min_element_size: Minimum element dimension (default 4)
                 - description: Optional config description
                 - similarity: Default similarity threshold (default 0.85)
+                - scale_factor: DPI scale (default 1.0, used for filtering only)
 
         Returns:
             Dictionary with complete QontinuiConfig and capture stats.
@@ -5860,7 +5867,6 @@ class QontinuiExecutor:
                 ExtractionConfig,
                 ExtractedElementImage,
             )
-            from qontinui.hal.factory import HALFactory
             from qontinui.state_machine.config_bridge import (
                 ConfigBridge,
                 UIBridgeStateInput,
@@ -5868,10 +5874,6 @@ class QontinuiExecutor:
             )
 
             api_port = params.get("api_port", 9876)
-            window_offset = (
-                params.get("window_offset_x", 0),
-                params.get("window_offset_y", 0),
-            )
             scale = params.get("scale_factor", 1.0)
             interactions = params.get("interactions", [])
             min_size = params.get("min_element_size", 4)
@@ -5888,7 +5890,6 @@ class QontinuiExecutor:
                 scale_factor=scale,
             )
             pipeline = ElementImagePipeline(config)
-            screen_capture = HALFactory.get_screen_capture()
 
             seen_ids: set[str] = set()
             ui_states: list[UIBridgeStateInput] = []
@@ -5926,10 +5927,7 @@ class QontinuiExecutor:
                     )
                     continue
 
-                # 3. Capture screenshot
-                screenshot = screen_capture.capture_screen(monitor=None)
-
-                # 4. Diff: find only NEW element IDs
+                # 3. Diff: find only NEW element IDs
                 current_ids: set[str] = set()
                 for el in elements:
                     eid = el.get("id", "")
@@ -5958,14 +5956,26 @@ class QontinuiExecutor:
                     flush=True,
                 )
 
+                # 4. Capture only the new elements via UI Bridge DOM capture
+                captures = self._fetch_ui_bridge_element_captures(
+                    api_port, element_ids=list(new_ids)
+                )
+                if captures is None:
+                    print(
+                        f"[warn    ] EXECUTOR: DOM capture failed at step {i}, skipping",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+
                 # 5. Filter snapshot to only new elements, run pipeline
                 filtered_elements = [
                     el for el in elements if el.get("id", "") in new_ids
                 ]
                 filtered_snapshot = {**snapshot, "elements": filtered_elements}
 
-                result = pipeline.extract(
-                    filtered_snapshot, screenshot, window_offset=window_offset
+                result = pipeline.extract_from_captures(
+                    filtered_snapshot, captures
                 )
 
                 # 6. Record state
@@ -6060,7 +6070,7 @@ class QontinuiExecutor:
         import sys
 
         try:
-            conn = http.client.HTTPConnection("localhost", api_port, timeout=10)
+            conn = http.client.HTTPConnection("127.0.0.1", api_port, timeout=10)
             conn.request(
                 "POST",
                 f"/ui-bridge/control/element/{target}/action",
@@ -6081,6 +6091,71 @@ class QontinuiExecutor:
                 file=sys.stderr,
                 flush=True,
             )
+
+    def _fetch_ui_bridge_element_captures(
+        self,
+        api_port: int,
+        element_ids: list[str] | None = None,
+    ) -> dict[str, dict[str, Any]] | None:
+        """Capture element images via the UI Bridge (DOM-based, no screen capture).
+
+        Uses html2canvas in the frontend to render each element directly from
+        the DOM. This produces correct images regardless of window z-order.
+
+        Args:
+            api_port: Runner API port
+            element_ids: Optional list of element IDs to capture.
+                If None, captures all visible elements.
+
+        Returns:
+            Dict mapping element_id to {base64_png, width, height}, or None on failure.
+        """
+        import http.client
+        import json as _json
+        import sys
+
+        try:
+            body = {}
+            if element_ids is not None:
+                body["element_ids"] = element_ids
+
+            conn = http.client.HTTPConnection("127.0.0.1", api_port, timeout=30)
+            conn.request(
+                "POST",
+                "/ui-bridge/control/capture-element-images",
+                _json.dumps(body).encode(),
+                {"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            raw = resp.read().decode("utf-8")
+            conn.close()
+
+            if resp.status != 200:
+                print(
+                    f"[warn    ] EXECUTOR: UI Bridge capture returned status {resp.status}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return None
+
+            response = _json.loads(raw)
+            data = response.get("data", response)
+            captures = data.get("captures", {})
+            count = len(captures)
+            print(
+                f"[info    ] EXECUTOR: Got {count} element captures from UI Bridge",
+                file=sys.stderr,
+                flush=True,
+            )
+            return captures
+
+        except Exception as e:
+            print(
+                f"[warn    ] EXECUTOR: Failed to capture element images via UI Bridge: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
 
     def __del__(self):
         """Clean up resources on exit."""

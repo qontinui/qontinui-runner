@@ -186,6 +186,21 @@ import { instanceStorage } from "@/lib/instance-storage";
 // Styles
 import "./index.css";
 
+/**
+ * Custom event type declarations for window events used across the app.
+ * These augment the global WindowEventMap so addEventListener/removeEventListener
+ * calls are properly typed without requiring `as CustomEvent` casts.
+ */
+declare global {
+  interface WindowEventMap {
+    "ui-bridge-navigate": CustomEvent<{ page: string; url?: string }>;
+    "navigate-to-error-monitor": Event;
+    "navigate-to-active": Event;
+    "sm-show-exploration": Event;
+    "runner-name-changed": CustomEvent<string>;
+  }
+}
+
 type LogSubTab = "general" | "image" | "actions";
 
 // Valid main tab IDs for the sidebar navigation
@@ -619,6 +634,37 @@ function AppContent() {
       }
     });
   }, [registerNavigate]);
+
+  // Listen for UI Bridge navigation events (dispatched by useUIBridgeEventHandler)
+  // This triggers actual React tab switches instead of just pushState URL updates
+  useEffect(() => {
+    const pageToTab: Record<string, MainTabId> = {
+      run: "gui-automation",
+      "gui-automation": "gui-automation",
+      active: "active",
+      "unified-workflow-builder": "unified-workflow-builder",
+      library: "library",
+      ai: "ai",
+      settings: "settings",
+      help: "help",
+      "ui-bridge": "settings",
+      "run-recap": "run-recap",
+      "run-dashboard": "run-recap",
+      history: "history",
+      logs: "logs",
+      "error-monitor": "error-monitor",
+      "state-machine": "state-machine",
+    };
+    const handler = (e: WindowEventMap["ui-bridge-navigate"]) => {
+      const { page } = e.detail;
+      const tabId = pageToTab[page];
+      if (tabId) {
+        setActiveTab(tabId);
+      }
+    };
+    window.addEventListener("ui-bridge-navigate", handler);
+    return () => window.removeEventListener("ui-bridge-navigate", handler);
+  }, []);
 
   // Listen for test-navigation events (for UI testing)
   // Allows Python tests to trigger navigation via HTTP API

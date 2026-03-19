@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info};
 
-use crate::executor::with_default_bridge;
+use crate::executor::{get_or_create_default_bridge, with_default_bridge};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 // ============================================================================
@@ -94,6 +94,22 @@ fn detect_window_geometry(
     }
 }
 
+/// Bring the runner window to the foreground so screenshots capture its content.
+///
+/// Screenshots capture the full screen, so the runner window must be on top.
+/// Without this, other windows (terminals, editors) covering the runner would
+/// be captured instead of the runner's UI.
+fn focus_runner_window(app_handle: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(win) = app_handle.get_webview_window("main") {
+        if let Err(e) = win.set_focus() {
+            error!("GUI Config: Failed to focus runner window: {}", e);
+        } else {
+            info!("GUI Config: Runner window focused for screenshot capture");
+        }
+    }
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -111,6 +127,10 @@ pub async fn capture_elements(
     Json(request): Json<CaptureElementsRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("GUI Config: Capturing elements from current UI");
+
+    // NOTE: Window focus is handled by Python via Windows API (ctypes) before
+    // each screenshot capture. We don't call focus_runner_window() here because
+    // Python runs inside spawn_blocking — an HTTP callback would deadlock.
 
     let api_port = state
         .app_state
@@ -261,6 +281,9 @@ pub async fn capture_multi_state(
         request.interactions.len()
     );
 
+    // NOTE: Window focus is handled by Python via Windows API (ctypes) before
+    // each screenshot capture inside the loop.
+
     let api_port = state
         .app_state
         .api_port
@@ -286,8 +309,9 @@ pub async fn capture_multi_state(
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
-            // Multi-state capture can take a while — generous timeout
-            let timeout = std::time::Duration::from_secs(120);
+            // Multi-state capture with html2canvas rendering can take several minutes
+            // (30+ elements × 9 states × ~2s per element render)
+            let timeout = std::time::Duration::from_secs(600);
             bridge.send_command_and_wait("gui_config_capture_multi_state", Some(params), timeout)
         })?
     })
@@ -325,6 +349,55 @@ pub async fn capture_multi_state(
     }
 }
 
+/// POST /gui-config/focus-window
+///
+/// Brings the runner window to the foreground. Called by the Python bridge
+/// before each screenshot capture to ensure the runner's content is visible.
+pub async fn focus_window(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    focus_runner_window(&state.app_handle);
+    // Small delay to let the window manager finish the focus transition
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    Ok(Json(ApiResponse::success(())))
+}
+
+/// POST /gui-config/start-executor
+///
+/// Ensures the Python executor is running. Creates and starts the bridge if
+/// it doesn't exist. This is an HTTP-accessible version of the Tauri IPC
+/// `start_python_executor` command for use by external tools.
+pub async fn start_executor(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("GUI Config: Starting Python executor via HTTP");
+
+    let app_state = state.app_state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        get_or_create_default_bridge(&app_state).map_err(|e| {
+            error!("Failed to start Python executor: {}", e);
+            format!("Failed to start Python executor: {}", e)
+        })
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("spawn_blocking error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(_) => {
+            info!("GUI Config: Python executor started successfully");
+            Ok(Json(ApiResponse::success(
+                "Python executor started".to_string(),
+            )))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
 // ============================================================================
 // Routes
 // ============================================================================
@@ -336,4 +409,6 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route("/gui-config/capture-elements", post(capture_elements))
         .route("/gui-config/build", post(build_gui_config))
         .route("/gui-config/capture-multi-state", post(capture_multi_state))
+        .route("/gui-config/focus-window", post(focus_window))
+        .route("/gui-config/start-executor", post(start_executor))
 }

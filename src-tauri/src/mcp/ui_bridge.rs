@@ -3066,6 +3066,95 @@ pub async fn ui_bridge_find_handler(
     }
 }
 
+/// POST /ui-bridge/control/capture-element-images — Capture element images directly from the DOM.
+///
+/// Uses html2canvas in the frontend to render each element to a canvas, bypassing
+/// screen capture entirely. This produces correct images even when other windows
+/// cover the runner.
+///
+/// Body: `{ "element_ids": ["btn-save", "input-name"] }` (optional — null captures all visible)
+/// Returns: `{ "captures": { "btn-save": { "base64_png": "...", "width": 80, "height": 30 }, ... } }`
+pub async fn ui_bridge_capture_element_images_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Capture element images");
+
+    // Use a longer timeout for element capture — html2canvas rendering 30+ elements
+    // can take 30-60 seconds. The default 10s UI Bridge IPC timeout is too short.
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let event_payload = serde_json::json!({
+        "requestId": request_id,
+        "type": "capture_element_images",
+        "params": body,
+    });
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+    {
+        let mut pending = state.ui_bridge_pending.lock().await;
+        pending.insert(request_id.clone(), tx);
+    }
+
+    if let Err(e) = state.app_handle.emit("ui-bridge-request", &event_payload) {
+        let mut pending = state.ui_bridge_pending.lock().await;
+        pending.remove(&request_id);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to emit request: {}", e))),
+        ));
+    }
+
+    // 120 second timeout for element capture (vs 10s default)
+    let timeout = std::time::Duration::from_secs(120);
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
+        Ok(Err(_)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error("Request channel closed".to_string())),
+        )),
+        Err(_) => {
+            let mut pending = state.ui_bridge_pending.lock().await;
+            pending.remove(&request_id);
+            error!("UI Bridge API: Capture element images timed out after 120s");
+            Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(api_error(
+                    "Element capture timed out after 120s".to_string(),
+                )),
+            ))
+        }
+    }
+}
+
+/// POST /ui-bridge/control/get-element-images — Read <img> src attributes from the DOM.
+///
+/// A lightweight alternative to capture-element-images that reads image metadata
+/// (src, alt, dimensions) without rendering via html2canvas. Useful for verifying
+/// which images are displayed (e.g., thumbnail URLs on state cards).
+///
+/// Body: `{ "element_id": "some-container", "max_images": 50, "full_src": false, "image_index": 0 }`
+/// - `element_id` (optional): Scope search to a specific UI Bridge element
+/// - `max_images` (optional, default 50): Maximum number of images to return
+/// - `full_src` (optional, default false): Return full data: URIs instead of truncated
+/// - `image_index` (optional): When `full_src` is true, only return full src for this index
+///
+/// Returns: `{ "images": [...], "total": N }`
+pub async fn ui_bridge_get_element_images_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Get element images");
+
+    let payload = serde_json::json!({ "params": body });
+    match ui_bridge_request_sync(&state, "get_element_images", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: get_element_images failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// POST /ui-bridge/control/workflow/:id/run — Run a workflow via the unified workflow engine.
 /// Proxies to the runner's existing `/unified-workflows/:id/run` endpoint via internal HTTP.
 pub async fn ui_bridge_run_workflow_handler(
@@ -3557,6 +3646,16 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/ai/find",
             post(ui_bridge_ai_find_handler),
+        )
+        // Element image capture (DOM-based, no screen capture)
+        .route(
+            "/ui-bridge/control/capture-element-images",
+            post(ui_bridge_capture_element_images_handler),
+        )
+        // Element image metadata (reads <img> src attributes, no rendering)
+        .route(
+            "/ui-bridge/control/get-element-images",
+            post(ui_bridge_get_element_images_handler),
         )
         // Find, workflows, element state, render log
         .route("/ui-bridge/control/find", post(ui_bridge_find_handler))
