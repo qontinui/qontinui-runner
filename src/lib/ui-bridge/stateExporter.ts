@@ -6,7 +6,7 @@
  */
 
 import type { CooccurrenceExport, ElementFingerprint } from "../../types/ui-bridge-types";
-import type { FingerprintDiscoveryResult } from "../../components/ui-bridge/StateDiscoveryPanel";
+import type { FingerprintDiscoveryResult } from "../../components/ui-bridge/discovery-types";
 
 /**
  * Options for exporting to automation config

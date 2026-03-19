@@ -31,7 +31,7 @@ import {
 } from "lucide-react";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
-import type { FingerprintDiscoveryResult } from "./StateDiscoveryPanel";
+import type { FingerprintDiscoveryResult } from "./discovery-types";
 import type { ExplorationProgress, ExplorationPhase } from "../../types";
 
 export interface ExplorationConfig {

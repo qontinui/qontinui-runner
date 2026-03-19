@@ -8,12 +8,8 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useUIBridge } from "ui-bridge";
 import type { RegisteredElement } from "ui-bridge";
-import {
-  UIBridgeInspectorPanel,
-  type UIBridgeElement,
-  type UIBridgeEvent,
-  type UIBridgeSnapshot,
-} from "./UIBridgeInspectorPanel";
+import { UIBridgeInspectorPanel } from "./UIBridgeInspectorPanel";
+import type { UIBridgeElement, UIBridgeEvent, UIBridgeSnapshot } from "./inspector-types";
 import { ElementOverlay } from "./ElementOverlay";
 import { ElementPicker } from "./ElementPicker";
 

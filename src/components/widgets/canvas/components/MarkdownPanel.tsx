@@ -5,7 +5,7 @@
  */
 
 import { MarkdownViewer } from "@/components/MarkdownViewer";
-import type { CanvasPanelComponentProps } from "./CanvasComponentRegistry";
+import type { CanvasPanelComponentProps } from "./types";
 
 export function MarkdownPanel({ data }: CanvasPanelComponentProps) {
   const content = (data.content as string) ?? "";

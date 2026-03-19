@@ -9,7 +9,8 @@
  * - tree_event: Tree-based execution events
  */
 
-import { logManager, actionLogManager } from "../index";
+import { logManager } from "../LogManager";
+import { actionLogManager } from "../ActionLogManager";
 import type { HandlerSetupFunction } from "./types";
 import type {
   ErrorEventPayload,

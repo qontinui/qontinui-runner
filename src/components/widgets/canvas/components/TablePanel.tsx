@@ -7,7 +7,7 @@
 import { useState, useMemo } from "react";
 import { ArrowUpDown, Search } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { CanvasPanelComponentProps } from "./CanvasComponentRegistry";
+import type { CanvasPanelComponentProps } from "./types";
 
 type CellValue = string | number | boolean | null;
 

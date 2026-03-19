@@ -18,7 +18,7 @@
  */
 
 import { cn } from "@/lib/utils";
-import type { CanvasPanelComponentProps } from "./CanvasComponentRegistry";
+import type { CanvasPanelComponentProps } from "./types";
 
 // ============================================================================
 // Data types

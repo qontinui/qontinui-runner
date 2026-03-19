@@ -9,7 +9,7 @@
  * The TauriFindingsListener bridges Rust events to FindingsTracker.
  */
 
-import { logManager } from "../index";
+import { logManager } from "../LogManager";
 import type { HandlerSetupFunction } from "./types";
 import type { AiOutputStreamEventPayload } from "../../types/eventPayloads";
 import { findingsTracker } from "../../services/FindingsTracker";

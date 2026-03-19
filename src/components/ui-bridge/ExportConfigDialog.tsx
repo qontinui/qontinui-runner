@@ -11,7 +11,7 @@ import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import { getStatusColors } from "@/design-system";
 import type { CooccurrenceExport } from "../../types/ui-bridge-types";
-import type { FingerprintDiscoveryResult } from "./StateDiscoveryPanel";
+import type { FingerprintDiscoveryResult } from "./discovery-types";
 import {
   exportToAutomationConfig,
   getAvailableStatesForExport,

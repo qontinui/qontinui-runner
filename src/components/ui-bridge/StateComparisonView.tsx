@@ -10,7 +10,7 @@ import { useMemo } from "react";
 import { X, Hash, MapPin, Fingerprint, Percent, Layers, ArrowRight } from "lucide-react";
 import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
-import type { FingerprintDiscoveryResult } from "./StateDiscoveryPanel";
+import type { FingerprintDiscoveryResult } from "./discovery-types";
 import type { ElementFingerprint } from "../../types/ui-bridge-types";
 
 interface StateComparisonViewProps {

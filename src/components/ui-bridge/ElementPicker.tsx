@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from "react";
-import type { UIBridgeElement } from "./UIBridgeInspectorPanel";
+import type { UIBridgeElement } from "./inspector-types";
 
 interface ElementPickerProps {
   elements: UIBridgeElement[];

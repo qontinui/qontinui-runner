@@ -5,7 +5,7 @@
  * - image_recognition: Pattern matching and template detection results
  */
 
-import { logManager } from "../index";
+import { logManager } from "../LogManager";
 import type { HandlerSetupFunction } from "./types";
 import type { ImageRecognitionEventPayload } from "../../types/eventPayloads";
 import {

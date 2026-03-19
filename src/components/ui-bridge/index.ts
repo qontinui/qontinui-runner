@@ -12,7 +12,7 @@ export type {
   UIBridgeTransition,
   UIBridgeEvent,
   UIBridgeSnapshot,
-} from "./UIBridgeInspectorPanel";
+} from "./inspector-types";
 
 export { ConnectedUIBridgeInspector } from "./ConnectedUIBridgeInspector";
 export { ConnectionPanel } from "./ConnectionPanel";

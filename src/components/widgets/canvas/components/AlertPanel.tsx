@@ -6,7 +6,7 @@
 
 import { AlertCircle, CheckCircle, AlertTriangle, Info } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { CanvasPanelComponentProps } from "./CanvasComponentRegistry";
+import type { CanvasPanelComponentProps } from "./types";
 
 type Severity = "info" | "success" | "warning" | "error";
 

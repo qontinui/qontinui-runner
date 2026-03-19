@@ -9,9 +9,9 @@ import { AgentCampaignConfig } from "./AgentCampaignConfig";
 import { AgentPerformanceView } from "./AgentPerformanceView";
 import { AgentTraceComparison } from "./AgentTraceComparison";
 import { AgentCampaignHistory } from "./AgentCampaignHistory";
+import type { AgentType, PerAgentView } from "./types";
 
-export type AgentType = "spec_analyst" | "locator" | "implementer" | "verifier";
-export type PerAgentView = "configure" | "monitor" | "results" | "history";
+export type { AgentType, PerAgentView } from "./types";
 
 const AGENTS: { id: AgentType; label: string }[] = [
   { id: "spec_analyst", label: "Spec Analyst" },

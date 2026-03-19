@@ -9,7 +9,7 @@
  * integration with the EventRouter system for other consumers.
  */
 
-import { logManager } from "../index";
+import { logManager } from "../LogManager";
 import type { HandlerSetupFunction } from "./types";
 import type { EventPayload } from "../../types/eventPayloads";
 

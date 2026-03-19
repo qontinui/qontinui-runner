@@ -7,7 +7,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { AgentType } from "./PerAgentTab";
+import type { AgentType } from "./types";
 import type { PipelineAgentTrace, MultiAgentPipelineResult } from "@/types";
 
 interface ExperimentConfig {

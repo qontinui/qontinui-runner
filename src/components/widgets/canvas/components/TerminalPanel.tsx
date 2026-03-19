@@ -5,7 +5,7 @@
  */
 
 import { cn } from "@/lib/utils";
-import type { CanvasPanelComponentProps } from "./CanvasComponentRegistry";
+import type { CanvasPanelComponentProps } from "./types";
 
 export function TerminalPanel({ data, size }: CanvasPanelComponentProps) {
   const lines = (data.lines as string[]) ?? [];

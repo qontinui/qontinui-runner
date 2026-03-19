@@ -6,7 +6,7 @@
  */
 
 import { cn } from "@/lib/utils";
-import type { CanvasPanelComponentProps } from "./CanvasComponentRegistry";
+import type { CanvasPanelComponentProps } from "./types";
 
 // Language keyword sets for syntax highlighting
 const KEYWORD_SETS: Record<string, Set<string>> = {

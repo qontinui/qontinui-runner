@@ -25,7 +25,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { memo } from "react";
 import { Circle, Layers, AlertCircle } from "lucide-react";
-import type { FingerprintDiscoveryResult } from "./StateDiscoveryPanel";
+import type { FingerprintDiscoveryResult } from "./discovery-types";
 import type { ElementFingerprint } from "../../types/ui-bridge-types";
 
 // =============================================================================

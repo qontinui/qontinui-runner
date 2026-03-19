@@ -10,7 +10,7 @@ import { useState, useCallback } from "react";
 import { Compass, RefreshCw } from "lucide-react";
 import { getApiBase } from "@/lib/runner-api";
 import { StateDiscoveryPanel } from "../../components/ui-bridge/StateDiscoveryPanel";
-import type { FingerprintDiscoveryResult } from "../../components/ui-bridge/StateDiscoveryPanel";
+import type { FingerprintDiscoveryResult } from "../../components/ui-bridge/discovery-types";
 import {
   ExplorationConfigDialog,
   type ExplorationConfig,

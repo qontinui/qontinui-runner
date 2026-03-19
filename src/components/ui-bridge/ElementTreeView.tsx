@@ -30,7 +30,7 @@ import {
   Check,
   Globe,
 } from "lucide-react";
-import type { UIBridgeElement, UIBridgeState } from "./UIBridgeInspectorPanel";
+import type { UIBridgeElement, UIBridgeState } from "./inspector-types";
 import { ImageViewerModal } from "./ImageViewerModal";
 import { cropPreview } from "../../lib/thumbnail-cropper";
 import { LazyThumbnail } from "./LazyThumbnail";

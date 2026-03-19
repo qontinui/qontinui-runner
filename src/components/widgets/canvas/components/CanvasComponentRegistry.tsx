@@ -6,6 +6,7 @@
  */
 
 import type { ComponentType } from "react";
+import type { CanvasPanelComponentProps } from "./types";
 import { MarkdownPanel } from "./MarkdownPanel";
 import { TablePanel } from "./TablePanel";
 import { CodeDiffPanel } from "./CodeDiffPanel";
@@ -32,15 +33,7 @@ import { CostBreakdownPanel } from "./CostBreakdownPanel";
 import { MissionBriefPanel } from "./MissionBriefPanel";
 import { AcceptanceCriteriaPanel } from "./AcceptanceCriteriaPanel";
 
-/**
- * Props that all canvas panel components receive.
- */
-export interface CanvasPanelComponentProps {
-  data: Record<string, unknown>;
-  size?: "compact" | "normal" | "large";
-  panelId?: string;
-  readOnly?: boolean;
-}
+export type { CanvasPanelComponentProps } from "./types";
 
 /**
  * Fallback component for unknown panel types.

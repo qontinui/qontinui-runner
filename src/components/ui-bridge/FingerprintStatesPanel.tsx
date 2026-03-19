@@ -8,7 +8,7 @@
 import { memo, useMemo } from "react";
 import { Layers, Circle, Fingerprint, ChevronRight, X } from "lucide-react";
 import { Badge } from "../ui/Badge";
-import type { FingerprintDiscoveryResult } from "./StateDiscoveryPanel";
+import type { FingerprintDiscoveryResult } from "./discovery-types";
 import type { ElementFingerprint } from "../../types/ui-bridge-types";
 
 // =============================================================================

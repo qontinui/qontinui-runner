@@ -6,7 +6,7 @@
 
 import { File, Folder } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { CanvasPanelComponentProps } from "./CanvasComponentRegistry";
+import type { CanvasPanelComponentProps } from "./types";
 
 interface FileEntry {
   path: string;

@@ -10,7 +10,23 @@
  * - "Step" = Progress checkpoint in multi-step tasks (internal: Phase)
  */
 
-import type { AiOutputLine } from "../components/AiOutputTab";
+export interface AiOutputLine {
+  id: string;
+  timestamp: number;
+  line: string;
+  source: string; // "prompt" for user prompt, "claude" for AI response, "user_hint" for user hints
+  actionId?: string;
+  /** Parent task run ID (matches task_runs.id in database) */
+  taskRunId?: string;
+  /** Session ID for grouping output (may include phase suffix like "-agentic-1") */
+  sessionId?: string;
+  /** Human-readable session/workflow name */
+  sessionName?: string;
+  /** Workflow phase: setup, verification, agentic, or completion */
+  phase?: string;
+  /** Iteration number within the phase (1, 2, 3...) */
+  phaseIteration?: number;
+}
 
 /**
  * Represents a single AI conversation session (one prompt + response exchange)

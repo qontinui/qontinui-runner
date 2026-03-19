@@ -27,7 +27,7 @@ import {
   ChevronDown,
   ChevronRight,
 } from "lucide-react";
-import type { UIBridgeElement } from "./UIBridgeInspectorPanel";
+import type { UIBridgeElement } from "./inspector-types";
 
 interface ActionExecutorViewProps {
   element?: UIBridgeElement;

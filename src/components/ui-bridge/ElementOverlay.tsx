@@ -1,5 +1,5 @@
 import { memo } from "react";
-import type { UIBridgeElement } from "./UIBridgeInspectorPanel";
+import type { UIBridgeElement } from "./inspector-types";
 
 interface ElementOverlayProps {
   elements: UIBridgeElement[];

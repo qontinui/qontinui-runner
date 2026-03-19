@@ -6,7 +6,7 @@
  */
 
 import { cn } from "@/lib/utils";
-import type { CanvasPanelComponentProps } from "./CanvasComponentRegistry";
+import type { CanvasPanelComponentProps } from "./types";
 
 export function SummaryStatsPanel({ data, size }: CanvasPanelComponentProps) {
   const total = (data.total as number) ?? 0;

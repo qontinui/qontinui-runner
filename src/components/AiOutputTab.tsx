@@ -15,28 +15,12 @@ import { Brain, MessageSquare, Loader2, Send, Square, Copy, Check } from "lucide
 import { getAccentColors } from "@/design-system";
 // Note: Issue and findings detection is now done in EventHandlers.ts to ensure
 // ALL lines are processed, not just filtered ones displayed in this component.
-import { groupEntriesIntoLoops /* type AiLoop */ } from "../types/aiLoop";
+import { groupEntriesIntoLoops, type AiOutputLine } from "../types/aiLoop";
 import { useAiTaskPolling } from "../hooks";
 import { AiMessageDisplay, groupEntriesBySource } from "./shared";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
-export interface AiOutputLine {
-  id: string;
-  timestamp: number;
-  line: string;
-  source: string; // "prompt" for user prompt, "claude" for AI response, "user_hint" for user hints
-  actionId?: string;
-  /** Parent task run ID (matches task_runs.id in database) */
-  taskRunId?: string;
-  /** Session ID for grouping output (may include phase suffix like "-agentic-1") */
-  sessionId?: string;
-  /** Human-readable session/workflow name */
-  sessionName?: string;
-  /** Workflow phase: setup, verification, agentic, or completion */
-  phase?: string;
-  /** Iteration number within the phase (1, 2, 3...) */
-  phaseIteration?: number;
-}
+export type { AiOutputLine } from "../types/aiLoop";
 
 interface AiOutputTabProps {
   lines: AiOutputLine[];

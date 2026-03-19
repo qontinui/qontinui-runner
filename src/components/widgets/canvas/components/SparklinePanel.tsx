@@ -7,7 +7,7 @@
 
 import { BarChart, Bar, Cell, ResponsiveContainer } from "recharts";
 import { cn } from "@/lib/utils";
-import type { CanvasPanelComponentProps } from "./CanvasComponentRegistry";
+import type { CanvasPanelComponentProps } from "./types";
 
 interface SparklineValue {
   iteration: number;

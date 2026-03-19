@@ -14,18 +14,12 @@ import {
   useRef,
   useState,
 } from "react";
-import {
-  usePythonExecutor,
-  useConfiguration,
-  useWorkflowSelection,
-  useMonitorDetection,
-  useExecutionControl,
-  useInitialStatesOverride,
-  type Config,
-  type Workflow,
-  type ConfigImage,
-  type ConfigState,
-} from "../hooks";
+import { usePythonExecutor } from "../hooks/usePythonExecutor";
+import { useConfiguration, type Config, type Workflow, type ConfigImage, type ConfigState } from "../hooks/useConfiguration";
+import { useWorkflowSelection } from "../hooks/useWorkflowSelection";
+import { useMonitorDetection } from "../hooks/useMonitorDetection";
+import { useExecutionControl } from "../hooks/useExecutionControl";
+import { useInitialStatesOverride } from "../hooks/useInitialStatesOverride";
 import type { ResolvedInitialStates, InitialStatesSource } from "../types/state-machine";
 import { getResolvedInitialStates } from "../types/state-machine";
 

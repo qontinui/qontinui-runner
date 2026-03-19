@@ -9,7 +9,9 @@
  * - execution_failed: Workflow execution failed
  */
 
-import { logManager, windowManager, configManager } from "../index";
+import { logManager } from "../LogManager";
+import { windowManager } from "../WindowManager";
+import { configManager } from "../ConfigManager";
 import { APP_VERSION } from "../../lib/appInfo";
 import type { HandlerSetupFunction } from "./types";
 import type { EventPayload } from "../../types/eventPayloads";

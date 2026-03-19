@@ -22,7 +22,7 @@ import {
   ChevronDown,
   ChevronRight,
 } from "lucide-react";
-import type { UIBridgeEvent } from "./UIBridgeInspectorPanel";
+import type { UIBridgeEvent } from "./inspector-types";
 
 interface EventTimelineViewProps {
   events: UIBridgeEvent[];
