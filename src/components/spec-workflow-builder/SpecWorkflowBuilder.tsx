@@ -7,12 +7,13 @@
  * Flow:
  * 1. Load SpecConfig JSON (.spec.uibridge.json or legacy migrated)
  * 2. Select which spec groups to include as verification steps
- * 3. Configure agentic prompt for failure recovery
+ * 3. Configure workflow mode and agentic prompt
  * 4. Preview and apply the generated workflow
  */
 
-import { useState, useCallback, useMemo, useReducer } from "react";
+import { useState, useCallback, useMemo } from "react";
 import { FileJson, CheckSquare, Bot, Eye } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { SpecFileLoader } from "./SpecFileLoader";
 import { SpecSelector } from "./SpecSelector";
 import { NavigationGraphPreview } from "./NavigationGraphPreview";
@@ -24,44 +25,10 @@ import {
   buildSpecWorkflow,
   type SpecConfig as BuildSpecConfig,
 } from "../../lib/workflow-builder/buildSpecWorkflow";
+import { buildSpecDrivenWorkflow } from "../../lib/workflow-builder/buildSpecDrivenWorkflow";
 
 type Step = "load" | "select" | "configure" | "preview";
-type WorkflowMode = "verify" | "fix";
-
-interface ConfigState {
-  agenticPrompt: string;
-  maxIterations: number;
-  elementSource: "control" | "external";
-  workflowMode: WorkflowMode;
-}
-
-type ConfigAction =
-  | { type: "SET_PROMPT"; payload: string }
-  | { type: "SET_MAX_ITERATIONS"; payload: number }
-  | { type: "SET_ELEMENT_SOURCE"; payload: "control" | "external" }
-  | { type: "SET_WORKFLOW_MODE"; payload: WorkflowMode };
-
-function configReducer(state: ConfigState, action: ConfigAction): ConfigState {
-  switch (action.type) {
-    case "SET_PROMPT":
-      return { ...state, agenticPrompt: action.payload };
-    case "SET_MAX_ITERATIONS":
-      return { ...state, maxIterations: action.payload };
-    case "SET_ELEMENT_SOURCE":
-      return { ...state, elementSource: action.payload };
-    case "SET_WORKFLOW_MODE":
-      return { ...state, workflowMode: action.payload };
-    default:
-      return state;
-  }
-}
-
-const initialConfig: ConfigState = {
-  agenticPrompt: "",
-  maxIterations: 3,
-  elementSource: "control",
-  workflowMode: "verify",
-};
+type WorkflowMode = "verify" | "implement" | "update";
 
 interface SpecWorkflowBuilderProps {
   onApplyWorkflow?: (workflow: UnifiedWorkflow) => void;
@@ -75,9 +42,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
   const [agenticPrompt, setAgenticPrompt] = useState("");
   const [maxIterations, setMaxIterations] = useState(3);
   const [elementSource, setElementSource] = useState<"control" | "external">("control");
-  // useReducer for config state (WorkflowMode and related config)
-  const [, dispatchConfig] = useReducer(configReducer, initialConfig);
-  void dispatchConfig; // declared for future use; setters below handle actual state
+  const [workflowMode, setWorkflowMode] = useState<WorkflowMode>("verify");
 
   // Extract generator metadata from SpecConfig
   const genMeta = useMemo<GeneratorSpecMetadata | undefined>(
@@ -89,27 +54,31 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
   const states = useMemo(() => genMeta?.states || [], [genMeta]);
   const transitions = useMemo(() => genMeta?.transitions || [], [genMeta]);
 
-  // Handle file load
-  const handleLoad = useCallback((config: SpecConfig) => {
-    setLoadedData(config);
-    const meta = config.metadata as GeneratorSpecMetadata | undefined;
+  // Handle file load + auto-version snapshot
+  const handleLoad = useCallback((loadedConfig: SpecConfig) => {
+    setLoadedData(loadedConfig);
+    const meta = loadedConfig.metadata as GeneratorSpecMetadata | undefined;
     const genType = meta?.generatorType || "spec";
     setFileName(`${genType}.spec.uibridge.json`);
-    // Auto-select all groups with critical assertions
     const criticalIds = new Set(
-      config.groups
+      loadedConfig.groups
         .filter((g) => g.assertions.some((a) => a.enabled && a.severity === "critical"))
         .map((g) => g.id),
     );
     setSelectedSpecIds(criticalIds);
-    // Determine element source: prefer explicit metadata, otherwise default to "control"
-    const rawMeta = config.metadata as Record<string, unknown> | undefined;
+    const rawMeta = loadedConfig.metadata as Record<string, unknown> | undefined;
     const explicitSource = rawMeta?.elementSource as "control" | "external" | undefined;
     setElementSource(explicitSource || "control");
     setCurrentStep("select");
+    // Auto-version: snapshot for change tracking (fire-and-forget)
+    invoke("snapshot_current_spec", {
+      specId: genType,
+      specJson: JSON.stringify(loadedConfig),
+      changeSummary: null,
+      changeType: "manual",
+    }).catch(() => {});
   }, []);
 
-  // Toggle spec selection
   const toggleSpec = useCallback((specId: string) => {
     setSelectedSpecIds((prev) => {
       const next = new Set(prev);
@@ -119,7 +88,6 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
     });
   }, []);
 
-  // Select all / deselect all
   const selectAll = useCallback(() => {
     if (!loadedData) return;
     setSelectedSpecIds(new Set(loadedData.groups.map((g) => g.id)));
@@ -129,7 +97,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
     setSelectedSpecIds(new Set());
   }, []);
 
-  // Build the full UnifiedWorkflow using the shared hybrid builder
+  // Build workflow based on selected mode
   const workflow: UnifiedWorkflow | null = useMemo(() => {
     if (!loadedData) return null;
 
@@ -139,43 +107,52 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
       ? explorationMeta?.targetUrl || states[0]?.pageUrl || undefined
       : undefined;
 
-    return buildSpecWorkflow({
+    if (workflowMode === "verify") {
+      return buildSpecWorkflow({
+        specConfig: loadedData as unknown as BuildSpecConfig,
+        selectedGroupIds: selectedSpecIds,
+        agenticPrompt: agenticPrompt || undefined,
+        maxIterations,
+        elementSource,
+        pageUrl,
+        workflowName: isNavigation ? "Navigation Verification" : "Snapshot Verification",
+      });
+    }
+
+    return buildSpecDrivenWorkflow({
       specConfig: loadedData as unknown as BuildSpecConfig,
-      selectedGroupIds: selectedSpecIds,
-      agenticPrompt: agenticPrompt || undefined,
-      maxIterations,
+      mode: workflowMode,
       elementSource,
       pageUrl,
-      workflowName: isNavigation ? "Navigation Verification" : "Snapshot Verification",
+      maxIterations: workflowMode === "implement" ? 5 : 3,
+      workflowName:
+        workflowMode === "implement"
+          ? `Implement from Spec — ${fileName.replace(".spec.uibridge.json", "")}`
+          : `Update from Spec — ${fileName.replace(".spec.uibridge.json", "")}`,
     });
-  }, [
-    loadedData,
-    selectedSpecIds,
-    agenticPrompt,
-    maxIterations,
-    elementSource,
-    generatorType,
-    genMeta,
-    states,
-  ]);
+  }, [loadedData, selectedSpecIds, agenticPrompt, maxIterations, elementSource, generatorType, genMeta, states, workflowMode, fileName]);
 
-  const steps: { id: Step; label: string; icon: React.ReactNode }[] = [
+  const stepDefs: { id: Step; label: string; icon: React.ReactNode }[] = [
     { id: "load", label: "Load Specs", icon: <FileJson className="w-4 h-4" /> },
     { id: "select", label: "Select", icon: <CheckSquare className="w-4 h-4" /> },
     { id: "configure", label: "Configure", icon: <Bot className="w-4 h-4" /> },
     { id: "preview", label: "Preview", icon: <Eye className="w-4 h-4" /> },
   ];
 
+  const modeOptions: { value: WorkflowMode; label: string; desc: string }[] = [
+    { value: "verify", label: "Verify Only", desc: "Run spec assertions against existing UI" },
+    { value: "implement", label: "Implement from Spec", desc: "Generate code to satisfy all assertions" },
+    { value: "update", label: "Update from Changes", desc: "Implement only changed/added assertions" },
+  ];
+
   return (
     <div className="flex flex-col h-full">
       {/* Step indicator */}
       <div className="flex items-center gap-1 px-4 py-3 border-b border-border bg-muted/50">
-        {steps.map((step, i) => (
+        {stepDefs.map((step, i) => (
           <div key={step.id} className="flex items-center">
             <button
-              onClick={() => {
-                if (step.id === "load" || loadedData) setCurrentStep(step.id);
-              }}
+              onClick={() => { if (step.id === "load" || loadedData) setCurrentStep(step.id); }}
               disabled={step.id !== "load" && !loadedData}
               className={`flex items-center gap-2 px-3 py-1.5 text-xs rounded-md transition-colors ${
                 currentStep === step.id
@@ -186,17 +163,13 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
               {step.icon}
               {step.label}
             </button>
-            {i < steps.length - 1 && <span className="text-border mx-1">&rsaquo;</span>}
+            {i < stepDefs.length - 1 && <span className="text-border mx-1">&rsaquo;</span>}
           </div>
         ))}
 
         {loadedData && (
           <span className="text-xs text-muted-foreground ml-auto">
-            {generatorType === "snapshot"
-              ? "Snapshot"
-              : generatorType === "navigation"
-                ? "Navigation"
-                : "Spec"}{" "}
+            {generatorType === "snapshot" ? "Snapshot" : generatorType === "navigation" ? "Navigation" : "Spec"}{" "}
             &middot; {loadedData.groups.length} groups
           </span>
         )}
@@ -210,7 +183,6 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
 
         {currentStep === "select" && loadedData && (
           <div className="flex flex-col h-full">
-            {/* Navigation graph preview for Tier 2 */}
             {generatorType === "navigation" && states.length > 0 && (
               <div className="border-b border-border max-h-[200px] overflow-auto">
                 <NavigationGraphPreview states={states} transitions={transitions} />
@@ -240,13 +212,34 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
         {currentStep === "configure" && (
           <div className="flex flex-col h-full">
             <div className="flex-1 overflow-auto">
+              {/* Workflow mode selector */}
+              <div className="px-4 pt-4 pb-2">
+                <div className="text-xs text-muted-foreground uppercase tracking-wide mb-2">Workflow Mode</div>
+                <div className="flex gap-2">
+                  {modeOptions.map((opt) => (
+                    <button
+                      key={opt.value}
+                      onClick={() => setWorkflowMode(opt.value)}
+                      className={`flex-1 px-3 py-2 text-left rounded-md border transition-colors ${
+                        workflowMode === opt.value
+                          ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-400"
+                          : "border-border bg-muted/30 text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      <div className="text-sm font-medium">{opt.label}</div>
+                      <div className="text-xs opacity-70 mt-0.5">{opt.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <AgenticPromptEditor
                 prompt={agenticPrompt}
-                onPromptChange={(v: string) => setAgenticPrompt(v)}
+                onPromptChange={setAgenticPrompt}
                 maxIterations={maxIterations}
-                onMaxIterationsChange={(v: number) => setMaxIterations(v)}
+                onMaxIterationsChange={setMaxIterations}
                 elementSource={elementSource}
-                onElementSourceChange={(v: "control" | "external") => setElementSource(v)}
+                onElementSourceChange={setElementSource}
               />
             </div>
             <div className="px-4 py-3 border-t border-border bg-muted/50">
