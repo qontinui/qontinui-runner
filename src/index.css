@@ -918,39 +918,8 @@
     -webkit-text-fill-color: transparent;
   }
 
-  /* Dark themed scrollbar — kept for explicit opt-in, matches global defaults */
-  @utility scrollbar-dark {
-    scrollbar-width: thin;
-    scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+  /* scrollbar utilities moved to top-level @utility blocks below */
 
-    &::-webkit-scrollbar {
-      width: 4px;
-      height: 4px;
-    }
-
-    &::-webkit-scrollbar-track {
-      background: transparent;
-    }
-
-    &::-webkit-scrollbar-thumb {
-      background: rgba(255, 255, 255, 0.12);
-      border-radius: 2px;
-    }
-
-    &::-webkit-scrollbar-thumb:hover {
-      background: rgba(255, 255, 255, 0.22);
-    }
-  }
-
-  /* Hide scrollbar utility */
-  @utility scrollbar-none {
-    scrollbar-width: none;
-    -ms-overflow-style: none;
-
-    &::-webkit-scrollbar {
-      display: none;
-    }
-  }
 
   /* ============================================
    * Multi-Run Dashboard Animations
@@ -1078,5 +1047,38 @@
     100% {
       box-shadow: none;
     }
+  }
+}
+
+/* Scrollbar utilities (must be top-level, not nested in @layer) */
+@utility scrollbar-dark {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+
+  &::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.12);
+    border-radius: 2px;
+  }
+
+  &::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.22);
+  }
+}
+
+@utility scrollbar-none {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+
+  &::-webkit-scrollbar {
+    display: none;
   }
 }
