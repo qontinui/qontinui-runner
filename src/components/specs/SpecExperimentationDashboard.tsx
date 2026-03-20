@@ -58,9 +58,9 @@ function scoreBadge(score: number): string {
 export function SpecExperimentationDashboard() {
   const [accuracyRecords, setAccuracyRecords] = useState<SpecAccuracyRecord[]>([]);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<"compliance" | "accuracy" | "coverage" | "freshness">(
-    "compliance",
-  );
+  const [activeTab, setActiveTab] = useState<
+    "compliance" | "accuracy" | "coverage" | "consistency" | "freshness"
+  >("compliance");
 
   useEffect(() => {
     invoke<SpecAccuracyRecord[]>("get_spec_accuracy_results", {
@@ -94,6 +94,7 @@ export function SpecExperimentationDashboard() {
             ["compliance", "Compliance"],
             ["accuracy", "Accuracy Scores"],
             ["coverage", "Coverage Gaps"],
+            ["consistency", "Cross-Page"],
             ["freshness", "Freshness"],
           ] as const
         ).map(([key, label]) => (
@@ -172,6 +173,8 @@ export function SpecExperimentationDashboard() {
       )}
 
       {activeTab === "coverage" && <CoverageGapsView records={accuracyRecords} />}
+
+      {activeTab === "consistency" && <CrossPageConsistencyView records={accuracyRecords} />}
 
       {activeTab === "freshness" && <FreshnessView />}
     </div>
@@ -252,6 +255,153 @@ function CoverageGapsView({ records }: { records: SpecAccuracyRecord[] }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+const CONSISTENCY_CATEGORIES = [
+  "error_handling",
+  "loading_states",
+  "empty_states",
+  "accessibility",
+  "navigation",
+];
+
+function CrossPageConsistencyView({ records }: { records: SpecAccuracyRecord[] }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Check if we have cached cross_page results
+  const crossPageRecords = records.filter((r) => r.analysis_type === "cross_page");
+  const hasCachedData = crossPageRecords.length > 0;
+
+  const runAnalysis = async () => {
+    try {
+      setLoading(true);
+      setError(null);
+      // This requires passing all spec configs — for now show cached results
+      setError(
+        "Run cross-page consistency analysis from the CLI or API to populate this view.",
+      );
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!hasCachedData) {
+    return (
+      <div className="space-y-4">
+        <div className="text-sm text-zinc-400">
+          Cross-page consistency checks which quality categories (error handling, loading states,
+          empty states, accessibility, navigation) are covered across all specs. Specs missing
+          commonly-covered categories are flagged as outliers.
+        </div>
+        <button
+          onClick={runAnalysis}
+          disabled={loading}
+          className="px-3 py-1.5 text-sm bg-zinc-700 text-zinc-200 rounded hover:bg-zinc-600 disabled:opacity-50"
+        >
+          {loading ? "Analyzing..." : "Run Consistency Analysis"}
+        </button>
+        {error && <div className="text-zinc-500 text-sm">{error}</div>}
+      </div>
+    );
+  }
+
+  // Build heatmap from cached per-spec cross_page records
+  const specScores = new Map<
+    string,
+    { covered: string[]; missing: string[]; score: number }
+  >();
+  for (const record of crossPageRecords) {
+    try {
+      const detail = JSON.parse(record.detail_json);
+      specScores.set(record.spec_id, {
+        covered: detail.covered_categories ?? [],
+        missing: detail.missing_categories ?? [],
+        score: record.score,
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const specEntries = [...specScores.entries()];
+
+  return (
+    <div className="space-y-4">
+      {/* Heatmap grid */}
+      <div className="bg-zinc-800 rounded-lg border border-zinc-700 overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-zinc-500 text-xs border-b border-zinc-700">
+              <th className="text-left py-2 px-3 sticky left-0 bg-zinc-800">Spec</th>
+              {CONSISTENCY_CATEGORIES.map((cat) => (
+                <th key={cat} className="text-center py-2 px-3 whitespace-nowrap">
+                  {cat.replace("_", " ")}
+                </th>
+              ))}
+              <th className="text-right py-2 px-3">Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {specEntries.map(([specId, data]) => (
+              <tr key={specId} className="border-b border-zinc-800/50">
+                <td className="py-2 px-3 text-zinc-300 truncate max-w-[180px] sticky left-0 bg-zinc-800">
+                  {specId}
+                </td>
+                {CONSISTENCY_CATEGORIES.map((cat) => {
+                  const covered = data.covered.includes(cat);
+                  return (
+                    <td key={cat} className="py-2 px-3 text-center">
+                      <span
+                        className={`inline-block w-4 h-4 rounded ${
+                          covered ? "bg-green-600" : "bg-zinc-700"
+                        }`}
+                        title={covered ? "Covered" : "Not covered"}
+                      />
+                    </td>
+                  );
+                })}
+                <td className={`py-2 px-3 text-right ${scoreColor(data.score)}`}>
+                  {(data.score * 100).toFixed(0)}%
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Category coverage summary */}
+      <div className="bg-zinc-800 rounded-lg p-4 border border-zinc-700">
+        <div className="text-xs text-zinc-500 uppercase tracking-wide mb-2">
+          Category Coverage Across Specs
+        </div>
+        <div className="space-y-2">
+          {CONSISTENCY_CATEGORIES.map((cat) => {
+            const coveredCount = specEntries.filter(([, d]) =>
+              d.covered.includes(cat),
+            ).length;
+            const pct = specEntries.length > 0 ? (coveredCount / specEntries.length) * 100 : 0;
+            return (
+              <div key={cat} className="flex items-center gap-2 text-sm">
+                <span className="w-28 text-zinc-400">{cat.replace("_", " ")}</span>
+                <div className="flex-1 h-2 bg-zinc-700 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-blue-500 rounded-full"
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+                <span className="w-16 text-right text-zinc-400 text-xs">
+                  {coveredCount}/{specEntries.length}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
     </div>
   );
 }

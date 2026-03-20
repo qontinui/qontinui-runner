@@ -3144,7 +3144,7 @@ CREATE INDEX IF NOT EXISTS idx_canary_rec ON canary_rollouts(recommendation_id);
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (121, datetime('now'));
 
 -- =============================================================================
--- Comparison Runs Table (migration 122)
+-- Comparison Runs Table (migration 124)
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS comparison_runs (
@@ -3161,7 +3161,7 @@ CREATE TABLE IF NOT EXISTS comparison_runs (
 CREATE INDEX IF NOT EXISTS idx_comparison_runs_workflow ON comparison_runs(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_comparison_runs_status ON comparison_runs(status);
 
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (122, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (124, datetime('now'));
 
 -- =============================================================================
 -- Spec Experimentation Tables (migration 123)

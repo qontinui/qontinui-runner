@@ -16,7 +16,7 @@
  */
 
 import { useEffect, useCallback, useState } from "react";
-import { ShieldCheck } from "lucide-react";
+import { ShieldCheck, FlaskConical } from "lucide-react";
 import { useSpecsState } from "./useSpecsState";
 import { ConnectionBar } from "./ConnectionBar";
 import { SpecTree } from "./SpecTree";
@@ -29,6 +29,7 @@ import {
 import { getApiBase } from "@/lib/runner-api";
 import { createSummaryStep } from "@/types/unified-workflow";
 import { useKnownIssues } from "@/hooks/useKnownIssues";
+import { SpecExperimentationDashboard } from "@/components/specs/SpecExperimentationDashboard";
 import type { LoadedSpec } from "./types";
 
 interface SpecsPageProps {
@@ -40,6 +41,7 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
   const [isSavingWorkflow, setIsSavingWorkflow] = useState(false);
   const [forcePromptOnly, setForcePromptOnly] = useState(false);
   const [includeRegressionChecks, setIncludeRegressionChecks] = useState(false);
+  const [viewMode, setViewMode] = useState<"editor" | "experimentation">("editor");
   const { issues: knownIssues, loadIssuesForSpec } = useKnownIssues();
   // Spec generation trigger — set when user clicks "Generate Spec" from detail panel or chat
   const [generateSpecRequest, setGenerateSpecRequest] = useState<{
@@ -191,8 +193,37 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
         <span className="text-xs px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 border border-purple-500/30 font-medium">
           {state.editMode ? "editor" : "viewer"}
         </span>
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            onClick={() => setViewMode("editor")}
+            className={`px-2 py-1 text-xs rounded ${
+              viewMode === "editor"
+                ? "bg-zinc-700 text-zinc-100"
+                : "text-zinc-500 hover:text-zinc-300"
+            }`}
+          >
+            Editor
+          </button>
+          <button
+            onClick={() => setViewMode("experimentation")}
+            className={`px-2 py-1 text-xs rounded flex items-center gap-1 ${
+              viewMode === "experimentation"
+                ? "bg-zinc-700 text-zinc-100"
+                : "text-zinc-500 hover:text-zinc-300"
+            }`}
+          >
+            <FlaskConical className="w-3 h-3" />
+            Experimentation
+          </button>
+        </div>
       </div>
 
+      {viewMode === "experimentation" ? (
+        <div className="flex-1 overflow-y-auto">
+          <SpecExperimentationDashboard />
+        </div>
+      ) : (
+      <>
       {/* Connection bar */}
       <ConnectionBar
         connection={state.connection}
@@ -286,6 +317,8 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
           />
         </div>
       </div>
+      </>
+      )}
     </div>
   );
 }

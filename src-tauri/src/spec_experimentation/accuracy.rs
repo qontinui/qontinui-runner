@@ -942,7 +942,7 @@ fn find_component_files(spec_name: &str, components_dir: &Path) -> Vec<PathBuf> 
     let mut results = Vec::new();
 
     // Convert spec name patterns like "active" → possible component files
-    let patterns = vec![
+    let patterns = [
         format!("{}.tsx", spec_name),
         format!("{}.ts", spec_name),
         format!("{}Page.tsx", capitalize(spec_name)),

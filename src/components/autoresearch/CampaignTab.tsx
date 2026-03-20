@@ -335,6 +335,7 @@ export function CampaignTab() {
               <option value="pass_rate">Pass Rate</option>
               <option value="mean_iterations">Mean Iterations</option>
               <option value="mean_duration">Mean Duration</option>
+              <option value="spec_compliance">Spec Compliance</option>
             </select>
           </div>
           <div>
