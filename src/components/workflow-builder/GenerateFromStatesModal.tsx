@@ -160,10 +160,11 @@ export function GenerateFromStatesModal({
             <>
               {/* Workflow name */}
               <div>
-                <label className="block text-sm font-medium text-zinc-400 mb-1.5">
+                <label htmlFor="generate-workflow-name" className="block text-sm font-medium text-zinc-400 mb-1.5">
                   Workflow Name
                 </label>
                 <input
+                  id="generate-workflow-name"
                   type="text"
                   value={workflowName}
                   onChange={(e) => setWorkflowName(e.target.value)}
@@ -174,10 +175,11 @@ export function GenerateFromStatesModal({
 
               {/* Description */}
               <div>
-                <label className="block text-sm font-medium text-zinc-400 mb-1.5">
+                <label htmlFor="generate-workflow-description" className="block text-sm font-medium text-zinc-400 mb-1.5">
                   Description (optional)
                 </label>
                 <textarea
+                  id="generate-workflow-description"
                   value={workflowDescription}
                   onChange={(e) => setWorkflowDescription(e.target.value)}
                   placeholder="What does this workflow verify?"
@@ -190,10 +192,11 @@ export function GenerateFromStatesModal({
               <div className="grid grid-cols-2 gap-4">
                 {/* Max iterations */}
                 <div>
-                  <label className="block text-sm font-medium text-zinc-400 mb-1.5">
+                  <label htmlFor="generate-max-iterations" className="block text-sm font-medium text-zinc-400 mb-1.5">
                     Max Iterations
                   </label>
                   <input
+                    id="generate-max-iterations"
                     type="number"
                     value={maxIterations}
                     onChange={(e) => setMaxIterations(parseInt(e.target.value) || 10)}
@@ -206,10 +209,11 @@ export function GenerateFromStatesModal({
 
                 {/* State timeout */}
                 <div>
-                  <label className="block text-sm font-medium text-zinc-400 mb-1.5">
+                  <label htmlFor="generate-state-timeout" className="block text-sm font-medium text-zinc-400 mb-1.5">
                     State Timeout (sec)
                   </label>
                   <input
+                    id="generate-state-timeout"
                     type="number"
                     value={stateTimeout}
                     onChange={(e) => setStateTimeout(parseInt(e.target.value) || 30)}
@@ -224,7 +228,7 @@ export function GenerateFromStatesModal({
               {/* Toggle options */}
               <div className="space-y-3">
                 {/* Include setup navigation */}
-                <label className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors">
+                <label htmlFor="generate-include-setup-nav" aria-label="Include Setup Navigation" className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors">
                   <div>
                     <span className="text-sm font-medium text-zinc-300">
                       Include Setup Navigation
@@ -234,6 +238,7 @@ export function GenerateFromStatesModal({
                     </p>
                   </div>
                   <input
+                    id="generate-include-setup-nav"
                     type="checkbox"
                     checked={includeSetupNavigation}
                     onChange={(e) => setIncludeSetupNavigation(e.target.checked)}
@@ -242,7 +247,7 @@ export function GenerateFromStatesModal({
                 </label>
 
                 {/* Include AI contexts */}
-                <label className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors">
+                <label htmlFor="generate-include-contexts" aria-label="Include AI Contexts" className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors">
                   <div>
                     <span className="text-sm font-medium text-zinc-300">Include AI Contexts</span>
                     <p className="text-xs text-zinc-500 mt-0.5">
@@ -250,6 +255,7 @@ export function GenerateFromStatesModal({
                     </p>
                   </div>
                   <input
+                    id="generate-include-contexts"
                     type="checkbox"
                     checked={includeContexts}
                     onChange={(e) => setIncludeContexts(e.target.checked)}
@@ -258,7 +264,7 @@ export function GenerateFromStatesModal({
                 </label>
 
                 {/* Include AI summary */}
-                <label className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors">
+                <label htmlFor="generate-include-summary" aria-label="Include AI Summary" className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors">
                   <div>
                     <span className="text-sm font-medium text-zinc-300">Include AI Summary</span>
                     <p className="text-xs text-zinc-500 mt-0.5">
@@ -266,6 +272,7 @@ export function GenerateFromStatesModal({
                     </p>
                   </div>
                   <input
+                    id="generate-include-summary"
                     type="checkbox"
                     checked={includeSummary}
                     onChange={(e) => setIncludeSummary(e.target.checked)}
