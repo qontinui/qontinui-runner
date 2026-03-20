@@ -252,7 +252,9 @@ export function AiGenerateWorkflowModal({
         aria-label="Close AI generate workflow modal"
         className="absolute inset-0 bg-black/50"
         onClick={handleClose}
-        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handleClose(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") handleClose();
+        }}
       />
 
       {/* Dialog */}

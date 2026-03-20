@@ -46,6 +46,8 @@ export default [
           caughtErrorsIgnorePattern: "^_",
         },
       ],
+      // Prefer structured logger over console.* — use createLogger() from lib/logger
+      "no-console": ["warn", { allow: ["warn", "error"] }],
     },
   },
   {

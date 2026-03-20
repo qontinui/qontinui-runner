@@ -152,8 +152,12 @@ function SimplePopover({
         role="button"
         tabIndex={0}
         onClick={() => setOpen((prev) => !prev)}
-        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setOpen((prev) => !prev); }}
-      >{trigger}</div>
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") setOpen((prev) => !prev);
+        }}
+      >
+        {trigger}
+      </div>
       {open && (
         <div className="absolute top-full left-0 z-50 mt-1 w-48 p-1.5 bg-zinc-900 border border-zinc-700 rounded-md shadow-lg">
           {children}

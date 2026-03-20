@@ -701,7 +701,10 @@ function DiscrepancySeverityGroup({
       </div>
       <div className="space-y-2">
         {items.map((item, idx) => (
-          <div key={`item-${idx}-${item.description.slice(0, 20)}`} className="p-2 bg-background rounded text-sm">
+          <div
+            key={`item-${idx}-${item.description.slice(0, 20)}`}
+            className="p-2 bg-background rounded text-sm"
+          >
             <div className="text-foreground">{item.description}</div>
             {item.suggested_action && (
               <div className="mt-1 text-xs text-muted-foreground">

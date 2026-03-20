@@ -151,7 +151,10 @@ export function RunDetailsPanel({ run, onClose }: RunDetailsPanelProps) {
           >
             <div className="flex flex-wrap gap-2">
               {run.states_visited.map((state, idx) => (
-                <span key={`${state}-${idx}`} className="px-2 py-1 text-xs rounded bg-primary/10 text-primary">
+                <span
+                  key={`${state}-${idx}`}
+                  className="px-2 py-1 text-xs rounded bg-primary/10 text-primary"
+                >
                   {state}
                 </span>
               ))}
@@ -170,7 +173,10 @@ export function RunDetailsPanel({ run, onClose }: RunDetailsPanelProps) {
           >
             <div className="space-y-2">
               {run.transitions_executed.map((transition, idx) => (
-                <TransitionItem key={`${transition.from_state}-${transition.to_state}-${idx}`} transition={transition} />
+                <TransitionItem
+                  key={`${transition.from_state}-${transition.to_state}-${idx}`}
+                  transition={transition}
+                />
               ))}
             </div>
           </CollapsibleSection>

@@ -60,7 +60,10 @@ export function SparklinePanel({ data, size }: CanvasPanelComponentProps) {
                 <BarChart data={chartData} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
                   <Bar dataKey="value" barSize={8}>
                     {chartData.map((entry) => (
-                      <Cell key={entry.iteration} fill={entry.outcome === "pass" ? PASS_COLOR : FAIL_COLOR} />
+                      <Cell
+                        key={entry.iteration}
+                        fill={entry.outcome === "pass" ? PASS_COLOR : FAIL_COLOR}
+                      />
                     ))}
                   </Bar>
                 </BarChart>

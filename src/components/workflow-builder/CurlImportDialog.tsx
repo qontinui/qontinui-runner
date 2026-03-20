@@ -117,7 +117,9 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
         aria-label="Close cURL import dialog"
         className="absolute inset-0 bg-black/50"
         onClick={handleClose}
-        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handleClose(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") handleClose();
+        }}
       />
 
       {/* Dialog */}

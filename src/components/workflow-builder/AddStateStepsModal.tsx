@@ -310,7 +310,9 @@ export function AddStateStepsModal({
         aria-label="Close modal"
         className="absolute inset-0 bg-black/60 backdrop-blur-sm"
         onClick={onClose}
-        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onClose(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") onClose();
+        }}
       />
 
       {/* Modal */}
@@ -417,7 +419,9 @@ export function AddStateStepsModal({
                             isSelected ? "bg-purple-500/20" : "hover:bg-zinc-800"
                           }`}
                           onClick={() => setSelectedStateId(state.id)}
-                          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setSelectedStateId(state.id); }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") setSelectedStateId(state.id);
+                          }}
                         >
                           {/* Expand button */}
                           <button
@@ -685,7 +689,10 @@ export function AddStateStepsModal({
                   <div className="p-3 bg-zinc-800/30 border border-zinc-700 rounded-lg space-y-2 max-h-40 overflow-y-auto">
                     {addVerificationSteps &&
                       preview.verificationSteps.map((step, i) => (
-                        <div key={`vstep-${step.name ?? i}`} className="flex items-center gap-2 text-sm text-zinc-400">
+                        <div
+                          key={`vstep-${step.name ?? i}`}
+                          className="flex items-center gap-2 text-sm text-zinc-400"
+                        >
                           <span className="w-5 h-5 rounded bg-green-500/20 text-green-400 flex items-center justify-center text-xs">
                             V
                           </span>

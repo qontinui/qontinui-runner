@@ -111,7 +111,9 @@ export function SpecFileLoader({ onLoad, currentFile }: SpecFileLoaderProps) {
         onDragLeave={() => setIsDragging(false)}
         onDrop={handleDrop}
         onClick={() => fileInputRef.current?.click()}
-        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") fileInputRef.current?.click(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") fileInputRef.current?.click();
+        }}
         role="button"
         tabIndex={0}
         aria-label="Drop a spec file here, or click to browse"

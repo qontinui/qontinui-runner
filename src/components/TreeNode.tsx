@@ -399,7 +399,9 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
         className="flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-accent/5 transition-colors cursor-pointer group"
         style={{ paddingLeft: `${8 + indentation}px` }}
         onClick={() => isExpandable && onToggle(node.id)}
-        onKeyDown={(e) => { if ((e.key === "Enter" || e.key === " ") && isExpandable) onToggle(node.id); }}
+        onKeyDown={(e) => {
+          if ((e.key === "Enter" || e.key === " ") && isExpandable) onToggle(node.id);
+        }}
         role={isExpandable ? "button" : undefined}
         tabIndex={isExpandable ? 0 : undefined}
       >

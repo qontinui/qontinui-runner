@@ -2714,8 +2714,7 @@ pub struct ActiveSessionInfo {
 async fn spawn_instance(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<SpawnInstanceRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiResponse<()>>)>
-{
+) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
     use crate::settings::{self, RunnerInstanceConfig};
 
     let name = body.name.trim().to_string();
@@ -2827,8 +2826,7 @@ async fn stop_instance(
 async fn launch_instance(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiResponse<()>>)>
-{
+) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
     let configs = crate::settings::get_runner_instances();
     let config = configs.iter().find(|c| c.id == id).ok_or_else(|| {
         (

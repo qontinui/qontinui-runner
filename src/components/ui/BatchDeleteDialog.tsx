@@ -44,7 +44,9 @@ export function BatchDeleteDialog({
       <div
         className="absolute inset-0 bg-black/50"
         onClick={isDeleting ? undefined : onClose}
-        onKeyDown={(e) => { if (e.key === "Escape" && !isDeleting) onClose(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Escape" && !isDeleting) onClose();
+        }}
         role="button"
         tabIndex={-1}
         aria-label="Close dialog"

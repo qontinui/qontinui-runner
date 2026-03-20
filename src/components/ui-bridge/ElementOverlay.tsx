@@ -30,7 +30,12 @@ export const ElementOverlay = memo(function ElementOverlay({
               e.stopPropagation();
               onSelectElement(el.id);
             }}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectElement(el.id); }}}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onSelectElement(el.id);
+              }
+            }}
             role="button"
             tabIndex={0}
           >

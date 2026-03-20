@@ -117,7 +117,9 @@ export function PromptLibraryPicker({
         aria-label="Close prompt picker"
         className="absolute inset-0 bg-black/50"
         onClick={onClose}
-        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onClose(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") onClose();
+        }}
       />
 
       {/* Dialog */}

@@ -465,7 +465,10 @@ pub fn create_task(
 
     db.insert_scheduled_task(&scheduled_task)?;
 
-    info!("Created scheduled task: {} ({})", scheduled_task.name, scheduled_task.id);
+    info!(
+        "Created scheduled task: {} ({})",
+        scheduled_task.name, scheduled_task.id
+    );
     Ok(scheduled_task)
 }
 
@@ -521,7 +524,10 @@ pub fn update_task(
     scheduled_task.touch();
     db.update_scheduled_task(&scheduled_task)?;
 
-    info!("Updated scheduled task: {} ({})", scheduled_task.name, scheduled_task.id);
+    info!(
+        "Updated scheduled task: {} ({})",
+        scheduled_task.name, scheduled_task.id
+    );
     Ok(scheduled_task)
 }
 
@@ -537,7 +543,11 @@ pub fn delete_task(db: &CheckpointDb, id: &str) -> Result<(), String> {
 }
 
 /// Record an execution
-pub fn record_execution(db: &CheckpointDb, task_id: &str, record: TaskExecutionRecord) -> Result<(), String> {
+pub fn record_execution(
+    db: &CheckpointDb,
+    task_id: &str,
+    record: TaskExecutionRecord,
+) -> Result<(), String> {
     // Update last_run on the task
     db.update_task_last_run(task_id, Some(&record.execution_id))?;
 
@@ -562,7 +572,11 @@ pub fn get_task_history(db: &CheckpointDb, task_id: &str) -> Vec<TaskExecutionRe
 }
 
 /// Update the condition status for a task
-pub fn update_task_condition_status(db: &CheckpointDb, task_id: &str, status: ConditionStatus) -> Result<(), String> {
+pub fn update_task_condition_status(
+    db: &CheckpointDb,
+    task_id: &str,
+    status: ConditionStatus,
+) -> Result<(), String> {
     let status_json = serde_json::to_string(&status)
         .map_err(|e| format!("Failed to serialize condition status: {}", e))?;
     db.update_task_condition_status(task_id, Some(&status_json))
@@ -585,7 +599,10 @@ pub fn get_scheduler_settings(db: &CheckpointDb) -> SchedulerSettings {
 }
 
 /// Update scheduler settings
-pub fn update_scheduler_settings(db: &CheckpointDb, settings: SchedulerSettings) -> Result<(), String> {
+pub fn update_scheduler_settings(
+    db: &CheckpointDb,
+    settings: SchedulerSettings,
+) -> Result<(), String> {
     db.update_scheduler_settings(&settings)?;
     info!("Updated scheduler settings");
     Ok(())

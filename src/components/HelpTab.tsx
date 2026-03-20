@@ -224,7 +224,10 @@ function ShortcutsPage() {
             </h3>
             <div className="bg-card border border-border rounded-lg divide-y divide-border">
               {category.shortcuts.map((shortcut, idx) => (
-                <div key={`${shortcut.keys.join("-")}-${idx}`} className="p-4 flex items-start gap-4">
+                <div
+                  key={`${shortcut.keys.join("-")}-${idx}`}
+                  className="p-4 flex items-start gap-4"
+                >
                   <div className="flex items-center gap-1.5 flex-shrink-0">
                     {shortcut.keys.map((key, keyIdx) => (
                       <span key={`${key}-${keyIdx}`}>
@@ -539,7 +542,10 @@ function TroubleshootingItemComponent({ item }: TroubleshootingItemComponentProp
             <h4 className="text-sm font-medium mb-2">Solution:</h4>
             <ul className="space-y-2">
               {item.solution.map((step, idx) => (
-                <li key={`step-${idx}-${step.slice(0, 20)}`} className="flex items-start gap-2 text-sm text-muted-foreground">
+                <li
+                  key={`step-${idx}-${step.slice(0, 20)}`}
+                  className="flex items-start gap-2 text-sm text-muted-foreground"
+                >
                   <span className="text-primary font-medium">{idx + 1}.</span>
                   <span>{step}</span>
                 </li>

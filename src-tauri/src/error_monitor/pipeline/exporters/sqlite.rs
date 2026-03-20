@@ -49,7 +49,7 @@ impl Exporter for SqliteExporter {
 
         tokio::task::spawn_blocking(move || {
             let conn = db
-                .connection_string()
+                .get_conn_string()
                 .map_err(|e| format!("DB connection error: {}", e))?;
             for event in &events {
                 if let Err(e) = ErrorEventStorage::insert(

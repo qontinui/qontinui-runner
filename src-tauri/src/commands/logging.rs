@@ -578,10 +578,7 @@ fn truncate_jsonl_file(path: &std::path::Path, keep_lines: usize) {
 
     let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(keep_lines);
-    let kept: String = lines[start..]
-        .iter()
-        .map(|l| format!("{}\n", l))
-        .collect();
+    let kept: String = lines[start..].iter().map(|l| format!("{}\n", l)).collect();
 
     if let Err(e) = fs::write(path, kept) {
         warn!("Failed to write truncated file: {}", e);

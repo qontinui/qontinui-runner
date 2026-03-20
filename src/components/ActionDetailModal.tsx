@@ -768,7 +768,9 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                             alt="Action screenshot"
                             className="w-full max-w-md rounded-lg border border-border cursor-pointer hover:opacity-90 transition-opacity"
                             onClick={() => setScreenshotViewerOpen(true)}
-                            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setScreenshotViewerOpen(true); }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") setScreenshotViewerOpen(true);
+                            }}
                             role="button"
                             tabIndex={0}
                           />

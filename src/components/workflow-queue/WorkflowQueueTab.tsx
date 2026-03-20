@@ -6,7 +6,7 @@
  * and execute the entire sequence.
  */
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
 import { Play, RefreshCw, Trash2, Loader2, Settings2, ChevronRight } from "lucide-react";
 import { WorkflowLibraryPanel } from "./WorkflowLibraryPanel";
@@ -189,9 +189,11 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
   // Check if any workflows are favorited
   const hasFavorites = useMemo(() => workflows.some((w) => w.is_favorite), [workflows]);
 
-  // Auto-enable favorites filter when favorites exist on first load
+  // Auto-enable favorites filter when favorites exist on first load only
+  const hasInitializedFavorites = useRef(false);
   useEffect(() => {
-    if (hasFavorites && workflows.length > 0 && !loading) {
+    if (!hasInitializedFavorites.current && hasFavorites && workflows.length > 0 && !loading) {
+      hasInitializedFavorites.current = true;
       setShowFavoritesOnly(true);
     }
   }, [hasFavorites, workflows.length, loading]);
@@ -324,24 +326,31 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
   }, [queue, stopOnFailure, onLog, onNavigateToActive]);
 
   // Filter workflows
-  const filteredWorkflows = workflows.filter((w) => {
-    const matchesSearch =
-      search === "" ||
-      w.name.toLowerCase().includes(search.toLowerCase()) ||
-      w.description.toLowerCase().includes(search.toLowerCase());
-    const matchesCategory = category === "all" || w.category === category;
-    const matchesFavorites = !showFavoritesOnly || w.is_favorite;
-    return matchesSearch && matchesCategory && matchesFavorites;
-  });
+  const filteredWorkflows = useMemo(
+    () =>
+      workflows.filter((w) => {
+        const matchesSearch =
+          search === "" ||
+          w.name.toLowerCase().includes(search.toLowerCase()) ||
+          w.description.toLowerCase().includes(search.toLowerCase());
+        const matchesCategory = category === "all" || w.category === category;
+        const matchesFavorites = !showFavoritesOnly || w.is_favorite;
+        return matchesSearch && matchesCategory && matchesFavorites;
+      }),
+    [workflows, search, category, showFavoritesOnly],
+  );
 
   // Get unique categories
-  const categories = ["all", ...new Set(workflows.map((w) => w.category).filter(Boolean))];
+  const categories = useMemo(
+    () => ["all", ...new Set(workflows.map((w) => w.category).filter(Boolean))],
+    [workflows],
+  );
 
   // Calculate totals
   const totalSteps = queue.reduce((sum, item) => sum + getTotalStepCount(item.workflow), 0);
 
   // Get queued workflow IDs (for showing "already in queue" state)
-  const queuedIds = new Set(queue.map((q) => q.workflow.id));
+  const queuedIds = useMemo(() => new Set(queue.map((q) => q.workflow.id)), [queue]);
 
   return (
     <div className="h-full flex flex-col bg-background">
@@ -427,7 +436,7 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
 
             {/* Options dropdown */}
             {showOptions && (
-              <div className="absolute bottom-full right-0 mb-2 w-64 card p-3 shadow-xl">
+              <div className="absolute bottom-full right-0 mb-2 w-64 card p-3 shadow-xl z-20">
                 <h4 className="text-label text-foreground mb-2">Execution Options</h4>
                 <label className="flex items-center gap-2 text-body-sm text-muted-foreground cursor-pointer">
                   <input

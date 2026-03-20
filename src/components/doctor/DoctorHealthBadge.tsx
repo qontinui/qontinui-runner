@@ -109,7 +109,9 @@ export function DoctorHealthBadge({ className }: DoctorHealthBadgeProps) {
           <div
             className="fixed inset-0 z-40"
             onClick={() => setShowDropdown(false)}
-            onKeyDown={(e) => { if (e.key === "Escape") setShowDropdown(false); }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setShowDropdown(false);
+            }}
             role="button"
             tabIndex={-1}
             aria-label="Close dropdown"

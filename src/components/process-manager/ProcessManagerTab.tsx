@@ -525,7 +525,10 @@ Be concise and actionable.`;
               <div
                 key={proc.id}
                 onClick={() => setSelectedId(selectedId === proc.id ? null : proc.id)}
-                onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setSelectedId(selectedId === proc.id ? null : proc.id); }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ")
+                    setSelectedId(selectedId === proc.id ? null : proc.id);
+                }}
                 role="button"
                 tabIndex={0}
                 className={cn(

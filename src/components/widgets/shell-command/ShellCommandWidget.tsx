@@ -233,7 +233,12 @@ function CommandRow({
               : "border-transparent hover:bg-muted/30",
         )}
         onClick={onToggle}
-        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(); }}}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onToggle();
+          }
+        }}
         role="button"
         tabIndex={0}
       >
@@ -287,7 +292,11 @@ function CommandRow({
           {parameters.length > 0 && (
             <div className="flex flex-wrap gap-1 mt-1">
               {parameters.map((param, idx) => (
-                <Badge key={`${param}-${idx}`} variant="muted" className="text-[10px] font-mono px-1.5 py-0">
+                <Badge
+                  key={`${param}-${idx}`}
+                  variant="muted"
+                  className="text-[10px] font-mono px-1.5 py-0"
+                >
                   {param}
                 </Badge>
               ))}

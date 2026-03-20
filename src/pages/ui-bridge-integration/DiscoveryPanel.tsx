@@ -289,7 +289,9 @@ function ProjectCard({
   return (
     <div
       onClick={onSelect ? () => onSelect(projectPath) : undefined}
-      onKeyDown={onSelect ? (e) => (e.key === "Enter" || e.key === " ") && onSelect(projectPath) : undefined}
+      onKeyDown={
+        onSelect ? (e) => (e.key === "Enter" || e.key === " ") && onSelect(projectPath) : undefined
+      }
       role={onSelect ? "button" : undefined}
       tabIndex={onSelect ? 0 : undefined}
       className={`flex items-center gap-3 p-3 rounded-lg border border-border bg-card/50${
@@ -375,7 +377,9 @@ function AppCard({
   return (
     <div
       onClick={clickable ? () => onSelect(projectPath) : undefined}
-      onKeyDown={clickable ? (e) => (e.key === "Enter" || e.key === " ") && onSelect(projectPath) : undefined}
+      onKeyDown={
+        clickable ? (e) => (e.key === "Enter" || e.key === " ") && onSelect(projectPath) : undefined
+      }
       role={clickable ? "button" : undefined}
       tabIndex={clickable ? 0 : undefined}
       className={`flex items-center gap-3 p-3 rounded-lg border border-border bg-card/50${

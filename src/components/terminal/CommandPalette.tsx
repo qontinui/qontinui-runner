@@ -551,7 +551,9 @@ export function CommandPalette({
                   tabIndex={0}
                   onClick={() => executeAction(action)}
                   onMouseEnter={() => setSelectedIndex(i)}
-                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") executeAction(action); }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") executeAction(action);
+                  }}
                   className={`flex items-center justify-between px-4 py-1.5 cursor-pointer transition-colors ${
                     i === selectedIndex
                       ? "bg-[#7aa2f7]/15 text-[#c0caf5]"

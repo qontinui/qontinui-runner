@@ -126,7 +126,9 @@ function ContextItem({
   return (
     <div
       onClick={handleClick}
-      onKeyDown={(e) => { if ((e.key === "Enter" || e.key === " ") && !disabled) handleClick(); }}
+      onKeyDown={(e) => {
+        if ((e.key === "Enter" || e.key === " ") && !disabled) handleClick();
+      }}
       role="button"
       tabIndex={disabled ? -1 : 0}
       aria-pressed={isSelected}

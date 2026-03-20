@@ -44,7 +44,12 @@ function WorkflowRow({
             : "border-transparent hover:bg-muted/30",
       )}
       onClick={onSelect}
-      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(); }}}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelect();
+        }
+      }}
       role="button"
       tabIndex={0}
     >

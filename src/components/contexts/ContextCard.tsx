@@ -332,7 +332,9 @@ export function ContextCard({
                   <div
                     className="fixed inset-0 z-10"
                     onClick={() => setShowMenu(false)}
-                    onKeyDown={(e) => { if (e.key === "Escape") setShowMenu(false); }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") setShowMenu(false);
+                    }}
                     role="button"
                     tabIndex={-1}
                     aria-label="Close menu"

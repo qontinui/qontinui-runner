@@ -160,7 +160,9 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
       <div
         className="absolute inset-0 bg-black/50"
         onClick={isLoading ? undefined : onClose}
-        onKeyDown={(e) => { if (e.key === "Escape" && !isLoading) onClose(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Escape" && !isLoading) onClose();
+        }}
         role="button"
         tabIndex={-1}
         aria-label="Close dialog"

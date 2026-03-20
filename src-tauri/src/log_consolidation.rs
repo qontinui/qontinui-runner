@@ -124,8 +124,8 @@ pub fn consolidate_ai_output(
     }
 
     // Read and filter entries line-by-line to avoid loading entire file into memory
-    let file = fs::File::open(&file_path)
-        .map_err(|e| format!("Failed to open ai-output.jsonl: {}", e))?;
+    let file =
+        fs::File::open(&file_path).map_err(|e| format!("Failed to open ai-output.jsonl: {}", e))?;
     let reader = std::io::BufReader::new(file);
 
     let end = end_time.unwrap_or_else(Utc::now);

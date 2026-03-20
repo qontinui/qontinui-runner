@@ -139,7 +139,16 @@ export function StepOutputPanel({
           collapsible && "cursor-pointer hover:bg-muted/50",
         )}
         onClick={collapsible ? () => setIsCollapsed(!isCollapsed) : undefined}
-        onKeyDown={collapsible ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setIsCollapsed(!isCollapsed); }} : undefined}
+        onKeyDown={
+          collapsible
+            ? (e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  setIsCollapsed(!isCollapsed);
+                }
+              }
+            : undefined
+        }
         role={collapsible ? "button" : undefined}
         tabIndex={collapsible ? 0 : undefined}
       >

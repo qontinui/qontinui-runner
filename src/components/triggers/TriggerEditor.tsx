@@ -913,7 +913,10 @@ export function TriggerEditor({ trigger, onSave, onCancel }: TriggerEditorProps)
             </p>
           )}
           {conditions.map((condition, idx) => (
-            <div key={`${condition.type || "cond"}-${idx}`} className="flex items-start gap-2 bg-gray-800/50 rounded p-2">
+            <div
+              key={`${condition.type || "cond"}-${idx}`}
+              className="flex items-start gap-2 bg-gray-800/50 rounded p-2"
+            >
               <div className="flex-1 space-y-2">
                 <div>
                   <label className={labelClass}>Type</label>

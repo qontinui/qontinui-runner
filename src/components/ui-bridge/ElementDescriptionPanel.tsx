@@ -1258,7 +1258,10 @@ export function ElementDescriptionPanel({
                   </span>
                   <div className="flex flex-wrap items-center gap-1">
                     {domContext.path.map((segment: PathSegment, index: number) => (
-                      <span key={`${segment.elementId ?? segment.tagName}-${index}`} className="flex items-center gap-1">
+                      <span
+                        key={`${segment.elementId ?? segment.tagName}-${index}`}
+                        className="flex items-center gap-1"
+                      >
                         {index > 0 && <ArrowRight className="w-3 h-3 text-muted-foreground/50" />}
                         {segment.elementId ? (
                           <button

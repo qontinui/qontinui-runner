@@ -701,7 +701,10 @@ function CheckResultCard({ check }: CheckResultCardProps) {
               </h5>
               <div className="space-y-1 max-h-60 overflow-y-auto">
                 {check.issues.map((issue, idx) => (
-                  <IssueRow key={`${issue.message?.slice(0, 20) || "issue"}-${idx}`} issue={issue} />
+                  <IssueRow
+                    key={`${issue.message?.slice(0, 20) || "issue"}-${idx}`}
+                    issue={issue}
+                  />
                 ))}
               </div>
             </div>

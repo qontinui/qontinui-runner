@@ -1645,20 +1645,24 @@ impl LoopController {
                 "production"
             };
             // Infer architecture: use explicit config, infer from sub-configs, or default to "traditional"
-            let architecture = config.workflow_architecture.as_ref().map(|a| {
-                serde_json::to_value(a)
-                    .ok()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_else(|| format!("{:?}", a).to_lowercase())
-            }).unwrap_or_else(|| {
-                if config.multi_agent_pipeline_config.is_some() {
-                    "multi_agent_pipeline".to_string()
-                } else if config.agentic_verification_config.is_some() {
-                    "agentic_verification".to_string()
-                } else {
-                    "traditional".to_string()
-                }
-            });
+            let architecture = config
+                .workflow_architecture
+                .as_ref()
+                .map(|a| {
+                    serde_json::to_value(a)
+                        .ok()
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| format!("{:?}", a).to_lowercase())
+                })
+                .unwrap_or_else(|| {
+                    if config.multi_agent_pipeline_config.is_some() {
+                        "multi_agent_pipeline".to_string()
+                    } else if config.agentic_verification_config.is_some() {
+                        "agentic_verification".to_string()
+                    } else {
+                        "traditional".to_string()
+                    }
+                });
             let outcome = crate::orchestrator::learning_recorder::WorkflowOutcome {
                 task_run_id: config.execution_id.clone(),
                 workflow_name: config.workflow_name.clone(),

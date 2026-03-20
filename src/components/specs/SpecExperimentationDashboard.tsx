@@ -102,9 +102,7 @@ export function SpecExperimentationDashboard() {
             key={key}
             onClick={() => setActiveTab(key)}
             className={`px-3 py-1.5 text-sm rounded-t ${
-              activeTab === key
-                ? "bg-zinc-700 text-zinc-100"
-                : "text-zinc-500 hover:text-zinc-300"
+              activeTab === key ? "bg-zinc-700 text-zinc-100" : "text-zinc-500 hover:text-zinc-300"
             }`}
           >
             {label}
@@ -144,9 +142,7 @@ export function SpecExperimentationDashboard() {
                 <tbody>
                   {specIds.map((specId) => (
                     <tr key={specId} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
-                      <td className="py-2 px-3 text-zinc-300 truncate max-w-[200px]">
-                        {specId}
-                      </td>
+                      <td className="py-2 px-3 text-zinc-300 truncate max-w-[200px]">{specId}</td>
                       {analysisTypes.map((type) => {
                         const record = latestBySpecAndType.get(`${specId}::${type}`);
                         return (
@@ -221,8 +217,7 @@ function CoverageGapsView({ records }: { records: SpecAccuracyRecord[] }) {
                 Total elements: <span className="text-zinc-200">{detail.total_elements}</span>
               </div>
               <div>
-                Interactive:{" "}
-                <span className="text-zinc-200">{detail.interactive_elements}</span>
+                Interactive: <span className="text-zinc-200">{detail.interactive_elements}</span>
               </div>
               <div>
                 With assertions:{" "}
@@ -237,10 +232,7 @@ function CoverageGapsView({ records }: { records: SpecAccuracyRecord[] }) {
                 </div>
                 <div className="flex flex-wrap gap-1">
                   {detail.uncovered_elements.slice(0, 20).map((el, i) => (
-                    <span
-                      key={i}
-                      className="text-xs bg-zinc-700 text-zinc-300 px-2 py-0.5 rounded"
-                    >
+                    <span key={i} className="text-xs bg-zinc-700 text-zinc-300 px-2 py-0.5 rounded">
                       {el}
                     </span>
                   ))}
@@ -280,9 +272,7 @@ function CrossPageConsistencyView({ records }: { records: SpecAccuracyRecord[] }
       setLoading(true);
       setError(null);
       // This requires passing all spec configs — for now show cached results
-      setError(
-        "Run cross-page consistency analysis from the CLI or API to populate this view.",
-      );
+      setError("Run cross-page consistency analysis from the CLI or API to populate this view.");
     } catch (e) {
       setError(String(e));
     } finally {
@@ -311,10 +301,7 @@ function CrossPageConsistencyView({ records }: { records: SpecAccuracyRecord[] }
   }
 
   // Build heatmap from cached per-spec cross_page records
-  const specScores = new Map<
-    string,
-    { covered: string[]; missing: string[]; score: number }
-  >();
+  const specScores = new Map<string, { covered: string[]; missing: string[]; score: number }>();
   for (const record of crossPageRecords) {
     try {
       const detail = JSON.parse(record.detail_json);
@@ -381,18 +368,13 @@ function CrossPageConsistencyView({ records }: { records: SpecAccuracyRecord[] }
         </div>
         <div className="space-y-2">
           {CONSISTENCY_CATEGORIES.map((cat) => {
-            const coveredCount = specEntries.filter(([, d]) =>
-              d.covered.includes(cat),
-            ).length;
+            const coveredCount = specEntries.filter(([, d]) => d.covered.includes(cat)).length;
             const pct = specEntries.length > 0 ? (coveredCount / specEntries.length) * 100 : 0;
             return (
               <div key={cat} className="flex items-center gap-2 text-sm">
                 <span className="w-28 text-zinc-400">{cat.replace("_", " ")}</span>
                 <div className="flex-1 h-2 bg-zinc-700 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-blue-500 rounded-full"
-                    style={{ width: `${pct}%` }}
-                  />
+                  <div className="h-full bg-blue-500 rounded-full" style={{ width: `${pct}%` }} />
                 </div>
                 <span className="w-16 text-right text-zinc-400 text-xs">
                   {coveredCount}/{specEntries.length}

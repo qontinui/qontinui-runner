@@ -223,101 +223,101 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
           <SpecExperimentationDashboard />
         </div>
       ) : (
-      <>
-      {/* Connection bar */}
-      <ConnectionBar
-        connection={state.connection}
-        isLoading={state.isLoading || isSavingWorkflow}
-        stats={state.stats}
-        editMode={state.editMode}
-        hasSelectedSpec={!!state.selectedSpec}
-        selectedSpecKind={state.selectedSpec?.kind || null}
-        onLoadBundled={state.loadBundledSpecs}
-        onDiscover={state.discoverFromApp}
-        onLoadFromFile={state.loadFromFile}
-        onSaveToFile={state.saveToFile}
-        forcePromptOnly={forcePromptOnly}
-        onToggleForcePromptOnly={() => setForcePromptOnly(!forcePromptOnly)}
-        includeRegressionChecks={includeRegressionChecks}
-        onToggleRegressionChecks={() => setIncludeRegressionChecks(!includeRegressionChecks)}
-        regressionIssueCount={knownIssues.filter((i) => i.status === "active").length}
-        onBuildWorkflow={() => handleBuildWorkflow()}
-        onToggleEditMode={() => state.setEditMode(!state.editMode)}
-      />
-
-      {/* Main content: tree + detail + chat */}
-      <div className="flex-1 flex min-h-0">
-        {/* Left sidebar: spec tree */}
-        <div className="w-64 shrink-0 border-r border-border overflow-y-auto">
-          <div className="px-3 py-2 border-b border-border">
-            <h2 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-              Specifications
-            </h2>
-          </div>
-          <SpecTree
-            tree={state.tree}
-            expandedNodes={state.expandedNodes}
-            selection={state.selection}
-            onToggle={state.toggleNode}
-            onSelect={state.selectNode}
-          />
-        </div>
-
-        {/* Center: detail panel */}
-        <div className="flex-1 min-w-0">
-          <SpecDetailPanel
-            selectedSpec={state.selectedSpec}
-            selectedGroup={state.selectedGroup}
-            selectionType={state.selection.type}
+        <>
+          {/* Connection bar */}
+          <ConnectionBar
+            connection={state.connection}
+            isLoading={state.isLoading || isSavingWorkflow}
+            stats={state.stats}
             editMode={state.editMode}
-            unspeccedPageInfo={
-              state.selection.type === "unspecced-page"
-                ? {
-                    label: state.selection.label,
-                    description: state.selection.description,
-                    expectedSpecId: state.selection.expectedSpecId,
-                  }
-                : null
-            }
-            onToggleAssertion={state.toggleAssertion}
-            onRemoveAssertion={state.removeAssertion}
-            onAddAssertion={state.addAssertion}
-            onAddGroup={state.addGroup}
-            onRemoveGroup={state.removeGroup}
-            onUpdateSetupActions={state.updateSetupActions}
-            onClearSelection={() => state.setSelection({ type: "none" })}
-            onGenerateSpec={
-              state.selection.type === "unspecced-page"
-                ? () => {
-                    const sel = state.selection as {
-                      type: "unspecced-page";
-                      expectedSpecId: string;
-                      label: string;
-                      description: string;
-                    };
-                    setGenerateSpecRequest({
-                      expectedSpecId: sel.expectedSpecId,
-                      label: sel.label,
-                      description: sel.description,
-                    });
-                  }
-                : undefined
-            }
+            hasSelectedSpec={!!state.selectedSpec}
+            selectedSpecKind={state.selectedSpec?.kind || null}
+            onLoadBundled={state.loadBundledSpecs}
+            onDiscover={state.discoverFromApp}
+            onLoadFromFile={state.loadFromFile}
+            onSaveToFile={state.saveToFile}
+            forcePromptOnly={forcePromptOnly}
+            onToggleForcePromptOnly={() => setForcePromptOnly(!forcePromptOnly)}
+            includeRegressionChecks={includeRegressionChecks}
+            onToggleRegressionChecks={() => setIncludeRegressionChecks(!includeRegressionChecks)}
+            regressionIssueCount={knownIssues.filter((i) => i.status === "active").length}
+            onBuildWorkflow={() => handleBuildWorkflow()}
+            onToggleEditMode={() => state.setEditMode(!state.editMode)}
           />
-        </div>
 
-        {/* Right: AI Chat panel */}
-        <div className="flex-[0.5] min-w-[280px] border-l border-border flex flex-col">
-          <SpecChatPanel
-            selectedSpec={state.selectedSpec}
-            onAddSpec={state.addSpec}
-            onBuildWorkflow={handleBuildWorkflow}
-            generateSpecRequest={generateSpecRequest}
-            onGenerateSpecHandled={() => setGenerateSpecRequest(null)}
-          />
-        </div>
-      </div>
-      </>
+          {/* Main content: tree + detail + chat */}
+          <div className="flex-1 flex min-h-0">
+            {/* Left sidebar: spec tree */}
+            <div className="w-64 shrink-0 border-r border-border overflow-y-auto">
+              <div className="px-3 py-2 border-b border-border">
+                <h2 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Specifications
+                </h2>
+              </div>
+              <SpecTree
+                tree={state.tree}
+                expandedNodes={state.expandedNodes}
+                selection={state.selection}
+                onToggle={state.toggleNode}
+                onSelect={state.selectNode}
+              />
+            </div>
+
+            {/* Center: detail panel */}
+            <div className="flex-1 min-w-0">
+              <SpecDetailPanel
+                selectedSpec={state.selectedSpec}
+                selectedGroup={state.selectedGroup}
+                selectionType={state.selection.type}
+                editMode={state.editMode}
+                unspeccedPageInfo={
+                  state.selection.type === "unspecced-page"
+                    ? {
+                        label: state.selection.label,
+                        description: state.selection.description,
+                        expectedSpecId: state.selection.expectedSpecId,
+                      }
+                    : null
+                }
+                onToggleAssertion={state.toggleAssertion}
+                onRemoveAssertion={state.removeAssertion}
+                onAddAssertion={state.addAssertion}
+                onAddGroup={state.addGroup}
+                onRemoveGroup={state.removeGroup}
+                onUpdateSetupActions={state.updateSetupActions}
+                onClearSelection={() => state.setSelection({ type: "none" })}
+                onGenerateSpec={
+                  state.selection.type === "unspecced-page"
+                    ? () => {
+                        const sel = state.selection as {
+                          type: "unspecced-page";
+                          expectedSpecId: string;
+                          label: string;
+                          description: string;
+                        };
+                        setGenerateSpecRequest({
+                          expectedSpecId: sel.expectedSpecId,
+                          label: sel.label,
+                          description: sel.description,
+                        });
+                      }
+                    : undefined
+                }
+              />
+            </div>
+
+            {/* Right: AI Chat panel */}
+            <div className="flex-[0.5] min-w-[280px] border-l border-border flex flex-col">
+              <SpecChatPanel
+                selectedSpec={state.selectedSpec}
+                onAddSpec={state.addSpec}
+                onBuildWorkflow={handleBuildWorkflow}
+                generateSpecRequest={generateSpecRequest}
+                onGenerateSpecHandled={() => setGenerateSpecRequest(null)}
+              />
+            </div>
+          </div>
+        </>
       )}
     </div>
   );

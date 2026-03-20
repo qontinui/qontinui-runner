@@ -57,9 +57,8 @@ pub(super) use super::phase_helpers::{
     check_environment_readiness, clear_console_errors, compute_embedding_sync, estimate_tokens,
     execute_prompt_response_mode, fetch_browser_events_from_ui_bridge,
     fetch_console_errors_from_ui_bridge, fetch_health_from_ui_bridge,
-    fetch_network_failures_from_ui_bridge,
-    record_phase_token_usage, try_auto_connect_sdk_for_ui_workflow,
-    REFLECTION_MODE_PREAMBLE,
+    fetch_network_failures_from_ui_bridge, record_phase_token_usage,
+    try_auto_connect_sdk_for_ui_workflow, REFLECTION_MODE_PREAMBLE,
 };
 
 // Execution Timing Context

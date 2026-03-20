@@ -478,7 +478,12 @@ function SdkArchitecturePanel({
                 <div
                   key={node.id}
                   onClick={() => setSelectedNode(selectedNode?.id === node.id ? null : node)}
-                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelectedNode(selectedNode?.id === node.id ? null : node); }}}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setSelectedNode(selectedNode?.id === node.id ? null : node);
+                    }
+                  }}
                   role="button"
                   tabIndex={0}
                   className={`flex items-center gap-2 px-2 py-1.5 rounded text-sm cursor-pointer transition-colors ${
@@ -534,7 +539,12 @@ function SdkArchitecturePanel({
                     <div
                       key={node.id}
                       onClick={() => setSelectedNode(selectedNode?.id === node.id ? null : node)}
-                      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelectedNode(selectedNode?.id === node.id ? null : node); }}}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setSelectedNode(selectedNode?.id === node.id ? null : node);
+                        }
+                      }}
                       role="button"
                       tabIndex={0}
                       className={`px-2 py-1.5 rounded text-sm cursor-pointer transition-colors ${
@@ -617,7 +627,11 @@ function SdkArchitecturePanel({
                   </div>
                   <div className="space-y-0.5">
                     {selectedNode.entryPoints.map((ep, i) => (
-                      <div key={`${ep}-${i}`} className="text-xs font-mono text-blue-400 truncate" title={ep}>
+                      <div
+                        key={`${ep}-${i}`}
+                        className="text-xs font-mono text-blue-400 truncate"
+                        title={ep}
+                      >
                         {ep}
                       </div>
                     ))}
@@ -680,7 +694,10 @@ function SdkArchitecturePanel({
                           ? edge.target.replace("feature:", "")
                           : edge.source.replace("feature:", "");
                         return (
-                          <div key={`${edge.source}-${edge.target}-${i}`} className="text-xs text-muted-foreground">
+                          <div
+                            key={`${edge.source}-${edge.target}-${i}`}
+                            className="text-xs text-muted-foreground"
+                          >
                             {isSource ? (
                               <>
                                 <span className="text-muted-foreground/60">{edge.type}</span>{" "}
@@ -746,7 +763,10 @@ function SdkArchitecturePanel({
               </h3>
               <div className="space-y-1">
                 {project.edges.map((edge, i) => (
-                  <div key={`${edge.source}-${edge.target}-${i}`} className="px-2 py-1 text-xs text-muted-foreground">
+                  <div
+                    key={`${edge.source}-${edge.target}-${i}`}
+                    className="px-2 py-1 text-xs text-muted-foreground"
+                  >
                     <span className="text-foreground">{edge.source.replace("feature:", "")}</span>
                     {" \u2192 "}
                     <span className="text-foreground">{edge.target.replace("feature:", "")}</span>

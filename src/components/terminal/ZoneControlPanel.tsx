@@ -390,7 +390,9 @@ function WorkspacesSection({
               tabIndex={0}
               className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-[#1a1b26]/50 hover:bg-[#1a1b26] transition-colors group cursor-pointer"
               onClick={() => onLoad(ws)}
-              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onLoad(ws); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") onLoad(ws);
+              }}
               title={`Load workspace "${ws.name}"`}
             >
               <div className="flex-1 min-w-0">
@@ -553,7 +555,9 @@ function ZoneRow({
           borderLeft: isFocused ? `2px solid ${stateColor}` : "2px solid transparent",
         }}
         onClick={onFocus}
-        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onFocus(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") onFocus();
+        }}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
       >

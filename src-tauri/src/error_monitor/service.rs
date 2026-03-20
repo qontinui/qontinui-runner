@@ -282,7 +282,7 @@ impl ErrorMonitorService {
         {
             let db = self.db.clone();
             match tokio::task::spawn_blocking(move || -> Result<usize, String> {
-                let conn = db.connection_string()?;
+                let conn = db.get_conn_string()?;
                 conn.execute(
                     "UPDATE error_events \
                      SET status = 'resolved', resolved_at = datetime('now') \

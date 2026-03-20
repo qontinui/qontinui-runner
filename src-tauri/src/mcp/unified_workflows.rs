@@ -11,7 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::database::CreateTaskRunInput;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
@@ -57,23 +57,21 @@ pub fn refetch_unified_workflow_steps(
 
             // Helper closure to convert step
             let convert_step = |step: &serde_json::Value| -> Option<ExecutionStepConfig> {
-                // Debug: log the raw step JSON
-                info!(
+                debug!(
                     "refetch_unified_workflow_steps: converting step: {}",
                     serde_json::to_string(step).unwrap_or_else(|_| "ERROR".to_string())
                 );
 
                 // Try direct deserialization first
                 if let Ok(config) = serde_json::from_value::<ExecutionStepConfig>(step.clone()) {
-                    info!(
+                    debug!(
                         "refetch_unified_workflow_steps: serde succeeded, check_type={:?}",
                         config.check_type
                     );
                     return Some(config);
                 }
 
-                // Debug: log that serde failed
-                info!("refetch_unified_workflow_steps: serde failed, using manual extraction");
+                debug!("refetch_unified_workflow_steps: serde failed, using manual extraction");
 
                 // Fall back to manual extraction
                 let step_type = step.get("type").and_then(|t| t.as_str())?;
@@ -343,46 +341,8 @@ pub async fn get_unified_workflow(
                 workflow.name
             );
             // Cache locally for future access
-            let create_req = crate::unified_workflows::CreateUnifiedWorkflowRequest {
-                name: workflow.name.clone(),
-                description: workflow.description.clone(),
-                category: workflow.category.clone(),
-                tags: workflow.tags.clone(),
-                setup_steps: workflow.setup_steps.clone(),
-                verification_steps: workflow.verification_steps.clone(),
-                agentic_steps: workflow.agentic_steps.clone(),
-                completion_steps: workflow.completion_steps.clone(),
-                max_iterations: workflow.max_iterations,
-                timeout_seconds: workflow.timeout_seconds,
-                provider: workflow.provider.clone(),
-                model: workflow.model.clone(),
-                skip_ai_summary: workflow.skip_ai_summary,
-                log_source_selection: Some(workflow.log_source_selection.clone()),
-                context_ids: Some(workflow.context_ids.clone()),
-                disabled_context_ids: Some(workflow.disabled_context_ids.clone()),
-                auto_include_contexts: Some(workflow.auto_include_contexts),
-                prompt_template: workflow.prompt_template.clone(),
-                log_watch_enabled: Some(workflow.log_watch_enabled),
-                health_check_enabled: Some(workflow.health_check_enabled),
-                health_check_urls: Some(workflow.health_check_urls.clone()),
-                preflight_check_enabled: Some(workflow.preflight_check_enabled),
-                targeted_error_ids: None,
-                generated_by_task_run_id: workflow.generated_by_task_run_id.clone(),
-                enable_sweep: Some(workflow.enable_sweep),
-                max_sweep_iterations: Some(workflow.max_sweep_iterations),
-                stages: Some(workflow.stages.clone()),
-                stop_on_failure: Some(workflow.stop_on_failure),
-                constraint_overrides: Some(workflow.constraint_overrides.clone()),
-                approval_gate: Some(workflow.approval_gate),
-                reflection_mode: Some(workflow.reflection_mode),
-                completion_prompts_first: Some(workflow.completion_prompts_first),
-                model_overrides: Some(workflow.model_overrides.clone()),
-                dependency_graph: workflow.dependency_graph.clone(),
-                cost_annotations: workflow.cost_annotations.clone(),
-                quality_report: workflow.quality_report.clone(),
-                acceptance_criteria: workflow.acceptance_criteria.clone(),
-                ai_reviewed: Some(workflow.ai_reviewed),
-            };
+            let create_req =
+                crate::unified_workflows::CreateUnifiedWorkflowRequest::from(&workflow);
             if let Err(e) = state
                 .app_state
                 .checkpoint_db
@@ -422,7 +382,10 @@ pub async fn create_unified_workflow(
                 created.name, created.id
             );
             // Push to web backend (best-effort, fire-and-forget)
-            tokio::spawn(push_to_backend(state.app_state.checkpoint_db.clone(), created.clone()));
+            tokio::spawn(push_to_backend(
+                state.app_state.checkpoint_db.clone(),
+                created.clone(),
+            ));
             Ok(Json(ApiResponse::success(created)))
         }
         Err(e) => {
@@ -497,7 +460,10 @@ pub async fn update_unified_workflow(
                 updated.name, updated.id
             );
             // Push update to web backend (best-effort, fire-and-forget)
-            tokio::spawn(update_on_backend(state.app_state.checkpoint_db.clone(), updated.clone()));
+            tokio::spawn(update_on_backend(
+                state.app_state.checkpoint_db.clone(),
+                updated.clone(),
+            ));
             Ok(Json(ApiResponse::success(updated)))
         }
         Err(e) if e.contains("not found") => Err((
@@ -622,7 +588,10 @@ pub async fn duplicate_unified_workflow(
         Ok(duplicated) => {
             info!("Duplicated unified workflow: {} -> {}", id, duplicated.id);
             // Push duplicate to web backend (best-effort, fire-and-forget)
-            tokio::spawn(push_to_backend(state.app_state.checkpoint_db.clone(), duplicated.clone()));
+            tokio::spawn(push_to_backend(
+                state.app_state.checkpoint_db.clone(),
+                duplicated.clone(),
+            ));
             Ok(Json(ApiResponse::success(duplicated)))
         }
         Err(e) if e.contains("not found") => Err((
@@ -755,46 +724,7 @@ pub async fn import_unified_workflow(
     }
 
     // Create the workflow using the existing create function logic
-    let create_request = crate::unified_workflows::CreateUnifiedWorkflowRequest {
-        name: workflow.name.clone(),
-        description: workflow.description.clone(),
-        category: workflow.category.clone(),
-        tags: workflow.tags.clone(),
-        setup_steps: workflow.setup_steps.clone(),
-        verification_steps: workflow.verification_steps.clone(),
-        agentic_steps: workflow.agentic_steps.clone(),
-        completion_steps: workflow.completion_steps.clone(),
-        max_iterations: workflow.max_iterations,
-        timeout_seconds: workflow.timeout_seconds,
-        provider: workflow.provider.clone(),
-        model: workflow.model.clone(),
-        skip_ai_summary: workflow.skip_ai_summary,
-        log_source_selection: Some(workflow.log_source_selection.clone()),
-        context_ids: Some(workflow.context_ids.clone()),
-        disabled_context_ids: Some(workflow.disabled_context_ids.clone()),
-        auto_include_contexts: Some(workflow.auto_include_contexts),
-        prompt_template: workflow.prompt_template.clone(),
-        log_watch_enabled: Some(workflow.log_watch_enabled),
-        health_check_enabled: Some(workflow.health_check_enabled),
-        health_check_urls: Some(workflow.health_check_urls.clone()),
-        preflight_check_enabled: Some(workflow.preflight_check_enabled),
-        targeted_error_ids: None,
-        generated_by_task_run_id: workflow.generated_by_task_run_id.clone(),
-        enable_sweep: Some(workflow.enable_sweep),
-        max_sweep_iterations: Some(workflow.max_sweep_iterations),
-        stages: Some(workflow.stages.clone()),
-        stop_on_failure: Some(workflow.stop_on_failure),
-        constraint_overrides: Some(workflow.constraint_overrides.clone()),
-        approval_gate: Some(workflow.approval_gate),
-        reflection_mode: Some(workflow.reflection_mode),
-        completion_prompts_first: Some(workflow.completion_prompts_first),
-        model_overrides: Some(workflow.model_overrides.clone()),
-        dependency_graph: workflow.dependency_graph.clone(),
-        cost_annotations: workflow.cost_annotations.clone(),
-        quality_report: workflow.quality_report.clone(),
-        acceptance_criteria: workflow.acceptance_criteria.clone(),
-        ai_reviewed: Some(workflow.ai_reviewed),
-    };
+    let create_request = crate::unified_workflows::CreateUnifiedWorkflowRequest::from(&workflow);
 
     // Use the database's create function but with our custom ID
     match state
@@ -808,7 +738,10 @@ pub async fn import_unified_workflow(
                 created.name, created.id, overwritten
             );
             // Push imported workflow to web backend (best-effort, fire-and-forget)
-            tokio::spawn(push_to_backend(state.app_state.checkpoint_db.clone(), created.clone()));
+            tokio::spawn(push_to_backend(
+                state.app_state.checkpoint_db.clone(),
+                created.clone(),
+            ));
             Ok(Json(ApiResponse::success(
                 crate::unified_workflows::ImportWorkflowResult {
                     workflow: created,
@@ -983,46 +916,9 @@ pub async fn generate_unified_workflow_async_handler(
         build_meta_workflow_template(&request, &resolved_contexts, historical_context.as_ref());
 
     // Save the meta-workflow to database
-    let create_request = crate::unified_workflows::CreateUnifiedWorkflowRequest {
-        name: meta_workflow.name.clone(),
-        description: meta_workflow.description.clone(),
-        category: meta_workflow.category.clone(),
-        tags: meta_workflow.tags.clone(),
-        setup_steps: meta_workflow.setup_steps.clone(),
-        verification_steps: meta_workflow.verification_steps.clone(),
-        agentic_steps: meta_workflow.agentic_steps.clone(),
-        completion_steps: meta_workflow.completion_steps.clone(),
-        max_iterations: meta_workflow.max_iterations,
-        timeout_seconds: meta_workflow.timeout_seconds,
-        provider: meta_workflow.provider.clone(),
-        model: meta_workflow.model.clone(),
-        skip_ai_summary: meta_workflow.skip_ai_summary,
-        log_source_selection: Some(meta_workflow.log_source_selection.clone()),
-        log_watch_enabled: Some(meta_workflow.log_watch_enabled),
-        health_check_enabled: Some(meta_workflow.health_check_enabled),
-        health_check_urls: Some(meta_workflow.health_check_urls.clone()),
-        preflight_check_enabled: Some(meta_workflow.preflight_check_enabled),
-        context_ids: Some(meta_workflow.context_ids.clone()),
-        disabled_context_ids: Some(meta_workflow.disabled_context_ids.clone()),
-        auto_include_contexts: Some(meta_workflow.auto_include_contexts),
-        prompt_template: meta_workflow.prompt_template.clone(),
-        targeted_error_ids: Some(meta_workflow.targeted_error_ids.clone()),
-        generated_by_task_run_id: None, // Will be set after task run creation
-        enable_sweep: Some(meta_workflow.enable_sweep),
-        max_sweep_iterations: Some(meta_workflow.max_sweep_iterations),
-        stages: Some(meta_workflow.stages.clone()),
-        stop_on_failure: Some(meta_workflow.stop_on_failure),
-        constraint_overrides: Some(meta_workflow.constraint_overrides.clone()),
-        approval_gate: Some(meta_workflow.approval_gate),
-        reflection_mode: Some(meta_workflow.reflection_mode),
-        completion_prompts_first: Some(meta_workflow.completion_prompts_first),
-        model_overrides: Some(meta_workflow.model_overrides.clone()),
-        dependency_graph: meta_workflow.dependency_graph.clone(),
-        cost_annotations: meta_workflow.cost_annotations.clone(),
-        quality_report: meta_workflow.quality_report.clone(),
-        acceptance_criteria: meta_workflow.acceptance_criteria.clone(),
-        ai_reviewed: Some(meta_workflow.ai_reviewed),
-    };
+    let mut create_request =
+        crate::unified_workflows::CreateUnifiedWorkflowRequest::from(&meta_workflow);
+    create_request.generated_by_task_run_id = None; // Will be set after task run creation
 
     let saved_workflow = match state
         .app_state
@@ -1122,44 +1018,14 @@ pub async fn generate_unified_workflow_async_handler(
         // For meta-workflows, run agentic first if there are targeted errors
         let run_agentic_first = !saved_workflow.targeted_error_ids.is_empty();
 
-        let loop_config = LoopConfig {
-            max_iterations: saved_workflow.max_iterations,
-            base_prompt: combined_prompt,
-            workflow_name: saved_workflow.name.clone(),
-            workflow_id: saved_workflow.id.clone(),
-            execution_id: task_run_id.clone(),
-            targeted_error_ids: saved_workflow.targeted_error_ids.clone(),
-            starting_iteration: 0,
-            run_agentic_first,
-            artifact_dir: None,
-            is_dev_mode: cfg!(debug_assertions),
-            enable_sweep: saved_workflow.enable_sweep,
-            max_sweep_iterations: saved_workflow.max_sweep_iterations,
+        let loop_config = LoopConfig::from_workflow(
+            &saved_workflow,
+            task_run_id.clone(),
+            combined_prompt,
             stages,
-            stop_on_failure: saved_workflow.stop_on_failure,
-            constraint_overrides: saved_workflow.constraint_overrides.clone(),
-            reflection_mode: saved_workflow.reflection_mode,
-            provider_override: None,
-            model_override: None,
-            model_overrides: saved_workflow.model_overrides.clone(),
-            stage_index: None,
-            max_sessions: Some(saved_workflow.max_iterations),
-            auto_run_generated: request.auto_run.unwrap_or(false),
-            approval_gate: saved_workflow.approval_gate,
-            max_context_tokens: 100_000,
-            cross_workflow_learning: true,
-            multi_agent_mode: saved_workflow.multi_agent_mode,
-            use_worktree: saved_workflow.use_worktree,
-            worktree_path: None,
-            worktree_branch: None,
-            workflow_architecture: None,
-            agentic_verification_config: None,
-            multi_agent_pipeline_config: None,
-            verification_history: std::collections::HashMap::new(),
-            routing_context: Default::default(),
-            project_path: crate::mcp::shared::current_project_path(),
-            acceptance_criteria: saved_workflow.acceptance_criteria.clone(),
-        };
+            run_agentic_first,
+            request.auto_run.unwrap_or(false),
+        );
 
         // Clone state fields for the background task
         let app_state = state.app_state.clone();
@@ -1521,47 +1387,17 @@ pub async fn run_unified_workflow(
         // Run agentic first when: error-fix workflows, or workflows with only agentic steps (no verification)
         let has_verification = !workflow.verification_steps.is_empty();
         let has_agentic = !workflow.agentic_steps.is_empty();
-        let run_agentic_first = !workflow.targeted_error_ids.is_empty()
-            || (has_agentic && !has_verification);
+        let run_agentic_first =
+            !workflow.targeted_error_ids.is_empty() || (has_agentic && !has_verification);
 
-        let mut loop_config = crate::unified_workflow_executor::LoopConfig {
-            max_iterations: workflow.max_iterations,
-            base_prompt: combined_prompt,
-            workflow_name: workflow.name.clone(),
-            workflow_id: workflow.id.clone(),
-            execution_id: execution_id.clone(),
-            targeted_error_ids: workflow.targeted_error_ids.clone(),
-            starting_iteration: 0,
-            run_agentic_first,
-            artifact_dir: None,
-            is_dev_mode: cfg!(debug_assertions),
-            enable_sweep: workflow.enable_sweep,
-            max_sweep_iterations: workflow.max_sweep_iterations,
+        let mut loop_config = crate::unified_workflow_executor::LoopConfig::from_workflow(
+            &workflow,
+            execution_id.clone(),
+            combined_prompt,
             stages,
-            stop_on_failure: workflow.stop_on_failure,
-            constraint_overrides: workflow.constraint_overrides.clone(),
-            reflection_mode: workflow.reflection_mode,
-            provider_override: None,
-            model_override: None,
-            model_overrides: workflow.model_overrides.clone(),
-            stage_index: None,
-            max_sessions: Some(workflow.max_iterations),
-            auto_run_generated: false,
-            approval_gate: workflow.approval_gate,
-            max_context_tokens: 100_000,
-            multi_agent_mode: workflow.multi_agent_mode,
-            use_worktree: workflow.use_worktree,
-            worktree_path: None,
-            worktree_branch: None,
-            workflow_architecture: None,
-            agentic_verification_config: None,
-            multi_agent_pipeline_config: None,
-            cross_workflow_learning: true,
-            verification_history: std::collections::HashMap::new(),
-            routing_context: Default::default(),
-            project_path: crate::mcp::shared::current_project_path(),
-            acceptance_criteria: workflow.acceptance_criteria.clone(),
-        };
+            run_agentic_first,
+            false,
+        );
 
         // Apply autoresearch overrides if present
         if let Some(ref overrides) = request.overrides {

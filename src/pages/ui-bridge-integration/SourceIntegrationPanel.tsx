@@ -210,7 +210,10 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
             <div className="mt-3">
               <p className="text-[10px] text-muted-foreground font-medium mb-1">Entry Points:</p>
               {analysis.entry_points.map((ep, i) => (
-                <div key={`${ep.path}-${i}`} className="flex items-center gap-2 text-xs text-muted-foreground">
+                <div
+                  key={`${ep.path}-${i}`}
+                  className="flex items-center gap-2 text-xs text-muted-foreground"
+                >
                   <FileCode className="w-3 h-3 shrink-0" />
                   <span className="truncate">{ep.path}</span>
                   <span className="text-[10px] px-1 py-0.5 rounded bg-white/5">
@@ -225,7 +228,10 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
             <div className="mt-3">
               <p className="text-[10px] text-yellow-400 font-medium mb-1">Issues:</p>
               {analysis.issues.map((issue, i) => (
-                <div key={`${issue}-${i}`} className="flex items-center gap-1.5 text-xs text-yellow-400/80">
+                <div
+                  key={`${issue}-${i}`}
+                  className="flex items-center gap-1.5 text-xs text-yellow-400/80"
+                >
                   <AlertTriangle className="w-3 h-3 shrink-0" />
                   {issue}
                 </div>
@@ -288,7 +294,10 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
           <h3 className="text-sm font-medium mb-3">Planned Modifications</h3>
           <div className="flex flex-col gap-2">
             {preview.map((mod, i) => (
-              <div key={`${mod.file_path}-${i}`} className="flex items-start gap-2 p-2 rounded bg-white/5 text-xs">
+              <div
+                key={`${mod.file_path}-${i}`}
+                className="flex items-start gap-2 p-2 rounded bg-white/5 text-xs"
+              >
                 <FileCode className="w-3.5 h-3.5 text-cyan-400 shrink-0 mt-0.5" />
                 <div>
                   <p className="font-medium text-foreground">{mod.file_path}</p>

@@ -282,9 +282,7 @@ impl StepType {
             | "check_group" | "checkgroup" | "api_request" | "apirequest" | "api" | "http"
             | "mcp_call" | "mcpcall" | "mcp" => Some(StepType::Command),
             "ui_bridge" | "uibridge" => Some(StepType::UiBridge),
-            "ui_bridge_design_audit" | "uibridgedesignaudit" => {
-                Some(StepType::UiBridgeDesignAudit)
-            }
+            "ui_bridge_design_audit" | "uibridgedesignaudit" => Some(StepType::UiBridgeDesignAudit),
 
             // AI
             "prompt" | "ai_prompt" | "aiprompt" => Some(StepType::Prompt),

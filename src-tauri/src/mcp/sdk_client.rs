@@ -806,8 +806,12 @@ async fn handle_element(
         Ok(data) => Json(data),
         Err(_) => {
             // Fall back to IPC
-            match ui_bridge_request_sync(&state, "get_element", serde_json::json!({ "elementId": id }))
-                .await
+            match ui_bridge_request_sync(
+                &state,
+                "get_element",
+                serde_json::json!({ "elementId": id }),
+            )
+            .await
             {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
                 Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -2411,8 +2415,12 @@ async fn handle_element_state(
         Ok(data) => Json(data),
         Err(_) => {
             // Fall back to IPC — get element details which include state
-            match ui_bridge_request_sync(&state, "get_element", serde_json::json!({ "elementId": id }))
-                .await
+            match ui_bridge_request_sync(
+                &state,
+                "get_element",
+                serde_json::json!({ "elementId": id }),
+            )
+            .await
             {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
                 Err(e) => Json(serde_json::json!({ "success": false, "error": e })),

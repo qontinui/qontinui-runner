@@ -37,6 +37,10 @@ interface PromptOption {
   description?: string;
 }
 
+interface RepositoryWatchWithId extends RepositoryWatch {
+  _formId: string;
+}
+
 interface SchedulerTaskFormProps {
   task?: ScheduledTask;
   onSubmit: (request: CreateScheduledTaskRequest) => void;
@@ -153,8 +157,11 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
   const [requireRepoInactive, setRequireRepoInactive] = useState(
     task?.conditions?.require_repo_inactive?.enabled ?? false,
   );
-  const [repositories, setRepositories] = useState<RepositoryWatch[]>(
-    task?.conditions?.require_repo_inactive?.repositories ?? [],
+  const [repositories, setRepositories] = useState<RepositoryWatchWithId[]>(
+    (task?.conditions?.require_repo_inactive?.repositories ?? []).map((r) => ({
+      ...r,
+      _formId: crypto.randomUUID(),
+    })),
   );
   const [timeoutMinutes, setTimeoutMinutes] = useState<number | undefined>(
     task?.conditions?.timeout_minutes,
@@ -317,7 +324,9 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
     if (requireRepoInactive && repositories.length > 0) {
       conditions.require_repo_inactive = {
         enabled: true,
-        repositories: repositories.filter((r) => r.path.trim() !== ""),
+        repositories: repositories
+          .filter((r) => r.path.trim() !== "")
+          .map(({ _formId: _, ...rest }) => rest),
       };
     }
 
@@ -330,7 +339,10 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
 
   // Repository management helpers
   const addRepository = () => {
-    setRepositories([...repositories, { path: "", inactive_minutes: 10 }]);
+    setRepositories([
+      ...repositories,
+      { path: "", inactive_minutes: 10, _formId: crypto.randomUUID() },
+    ]);
   };
 
   const removeRepository = (index: number) => {
@@ -342,13 +354,9 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
     field: keyof RepositoryWatch,
     value: string | number,
   ) => {
-    const updated = [...repositories];
-    if (field === "path") {
-      updated[index].path = value as string;
-    } else if (field === "inactive_minutes") {
-      updated[index].inactive_minutes = value as number;
-    }
-    setRepositories(updated);
+    setRepositories(
+      repositories.map((repo, i) => (i === index ? { ...repo, [field]: value } : repo)),
+    );
   };
 
   const browseForRepository = async (index: number) => {
@@ -883,7 +891,7 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
                 All repositories must be inactive (no file changes) for the specified time
               </p>
               {repositories.map((repo, idx) => (
-                <div key={`${repo.path || "repo"}-${idx}`} className="flex items-center gap-2">
+                <div key={repo._formId} className="flex items-center gap-2">
                   <input
                     type="text"
                     value={repo.path}

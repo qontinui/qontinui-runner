@@ -419,7 +419,9 @@ export function ContextList({ onLog }: ContextListProps) {
           <div
             className="absolute inset-0 bg-black/50"
             onClick={() => setDuplicateTarget(null)}
-            onKeyDown={(e) => { if (e.key === "Escape") setDuplicateTarget(null); }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setDuplicateTarget(null);
+            }}
             role="button"
             tabIndex={-1}
             aria-label="Close dialog"

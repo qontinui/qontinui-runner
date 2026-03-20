@@ -3,8 +3,6 @@
 //! Provides transaction-safe storage for sessions, checkpoints, settings,
 //! prompts, workflows, and scheduler state.
 
-#![allow(dead_code)]
-
 pub mod embedding_client;
 pub mod embedding_jobs;
 pub mod embeddings;
@@ -228,13 +226,6 @@ impl CheckpointDb {
         let conn = self.get_conn_string()?;
         conn.execute(sql, params)
             .map_err(|e| format!("SQL execution failed: {}", e))
-    }
-
-    /// Get a connection (legacy API returning String error).
-    ///
-    /// Deprecated: Use `connection()` instead which returns `AppError`.
-    pub fn connection_string(&self) -> Result<PooledConnection<SqliteConnectionManager>, String> {
-        self.get_conn_string()
     }
 
     /// Execute a function within a database transaction.

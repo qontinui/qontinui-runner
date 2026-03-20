@@ -34,10 +34,7 @@ impl StepHandler for UiBridgeDesignAuditHandler {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to create HTTP client: {}", e);
-                return StepHandlerResult::failure(format!(
-                    "Failed to create HTTP client: {}",
-                    e
-                ));
+                return StepHandlerResult::failure(format!("Failed to create HTTP client: {}", e));
             }
         };
 
@@ -90,10 +87,7 @@ impl StepHandler for UiBridgeDesignAuditHandler {
             },
             Err(e) => {
                 error!("Design audit request failed: {}", e);
-                return StepHandlerResult::failure(format!(
-                    "Design audit request failed: {}",
-                    e
-                ));
+                return StepHandlerResult::failure(format!("Design audit request failed: {}", e));
             }
         };
 

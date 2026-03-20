@@ -237,7 +237,9 @@ export function ContextEditor({
       <div
         className="absolute inset-0 bg-black/50"
         onClick={onClose}
-        onKeyDown={(e) => { if (e.key === "Escape") onClose(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") onClose();
+        }}
         role="button"
         tabIndex={-1}
         aria-label="Close dialog"

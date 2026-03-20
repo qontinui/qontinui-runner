@@ -631,7 +631,8 @@ impl UnifiedAiSessionExecutor {
         // silently discarded in the interactive session runner).
         let interactive_enabled = get_ai_settings().interactive_sessions_enabled;
         let has_reflection_ctx = config.reflection_fix_ctx.is_some();
-        let use_interactive = self.session_manager.is_some() && interactive_enabled && !has_reflection_ctx;
+        let use_interactive =
+            self.session_manager.is_some() && interactive_enabled && !has_reflection_ctx;
 
         if !use_interactive && self.session_manager.is_some() {
             if has_reflection_ctx {

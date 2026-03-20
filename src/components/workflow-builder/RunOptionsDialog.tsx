@@ -118,7 +118,9 @@ export function RunOptionsDialog({
         aria-label="Close run options dialog"
         className="absolute inset-0 bg-black/50"
         onClick={isLoading ? undefined : onClose}
-        onKeyDown={(e) => { if ((e.key === "Enter" || e.key === " ") && !isLoading) onClose(); }}
+        onKeyDown={(e) => {
+          if ((e.key === "Enter" || e.key === " ") && !isLoading) onClose();
+        }}
       />
 
       <div className="relative bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden">

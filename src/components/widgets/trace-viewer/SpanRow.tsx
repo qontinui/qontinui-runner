@@ -37,7 +37,12 @@ export const SpanRow: React.FC<SpanRowProps> = React.memo(
           isSelected ? "bg-zinc-700/50" : ""
         }`}
         onClick={onClick}
-        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick(); }}}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onClick();
+          }
+        }}
         role="button"
         tabIndex={0}
       >

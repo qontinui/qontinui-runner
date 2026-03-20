@@ -4795,12 +4795,32 @@ impl CheckpointDb {
         if current_version < 122 {
             info!("Migrating to version 122 (slash command import tracking)...");
 
+            // Check which columns already exist (schema.sql may have added them for fresh DBs)
+            let existing_columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(unified_workflows)")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(1))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default();
+
+            if !existing_columns.contains(&"source_file_path".to_string()) {
+                conn.execute_batch(
+                    "ALTER TABLE unified_workflows ADD COLUMN source_file_path TEXT DEFAULT NULL;",
+                )
+                .map_err(|e| format!("Failed to migrate to version 122: {}", e))?;
+            }
+
+            if !existing_columns.contains(&"source_content_hash".to_string()) {
+                conn.execute_batch(
+                    "ALTER TABLE unified_workflows ADD COLUMN source_content_hash TEXT DEFAULT NULL;",
+                )
+                .map_err(|e| format!("Failed to migrate to version 122: {}", e))?;
+            }
+
             conn.execute_batch(
                 r#"
-                ALTER TABLE unified_workflows ADD COLUMN source_file_path TEXT DEFAULT NULL;
-                ALTER TABLE unified_workflows ADD COLUMN source_content_hash TEXT DEFAULT NULL;
                 CREATE INDEX IF NOT EXISTS idx_unified_workflows_source_file_path ON unified_workflows(source_file_path);
-
                 INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (122, datetime('now'));
                 "#,
             )

@@ -312,7 +312,12 @@ export function EventTimelineView({
               <div
                 className="flex items-center gap-2 py-2 px-2 cursor-pointer hover:bg-muted/30 transition-colors"
                 onClick={() => toggleExpand(event.id)}
-                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleExpand(event.id); }}}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    toggleExpand(event.id);
+                  }
+                }}
                 role="button"
                 tabIndex={0}
               >

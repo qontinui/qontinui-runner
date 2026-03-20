@@ -8,8 +8,8 @@ use tracing::warn;
 
 use super::CheckpointDb;
 use crate::scheduler::{
-    ScheduleExpression, ScheduledTask, ScheduledTaskType,
-    SchedulerSettings, TaskExecutionRecord, ScheduledTaskStatus,
+    ScheduleExpression, ScheduledTask, ScheduledTaskStatus, ScheduledTaskType, SchedulerSettings,
+    TaskExecutionRecord,
 };
 
 // ============================================================================
@@ -48,7 +48,10 @@ fn row_to_scheduled_task(row: &rusqlite::Row) -> rusqlite::Result<ScheduledTask>
             let secs: u64 = match schedule_value.parse() {
                 Ok(v) => v,
                 Err(e) => {
-                    warn!("Invalid schedule interval value '{}': {}; defaulting to 60s", schedule_value, e);
+                    warn!(
+                        "Invalid schedule interval value '{}': {}; defaulting to 60s",
+                        schedule_value, e
+                    );
                     60
                 }
             };
@@ -60,7 +63,10 @@ fn row_to_scheduled_task(row: &rusqlite::Row) -> rusqlite::Result<ScheduledTask>
     let task: ScheduledTaskType = match serde_json::from_str(&task_config_json) {
         Ok(t) => t,
         Err(e) => {
-            warn!("Failed to deserialize task config '{}': {}; using default", task_config_json, e);
+            warn!(
+                "Failed to deserialize task config '{}': {}; using default",
+                task_config_json, e
+            );
             ScheduledTaskType::default()
         }
     };
@@ -399,11 +405,7 @@ impl CheckpointDb {
     }
 
     /// Trim execution history for a task, keeping only the most recent `max_entries`.
-    pub fn trim_execution_history(
-        &self,
-        task_id: &str,
-        max_entries: usize,
-    ) -> Result<(), String> {
+    pub fn trim_execution_history(&self, task_id: &str, max_entries: usize) -> Result<(), String> {
         let conn = self.get_conn()?;
         conn.execute(
             r#"

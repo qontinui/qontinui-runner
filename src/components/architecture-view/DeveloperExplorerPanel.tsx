@@ -372,7 +372,11 @@ function FeatureCard({ node }: { node: SdkArchitectureNode }) {
       {node.entryPoints && node.entryPoints.length > 0 && (
         <div className="mt-1.5 space-y-0.5">
           {node.entryPoints.slice(0, 3).map((ep, i) => (
-            <div key={`${ep}-${i}`} className="text-[10px] font-mono text-blue-400 truncate" title={ep}>
+            <div
+              key={`${ep}-${i}`}
+              className="text-[10px] font-mono text-blue-400 truncate"
+              title={ep}
+            >
               {ep}
             </div>
           ))}

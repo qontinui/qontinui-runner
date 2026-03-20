@@ -275,7 +275,11 @@ function CommandRow({
           {parameters.length > 0 && (
             <div className="flex flex-wrap gap-1 mt-1">
               {parameters.map((param, idx) => (
-                <Badge key={`${param}-${idx}`} variant="muted" className="text-[10px] font-mono px-1.5 py-0">
+                <Badge
+                  key={`${param}-${idx}`}
+                  variant="muted"
+                  className="text-[10px] font-mono px-1.5 py-0"
+                >
                   {param}
                 </Badge>
               ))}

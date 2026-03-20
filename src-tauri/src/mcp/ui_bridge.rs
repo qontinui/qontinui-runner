@@ -380,11 +380,8 @@ pub async fn ui_bridge_request_sync(
             debug!("UI Bridge: Deduplicating {} request", key);
             // Apply the same timeout to dedup waits so stale entries don't block forever
             let timeout_ms = get_ui_bridge_timeout_ms();
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(timeout_ms),
-                rx.recv(),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx.recv())
+                .await
             {
                 Ok(Ok(result)) => return result,
                 Ok(Err(_)) => return Err("Dedup channel closed".to_string()),

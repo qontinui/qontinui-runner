@@ -529,7 +529,13 @@ function DiscoveredStateCard({
               e.stopPropagation();
               onToggleSelect?.();
             }}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); onToggleSelect?.(); }}}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                e.stopPropagation();
+                onToggleSelect?.();
+              }
+            }}
             role="button"
             tabIndex={0}
           >
@@ -926,7 +932,10 @@ function CooccurrenceMatrixView({ data }: { data: CooccurrenceExport }) {
           </div>
           <div className="max-h-64 overflow-y-auto space-y-1">
             {data.stateCandidates.slice(0, 10).map((candidate, i) => (
-              <div key={`${candidate.fingerprints[0] ?? i}-${i}`} className="p-2 bg-muted/30 rounded text-xs flex items-center gap-2">
+              <div
+                key={`${candidate.fingerprints[0] ?? i}-${i}`}
+                className="p-2 bg-muted/30 rounded text-xs flex items-center gap-2"
+              >
                 <Badge variant="success" size="sm">
                   {candidate.fingerprints.length} elements
                 </Badge>

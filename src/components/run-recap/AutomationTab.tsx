@@ -168,7 +168,9 @@ export function AutomationTab({ taskRunId: _taskRunId, stats }: AutomationTabPro
         <div
           className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-8"
           onClick={() => setSelectedScreenshot(null)}
-          onKeyDown={(e) => { if (e.key === "Escape") setSelectedScreenshot(null); }}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") setSelectedScreenshot(null);
+          }}
           role="button"
           tabIndex={0}
           aria-label="Close screenshot preview"

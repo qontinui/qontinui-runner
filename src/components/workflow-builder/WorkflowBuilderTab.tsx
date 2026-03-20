@@ -981,7 +981,9 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
         tabIndex={0}
         className="flex items-center gap-2 p-2 cursor-pointer hover:bg-zinc-750 transition-colors"
         onClick={() => setIsExpanded(!isExpanded)}
-        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setIsExpanded(!isExpanded); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") setIsExpanded(!isExpanded);
+        }}
       >
         <button
           type="button"
@@ -1692,7 +1694,9 @@ function WorkflowBuilderContent({
           // Launch one run per architecture
           console.log("[WorkflowBuilder] Comparing architectures:", compareArchitectures);
           for (const arch of compareArchitectures) {
-            const archOverrides: Record<string, unknown> = { use_worktree: overrides?.use_worktree ?? true };
+            const archOverrides: Record<string, unknown> = {
+              use_worktree: overrides?.use_worktree ?? true,
+            };
             if (arch !== "traditional") {
               archOverrides.workflow_architecture = arch;
             }
@@ -1715,7 +1719,9 @@ function WorkflowBuilderContent({
             onNavigateToActive?.();
           }, 100);
 
-          setExecutionSuccess(`Launched ${compareArchitectures.length} architecture comparison runs! Check the Active tab.`);
+          setExecutionSuccess(
+            `Launched ${compareArchitectures.length} architecture comparison runs! Check the Active tab.`,
+          );
         } else {
           // Single run
           const body: Record<string, unknown> = {
@@ -1783,7 +1789,7 @@ function WorkflowBuilderContent({
       if (isExecuting) return;
 
       // Check if workflow has steps (skip for comparison — workflow may have been generated and saved already)
-      const isComparison = !!(overrides?._compareArchitectures);
+      const isComparison = !!overrides?._compareArchitectures;
       if (isEmpty && !isComparison) {
         setExecutionError("Cannot run an empty workflow. Add some steps first.");
         return;
@@ -2883,7 +2889,6 @@ function WorkflowBuilderContent({
                 onClose={() => setShowBatchDeleteDialog(false)}
                 onConfirm={deleteSelectedWorkflows}
               />
-
             </div>
           )}
 
@@ -2895,7 +2900,9 @@ function WorkflowBuilderContent({
               tabIndex={0}
               aria-label="Close add step dropdown"
               onClick={() => setDropdownOpen(false)}
-              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setDropdownOpen(false); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") setDropdownOpen(false);
+              }}
             >
               <div
                 role="presentation"

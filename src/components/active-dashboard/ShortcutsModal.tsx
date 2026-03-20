@@ -67,7 +67,9 @@ export function ShortcutsModal({ isOpen, onClose }: ShortcutsModalProps) {
     <div
       className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center"
       onClick={onClose}
-      onKeyDown={(e) => { if (e.key === "Escape") onClose(); }}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onClose();
+      }}
       role="dialog"
       aria-modal="true"
       aria-label="Keyboard shortcuts"

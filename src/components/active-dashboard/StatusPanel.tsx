@@ -150,7 +150,10 @@ export function StatusPanel({ executionState }: StatusPanelProps) {
             </CardHeader>
             <CardContent className="space-y-2">
               {imageRecognitionResults.map((match, i) => (
-                <div key={`${match.template}-${i}`} className="flex items-center gap-3 rounded-lg bg-muted/30 p-3">
+                <div
+                  key={`${match.template}-${i}`}
+                  className="flex items-center gap-3 rounded-lg bg-muted/30 p-3"
+                >
                   <div className="h-10 w-10 rounded bg-muted/50 flex items-center justify-center">
                     <ImageIcon className="h-5 w-5 text-muted-foreground" />
                   </div>
@@ -199,7 +202,10 @@ export function StatusPanel({ executionState }: StatusPanelProps) {
             </CardHeader>
             <CardContent className="space-y-2">
               {warnings.map((warning, i) => (
-                <div key={`warning-${i}-${warning.message.slice(0, 20)}`} className="flex items-start gap-2 rounded-lg bg-muted/30 p-3">
+                <div
+                  key={`warning-${i}-${warning.message.slice(0, 20)}`}
+                  className="flex items-start gap-2 rounded-lg bg-muted/30 p-3"
+                >
                   <AlertTriangle
                     className={`h-4 w-4 flex-shrink-0 ${
                       warning.severity === "amber"

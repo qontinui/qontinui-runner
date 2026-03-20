@@ -180,7 +180,12 @@ function CheckStepRow({
               : "border-transparent hover:bg-muted/30",
         )}
         onClick={onToggle}
-        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(); }}}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onToggle();
+          }
+        }}
         role="button"
         tabIndex={0}
       >

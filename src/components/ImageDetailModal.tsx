@@ -262,7 +262,10 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                                 alt="Template"
                                 className="max-w-[200px] max-h-[200px] object-contain rounded-lg border border-border cursor-pointer hover:border-primary transition-colors"
                                 onClick={() => setTemplateViewerOpen(true)}
-                                onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setTemplateViewerOpen(true); }}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" || e.key === " ")
+                                    setTemplateViewerOpen(true);
+                                }}
                                 role="button"
                                 tabIndex={0}
                               />
@@ -295,7 +298,10 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                                     : "border-red-500 hover:border-red-400",
                                 )}
                                 onClick={() => setMatchedRegionViewerOpen(true)}
-                                onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setMatchedRegionViewerOpen(true); }}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" || e.key === " ")
+                                    setMatchedRegionViewerOpen(true);
+                                }}
                                 role="button"
                                 tabIndex={0}
                               />
@@ -333,7 +339,9 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                             alt="Search screenshot"
                             className="w-full rounded-lg border border-border cursor-pointer hover:border-primary transition-colors"
                             onClick={() => setScreenshotViewerOpen(true)}
-                            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setScreenshotViewerOpen(true); }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") setScreenshotViewerOpen(true);
+                            }}
                             role="button"
                             tabIndex={0}
                           />

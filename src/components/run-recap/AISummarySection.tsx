@@ -127,7 +127,10 @@ function SummaryContent({ text }: { text: string }) {
         segment.type === "user_message" ? (
           <UserMessageBubble key={`user-${index}`} content={segment.content} />
         ) : (
-          <p key={`text-${index}`} className="text-foreground/90 leading-relaxed whitespace-pre-wrap">
+          <p
+            key={`text-${index}`}
+            className="text-foreground/90 leading-relaxed whitespace-pre-wrap"
+          >
             {segment.content}
           </p>
         ),

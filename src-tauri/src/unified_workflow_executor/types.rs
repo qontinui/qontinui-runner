@@ -261,6 +261,60 @@ pub struct LoopConfig {
 }
 
 impl LoopConfig {
+    /// Build a LoopConfig from a UnifiedWorkflow and runtime parameters.
+    ///
+    /// This captures the common pattern of converting a saved workflow into
+    /// a LoopConfig for execution. Caller-specific fields (execution_id,
+    /// base_prompt, stages, run_agentic_first, auto_run_generated) must be
+    /// provided explicitly since they differ per call site.
+    pub fn from_workflow(
+        workflow: &crate::unified_workflows::UnifiedWorkflow,
+        execution_id: String,
+        base_prompt: String,
+        stages: Vec<StageConfig>,
+        run_agentic_first: bool,
+        auto_run_generated: bool,
+    ) -> Self {
+        Self {
+            max_iterations: workflow.max_iterations,
+            base_prompt,
+            workflow_name: workflow.name.clone(),
+            workflow_id: workflow.id.clone(),
+            execution_id,
+            targeted_error_ids: workflow.targeted_error_ids.clone(),
+            starting_iteration: 0,
+            run_agentic_first,
+            artifact_dir: None,
+            is_dev_mode: cfg!(debug_assertions),
+            enable_sweep: workflow.enable_sweep,
+            max_sweep_iterations: workflow.max_sweep_iterations,
+            stages,
+            stop_on_failure: workflow.stop_on_failure,
+            constraint_overrides: workflow.constraint_overrides.clone(),
+            reflection_mode: workflow.reflection_mode,
+            provider_override: None,
+            model_override: None,
+            model_overrides: workflow.model_overrides.clone(),
+            stage_index: None,
+            max_sessions: Some(workflow.max_iterations),
+            auto_run_generated,
+            approval_gate: workflow.approval_gate,
+            max_context_tokens: 100_000,
+            cross_workflow_learning: true,
+            multi_agent_mode: workflow.multi_agent_mode,
+            use_worktree: workflow.use_worktree,
+            worktree_path: None,
+            worktree_branch: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
+            verification_history: HashMap::new(),
+            routing_context: Default::default(),
+            project_path: crate::mcp::shared::current_project_path(),
+            acceptance_criteria: workflow.acceptance_criteria.clone(),
+        }
+    }
+
     /// Update the routing context with current loop state.
     pub fn set_routing_context(&mut self, iteration: u32, verification_failures: u32) {
         self.routing_context = RoutingContext {

@@ -1084,7 +1084,10 @@ function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
                       </div>
                       <div className="space-y-1">
                         {extractions.map((ext, i) => (
-                          <div key={`ext-${ext.variable_name}-${i}`} className="flex items-center gap-2 text-xs">
+                          <div
+                            key={`ext-${ext.variable_name}-${i}`}
+                            className="flex items-center gap-2 text-xs"
+                          >
                             {ext.success ? (
                               <CheckCircle
                                 className={`w-3 h-3 ${getStatusColors("success").icon}`}
@@ -1109,7 +1112,10 @@ function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
                       </div>
                       <div className="space-y-1">
                         {assertions.map((a, i) => (
-                          <div key={`assert-${a.type}-${i}`} className="flex items-center gap-2 text-xs flex-wrap">
+                          <div
+                            key={`assert-${a.type}-${i}`}
+                            className="flex items-center gap-2 text-xs flex-wrap"
+                          >
                             {a.passed ? (
                               <CheckCircle
                                 className={`w-3 h-3 ${getStatusColors("success").icon}`}
@@ -1731,7 +1737,10 @@ function ApiRequestsSection() {
                       </div>
                       <div className="space-y-1">
                         {req.extractions.map((ext, i) => (
-                          <div key={`reqext-${ext.variable_name}-${i}`} className="flex items-center gap-2 text-xs">
+                          <div
+                            key={`reqext-${ext.variable_name}-${i}`}
+                            className="flex items-center gap-2 text-xs"
+                          >
                             {ext.success ? (
                               <CheckCircle
                                 className={`w-3 h-3 ${getStatusColors("success").icon}`}
@@ -1754,7 +1763,10 @@ function ApiRequestsSection() {
                       </div>
                       <div className="space-y-1">
                         {req.assertions.map((a, i) => (
-                          <div key={`reqassert-${a.assertion_type}-${i}`} className="flex items-center gap-2 text-xs">
+                          <div
+                            key={`reqassert-${a.assertion_type}-${i}`}
+                            className="flex items-center gap-2 text-xs"
+                          >
                             {a.passed ? (
                               <CheckCircle
                                 className={`w-3 h-3 ${getStatusColors("success").icon}`}

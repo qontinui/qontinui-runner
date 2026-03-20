@@ -664,6 +664,51 @@ pub struct CreateUnifiedWorkflowRequest {
     pub ai_reviewed: Option<bool>,
 }
 
+impl From<&UnifiedWorkflow> for CreateUnifiedWorkflowRequest {
+    fn from(w: &UnifiedWorkflow) -> Self {
+        Self {
+            name: w.name.clone(),
+            description: w.description.clone(),
+            category: w.category.clone(),
+            tags: w.tags.clone(),
+            setup_steps: w.setup_steps.clone(),
+            verification_steps: w.verification_steps.clone(),
+            agentic_steps: w.agentic_steps.clone(),
+            completion_steps: w.completion_steps.clone(),
+            max_iterations: w.max_iterations,
+            timeout_seconds: w.timeout_seconds,
+            provider: w.provider.clone(),
+            model: w.model.clone(),
+            skip_ai_summary: w.skip_ai_summary,
+            log_source_selection: Some(w.log_source_selection.clone()),
+            context_ids: Some(w.context_ids.clone()),
+            disabled_context_ids: Some(w.disabled_context_ids.clone()),
+            auto_include_contexts: Some(w.auto_include_contexts),
+            prompt_template: w.prompt_template.clone(),
+            log_watch_enabled: Some(w.log_watch_enabled),
+            health_check_enabled: Some(w.health_check_enabled),
+            health_check_urls: Some(w.health_check_urls.clone()),
+            preflight_check_enabled: Some(w.preflight_check_enabled),
+            targeted_error_ids: Some(w.targeted_error_ids.clone()),
+            generated_by_task_run_id: w.generated_by_task_run_id.clone(),
+            enable_sweep: Some(w.enable_sweep),
+            max_sweep_iterations: Some(w.max_sweep_iterations),
+            stages: Some(w.stages.clone()),
+            stop_on_failure: Some(w.stop_on_failure),
+            constraint_overrides: Some(w.constraint_overrides.clone()),
+            approval_gate: Some(w.approval_gate),
+            reflection_mode: Some(w.reflection_mode),
+            completion_prompts_first: Some(w.completion_prompts_first),
+            model_overrides: Some(w.model_overrides.clone()),
+            dependency_graph: w.dependency_graph.clone(),
+            cost_annotations: w.cost_annotations.clone(),
+            quality_report: w.quality_report.clone(),
+            acceptance_criteria: w.acceptance_criteria.clone(),
+            ai_reviewed: Some(w.ai_reviewed),
+        }
+    }
+}
+
 /// Request body for updating a unified workflow
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateUnifiedWorkflowRequest {

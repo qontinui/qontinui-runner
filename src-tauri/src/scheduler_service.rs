@@ -4,10 +4,6 @@
 //! at their scheduled times. Integrates with existing workflow and prompt
 //! execution infrastructure.
 
-// Allow dead code - these are public API functions that may not be called yet
-// but are part of the complete scheduler interface
-#![allow(dead_code)]
-
 use crate::database::CheckpointDb;
 use crate::scheduler::{
     compute_next_run, ConditionStatus, RepositoryWatch, ScheduledTask, ScheduledTaskStatus,
@@ -83,8 +79,7 @@ impl SchedulerService {
             } else {
                 None
             };
-            self.db
-                .update_task_next_run(&task.id, next.as_deref())?;
+            self.db.update_task_next_run(&task.id, next.as_deref())?;
         }
 
         Ok(())

@@ -164,9 +164,7 @@ export function SpecCompliancePanel({ specId }: { specId?: string }) {
 
       {/* Severity breakdown */}
       <div className="bg-zinc-800 rounded-lg p-4 border border-zinc-700 space-y-2">
-        <div className="text-xs text-zinc-500 uppercase tracking-wide mb-2">
-          Severity Breakdown
-        </div>
+        <div className="text-xs text-zinc-500 uppercase tracking-wide mb-2">Severity Breakdown</div>
         <SeverityBar
           label="Critical"
           passed={latest.critical_passed}
@@ -190,9 +188,7 @@ export function SpecCompliancePanel({ specId }: { specId?: string }) {
       {/* Per-group scores */}
       {latest.group_scores.length > 0 && (
         <div className="bg-zinc-800 rounded-lg p-4 border border-zinc-700">
-          <div className="text-xs text-zinc-500 uppercase tracking-wide mb-2">
-            Group Scores
-          </div>
+          <div className="text-xs text-zinc-500 uppercase tracking-wide mb-2">Group Scores</div>
           <table className="w-full text-sm">
             <thead>
               <tr className="text-zinc-500 text-xs border-b border-zinc-700">
