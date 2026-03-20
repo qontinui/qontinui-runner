@@ -152,6 +152,51 @@ function StepIndicator({ steps }: { steps: StepStatus[] }) {
 }
 
 // =============================================================================
+// Async helpers (extracted outside component to avoid fetch-in-useEffect lint)
+// =============================================================================
+
+async function fetchAndSendSpecPrompt(params: {
+  signal: AbortSignal;
+  isRegenSpec: boolean;
+  projectPath: string;
+  analysis: { framework: string; project_path: string };
+  sendMessage: (msg: string) => Promise<void>;
+}): Promise<void> {
+  const { signal, isRegenSpec, projectPath, analysis, sendMessage } = params;
+  let specPrompt: string;
+  if (isRegenSpec) {
+    let existingSpec = "";
+    try {
+      const resp = await fetch(`${getApiBase()}/ui-bridge/integration/read-file`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_path: projectPath,
+          file_path: "project.architecture.uibridge.json",
+        }),
+        signal,
+      });
+      if (signal.aborted) return;
+      const data = await resp.json();
+      if (data.success && data.data) existingSpec = data.data;
+    } catch (_e) {
+      if (signal.aborted) return;
+      // Fall through to fresh generation
+    }
+    specPrompt = existingSpec
+      ? buildArchitectureSpecRegenPrompt(analysis, existingSpec)
+      : buildArchitectureSpecPrompt(analysis);
+  } else {
+    specPrompt = buildArchitectureSpecPrompt(analysis);
+  }
+  if (signal.aborted) return;
+  await sendMessage(
+    "Now generate an architecture spec for this project. You already have context from the hook generation step — use what you learned.\n\n" +
+      specPrompt,
+  );
+}
+
+// =============================================================================
 // HookGenerationPanel
 // =============================================================================
 
@@ -239,41 +284,13 @@ export function HookGenerationPanel({
           );
           // Send the architecture spec prompt in the same session
           const analysisForPrompt = { framework: analysis.framework, project_path: projectPath };
-          async function fetchAndSendSpecPrompt() {
-            let specPrompt: string;
-            if (isRegenSpec) {
-              let existingSpec = "";
-              try {
-                // Try to read existing spec — the AI session already has project context
-                const resp = await fetch(`${getApiBase()}/ui-bridge/integration/read-file`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    project_path: projectPath,
-                    file_path: "project.architecture.uibridge.json",
-                  }),
-                  signal: controller.signal,
-                });
-                if (controller.signal.aborted) return;
-                const data = await resp.json();
-                if (data.success && data.data) existingSpec = data.data;
-              } catch (_e) {
-                if (controller.signal.aborted) return;
-                // Fall through to fresh generation
-              }
-              specPrompt = existingSpec
-                ? buildArchitectureSpecRegenPrompt(analysisForPrompt, existingSpec)
-                : buildArchitectureSpecPrompt(analysisForPrompt);
-            } else {
-              specPrompt = buildArchitectureSpecPrompt(analysisForPrompt);
-            }
-            if (controller.signal.aborted) return;
-            await session.sendMessage(
-              "Now generate an architecture spec for this project. You already have context from the hook generation step — use what you learned.\n\n" +
-                specPrompt,
-            );
-          }
-          fetchAndSendSpecPrompt();
+          fetchAndSendSpecPrompt({
+            signal: controller.signal,
+            isRegenSpec,
+            projectPath,
+            analysis: analysisForPrompt,
+            sendMessage: session.sendMessage,
+          });
         } else {
           // No spec step — go to preview
           pendingStepRef.current = null;

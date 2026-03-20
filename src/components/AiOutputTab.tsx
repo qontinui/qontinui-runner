@@ -31,13 +31,16 @@ interface AiOutputTabProps {
   filterSessionIds?: string[];
 }
 
+// Stable empty array for default prop to avoid creating new references on each render
+const EMPTY_LINES: AiOutputLine[] = [];
+
 // Time threshold (ms) to consider AI as "recently active"
 const AI_ACTIVITY_THRESHOLD_MS = 5000;
 // Polling interval for executor status
 const STATUS_POLL_INTERVAL_MS = 1000;
 
 export function AiOutputTab({
-  lines = [],
+  lines = EMPTY_LINES,
   onClear: _onClear,
   onAddLine,
   filterSessionIds,

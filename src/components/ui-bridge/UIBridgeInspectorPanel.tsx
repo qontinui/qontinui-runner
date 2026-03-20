@@ -28,6 +28,9 @@ export type { UIBridgeElement, UIBridgeState, UIBridgeTransition, UIBridgeEvent,
 
 type TabId = "elements" | "events" | "actions";
 
+// Stable empty array for default prop to avoid creating new references on each render
+const EMPTY_EVENTS: UIBridgeEvent[] = [];
+
 interface UIBridgeInspectorPanelProps {
   /** Target page URL for connection */
   targetUrl?: string;
@@ -68,7 +71,7 @@ export function UIBridgeInspectorPanel({
   connected = false,
   onRefresh,
   snapshot,
-  events = [],
+  events = EMPTY_EVENTS,
   loading = false,
   error,
   selectedElementId,

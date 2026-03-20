@@ -12,6 +12,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { useState, useCallback, useEffect } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import type { DiscoveredApp, MobileDevice, DiscoveryResult, ApiResponse } from "./types";
 import { getApiBase } from "@/lib/runner-api";
@@ -48,8 +49,6 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
   const [portToPath, setPortToPath] = useState<Map<number, string>>(new Map());
   const [projectsExpanded, setProjectsExpanded] = useState(true);
 
-  const [runnerPath, setRunnerPath] = useState<string | null>(null);
-
   // Collapse "Your Projects" when a project is selected
   useEffect(() => {
     if (selectedProjectPath) {
@@ -57,15 +56,12 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
     }
   }, [selectedProjectPath]);
 
-  // Load process configs and runner path on mount
+  // Load process configs via Tauri IPC on mount
   useEffect(() => {
-    const controller = new AbortController();
-
-    async function loadData() {
-      // Load process configs via Tauri IPC (not abortable, check signal after)
-      try {
-        const configs = await invoke<ProcessConfig[]>("get_process_configs");
-        if (controller.signal.aborted) return;
+    let cancelled = false;
+    invoke<ProcessConfig[]>("get_process_configs")
+      .then((configs) => {
+        if (cancelled) return;
         setProcessConfigs(configs);
         const map = new Map<number, string>();
         for (const cfg of configs) {
@@ -74,27 +70,27 @@ export function DiscoveryPanel({ onSelectApp, selectedProjectPath }: DiscoveryPa
           }
         }
         setPortToPath(map);
-      } catch {
+      })
+      .catch(() => {
         // Ignore — process configs may not be available
-      }
-
-      // Get runner's own project path (available in dev mode)
-      try {
-        const r = await fetch(`${getApiBase()}/ui-bridge/integration/runner-project`, {
-          signal: controller.signal,
-        });
-        const data: ApiResponse<string | null> = await r.json();
-        if (!controller.signal.aborted && data.success && data.data) {
-          setRunnerPath(data.data);
-        }
-      } catch {
-        // Silently ignore — runner project path is optional
-      }
-    }
-    loadData();
-
-    return () => controller.abort();
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  // Get runner's own project path (available in dev mode) via useQuery
+  const { data: runnerPathData } = useQuery<string | null>({
+    queryKey: ["runner-project-path"],
+    queryFn: async () => {
+      const r = await fetch(`${getApiBase()}/ui-bridge/integration/runner-project`);
+      const data: ApiResponse<string | null> = await r.json();
+      return data.success && data.data ? data.data : null;
+    },
+    staleTime: Infinity,
+    retry: false,
+  });
+  const runnerPath = runnerPathData ?? null;
 
   const scan = useCallback(async () => {
     setScanning(true);
