@@ -1,4 +1,4 @@
-import type { Preview } from "@storybook/react";
+import type { Preview } from "storybook";
 import "../src/index.css";
 
 const preview: Preview = {
@@ -9,20 +9,10 @@ const preview: Preview = {
         date: /Date$/i,
       },
     },
-    backgrounds: {
-      default: "dark",
-      values: [
-        {
-          name: "dark",
-          value: "hsl(0 0% 4%)",
-        },
-        {
-          name: "light",
-          value: "#ffffff",
-        },
-      ],
-    },
     layout: "centered",
+  },
+  initialGlobals: {
+    backgrounds: { value: "dark" },
   },
   decorators: [
     (Story) => (

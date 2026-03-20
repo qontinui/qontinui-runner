@@ -5,7 +5,7 @@
  * Displays a standardized empty state with icon, title, and optional description.
  */
 
-import type { Meta, StoryObj } from "@storybook/react";
+import type { Meta, StoryObj } from "storybook";
 import { Terminal, Monitor, Clock, Search } from "lucide-react";
 import { EmptyState } from "./EmptyState";
 

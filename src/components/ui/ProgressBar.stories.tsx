@@ -5,7 +5,7 @@
  * Showcases all variants, states, sizes, and progress types.
  */
 
-import type { Meta, StoryObj } from "@storybook/react";
+import type { Meta, StoryObj } from "storybook";
 import { useEffect, useState } from "react";
 import { ProgressBar, type ProgressType } from "./ProgressBar";
 

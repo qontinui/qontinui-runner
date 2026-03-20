@@ -5,7 +5,7 @@
  * Used for progress display in tables, lists, and other compact UI contexts.
  */
 
-import type { Meta, StoryObj } from "@storybook/react";
+import type { Meta, StoryObj } from "storybook";
 import { InlineProgressBar, type ProgressType } from "./ProgressBar";
 
 const meta: Meta<typeof InlineProgressBar> = {
