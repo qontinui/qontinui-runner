@@ -130,9 +130,7 @@ export function WorktreeComparisonTab() {
         </button>
       </div>
 
-      {error && (
-        <div className="text-xs bg-red-900/30 text-red-400 rounded px-2 py-1">{error}</div>
-      )}
+      {error && <div className="text-xs bg-red-900/30 text-red-400 rounded px-2 py-1">{error}</div>}
 
       {/* Worktree list */}
       {visibleWorktrees.length === 0 ? (
@@ -201,7 +199,8 @@ export function WorktreeComparisonTab() {
         <div className="border border-zinc-700 rounded-lg">
           <div className="flex items-center justify-between px-3 py-2 border-b border-zinc-700">
             <span className="text-xs text-zinc-400">
-              Diff: <span className="font-mono text-zinc-200">{diffResult.branch}</span> ({diffResult.data.files_changed} files)
+              Diff: <span className="font-mono text-zinc-200">{diffResult.branch}</span> (
+              {diffResult.data.files_changed} files)
             </span>
             <button
               onClick={() => setDiffResult(null)}

@@ -380,7 +380,10 @@ pub fn rollback_canary(db: &CheckpointDb, canary_id: &str) -> Result<(), String>
             )
             .map_err(|e| format!("Failed to revert recommendation: {}", e))?;
 
-            info!("Rolled back canary {} (recommendation {})", canary_id, rec_id);
+            info!(
+                "Rolled back canary {} (recommendation {})",
+                canary_id, rec_id
+            );
             Ok(())
         }
     })

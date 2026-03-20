@@ -6,7 +6,13 @@
  */
 
 import { useState, useCallback } from "react";
-import type { ExternalElement, CaptureRecord, CaptureSessionStatus, SdkAppInfo, CaptureSessionRef } from "./types";
+import type {
+  ExternalElement,
+  CaptureRecord,
+  CaptureSessionStatus,
+  SdkAppInfo,
+  CaptureSessionRef,
+} from "./types";
 import { mapSdkElement } from "./utils";
 import {
   generateFingerprints,

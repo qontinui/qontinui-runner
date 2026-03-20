@@ -6,12 +6,15 @@
 use rusqlite::params;
 use tracing::info;
 
-use crate::database::CheckpointDb;
 use super::types::PromptVariant;
+use crate::database::CheckpointDb;
 
 /// Get the currently active prompt for a given agent type.
 /// Returns None if no active variant exists (pipeline should use its default).
-pub fn get_active_prompt(db: &CheckpointDb, agent_type: &str) -> Result<Option<PromptVariant>, String> {
+pub fn get_active_prompt(
+    db: &CheckpointDb,
+    agent_type: &str,
+) -> Result<Option<PromptVariant>, String> {
     let agent_type = agent_type.to_string();
     db.with_conn(move |conn| {
         let result = conn.query_row(
@@ -136,7 +139,10 @@ pub fn activate_variant(db: &CheckpointDb, variant_id: &str) -> Result<(), Strin
         )
         .map_err(|e| format!("Failed to activate variant: {}", e))?;
 
-        info!("Activated prompt variant {} for agent {}", variant_id, agent_type);
+        info!(
+            "Activated prompt variant {} for agent {}",
+            variant_id, agent_type
+        );
         Ok(())
     })
 }
@@ -149,27 +155,28 @@ pub fn list_variants(
     let agent_type = agent_type.map(|s| s.to_string());
 
     db.with_conn(move |conn| {
-        let (sql, param): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ref at) = agent_type {
-            (
-                r#"SELECT id, agent_type, variant_name, prompt_content, version,
+        let (sql, param): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+            if let Some(ref at) = agent_type {
+                (
+                    r#"SELECT id, agent_type, variant_name, prompt_content, version,
                           is_active, source_recommendation_id, performance_metrics,
                           created_at, updated_at
                    FROM prompt_registry WHERE agent_type = ?1
                    ORDER BY agent_type, variant_name, version DESC"#
-                    .to_string(),
-                vec![Box::new(at.clone())],
-            )
-        } else {
-            (
-                r#"SELECT id, agent_type, variant_name, prompt_content, version,
+                        .to_string(),
+                    vec![Box::new(at.clone())],
+                )
+            } else {
+                (
+                    r#"SELECT id, agent_type, variant_name, prompt_content, version,
                           is_active, source_recommendation_id, performance_metrics,
                           created_at, updated_at
                    FROM prompt_registry
                    ORDER BY agent_type, variant_name, version DESC"#
-                    .to_string(),
-                vec![],
-            )
-        };
+                        .to_string(),
+                    vec![],
+                )
+            };
 
         let mut stmt = conn
             .prepare(&sql)
@@ -232,7 +239,8 @@ mod tests {
         let db = setup_test_db();
 
         // Create a variant — it should be inactive by default
-        let variant = create_variant(&db, "planner", "improved_v1", "You are a planner.", None).unwrap();
+        let variant =
+            create_variant(&db, "planner", "improved_v1", "You are a planner.", None).unwrap();
         assert!(!variant.is_active);
         assert_eq!(variant.agent_type, "planner");
         assert_eq!(variant.variant_name, "improved_v1");

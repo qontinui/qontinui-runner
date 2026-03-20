@@ -178,9 +178,7 @@ export function useDebugInspectEvents(
         case "get_forms": {
           const { discoverForms } = await import("ui-bridge/ai");
           const formElements = currentBridge.elements
-            .filter((el) =>
-              ["input", "select", "textarea", "checkbox", "radio"].includes(el.type),
-            )
+            .filter((el) => ["input", "select", "textarea", "checkbox", "radio"].includes(el.type))
             .map((el) => ({
               id: el.id,
               element: el.element,

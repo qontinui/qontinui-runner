@@ -59,10 +59,7 @@ impl RunnerClient {
         workflow_id: &str,
         overrides: &serde_json::Value,
     ) -> Result<String, String> {
-        let url = format!(
-            "{}/unified-workflows/{}/run",
-            self.base_url, workflow_id
-        );
+        let url = format!("{}/unified-workflows/{}/run", self.base_url, workflow_id);
 
         let mut body = serde_json::json!({
             "force_fresh_start": true,
@@ -116,10 +113,7 @@ impl RunnerClient {
             }
 
             // Check workflow state
-            let url = format!(
-                "{}/task-runs/{}/workflow-state",
-                self.base_url, task_run_id
-            );
+            let url = format!("{}/task-runs/{}/workflow-state", self.base_url, task_run_id);
             if let Ok(resp) = self.client.get(&url).send().await {
                 if let Ok(body) = resp.json::<serde_json::Value>().await {
                     let data = if body.get("success").is_some() {
@@ -142,8 +136,7 @@ impl RunnerClient {
                                 "completed" | "complete" | "failed" | "stopped"
                             ) {
                                 let mut result = data;
-                                result["is_complete"] =
-                                    serde_json::Value::Bool(true);
+                                result["is_complete"] = serde_json::Value::Bool(true);
                                 return Ok(result);
                             }
                         }
@@ -185,14 +178,8 @@ impl RunnerClient {
 
     /// Trigger reflection on a completed task run.
     /// Returns the reflection task_run_id, or None if already running.
-    pub async fn trigger_reflection(
-        &self,
-        task_run_id: &str,
-    ) -> Result<Option<String>, String> {
-        let url = format!(
-            "{}/reflection/trigger/{}",
-            self.base_url, task_run_id
-        );
+    pub async fn trigger_reflection(&self, task_run_id: &str) -> Result<Option<String>, String> {
+        let url = format!("{}/reflection/trigger/{}", self.base_url, task_run_id);
         let resp = self
             .client
             .post(&url)
@@ -261,7 +248,10 @@ impl RunnerClient {
                     .and_then(|v| v.as_str());
 
                 if is_reflection && source == Some(source_task_run_id) {
-                    return Ok(run.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()));
+                    return Ok(run
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()));
                 }
             }
         }
@@ -363,13 +353,12 @@ impl RunnerClient {
 
         // Poll until the meta-workflow completes
         let stop_rx_dummy = tokio::sync::watch::channel(false).1;
-        let result = self.poll_until_complete(&task_run_id, &stop_rx_dummy).await?;
+        let result = self
+            .poll_until_complete(&task_run_id, &stop_rx_dummy)
+            .await?;
 
         // Fetch result-data which contains the generated_workflow_id
-        let result_url = format!(
-            "{}/task-runs/{}/result-data",
-            self.base_url, task_run_id
-        );
+        let result_url = format!("{}/task-runs/{}/result-data", self.base_url, task_run_id);
         let result_resp = self
             .client
             .get(&result_url)
@@ -383,7 +372,10 @@ impl RunnerClient {
             .map_err(|e| format!("Failed to parse result-data: {}", e))?;
 
         let result_data = if result_body.get("success").is_some() {
-            result_body.get("data").cloned().unwrap_or(result_body.clone())
+            result_body
+                .get("data")
+                .cloned()
+                .unwrap_or(result_body.clone())
         } else {
             result_body
         };
@@ -394,12 +386,7 @@ impl RunnerClient {
             .or_else(|| result.get("generated_workflow_id"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| {
-                format!(
-                    "No generated_workflow_id in result-data: {}",
-                    result_data
-                )
-            })?;
+            .ok_or_else(|| format!("No generated_workflow_id in result-data: {}", result_data))?;
 
         Ok((workflow_id, task_run_id))
     }
@@ -571,11 +558,7 @@ impl SupervisorClient {
     }
 
     /// Restart a runner by ID.
-    pub async fn restart_runner(
-        &self,
-        runner_id: &str,
-        rebuild: bool,
-    ) -> Result<(), String> {
+    pub async fn restart_runner(&self, runner_id: &str, rebuild: bool) -> Result<(), String> {
         let url = format!("{}/runners/{}/restart", self.base_url, runner_id);
         let resp = self
             .client
@@ -592,5 +575,4 @@ impl SupervisorClient {
 
         Ok(())
     }
-
 }

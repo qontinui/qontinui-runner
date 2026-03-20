@@ -55,7 +55,15 @@ function groupByArchitecture(results: [number, ExperimentResult][]): ArchGroup[]
     const pValues = experiments.map((e) => e.p_value).filter((p): p is number => p != null);
     const bestPValue = pValues.length > 0 ? Math.min(...pValues) : null;
 
-    return { architecture, experiments, meanPassRate, meanIterations, meanDuration, acceptanceRate, bestPValue };
+    return {
+      architecture,
+      experiments,
+      meanPassRate,
+      meanIterations,
+      meanDuration,
+      acceptanceRate,
+      bestPValue,
+    };
   });
 }
 

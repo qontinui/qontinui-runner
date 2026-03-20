@@ -10,19 +10,20 @@
 #![allow(clippy::too_many_arguments)]
 
 mod action_service;
-mod autoresearch;
 mod ai_pricing;
 mod ai_provider;
 mod ai_router;
 mod ai_workflows;
 mod api_request;
 mod auth;
+mod autoresearch;
 mod backup;
 mod check_executor;
 mod check_generation;
 mod claude_protocol;
 mod claude_session;
 mod commands;
+mod comparison;
 mod config;
 mod config_facade;
 mod config_storage;
@@ -46,7 +47,6 @@ mod exploration;
 mod findings;
 mod fixer;
 mod follow_up;
-mod meta_optimizer;
 mod health_monitor;
 mod heartbeat;
 mod instance_manager;
@@ -62,6 +62,7 @@ mod mcp;
 mod mcp_api;
 mod mcp_client;
 mod mcp_embedded;
+mod meta_optimizer;
 mod middleware;
 mod orchestration_loop;
 mod orchestration_loop_configs;
@@ -84,6 +85,7 @@ mod secure_storage;
 mod semantic_conventions;
 mod settings;
 mod skills;
+mod slash_commands;
 mod spec_utils;
 mod state_explorer;
 mod state_machine_configs;
@@ -109,7 +111,6 @@ mod unified_ai_session;
 mod unified_workflow_executor;
 mod unified_workflows;
 mod video_recorder;
-mod comparison;
 mod workflow_generation;
 mod workflow_queue;
 mod workflow_state;
@@ -1240,6 +1241,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     .inner()
                     .clone();
                 demo_workflows::seed_demo_workflows_if_needed(&seed_db);
+
+                // Sync slash commands from qontinui-claude-config
+                match slash_commands::sync_slash_commands(&seed_db) {
+                    Ok(result) => {
+                        info!(
+                            "Slash command sync: {} created, {} updated, {} deleted, {} unchanged",
+                            result.created, result.updated, result.deleted, result.unchanged
+                        );
+                        if !result.errors.is_empty() {
+                            warn!("Slash command sync had {} errors", result.errors.len());
+                        }
+                    }
+                    Err(e) => warn!("Slash command sync failed: {}", e),
+                }
 
                 // Seed built-in issue pattern templates
                 if let Ok(conn) = seed_db.get_conn() {

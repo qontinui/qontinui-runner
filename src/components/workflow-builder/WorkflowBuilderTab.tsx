@@ -1738,25 +1738,28 @@ function WorkflowBuilderContent({
   }, [saveWorkflow, executeWorkflowRun, pendingOverrides]);
 
   // Handle run workflow (with optional overrides from RunOptionsDialog)
-  const handleRun = useCallback(async (overrides?: Record<string, unknown>) => {
-    if (isExecuting) return;
+  const handleRun = useCallback(
+    async (overrides?: Record<string, unknown>) => {
+      if (isExecuting) return;
 
-    // Check if workflow has steps
-    if (isEmpty) {
-      setExecutionError("Cannot run an empty workflow. Add some steps first.");
-      return;
-    }
+      // Check if workflow has steps
+      if (isEmpty) {
+        setExecutionError("Cannot run an empty workflow. Add some steps first.");
+        return;
+      }
 
-    // Check if workflow is saved (must have an ID to run)
-    if (!state.workflow.id || hasUnsavedChanges) {
-      if (overrides) setPendingOverrides(overrides);
-      setShowSaveBeforeRunDialog(true);
-      return;
-    }
+      // Check if workflow is saved (must have an ID to run)
+      if (!state.workflow.id || hasUnsavedChanges) {
+        if (overrides) setPendingOverrides(overrides);
+        setShowSaveBeforeRunDialog(true);
+        return;
+      }
 
-    // Workflow is already saved, run it directly
-    await executeWorkflowRun(state.workflow.id, overrides);
-  }, [state.workflow.id, isEmpty, hasUnsavedChanges, isExecuting, executeWorkflowRun]);
+      // Workflow is already saved, run it directly
+      await executeWorkflowRun(state.workflow.id, overrides);
+    },
+    [state.workflow.id, isEmpty, hasUnsavedChanges, isExecuting, executeWorkflowRun],
+  );
 
   // Handle loading a deterministic spec workflow into the builder
   const handleLoadSpecWorkflow = useCallback(

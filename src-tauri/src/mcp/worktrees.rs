@@ -3,15 +3,15 @@
 //! Provides tools for listing, reviewing, merging, comparing, and discarding
 //! worktrees created by isolated workflow runs.
 
-use std::path::Path;
-use std::sync::Arc;
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
+use std::path::Path;
+use std::sync::Arc;
 use tracing::info;
 
-use super::types::{ApiResponse, ApiState, api_error};
+use super::types::{api_error, ApiResponse, ApiState};
 use crate::worktree;
 
 // =============================================================================
@@ -68,17 +68,16 @@ pub struct BranchInfo {
 pub async fn list_worktrees_handler(
     State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let repo = crate::mcp::shared::current_project_path()
-        .ok_or_else(|| {
-            (StatusCode::BAD_REQUEST, Json(api_error("No project path available")))
-        })?;
+    let repo = crate::mcp::shared::current_project_path().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(api_error("No project path available")),
+        )
+    })?;
 
     match worktree::list_worktrees(Path::new(&repo)) {
         Ok(paths) => {
-            let managed: Vec<&String> = paths
-                .iter()
-                .filter(|p| p.contains(".worktrees"))
-                .collect();
+            let managed: Vec<&String> = paths.iter().filter(|p| p.contains(".worktrees")).collect();
             Ok(Json(ApiResponse::success(json!({
                 "worktrees": managed,
                 "total": managed.len(),
@@ -99,7 +98,8 @@ pub async fn get_worktree_diff_handler(
         repo_path,
         &request.branch_name,
         &request.source_branch,
-    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
     let mut result = json!({
         "summary": summary,
@@ -108,11 +108,8 @@ pub async fn get_worktree_diff_handler(
     });
 
     if request.full_diff {
-        let diff = worktree::get_full_diff(
-            repo_path,
-            &request.branch_name,
-            &request.source_branch,
-        ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        let diff = worktree::get_full_diff(repo_path, &request.branch_name, &request.source_branch)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
         result["full_diff"] = json!(diff);
     }
 
@@ -127,14 +124,14 @@ pub async fn merge_worktree_handler(
     let repo_path = Path::new(&request.repo_path);
 
     // First attempt a regular merge
-    let result = worktree::merge_worktree(
-        repo_path,
-        &request.branch_name,
-        &request.source_branch,
-    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let result = worktree::merge_worktree(repo_path, &request.branch_name, &request.source_branch)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
     if result.success {
-        info!("WORKTREE: Merge successful: {} into {}", request.branch_name, request.source_branch);
+        info!(
+            "WORKTREE: Merge successful: {} into {}",
+            request.branch_name, request.source_branch
+        );
         return Ok(Json(ApiResponse::success(json!({
             "success": true,
             "merge_commit": result.merge_commit,
@@ -153,12 +150,13 @@ pub async fn merge_worktree_handler(
     }
 
     // AI-assisted merge: start the merge with conflicts in working directory
-    info!("WORKTREE: Starting AI-assisted merge for {} conflicts", result.conflicts.len());
+    info!(
+        "WORKTREE: Starting AI-assisted merge for {} conflicts",
+        result.conflicts.len()
+    );
 
-    let merge_state = worktree::start_merge_with_conflicts(
-        repo_path,
-        &request.branch_name,
-    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let merge_state = worktree::start_merge_with_conflicts(repo_path, &request.branch_name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
     if merge_state.success {
         return Ok(Json(ApiResponse::success(json!({
@@ -170,18 +168,27 @@ pub async fn merge_worktree_handler(
 
     // Build AI merge prompt
     let diff_summary = worktree::get_worktree_diff_summary(
-        repo_path, &request.branch_name, &request.source_branch,
-    ).unwrap_or_default();
+        repo_path,
+        &request.branch_name,
+        &request.source_branch,
+    )
+    .unwrap_or_default();
 
-    let full_diff = worktree::get_full_diff(
-        repo_path, &request.branch_name, &request.source_branch,
-    ).unwrap_or_default();
+    let full_diff =
+        worktree::get_full_diff(repo_path, &request.branch_name, &request.source_branch)
+            .unwrap_or_default();
 
-    let workflow_name = request.workflow_name.as_deref().unwrap_or("Unknown workflow");
+    let workflow_name = request
+        .workflow_name
+        .as_deref()
+        .unwrap_or("Unknown workflow");
 
     let prompt = worktree::build_ai_merge_prompt(
-        &request.branch_name, &request.source_branch,
-        &diff_summary, &full_diff, workflow_name,
+        &request.branch_name,
+        &request.source_branch,
+        &diff_summary,
+        &full_diff,
+        workflow_name,
         Some(&merge_state.conflicts),
     );
 
@@ -205,7 +212,8 @@ pub async fn remove_worktree_handler(
         Path::new(&request.worktree_path),
         &request.branch_name,
         request.delete_branch,
-    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
     Ok(Json(ApiResponse::success(json!({
         "success": true,
@@ -225,28 +233,42 @@ pub async fn compare_worktrees_handler(
 
     for branch_info in &request.branches {
         let diff_summary = worktree::get_worktree_diff_summary(
-            repo_path, &branch_info.branch_name, &request.source_branch,
-        ).unwrap_or_else(|e| format!("Failed to get diff: {}", e));
+            repo_path,
+            &branch_info.branch_name,
+            &request.source_branch,
+        )
+        .unwrap_or_else(|e| format!("Failed to get diff: {}", e));
 
         let result_summary = if let Some(ref task_run_id) = branch_info.task_run_id {
-            state.app_state.checkpoint_db
+            state
+                .app_state
+                .checkpoint_db
                 .get_task_run(task_run_id)
                 .ok()
                 .flatten()
                 .map(|run| {
-                    format!("Status: {}, Summary: {}",
-                        run.status, run.summary.as_deref().unwrap_or("none"))
+                    format!(
+                        "Status: {}, Summary: {}",
+                        run.status,
+                        run.summary.as_deref().unwrap_or("none")
+                    )
                 })
                 .unwrap_or_else(|| "No summary available".to_string())
         } else {
             "No task run linked".to_string()
         };
 
-        branch_data.push((branch_info.branch_name.clone(), diff_summary, result_summary));
+        branch_data.push((
+            branch_info.branch_name.clone(),
+            diff_summary,
+            result_summary,
+        ));
     }
 
     let prompt = worktree::build_comparison_prompt(
-        &branch_data, &request.workflow_name, &request.source_branch,
+        &branch_data,
+        &request.workflow_name,
+        &request.source_branch,
     );
 
     Ok(Json(ApiResponse::success(json!({

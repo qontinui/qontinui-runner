@@ -102,10 +102,7 @@ export function CanaryStatusPanel() {
           const progress = Math.min(c.canary_run_count / MIN_CANARY_RUNS, 1);
 
           return (
-            <div
-              key={c.id}
-              className="bg-purple-900/20 border border-purple-800/50 rounded-lg p-4"
-            >
+            <div key={c.id} className="bg-purple-900/20 border border-purple-800/50 rounded-lg p-4">
               <div className="flex items-center justify-between mb-3">
                 <div className="flex items-center gap-2">
                   <span className="text-xs px-2 py-0.5 rounded text-purple-400 bg-purple-900/30">

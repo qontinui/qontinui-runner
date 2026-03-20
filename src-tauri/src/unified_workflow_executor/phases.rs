@@ -51,15 +51,13 @@ use super::phase_configs::{
 };
 use super::types::{get_parent_task_id, AgenticOutcome, LoopConfig};
 
-
 // Token tracking, UI Bridge, environment readiness, response mode, and token
 // estimation extracted to phase_helpers module.
 pub(super) use super::phase_helpers::{
-    check_environment_readiness, clear_console_errors, compute_embedding_sync,
-    estimate_tokens, execute_prompt_response_mode, fetch_browser_events_from_ui_bridge,
+    check_environment_readiness, clear_console_errors, compute_embedding_sync, estimate_tokens,
+    execute_prompt_response_mode, fetch_browser_events_from_ui_bridge,
     fetch_console_errors_from_ui_bridge, fetch_health_from_ui_bridge,
-    fetch_network_failures_from_ui_bridge,
-    record_phase_token_usage, REFLECTION_MODE_PREAMBLE,
+    fetch_network_failures_from_ui_bridge, record_phase_token_usage, REFLECTION_MODE_PREAMBLE,
 };
 
 // Execution Timing Context
@@ -3527,10 +3525,7 @@ impl AgenticExecutor {
             iteration: iteration as i32,
         });
 
-        let result = self
-            .ai_executor
-            .execute(&ai_config, prompt, logger)
-            .await;
+        let result = self.ai_executor.execute(&ai_config, prompt, logger).await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 

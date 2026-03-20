@@ -11,8 +11,8 @@
 
 use tracing::{debug, info, warn};
 
-use crate::database::CheckpointDb;
 use super::recommendations;
+use crate::database::CheckpointDb;
 
 // ── Parsed types ────────────────────────────────────────────────────────
 
@@ -352,7 +352,11 @@ pub fn save_parsed_recommendations(
                 };
 
                 if rec.confidence < 0.5 {
-                    debug!("Skipping low-confidence recommendation ({:.0}%): {}", rec.confidence * 100.0, title);
+                    debug!(
+                        "Skipping low-confidence recommendation ({:.0}%): {}",
+                        rec.confidence * 100.0,
+                        title
+                    );
                     continue;
                 }
 
@@ -366,7 +370,8 @@ pub fn save_parsed_recommendations(
                     "agent_type": rec.agent_type,
                     "variant_name": rec.variant_name,
                     "prompt_content": rec.prompt_content,
-                }).to_string();
+                })
+                .to_string();
 
                 recommendations::create_recommendation(
                     db,
@@ -399,7 +404,11 @@ pub fn save_parsed_recommendations(
                 );
 
                 if rec.confidence < 0.5 {
-                    debug!("Skipping low-confidence recommendation ({:.0}%): {}", rec.confidence * 100.0, title);
+                    debug!(
+                        "Skipping low-confidence recommendation ({:.0}%): {}",
+                        rec.confidence * 100.0,
+                        title
+                    );
                     continue;
                 }
 
@@ -421,11 +430,13 @@ pub fn save_parsed_recommendations(
                 let current_value = serde_json::json!({
                     "key": format!("architecture.{}", rec.workflow_category),
                     "value": rec.current_architecture,
-                }).to_string();
+                })
+                .to_string();
                 let recommended_value = serde_json::json!({
                     "key": format!("architecture.{}", rec.workflow_category),
                     "value": rec.recommended_architecture,
-                }).to_string();
+                })
+                .to_string();
 
                 recommendations::create_recommendation(
                     db,
@@ -454,13 +465,14 @@ pub fn save_parsed_recommendations(
                 config_recs.len()
             );
             for rec in &config_recs {
-                let title = format!(
-                    "Tune {} for {}",
-                    rec.parameter, rec.architecture
-                );
+                let title = format!("Tune {} for {}", rec.parameter, rec.architecture);
 
                 if rec.confidence < 0.5 {
-                    debug!("Skipping low-confidence recommendation ({:.0}%): {}", rec.confidence * 100.0, title);
+                    debug!(
+                        "Skipping low-confidence recommendation ({:.0}%): {}",
+                        rec.confidence * 100.0,
+                        title
+                    );
                     continue;
                 }
 
@@ -483,11 +495,13 @@ pub fn save_parsed_recommendations(
                 let current_value = serde_json::json!({
                     "key": config_key,
                     "value": rec.current_value,
-                }).to_string();
+                })
+                .to_string();
                 let recommended_value = serde_json::json!({
                     "key": config_key,
                     "value": rec.recommended_value,
-                }).to_string();
+                })
+                .to_string();
 
                 recommendations::create_recommendation(
                     db,
@@ -511,10 +525,7 @@ pub fn save_parsed_recommendations(
 
             // Parse advisory findings
             let findings = parse_arch_findings(output);
-            info!(
-                "Parsed {} ARCH_FINDING(s) from output",
-                findings.len()
-            );
+            info!("Parsed {} ARCH_FINDING(s) from output", findings.len());
             for finding in &findings {
                 let title = finding.title.clone();
                 if is_duplicate_recommendation(db, &title) {
@@ -525,11 +536,12 @@ pub fn save_parsed_recommendations(
                     "category": finding.category,
                     "severity": finding.severity,
                     "suggested_action": finding.suggested_action,
-                }).to_string();
+                })
+                .to_string();
                 recommendations::create_recommendation(
                     db,
                     optimizer_type,
-                    "finding",  // Not actionable as config_change
+                    "finding", // Not actionable as config_change
                     None,
                     &title,
                     &finding.finding,
@@ -540,7 +552,7 @@ pub fn save_parsed_recommendations(
                     } else {
                         Some(&finding.evidence)
                     },
-                    0.0,  // Findings don't have confidence — they're observations
+                    0.0, // Findings don't have confidence — they're observations
                     optimizer_run_id,
                 )?;
                 count += 1;
@@ -558,7 +570,11 @@ pub fn save_parsed_recommendations(
                 };
 
                 if rec.confidence < 0.5 {
-                    debug!("Skipping low-confidence recommendation ({:.0}%): {}", rec.confidence * 100.0, title);
+                    debug!(
+                        "Skipping low-confidence recommendation ({:.0}%): {}",
+                        rec.confidence * 100.0,
+                        title
+                    );
                     continue;
                 }
 
@@ -589,7 +605,8 @@ pub fn save_parsed_recommendations(
                     "content": rec.content,
                     "rule_id": rec.rule_id,
                     "status": status_override,
-                }).to_string();
+                })
+                .to_string();
 
                 let rec_type = match rec.action.as_str() {
                     "create" => "rule_create",
@@ -679,10 +696,7 @@ pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&s
                 );
             }
             Err(e) => {
-                warn!(
-                    "Failed to auto-apply recommendation {}: {}",
-                    rec_id, e
-                );
+                warn!("Failed to auto-apply recommendation {}: {}", rec_id, e);
             }
         }
     }

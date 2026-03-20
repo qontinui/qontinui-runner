@@ -32,9 +32,7 @@ function extractTraces(
   agentType: AgentType,
 ): { traces: PipelineAgentTrace[]; goalAchieved: boolean } {
   const extra = result.config.extra ?? {};
-  const pipelineResult = extra["pipeline_result"] as
-    | MultiAgentPipelineResult
-    | undefined;
+  const pipelineResult = extra["pipeline_result"] as MultiAgentPipelineResult | undefined;
   if (!pipelineResult?.agent_traces) return { traces: [], goalAchieved: false };
   return {
     traces: pipelineResult.agent_traces.filter((t) => t.agent_type === agentType),

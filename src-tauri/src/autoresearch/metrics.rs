@@ -1,6 +1,8 @@
 //! Metric computation, comparison, and statistical significance for autoresearch experiments.
 
-use super::types::{AcceptanceCriteria, AggregateMetrics, MultiWorkflowAggregation, PrimaryMetric, TrialResult};
+use super::types::{
+    AcceptanceCriteria, AggregateMetrics, MultiWorkflowAggregation, PrimaryMetric, TrialResult,
+};
 use std::collections::HashMap;
 
 /// Compute aggregate metrics from a set of trial results.
@@ -71,12 +73,14 @@ pub fn compute_aggregate_multi_workflow(
         MultiWorkflowAggregation::Average => {
             per_wf_pass_rates.iter().sum::<f64>() / per_wf_pass_rates.len() as f64
         }
-        MultiWorkflowAggregation::AllMustPass => {
-            per_wf_pass_rates.iter().cloned().fold(f64::INFINITY, f64::min)
-        }
-        MultiWorkflowAggregation::AnyPass => {
-            per_wf_pass_rates.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
-        }
+        MultiWorkflowAggregation::AllMustPass => per_wf_pass_rates
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min),
+        MultiWorkflowAggregation::AnyPass => per_wf_pass_rates
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max),
     };
 
     // Iterations and duration always averaged across all trials
@@ -102,29 +106,41 @@ pub fn compare_to_control(
     criteria: &AcceptanceCriteria,
 ) -> (bool, String, Option<f64>) {
     match criteria.primary_metric {
-        PrimaryMetric::PassRate => {
-            compare_pass_rate(experiment, control, experiment_trials, control_trials, criteria)
-        }
-        PrimaryMetric::MeanIterations => {
-            compare_lower_is_better(
-                experiment.mean_iterations,
-                control.mean_iterations,
-                "mean_iterations",
-                experiment_trials.iter().map(|t| t.iterations_used as f64).collect::<Vec<_>>(),
-                control_trials.iter().map(|t| t.iterations_used as f64).collect::<Vec<_>>(),
-                criteria,
-            )
-        }
-        PrimaryMetric::MeanDuration => {
-            compare_lower_is_better(
-                experiment.mean_duration_ms,
-                control.mean_duration_ms,
-                "mean_duration_ms",
-                experiment_trials.iter().map(|t| t.duration_ms as f64).collect::<Vec<_>>(),
-                control_trials.iter().map(|t| t.duration_ms as f64).collect::<Vec<_>>(),
-                criteria,
-            )
-        }
+        PrimaryMetric::PassRate => compare_pass_rate(
+            experiment,
+            control,
+            experiment_trials,
+            control_trials,
+            criteria,
+        ),
+        PrimaryMetric::MeanIterations => compare_lower_is_better(
+            experiment.mean_iterations,
+            control.mean_iterations,
+            "mean_iterations",
+            experiment_trials
+                .iter()
+                .map(|t| t.iterations_used as f64)
+                .collect::<Vec<_>>(),
+            control_trials
+                .iter()
+                .map(|t| t.iterations_used as f64)
+                .collect::<Vec<_>>(),
+            criteria,
+        ),
+        PrimaryMetric::MeanDuration => compare_lower_is_better(
+            experiment.mean_duration_ms,
+            control.mean_duration_ms,
+            "mean_duration_ms",
+            experiment_trials
+                .iter()
+                .map(|t| t.duration_ms as f64)
+                .collect::<Vec<_>>(),
+            control_trials
+                .iter()
+                .map(|t| t.duration_ms as f64)
+                .collect::<Vec<_>>(),
+            criteria,
+        ),
     }
 }
 
@@ -142,7 +158,10 @@ fn compare_pass_rate(
     if ctrl_val == 0.0 && exp_val > 0.0 {
         return (
             true,
-            format!("pass_rate: experiment={:.3}, control=0 (infinite improvement)", exp_val),
+            format!(
+                "pass_rate: experiment={:.3}, control=0 (infinite improvement)",
+                exp_val
+            ),
             None,
         );
     }
@@ -173,7 +192,10 @@ fn compare_pass_rate(
         exp_val, ctrl_val, ratio, criteria.min_improvement_ratio,
     );
     if let Some(p) = p_value {
-        reason.push_str(&format!(", p={:.4} (threshold={:.2})", p, criteria.significance_threshold));
+        reason.push_str(&format!(
+            ", p={:.4} (threshold={:.2})",
+            p, criteria.significance_threshold
+        ));
         if ratio_ok && !sig_ok {
             reason.push_str(" [ratio OK but not significant]");
         }
@@ -192,7 +214,11 @@ fn compare_lower_is_better(
     criteria: &AcceptanceCriteria,
 ) -> (bool, String, Option<f64>) {
     if exp_val == 0.0 {
-        return (true, format!("{}: experiment=0 (perfect)", metric_name), None);
+        return (
+            true,
+            format!("{}: experiment=0 (perfect)", metric_name),
+            None,
+        );
     }
 
     let ratio = ctrl_val / exp_val;
@@ -214,7 +240,10 @@ fn compare_lower_is_better(
         metric_name, exp_val, ctrl_val, ratio, criteria.min_improvement_ratio,
     );
     if let Some(p) = p_value {
-        reason.push_str(&format!(", p={:.4} (threshold={:.2})", p, criteria.significance_threshold));
+        reason.push_str(&format!(
+            ", p={:.4} (threshold={:.2})",
+            p, criteria.significance_threshold
+        ));
         if ratio_ok && !sig_ok {
             reason.push_str(" [ratio OK but not significant]");
         }
@@ -309,7 +338,9 @@ fn normal_cdf(x: f64) -> f64 {
     let t = 1.0 / (1.0 + 0.2316419 * x.abs());
     let d = 0.3989422804014327; // 1/sqrt(2*pi)
     let p = d * (-x * x / 2.0).exp();
-    let poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+    let poly = t
+        * (0.319381530
+            + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
 
     if x >= 0.0 {
         1.0 - p * poly
@@ -371,8 +402,7 @@ fn regularized_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
         f *= d * c;
 
         // Odd step
-        let num_odd = -((a + m_f) * (a + b + m_f) * x)
-            / ((a + 2.0 * m_f) * (a + 2.0 * m_f + 1.0));
+        let num_odd = -((a + m_f) * (a + b + m_f) * x) / ((a + 2.0 * m_f) * (a + 2.0 * m_f + 1.0));
         d = 1.0 + num_odd * d;
         if d.abs() < 1e-30 {
             d = 1e-30;
@@ -429,13 +459,13 @@ fn ln_gamma(x: f64) -> f64 {
 }
 
 /// Format experiment results as a TSV table.
-pub fn format_results_tsv(
-    results: &[(u32, super::types::ExperimentResult)],
-) -> String {
+pub fn format_results_tsv(results: &[(u32, super::types::ExperimentResult)]) -> String {
     let mut out = String::new();
     out.push_str("experiment\tconfig\tpass_rate\tmean_iterations\tmean_duration_ms\taccepted\tp_value\treason\n");
     for (num, result) in results {
-        let p_str = result.p_value.map_or("-".to_string(), |p| format!("{:.4}", p));
+        let p_str = result
+            .p_value
+            .map_or("-".to_string(), |p| format!("{:.4}", p));
         out.push_str(&format!(
             "{}\t{}\t{:.3}\t{:.1}\t{:.0}\t{}\t{}\t{}\n",
             num,
@@ -490,19 +520,56 @@ mod tests {
     #[test]
     fn test_compare_pass_rate_improvement() {
         let exp_trials = vec![
-            TrialResult { task_run_id: "e1".into(), passed: true, iterations_used: 3, duration_ms: 1000, workflow_id: None },
-            TrialResult { task_run_id: "e2".into(), passed: true, iterations_used: 4, duration_ms: 1200, workflow_id: None },
-            TrialResult { task_run_id: "e3".into(), passed: true, iterations_used: 3, duration_ms: 1100, workflow_id: None },
+            TrialResult {
+                task_run_id: "e1".into(),
+                passed: true,
+                iterations_used: 3,
+                duration_ms: 1000,
+                workflow_id: None,
+            },
+            TrialResult {
+                task_run_id: "e2".into(),
+                passed: true,
+                iterations_used: 4,
+                duration_ms: 1200,
+                workflow_id: None,
+            },
+            TrialResult {
+                task_run_id: "e3".into(),
+                passed: true,
+                iterations_used: 3,
+                duration_ms: 1100,
+                workflow_id: None,
+            },
         ];
         let ctrl_trials = vec![
-            TrialResult { task_run_id: "c1".into(), passed: true, iterations_used: 5, duration_ms: 2000, workflow_id: None },
-            TrialResult { task_run_id: "c2".into(), passed: false, iterations_used: 10, duration_ms: 5000, workflow_id: None },
-            TrialResult { task_run_id: "c3".into(), passed: false, iterations_used: 10, duration_ms: 5000, workflow_id: None },
+            TrialResult {
+                task_run_id: "c1".into(),
+                passed: true,
+                iterations_used: 5,
+                duration_ms: 2000,
+                workflow_id: None,
+            },
+            TrialResult {
+                task_run_id: "c2".into(),
+                passed: false,
+                iterations_used: 10,
+                duration_ms: 5000,
+                workflow_id: None,
+            },
+            TrialResult {
+                task_run_id: "c3".into(),
+                passed: false,
+                iterations_used: 10,
+                duration_ms: 5000,
+                workflow_id: None,
+            },
         ];
         let exp_agg = compute_aggregate(&exp_trials);
         let ctrl_agg = compute_aggregate(&ctrl_trials);
         let criteria = AcceptanceCriteria::default();
-        let (accepted, _reason, p_value) = compare_to_control(&exp_agg, &ctrl_agg, &exp_trials, &ctrl_trials, &criteria);
+        let (accepted, _reason, p_value) =
+            compare_to_control(&exp_agg, &ctrl_agg, &exp_trials, &ctrl_trials, &criteria);
         assert!(accepted);
         assert!(p_value.is_some());
     }
@@ -510,17 +577,42 @@ mod tests {
     #[test]
     fn test_compare_pass_rate_no_improvement() {
         let exp_trials = vec![
-            TrialResult { task_run_id: "e1".into(), passed: false, iterations_used: 10, duration_ms: 5000, workflow_id: None },
-            TrialResult { task_run_id: "e2".into(), passed: true, iterations_used: 5, duration_ms: 2000, workflow_id: None },
+            TrialResult {
+                task_run_id: "e1".into(),
+                passed: false,
+                iterations_used: 10,
+                duration_ms: 5000,
+                workflow_id: None,
+            },
+            TrialResult {
+                task_run_id: "e2".into(),
+                passed: true,
+                iterations_used: 5,
+                duration_ms: 2000,
+                workflow_id: None,
+            },
         ];
         let ctrl_trials = vec![
-            TrialResult { task_run_id: "c1".into(), passed: true, iterations_used: 3, duration_ms: 1000, workflow_id: None },
-            TrialResult { task_run_id: "c2".into(), passed: true, iterations_used: 4, duration_ms: 1500, workflow_id: None },
+            TrialResult {
+                task_run_id: "c1".into(),
+                passed: true,
+                iterations_used: 3,
+                duration_ms: 1000,
+                workflow_id: None,
+            },
+            TrialResult {
+                task_run_id: "c2".into(),
+                passed: true,
+                iterations_used: 4,
+                duration_ms: 1500,
+                workflow_id: None,
+            },
         ];
         let exp_agg = compute_aggregate(&exp_trials);
         let ctrl_agg = compute_aggregate(&ctrl_trials);
         let criteria = AcceptanceCriteria::default();
-        let (accepted, _reason, _p) = compare_to_control(&exp_agg, &ctrl_agg, &exp_trials, &ctrl_trials, &criteria);
+        let (accepted, _reason, _p) =
+            compare_to_control(&exp_agg, &ctrl_agg, &exp_trials, &ctrl_trials, &criteria);
         assert!(!accepted);
     }
 
@@ -545,6 +637,10 @@ mod tests {
         let a = vec![100.0, 101.0, 102.0, 103.0, 104.0];
         let b = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let p = welch_t_test(&a, &b);
-        assert!(p < 0.01, "Very different samples should have p < 0.01, got {}", p);
+        assert!(
+            p < 0.01,
+            "Very different samples should have p < 0.01, got {}",
+            p
+        );
     }
 }

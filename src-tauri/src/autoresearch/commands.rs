@@ -29,9 +29,7 @@ pub async fn start_autoresearch(
 
 /// Stop the currently running autoresearch campaign.
 #[tauri::command]
-pub async fn stop_autoresearch(
-    engine: State<'_, SharedResearchEngine>,
-) -> Result<(), String> {
+pub async fn stop_autoresearch(engine: State<'_, SharedResearchEngine>) -> Result<(), String> {
     let mut eng = engine.lock().await;
     eng.stop()
 }
@@ -191,18 +189,17 @@ pub async fn rerun_autoresearch_campaign(
     db: State<'_, Arc<CheckpointDb>>,
 ) -> Result<String, String> {
     // Load the original campaign's config
-    let config_json: String = db
-        .with_conn({
-            let campaign_id = campaign_id.clone();
-            move |conn| {
-                conn.query_row(
-                    "SELECT config_json FROM autoresearch_campaigns WHERE id = ?1",
-                    rusqlite::params![campaign_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("Campaign not found: {}", e))
-            }
-        })?;
+    let config_json: String = db.with_conn({
+        let campaign_id = campaign_id.clone();
+        move |conn| {
+            conn.query_row(
+                "SELECT config_json FROM autoresearch_campaigns WHERE id = ?1",
+                rusqlite::params![campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Campaign not found: {}", e))
+        }
+    })?;
 
     let mut config: super::types::ResearchConfig = serde_json::from_str(&config_json)
         .map_err(|e| format!("Invalid campaign config: {}", e))?;
@@ -230,7 +227,10 @@ pub async fn compare_autoresearch_campaigns(
     campaign_id_b: String,
     db: State<'_, Arc<CheckpointDb>>,
 ) -> Result<CampaignComparison, String> {
-    let load_campaign = |id: String| -> Result<(CampaignSummary, Vec<(u32, super::types::ExperimentResult)>), String> {
+    let load_campaign = |id: String| -> Result<
+        (CampaignSummary, Vec<(u32, super::types::ExperimentResult)>),
+        String,
+    > {
         let summary = db.with_conn({
             let id = id.clone();
             move |conn| {
@@ -323,7 +323,10 @@ pub async fn compare_autoresearch_campaigns(
         if exps.is_empty() {
             return 0.0;
         }
-        exps.iter().map(|(_, e)| e.aggregate.mean_duration_ms).sum::<f64>() / exps.len() as f64
+        exps.iter()
+            .map(|(_, e)| e.aggregate.mean_duration_ms)
+            .sum::<f64>()
+            / exps.len() as f64
     };
 
     let compute_accepted_rate = |summary: &CampaignSummary| -> f64 {
@@ -427,24 +430,22 @@ pub async fn get_worktree_diff(
     let record = find_worktree_by_branch(&db, &branch_name)?;
     let repo_path = Path::new(&record.repo_path);
 
-    let summary = worktree::get_worktree_diff_summary(
-        repo_path,
-        &record.branch_name,
-        &record.source_branch,
-    )?;
+    let summary =
+        worktree::get_worktree_diff_summary(repo_path, &record.branch_name, &record.source_branch)?;
 
-    let full_diff = worktree::get_full_diff(
-        repo_path,
-        &record.branch_name,
-        &record.source_branch,
-    ).unwrap_or_default();
+    let full_diff = worktree::get_full_diff(repo_path, &record.branch_name, &record.source_branch)
+        .unwrap_or_default();
 
     let files_changed = full_diff
         .lines()
         .filter(|l| l.starts_with("diff --git"))
         .count();
 
-    let diff_text = if full_diff.is_empty() { summary } else { full_diff };
+    let diff_text = if full_diff.is_empty() {
+        summary
+    } else {
+        full_diff
+    };
 
     Ok(WorktreeDiffResult {
         diff: diff_text,
@@ -462,17 +463,10 @@ pub async fn merge_worktree_branch(
     let record = find_worktree_by_branch(&db, &branch_name)?;
     let repo_path = Path::new(&record.repo_path);
 
-    let result = worktree::merge_worktree(
-        repo_path,
-        &record.branch_name,
-        &record.source_branch,
-    )?;
+    let result = worktree::merge_worktree(repo_path, &record.branch_name, &record.source_branch)?;
 
     if result.success {
-        let _ = db.update_worktree_status(
-            &record.id,
-            &worktree::WorktreeStatus::Merged,
-        );
+        let _ = db.update_worktree_status(&record.id, &worktree::WorktreeStatus::Merged);
         return Ok(serde_json::json!({
             "success": true,
             "merge_commit": result.merge_commit,
@@ -489,16 +483,10 @@ pub async fn merge_worktree_branch(
     }
 
     // AI-assisted merge
-    let merge_state = worktree::start_merge_with_conflicts(
-        repo_path,
-        &record.branch_name,
-    )?;
+    let merge_state = worktree::start_merge_with_conflicts(repo_path, &record.branch_name)?;
 
     if merge_state.success {
-        let _ = db.update_worktree_status(
-            &record.id,
-            &worktree::WorktreeStatus::Merged,
-        );
+        let _ = db.update_worktree_status(&record.id, &worktree::WorktreeStatus::Merged);
         return Ok(serde_json::json!({
             "success": true,
             "merge_commit": merge_state.merge_commit,
@@ -529,10 +517,7 @@ pub async fn remove_worktree_branch(
         true, // delete branch
     )?;
 
-    let _ = db.update_worktree_status(
-        &record.id,
-        &worktree::WorktreeStatus::Removed,
-    );
+    let _ = db.update_worktree_status(&record.id, &worktree::WorktreeStatus::Removed);
 
     Ok(serde_json::json!({
         "success": true,
@@ -558,7 +543,8 @@ pub async fn compare_worktree_branches(
             Path::new(&r.repo_path),
             &r.branch_name,
             &r.source_branch,
-        ).unwrap_or_else(|e| format!("Failed to get diff: {}", e));
+        )
+        .unwrap_or_else(|e| format!("Failed to get diff: {}", e));
 
         let result_summary = r.workflow_name.clone().unwrap_or_default();
         branch_data.push((r.branch_name.clone(), diff_summary, result_summary));
@@ -585,4 +571,3 @@ fn find_worktree_by_branch(
         .find(|r| r.branch_name == branch_name)
         .ok_or_else(|| format!("No worktree found for branch: {}", branch_name))
 }
-

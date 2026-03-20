@@ -72,9 +72,7 @@ export function AgentCampaignConfig({ selectedAgent, onStarted }: Props) {
   const [newPromptVariant, setNewPromptVariant] = useState("");
 
   // Baseline configs for the other agents
-  const [baselineConfigs, _setBaselineConfigs] = useState<
-    Record<AgentType, PipelineAgentConfig>
-  >({
+  const [baselineConfigs, _setBaselineConfigs] = useState<Record<AgentType, PipelineAgentConfig>>({
     spec_analyst: {},
     locator: {},
     implementer: {},
@@ -277,26 +275,15 @@ export function AgentCampaignConfig({ selectedAgent, onStarted }: Props) {
 
       {/* Baseline (other agents) — read-only display */}
       <div className="border border-zinc-700 rounded-lg p-4">
-        <h3 className="text-sm font-bold text-zinc-200 mb-2">
-          Held Constant (other agents)
-        </h3>
+        <h3 className="text-sm font-bold text-zinc-200 mb-2">Held Constant (other agents)</h3>
         <div className="grid grid-cols-3 gap-2">
           {otherAgents.map((agent) => (
-            <div
-              key={agent}
-              className="bg-zinc-800/50 border border-zinc-700 rounded-md p-2"
-            >
-              <div className="text-xs font-medium text-zinc-300 mb-1">
-                {AGENT_LABELS[agent]}
-              </div>
+            <div key={agent} className="bg-zinc-800/50 border border-zinc-700 rounded-md p-2">
+              <div className="text-xs font-medium text-zinc-300 mb-1">{AGENT_LABELS[agent]}</div>
               <div className="text-[10px] text-zinc-500 space-y-0.5">
                 <div>Model: {baselineConfigs[agent]?.model || "(default)"}</div>
-                <div>
-                  Temp: {baselineConfigs[agent]?.temperature ?? "(default)"}
-                </div>
-                <div>
-                  Max Tokens: {baselineConfigs[agent]?.max_tokens ?? "(default)"}
-                </div>
+                <div>Temp: {baselineConfigs[agent]?.temperature ?? "(default)"}</div>
+                <div>Max Tokens: {baselineConfigs[agent]?.max_tokens ?? "(default)"}</div>
               </div>
             </div>
           ))}
@@ -460,11 +447,7 @@ export function AgentCampaignConfig({ selectedAgent, onStarted }: Props) {
         </button>
       </div>
 
-      {error && (
-        <div className="text-xs bg-red-900/30 text-red-400 rounded px-2 py-1">
-          {error}
-        </div>
-      )}
+      {error && <div className="text-xs bg-red-900/30 text-red-400 rounded px-2 py-1">{error}</div>}
     </div>
   );
 }

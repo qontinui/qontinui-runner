@@ -1766,7 +1766,6 @@ pub fn session_start_marker(session_num: u32) -> String {
     format!("[SESSION_START:{}]", session_num)
 }
 
-
 // ========================================================================
 // Types defined after impl blocks
 // ========================================================================

@@ -5,6 +5,7 @@ When "Capture Input for Validation" is enabled in the Advanced settings, the run
 ### When to Use This Feature
 
 Enable input validation when clicks are:
+
 - Missing their targets despite correct image recognition
 - Landing in wrong locations on multi-monitor setups
 - Offset due to DPI scaling issues
@@ -29,12 +30,12 @@ When enabled, the Iteration Bundle includes an **Input Validation** section with
 
 ### Interpreting Results
 
-| Discrepancy | Likely Cause |
-|-------------|--------------|
-| Consistent offset (e.g., always +1920px X) | Multi-monitor coordinate issue |
-| Scaled offset (e.g., 1.5x or 2x) | DPI scaling not applied |
-| Random small offsets (< 5px) | Normal - click targets still hit |
-| Large variable offsets | Coordinate transformation bug |
+| Discrepancy                                | Likely Cause                     |
+| ------------------------------------------ | -------------------------------- |
+| Consistent offset (e.g., always +1920px X) | Multi-monitor coordinate issue   |
+| Scaled offset (e.g., 1.5x or 2x)           | DPI scaling not applied          |
+| Random small offsets (< 5px)               | Normal - click targets still hit |
+| Large variable offsets                     | Coordinate transformation bug    |
 
 ### Common Fixes
 
@@ -47,6 +48,7 @@ When enabled, the Iteration Bundle includes an **Input Validation** section with
 ### Raw Events File
 
 The raw input events are saved to `.dev-logs/input_events/{session_id}_events.jsonl` and include:
+
 - All mouse clicks with exact timestamps and positions
 - Mouse movements (sampled)
 - Keyboard events

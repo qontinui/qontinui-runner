@@ -80,17 +80,44 @@ use crate::mcp::types::ApiState;
 
 /// Health check endpoint.
 /// Includes `uiBridge` metadata so the app discovery scanner can detect the runner.
-async fn health() -> Json<serde_json::Value> {
+/// Returns rich diagnostics: frontend responsiveness, uptime, circuit breaker state.
+async fn health(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    let uptime_secs = state.started_at.elapsed().as_secs();
+    let last_pong = state.ui_bridge_last_pong.load(Ordering::Relaxed);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let pong_age_ms = if last_pong > 0 { now_ms - last_pong } else { 0 };
+    let responsive = last_pong > 0 && pong_age_ms < 15000;
+
+    let pending_count = {
+        let pending = state.ui_bridge_pending.lock().await;
+        pending.len()
+    };
+    let circuit_breaker_state = state.ui_bridge_circuit_breaker.get_state().await;
+
     Json(serde_json::json!({
         "success": true,
-        "data": "ok",
+        "data": {
+            "status": "ok",
+            "responsive": responsive,
+            "lastHeartbeat": last_pong,
+            "heartbeatAgeMs": pong_age_ms,
+            "uptimeSeconds": uptime_secs,
+            "pendingRequests": pending_count,
+            "circuitBreaker": format!("{:?}", circuit_breaker_state),
+        },
         "uiBridge": {
             "appId": "qontinui-runner",
             "appName": "Qontinui Runner",
             "appType": "desktop",
             "framework": "tauri",
             "capabilities": ["control", "renderLog", "debug"],
-        }
+        },
+        "timestamp": now_ms,
     }))
 }
 
@@ -148,6 +175,7 @@ pub fn create_router(
         ui_bridge_dedup: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         ui_bridge_render_log: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         doctor_handle: None, // Doctor handle accessed via app_state.doctor_handle when needed
+        started_at: std::time::Instant::now(),
     });
 
     // Set up UI Bridge response listener
@@ -432,6 +460,7 @@ pub fn create_router(
         .merge(crate::mcp::state_explorer::routes())
         .merge(crate::mcp::state_machine::routes())
         .merge(crate::mcp::gui_config::routes())
+        .merge(crate::mcp::image_quality_tests::routes())
         .merge(crate::mcp::step_type_knowledge_api::routes())
         .merge(crate::mcp::step_type_metadata_api::routes())
         .merge(crate::mcp::task_runs::routes())

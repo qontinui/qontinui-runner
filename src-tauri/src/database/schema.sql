@@ -931,6 +931,10 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     acceptance_criteria TEXT DEFAULT NULL,
     ai_reviewed INTEGER DEFAULT 1,
 
+    -- Slash command import tracking
+    source_file_path TEXT DEFAULT NULL,    -- Relative path to source .md file (e.g. "qontinui-claude-config/.claude/commands/fix.md")
+    source_content_hash TEXT DEFAULT NULL, -- SHA-256 hex of file content for change detection
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -944,6 +948,7 @@ CREATE INDEX IF NOT EXISTS idx_unified_workflows_name ON unified_workflows(name)
 CREATE INDEX IF NOT EXISTS idx_unified_workflows_example_status ON unified_workflows(example_status);
 CREATE INDEX IF NOT EXISTS idx_unified_workflows_sync_pending ON unified_workflows(sync_pending);
 CREATE INDEX IF NOT EXISTS idx_unified_workflows_is_favorite ON unified_workflows(is_favorite);
+CREATE INDEX IF NOT EXISTS idx_unified_workflows_source_file_path ON unified_workflows(source_file_path);
 
 -- =============================================================================
 -- Task Run Event Logs (Phase 10: Hybrid Event Logging)

@@ -4,8 +4,20 @@
  * Form for creating and editing scheduled tasks.
  */
 
-import { useState, useEffect } from "react";
-import { X, Save, Loader2, Trash2, Plus, FolderOpen, GitBranch } from "lucide-react";
+import { useState, useEffect, useMemo } from "react";
+import {
+  X,
+  Save,
+  Loader2,
+  Trash2,
+  Plus,
+  FolderOpen,
+  GitBranch,
+  Search,
+  Star,
+  Terminal,
+  ChevronDown,
+} from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getAccentColors } from "@/design-system";
 import type {
@@ -16,14 +28,8 @@ import type {
   ScheduleConditions,
   RepositoryWatch,
 } from "../../types/scheduler";
-import { useExecution } from "../../contexts";
+import type { UnifiedWorkflow } from "../../types/unified-workflow";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
-
-interface WorkflowOption {
-  id: string;
-  name: string;
-  configPath?: string;
-}
 
 interface PromptOption {
   id: string;
@@ -113,10 +119,13 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
         return "autofix";
     }
   });
+  const [workflowId, setWorkflowId] = useState(
+    task?.task.task_type === "Workflow" ? task.task.workflow_id || "" : "",
+  );
   const [workflowName, setWorkflowName] = useState(
     task?.task.task_type === "Workflow" ? task.task.workflow_name : "",
   );
-  const [taskConfigPath, setTaskConfigPath] = useState(
+  const [taskConfigPath, _setTaskConfigPath] = useState(
     task?.task.task_type === "Workflow" ? task.task.config_path || "" : "",
   );
   const [monitorIndex, setMonitorIndex] = useState<string>(
@@ -151,16 +160,60 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
     task?.conditions?.timeout_minutes,
   );
 
-  // Get workflows from ExecutionContext
-  const { workflows: contextWorkflows, config } = useExecution();
-  const contextConfigPath = config?.path;
+  // Unified workflows from API
+  const [unifiedWorkflows, setUnifiedWorkflows] = useState<UnifiedWorkflow[]>([]);
+  const [loadingWorkflows, setLoadingWorkflows] = useState(false);
+  const [workflowSearch, setWorkflowSearch] = useState("");
+  const [workflowFilter, setWorkflowFilter] = useState<"all" | "favorites" | "commands">("all");
+  const [workflowPickerOpen, setWorkflowPickerOpen] = useState(false);
 
-  // Convert context workflows to WorkflowOption format
-  const workflowOptions: WorkflowOption[] = contextWorkflows.map((w) => ({
-    id: w.id,
-    name: w.name,
-    configPath: contextConfigPath,
-  }));
+  // Fetch unified workflows from API
+  useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+
+    const fetchWorkflows = async () => {
+      setLoadingWorkflows(true);
+      try {
+        const response = await tracedFetch(`${getApiBase()}/unified-workflows`, {
+          signal: controller.signal,
+        });
+        const result = await response.json();
+        if (!cancelled && result.success && result.data) {
+          setUnifiedWorkflows(result.data);
+        }
+      } catch (error) {
+        if (!cancelled) console.error("Failed to fetch workflows:", error);
+      } finally {
+        if (!cancelled) setLoadingWorkflows(false);
+      }
+    };
+    fetchWorkflows();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, []);
+
+  // Filtered unified workflows
+  const filteredWorkflows = useMemo(() => {
+    let list = unifiedWorkflows;
+    if (workflowFilter === "favorites") {
+      list = list.filter((w) => w.is_favorite);
+    } else if (workflowFilter === "commands") {
+      list = list.filter((w) => w.category === "slash-command");
+    }
+    if (workflowSearch) {
+      const q = workflowSearch.toLowerCase();
+      list = list.filter(
+        (w) => w.name.toLowerCase().includes(q) || w.description?.toLowerCase().includes(q),
+      );
+    }
+    return list;
+  }, [unifiedWorkflows, workflowFilter, workflowSearch]);
+
+  // Selected workflow display name
+  const selectedWorkflow = unifiedWorkflows.find((w) => w.id === workflowId);
 
   // Available prompts
   const [prompts, setPrompts] = useState<PromptOption[]>([]);
@@ -228,9 +281,10 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
       case "workflow":
         return {
           task_type: "Workflow",
-          workflow_name: workflowName,
+          workflow_name: workflowId ? selectedWorkflow?.name || workflowName : workflowName,
           config_path: taskConfigPath || undefined,
           monitor_index: monitorIndex ? parseInt(monitorIndex, 10) : undefined,
+          workflow_id: workflowId || undefined,
         };
       case "prompt":
         return {
@@ -334,7 +388,7 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
 
     switch (taskType) {
       case "workflow":
-        return workflowName.trim() !== "";
+        return workflowId.trim() !== "" || workflowName.trim() !== "";
       case "prompt":
         return promptId.trim() !== "";
       case "autofix":
@@ -570,51 +624,121 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
           <div className="space-y-3">
             <div>
               <label className="block text-sm font-medium mb-1">Workflow *</label>
-              {workflowOptions.length > 0 ? (
-                <select
-                  value={workflowName}
-                  onChange={(e) => {
-                    const selected = workflowOptions.find((w) => w.name === e.target.value);
-                    setWorkflowName(e.target.value);
-                    if (selected?.configPath && !taskConfigPath) {
-                      setTaskConfigPath(selected.configPath);
-                    }
-                  }}
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
-                  required={taskType === "workflow"}
-                >
-                  <option value="">Select a workflow...</option>
-                  {workflowOptions.map((workflow) => (
-                    <option key={workflow.id} value={workflow.name}>
-                      {workflow.name}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <div className="space-y-2">
-                  <p className="text-sm text-muted-foreground">
-                    No workflows found. Load a config file first, or enter manually:
-                  </p>
-                  <input
-                    type="text"
-                    value={workflowName}
-                    onChange={(e) => setWorkflowName(e.target.value)}
-                    placeholder="Enter workflow name"
-                    className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
-                    required={taskType === "workflow"}
+
+              {/* Selected workflow display / trigger */}
+              <button
+                type="button"
+                onClick={() => setWorkflowPickerOpen(!workflowPickerOpen)}
+                className="w-full flex items-center justify-between px-3 py-2 bg-background border border-border rounded-lg hover:border-primary/50 transition-colors text-left"
+              >
+                {selectedWorkflow ? (
+                  <span className="flex items-center gap-2 truncate">
+                    {selectedWorkflow.category === "slash-command" && (
+                      <Terminal className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />
+                    )}
+                    {selectedWorkflow.is_favorite && (
+                      <Star className="w-3.5 h-3.5 text-amber-400 fill-amber-400 flex-shrink-0" />
+                    )}
+                    <span className="truncate">{selectedWorkflow.name}</span>
+                  </span>
+                ) : (
+                  <span className="text-muted-foreground">Select a workflow...</span>
+                )}
+                <ChevronDown
+                  className={`w-4 h-4 text-muted-foreground flex-shrink-0 transition-transform ${workflowPickerOpen ? "rotate-180" : ""}`}
+                />
+              </button>
+
+              {/* Workflow picker dropdown */}
+              {workflowPickerOpen && (
+                <>
+                  <div
+                    className="fixed inset-0 z-10"
+                    onClick={() => setWorkflowPickerOpen(false)}
                   />
-                </div>
+                  <div className="relative z-20 mt-1 border border-border rounded-lg bg-card shadow-xl overflow-hidden">
+                    {/* Search + filters */}
+                    <div className="p-2 border-b border-border space-y-2">
+                      <div className="relative">
+                        <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
+                        <input
+                          type="text"
+                          value={workflowSearch}
+                          onChange={(e) => setWorkflowSearch(e.target.value)}
+                          placeholder="Search workflows..."
+                          className="w-full pl-8 pr-3 py-1.5 bg-background border border-border rounded text-sm focus:outline-none focus:ring-1 focus:ring-primary/50"
+                          autoFocus
+                        />
+                      </div>
+                      <div className="flex gap-1">
+                        {(["all", "favorites", "commands"] as const).map((f) => (
+                          <button
+                            key={f}
+                            type="button"
+                            onClick={() => setWorkflowFilter(f)}
+                            className={`px-2 py-0.5 rounded text-xs transition-colors ${
+                              workflowFilter === f
+                                ? "bg-cyan-500/20 text-cyan-400 border border-cyan-500/50"
+                                : "bg-white/5 text-muted-foreground border border-transparent hover:bg-white/10"
+                            }`}
+                          >
+                            {f === "all" ? "All" : f === "favorites" ? "Favorites" : "Commands"}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Workflow list */}
+                    <div className="max-h-52 overflow-y-auto">
+                      {loadingWorkflows ? (
+                        <div className="flex items-center justify-center py-4">
+                          <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+                        </div>
+                      ) : filteredWorkflows.length === 0 ? (
+                        <div className="text-center py-4 text-sm text-muted-foreground">
+                          No workflows match
+                        </div>
+                      ) : (
+                        filteredWorkflows.map((wf) => (
+                          <button
+                            key={wf.id}
+                            type="button"
+                            onClick={() => {
+                              setWorkflowId(wf.id);
+                              setWorkflowName(wf.name);
+                              setWorkflowPickerOpen(false);
+                              setWorkflowSearch("");
+                            }}
+                            className={`w-full text-left px-3 py-2 text-sm hover:bg-white/5 transition-colors flex items-center gap-2 ${
+                              wf.id === workflowId ? "bg-cyan-500/10 text-cyan-400" : ""
+                            }`}
+                          >
+                            {wf.category === "slash-command" && (
+                              <Terminal className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />
+                            )}
+                            {wf.is_favorite && (
+                              <Star className="w-3 h-3 text-amber-400 fill-amber-400 flex-shrink-0" />
+                            )}
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate">{wf.name}</div>
+                              {wf.description && (
+                                <div className="text-xs text-muted-foreground truncate">
+                                  {wf.description}
+                                </div>
+                              )}
+                            </div>
+                            {wf.tags?.includes("requires-arguments") && (
+                              <span className="flex-shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-amber-500/20 text-amber-400">
+                                Args
+                              </span>
+                            )}
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </>
               )}
-            </div>
-            <div>
-              <label className="block text-sm font-medium mb-1">Config Path</label>
-              <input
-                type="text"
-                value={taskConfigPath}
-                onChange={(e) => setTaskConfigPath(e.target.value)}
-                placeholder="Path to config file (optional, uses current if empty)"
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
-              />
             </div>
             <div>
               <label className="block text-sm font-medium mb-1">Monitor Index</label>

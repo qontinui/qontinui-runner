@@ -205,8 +205,7 @@ pub async fn start_comparison(
     let comparison_id = format!("cmp-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
     let entries_count = entries.len();
-    let entries_json_str =
-        serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+    let entries_json_str = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
 
     // Insert into database
     let cid = comparison_id.clone();
@@ -236,7 +235,10 @@ pub async fn start_comparison(
 
     // Spawn background task to launch all the workflow runs
     let db = state.app_state.checkpoint_db.clone();
-    let api_port = state.app_state.api_port.load(std::sync::atomic::Ordering::Relaxed);
+    let api_port = state
+        .app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
     let workflow_id = req.workflow_id.clone();
     let comp_id = comparison_id.clone();
 
@@ -356,7 +358,16 @@ pub async fn get_comparison(
         })
         .map_err(|e| (StatusCode::NOT_FOUND, Json(api_error(e))))?;
 
-    let (id, workflow_id, variation_type, status, entries_json_str, report, created_at, completed_at) = row;
+    let (
+        id,
+        workflow_id,
+        variation_type,
+        status,
+        entries_json_str,
+        report,
+        created_at,
+        completed_at,
+    ) = row;
 
     let mut entries: Vec<ComparisonEntryJson> =
         serde_json::from_str(&entries_json_str).unwrap_or_default();

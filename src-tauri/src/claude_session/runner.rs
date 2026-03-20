@@ -1353,7 +1353,10 @@ fn run_claude_session_inline(
                 let db = match CheckpointDb::new() {
                     Ok(db) => Some(db),
                     Err(e) => {
-                        warn!("Failed to open database for reflection fix storage (inferred ctx): {}", e);
+                        warn!(
+                            "Failed to open database for reflection fix storage (inferred ctx): {}",
+                            e
+                        );
                         None
                     }
                 };
@@ -1411,15 +1414,16 @@ fn run_claude_session_inline(
                                     "Reflection fix recorded: [{}:{}] {}",
                                     fix.fix_type, fix.confidence, fix.fix_description
                                 );
-                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    emit_ai_output(
-                                        &app_handle_reflection,
-                                        &msg,
-                                        "reflection_fix",
-                                        None,
-                                        session_ctx_for_reflection.as_ref(),
-                                    );
-                                }));
+                                let _ =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        emit_ai_output(
+                                            &app_handle_reflection,
+                                            &msg,
+                                            "reflection_fix",
+                                            None,
+                                            session_ctx_for_reflection.as_ref(),
+                                        );
+                                    }));
                             }
                             Err(e) => {
                                 warn!("Failed to store reflection fix (inferred ctx): {}", e);

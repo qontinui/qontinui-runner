@@ -84,12 +84,8 @@ export function PerAgentTab() {
             onStarted={() => setActiveView("monitor")}
           />
         )}
-        {activeView === "monitor" && (
-          <AgentPerformanceView selectedAgent={selectedAgent} live />
-        )}
-        {activeView === "results" && (
-          <AgentTraceComparison selectedAgent={selectedAgent} />
-        )}
+        {activeView === "monitor" && <AgentPerformanceView selectedAgent={selectedAgent} live />}
+        {activeView === "results" && <AgentTraceComparison selectedAgent={selectedAgent} />}
         {activeView === "history" && (
           <AgentCampaignHistory
             selectedAgent={selectedAgent}

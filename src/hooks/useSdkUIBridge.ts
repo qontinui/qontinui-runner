@@ -49,19 +49,15 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
   const connectedAppRef = useRef<SdkAppInfo | null>(null);
 
   // --- Snapshot & Components ---
-  const {
-    snapshot,
-    components,
-    refreshSnapshot,
-    refreshComponents,
-    setSnapshot,
-    setComponents,
-  } = useSnapshotComponents();
+  const { snapshot, components, refreshSnapshot, refreshComponents, setSnapshot, setComponents } =
+    useSnapshotComponents();
 
   // --- Capture Session ---
   const captureHook = useCaptureSession(
     // fetchElements placeholder — wired below via stable ref
-    async () => { await fetchElementsRef.current(); },
+    async () => {
+      await fetchElementsRef.current();
+    },
   );
 
   // --- Elements ---
@@ -85,7 +81,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
     elementsHook.setSelectedElementId(null);
     setSnapshot(null);
     setComponents([]);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [setSnapshot, setComponents]);
 
   const connectionHook = useConnection(elementsHook.fetchElements, clearElementState);

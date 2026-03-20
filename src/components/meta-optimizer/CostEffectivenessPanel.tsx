@@ -41,10 +41,10 @@ export function CostEffectivenessPanel() {
   const load = useCallback(async () => {
     try {
       setLoading(true);
-      const data = await invoke<CostEffectivenessPoint[]>(
-        "get_agent_cost_effectiveness",
-        { agentType: agentFilter === "all" ? null : agentFilter, days: 90 },
-      );
+      const data = await invoke<CostEffectivenessPoint[]>("get_agent_cost_effectiveness", {
+        agentType: agentFilter === "all" ? null : agentFilter,
+        days: 90,
+      });
       setPoints(data);
     } catch {
       // silently fail
@@ -104,7 +104,8 @@ export function CostEffectivenessPanel() {
   const plotH = SVG_H - PAD.top - PAD.bottom;
 
   const scaleX = (v: number) => PAD.left + ((v - minCost) / (maxCost - minCost || 1)) * plotW;
-  const scaleY = (v: number) => PAD.top + plotH - ((v - minRate) / (maxRate - minRate || 1)) * plotH;
+  const scaleY = (v: number) =>
+    PAD.top + plotH - ((v - minRate) / (maxRate - minRate || 1)) * plotH;
 
   // Pareto frontier line
   const paretoPoints = [...paretoSet]
@@ -113,7 +114,9 @@ export function CostEffectivenessPanel() {
   const paretoPath =
     paretoPoints.length > 1
       ? paretoPoints
-          .map((p, i) => `${i === 0 ? "M" : "L"} ${scaleX(p.avg_cost_usd)} ${scaleY(p.success_rate)}`)
+          .map(
+            (p, i) => `${i === 0 ? "M" : "L"} ${scaleX(p.avg_cost_usd)} ${scaleY(p.success_rate)}`,
+          )
           .join(" ")
       : "";
 
@@ -153,7 +156,13 @@ export function CostEffectivenessPanel() {
                   stroke="#3f3f46"
                   strokeWidth={0.5}
                 />
-                <text x={PAD.left - 5} y={scaleY(v) + 3} textAnchor="end" fill="#71717a" fontSize={9}>
+                <text
+                  x={PAD.left - 5}
+                  y={scaleY(v) + 3}
+                  textAnchor="end"
+                  fill="#71717a"
+                  fontSize={9}
+                >
                   {v}%
                 </text>
               </g>
@@ -183,7 +192,13 @@ export function CostEffectivenessPanel() {
 
           {/* Pareto frontier */}
           {paretoPath && (
-            <path d={paretoPath} fill="none" stroke="#22d3ee" strokeWidth={1.5} strokeDasharray="4 2" />
+            <path
+              d={paretoPath}
+              fill="none"
+              stroke="#22d3ee"
+              strokeWidth={1.5}
+              strokeDasharray="4 2"
+            />
           )}
 
           {/* Data points */}
@@ -222,7 +237,8 @@ export function CostEffectivenessPanel() {
                       {AGENT_LABELS[p.agent_type] ?? p.agent_type} | {p.period_label}
                     </text>
                     <text x={cx + 14} y={cy - 3} fill="#a1a1aa" fontSize={9}>
-                      ${p.avg_cost_usd.toFixed(4)} | {p.success_rate.toFixed(1)}% | {p.run_count} runs
+                      ${p.avg_cost_usd.toFixed(4)} | {p.success_rate.toFixed(1)}% | {p.run_count}{" "}
+                      runs
                     </text>
                   </g>
                 )}

@@ -295,11 +295,11 @@ impl AiGuidedMutator {
             &context,
             None,
             self.guidance_model.as_deref(),
-            None,  // provider_override
-            Some(0.7), // temperature — some creativity
+            None,       // provider_override
+            Some(0.7),  // temperature — some creativity
             Some(2048), // max_tokens
-            None,  // fallback_model
-            None,  // fallback_provider
+            None,       // fallback_model
+            None,       // fallback_provider
         );
 
         if !response.success {
@@ -322,7 +322,9 @@ fn build_guidance_prompt(
 ) -> String {
     let mut prompt = String::new();
 
-    prompt.push_str("You are an optimization advisor for an autonomous workflow experiment loop.\n\n");
+    prompt.push_str(
+        "You are an optimization advisor for an autonomous workflow experiment loop.\n\n",
+    );
 
     // Current control
     prompt.push_str(&format!(
@@ -359,7 +361,11 @@ fn build_guidance_prompt(
     prompt.push_str("\n## Experiment History (most recent)\n");
     prompt.push_str("| # | Config | Pass Rate | Iterations | Duration | Accepted |\n");
     prompt.push_str("|---|--------|-----------|------------|----------|----------|\n");
-    let start = if history.len() > 20 { history.len() - 20 } else { 0 };
+    let start = if history.len() > 20 {
+        history.len() - 20
+    } else {
+        0
+    };
     for (num, result) in &history[start..] {
         prompt.push_str(&format!(
             "| {} | {} | {:.1}% | {:.1} | {:.0}ms | {} |\n",
@@ -379,10 +385,15 @@ fn build_guidance_prompt(
         "\n## Summary\n- Total experiments: {}\n- Accepted: {} ({:.1}%)\n",
         total,
         accepted,
-        if total > 0 { accepted as f64 / total as f64 * 100.0 } else { 0.0 }
+        if total > 0 {
+            accepted as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        }
     ));
 
-    prompt.push_str(r#"
+    prompt.push_str(
+        r#"
 ## Task
 Based on the experiment history, recommend the SINGLE best config to try next.
 Consider:
@@ -404,7 +415,8 @@ Respond with ONLY a JSON object:
 ```
 
 Use null for dimensions you don't want to change from the control.
-"#);
+"#,
+    );
 
     prompt
 }
@@ -540,7 +552,10 @@ mod tests {
 
         // At least some should differ from control
         let different = configs.iter().any(|c| c.summary() != control.summary());
-        assert!(different, "RandomPerturbator should produce at least one different config");
+        assert!(
+            different,
+            "RandomPerturbator should produce at least one different config"
+        );
     }
 
     #[test]
@@ -561,7 +576,11 @@ mod tests {
         for _ in 0..50 {
             let config = mutator.next_experiment(&control, &dims, &[]).unwrap();
             let val = config.max_iterations.unwrap();
-            assert!(val >= 3 && val <= 15, "max_iterations {} out of range [3, 15]", val);
+            assert!(
+                val >= 3 && val <= 15,
+                "max_iterations {} out of range [3, 15]",
+                val
+            );
         }
     }
 }

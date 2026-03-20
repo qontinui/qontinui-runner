@@ -1237,6 +1237,9 @@ pub struct RunUnifiedWorkflowRequest {
     /// multi_agent_mode, max_context_tokens.
     #[serde(default)]
     overrides: Option<serde_json::Value>,
+    /// Arguments to substitute for $ARGUMENTS in slash command workflows.
+    #[serde(default)]
+    pub arguments: Option<String>,
 }
 
 /// Response body for running a unified workflow (non-blocking)
@@ -1339,6 +1342,23 @@ pub async fn run_unified_workflow(
                 "Runtime sanitizer: fixed {} steps with command/retry issues",
                 fix_count
             );
+        }
+    }
+
+    // Substitute $ARGUMENTS in agentic step content if arguments are provided
+    if let Some(ref args) = request.arguments {
+        for step in workflow.agentic_steps.iter_mut() {
+            if let Some(content) = step
+                .get("content")
+                .and_then(|c| c.as_str())
+                .map(String::from)
+            {
+                if content.contains("$ARGUMENTS") {
+                    step["content"] =
+                        serde_json::Value::String(content.replace("$ARGUMENTS", args));
+                    info!("Substituted $ARGUMENTS in agentic step");
+                }
+            }
         }
     }
 
@@ -1555,17 +1575,26 @@ pub async fn run_unified_workflow(
                 loop_config.max_context_tokens = tokens as usize;
             }
             if let Some(arch) = overrides.get("workflow_architecture") {
-                if let Ok(parsed) = serde_json::from_value::<crate::autoresearch::agentic_verification::WorkflowArchitecture>(arch.clone()) {
+                if let Ok(parsed) = serde_json::from_value::<
+                    crate::autoresearch::agentic_verification::WorkflowArchitecture,
+                >(arch.clone())
+                {
                     loop_config.workflow_architecture = Some(parsed);
                 }
             }
             if let Some(av_config) = overrides.get("agentic_verification_config") {
-                if let Ok(parsed) = serde_json::from_value::<crate::autoresearch::agentic_verification::AgenticVerificationConfig>(av_config.clone()) {
+                if let Ok(parsed) = serde_json::from_value::<
+                    crate::autoresearch::agentic_verification::AgenticVerificationConfig,
+                >(av_config.clone())
+                {
                     loop_config.agentic_verification_config = Some(parsed);
                 }
             }
             if let Some(map_config) = overrides.get("multi_agent_pipeline_config") {
-                if let Ok(parsed) = serde_json::from_value::<crate::autoresearch::agentic_verification::MultiAgentPipelineConfig>(map_config.clone()) {
+                if let Ok(parsed) = serde_json::from_value::<
+                    crate::autoresearch::agentic_verification::MultiAgentPipelineConfig,
+                >(map_config.clone())
+                {
                     loop_config.multi_agent_pipeline_config = Some(parsed);
                 }
             }
@@ -2039,17 +2068,26 @@ pub async fn execute_inline_workflow(
                 loop_config.max_context_tokens = tokens as usize;
             }
             if let Some(arch) = overrides.get("workflow_architecture") {
-                if let Ok(parsed) = serde_json::from_value::<crate::autoresearch::agentic_verification::WorkflowArchitecture>(arch.clone()) {
+                if let Ok(parsed) = serde_json::from_value::<
+                    crate::autoresearch::agentic_verification::WorkflowArchitecture,
+                >(arch.clone())
+                {
                     loop_config.workflow_architecture = Some(parsed);
                 }
             }
             if let Some(av_config) = overrides.get("agentic_verification_config") {
-                if let Ok(parsed) = serde_json::from_value::<crate::autoresearch::agentic_verification::AgenticVerificationConfig>(av_config.clone()) {
+                if let Ok(parsed) = serde_json::from_value::<
+                    crate::autoresearch::agentic_verification::AgenticVerificationConfig,
+                >(av_config.clone())
+                {
                     loop_config.agentic_verification_config = Some(parsed);
                 }
             }
             if let Some(map_config) = overrides.get("multi_agent_pipeline_config") {
-                if let Ok(parsed) = serde_json::from_value::<crate::autoresearch::agentic_verification::MultiAgentPipelineConfig>(map_config.clone()) {
+                if let Ok(parsed) = serde_json::from_value::<
+                    crate::autoresearch::agentic_verification::MultiAgentPipelineConfig,
+                >(map_config.clone())
+                {
                     loop_config.multi_agent_pipeline_config = Some(parsed);
                 }
             }
@@ -2491,9 +2529,9 @@ pub async fn run_composed_workflow(
                 use_worktree: false,
                 worktree_path: None,
                 worktree_branch: None,
-            workflow_architecture: None,
-            agentic_verification_config: None,
-            multi_agent_pipeline_config: None,
+                workflow_architecture: None,
+                agentic_verification_config: None,
+                multi_agent_pipeline_config: None,
                 auto_run_generated: false,
                 approval_gate: false,
                 max_context_tokens: 100_000,
@@ -2638,6 +2676,43 @@ async fn update_example_status_handler(
 }
 
 // ============================================================================
+// Slash Command Sync
+// ============================================================================
+
+/// POST /slash-commands/sync — re-sync slash commands from disk
+async fn sync_slash_commands_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<crate::slash_commands::SyncResult>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    info!("Manual slash command sync requested");
+
+    match crate::slash_commands::sync_slash_commands(&state.app_state.checkpoint_db) {
+        Ok(result) => {
+            info!(
+                "Slash command sync complete: {} created, {} updated, {} deleted, {} unchanged",
+                result.created, result.updated, result.deleted, result.unchanged
+            );
+
+            // Emit event to refresh frontend
+            let _ = state.app_handle.emit("slash-commands-synced", &result);
+
+            Ok(Json(ApiResponse {
+                success: true,
+                data: Some(result),
+                error: None,
+            }))
+        }
+        Err(e) => {
+            error!("Slash command sync failed: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Slash command sync failed: {}", e))),
+            ))
+        }
+    }
+}
+
+// ============================================================================
 // End Unified Workflows HTTP API Handlers
 // ============================================================================
 
@@ -2672,6 +2747,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/unified-workflows/run-composed",
             post(run_composed_workflow),
         )
+        .route("/slash-commands/sync", post(sync_slash_commands_handler))
         // Parameterized paths after all literal paths
         .route(
             "/unified-workflows/:id",

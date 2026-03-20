@@ -2508,11 +2508,12 @@ pub async fn get_screenshot_monitors_ipc(
 
 // Integration Testing handlers removed — see crate::mcp module
 
-
 // Playwright State Collector handlers moved to crate::mcp::playwright_collection
 
 // AI session management handlers moved to crate::mcp::ai_session
-use crate::mcp::ai_session::{has_running_ai_tasks_async, InlinePythonRequest, InlinePythonResponse};
+use crate::mcp::ai_session::{
+    has_running_ai_tasks_async, InlinePythonRequest, InlinePythonResponse,
+};
 
 // ============================================================================
 // Inline Python Execution
@@ -2680,12 +2681,10 @@ if __name__ == "__main__":
     }
 }
 
-
 // Backup/restore handlers moved to crate::mcp::backup_restore
 
 // Trace, verification, and media utilities moved to crate::mcp::trace_verification
 // Trace, verification, and media utilities moved to crate::mcp::trace_verification
-
 
 /// Information about a single active session
 #[derive(Debug, Clone, Serialize)]
@@ -2705,7 +2704,6 @@ pub struct ActiveSessionInfo {
 // NOTE: ResumableWorkflowInfo, get_resumable_workflow, ResumeWorkflowResponse, resume_workflow,
 // ForceContinueRequest, ForceContinueResponse, force_continue_session, force_continue_simple
 // functions removed - these are now handled by the LoopController
-
 
 // Auto-continue settings moved to crate::mcp::auto_continue
 // Auto-continue settings moved to crate::mcp::auto_continue

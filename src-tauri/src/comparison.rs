@@ -135,32 +135,31 @@ pub fn build_run_overrides(
     run_count: usize,
 ) -> Vec<serde_json::Value> {
     match variation {
-        ComparisonVariation::Same => {
-            (0..run_count).map(|_| serde_json::json!({})).collect()
-        }
+        ComparisonVariation::Same => (0..run_count).map(|_| serde_json::json!({})).collect(),
         ComparisonVariation::MultiAgent => {
             vec![
                 serde_json::json!({"multi_agent_mode": true, "label": "multi-agent"}),
                 serde_json::json!({"multi_agent_mode": false, "label": "monolithic"}),
             ]
         }
-        ComparisonVariation::Model { models } => {
-            models.iter().map(|m| serde_json::json!({"model": m, "label": m})).collect()
-        }
-        ComparisonVariation::ContextTokens { limits } => {
-            limits.iter().map(|l| serde_json::json!({"max_context_tokens": l, "label": format!("{}K", l / 1000)})).collect()
-        }
-        ComparisonVariation::Custom { overrides } => {
-            overrides.clone()
-        }
+        ComparisonVariation::Model { models } => models
+            .iter()
+            .map(|m| serde_json::json!({"model": m, "label": m}))
+            .collect(),
+        ComparisonVariation::ContextTokens { limits } => limits
+            .iter()
+            .map(
+                |l| serde_json::json!({"max_context_tokens": l, "label": format!("{}K", l / 1000)}),
+            )
+            .collect(),
+        ComparisonVariation::Custom { overrides } => overrides.clone(),
     }
 }
 
 /// Check if all entries in a comparison are done (completed or failed).
 pub fn all_entries_done(entries: &[ComparisonEntry]) -> bool {
     entries.iter().all(|e| {
-        e.status == ComparisonEntryStatus::Completed
-            || e.status == ComparisonEntryStatus::Failed
+        e.status == ComparisonEntryStatus::Completed || e.status == ComparisonEntryStatus::Failed
     })
 }
 
@@ -169,24 +168,34 @@ pub fn build_entry_summaries(
     entries: &[ComparisonEntry],
     db: &CheckpointDb,
 ) -> Vec<(String, String, String)> {
-    entries.iter().map(|entry| {
-        let result_summary = entry.result.as_ref().map(|r| {
-            format!(
+    entries
+        .iter()
+        .map(|entry| {
+            let result_summary = entry
+                .result
+                .as_ref()
+                .map(|r| {
+                    format!(
                 "Success: {}, Verification: {}, Iterations: {}, Duration: {}ms, Files changed: {}",
                 r.success, r.verification_passed, r.iterations, r.duration_ms, r.files_changed
             )
-        }).unwrap_or_else(|| {
-            // Try to get from database
-            db.get_task_run(&entry.task_run_id)
-                .ok()
-                .flatten()
-                .map(|run| {
-                    format!("Status: {}, Summary: {}",
-                        run.status, run.summary.as_deref().unwrap_or("none"))
                 })
-                .unwrap_or_else(|| format!("Status: {:?}", entry.status))
-        });
+                .unwrap_or_else(|| {
+                    // Try to get from database
+                    db.get_task_run(&entry.task_run_id)
+                        .ok()
+                        .flatten()
+                        .map(|run| {
+                            format!(
+                                "Status: {}, Summary: {}",
+                                run.status,
+                                run.summary.as_deref().unwrap_or("none")
+                            )
+                        })
+                        .unwrap_or_else(|| format!("Status: {:?}", entry.status))
+                });
 
-        (entry.branch_name.clone(), String::new(), result_summary)
-    }).collect()
+            (entry.branch_name.clone(), String::new(), result_summary)
+        })
+        .collect()
 }

@@ -5,9 +5,7 @@ import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 /**
  * Handles: page_refresh, page_navigate, page_go_back, page_go_forward, query_selector, page_evaluate
  */
-export function usePageEvents(
-  context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">,
-) {
+export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">) {
   const { sendResponse } = context;
 
   return useCallback(

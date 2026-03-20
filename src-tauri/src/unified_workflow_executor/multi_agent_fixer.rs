@@ -135,7 +135,10 @@ pub struct MultiAgentFixResult {
 ///
 /// The triage agent receives the failure context and returns structured JSON
 /// classifying each failure into groups with priorities and dependencies.
-pub fn build_triage_prompt(failure_context: &str, all_step_results: &[StepExecutionResult]) -> String {
+pub fn build_triage_prompt(
+    failure_context: &str,
+    all_step_results: &[StepExecutionResult],
+) -> String {
     // Build a structured summary of all steps (passed and failed)
     let mut steps_summary = String::new();
     for (i, result) in all_step_results.iter().enumerate() {
@@ -159,7 +162,13 @@ pub fn build_triage_prompt(failure_context: &str, all_step_results: &[StepExecut
             if result.success {
                 "OK".to_string()
             } else {
-                result.error.as_deref().unwrap_or("unknown error").chars().take(200).collect::<String>()
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or("unknown error")
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
             }
         ));
     }

@@ -1385,7 +1385,7 @@ impl CheckpointDb {
                     follow_up_source_task_run_id: None, // Not queried for performance
                     is_fixer: false,          // Not queried for performance
                     fixer_source_task_run_id: None, // Not queried for performance
-                    is_meta_optimizer: false,      // Not queried for performance
+                    is_meta_optimizer: false, // Not queried for performance
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -1404,7 +1404,10 @@ impl CheckpointDb {
 
     /// Get all running unified workflow task runs for resume on startup.
     /// Returns task runs where status = 'running' AND workflow_type = 'unified'.
-    pub fn get_running_unified_workflows(&self, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
+    pub fn get_running_unified_workflows(
+        &self,
+        runner_port: Option<u16>,
+    ) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -1462,7 +1465,7 @@ impl CheckpointDb {
                     follow_up_source_task_run_id: None, // Not queried for performance
                     is_fixer: row.get::<_, i32>(25).unwrap_or(0) != 0,
                     fixer_source_task_run_id: None, // Not queried for performance
-                    is_meta_optimizer: false,      // Not queried for performance
+                    is_meta_optimizer: false,       // Not queried for performance
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -1481,7 +1484,10 @@ impl CheckpointDb {
 
     /// Get all running AI session task runs for resume on startup.
     /// Returns task runs where status = 'running' AND workflow_type = 'chat'.
-    pub fn get_running_ai_sessions(&self, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
+    pub fn get_running_ai_sessions(
+        &self,
+        runner_port: Option<u16>,
+    ) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -1555,7 +1561,11 @@ impl CheckpointDb {
 
     /// Get recent AI sessions (all statuses) for sidebar listing.
     /// Returns lightweight summaries ordered by most recently updated.
-    pub fn get_ai_sessions(&self, limit: u32, runner_port: Option<u16>) -> Result<Vec<AiSessionSummary>, String> {
+    pub fn get_ai_sessions(
+        &self,
+        limit: u32,
+        runner_port: Option<u16>,
+    ) -> Result<Vec<AiSessionSummary>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -1697,7 +1707,11 @@ impl CheckpointDb {
 
     /// Get recent task runs (for display in UI).
     /// Note: output_log is empty for performance. Use get_full_task_output() to get output.
-    pub fn get_recent_task_runs(&self, limit: u32, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
+    pub fn get_recent_task_runs(
+        &self,
+        limit: u32,
+        runner_port: Option<u16>,
+    ) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -1757,7 +1771,7 @@ impl CheckpointDb {
                     follow_up_source_task_run_id: None, // Not queried for performance
                     is_fixer: false,          // Not queried for performance
                     fixer_source_task_run_id: None, // Not queried for performance
-                    is_meta_optimizer: false,      // Not queried for performance
+                    is_meta_optimizer: false, // Not queried for performance
                     created_at: row.get(18)?,
                     updated_at: row.get(19)?,
                     completed_at: row.get(20)?,
@@ -1871,7 +1885,7 @@ impl CheckpointDb {
                     follow_up_source_task_run_id: None, // Not queried for performance
                     is_fixer: false,      // Not queried for performance
                     fixer_source_task_run_id: None, // Not queried for performance
-                    is_meta_optimizer: false,      // Not queried for performance
+                    is_meta_optimizer: false, // Not queried for performance
                     created_at: row.get(19)?,
                     updated_at: row.get(20)?,
                     completed_at: row.get(21)?,
@@ -2363,5 +2377,4 @@ impl CheckpointDb {
             Err(e) => Err(format!("Failed to get automation record: {}", e)),
         }
     }
-
 }

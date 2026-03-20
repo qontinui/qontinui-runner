@@ -17,48 +17,54 @@ client = UIBridgeClient("https://your-domain.com")
 ### Available Elements
 
 #### Navigation
-| Element ID | Type | Description |
-|------------|------|-------------|
-| `nav-projects` | button | Navigate to projects |
-| `nav-workflows` | button | Navigate to workflows |
-| `nav-runs` | button | Navigate to run history |
-| `nav-settings` | button | Navigate to settings |
+
+| Element ID      | Type   | Description             |
+| --------------- | ------ | ----------------------- |
+| `nav-projects`  | button | Navigate to projects    |
+| `nav-workflows` | button | Navigate to workflows   |
+| `nav-runs`      | button | Navigate to run history |
+| `nav-settings`  | button | Navigate to settings    |
 
 #### Project Management
-| Element ID | Type | Description |
-|------------|------|-------------|
+
+| Element ID                 | Type      | Description          |
+| -------------------------- | --------- | -------------------- |
 | `project-card-{projectId}` | pressable | Project card in list |
-| `project-create-btn` | button | Create new project |
-| `project-edit-btn` | button | Edit current project |
-| `project-delete-btn` | button | Delete project |
+| `project-create-btn`       | button    | Create new project   |
+| `project-edit-btn`         | button    | Edit current project |
+| `project-delete-btn`       | button    | Delete project       |
 
 #### Workflow Builder
-| Element ID | Type | Description |
-|------------|------|-------------|
-| `workflow-canvas` | view | Main workflow canvas |
-| `workflow-save-btn` | button | Save workflow |
-| `workflow-run-btn` | button | Run workflow |
-| `workflow-export-btn` | button | Export workflow |
+
+| Element ID            | Type   | Description          |
+| --------------------- | ------ | -------------------- |
+| `workflow-canvas`     | view   | Main workflow canvas |
+| `workflow-save-btn`   | button | Save workflow        |
+| `workflow-run-btn`    | button | Run workflow         |
+| `workflow-export-btn` | button | Export workflow      |
 
 #### State Explorer
-| Element ID | Type | Description |
-|------------|------|-------------|
-| `state-node-{stateId}` | pressable | State node in explorer |
-| `transition-edge-{transitionId}` | view | Transition between states |
-| `explorer-zoom-in` | button | Zoom in |
-| `explorer-zoom-out` | button | Zoom out |
-| `explorer-fit-view` | button | Fit to view |
+
+| Element ID                       | Type      | Description               |
+| -------------------------------- | --------- | ------------------------- |
+| `state-node-{stateId}`           | pressable | State node in explorer    |
+| `transition-edge-{transitionId}` | view      | Transition between states |
+| `explorer-zoom-in`               | button    | Zoom in                   |
+| `explorer-zoom-out`              | button    | Zoom out                  |
+| `explorer-fit-view`              | button    | Fit to view               |
 
 #### Forms
-| Element ID | Type | Description |
-|------------|------|-------------|
-| `form-{formName}-submit` | button | Submit form |
-| `form-{formName}-cancel` | button | Cancel form |
-| `input-{fieldName}` | input | Form input field |
+
+| Element ID               | Type   | Description      |
+| ------------------------ | ------ | ---------------- |
+| `form-{formName}-submit` | button | Submit form      |
+| `form-{formName}-cancel` | button | Cancel form      |
+| `input-{fieldName}`      | input  | Form input field |
 
 ### Common Automation Patterns
 
 **Create a new project:**
+
 ```python
 client.click("project-create-btn")
 client.type("input-project-name", "My New Project")
@@ -67,6 +73,7 @@ client.click("form-create-project-submit")
 ```
 
 **Navigate to a specific project:**
+
 ```python
 elements = client.get_elements()
 for elem in elements:
@@ -76,6 +83,7 @@ for elem in elements:
 ```
 
 **Run a workflow:**
+
 ```python
 client.click("workflow-run-btn")
 # Wait for run to start
@@ -83,6 +91,7 @@ time.sleep(2)
 ```
 
 **Export workflow configuration:**
+
 ```python
 client.click("workflow-export-btn")
 # Handle file download dialog if needed

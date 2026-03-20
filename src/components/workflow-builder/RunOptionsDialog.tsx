@@ -32,7 +32,8 @@ const ARCHITECTURE_OPTIONS: ArchitectureOption[] = [
   {
     value: "multi_agent_pipeline",
     label: "Multi-Agent Pipeline",
-    description: "DAG-based pipeline with specialized agents (spec analyst → locator → implementer → verifier)",
+    description:
+      "DAG-based pipeline with specialized agents (spec analyst → locator → implementer → verifier)",
   },
 ];
 
@@ -210,9 +211,7 @@ export function RunOptionsDialog({
                     </div>
                     <div
                       className={`w-5 h-5 rounded flex-shrink-0 flex items-center justify-center border ${
-                        isSelected
-                          ? "bg-blue-500 border-blue-500"
-                          : "border-zinc-600 bg-zinc-800"
+                        isSelected ? "bg-blue-500 border-blue-500" : "border-zinc-600 bg-zinc-800"
                       }`}
                     >
                       {isSelected && <Check className="w-3.5 h-3.5 text-white" />}
@@ -256,11 +255,7 @@ export function RunOptionsDialog({
           <Button variant="ghost" onClick={onClose} disabled={isLoading || isLaunching}>
             Cancel
           </Button>
-          <Button
-            variant="primary"
-            onClick={handleRun}
-            disabled={isLoading || isLaunching}
-          >
+          <Button variant="primary" onClick={handleRun} disabled={isLoading || isLaunching}>
             {isLaunching ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />

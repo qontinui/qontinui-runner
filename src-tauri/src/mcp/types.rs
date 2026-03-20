@@ -56,6 +56,8 @@ pub struct ApiState {
     pub action_service: Arc<UnifiedActionService>,
     /// Currently running AI process PIDs (for stopping)
     pub current_ai_pids: Arc<std::sync::Mutex<Vec<u32>>>,
+    /// Server start time for uptime calculation
+    pub started_at: std::time::Instant,
     /// Pending UI Bridge requests waiting for frontend response
     pub ui_bridge_pending:
         Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,

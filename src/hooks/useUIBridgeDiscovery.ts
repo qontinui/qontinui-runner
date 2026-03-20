@@ -254,7 +254,15 @@ export function useUIBridgeDiscovery(
 
       return savedConfigId;
     },
-    [cooccurrenceData, dataSource, configName, discoveryResult, smConfig, showToast, pendingScreenshotSessionId],
+    [
+      cooccurrenceData,
+      dataSource,
+      configName,
+      discoveryResult,
+      smConfig,
+      showToast,
+      pendingScreenshotSessionId,
+    ],
   );
 
   const reset = useCallback(() => {
@@ -329,10 +337,7 @@ async function createStatesForConfig(
 }
 
 /** Save element thumbnails for a config (fire-and-forget). */
-function saveThumbnailsForConfig(
-  configId: string,
-  cooccurrenceData: CooccurrenceExport,
-): void {
+function saveThumbnailsForConfig(configId: string, cooccurrenceData: CooccurrenceExport): void {
   let thumbnails = cooccurrenceData.elementThumbnails;
   if (!thumbnails || Object.keys(thumbnails).length === 0) {
     try {
@@ -432,15 +437,17 @@ async function captureFallbackScreenshot(
 
     await invoke<number>("sm_save_capture_screenshots", {
       configId,
-      screenshots: [{
-        captureIndex: 0,
-        screenshotBase64: ssJson.data.screenshot,
-        width: Math.round(imgW),
-        height: Math.round(imgH),
-        elementBoundsJson: JSON.stringify(boundsMap),
-        fingerprintHashesJson: JSON.stringify([...visibleHashes]),
-        capturedAt: new Date().toISOString(),
-      }],
+      screenshots: [
+        {
+          captureIndex: 0,
+          screenshotBase64: ssJson.data.screenshot,
+          width: Math.round(imgW),
+          height: Math.round(imgH),
+          elementBoundsJson: JSON.stringify(boundsMap),
+          fingerprintHashesJson: JSON.stringify([...visibleHashes]),
+          capturedAt: new Date().toISOString(),
+        },
+      ],
     });
   } catch (err) {
     console.warn("[useUIBridgeDiscovery] Fallback screenshot failed:", err);

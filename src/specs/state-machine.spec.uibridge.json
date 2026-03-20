@@ -2182,7 +2182,11 @@
           "category": "semantic",
           "severity": "critical",
           "assertionType": "semantic",
-          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Active state set" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "Active state set"
+          },
           "expected": "The state machine viewer should support and display multiple co-active states. The screenshot view should show bounding boxes from multiple states simultaneously. State transitions should not force all other states to deactivate.",
           "source": "manual",
           "reviewed": true,
@@ -2194,7 +2198,11 @@
           "category": "semantic",
           "severity": "critical",
           "assertionType": "semantic",
-          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Element-to-state assignment" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "Element-to-state assignment"
+          },
           "expected": "In the graph editor and state view, every element should appear in exactly one state. No element should be listed under multiple states. The discovery algorithm must assign each fingerprint hash to exactly one state.",
           "source": "manual",
           "reviewed": true,
@@ -2206,7 +2214,11 @@
           "category": "semantic",
           "severity": "critical",
           "assertionType": "semantic",
-          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Discovered state element sets" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "Discovered state element sets"
+          },
           "expected": "Discovered states should contain elements that consistently co-occur across captures. Elements that appear on different subsets of screens should be assigned to different states.",
           "source": "manual",
           "reviewed": true,
@@ -2218,7 +2230,11 @@
           "category": "semantic",
           "severity": "critical",
           "assertionType": "semantic",
-          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "State activation logic" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "State activation logic"
+          },
           "expected": "The state machine should not mark a state as inactive simply because one of its elements was not found. State deactivation should only occur through transition execution.",
           "source": "manual",
           "reviewed": true,
@@ -2230,7 +2246,11 @@
           "category": "semantic",
           "severity": "critical",
           "assertionType": "semantic",
-          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Screenshot element bounds" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "Screenshot element bounds"
+          },
           "expected": "In the Screenshot State View, bounding boxes should only outline elements actually visible in the screenshot image. No bounding boxes should float over blank areas or elements not visually present. Bounding box positions must be actual pixel positions from the capture moment, not averaged or estimated positions.",
           "source": "manual",
           "reviewed": true,
@@ -2242,7 +2262,11 @@
           "category": "semantic",
           "severity": "critical",
           "assertionType": "semantic",
-          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Screenshot-to-state matching" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "Screenshot-to-state matching"
+          },
           "expected": "In the Screenshot State View, the screenshots column should only show screenshots where the selected state's elements are present. Multiple states matching the same screenshot is expected (co-active states). States from a different page should show no matching screenshots.",
           "source": "manual",
           "reviewed": true,
@@ -2254,7 +2278,11 @@
           "category": "semantic",
           "severity": "critical",
           "assertionType": "semantic",
-          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Bounding box coordinates" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "Bounding box coordinates"
+          },
           "expected": "Bounding boxes on the screenshot canvas should precisely outline the visual elements they represent. The coordinates in elementBoundsJson should come from the actual element bounds at capture time, not from averaged relativePosition data.",
           "source": "manual",
           "reviewed": true,
@@ -2266,7 +2294,11 @@
           "category": "semantic",
           "severity": "warning",
           "assertionType": "semantic",
-          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Occlusion handling" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "Occlusion handling"
+          },
           "expected": "States marked as blocking should be recognized as modal/overlay states. The graph editor should support the staysVisible transition property for modeling occlusion relationships.",
           "source": "manual",
           "reviewed": true,
@@ -2278,7 +2310,11 @@
           "category": "semantic",
           "severity": "warning",
           "assertionType": "semantic",
-          "target": { "type": "search", "criteria": { "role": "generic" }, "label": "Transition execution model" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "generic" },
+            "label": "Transition execution model"
+          },
           "expected": "Transitions in the graph editor should support multiple activate and exit states. The transition detail panel should allow specifying both activate and exit state sets.",
           "source": "manual",
           "reviewed": true,

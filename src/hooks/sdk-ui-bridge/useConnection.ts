@@ -6,7 +6,7 @@
  */
 
 import { useState, useCallback, useEffect } from "react";
-import type { ConnectionStatus, ExternalElement } from "./types";
+import type { ConnectionStatus } from "./types";
 import type { SdkAppInfo } from "./types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
@@ -96,103 +96,108 @@ export function useConnection(
   // Disconnect
   // =========================================================================
 
-  const disconnect = useCallback(async (url?: string) => {
-    try {
-      await tracedFetch(`${getApiBase()}/ui-bridge/sdk/disconnect`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: url ?? null }),
-      });
-    } catch {
-      // Best-effort disconnect
-    }
-
-    if (url) {
-      // Remove specific connection from map
-      setConnections((prev) => {
-        const next = new Map(prev);
-        next.delete(url.replace(/\/+$/, ""));
-        return next;
-      });
-    } else {
-      // Disconnecting active — remove it from the map too
-      // Fetch updated status to stay in sync
-      setConnections((prev) => {
-        // We don't know which was active on the client side,
-        // so we'll sync from server in the health check
-        return prev;
-      });
-    }
-
-    // Clear UI state (will be repopulated if another connection becomes active)
-    setConnectionStatus("disconnected");
-    setConnectedApp(null);
-    clearElementState();
-    setError(null);
-
-    // Check if other connections remain and sync state
-    try {
-      const statusResp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/status`);
-      const statusJson = await statusResp.json();
-      if (statusJson.success && statusJson.data) {
-        const data = statusJson.data;
-        // Rebuild connections map from server
-        const newConnections = new Map<string, SdkAppInfo>();
-        for (const conn of data.allConnections || []) {
-          newConnections.set(conn.url, conn.app);
-        }
-        setConnections(newConnections);
-
-        if (data.connected && data.app) {
-          setConnectedApp(data.app);
-          setConnectionStatus("connected");
-        }
+  const disconnect = useCallback(
+    async (url?: string) => {
+      try {
+        await tracedFetch(`${getApiBase()}/ui-bridge/sdk/disconnect`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: url ?? null }),
+        });
+      } catch {
+        // Best-effort disconnect
       }
-    } catch {
-      // If status check fails, keep disconnected state
-    }
-  }, [clearElementState]);
+
+      if (url) {
+        // Remove specific connection from map
+        setConnections((prev) => {
+          const next = new Map(prev);
+          next.delete(url.replace(/\/+$/, ""));
+          return next;
+        });
+      } else {
+        // Disconnecting active — remove it from the map too
+        // Fetch updated status to stay in sync
+        setConnections((prev) => {
+          // We don't know which was active on the client side,
+          // so we'll sync from server in the health check
+          return prev;
+        });
+      }
+
+      // Clear UI state (will be repopulated if another connection becomes active)
+      setConnectionStatus("disconnected");
+      setConnectedApp(null);
+      clearElementState();
+      setError(null);
+
+      // Check if other connections remain and sync state
+      try {
+        const statusResp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/status`);
+        const statusJson = await statusResp.json();
+        if (statusJson.success && statusJson.data) {
+          const data = statusJson.data;
+          // Rebuild connections map from server
+          const newConnections = new Map<string, SdkAppInfo>();
+          for (const conn of data.allConnections || []) {
+            newConnections.set(conn.url, conn.app);
+          }
+          setConnections(newConnections);
+
+          if (data.connected && data.app) {
+            setConnectedApp(data.app);
+            setConnectionStatus("connected");
+          }
+        }
+      } catch {
+        // If status check fails, keep disconnected state
+      }
+    },
+    [clearElementState],
+  );
 
   // =========================================================================
   // Switch Connection
   // =========================================================================
 
-  const switchConnection = useCallback(async (url: string): Promise<boolean> => {
-    try {
-      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/switch`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url }),
-      });
+  const switchConnection = useCallback(
+    async (url: string): Promise<boolean> => {
+      try {
+        const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/switch`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url }),
+        });
 
-      const json = await resp.json();
-      if (!json.success) {
-        setError(json.error || "Switch failed");
+        const json = await resp.json();
+        if (!json.success) {
+          setError(json.error || "Switch failed");
+          return false;
+        }
+
+        const data = json.data;
+        setConnectedApp(data.app);
+        setConnectionStatus("connected");
+        setError(null);
+
+        // Clear element-level state since we switched apps
+        clearElementState();
+
+        // Auto-fetch elements for the new active app
+        try {
+          await fetchElements();
+        } catch {
+          // Non-fatal
+        }
+
+        return true;
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Switch failed");
         return false;
       }
-
-      const data = json.data;
-      setConnectedApp(data.app);
-      setConnectionStatus("connected");
-      setError(null);
-
-      // Clear element-level state since we switched apps
-      clearElementState();
-
-      // Auto-fetch elements for the new active app
-      try {
-        await fetchElements();
-      } catch {
-        // Non-fatal
-      }
-
-      return true;
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Switch failed");
-      return false;
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clearElementState]);
+    },
+    [clearElementState, fetchElements],
+  );
 
   // =========================================================================
   // Mount-time hydration — sync from backend if already connected

@@ -146,7 +146,9 @@ pub(super) async fn clear_console_errors() {
 /// Handles both formats:
 /// - Runner control: `{ "success": true, "data": { "errors": [...] } }`
 /// - SDK proxy: `{ "success": true, "data": { "errors": [...] } }` or `{ "errors": [...] }`
-pub(super) fn extract_console_errors_from_response(body: &serde_json::Value) -> Vec<serde_json::Value> {
+pub(super) fn extract_console_errors_from_response(
+    body: &serde_json::Value,
+) -> Vec<serde_json::Value> {
     // Try { "data": { "errors": [...] } } first (control endpoint)
     body.get("data")
         .and_then(|d| d.get("errors"))
@@ -161,7 +163,8 @@ pub(super) fn extract_console_errors_from_response(body: &serde_json::Value) -> 
 ///
 /// This is best-effort — if endpoints aren't available (e.g., headless execution,
 /// no SDK app connected), they silently return empty results.
-pub(super) async fn fetch_console_errors_from_ui_bridge() -> Result<Vec<serde_json::Value>, String> {
+pub(super) async fn fetch_console_errors_from_ui_bridge() -> Result<Vec<serde_json::Value>, String>
+{
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -362,11 +365,7 @@ pub async fn check_environment_readiness(
     let mut issues: Vec<String> = Vec::new();
 
     // ── Check 1: Runner API health ──
-    let runner_ok = match client
-        .get(format!("{}/health", base_url))
-        .send()
-        .await
-    {
+    let runner_ok = match client.get(format!("{}/health", base_url)).send().await {
         Ok(resp) if resp.status().is_success() => true,
         Ok(resp) => {
             issues.push(format!("Runner API returned status {}", resp.status()));
@@ -485,8 +484,9 @@ pub async fn check_environment_readiness(
                         .and_then(|c| c.get("url"))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
+                } else {
+                    None
                 }
-                else { None }
             }
             _ => None,
         };
@@ -506,11 +506,12 @@ pub async fn check_environment_readiness(
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 }
                 Ok(resp) => {
-                    recovery_actions.push(format!(
-                        "SDK reconnect failed (status {})",
+                    recovery_actions
+                        .push(format!("SDK reconnect failed (status {})", resp.status()));
+                    warn!(
+                        "ENV-DOCTOR: SDK reconnect failed with status {}",
                         resp.status()
-                    ));
-                    warn!("ENV-DOCTOR: SDK reconnect failed with status {}", resp.status());
+                    );
                 }
                 Err(e) => {
                     recovery_actions.push(format!("SDK reconnect failed: {}", e));
@@ -874,7 +875,11 @@ pub(super) fn parse_findings_from_response(text: &str) -> Vec<ParsedFinding> {
 }
 
 /// Store parsed findings in the database for a given task run.
-pub(super) fn store_parsed_findings(db: &CheckpointDb, task_run_id: &str, findings: &[ParsedFinding]) {
+pub(super) fn store_parsed_findings(
+    db: &CheckpointDb,
+    task_run_id: &str,
+    findings: &[ParsedFinding],
+) {
     let conn = match db.connection() {
         Ok(c) => c,
         Err(e) => {

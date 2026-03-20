@@ -48,10 +48,7 @@ export function CampaignComparisonView({ comparison, onClose }: Props) {
     <div className="bg-zinc-900 border border-zinc-700 rounded-lg p-4">
       <div className="flex items-center justify-between mb-4">
         <div className="text-sm text-zinc-300 font-medium">Campaign Comparison</div>
-        <button
-          onClick={onClose}
-          className="text-xs text-zinc-500 hover:text-zinc-300 px-2 py-1"
-        >
+        <button onClick={onClose} className="text-xs text-zinc-500 hover:text-zinc-300 px-2 py-1">
           Close
         </button>
       </div>
@@ -60,12 +57,8 @@ export function CampaignComparisonView({ comparison, onClose }: Props) {
         <thead>
           <tr className="text-zinc-500 border-b border-zinc-800">
             <th className="text-left py-2 px-2">Metric</th>
-            <th className="text-right py-2 px-2 max-w-[200px] truncate">
-              {campaign_a.name}
-            </th>
-            <th className="text-right py-2 px-2 max-w-[200px] truncate">
-              {campaign_b.name}
-            </th>
+            <th className="text-right py-2 px-2 max-w-[200px] truncate">{campaign_a.name}</th>
+            <th className="text-right py-2 px-2 max-w-[200px] truncate">{campaign_b.name}</th>
             <th className="text-right py-2 px-2">Delta</th>
           </tr>
         </thead>
@@ -82,29 +75,18 @@ export function CampaignComparisonView({ comparison, onClose }: Props) {
           </tr>
           <tr className="border-b border-zinc-800/50">
             <td className="py-2 px-2 text-zinc-400">Experiments</td>
-            <td className="py-2 px-2 text-right text-zinc-300">
-              {campaign_a.experiment_count}
-            </td>
-            <td className="py-2 px-2 text-right text-zinc-300">
-              {campaign_b.experiment_count}
-            </td>
+            <td className="py-2 px-2 text-right text-zinc-300">{campaign_a.experiment_count}</td>
+            <td className="py-2 px-2 text-right text-zinc-300">{campaign_b.experiment_count}</td>
             <td className="py-2 px-2 text-right text-zinc-500">
               {campaign_b.experiment_count - campaign_a.experiment_count}
             </td>
           </tr>
           <tr className="border-b border-zinc-800/50">
             <td className="py-2 px-2 text-zinc-400">Accepted</td>
-            <td className="py-2 px-2 text-right text-zinc-300">
-              {campaign_a.accepted_count}
-            </td>
-            <td className="py-2 px-2 text-right text-zinc-300">
-              {campaign_b.accepted_count}
-            </td>
+            <td className="py-2 px-2 text-right text-zinc-300">{campaign_a.accepted_count}</td>
+            <td className="py-2 px-2 text-right text-zinc-300">{campaign_b.accepted_count}</td>
             <td className="py-2 px-2 text-right">
-              <DeltaIndicator
-                delta={comparison.accepted_rate_delta * 100}
-                higherIsBetter={true}
-              />
+              <DeltaIndicator delta={comparison.accepted_rate_delta * 100} higherIsBetter={true} />
             </td>
           </tr>
           <tr className="border-b border-zinc-800/50">
@@ -112,10 +94,7 @@ export function CampaignComparisonView({ comparison, onClose }: Props) {
             <td className="py-2 px-2 text-right text-zinc-300">--</td>
             <td className="py-2 px-2 text-right text-zinc-300">--</td>
             <td className="py-2 px-2 text-right">
-              <DeltaIndicator
-                delta={comparison.pass_rate_delta}
-                higherIsBetter={true}
-              />
+              <DeltaIndicator delta={comparison.pass_rate_delta} higherIsBetter={true} />
             </td>
           </tr>
           <tr className="border-b border-zinc-800/50">
@@ -123,20 +102,13 @@ export function CampaignComparisonView({ comparison, onClose }: Props) {
             <td className="py-2 px-2 text-right text-zinc-300">--</td>
             <td className="py-2 px-2 text-right text-zinc-300">--</td>
             <td className="py-2 px-2 text-right">
-              <DeltaIndicator
-                delta={comparison.duration_delta}
-                higherIsBetter={false}
-              />
+              <DeltaIndicator delta={comparison.duration_delta} higherIsBetter={false} />
             </td>
           </tr>
           <tr>
             <td className="py-2 px-2 text-zinc-400">Status</td>
-            <td className="py-2 px-2 text-right text-zinc-300">
-              {campaign_a.status}
-            </td>
-            <td className="py-2 px-2 text-right text-zinc-300">
-              {campaign_b.status}
-            </td>
+            <td className="py-2 px-2 text-right text-zinc-300">{campaign_a.status}</td>
+            <td className="py-2 px-2 text-right text-zinc-300">{campaign_b.status}</td>
             <td className="py-2 px-2 text-right text-zinc-500">--</td>
           </tr>
         </tbody>

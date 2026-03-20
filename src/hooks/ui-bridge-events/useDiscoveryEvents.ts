@@ -108,9 +108,7 @@ export function useDiscoveryEvents(
             page: safeGet(() => navTracker?.getSnapshotPageContext()),
             modalStack: safeGet(() => modalDet?.getSnapshotModalContext()),
             toasts: safeGet(() => toastCap?.getSnapshotToastContext()),
-            relationships: safeGet(() =>
-              relTracker?.getSnapshotRelationshipContext(elementPairs),
-            ),
+            relationships: safeGet(() => relTracker?.getSnapshotRelationshipContext(elementPairs)),
             dragDrop: safeGet(() => dndDetector?.getSnapshotDragDropContext(elementPairs)),
             undoRedo: safeGet(() => undoTracker?.getSnapshotUndoContext()),
             shortcuts: safeGet(() => shortcutTracker?.getSnapshotShortcutContext()),

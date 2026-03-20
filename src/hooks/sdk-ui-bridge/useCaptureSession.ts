@@ -6,11 +6,7 @@
  */
 
 import { useState, useCallback, useRef } from "react";
-import type {
-  CaptureSessionStatus,
-  CooccurrenceExport,
-  CaptureSessionRef,
-} from "./types";
+import type { CaptureSessionStatus, CooccurrenceExport, CaptureSessionRef } from "./types";
 // extractFingerprintHashes is used by useElements (auto-capture) and useStateExploration
 
 /**
@@ -22,7 +18,9 @@ import type {
 let pendingCaptureScreenshots: CooccurrenceExport["captureScreenshots"] | undefined;
 
 /** Retrieve and consume pending capture screenshots saved during exploration. */
-export function consumePendingCaptureScreenshots(): CooccurrenceExport["captureScreenshots"] | undefined {
+export function consumePendingCaptureScreenshots():
+  | CooccurrenceExport["captureScreenshots"]
+  | undefined {
   const data = pendingCaptureScreenshots;
   pendingCaptureScreenshots = undefined;
   return data;
@@ -46,9 +44,7 @@ export interface UseCaptureSessionReturn {
   generateCooccurrenceExport: () => Promise<CooccurrenceExport | null>;
 }
 
-export function useCaptureSession(
-  fetchElements: () => Promise<void>,
-): UseCaptureSessionReturn {
+export function useCaptureSession(fetchElements: () => Promise<void>): UseCaptureSessionReturn {
   const [captureSession, setCaptureSession] = useState<CaptureSessionStatus>({ active: false });
   const captureSessionRef = useRef<CaptureSessionRef | null>(null);
   const [cooccurrenceData, setCooccurrenceData] = useState<CooccurrenceExport | null>(null);

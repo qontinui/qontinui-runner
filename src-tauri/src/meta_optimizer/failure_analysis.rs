@@ -6,8 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::database::CheckpointDb;
 use super::types::WorkflowCategory;
+use crate::database::CheckpointDb;
 use rusqlite::params;
 use tracing::debug;
 
@@ -94,10 +94,13 @@ pub struct RecurringIssue {
 
 // ── Public API ───────────────────────────────────────────────────────────
 
-pub fn get_failure_analysis(db: &CheckpointDb, days: u32, category: WorkflowCategory) -> Result<FailureAnalysis, String> {
+pub fn get_failure_analysis(
+    db: &CheckpointDb,
+    days: u32,
+    category: WorkflowCategory,
+) -> Result<FailureAnalysis, String> {
     db.with_conn(|conn| {
-        let since =
-            (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        let since = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
         debug!(days, %since, "Running failure analysis");
 
         let (total_runs, failed_runs) = query_run_totals(conn, &since, category);
@@ -126,7 +129,11 @@ pub fn get_failure_analysis(db: &CheckpointDb, days: u32, category: WorkflowCate
 
 // ── Private Query Functions ──────────────────────────────────────────────
 
-fn query_run_totals(conn: &rusqlite::Connection, since: &str, category: WorkflowCategory) -> (i64, i64) {
+fn query_run_totals(
+    conn: &rusqlite::Connection,
+    since: &str,
+    category: WorkflowCategory,
+) -> (i64, i64) {
     let filter = category.sql_filter("task_runs");
 
     let total_runs: i64 = conn
@@ -157,14 +164,17 @@ fn query_run_totals(conn: &rusqlite::Connection, since: &str, category: Workflow
     (total_runs, failed_runs)
 }
 
-fn query_abort_reasons(conn: &rusqlite::Connection, since: &str, category: WorkflowCategory) -> Vec<AbortReason> {
+fn query_abort_reasons(
+    conn: &rusqlite::Connection,
+    since: &str,
+    category: WorkflowCategory,
+) -> Vec<AbortReason> {
     let mut reasons: Vec<AbortReason> = Vec::new();
     let filter = category.sql_filter("tr");
 
     // First: learning_outcomes-based reasons
-    if let Ok(mut stmt) = conn.prepare(
-        &format!(
-            "SELECT \
+    if let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT \
                  CASE \
                      WHEN lo.status = 'partial' THEN 'stopped_by_user' \
                      WHEN lo.error_type IS NOT NULL THEN lo.error_type \
@@ -176,9 +186,8 @@ fn query_abort_reasons(conn: &rusqlite::Connection, since: &str, category: Workf
              WHERE lo.status != 'success' AND lo.created_at > ?1{} \
              GROUP BY reason \
              ORDER BY count DESC",
-            filter
-        ),
-    ) {
+        filter
+    )) {
         if let Ok(rows) = stmt.query_map(params![since], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         }) {
@@ -292,17 +301,15 @@ fn query_finding_distribution(
     let mut results = Vec::new();
     let filter = category.sql_filter("tr");
 
-    if let Ok(mut stmt) = conn.prepare(
-        &format!(
-            "SELECT trf.category, COUNT(*) as count \
+    if let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT trf.category, COUNT(*) as count \
              FROM task_run_findings trf \
              JOIN task_runs tr ON trf.task_run_id = tr.id \
              WHERE trf.detected_at > ?1{} \
              GROUP BY trf.category \
              ORDER BY count DESC",
-            filter
-        ),
-    ) {
+        filter
+    )) {
         if let Ok(rows) = stmt.query_map(params![since], |row| {
             Ok(CategoryCount {
                 category: row.get(0).unwrap_or_default(),
@@ -324,9 +331,8 @@ fn query_severity_distribution(
     let mut results = Vec::new();
     let filter = category.sql_filter("tr");
 
-    if let Ok(mut stmt) = conn.prepare(
-        &format!(
-            "SELECT trf.severity, COUNT(*) as count \
+    if let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT trf.severity, COUNT(*) as count \
              FROM task_run_findings trf \
              JOIN task_runs tr ON trf.task_run_id = tr.id \
              WHERE trf.detected_at > ?1{} \
@@ -338,9 +344,8 @@ fn query_severity_distribution(
                  WHEN 'low' THEN 4 \
                  WHEN 'info' THEN 5 \
              END",
-            filter
-        ),
-    ) {
+        filter
+    )) {
         if let Ok(rows) = stmt.query_map(params![since], |row| {
             Ok(CategoryCount {
                 category: row.get(0).unwrap_or_default(),
@@ -398,10 +403,7 @@ fn query_fix_effectiveness(
     results
 }
 
-fn query_generation_quality(
-    conn: &rusqlite::Connection,
-    since: &str,
-) -> GenerationQualityMetrics {
+fn query_generation_quality(conn: &rusqlite::Connection, since: &str) -> GenerationQualityMetrics {
     let mut metrics = GenerationQualityMetrics {
         total_feedback: 0,
         edits: 0,
@@ -484,9 +486,8 @@ fn query_pipeline_agent_failures(
     let mut results = Vec::new();
     let filter = category.sql_filter("tr");
 
-    if let Ok(mut stmt) = conn.prepare(
-        &format!(
-            "SELECT \
+    if let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT \
                  pat.agent_type, \
                  COUNT(*) as total_runs, \
                  SUM(CASE WHEN pat.downstream_success = 0 THEN 1 ELSE 0 END) as failures, \
@@ -497,9 +498,8 @@ fn query_pipeline_agent_failures(
              WHERE pat.created_at > ?1 AND pat.downstream_success IS NOT NULL{} \
              GROUP BY pat.agent_type \
              ORDER BY pat.agent_type",
-            filter
-        ),
-    ) {
+        filter
+    )) {
         if let Ok(rows) = stmt.query_map(params![since], |row| {
             let total_runs: i64 = row.get(1).unwrap_or(0);
             let failures: i64 = row.get(2).unwrap_or(0);
@@ -532,9 +532,8 @@ fn query_recurring_issues(
     let mut results = Vec::new();
     let filter = category.sql_filter("tr");
 
-    if let Ok(mut stmt) = conn.prepare(
-        &format!(
-            "SELECT \
+    if let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT \
                  trf.signature_hash, \
                  trf.title, \
                  trf.category, \
@@ -548,9 +547,8 @@ fn query_recurring_issues(
              HAVING COUNT(*) >= 2 \
              ORDER BY occurrence_count DESC \
              LIMIT 20",
-            filter
-        ),
-    ) {
+        filter
+    )) {
         if let Ok(rows) = stmt.query_map(params![since], |row| {
             Ok(RecurringIssue {
                 signature_hash: row.get(0).unwrap_or_default(),

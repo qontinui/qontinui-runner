@@ -175,9 +175,12 @@ import { OrchestrationLoopPanel } from "./components/orchestration-loop/Orchestr
 import { AutoresearchPage } from "./pages/AutoresearchPage";
 import { MetaOptimizerPage } from "./pages/MetaOptimizerPage";
 import { SpecsPage } from "./pages/specs/SpecsPage";
+import { getAllSpecs } from "./lib/spec-registry";
+import { getGlobalSpecStore } from "@qontinui/ui-bridge/specs";
 import { UIBridgeIntegrationPage } from "./pages/ui-bridge-integration/UIBridgeIntegrationPage";
 import { TerminalPage } from "./components/terminal";
 import { UIBridgeStateMachinePage } from "./pages/state-machine";
+import { ImageQualityTestsPage } from "./pages/ImageQualityTestsPage";
 
 // Development tools
 import { PerformanceOverlay } from "./components/dev";
@@ -277,6 +280,7 @@ type MainTabId =
   | "settings-debug"
   | "settings-updates"
   | "orchestration-loop"
+  | "image-quality-tests"
   | "terminal"
   | "help";
 
@@ -351,6 +355,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "settings-debug",
   "settings-updates",
   "orchestration-loop",
+  "image-quality-tests",
   "terminal",
   "help",
 ];
@@ -548,6 +553,11 @@ function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
         name: "Orchestration Loop",
         section: "tools",
         breadcrumb: ["Tools", "Orchestration Loop"],
+      },
+      "image-quality-tests": {
+        name: "Image Quality Tests",
+        section: "tools",
+        breadcrumb: ["Tools", "Image Quality Tests"],
       },
 
       // OTHER
@@ -1248,6 +1258,13 @@ function AppContent() {
           </div>
         );
 
+      case "image-quality-tests":
+        return (
+          <div className="h-full overflow-hidden">
+            <ImageQualityTestsPage />
+          </div>
+        );
+
       // ========== NEW OBSERVE TABS ==========
       case "run-recap":
         return (
@@ -1927,16 +1944,41 @@ function AppWithTutorials() {
 }
 
 /**
+ * Loads bundled page specs into the global SpecStore on mount so they are
+ * returned by the /control/specs endpoint and IPC get_specs handler.
+ */
+function BundledSpecsLoader() {
+  useEffect(() => {
+    const store = getGlobalSpecStore();
+    const specs = getAllSpecs();
+    for (const spec of specs) {
+      // Cast config to satisfy SpecConfig's literal version type
+      store.load(spec.specId, spec.config as Parameters<typeof store.load>[1]);
+    }
+    return () => {
+      for (const spec of specs) {
+        store.unload(spec.specId);
+      }
+    };
+  }, []);
+  return null;
+}
+
+/**
  * Main App component with providers
  */
 export default function App() {
   return (
-    <UIBridgeProvider features={{ renderLog: true, control: true, debug: true }}>
+    <UIBridgeProvider
+      features={{ renderLog: true, control: true, debug: true }}
+      browserCaptureConfig={{ console: true }}
+    >
       {/* CommandRelayListener removed — the runner uses Tauri IPC via UIBridgeEventHandler
           instead. Having both caused page_refresh commands to trigger window.location.reload(),
           resetting React state and flashing "Checking authentication..." during workflows. */}
       <UIBridgeEventHandler />
       <SpecExecutionHandler />
+      <BundledSpecsLoader />
       {/* AutoRegisterProvider enables automatic UI Bridge element registration */}
       {/* All interactive elements (buttons, inputs, links, etc.) are auto-registered */}
       <AutoRegisterProvider
@@ -1944,6 +1986,7 @@ export default function App() {
         idStrategy="prefer-existing"
         debounceMs={100}
         excludeSelectors={["[data-no-register]"]}
+        contentDiscovery={{ enabled: true, maxContentElements: 200 }}
       >
         <AuthProvider>
           <NavigationProvider>

@@ -80,13 +80,7 @@ function formatCost(cents: number): string {
   return `$${(cents / 100).toFixed(2)}`;
 }
 
-function DeltaIndicator({
-  delta,
-  higherIsBetter,
-}: {
-  delta: number;
-  higherIsBetter: boolean;
-}) {
+function DeltaIndicator({ delta, higherIsBetter }: { delta: number; higherIsBetter: boolean }) {
   if (Math.abs(delta) < 0.001) {
     return <span className="text-zinc-500 text-xs">--</span>;
   }
@@ -118,9 +112,7 @@ function MetricCard({
 }) {
   return (
     <div className="bg-zinc-800 rounded-lg p-4 border border-zinc-700">
-      <div className="text-xs text-zinc-500 uppercase tracking-wide mb-3">
-        {label}
-      </div>
+      <div className="text-xs text-zinc-500 uppercase tracking-wide mb-3">{label}</div>
       <div className="flex items-end justify-between mb-2">
         <div>
           <div className="text-2xl font-semibold text-zinc-100">{current}</div>
@@ -177,17 +169,11 @@ export function ProgressTab() {
   };
 
   if (loading) {
-    return (
-      <div className="p-4 text-zinc-500 text-sm">Loading progress data...</div>
-    );
+    return <div className="p-4 text-zinc-500 text-sm">Loading progress data...</div>;
   }
 
   if (error && !summary) {
-    return (
-      <div className="p-4 text-red-400 text-sm">
-        Failed to load progress: {error}
-      </div>
-    );
+    return <div className="p-4 text-red-400 text-sm">Failed to load progress: {error}</div>;
   }
 
   const hasBaseline = summary?.baseline != null;
@@ -222,13 +208,10 @@ export function ProgressTab() {
         {!hasBaseline ? (
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-zinc-200 font-medium">
-                No baseline captured yet
-              </div>
+              <div className="text-zinc-200 font-medium">No baseline captured yet</div>
               <div className="text-zinc-500 text-sm mt-1">
-                Capture a baseline snapshot to start tracking meta-optimizer
-                impact. This records the current performance metrics from the
-                last 30 days of workflow runs.
+                Capture a baseline snapshot to start tracking meta-optimizer impact. This records
+                the current performance metrics from the last 30 days of workflow runs.
               </div>
             </div>
             <button
@@ -246,8 +229,7 @@ export function ProgressTab() {
               <span className="text-zinc-300">
                 {summary?.snapshots
                   .filter((s) => s.snapshot_type === "baseline")
-                  .map((s) => new Date(s.created_at).toLocaleString())[0] ??
-                  "unknown"}
+                  .map((s) => new Date(s.created_at).toLocaleString())[0] ?? "unknown"}
               </span>
               {" | "}
               {summary?.baseline?.total_runs ?? 0} runs analyzed
@@ -271,7 +253,6 @@ export function ProgressTab() {
             baseline={formatRate(summary.baseline!.success_rate)}
             current={formatRate(summary.current!.success_rate)}
             delta={summary.delta.success_rate_delta * 100}
-
             higherIsBetter={true}
           />
           <MetricCard
@@ -279,7 +260,6 @@ export function ProgressTab() {
             baseline={formatDuration(summary.baseline!.avg_duration_secs)}
             current={formatDuration(summary.current!.avg_duration_secs)}
             delta={summary.delta.duration_delta}
-
             higherIsBetter={false}
           />
           <MetricCard
@@ -287,7 +267,6 @@ export function ProgressTab() {
             baseline={formatIterations(summary.baseline!.avg_iterations)}
             current={formatIterations(summary.current!.avg_iterations)}
             delta={summary.delta.iterations_delta}
-
             higherIsBetter={false}
           />
           <MetricCard
@@ -295,7 +274,6 @@ export function ProgressTab() {
             baseline={formatCost(summary.baseline!.avg_cost_cents)}
             current={formatCost(summary.current!.avg_cost_cents)}
             delta={summary.delta.cost_delta}
-
             higherIsBetter={false}
           />
         </div>
@@ -303,8 +281,8 @@ export function ProgressTab() {
 
       {hasBaseline && !hasCurrent && (
         <div className="text-zinc-500 text-sm py-4 text-center">
-          No current periodic snapshot available. Run some workflows and capture
-          a periodic snapshot to see comparisons.
+          No current periodic snapshot available. Run some workflows and capture a periodic snapshot
+          to see comparisons.
         </div>
       )}
 
@@ -316,9 +294,7 @@ export function ProgressTab() {
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 text-sm">
             <div>
               <span className="text-zinc-500">Success Rate: </span>
-              <span className="text-zinc-200">
-                {formatRate(summary!.current!.success_rate)}
-              </span>
+              <span className="text-zinc-200">{formatRate(summary!.current!.success_rate)}</span>
             </div>
             <div>
               <span className="text-zinc-500">Avg Duration: </span>
@@ -334,9 +310,7 @@ export function ProgressTab() {
             </div>
             <div>
               <span className="text-zinc-500">Avg Cost: </span>
-              <span className="text-zinc-200">
-                {formatCost(summary!.current!.avg_cost_cents)}
-              </span>
+              <span className="text-zinc-200">{formatCost(summary!.current!.avg_cost_cents)}</span>
             </div>
           </div>
         </div>
@@ -345,12 +319,8 @@ export function ProgressTab() {
       {/* C. Applied recommendations count */}
       {summary && summary.applied_recommendations_count > 0 && (
         <div className="bg-zinc-800 rounded-lg px-4 py-3 border border-zinc-700 flex items-center gap-2">
-          <span className="text-zinc-500 text-sm">
-            Applied Recommendations:
-          </span>
-          <span className="text-zinc-200 font-medium">
-            {summary.applied_recommendations_count}
-          </span>
+          <span className="text-zinc-500 text-sm">Applied Recommendations:</span>
+          <span className="text-zinc-200 font-medium">{summary.applied_recommendations_count}</span>
         </div>
       )}
 
@@ -385,10 +355,7 @@ export function ProgressTab() {
               {summary.snapshots.map((snap) => {
                 const metrics = parseMetrics(snap.metrics_json);
                 return (
-                  <tr
-                    key={snap.id}
-                    className="border-b border-zinc-800/50 hover:bg-zinc-800/30"
-                  >
+                  <tr key={snap.id} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
                     <td className="py-2 px-3">
                       <span
                         className={`text-xs px-2 py-0.5 rounded ${SNAPSHOT_TYPE_COLORS[snap.snapshot_type] ?? ""}`}
@@ -399,16 +366,12 @@ export function ProgressTab() {
                     <td className="py-2 px-3 text-zinc-400 text-xs">
                       {formatPeriod(snap.period_start, snap.period_end)}
                     </td>
-                    <td className="py-2 px-3 text-right text-zinc-300">
-                      {snap.runs_included}
-                    </td>
+                    <td className="py-2 px-3 text-right text-zinc-300">{snap.runs_included}</td>
                     <td className="py-2 px-3 text-right text-zinc-300">
                       {metrics ? formatRate(metrics.success_rate) : "--"}
                     </td>
                     <td className="py-2 px-3 text-right text-zinc-300">
-                      {metrics
-                        ? formatDuration(metrics.avg_duration_secs)
-                        : "--"}
+                      {metrics ? formatDuration(metrics.avg_duration_secs) : "--"}
                     </td>
                     <td className="py-2 px-3 text-zinc-500 text-xs">
                       {new Date(snap.created_at).toLocaleString()}
@@ -422,9 +385,7 @@ export function ProgressTab() {
       )}
 
       {summary && summary.snapshots.length === 0 && (
-        <div className="text-zinc-500 text-sm py-4 text-center">
-          No snapshots recorded yet.
-        </div>
+        <div className="text-zinc-500 text-sm py-4 text-center">No snapshots recorded yet.</div>
       )}
 
       {/* Failure Analysis */}
@@ -434,10 +395,7 @@ export function ProgressTab() {
 
       {/* Refresh button */}
       <div className="flex justify-end">
-        <button
-          onClick={load}
-          className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-1"
-        >
+        <button onClick={load} className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-1">
           Refresh
         </button>
       </div>
@@ -502,9 +460,7 @@ function ArchitectureBreakdown({ snapshots }: { snapshots: Snapshot[] }) {
 
   return (
     <div>
-      <div className="text-sm text-zinc-400 mb-2">
-        Per-Architecture Breakdown
-      </div>
+      <div className="text-sm text-zinc-400 mb-2">Per-Architecture Breakdown</div>
       <table className="w-full text-sm">
         <thead>
           <tr className="text-zinc-500 text-xs border-b border-zinc-800">
@@ -516,23 +472,16 @@ function ArchitectureBreakdown({ snapshots }: { snapshots: Snapshot[] }) {
         </thead>
         <tbody>
           {entries.map(({ architecture, data }) => (
-            <tr
-              key={architecture}
-              className="border-b border-zinc-800/50 hover:bg-zinc-800/30"
-            >
+            <tr key={architecture} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
               <td className="py-2 px-3 text-zinc-200">{architecture}</td>
               <td className="py-2 px-3 text-right text-zinc-300">
                 {data.count ?? data.total_runs ?? "--"}
               </td>
               <td className="py-2 px-3 text-right text-zinc-300">
-                {data.success_rate != null
-                  ? `${data.success_rate.toFixed(1)}%`
-                  : "--"}
+                {data.success_rate != null ? `${data.success_rate.toFixed(1)}%` : "--"}
               </td>
               <td className="py-2 px-3 text-right text-zinc-300">
-                {data.avg_duration_secs != null
-                  ? formatDuration(data.avg_duration_secs)
-                  : "--"}
+                {data.avg_duration_secs != null ? formatDuration(data.avg_duration_secs) : "--"}
               </td>
             </tr>
           ))}

@@ -7,6 +7,7 @@ The qontinui-runner executes GUI automation and spawns AI sessions. All relevant
 **Pre-execution steps (GUI automation, screenshots, Playwright tests) run at the START of each new iteration, BEFORE your AI session starts.**
 
 The iteration lifecycle is:
+
 1. **Runner starts new iteration** → Runs all pre-execution steps (clicks, screenshots, tests)
 2. **Runner captures results** → Creates the Iteration Data Bundle
 3. **Runner spawns AI session** → Delivers the bundle to you
@@ -17,6 +18,7 @@ The iteration lifecycle is:
 8. **If verification passes** → System marks task complete
 
 **Key implications:**
+
 - The Pre-Execution Results you see are from steps that ALREADY RAN
 - To get NEW screenshots or automation results, you must END your current iteration
 - You CANNOT re-run pre-execution steps mid-iteration - they only run at iteration start
@@ -71,6 +73,7 @@ When your session starts, the runner provides a complete **Iteration Data Bundle
 ### Getting Fresh Screenshots
 
 If you need new screenshots after making code changes:
+
 1. Complete your current work (make fixes, commit if needed)
 2. Signal `[WORK_COMPLETE]` to trigger verification (which includes fresh pre-execution)
 3. If verification fails, you'll get a new iteration with fresh screenshots and test results
@@ -82,12 +85,12 @@ If you need new screenshots after making code changes:
 
 If you need raw files (rare), they're in `.dev-logs/`:
 
-| File | Contains |
-|------|----------|
-| `runner-general.jsonl` | Executor events |
-| `runner-actions.jsonl` | Action execution |
-| `runner-image-recognition.jsonl` | Template matching |
-| `screenshots/` | Annotated screenshots |
+| File                             | Contains              |
+| -------------------------------- | --------------------- |
+| `runner-general.jsonl`           | Executor events       |
+| `runner-actions.jsonl`           | Action execution      |
+| `runner-image-recognition.jsonl` | Template matching     |
+| `screenshots/`                   | Annotated screenshots |
 
 ### Accessing Data
 
@@ -105,11 +108,13 @@ If you need data NOT in the bundle (rare):
 | `screenshots/*.png` | Annotated screenshots |
 
 **Database (direct file access):**
+
 - Windows: `C:\Users\<USER>\AppData\Roaming\com.qontinui.runner\runner.db`
 - macOS/Linux: `~/.config/com.qontinui.runner/runner.db`
 - Tables: `task_runs` (status, output, findings), `run_details` (execution data)
 
 **MCP tools (if available in your session):**
+
 - `get_task_runs`, `get_task_run`, `read_runner_logs`, `list_screenshots`
 - Note: MCP tools may not be available in all runner-spawned sessions
 

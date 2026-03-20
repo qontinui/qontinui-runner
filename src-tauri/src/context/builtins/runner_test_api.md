@@ -28,6 +28,7 @@ def navigate_to_page(page: str, select_run: int = None) -> dict:
 ### UI Bridge API
 
 **Get All Elements:**
+
 ```python
 def get_elements_by_id() -> dict[str, dict]:
     """Get elements indexed by their ID."""
@@ -40,6 +41,7 @@ def get_elements_by_id() -> dict[str, dict]:
 **IMPORTANT:** Elements are returned as an ARRAY, not a dictionary. Convert to dict by ID.
 
 **Response structure for each element:**
+
 ```json
 {
   "id": "recap-status-banner",
@@ -53,6 +55,7 @@ def get_elements_by_id() -> dict[str, dict]:
 ```
 
 **Click an Element:**
+
 ```python
 def click_element(element_id: str) -> dict:
     response = requests.post(
@@ -129,6 +132,7 @@ def wait_for_element(element_id: str, timeout: float = 10.0) -> bool:
 ### Common Patterns
 
 **Navigate and Select Run:**
+
 ```python
 # 1. Navigate to recap page
 navigate_to_page("run-recap")
@@ -149,6 +153,7 @@ if run_item_id:
 ```
 
 **Verify Page State:**
+
 ```python
 elements = get_elements_by_id()
 assert element_visible(elements, "recap-status-banner"), "Status banner not visible"

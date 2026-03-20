@@ -41,8 +41,7 @@ function successRate(a: AgentAggregate): number {
 
 function SuccessBar({ rate }: { rate: number }) {
   const pct = rate * 100;
-  const color =
-    pct >= 80 ? "bg-green-500" : pct >= 50 ? "bg-amber-500" : "bg-red-500";
+  const color = pct >= 80 ? "bg-green-500" : pct >= 50 ? "bg-amber-500" : "bg-red-500";
   return (
     <div className="flex items-center gap-2">
       <div className="w-24 h-1.5 bg-zinc-700 rounded-full overflow-hidden">
@@ -51,9 +50,7 @@ function SuccessBar({ rate }: { rate: number }) {
           style={{ width: `${Math.min(pct, 100)}%` }}
         />
       </div>
-      <span className="text-xs text-zinc-300 font-mono w-12 text-right">
-        {pct.toFixed(0)}%
-      </span>
+      <span className="text-xs text-zinc-300 font-mono w-12 text-right">{pct.toFixed(0)}%</span>
     </div>
   );
 }
@@ -100,18 +97,13 @@ export function AgentEffectivenessPanel() {
   const totalFailure = sorted.reduce((s, a) => s + a.failure_count, 0);
   const totalCost = sorted.reduce((s, a) => s + a.avg_cost_usd * a.run_count, 0);
   const overallSuccessRate =
-    totalSuccess + totalFailure > 0
-      ? totalSuccess / (totalSuccess + totalFailure)
-      : 0;
+    totalSuccess + totalFailure > 0 ? totalSuccess / (totalSuccess + totalFailure) : 0;
 
   return (
     <div>
       <div className="flex items-center justify-between mb-2">
         <div className="text-sm text-zinc-400">Per-Agent Effectiveness</div>
-        <button
-          onClick={load}
-          className="text-xs text-zinc-500 hover:text-zinc-300"
-        >
+        <button onClick={load} className="text-xs text-zinc-500 hover:text-zinc-300">
           Refresh
         </button>
       </div>
@@ -119,8 +111,7 @@ export function AgentEffectivenessPanel() {
       {/* Summary row */}
       <div className="bg-zinc-800/50 rounded-lg px-4 py-2 mb-3 border border-zinc-700/50 flex items-center gap-6 text-xs text-zinc-400">
         <span>
-          <span className="text-zinc-200 font-medium">{totalRuns}</span> total
-          invocations
+          <span className="text-zinc-200 font-medium">{totalRuns}</span> total invocations
         </span>
         <span>
           Overall success:{" "}
@@ -129,10 +120,7 @@ export function AgentEffectivenessPanel() {
           </span>
         </span>
         <span>
-          Total cost:{" "}
-          <span className="text-zinc-200 font-medium">
-            ${totalCost.toFixed(2)}
-          </span>
+          Total cost: <span className="text-zinc-200 font-medium">${totalCost.toFixed(2)}</span>
         </span>
       </div>
 
@@ -149,12 +137,8 @@ export function AgentEffectivenessPanel() {
               className={`bg-zinc-800 rounded-lg p-3 border border-zinc-700 border-l-2 ${borderColor}`}
             >
               <div className="flex items-center justify-between mb-2">
-                <div className="text-xs font-medium text-zinc-200">
-                  {label}
-                </div>
-                <div className="text-[10px] text-zinc-500">
-                  {a.run_count} runs
-                </div>
+                <div className="text-xs font-medium text-zinc-200">{label}</div>
+                <div className="text-[10px] text-zinc-500">{a.run_count} runs</div>
               </div>
 
               {/* Success rate bar */}

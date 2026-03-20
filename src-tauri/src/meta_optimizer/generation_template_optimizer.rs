@@ -61,7 +61,10 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
         build_api_step(
             "Load optimizer context",
             "GET",
-            &format!("{}/meta-optimizer/optimizer-context?type=generation_template", base_url),
+            &format!(
+                "{}/meta-optimizer/optimizer-context?type=generation_template",
+                base_url
+            ),
             None,
             Some("optimizer_context"),
         ),
@@ -69,10 +72,7 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
         build_api_step(
             "Load generation feedback",
             "GET",
-            &format!(
-                "{}/workflow-generation/feedback?limit=100",
-                base_url
-            ),
+            &format!("{}/workflow-generation/feedback?limit=100", base_url),
             None,
             Some("generation_feedback"),
         ),

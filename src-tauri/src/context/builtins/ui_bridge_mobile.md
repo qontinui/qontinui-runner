@@ -22,8 +22,9 @@ client = UIBridgeClient("http://192.168.1.100:8087")
 ### Available Elements
 
 #### Run Cards
-| Element ID | Type | Description |
-|------------|------|-------------|
+
+| Element ID         | Type      | Description                 |
+| ------------------ | --------- | --------------------------- |
 | `run-card-{runId}` | pressable | Individual run history card |
 
 **Actions:** `click` (navigates to run details)
@@ -31,8 +32,9 @@ client = UIBridgeClient("http://192.168.1.100:8087")
 **State:** `label` contains workflow name and status
 
 #### Finding Cards
-| Element ID | Type | Description |
-|------------|------|-------------|
+
+| Element ID                 | Type      | Description             |
+| -------------------------- | --------- | ----------------------- |
 | `finding-card-{findingId}` | pressable | Individual finding card |
 
 **Actions:** `click` (opens finding details)
@@ -40,15 +42,17 @@ client = UIBridgeClient("http://192.168.1.100:8087")
 **State:** `label` contains finding title and severity
 
 #### Execution Controls
-| Element ID | Type | Description |
-|------------|------|-------------|
-| `execution-stop-btn` | button | Stop running workflow |
-| `execution-resume-btn` | button | Resume paused workflow |
-| `execution-force-btn` | button | Force continue workflow |
+
+| Element ID             | Type   | Description             |
+| ---------------------- | ------ | ----------------------- |
+| `execution-stop-btn`   | button | Stop running workflow   |
+| `execution-resume-btn` | button | Resume paused workflow  |
+| `execution-force-btn`  | button | Force continue workflow |
 
 **Component:** `execution-controls`
 
 **Component Actions:**
+
 - `stop` - Stop the current workflow
 - `resume` - Resume a paused workflow
 - `force-continue` - Force continue past a waiting point
@@ -62,15 +66,17 @@ client.click("execution-stop-btn")
 ```
 
 #### Quick Actions
-| Element ID | Type | Description |
-|------------|------|-------------|
-| `quick-action-rerun-btn` | button | Re-run last workflow |
-| `quick-action-reload-btn` | button | Reload configuration |
+
+| Element ID                 | Type   | Description           |
+| -------------------------- | ------ | --------------------- |
+| `quick-action-rerun-btn`   | button | Re-run last workflow  |
+| `quick-action-reload-btn`  | button | Reload configuration  |
 | `quick-action-monitor-btn` | button | Change target monitor |
 
 **Component:** `quick-actions`
 
 **Component Actions:**
+
 - `rerun-last` - Re-run the last executed workflow
 - `reload-config` - Reload the last loaded configuration
 
@@ -80,8 +86,9 @@ client.execute_component_action("quick-actions", "rerun-last")
 ```
 
 #### Stats Cards (Dashboard)
-| Element ID Pattern | Type | Description |
-|-------------------|------|-------------|
+
+| Element ID Pattern   | Type | Description             |
+| -------------------- | ---- | ----------------------- |
 | `stats-card-{label}` | view | Statistics display card |
 
 **Examples:** `stats-card-total-runs`, `stats-card-success-rate`, `stats-card-active-workflows`
@@ -91,6 +98,7 @@ client.execute_component_action("quick-actions", "rerun-last")
 ### Common Automation Patterns
 
 **Check if a workflow is running:**
+
 ```python
 elements = client.get_elements()
 stop_btn = next((e for e in elements if e.id == "execution-stop-btn"), None)
@@ -98,11 +106,13 @@ is_running = stop_btn is not None and stop_btn.state.visible
 ```
 
 **Stop a running workflow:**
+
 ```python
 client.execute_component_action("execution-controls", "stop")
 ```
 
 **Navigate to a specific run:**
+
 ```python
 # Find the run card by workflow name
 elements = client.get_elements()
@@ -113,11 +123,13 @@ for elem in elements:
 ```
 
 **Re-run the last workflow:**
+
 ```python
 client.execute_component_action("quick-actions", "rerun-last")
 ```
 
 **Wait for workflow completion:**
+
 ```python
 import time
 

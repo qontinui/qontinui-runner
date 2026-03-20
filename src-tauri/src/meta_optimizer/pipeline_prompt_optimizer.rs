@@ -61,7 +61,10 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
         build_api_step(
             "Load optimizer context",
             "GET",
-            &format!("{}/meta-optimizer/optimizer-context?type=pipeline_prompt", base_url),
+            &format!(
+                "{}/meta-optimizer/optimizer-context?type=pipeline_prompt",
+                base_url
+            ),
             None,
             Some("optimizer_context"),
         ),
@@ -69,7 +72,10 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
         build_api_step(
             "Load pipeline agent trace aggregates",
             "GET",
-            &format!("{}/meta-optimizer/agent-trace-aggregates?limit=50", base_url),
+            &format!(
+                "{}/meta-optimizer/agent-trace-aggregates?limit=50",
+                base_url
+            ),
             None,
             Some("agent_trace_aggregates"),
         ),
@@ -77,10 +83,7 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
         build_api_step(
             "Load reflection fixes by agent",
             "GET",
-            &format!(
-                "{}/meta-optimizer/reflection-fixes?limit=100",
-                base_url
-            ),
+            &format!("{}/meta-optimizer/reflection-fixes?limit=100", base_url),
             None,
             Some("reflection_fixes"),
         ),

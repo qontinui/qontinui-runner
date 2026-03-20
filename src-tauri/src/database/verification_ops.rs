@@ -1970,5 +1970,4 @@ impl CheckpointDb {
 
         Ok(())
     }
-
 }

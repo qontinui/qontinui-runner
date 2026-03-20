@@ -235,7 +235,10 @@ export function useStateExploration(
                   // Use only elements from the CURRENT snapshot (mapped), not the
                   // accumulated session.elementBoundsMap which spans all pages.
                   const currentPageHashes = new Set<string>();
-                  const currentPageBounds: Record<string, { x: number; y: number; width: number; height: number }> = {};
+                  const currentPageBounds: Record<
+                    string,
+                    { x: number; y: number; width: number; height: number }
+                  > = {};
                   for (const el of mapped) {
                     if (
                       el.fingerprint?.hash &&
@@ -253,9 +256,10 @@ export function useStateExploration(
                     }
                   }
                   const prevHashes = session.prevCaptureHashes;
-                  const hashesChanged = !prevHashes ||
+                  const hashesChanged =
+                    !prevHashes ||
                     currentPageHashes.size !== prevHashes.size ||
-                    [...currentPageHashes].some(h => !prevHashes.has(h));
+                    [...currentPageHashes].some((h) => !prevHashes.has(h));
                   if (hashesChanged && currentPageHashes.size > 0) {
                     if (!session.captureScreenshots) session.captureScreenshots = [];
                     const screenshotEntry = {
@@ -274,12 +278,18 @@ export function useStateExploration(
                     setPendingCaptureScreenshots([...session.captureScreenshots]);
                     // Save screenshot to DB immediately with a pending config ID
                     // so it survives process restarts and page navigation
-                    import("@tauri-apps/api/core").then(({ invoke }) => {
-                      invoke("sm_save_capture_screenshots", {
-                        configId: `pending-${session.sessionId}`,
-                        screenshots: [screenshotEntry],
-                      }).catch(() => { /* non-fatal */ });
-                    }).catch(() => { /* non-fatal */ });
+                    import("@tauri-apps/api/core")
+                      .then(({ invoke }) => {
+                        invoke("sm_save_capture_screenshots", {
+                          configId: `pending-${session.sessionId}`,
+                          screenshots: [screenshotEntry],
+                        }).catch(() => {
+                          /* non-fatal */
+                        });
+                      })
+                      .catch(() => {
+                        /* non-fatal */
+                      });
                   }
                 }
               }
@@ -546,7 +556,11 @@ export function useStateExploration(
           const { instanceStorage } = await import("@/lib/instance-storage");
           // Strip thumbnails and capture screenshots from the persisted discovery data
           // (they're saved separately to the DB and would make this JSON too large for localStorage)
-          const { elementThumbnails: _thumbs, captureScreenshots: _screenshots, ...resultWithoutThumbs } = result;
+          const {
+            elementThumbnails: _thumbs,
+            captureScreenshots: _screenshots,
+            ...resultWithoutThumbs
+          } = result;
           instanceStorage.setJSON("qontinui-runner-sm-discovery", {
             cooccurrenceData: resultWithoutThumbs,
             dataSource: "explore",
@@ -575,7 +589,16 @@ export function useStateExploration(
       setIsExploring(false);
       setExplorationProgress(null);
     }
-  }, [isExploring, connectedApp, fetchElements, generateCooccurrenceExport, captureSessionRef, setCaptureSession, setElements, setCooccurrenceData]);
+  }, [
+    isExploring,
+    connectedApp,
+    fetchElements,
+    generateCooccurrenceExport,
+    captureSessionRef,
+    setCaptureSession,
+    setElements,
+    setCooccurrenceData,
+  ]);
 
   return {
     isExploring,

@@ -74,11 +74,16 @@ function configSummary(config: ExperimentConfig): string {
 
 function statusColor(status: CampaignStatus["status"]): string {
   switch (status) {
-    case "running": return "text-blue-400";
-    case "completed": return "text-green-400";
-    case "converged": return "text-yellow-400";
-    case "stopped": return "text-gray-400";
-    case "failed": return "text-red-400";
+    case "running":
+      return "text-blue-400";
+    case "completed":
+      return "text-green-400";
+    case "converged":
+      return "text-yellow-400";
+    case "stopped":
+      return "text-gray-400";
+    case "failed":
+      return "text-red-400";
   }
 }
 
@@ -104,18 +109,27 @@ function ConvergenceSparkline({ results }: { results: [number, ExperimentResult]
   return (
     <svg width={width} height={height} className="border border-zinc-700 rounded bg-zinc-900/50">
       {/* Grid line at 50% */}
-      <line x1={padding} y1={height / 2} x2={width - padding} y2={height / 2}
-        stroke="#444" strokeDasharray="2,2" />
+      <line
+        x1={padding}
+        y1={height / 2}
+        x2={width - padding}
+        y2={height / 2}
+        stroke="#444"
+        strokeDasharray="2,2"
+      />
       {/* Line */}
       <path d={pathD} fill="none" stroke="#60a5fa" strokeWidth={1.5} />
       {/* Points */}
       {points.map((p) => (
-        <circle key={p.num} cx={p.x} cy={p.y} r={3}
-          fill={p.accepted ? "#4ade80" : "#f87171"} />
+        <circle key={p.num} cx={p.x} cy={p.y} r={3} fill={p.accepted ? "#4ade80" : "#f87171"} />
       ))}
       {/* Y-axis labels */}
-      <text x={2} y={12} fill="#888" fontSize={9}>100%</text>
-      <text x={2} y={height - 2} fill="#888" fontSize={9}>0%</text>
+      <text x={2} y={12} fill="#888" fontSize={9}>
+        100%
+      </text>
+      <text x={2} y={height - 2} fill="#888" fontSize={9}>
+        0%
+      </text>
     </svg>
   );
 }
@@ -147,20 +161,15 @@ export function AutoresearchDashboard() {
   }, [fetchData]);
 
   if (!status || !status.campaign_id) {
-    return (
-      <div className="text-sm text-zinc-500 p-4">
-        No autoresearch campaign active.
-      </div>
-    );
+    return <div className="text-sm text-zinc-500 p-4">No autoresearch campaign active.</div>;
   }
 
-  const acceptRate = status.experiment_count > 0
-    ? ((status.accepted_count / status.experiment_count) * 100).toFixed(1)
-    : "0.0";
+  const acceptRate =
+    status.experiment_count > 0
+      ? ((status.accepted_count / status.experiment_count) * 100).toFixed(1)
+      : "0.0";
 
-  const selectedResult = selected != null
-    ? results.find(([n]) => n === selected)?.[1]
-    : null;
+  const selectedResult = selected != null ? results.find(([n]) => n === selected)?.[1] : null;
 
   return (
     <div className="flex flex-col gap-3 p-3 text-sm">
@@ -168,13 +177,13 @@ export function AutoresearchDashboard() {
       <div className="flex items-center justify-between">
         <div>
           <span className="font-bold">{status.name}</span>
-          <span className={`ml-2 ${statusColor(status.status)}`}>
-            {status.status}
-          </span>
+          <span className={`ml-2 ${statusColor(status.status)}`}>{status.status}</span>
         </div>
         <div className="flex gap-4 text-xs text-zinc-400">
           <span>Experiments: {status.experiment_count}</span>
-          <span>Accepted: {status.accepted_count} ({acceptRate}%)</span>
+          <span>
+            Accepted: {status.accepted_count} ({acceptRate}%)
+          </span>
           <span>Since last accept: {status.experiments_since_last_accept}</span>
         </div>
       </div>
@@ -223,24 +232,27 @@ export function AutoresearchDashboard() {
                 <td className="px-2 py-1 text-zinc-400">
                   {r.config.workflow_architecture || "traditional"}
                 </td>
-                <td className="px-2 py-1 font-mono truncate max-w-48" title={configSummary(r.config)}>
+                <td
+                  className="px-2 py-1 font-mono truncate max-w-48"
+                  title={configSummary(r.config)}
+                >
                   {configSummary(r.config)}
                 </td>
                 <td className="px-2 py-1 text-center">
                   {(r.aggregate.pass_rate * 100).toFixed(0)}%
                 </td>
-                <td className="px-2 py-1 text-center">
-                  {r.aggregate.mean_iterations.toFixed(1)}
-                </td>
+                <td className="px-2 py-1 text-center">{r.aggregate.mean_iterations.toFixed(1)}</td>
                 <td className="px-2 py-1 text-center">
                   {(r.aggregate.mean_duration_ms / 1000).toFixed(1)}s
                 </td>
                 <td className="px-2 py-1 text-center text-zinc-500">
                   {r.p_value != null ? r.p_value.toFixed(3) : "-"}
                 </td>
-                <td className={`px-2 py-1 text-center font-bold ${
-                  r.accepted ? "text-green-400" : "text-red-400"
-                }`}>
+                <td
+                  className={`px-2 py-1 text-center font-bold ${
+                    r.accepted ? "text-green-400" : "text-red-400"
+                  }`}
+                >
                   {r.accepted ? "ACCEPT" : "reject"}
                 </td>
               </tr>
@@ -285,9 +297,7 @@ export function AutoresearchDashboard() {
                     <span className="text-zinc-500">
                       {t.iterations_used} iter, {(t.duration_ms / 1000).toFixed(1)}s
                     </span>
-                    {t.workflow_id && (
-                      <span className="text-zinc-600">[{t.workflow_id}]</span>
-                    )}
+                    {t.workflow_id && <span className="text-zinc-600">[{t.workflow_id}]</span>}
                   </div>
                 ))}
               </div>

@@ -950,7 +950,10 @@ impl CheckpointDb {
             let acceptance_criteria = if workflow["acceptance_criteria"].is_null() {
                 None
             } else {
-                Some(serde_json::to_string(&workflow["acceptance_criteria"]).unwrap_or_else(|_| "null".to_string()))
+                Some(
+                    serde_json::to_string(&workflow["acceptance_criteria"])
+                        .unwrap_or_else(|_| "null".to_string()),
+                )
             };
 
             let result = conn.execute(

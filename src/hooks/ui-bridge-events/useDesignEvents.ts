@@ -42,8 +42,7 @@ export function useDesignEvents(
               : allElements;
 
             for (const el of filtered) {
-              let domEl: HTMLElement | null =
-                el.element instanceof HTMLElement ? el.element : null;
+              let domEl: HTMLElement | null = el.element instanceof HTMLElement ? el.element : null;
               if (!domEl) {
                 const selector = el.getIdentifier?.()?.selector;
                 if (selector) {
@@ -94,8 +93,7 @@ export function useDesignEvents(
           const styleElement = currentBridge.getElement(styleElementId);
           let styleDomEl: HTMLElement | null = null;
           if (styleElement) {
-            styleDomEl =
-              styleElement.element instanceof HTMLElement ? styleElement.element : null;
+            styleDomEl = styleElement.element instanceof HTMLElement ? styleElement.element : null;
             if (!styleDomEl) {
               const sel = styleElement.getIdentifier?.()?.selector;
               if (sel) {
@@ -152,8 +150,7 @@ export function useDesignEvents(
           const stateElement = currentBridge.getElement(stateElementId);
           let stateDomEl: HTMLElement | null = null;
           if (stateElement) {
-            stateDomEl =
-              stateElement.element instanceof HTMLElement ? stateElement.element : null;
+            stateDomEl = stateElement.element instanceof HTMLElement ? stateElement.element : null;
             if (!stateDomEl) {
               const sel = stateElement.getIdentifier?.()?.selector;
               if (sel) {
@@ -228,8 +225,7 @@ export function useDesignEvents(
               ? auditElements.filter((el) => auditTargetIds.includes(el.id))
               : auditElements;
             for (const el of auditFiltered) {
-              let domEl: HTMLElement | null =
-                el.element instanceof HTMLElement ? el.element : null;
+              let domEl: HTMLElement | null = el.element instanceof HTMLElement ? el.element : null;
               if (!domEl) {
                 const sel = el.getIdentifier?.()?.selector;
                 if (sel) {

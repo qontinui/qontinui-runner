@@ -373,15 +373,9 @@ impl AgenticVerificationResult {
     /// Get a human-readable summary.
     pub fn summary(&self) -> String {
         if self.was_stopped {
-            format!(
-                "STOPPED by user after {} iteration(s)",
-                self.iterations_run
-            )
+            format!("STOPPED by user after {} iteration(s)", self.iterations_run)
         } else if self.goal_achieved {
-            format!(
-                "Goal ACHIEVED after {} iteration(s)",
-                self.iterations_run
-            )
+            format!("Goal ACHIEVED after {} iteration(s)", self.iterations_run)
         } else if self.unreachable {
             format!(
                 "Goal deemed UNREACHABLE after {} iteration(s)",
@@ -403,10 +397,7 @@ pub struct AgenticVerificationPrompts;
 
 impl AgenticVerificationPrompts {
     /// Build the verification agent's system prompt.
-    pub fn verifier_system_prompt(
-        goal: &str,
-        preamble: Option<&str>,
-    ) -> String {
+    pub fn verifier_system_prompt(goal: &str, preamble: Option<&str>) -> String {
         let mut prompt = String::new();
 
         if let Some(pre) = preamble {
@@ -509,7 +500,9 @@ pub fn parse_verification_verdict(output: &str) -> Option<VerificationVerdict> {
     // Try to find JSON block (with or without markdown code fences)
     let json_str = if let Some(start) = output.find("```json") {
         let content_start = start + 7;
-        let end = output[content_start..].find("```").map(|e| content_start + e)?;
+        let end = output[content_start..]
+            .find("```")
+            .map(|e| content_start + e)?;
         &output[content_start..end]
     } else if let Some(start) = output.find("```") {
         let content_start = start + 3;

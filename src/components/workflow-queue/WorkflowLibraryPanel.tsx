@@ -5,7 +5,7 @@
  * Includes search, category filtering, and add-to-queue functionality.
  */
 
-import { Search, Loader2, Inbox, ChevronLeft, Star } from "lucide-react";
+import { Search, Loader2, Inbox, ChevronLeft, Star, RefreshCw } from "lucide-react";
 import type { WorkflowWithStats } from "./types";
 import { WorkflowLibraryCard } from "./WorkflowLibraryCard";
 
@@ -24,6 +24,8 @@ interface WorkflowLibraryPanelProps {
   onToggleFavoritesFilter?: () => void;
   onToggleFavorite?: (workflowId: string) => void;
   hasFavorites?: boolean;
+  onSyncCommands?: () => void;
+  isSyncing?: boolean;
 }
 
 export function WorkflowLibraryPanel({
@@ -41,6 +43,8 @@ export function WorkflowLibraryPanel({
   onToggleFavoritesFilter,
   onToggleFavorite,
   hasFavorites,
+  onSyncCommands,
+  isSyncing,
 }: WorkflowLibraryPanelProps) {
   return (
     <div className="w-full border-r border-white/10 flex flex-col">
@@ -57,16 +61,28 @@ export function WorkflowLibraryPanel({
           </button>
         </div>
 
-        {/* Search */}
-        <div className="relative mb-3">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-          <input
-            type="text"
-            placeholder="Search workflows..."
-            value={search}
-            onChange={(e) => onSearchChange(e.target.value)}
-            className="input pl-9 w-full"
-          />
+        {/* Search + Sync */}
+        <div className="flex gap-2 mb-3">
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <input
+              type="text"
+              placeholder="Search workflows..."
+              value={search}
+              onChange={(e) => onSearchChange(e.target.value)}
+              className="input pl-9 w-full"
+            />
+          </div>
+          {onSyncCommands && (
+            <button
+              onClick={onSyncCommands}
+              disabled={isSyncing}
+              className="p-2 rounded-lg bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 transition-colors flex-shrink-0"
+              title="Sync slash commands from disk"
+            >
+              <RefreshCw className={`w-4 h-4 ${isSyncing ? "animate-spin" : ""}`} />
+            </button>
+          )}
         </div>
 
         {/* Category filter */}
@@ -94,7 +110,11 @@ export function WorkflowLibraryPanel({
                   : "bg-white/5 text-muted-foreground border border-transparent hover:bg-white/10"
               }`}
             >
-              {cat === "all" ? "All" : cat.charAt(0).toUpperCase() + cat.slice(1)}
+              {cat === "all"
+                ? "All"
+                : cat === "slash-command"
+                  ? "Commands"
+                  : cat.charAt(0).toUpperCase() + cat.slice(1)}
             </button>
           ))}
         </div>

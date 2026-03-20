@@ -46,7 +46,9 @@ export function RunHistoryTab() {
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const handleTrigger = async (optimizerType: string) => {
     try {
@@ -77,7 +79,10 @@ export function RunHistoryTab() {
             {triggering === type ? "Launching..." : TYPE_LABELS[type] || type}
           </button>
         ))}
-        <button onClick={load} className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-1 ml-auto">
+        <button
+          onClick={load}
+          className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-1 ml-auto"
+        >
           Refresh
         </button>
       </div>
@@ -110,12 +115,16 @@ export function RunHistoryTab() {
                 </td>
                 <td className="py-2 px-3 text-zinc-400">{run.trigger_type}</td>
                 <td className="py-2 px-3">
-                  <span className={`text-xs px-2 py-0.5 rounded ${STATUS_COLORS[run.status] || ""}`}>
+                  <span
+                    className={`text-xs px-2 py-0.5 rounded ${STATUS_COLORS[run.status] || ""}`}
+                  >
                     {run.status}
                   </span>
                 </td>
                 <td className="py-2 px-3 text-right text-zinc-300">{run.runs_analyzed}</td>
-                <td className="py-2 px-3 text-right text-zinc-300">{run.recommendations_produced}</td>
+                <td className="py-2 px-3 text-right text-zinc-300">
+                  {run.recommendations_produced}
+                </td>
                 <td className="py-2 px-3 text-zinc-500 text-xs">
                   {new Date(run.created_at).toLocaleString()}
                 </td>

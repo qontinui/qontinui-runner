@@ -31,6 +31,10 @@ pub struct UIBridgeActionRequest {
     params: Option<serde_json::Value>,
     #[serde(default)]
     wait_options: Option<serde_json::Value>,
+    /// Capture any extra top-level fields (e.g., targetPosition, text, clear)
+    /// so they can be merged into params for actions that accept flat format.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Request to execute an action on a component
@@ -47,9 +51,9 @@ pub struct UIBridgeComponentActionRequest {
 pub struct UIBridgeDiscoveryRequest {
     #[serde(default)]
     root: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "interactive_only")]
     interactive_only: Option<bool>,
-    #[serde(default)]
+    #[serde(default, alias = "include_hidden")]
     include_hidden: Option<bool>,
     #[serde(default)]
     limit: Option<u32>,
@@ -562,6 +566,40 @@ pub async fn handle_ui_bridge_response(
 // Control Handlers
 // ============================================================================
 
+/// Wrap a UI Bridge IPC result into an API response, propagating inner success/error status.
+///
+/// When the frontend returns `{success: false, error: "..."}` in the IPC data,
+/// this propagates the failure to the outer API envelope instead of wrapping
+/// it in `ApiResponse::success()` (which would create a misleading double-envelope:
+/// `{success: true, data: {success: false, error: "..."}}`).
+fn wrap_ipc_result(
+    result: Result<serde_json::Value, String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match result {
+        Ok(data) => {
+            // Check if the IPC response indicates failure
+            if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
+                let error_msg = data
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Operation failed")
+                    .to_string();
+                Ok(Json(ApiResponse {
+                    success: false,
+                    data: Some(data),
+                    error: Some(error_msg),
+                }))
+            } else {
+                Ok(Json(ApiResponse::success(data)))
+            }
+        }
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// Get all registered UI elements from the React UI Bridge.
 pub async fn ui_bridge_get_elements_handler(
     State(state): State<Arc<ApiState>>,
@@ -584,19 +622,14 @@ pub async fn ui_bridge_get_element_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting element {}", id);
 
-    match ui_bridge_request_sync(
-        &state,
-        "get_element",
-        serde_json::json!({ "elementId": id }),
+    wrap_ipc_result(
+        ui_bridge_request_sync(
+            &state,
+            "get_element",
+            serde_json::json!({ "elementId": id }),
+        )
+        .await,
     )
-    .await
-    {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
 }
 
 /// Execute an action on an element.
@@ -610,22 +643,32 @@ pub async fn ui_bridge_execute_action_handler(
         request.action, id
     );
 
+    // Merge flat top-level fields into params so actions like drag work with
+    // both {"action":"drag","params":{"targetPosition":{...}}} and
+    // {"action":"drag","targetPosition":{...}} formats.
+    let merged_params = if request.extra.is_empty() {
+        request.params
+    } else {
+        let mut base = match request.params {
+            Some(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        for (k, v) in request.extra {
+            base.entry(k).or_insert(v);
+        }
+        Some(serde_json::Value::Object(base))
+    };
+
     let payload = serde_json::json!({
         "elementId": id,
         "action": {
             "action": request.action,
-            "params": request.params,
+            "params": merged_params,
             "waitOptions": request.wait_options
         }
     });
 
-    match ui_bridge_request_sync(&state, "execute_action", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "execute_action", payload).await)
 }
 
 /// Get all registered components.
@@ -682,13 +725,7 @@ pub async fn ui_bridge_execute_component_action_handler(
         "params": request.params
     });
 
-    match ui_bridge_request_sync(&state, "execute_component_action", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+    wrap_ipc_result(ui_bridge_request_sync(&state, "execute_component_action", payload).await)
 }
 
 /// Discover controllable elements in the UI.
@@ -3677,6 +3714,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route(
             "/ui-bridge/control/render-log",
+            get(ui_bridge_get_render_log_handler).post(ui_bridge_append_render_log_handler),
+        )
+        // Render log alias (matches web's /render-log path for cross-app consistency)
+        .route(
+            "/ui-bridge/render-log",
             get(ui_bridge_get_render_log_handler).post(ui_bridge_append_render_log_handler),
         )
         // Diagnostics & health

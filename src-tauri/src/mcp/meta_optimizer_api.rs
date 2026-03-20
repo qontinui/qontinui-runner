@@ -110,19 +110,14 @@ pub async fn get_prompt_variants_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<PromptVariantQuery>,
 ) -> Result<Json<ApiResponse<Vec<PromptVariant>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let variants = prompt_registry::list_variants(
-        &state.app_state.checkpoint_db,
-        query.agent_type.as_deref(),
-    )
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!(
-                "Failed to list prompt variants: {}",
-                e
-            ))),
-        )
-    })?;
+    let variants =
+        prompt_registry::list_variants(&state.app_state.checkpoint_db, query.agent_type.as_deref())
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to list prompt variants: {}", e))),
+                )
+            })?;
 
     Ok(Json(ApiResponse::success(variants)))
 }
@@ -142,10 +137,7 @@ pub async fn get_recommendations_handler(
     .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!(
-                "Failed to list recommendations: {}",
-                e
-            ))),
+            Json(api_error(format!("Failed to list recommendations: {}", e))),
         )
     })?;
 
@@ -158,15 +150,13 @@ pub async fn get_recommendations_handler(
 pub async fn get_optimizer_runs_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<MetaOptimizerRun>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let runs = recommendations::list_optimizer_runs(&state.app_state.checkpoint_db).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!(
-                "Failed to list optimizer runs: {}",
-                e
-            ))),
-        )
-    })?;
+    let runs =
+        recommendations::list_optimizer_runs(&state.app_state.checkpoint_db).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to list optimizer runs: {}", e))),
+            )
+        })?;
 
     Ok(Json(ApiResponse::success(runs)))
 }
@@ -857,7 +847,9 @@ pub async fn get_reflection_fixes_handler(
 
             sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
 
-            let mut stmt = conn.prepare(&sql).map_err(|e| format!("Query error: {}", e))?;
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| format!("Query error: {}", e))?;
             let rows: Vec<serde_json::Value> = stmt
                 .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
                     Ok(serde_json::json!({
@@ -914,10 +906,7 @@ pub async fn reject_recommendation_handler(
     recommendations::reject_recommendation(&state.app_state.checkpoint_db, &id).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!(
-                "Failed to reject recommendation: {}",
-                e
-            ))),
+            Json(api_error(format!("Failed to reject recommendation: {}", e))),
         )
     })?;
     Ok(Json(ApiResponse::success(())))
@@ -952,26 +941,17 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/meta-optimizer/recommendations",
             get(get_recommendations_handler),
         )
-        .route(
-            "/meta-optimizer/runs",
-            get(get_optimizer_runs_handler),
-        )
+        .route("/meta-optimizer/runs", get(get_optimizer_runs_handler))
         .route(
             "/meta-optimizer/optimizer-context",
             get(get_optimizer_context_handler),
         )
-        .route(
-            "/learning/outcomes",
-            get(get_learning_outcomes_handler),
-        )
+        .route("/learning/outcomes", get(get_learning_outcomes_handler))
         .route(
             "/workflow-generation/feedback",
             get(get_generation_feedback_handler),
         )
-        .route(
-            "/prompt-analysis",
-            get(get_prompt_analysis_handler),
-        )
+        .route("/prompt-analysis", get(get_prompt_analysis_handler))
         .route(
             "/autoresearch/campaigns",
             get(get_autoresearch_campaigns_handler),

@@ -648,7 +648,9 @@ impl CanvasPanelManager {
             crate::autoresearch::agentic_verification::VerificationStatus::Pass => "PASS",
             crate::autoresearch::agentic_verification::VerificationStatus::Partial => "PARTIAL",
             crate::autoresearch::agentic_verification::VerificationStatus::Fail => "FAIL",
-            crate::autoresearch::agentic_verification::VerificationStatus::Unreachable => "UNREACHABLE",
+            crate::autoresearch::agentic_verification::VerificationStatus::Unreachable => {
+                "UNREACHABLE"
+            }
         };
 
         // Build iteration digest as Markdown
@@ -666,7 +668,11 @@ impl CanvasPanelManager {
                     "- [{}] {}{}\n",
                     issue.severity,
                     issue.description,
-                    issue.suggestion.as_ref().map(|s| format!(" *({})*", s)).unwrap_or_default(),
+                    issue
+                        .suggestion
+                        .as_ref()
+                        .map(|s| format!(" *({})*", s))
+                        .unwrap_or_default(),
                 ));
             }
         }
@@ -676,10 +682,7 @@ impl CanvasPanelManager {
         }
 
         if let Some(summary) = worker_summary {
-            md.push_str(&format!(
-                "\n**Worker:** {}\n",
-                truncate_str(summary, 300),
-            ));
+            md.push_str(&format!("\n**Worker:** {}\n", truncate_str(summary, 300),));
         }
 
         md.push_str(&format!(
@@ -711,7 +714,9 @@ impl CanvasPanelManager {
         self.brief_phase = Some("agentic-verification".to_string());
         self.brief_activity = Some(format!(
             "Iteration {} — {} ({:.0}%)",
-            iteration, status_indicator, verdict.confidence * 100.0,
+            iteration,
+            status_indicator,
+            verdict.confidence * 100.0,
         ));
         self.emit_mission_brief_update().await;
     }
@@ -802,7 +807,8 @@ impl CanvasPanelManager {
         .await;
 
         // Final tracker update
-        self.on_agentic_verification_tracker(&result.iteration_results).await;
+        self.on_agentic_verification_tracker(&result.iteration_results)
+            .await;
     }
 
     /// Called when the workflow completes (success or failure).

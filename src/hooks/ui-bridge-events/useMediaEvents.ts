@@ -5,9 +5,7 @@ import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
  * Handles: find_media, media_audit, capture_media_snapshot, analyze_media,
  *          capture_element_images, get_element_images
  */
-export function useMediaEvents(
-  context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">,
-) {
+export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">) {
   const { bridgeRef, sendResponse } = context;
 
   return useCallback(

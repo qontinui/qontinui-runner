@@ -115,13 +115,16 @@ impl Default for ConditionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "task_type")]
 pub enum ScheduledTaskType {
-    /// Run a workflow from loaded config
+    /// Run a workflow from loaded config or unified workflow by ID
     Workflow {
         workflow_name: String,
         #[serde(default)]
         config_path: Option<String>,
         #[serde(default)]
         monitor_index: Option<i32>,
+        /// If set, run unified workflow by ID instead of legacy workflow by name
+        #[serde(default)]
+        workflow_id: Option<String>,
     },
     /// Run a prompt from Prompt Library
     Prompt {

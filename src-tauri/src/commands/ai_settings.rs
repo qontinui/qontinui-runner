@@ -902,13 +902,8 @@ async fn probe_account_usage(config_dir: String) -> AccountUsageInfo {
 /// reading the `anthropic-ratelimit-unified-7d-utilization` response header.
 /// This gives the exact weekly utilization for every account.
 #[tauri::command]
-pub async fn check_accounts_usage(
-    config_dirs: Vec<String>,
-) -> Result<CommandResponse, String> {
-    info!(
-        "Checking usage for {} Claude accounts",
-        config_dirs.len()
-    );
+pub async fn check_accounts_usage(config_dirs: Vec<String>) -> Result<CommandResponse, String> {
+    info!("Checking usage for {} Claude accounts", config_dirs.len());
 
     // Probe all accounts concurrently
     let futures: Vec<_> = config_dirs
@@ -952,14 +947,11 @@ pub async fn resolve_active_config_dir() -> Option<String> {
 
             let results = futures::future::join_all(futures).await;
 
-            let best = results
-                .iter()
-                .filter(|r| r.error.is_none())
-                .min_by(|a, b| {
-                    a.utilization
-                        .partial_cmp(&b.utilization)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+            let best = results.iter().filter(|r| r.error.is_none()).min_by(|a, b| {
+                a.utilization
+                    .partial_cmp(&b.utilization)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
             match best {
                 Some(account) => {

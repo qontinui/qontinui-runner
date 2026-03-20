@@ -40,7 +40,9 @@ export function PromptRegistryTab() {
     }
   }, [filterAgent]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const handleActivate = async (variantId: string) => {
     try {
@@ -51,10 +53,13 @@ export function PromptRegistryTab() {
     }
   };
 
-  const grouped = AGENT_TYPES.reduce((acc, agentType) => {
-    acc[agentType] = variants.filter((v) => v.agent_type === agentType);
-    return acc;
-  }, {} as Record<string, PromptVariant[]>);
+  const grouped = AGENT_TYPES.reduce(
+    (acc, agentType) => {
+      acc[agentType] = variants.filter((v) => v.agent_type === agentType);
+      return acc;
+    },
+    {} as Record<string, PromptVariant[]>,
+  );
 
   return (
     <div className="p-4 space-y-4">
@@ -66,7 +71,9 @@ export function PromptRegistryTab() {
         >
           <option value="all">All Agents</option>
           {AGENT_TYPES.map((at) => (
-            <option key={at} value={at}>{at}</option>
+            <option key={at} value={at}>
+              {at}
+            </option>
           ))}
         </select>
         <button onClick={load} className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-1">
@@ -83,79 +90,79 @@ export function PromptRegistryTab() {
         </div>
       ) : (
         <div className="space-y-6">
-          {AGENT_TYPES.filter((at) => filterAgent === "all" || filterAgent === at).map((agentType) => {
-            const agentVariants = grouped[agentType];
-            if (!agentVariants || agentVariants.length === 0) return null;
-            const active = agentVariants.find((v) => v.is_active);
+          {AGENT_TYPES.filter((at) => filterAgent === "all" || filterAgent === at).map(
+            (agentType) => {
+              const agentVariants = grouped[agentType];
+              if (!agentVariants || agentVariants.length === 0) return null;
+              const active = agentVariants.find((v) => v.is_active);
 
-            return (
-              <div key={agentType} className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <h3 className="text-sm font-medium text-zinc-200">{agentType}</h3>
-                  {active && (
-                    <span className="text-xs text-green-400">
-                      Active: {active.variant_name} v{active.version}
-                    </span>
-                  )}
-                  {!active && (
-                    <span className="text-xs text-zinc-500">Using default prompt</span>
-                  )}
-                </div>
-
-                {agentVariants.map((v) => (
-                  <div
-                    key={v.id}
-                    className={`bg-zinc-900 border rounded-lg overflow-hidden ${
-                      v.is_active ? "border-green-800" : "border-zinc-800"
-                    }`}
-                  >
-                    <div
-                      className="flex items-center gap-3 px-4 py-2 cursor-pointer hover:bg-zinc-800/50"
-                      onClick={() => setExpanded(expanded === v.id ? null : v.id)}
-                    >
-                      {v.is_active && (
-                        <span className="text-xs px-2 py-0.5 rounded bg-green-900/30 text-green-400">
-                          active
-                        </span>
-                      )}
-                      <span className="text-sm text-zinc-200">
-                        {v.variant_name} <span className="text-zinc-500">v{v.version}</span>
+              return (
+                <div key={agentType} className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-sm font-medium text-zinc-200">{agentType}</h3>
+                    {active && (
+                      <span className="text-xs text-green-400">
+                        Active: {active.variant_name} v{active.version}
                       </span>
-                      <span className="text-xs text-zinc-600 ml-auto">
-                        {new Date(v.created_at).toLocaleDateString()}
-                      </span>
-                    </div>
-
-                    {expanded === v.id && (
-                      <div className="px-4 pb-4 space-y-3 border-t border-zinc-800">
-                        <pre className="text-xs text-zinc-300 bg-zinc-800/50 p-3 rounded overflow-auto max-h-64 mt-3 whitespace-pre-wrap">
-                          {v.prompt_content}
-                        </pre>
-
-                        {v.performance_metrics && v.performance_metrics !== "{}" && (
-                          <div>
-                            <div className="text-xs text-zinc-500 mb-1">Performance Metrics</div>
-                            <pre className="text-xs text-zinc-400 bg-zinc-800/30 p-2 rounded">
-                              {v.performance_metrics}
-                            </pre>
-                          </div>
-                        )}
-
-                        {!v.is_active && (
-                          <button
-                            onClick={() => handleActivate(v.id)}
-                            className="px-3 py-1 text-xs bg-green-800 text-green-200 rounded hover:bg-green-700"
-                          >
-                            Activate
-                          </button>
-                        )}
-                      </div>
                     )}
+                    {!active && <span className="text-xs text-zinc-500">Using default prompt</span>}
                   </div>
-                ))}
-              </div>
-            );
-          })}
+
+                  {agentVariants.map((v) => (
+                    <div
+                      key={v.id}
+                      className={`bg-zinc-900 border rounded-lg overflow-hidden ${
+                        v.is_active ? "border-green-800" : "border-zinc-800"
+                      }`}
+                    >
+                      <div
+                        className="flex items-center gap-3 px-4 py-2 cursor-pointer hover:bg-zinc-800/50"
+                        onClick={() => setExpanded(expanded === v.id ? null : v.id)}
+                      >
+                        {v.is_active && (
+                          <span className="text-xs px-2 py-0.5 rounded bg-green-900/30 text-green-400">
+                            active
+                          </span>
+                        )}
+                        <span className="text-sm text-zinc-200">
+                          {v.variant_name} <span className="text-zinc-500">v{v.version}</span>
+                        </span>
+                        <span className="text-xs text-zinc-600 ml-auto">
+                          {new Date(v.created_at).toLocaleDateString()}
+                        </span>
+                      </div>
+
+                      {expanded === v.id && (
+                        <div className="px-4 pb-4 space-y-3 border-t border-zinc-800">
+                          <pre className="text-xs text-zinc-300 bg-zinc-800/50 p-3 rounded overflow-auto max-h-64 mt-3 whitespace-pre-wrap">
+                            {v.prompt_content}
+                          </pre>
+
+                          {v.performance_metrics && v.performance_metrics !== "{}" && (
+                            <div>
+                              <div className="text-xs text-zinc-500 mb-1">Performance Metrics</div>
+                              <pre className="text-xs text-zinc-400 bg-zinc-800/30 p-2 rounded">
+                                {v.performance_metrics}
+                              </pre>
+                            </div>
+                          )}
+
+                          {!v.is_active && (
+                            <button
+                              onClick={() => handleActivate(v.id)}
+                              className="px-3 py-1 text-xs bg-green-800 text-green-200 rounded hover:bg-green-700"
+                            >
+                              Activate
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              );
+            },
+          )}
         </div>
       )}
     </div>

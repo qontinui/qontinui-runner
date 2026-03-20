@@ -89,7 +89,9 @@ pub async fn start_comparison(
 
     // Launch runs via local HTTP API in background
     let db = app_state.checkpoint_db.clone();
-    let api_port = app_state.api_port.load(std::sync::atomic::Ordering::Relaxed);
+    let api_port = app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
     let comp_id = comparison_id.clone();
 
     tokio::spawn(async move {
@@ -175,7 +177,16 @@ pub async fn get_comparison_status(
         .map_err(|e| format!("Comparison not found: {}", e))
     })?;
 
-    let (id, workflow_id, variation_type, status, entries_json_str, report, created_at, completed_at) = row;
+    let (
+        id,
+        workflow_id,
+        variation_type,
+        status,
+        entries_json_str,
+        report,
+        created_at,
+        completed_at,
+    ) = row;
 
     let mut entries: Vec<ComparisonEntryJson> =
         serde_json::from_str(&entries_json_str).unwrap_or_default();
@@ -188,21 +199,29 @@ pub async fn get_comparison_status(
                 match task_run.status.as_str() {
                     "complete" => {
                         entry.status = "completed".to_string();
-                        let dur = calculate_duration(&task_run.created_at, task_run.completed_at.as_deref());
-                        entry.result = Some(crate::mcp::comparison_api::ComparisonEntryResultJson {
-                            success: true,
-                            iterations: task_run.sessions_count,
-                            duration_ms: dur,
-                        });
+                        let dur = calculate_duration(
+                            &task_run.created_at,
+                            task_run.completed_at.as_deref(),
+                        );
+                        entry.result =
+                            Some(crate::mcp::comparison_api::ComparisonEntryResultJson {
+                                success: true,
+                                iterations: task_run.sessions_count,
+                                duration_ms: dur,
+                            });
                     }
                     "failed" | "stopped" => {
                         entry.status = "failed".to_string();
-                        let dur = calculate_duration(&task_run.created_at, task_run.completed_at.as_deref());
-                        entry.result = Some(crate::mcp::comparison_api::ComparisonEntryResultJson {
-                            success: false,
-                            iterations: task_run.sessions_count,
-                            duration_ms: dur,
-                        });
+                        let dur = calculate_duration(
+                            &task_run.created_at,
+                            task_run.completed_at.as_deref(),
+                        );
+                        entry.result =
+                            Some(crate::mcp::comparison_api::ComparisonEntryResultJson {
+                                success: false,
+                                iterations: task_run.sessions_count,
+                                duration_ms: dur,
+                            });
                     }
                     _ => {
                         entry.status = "running".to_string();

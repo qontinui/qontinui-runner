@@ -30,7 +30,6 @@ import type {
   CliExecutionMode,
   GeminiAuthMethod,
   AiConnectionTestResult,
-  AccountSelectionMode,
   AccountUsageInfo,
   LogFunction,
 } from "./types";
@@ -248,10 +247,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
   const saveClaudeConfigDirs = useCallback(
     async (dirs: string[]) => {
       try {
-        const result = await invoke<TauriResult<ClaudeConfigDirsData>>(
-          "save_claude_config_dirs",
-          { dirs },
-        );
+        const result = await invoke<TauriResult<ClaudeConfigDirsData>>("save_claude_config_dirs", {
+          dirs,
+        });
         if (result?.success && result.data) {
           setClaudeConfigDirs(result.data.dirs);
           onLog("success", `Saved ${result.data.dirs.length} Claude account directories`);
@@ -861,11 +859,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                 ) : (
                   claudeConfigDirs.map((dir) => {
                     const usage = accountUsages.find((a) => a.config_dir === dir);
-                    const label =
-                      dir
-                        .split(/[\\/]/)
-                        .filter(Boolean)
-                        .pop() || dir;
+                    const label = dir.split(/[\\/]/).filter(Boolean).pop() || dir;
                     const isSelected =
                       settings.claude_cli.account_selection_mode !== "least_usage" &&
                       settings.claude_cli.config_dir === dir;
@@ -956,9 +950,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                             </div>
                           )}
                           {usage?.error && (
-                            <span
-                              className={`text-[10px] ${getAccentColors("red").text} shrink-0`}
-                            >
+                            <span className={`text-[10px] ${getAccentColors("red").text} shrink-0`}>
                               Error
                             </span>
                           )}
@@ -975,8 +967,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                         {/* Expanded usage details */}
                         {usage?.resets_at && !usage.error && (
                           <div className="text-[10px] text-muted-foreground mt-1 ml-6">
-                            Weekly limit resets{" "}
-                            {new Date(usage.resets_at * 1000).toLocaleString()}
+                            Weekly limit resets {new Date(usage.resets_at * 1000).toLocaleString()}
                           </div>
                         )}
                         {usage?.error && (
@@ -1006,9 +997,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   onClick={handleAutoDetectClaudeDirs}
                   disabled={detectingDirs}
                 >
-                  <FolderSearch
-                    className={`w-3 h-3 ${detectingDirs ? "animate-pulse" : ""}`}
-                  />
+                  <FolderSearch className={`w-3 h-3 ${detectingDirs ? "animate-pulse" : ""}`} />
                   {detectingDirs ? "Detecting..." : "Auto-Detect"}
                 </button>
                 {claudeConfigDirs.length > 0 && (
@@ -1017,9 +1006,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     disabled={checkingUsage}
                     className="px-2.5 py-1.5 text-xs rounded-md bg-primary/10 hover:bg-primary/20 text-primary transition-colors flex items-center gap-1.5 disabled:opacity-50"
                   >
-                    <RefreshCw
-                      className={`w-3 h-3 ${checkingUsage ? "animate-spin" : ""}`}
-                    />
+                    <RefreshCw className={`w-3 h-3 ${checkingUsage ? "animate-spin" : ""}`} />
                     {checkingUsage ? "Checking..." : "Check Usage"}
                   </button>
                 )}
@@ -1049,9 +1036,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                       }`}
                     >
                       <div className="text-xs font-medium">Manual</div>
-                      <div className="text-[10px] text-muted-foreground">
-                        Select account above
-                      </div>
+                      <div className="text-[10px] text-muted-foreground">Select account above</div>
                     </button>
                     <button
                       onClick={() =>

@@ -77,10 +77,7 @@ pub fn activate_prompt_variant(
     app_state: State<'_, Arc<AppState>>,
     variant_id: String,
 ) -> Result<(), String> {
-    crate::meta_optimizer::prompt_registry::activate_variant(
-        &app_state.checkpoint_db,
-        &variant_id,
-    )
+    crate::meta_optimizer::prompt_registry::activate_variant(&app_state.checkpoint_db, &variant_id)
 }
 
 // ── Optimizer Runs ─────────────────────────────────────────────────────
@@ -100,10 +97,8 @@ pub fn get_meta_optimizer_progress(
     category: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
-    let summary = crate::meta_optimizer::snapshots::get_progress_summary(
-        &app_state.checkpoint_db,
-        cat,
-    )?;
+    let summary =
+        crate::meta_optimizer::snapshots::get_progress_summary(&app_state.checkpoint_db, cat)?;
     serde_json::to_value(summary).map_err(|e| format!("Serialization error: {}", e))
 }
 
@@ -113,10 +108,8 @@ pub fn capture_meta_optimizer_baseline(
     category: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
-    let snapshot = crate::meta_optimizer::snapshots::capture_baseline(
-        &app_state.checkpoint_db,
-        cat,
-    )?;
+    let snapshot =
+        crate::meta_optimizer::snapshots::capture_baseline(&app_state.checkpoint_db, cat)?;
     serde_json::to_value(snapshot).map_err(|e| format!("Serialization error: {}", e))
 }
 
@@ -175,8 +168,8 @@ pub fn get_recommendation_outcomes(
 
     let mut results = Vec::new();
     for rec in recs {
-        let mut val = serde_json::to_value(&rec)
-            .map_err(|e| format!("Serialization error: {}", e))?;
+        let mut val =
+            serde_json::to_value(&rec).map_err(|e| format!("Serialization error: {}", e))?;
         if let Some(outcome_str) = &rec.outcome_after_apply {
             if let Ok(outcome) = serde_json::from_str::<serde_json::Value>(outcome_str) {
                 val["outcome_parsed"] = outcome;
@@ -259,8 +252,11 @@ pub fn get_canary_rollouts(
 ) -> Result<Vec<serde_json::Value>, String> {
     let rollouts = crate::meta_optimizer::canary::get_active_canaries(&app_state.checkpoint_db)?;
     let recs = crate::meta_optimizer::recommendations::list_recommendations(
-        &app_state.checkpoint_db, None, None,
-    ).unwrap_or_default();
+        &app_state.checkpoint_db,
+        None,
+        None,
+    )
+    .unwrap_or_default();
 
     let values: Vec<serde_json::Value> = rollouts
         .into_iter()

@@ -19,14 +19,14 @@
 //! - `architecture_optimizer` — Workflow builder for Agent 2
 //! - `generation_template_optimizer` — Workflow builder for Agent 3
 
-pub mod types;
-pub mod trigger;
+pub mod architecture_optimizer;
+pub mod canary;
+pub mod failure_analysis;
+pub mod generation_template_optimizer;
+pub mod parser;
+pub mod pipeline_prompt_optimizer;
 pub mod prompt_registry;
 pub mod recommendations;
 pub mod snapshots;
-pub mod parser;
-pub mod pipeline_prompt_optimizer;
-pub mod architecture_optimizer;
-pub mod failure_analysis;
-pub mod generation_template_optimizer;
-pub mod canary;
+pub mod trigger;
+pub mod types;

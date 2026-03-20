@@ -41,9 +41,7 @@ export function AutoresearchPage() {
             }`}
           >
             {t.label}
-            {t.devOnly && (
-              <span className="ml-1 text-[10px] text-yellow-500/70">(dev)</span>
-            )}
+            {t.devOnly && <span className="ml-1 text-[10px] text-yellow-500/70">(dev)</span>}
           </button>
         ))}
       </div>

@@ -4582,10 +4582,7 @@ impl CheckpointDb {
                     .prepare("PRAGMA table_info(unified_workflows)")
                     .and_then(|mut stmt| {
                         stmt.query_map([], |row| row.get::<_, String>(1))
-                            .map(|rows| {
-                                rows.filter_map(|r| r.ok())
-                                    .any(|name| name == *col_name)
-                            })
+                            .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == *col_name))
                     })
                     .unwrap_or(false);
                 if !has_col {
@@ -4641,7 +4638,9 @@ impl CheckpointDb {
 
         // --- Migration 119: Meta-Optimizer tables and is_meta_optimizer column on task_runs ---
         if current_version < 119 {
-            info!("Migrating to version 119 (meta-optimizer tables, task_runs.is_meta_optimizer)...");
+            info!(
+                "Migrating to version 119 (meta-optimizer tables, task_runs.is_meta_optimizer)..."
+            );
 
             conn.execute_batch(
                 r#"
@@ -4790,6 +4789,24 @@ impl CheckpointDb {
             .map_err(|e| format!("Failed to migrate to version 121: {}", e))?;
 
             info!("Successfully migrated to version 121 (canary_rollouts)");
+        }
+
+        // --- Migration 122: Slash command import tracking ---
+        if current_version < 122 {
+            info!("Migrating to version 122 (slash command import tracking)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN source_file_path TEXT DEFAULT NULL;
+                ALTER TABLE unified_workflows ADD COLUMN source_content_hash TEXT DEFAULT NULL;
+                CREATE INDEX IF NOT EXISTS idx_unified_workflows_source_file_path ON unified_workflows(source_file_path);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (122, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 122: {}", e))?;
+
+            info!("Successfully migrated to version 122 (source_file_path, source_content_hash)");
         }
 
         // Repair migration: is_favorite column may be missing on databases created from

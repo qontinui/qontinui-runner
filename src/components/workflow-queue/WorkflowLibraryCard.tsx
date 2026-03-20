@@ -5,7 +5,7 @@
  * Shows workflow name, description, step count, and execution stats.
  */
 
-import { Plus, Check, Clock, AlertCircle, Star } from "lucide-react";
+import { Plus, Check, Clock, AlertCircle, Star, Terminal } from "lucide-react";
 import type { WorkflowWithStats } from "./types";
 import { getTotalStepCount } from "../../types/unified-workflow";
 import { formatDistanceToNow } from "date-fns";
@@ -25,6 +25,8 @@ export function WorkflowLibraryCard({
 }: WorkflowLibraryCardProps) {
   const stepCount = getTotalStepCount(workflow);
   const { stats } = workflow;
+  const isSlashCommand = workflow.category === "slash-command";
+  const requiresArgs = workflow.tags?.includes("requires-arguments");
 
   // Status indicator based on last run
   const getStatusIndicator = () => {
@@ -72,7 +74,13 @@ export function WorkflowLibraryCard({
                 />
               </button>
             )}
+            {isSlashCommand && <Terminal className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />}
             <h3 className="text-body font-medium text-white truncate">{workflow.name}</h3>
+            {requiresArgs && (
+              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                Args
+              </span>
+            )}
           </div>
           {workflow.description && (
             <p className="text-body-sm text-muted-foreground line-clamp-2 mt-1">

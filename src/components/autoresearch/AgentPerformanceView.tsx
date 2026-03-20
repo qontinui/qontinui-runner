@@ -43,18 +43,11 @@ interface VariantAggregate {
   traceCount: number;
 }
 
-function extractAgentTraces(
-  result: ExperimentResult,
-  agentType: AgentType,
-): PipelineAgentTrace[] {
+function extractAgentTraces(result: ExperimentResult, agentType: AgentType): PipelineAgentTrace[] {
   const extra = result.config.extra ?? {};
-  const pipelineResult = extra["pipeline_result"] as
-    | MultiAgentPipelineResult
-    | undefined;
+  const pipelineResult = extra["pipeline_result"] as MultiAgentPipelineResult | undefined;
   if (!pipelineResult?.agent_traces) return [];
-  return pipelineResult.agent_traces.filter(
-    (t) => t.agent_type === agentType,
-  );
+  return pipelineResult.agent_traces.filter((t) => t.agent_type === agentType);
 }
 
 function variantKey(result: ExperimentResult, agentType: AgentType): string {
@@ -130,8 +123,7 @@ function computeVariants(
     }
   }
 
-  const avg = (arr: number[]) =>
-    arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+  const avg = (arr: number[]) => (arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0);
 
   return Array.from(groups.entries())
     .map(([key, g]) => ({
@@ -169,13 +161,7 @@ function paretoFront(variants: VariantAggregate[]): Set<string> {
 
 // ─── Scatter Plot (SVG) ──────────────────────────────────────────────────────
 
-function ScatterPlot({
-  variants,
-  pareto,
-}: {
-  variants: VariantAggregate[];
-  pareto: Set<string>;
-}) {
+function ScatterPlot({ variants, pareto }: { variants: VariantAggregate[]; pareto: Set<string> }) {
   if (variants.length === 0) return null;
 
   const W = 500;
@@ -191,8 +177,7 @@ function ScatterPlot({
   const minRate = Math.max(0, Math.min(...rates) - 0.05);
   const maxRate = Math.min(1, Math.max(...rates) + 0.05);
 
-  const x = (cost: number) =>
-    PAD.left + ((cost - minCost) / (maxCost - minCost || 1)) * plotW;
+  const x = (cost: number) => PAD.left + ((cost - minCost) / (maxCost - minCost || 1)) * plotW;
   const y = (rate: number) =>
     PAD.top + plotH - ((rate - minRate) / (maxRate - minRate || 1)) * plotH;
 
@@ -217,13 +202,7 @@ function ScatterPlot({
         y2={PAD.top + plotH}
         stroke="#52525b"
       />
-      <line
-        x1={PAD.left}
-        y1={PAD.top}
-        x2={PAD.left}
-        y2={PAD.top + plotH}
-        stroke="#52525b"
-      />
+      <line x1={PAD.left} y1={PAD.top} x2={PAD.left} y2={PAD.top + plotH} stroke="#52525b" />
 
       {/* Axis labels */}
       <text
@@ -261,11 +240,7 @@ function ScatterPlot({
             stroke={pareto.has(v.key) ? "#06b6d4" : "#7c3aed"}
             strokeWidth={1.5}
           />
-          <text
-            x={x(v.meanCost) + 8}
-            y={y(v.passRate) + 3}
-            className="fill-zinc-400 text-[9px]"
-          >
+          <text x={x(v.meanCost) + 8} y={y(v.passRate) + 3} className="fill-zinc-400 text-[9px]">
             {v.key.length > 20 ? v.key.slice(0, 20) + "..." : v.key}
           </text>
         </g>
@@ -312,19 +287,13 @@ interface Props {
   historicalResults?: [number, ExperimentResult][];
 }
 
-export function AgentPerformanceView({
-  selectedAgent,
-  live,
-  historicalResults,
-}: Props) {
+export function AgentPerformanceView({ selectedAgent, live, historicalResults }: Props) {
   const [results, setResults] = useState<[number, ExperimentResult][]>([]);
 
   const fetchResults = useCallback(async () => {
     if (historicalResults) return;
     try {
-      const r = await invoke<[number, ExperimentResult][]>(
-        "get_autoresearch_results",
-      );
+      const r = await invoke<[number, ExperimentResult][]>("get_autoresearch_results");
       setResults(r);
     } catch {
       // Campaign may not exist yet
@@ -357,10 +326,8 @@ export function AgentPerformanceView({
   const best = variants[0]; // sorted by passRate desc
   const totalConfigs = variants.length;
   const bestPassRate = best.passRate;
-  const avgCost =
-    variants.reduce((s, v) => s + v.meanCost, 0) / variants.length;
-  const avgDuration =
-    variants.reduce((s, v) => s + v.meanDuration, 0) / variants.length;
+  const avgCost = variants.reduce((s, v) => s + v.meanCost, 0) / variants.length;
+  const avgDuration = variants.reduce((s, v) => s + v.meanDuration, 0) / variants.length;
 
   // Find best values for cell highlighting
   const bestValues = {
@@ -371,20 +338,14 @@ export function AgentPerformanceView({
     quality: Math.max(...variants.filter((v) => v.meanQuality != null).map((v) => v.meanQuality!)),
   };
 
-  function cellHighlight(
-    value: number,
-    best: number,
-    lowerIsBetter = false,
-  ): string {
+  function cellHighlight(value: number, best: number, lowerIsBetter = false): string {
     const isBest = lowerIsBetter ? value <= best : value >= best;
     return isBest ? "text-green-400 font-bold" : "text-zinc-300";
   }
 
   // Pareto recommendation
   const paretoVariants = variants.filter((v) => pareto.has(v.key));
-  const cheapestPareto = paretoVariants.sort(
-    (a, b) => a.meanCost - b.meanCost,
-  )[0];
+  const cheapestPareto = paretoVariants.sort((a, b) => a.meanCost - b.meanCost)[0];
 
   return (
     <div className="p-4 space-y-4">
@@ -458,9 +419,7 @@ export function AgentPerformanceView({
                 <td className="px-3 py-1.5 text-center text-zinc-400">
                   {v.meanQuality != null ? v.meanQuality.toFixed(2) : "N/A"}
                 </td>
-                <td className="px-3 py-1.5 text-center text-zinc-500">
-                  {v.experimentCount}
-                </td>
+                <td className="px-3 py-1.5 text-center text-zinc-500">{v.experimentCount}</td>
               </tr>
             ))}
           </tbody>
@@ -469,35 +428,24 @@ export function AgentPerformanceView({
 
       {/* Scatter Plot */}
       <div className="border border-zinc-700 rounded-lg p-3">
-        <div className="text-xs font-medium text-zinc-300 mb-2">
-          Cost vs Pass Rate
-        </div>
+        <div className="text-xs font-medium text-zinc-300 mb-2">Cost vs Pass Rate</div>
         <ScatterPlot variants={variants} pareto={pareto} />
       </div>
 
       {/* Recommendation */}
       <div className="border border-zinc-700 rounded-lg p-4 bg-zinc-800/30">
-        <div className="text-sm font-bold text-zinc-200 mb-1">
-          Recommendation
-        </div>
+        <div className="text-sm font-bold text-zinc-200 mb-1">Recommendation</div>
         <div className="text-sm text-zinc-300">
-          <span className="text-green-400 font-bold">{best.key}</span> achieves
-          highest pass rate at{" "}
-          <span className="font-mono">
-            {(best.passRate * 100).toFixed(1)}%
-          </span>{" "}
-          / ${best.meanCost.toFixed(4)} per call.
+          <span className="text-green-400 font-bold">{best.key}</span> achieves highest pass rate at{" "}
+          <span className="font-mono">{(best.passRate * 100).toFixed(1)}%</span> / $
+          {best.meanCost.toFixed(4)} per call.
           {cheapestPareto && cheapestPareto.key !== best.key && (
             <>
               {" "}
-              <span className="text-cyan-400 font-bold">
-                {cheapestPareto.key}
-              </span>{" "}
-              is Pareto-optimal at{" "}
-              <span className="font-mono">
-                {(cheapestPareto.passRate * 100).toFixed(1)}%
-              </span>{" "}
-              pass / ${cheapestPareto.meanCost.toFixed(4)}.
+              <span className="text-cyan-400 font-bold">{cheapestPareto.key}</span> is
+              Pareto-optimal at{" "}
+              <span className="font-mono">{(cheapestPareto.passRate * 100).toFixed(1)}%</span> pass
+              / ${cheapestPareto.meanCost.toFixed(4)}.
             </>
           )}
         </div>

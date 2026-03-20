@@ -1578,5 +1578,4 @@ impl CheckpointDb {
 
         self.create_saved_api_request(&create_request)
     }
-
 }

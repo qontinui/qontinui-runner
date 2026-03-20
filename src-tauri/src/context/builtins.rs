@@ -93,7 +93,12 @@ This project is in active development. Backward compatibility is NOT a priority.
             name: "Runner Architecture & Logs".to_string(),
             content: include_str!("builtins/runner_architecture.md").to_string(),
             category: Some("architecture".to_string()),
-            tags: vec!["runner".to_string(), "logs".to_string(), "debugging".to_string(), "architecture".to_string()],
+            tags: vec![
+                "runner".to_string(),
+                "logs".to_string(),
+                "debugging".to_string(),
+                "architecture".to_string(),
+            ],
             auto_include: Some(ContextAutoInclude {
                 task_mentions: Some(vec![
                     "runner".to_string(),
@@ -118,7 +123,11 @@ This project is in active development. Backward compatibility is NOT a priority.
             name: "Multi-Step Task Guide".to_string(),
             content: include_str!("builtins/multi_step_guide.md").to_string(),
             category: Some("workflow".to_string()),
-            tags: vec!["multi-step".to_string(), "workflow".to_string(), "runner".to_string()],
+            tags: vec![
+                "multi-step".to_string(),
+                "workflow".to_string(),
+                "runner".to_string(),
+            ],
             auto_include: None, // Always injected for runner-triggered sessions
             created_at: now.clone(),
             modified_at: now.clone(),
@@ -128,7 +137,12 @@ This project is in active development. Backward compatibility is NOT a priority.
             name: "Input Validation Guide".to_string(),
             content: include_str!("builtins/input_validation.md").to_string(),
             category: Some("debugging".to_string()),
-            tags: vec!["debugging".to_string(), "input".to_string(), "coordinates".to_string(), "multi-monitor".to_string()],
+            tags: vec![
+                "debugging".to_string(),
+                "input".to_string(),
+                "coordinates".to_string(),
+                "multi-monitor".to_string(),
+            ],
             auto_include: None, // Explicitly added when "Capture Input for Validation" is enabled
             created_at: now.clone(),
             modified_at: now.clone(),
@@ -138,7 +152,12 @@ This project is in active development. Backward compatibility is NOT a priority.
             name: "Runner Test API Reference".to_string(),
             content: include_str!("builtins/runner_test_api.md").to_string(),
             category: Some("testing".to_string()),
-            tags: vec!["testing".to_string(), "api".to_string(), "ui-bridge".to_string(), "python".to_string()],
+            tags: vec![
+                "testing".to_string(),
+                "api".to_string(),
+                "ui-bridge".to_string(),
+                "python".to_string(),
+            ],
             auto_include: Some(ContextAutoInclude {
                 task_mentions: Some(vec![
                     "test".to_string(),
@@ -158,7 +177,12 @@ This project is in active development. Backward compatibility is NOT a priority.
             name: "UI Bridge Control - Core API".to_string(),
             content: include_str!("builtins/ui_bridge_core.md").to_string(),
             category: Some("ui-bridge".to_string()),
-            tags: vec!["ui-bridge".to_string(), "automation".to_string(), "api".to_string(), "control".to_string()],
+            tags: vec![
+                "ui-bridge".to_string(),
+                "automation".to_string(),
+                "api".to_string(),
+                "control".to_string(),
+            ],
             auto_include: Some(ContextAutoInclude {
                 task_mentions: Some(vec![
                     "ui-bridge".to_string(),
@@ -179,7 +203,12 @@ This project is in active development. Backward compatibility is NOT a priority.
             name: "UI Bridge Control - qontinui-mobile".to_string(),
             content: include_str!("builtins/ui_bridge_mobile.md").to_string(),
             category: Some("ui-bridge".to_string()),
-            tags: vec!["ui-bridge".to_string(), "mobile".to_string(), "qontinui-mobile".to_string(), "react-native".to_string()],
+            tags: vec![
+                "ui-bridge".to_string(),
+                "mobile".to_string(),
+                "qontinui-mobile".to_string(),
+                "react-native".to_string(),
+            ],
             auto_include: Some(ContextAutoInclude {
                 task_mentions: Some(vec![
                     "qontinui-mobile".to_string(),
@@ -188,9 +217,7 @@ This project is in active development. Backward compatibility is NOT a priority.
                     "android".to_string(),
                     "ios".to_string(),
                 ]),
-                file_patterns: Some(vec![
-                    "**/qontinui-mobile/**".to_string(),
-                ]),
+                file_patterns: Some(vec!["**/qontinui-mobile/**".to_string()]),
                 ..Default::default()
             }),
             created_at: now.clone(),
@@ -201,7 +228,12 @@ This project is in active development. Backward compatibility is NOT a priority.
             name: "UI Bridge Control - qontinui-web".to_string(),
             content: include_str!("builtins/ui_bridge_web.md").to_string(),
             category: Some("ui-bridge".to_string()),
-            tags: vec!["ui-bridge".to_string(), "web".to_string(), "qontinui-web".to_string(), "next.js".to_string()],
+            tags: vec![
+                "ui-bridge".to_string(),
+                "web".to_string(),
+                "qontinui-web".to_string(),
+                "next.js".to_string(),
+            ],
             auto_include: Some(ContextAutoInclude {
                 task_mentions: Some(vec![
                     "qontinui-web".to_string(),
@@ -209,9 +241,7 @@ This project is in active development. Backward compatibility is NOT a priority.
                     "next.js".to_string(),
                     "frontend".to_string(),
                 ]),
-                file_patterns: Some(vec![
-                    "**/qontinui-web/**".to_string(),
-                ]),
+                file_patterns: Some(vec!["**/qontinui-web/**".to_string()]),
                 ..Default::default()
             }),
             created_at: now.clone(),
@@ -222,7 +252,11 @@ This project is in active development. Backward compatibility is NOT a priority.
             name: "UI Bridge Control - Custom App Template".to_string(),
             content: include_str!("builtins/ui_bridge_custom.md").to_string(),
             category: Some("ui-bridge".to_string()),
-            tags: vec!["ui-bridge".to_string(), "template".to_string(), "custom".to_string()],
+            tags: vec![
+                "ui-bridge".to_string(),
+                "template".to_string(),
+                "custom".to_string(),
+            ],
             auto_include: None, // Manual inclusion only
             created_at: now.clone(),
             modified_at: now.clone(),
@@ -232,7 +266,13 @@ This project is in active development. Backward compatibility is NOT a priority.
             name: "Shell Command Step Schema".to_string(),
             content: include_str!("builtins/shell_command_schema.md").to_string(),
             category: Some("workflow-generation".to_string()),
-            tags: vec!["shell".to_string(), "command".to_string(), "schema".to_string(), "workflow".to_string(), "step-type".to_string()],
+            tags: vec![
+                "shell".to_string(),
+                "command".to_string(),
+                "schema".to_string(),
+                "workflow".to_string(),
+                "step-type".to_string(),
+            ],
             auto_include: Some(ContextAutoInclude {
                 task_mentions: Some(vec![
                     "shell".to_string(),
@@ -253,7 +293,11 @@ This project is in active development. Backward compatibility is NOT a priority.
             name: "Service Restart Commands".to_string(),
             content: include_str!("builtins/service_restart.md").to_string(),
             category: Some("development".to_string()),
-            tags: vec!["restart".to_string(), "services".to_string(), "development".to_string()],
+            tags: vec![
+                "restart".to_string(),
+                "services".to_string(),
+                "development".to_string(),
+            ],
             auto_include: Some(ContextAutoInclude {
                 task_mentions: Some(vec![
                     "restart".to_string(),

@@ -43,10 +43,7 @@ export function useScreenshot(): UseScreenshotReturn {
         console.warn("[useScreenshot] Screenshot capture failed:", json.error || "Unknown error");
       }
     } catch (e) {
-      console.warn(
-        "[useScreenshot] Screenshot capture error:",
-        e instanceof Error ? e.message : e,
-      );
+      console.warn("[useScreenshot] Screenshot capture error:", e instanceof Error ? e.message : e);
     } finally {
       setIsCapturingScreenshot(false);
     }

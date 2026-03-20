@@ -515,16 +515,7 @@ mod tests {
             2,
             "2020-01-01T00:00:00Z",
         );
-        insert_convergence_snapshot(
-            &conn,
-            "test-wf",
-            0.8,
-            0.9,
-            0.5,
-            15,
-            13,
-            &recent,
-        );
+        insert_convergence_snapshot(&conn, "test-wf", 0.8, 0.9, 0.5, 15, 13, &recent);
 
         let trends = get_workflow_trends(&conn, "test-wf", Some("7d")).unwrap();
         // Only the recent snapshot should pass the filter
@@ -548,16 +539,7 @@ mod tests {
             2,
             "2020-01-01T00:00:00Z",
         );
-        insert_convergence_snapshot(
-            &conn,
-            "test-wf",
-            0.8,
-            0.9,
-            0.5,
-            15,
-            13,
-            &recent,
-        );
+        insert_convergence_snapshot(&conn, "test-wf", 0.8, 0.9, 0.5, 15, 13, &recent);
 
         let trends = get_workflow_trends(&conn, "test-wf", Some("all")).unwrap();
         assert_eq!(trends.snapshot_count, 2);

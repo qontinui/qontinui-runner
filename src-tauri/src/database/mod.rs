@@ -109,13 +109,18 @@ impl CheckpointDb {
     /// Set the runner port for instance-level task_run filtering.
     /// Called after the HTTP server binds to its port.
     pub fn set_runner_port(&self, port: u16) {
-        self.runner_port.store(port, std::sync::atomic::Ordering::Relaxed);
+        self.runner_port
+            .store(port, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get the runner port (0 means unset).
     pub fn get_runner_port(&self) -> Option<u16> {
         let port = self.runner_port.load(std::sync::atomic::Ordering::Relaxed);
-        if port == 0 { None } else { Some(port) }
+        if port == 0 {
+            None
+        } else {
+            Some(port)
+        }
     }
 
     /// Create an in-memory database for testing or no-op logging.
@@ -447,7 +452,6 @@ impl CheckpointDb {
 
         Ok(rows.join("\n"))
     }
-
 
     // ========================================================================
     // Checkpoint/Workflow Operations
@@ -830,7 +834,6 @@ impl CheckpointDb {
 
         Ok(events)
     }
-
 
     // ========================================================================
     // Settings Operations
@@ -1330,7 +1333,6 @@ impl CheckpointDb {
         let conn = self.get_conn()?;
         crate::findings::storage::format_findings_for_continuation_prompt(&conn, task_run_id)
     }
-
 
     // ========================================================================
     // Hybrid Logging Operations (Phase 10)
@@ -6402,17 +6404,13 @@ impl CheckpointDb {
     }
 }
 
-
 // =============================================================================
 // Worktree CRUD operations
 // =============================================================================
 
 impl CheckpointDb {
     /// Insert a worktree record.
-    pub fn insert_worktree(
-        &self,
-        record: &crate::worktree::WorktreeRecord,
-    ) -> Result<(), String> {
+    pub fn insert_worktree(&self, record: &crate::worktree::WorktreeRecord) -> Result<(), String> {
         let conn = self.pool.get().map_err(|e| e.to_string())?;
         conn.execute(
             r#"INSERT INTO worktrees (id, worktree_path, branch_name, source_branch, source_commit, repo_path, task_run_id, workflow_name, status, created_at, updated_at)
@@ -6457,7 +6455,8 @@ impl CheckpointDb {
     ) -> Result<Vec<crate::worktree::WorktreeRecord>, String> {
         let conn = self.pool.get().map_err(|e| e.to_string())?;
 
-        let (query, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(s) = status {
+        let (query, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(s) = status
+        {
             (
                 "SELECT id, worktree_path, branch_name, source_branch, source_commit, repo_path, task_run_id, workflow_name, status, created_at, updated_at FROM worktrees WHERE status = ?1 ORDER BY created_at DESC",
                 vec![Box::new(s.to_string())],
@@ -6470,7 +6469,8 @@ impl CheckpointDb {
         };
 
         let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let rows = stmt
             .query_map(params_refs.as_slice(), |row| {
                 Ok(crate::worktree::WorktreeRecord {
@@ -6482,9 +6482,7 @@ impl CheckpointDb {
                     repo_path: row.get(5)?,
                     task_run_id: row.get(6)?,
                     workflow_name: row.get(7)?,
-                    status: crate::worktree::WorktreeStatus::from_str(
-                        &row.get::<_, String>(8)?,
-                    ),
+                    status: crate::worktree::WorktreeStatus::from_str(&row.get::<_, String>(8)?),
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
                 })
@@ -6499,7 +6497,10 @@ impl CheckpointDb {
     }
 
     /// Get a single worktree by ID.
-    pub fn get_worktree(&self, id: &str) -> Result<Option<crate::worktree::WorktreeRecord>, String> {
+    pub fn get_worktree(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::worktree::WorktreeRecord>, String> {
         let conn = self.pool.get().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
@@ -6518,9 +6519,7 @@ impl CheckpointDb {
                     repo_path: row.get(5)?,
                     task_run_id: row.get(6)?,
                     workflow_name: row.get(7)?,
-                    status: crate::worktree::WorktreeStatus::from_str(
-                        &row.get::<_, String>(8)?,
-                    ),
+                    status: crate::worktree::WorktreeStatus::from_str(&row.get::<_, String>(8)?),
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
                 })

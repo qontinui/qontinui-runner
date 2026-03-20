@@ -24,7 +24,12 @@ interface CampaignSummary {
 interface ExperimentResult {
   config: { extra: Record<string, unknown>; multi_agent_pipeline_config?: Record<string, unknown> };
   trials: Array<{ task_run_id: string; passed: boolean; duration_ms: number }>;
-  aggregate: { pass_rate: number; mean_iterations: number; mean_duration_ms: number; trial_count: number };
+  aggregate: {
+    pass_rate: number;
+    mean_iterations: number;
+    mean_duration_ms: number;
+    trial_count: number;
+  };
   accepted: boolean;
   reason: string;
   p_value?: number;
@@ -57,10 +62,9 @@ export function AgentCampaignHistory({ selectedAgent, onSelectCampaign }: Props)
 
   const fetchCampaigns = useCallback(async () => {
     try {
-      const all = await invoke<CampaignSummary[]>(
-        "get_autoresearch_campaign_history",
-        { filter: `[per-agent:${selectedAgent}` },
-      );
+      const all = await invoke<CampaignSummary[]>("get_autoresearch_campaign_history", {
+        filter: `[per-agent:${selectedAgent}`,
+      });
       setCampaigns(all);
     } catch {
       // DB may not be available
@@ -126,7 +130,11 @@ export function AgentCampaignHistory({ selectedAgent, onSelectCampaign }: Props)
       {/* Controls */}
       <div className="flex gap-2 items-center">
         <button
-          onClick={() => { setCompareMode(!compareMode); setCompareSelection([]); setComparison(null); }}
+          onClick={() => {
+            setCompareMode(!compareMode);
+            setCompareSelection([]);
+            setComparison(null);
+          }}
           className={`text-xs px-2 py-1 rounded border ${
             compareMode
               ? "border-blue-600 bg-blue-900/30 text-blue-300"
@@ -152,7 +160,11 @@ export function AgentCampaignHistory({ selectedAgent, onSelectCampaign }: Props)
       {comparison && (
         <CampaignComparisonView
           comparison={comparison}
-          onClose={() => { setComparison(null); setCompareSelection([]); setCompareMode(false); }}
+          onClose={() => {
+            setComparison(null);
+            setCompareSelection([]);
+            setCompareMode(false);
+          }}
         />
       )}
 
@@ -228,12 +240,8 @@ export function AgentCampaignHistory({ selectedAgent, onSelectCampaign }: Props)
                       {c.status}
                     </span>
                   </td>
-                  <td className="px-3 py-1.5 text-center text-zinc-300">
-                    {c.experiment_count}
-                  </td>
-                  <td className="px-3 py-1.5 text-center text-zinc-300">
-                    {c.accepted_count}
-                  </td>
+                  <td className="px-3 py-1.5 text-center text-zinc-300">{c.experiment_count}</td>
+                  <td className="px-3 py-1.5 text-center text-zinc-300">{c.accepted_count}</td>
                   <td className="px-3 py-1.5 text-center">
                     <button
                       onClick={(e) => handleRerun(c.id, e)}

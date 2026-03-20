@@ -158,21 +158,22 @@ except UIBridgeError as e:
 
 If not using the Python client:
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/ui-bridge/control/elements` | List all elements |
-| GET | `/ui-bridge/control/element/:id` | Get element details |
-| GET | `/ui-bridge/control/element/:id/state` | Get element state |
-| POST | `/ui-bridge/control/element/:id/action` | Execute action |
-| GET | `/ui-bridge/control/components` | List all components |
-| POST | `/ui-bridge/control/component/:id/action/:actionId` | Execute component action |
-| POST | `/ui-bridge/control/find` | Find elements |
-| GET | `/ui-bridge/control/snapshot` | Get UI snapshot |
-| GET | `/health` | Health check |
+| Method | Endpoint                                            | Description              |
+| ------ | --------------------------------------------------- | ------------------------ |
+| GET    | `/ui-bridge/control/elements`                       | List all elements        |
+| GET    | `/ui-bridge/control/element/:id`                    | Get element details      |
+| GET    | `/ui-bridge/control/element/:id/state`              | Get element state        |
+| POST   | `/ui-bridge/control/element/:id/action`             | Execute action           |
+| GET    | `/ui-bridge/control/components`                     | List all components      |
+| POST   | `/ui-bridge/control/component/:id/action/:actionId` | Execute component action |
+| POST   | `/ui-bridge/control/find`                           | Find elements            |
+| GET    | `/ui-bridge/control/snapshot`                       | Get UI snapshot          |
+| GET    | `/health`                                           | Health check             |
 
 ### Common Patterns
 
 **Wait for element to appear:**
+
 ```python
 import time
 
@@ -190,6 +191,7 @@ def wait_for_element(client, element_id, timeout=10.0):
 ```
 
 **Interact with dynamic lists:**
+
 ```python
 # Find all items matching a pattern
 elements = client.get_elements()

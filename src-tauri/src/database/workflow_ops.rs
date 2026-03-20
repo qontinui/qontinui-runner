@@ -129,7 +129,11 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(39)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
+                    ai_reviewed: row
+                        .get::<_, Option<i32>>(40)
+                        .unwrap_or(Some(1))
+                        .unwrap_or(1)
+                        != 0,
                     multi_agent_mode: true,
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
@@ -977,7 +981,11 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(39)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
+                    ai_reviewed: row
+                        .get::<_, Option<i32>>(40)
+                        .unwrap_or(Some(1))
+                        .unwrap_or(1)
+                        != 0,
                     multi_agent_mode: true,
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
@@ -1191,7 +1199,11 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(39)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    ai_reviewed: row.get::<_, Option<i32>>(40).unwrap_or(Some(1)).unwrap_or(1) != 0,
+                    ai_reviewed: row
+                        .get::<_, Option<i32>>(40)
+                        .unwrap_or(Some(1))
+                        .unwrap_or(1)
+                        != 0,
                     multi_agent_mode: true,
                     use_worktree: false,
                     targeted_error_ids: vec![],
@@ -1226,4 +1238,72 @@ impl CheckpointDb {
         Ok(())
     }
 
+    // =========================================================================
+    // Slash Command Import Methods
+    // =========================================================================
+
+    /// List all workflows that were imported from slash commands (have source_file_path set).
+    /// Returns (id, source_file_path, source_content_hash) tuples.
+    pub fn list_slash_command_sources(&self) -> Result<Vec<(String, String, String)>, String> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, source_file_path, source_content_hash FROM unified_workflows WHERE source_file_path IS NOT NULL",
+            )
+            .map_err(|e| format!("Failed to prepare slash command query: {}", e))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("Failed to query slash command sources: {}", e))?;
+
+        let mut results = Vec::new();
+        for r in rows.flatten() {
+            results.push(r);
+        }
+        Ok(results)
+    }
+
+    /// Create a unified workflow imported from a slash command file.
+    pub fn create_slash_command_workflow(
+        &self,
+        request: &crate::unified_workflows::CreateUnifiedWorkflowRequest,
+        source_file_path: &str,
+        source_content_hash: &str,
+    ) -> Result<crate::unified_workflows::UnifiedWorkflow, String> {
+        let workflow = self.create_unified_workflow(request)?;
+
+        let conn = self.get_conn()?;
+        conn.execute(
+            "UPDATE unified_workflows SET source_file_path = ?1, source_content_hash = ?2 WHERE id = ?3",
+            params![source_file_path, source_content_hash, workflow.id],
+        )
+        .map_err(|e| format!("Failed to set slash command source: {}", e))?;
+
+        Ok(workflow)
+    }
+
+    /// Update a slash command workflow's content and hash.
+    pub fn update_slash_command_content(
+        &self,
+        id: &str,
+        request: &crate::unified_workflows::UpdateUnifiedWorkflowRequest,
+        new_hash: &str,
+    ) -> Result<crate::unified_workflows::UnifiedWorkflow, String> {
+        let workflow = self.update_unified_workflow(id, request)?;
+
+        let conn = self.get_conn()?;
+        conn.execute(
+            "UPDATE unified_workflows SET source_content_hash = ?1 WHERE id = ?2",
+            params![new_hash, id],
+        )
+        .map_err(|e| format!("Failed to update slash command hash: {}", e))?;
+
+        Ok(workflow)
+    }
 }

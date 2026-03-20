@@ -122,7 +122,9 @@ export function AgentInteractionMatrix() {
                       width={CELL_SIZE - 2}
                       height={CELL_SIZE - 2}
                       rx={3}
-                      fill={isSelf ? "#18181b" : item ? correlationColor(item.correlation) : "#27272a"}
+                      fill={
+                        isSelf ? "#18181b" : item ? correlationColor(item.correlation) : "#27272a"
+                      }
                       stroke={isHovered ? "#71717a" : "none"}
                       strokeWidth={isHovered ? 1.5 : 0}
                       onMouseEnter={() => setHovered({ row: ri, col: ci })}

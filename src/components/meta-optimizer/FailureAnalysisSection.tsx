@@ -85,9 +85,7 @@ interface FailureAnalysis {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function formatReasonName(raw: string): string {
-  return raw
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
+  return raw.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 function rateColor(rate: number): string {
@@ -141,9 +139,7 @@ function AbortReasonsChart({ reasons }: { reasons: AbortReason[] }) {
     <div className="space-y-2">
       {reasons.map((r) => (
         <div key={r.reason} className="flex items-center gap-3 text-sm">
-          <div className="w-44 text-zinc-300 truncate shrink-0">
-            {formatReasonName(r.reason)}
-          </div>
+          <div className="w-44 text-zinc-300 truncate shrink-0">{formatReasonName(r.reason)}</div>
           <div className="flex-1 h-5 bg-zinc-800 rounded overflow-hidden">
             <div
               className="h-full bg-red-800 rounded"
@@ -159,11 +155,7 @@ function AbortReasonsChart({ reasons }: { reasons: AbortReason[] }) {
   );
 }
 
-function VerificationFailuresTable({
-  failures,
-}: {
-  failures: VerificationFailurePattern[];
-}) {
+function VerificationFailuresTable({ failures }: { failures: VerificationFailurePattern[] }) {
   if (failures.length === 0) {
     return <EmptyState message="No verification failure data for this period" />;
   }
@@ -181,25 +173,14 @@ function VerificationFailuresTable({
       </thead>
       <tbody>
         {failures.map((f) => (
-          <tr
-            key={f.iteration}
-            className="border-b border-zinc-800/50 hover:bg-zinc-800/30"
-          >
+          <tr key={f.iteration} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
             <td className="py-2 px-3 text-zinc-200">{f.iteration}</td>
-            <td className="py-2 px-3 text-right text-zinc-300">
-              {f.total_checks}
-            </td>
-            <td className="py-2 px-3 text-right text-zinc-300">
-              {f.failed_checks}
-            </td>
-            <td
-              className={`py-2 px-3 text-right ${rateColor(f.failure_rate)}`}
-            >
+            <td className="py-2 px-3 text-right text-zinc-300">{f.total_checks}</td>
+            <td className="py-2 px-3 text-right text-zinc-300">{f.failed_checks}</td>
+            <td className={`py-2 px-3 text-right ${rateColor(f.failure_rate)}`}>
               {f.failure_rate.toFixed(1)}%
             </td>
-            <td className="py-2 px-3 text-right text-zinc-300">
-              {f.critical_failure_count}
-            </td>
+            <td className="py-2 px-3 text-right text-zinc-300">{f.critical_failure_count}</td>
           </tr>
         ))}
       </tbody>
@@ -228,10 +209,7 @@ function FindingDistributions({
         ) : (
           <ul className="space-y-1">
             {categories.map((c) => (
-              <li
-                key={c.category}
-                className="flex items-center justify-between text-sm"
-              >
+              <li key={c.category} className="flex items-center justify-between text-sm">
                 <span className="text-zinc-300">{formatReasonName(c.category)}</span>
                 <span className="text-zinc-400">{c.count}</span>
               </li>
@@ -248,10 +226,7 @@ function FindingDistributions({
         ) : (
           <ul className="space-y-1">
             {severities.map((s) => (
-              <li
-                key={s.category}
-                className="flex items-center justify-between text-sm"
-              >
+              <li key={s.category} className="flex items-center justify-between text-sm">
                 <span className="flex items-center gap-2 text-zinc-300">
                   <span
                     className={`inline-block w-2 h-2 rounded-full ${severityDot(s.category)}`}
@@ -268,11 +243,7 @@ function FindingDistributions({
   );
 }
 
-function FixEffectivenessTable({
-  records,
-}: {
-  records: FixEffectivenessRecord[];
-}) {
+function FixEffectivenessTable({ records }: { records: FixEffectivenessRecord[] }) {
   if (records.length === 0) {
     return <EmptyState message="No fix effectiveness data for this period" />;
   }
@@ -296,25 +267,15 @@ function FixEffectivenessTable({
             key={`${r.fix_type}-${r.source_agent ?? i}`}
             className="border-b border-zinc-800/50 hover:bg-zinc-800/30"
           >
-            <td className="py-2 px-3 text-zinc-200">
-              {formatReasonName(r.fix_type)}
-            </td>
+            <td className="py-2 px-3 text-zinc-200">{formatReasonName(r.fix_type)}</td>
             <td className="py-2 px-3 text-zinc-400">
               {r.source_agent ? formatReasonName(r.source_agent) : "--"}
             </td>
             <td className="py-2 px-3 text-right text-zinc-300">{r.total}</td>
-            <td className="py-2 px-3 text-right text-zinc-300">
-              {r.effective}
-            </td>
-            <td className="py-2 px-3 text-right text-zinc-300">
-              {r.ineffective}
-            </td>
-            <td className="py-2 px-3 text-right text-zinc-300">
-              {r.caused_regression}
-            </td>
-            <td
-              className={`py-2 px-3 text-right ${effectivenessColor(r.effectiveness_rate)}`}
-            >
+            <td className="py-2 px-3 text-right text-zinc-300">{r.effective}</td>
+            <td className="py-2 px-3 text-right text-zinc-300">{r.ineffective}</td>
+            <td className="py-2 px-3 text-right text-zinc-300">{r.caused_regression}</td>
+            <td className={`py-2 px-3 text-right ${effectivenessColor(r.effectiveness_rate)}`}>
               {r.effectiveness_rate.toFixed(1)}%
             </td>
           </tr>
@@ -324,11 +285,7 @@ function FixEffectivenessTable({
   );
 }
 
-function GenerationQuality({
-  quality,
-}: {
-  quality: GenerationQualityMetrics;
-}) {
+function GenerationQuality({ quality }: { quality: GenerationQualityMetrics }) {
   if (quality.total_feedback === 0) {
     return <EmptyState message="No generation quality data for this period" />;
   }
@@ -339,22 +296,16 @@ function GenerationQuality({
       <div className="grid grid-cols-3 gap-3">
         <div className="bg-zinc-800 rounded px-3 py-2 border border-zinc-700">
           <div className="text-xs text-zinc-500">Edits</div>
-          <div className="text-lg font-medium text-zinc-200">
-            {quality.edits}
-          </div>
+          <div className="text-lg font-medium text-zinc-200">{quality.edits}</div>
         </div>
         <div className="bg-zinc-800 rounded px-3 py-2 border border-zinc-700">
           <div className="text-xs text-zinc-500">Deletes</div>
-          <div className="text-lg font-medium text-zinc-200">
-            {quality.deletes}
-          </div>
+          <div className="text-lg font-medium text-zinc-200">{quality.deletes}</div>
         </div>
         <div className="bg-zinc-800 rounded px-3 py-2 border border-zinc-700">
           <div className="text-xs text-zinc-500">Avg Rating</div>
           <div className="text-lg font-medium text-zinc-200">
-            {quality.avg_rating != null
-              ? `${quality.avg_rating.toFixed(1)}/5`
-              : "--"}
+            {quality.avg_rating != null ? `${quality.avg_rating.toFixed(1)}/5` : "--"}
           </div>
         </div>
       </div>
@@ -365,10 +316,7 @@ function GenerationQuality({
           <div className="text-xs text-zinc-500 mb-1">Most Edited Fields</div>
           <ul className="space-y-0.5">
             {quality.most_edited_fields.map((f) => (
-              <li
-                key={f.category}
-                className="flex items-center justify-between text-sm"
-              >
+              <li key={f.category} className="flex items-center justify-between text-sm">
                 <span className="text-zinc-300">{f.category}</span>
                 <span className="text-zinc-400">{f.count}</span>
               </li>
@@ -383,13 +331,8 @@ function GenerationQuality({
           <div className="text-xs text-zinc-500 mb-1">Delete Reasons</div>
           <ul className="space-y-0.5">
             {quality.delete_reasons.map((r) => (
-              <li
-                key={r.category}
-                className="flex items-center justify-between text-sm"
-              >
-                <span className="text-zinc-300">
-                  {formatReasonName(r.category)}
-                </span>
+              <li key={r.category} className="flex items-center justify-between text-sm">
+                <span className="text-zinc-300">{formatReasonName(r.category)}</span>
                 <span className="text-zinc-400">{r.count}</span>
               </li>
             ))}
@@ -400,18 +343,12 @@ function GenerationQuality({
   );
 }
 
-function PipelineAgentFailuresTable({
-  agents,
-}: {
-  agents: PipelineAgentFailureRecord[];
-}) {
+function PipelineAgentFailuresTable({ agents }: { agents: PipelineAgentFailureRecord[] }) {
   if (agents.length === 0) return null;
 
   return (
     <div className="border-t border-zinc-800 pt-4 mt-4">
-      <div className="text-sm font-medium text-zinc-200 mb-2">
-        Pipeline Agent Performance
-      </div>
+      <div className="text-sm font-medium text-zinc-200 mb-2">Pipeline Agent Performance</div>
       <table className="w-full text-sm">
         <thead>
           <tr className="text-zinc-500 text-xs border-b border-zinc-800">
@@ -425,22 +362,11 @@ function PipelineAgentFailuresTable({
         </thead>
         <tbody>
           {agents.map((a) => (
-            <tr
-              key={a.agent_type}
-              className="border-b border-zinc-800/50 hover:bg-zinc-800/30"
-            >
-              <td className="py-2 px-3 text-zinc-200">
-                {formatReasonName(a.agent_type)}
-              </td>
-              <td className="py-2 px-3 text-right text-zinc-300">
-                {a.total_runs}
-              </td>
-              <td className="py-2 px-3 text-right text-zinc-300">
-                {a.failures}
-              </td>
-              <td
-                className={`py-2 px-3 text-right ${rateColor(a.failure_rate)}`}
-              >
+            <tr key={a.agent_type} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
+              <td className="py-2 px-3 text-zinc-200">{formatReasonName(a.agent_type)}</td>
+              <td className="py-2 px-3 text-right text-zinc-300">{a.total_runs}</td>
+              <td className="py-2 px-3 text-right text-zinc-300">{a.failures}</td>
+              <td className={`py-2 px-3 text-right ${rateColor(a.failure_rate)}`}>
                 {a.failure_rate.toFixed(1)}%
               </td>
               <td className="py-2 px-3 text-right text-zinc-300">
@@ -460,21 +386,14 @@ function PipelineAgentFailuresTable({
 function RecurringIssuesList({ issues }: { issues: RecurringIssue[] }) {
   if (issues.length === 0) return null;
 
-  const sorted = [...issues]
-    .sort((a, b) => b.occurrence_count - a.occurrence_count)
-    .slice(0, 10);
+  const sorted = [...issues].sort((a, b) => b.occurrence_count - a.occurrence_count).slice(0, 10);
 
   return (
     <div className="border-t border-zinc-800 pt-4 mt-4">
-      <div className="text-sm font-medium text-zinc-200 mb-2">
-        Recurring Issues
-      </div>
+      <div className="text-sm font-medium text-zinc-200 mb-2">Recurring Issues</div>
       <ul className="space-y-2">
         {sorted.map((issue) => (
-          <li
-            key={issue.signature_hash}
-            className="flex items-start gap-2 text-sm"
-          >
+          <li key={issue.signature_hash} className="flex items-start gap-2 text-sm">
             <span
               className={`mt-1.5 inline-block w-2 h-2 rounded-full shrink-0 ${severityDot(issue.severity)}`}
             />
@@ -484,9 +403,7 @@ function RecurringIssuesList({ issues }: { issues: RecurringIssue[] }) {
                 <span className="text-xs px-2 py-0.5 rounded bg-zinc-800 text-zinc-400">
                   {formatReasonName(issue.category)}
                 </span>
-                <span className="text-xs text-zinc-500">
-                  {issue.occurrence_count}x
-                </span>
+                <span className="text-xs text-zinc-500">{issue.occurrence_count}x</span>
                 <span className="text-xs text-zinc-600">
                   last seen {new Date(issue.last_seen).toLocaleDateString()}
                 </span>
@@ -514,10 +431,10 @@ export function FailureAnalysisSection({ category = "main" }: FailureAnalysisSec
     try {
       setLoading(true);
       setError(null);
-      const result = await invoke<FailureAnalysis>(
-        "get_meta_optimizer_failure_analysis",
-        { days: 30, category },
-      );
+      const result = await invoke<FailureAnalysis>("get_meta_optimizer_failure_analysis", {
+        days: 30,
+        category,
+      });
       setData(result);
     } catch (e) {
       console.error("Failed to load failure analysis:", e);
@@ -532,18 +449,12 @@ export function FailureAnalysisSection({ category = "main" }: FailureAnalysisSec
   }, [load]);
 
   if (loading) {
-    return (
-      <div className="text-zinc-500 text-sm py-4">
-        Loading failure analysis...
-      </div>
-    );
+    return <div className="text-zinc-500 text-sm py-4">Loading failure analysis...</div>;
   }
 
   if (error && !data) {
     return (
-      <div className="text-red-400 text-sm py-2">
-        Failed to load failure analysis: {error}
-      </div>
+      <div className="text-red-400 text-sm py-2">Failed to load failure analysis: {error}</div>
     );
   }
 
@@ -564,22 +475,25 @@ export function FailureAnalysisSection({ category = "main" }: FailureAnalysisSec
             Failure Analysis (last 30 days)
             {category !== "main" && (
               <span className="text-xs text-zinc-500 ml-2">
-                — {category === "reflections" ? "reflections only" :
-                   category === "fixers" ? "fixers only" :
-                   category === "follow_ups" ? "follow-ups only" :
-                   category === "meta_optimizer" ? "meta-optimizer only" : ""}
+                —{" "}
+                {category === "reflections"
+                  ? "reflections only"
+                  : category === "fixers"
+                    ? "fixers only"
+                    : category === "follow_ups"
+                      ? "follow-ups only"
+                      : category === "meta_optimizer"
+                        ? "meta-optimizer only"
+                        : ""}
               </span>
             )}
           </span>
           <span className="text-xs text-zinc-400">
-            {data.total_runs} total runs, {data.failed_runs} failed (
-            {data.failure_rate.toFixed(1)}%)
+            {data.total_runs} total runs, {data.failed_runs} failed ({data.failure_rate.toFixed(1)}
+            %)
           </span>
         </div>
-        <button
-          onClick={load}
-          className="text-xs text-zinc-400 hover:text-zinc-200 px-2 py-1"
-        >
+        <button onClick={load} className="text-xs text-zinc-400 hover:text-zinc-200 px-2 py-1">
           Refresh
         </button>
       </div>
@@ -603,9 +517,7 @@ export function FailureAnalysisSection({ category = "main" }: FailureAnalysisSec
 
         {/* D. Finding Categories */}
         <div className="border-t border-zinc-800 pt-4 mt-4">
-          <div className="text-sm font-medium text-zinc-200 mb-2">
-            Finding Categories
-          </div>
+          <div className="text-sm font-medium text-zinc-200 mb-2">Finding Categories</div>
           <FindingDistributions
             categories={data.finding_distribution}
             severities={data.severity_distribution}
@@ -614,17 +526,13 @@ export function FailureAnalysisSection({ category = "main" }: FailureAnalysisSec
 
         {/* E. Reflection Fix Effectiveness */}
         <div className="border-t border-zinc-800 pt-4 mt-4">
-          <div className="text-sm font-medium text-zinc-200 mb-2">
-            Reflection Fix Effectiveness
-          </div>
+          <div className="text-sm font-medium text-zinc-200 mb-2">Reflection Fix Effectiveness</div>
           <FixEffectivenessTable records={data.reflection_fix_effectiveness} />
         </div>
 
         {/* F. Workflow Generation Quality */}
         <div className="border-t border-zinc-800 pt-4 mt-4">
-          <div className="text-sm font-medium text-zinc-200 mb-2">
-            Workflow Generation Quality
-          </div>
+          <div className="text-sm font-medium text-zinc-200 mb-2">Workflow Generation Quality</div>
           <GenerationQuality quality={data.generation_quality} />
         </div>
 

@@ -1286,13 +1286,13 @@ pub async fn resume_task_run(
         routing_context: Default::default(),
         project_path: crate::mcp::shared::current_project_path(),
         acceptance_criteria: workflow.acceptance_criteria.clone(),
-            multi_agent_mode: false,
-            use_worktree: false,
-            worktree_path: None,
-            worktree_branch: None,
-            workflow_architecture: None,
-            agentic_verification_config: None,
-            multi_agent_pipeline_config: None,
+        multi_agent_mode: false,
+        use_worktree: false,
+        worktree_path: None,
+        worktree_branch: None,
+        workflow_architecture: None,
+        agentic_verification_config: None,
+        multi_agent_pipeline_config: None,
     };
 
     // Spawn the workflow execution in background with panic protection

@@ -192,7 +192,6 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
           </div>
         </div>
       </div>
-
     </div>
   );
 }

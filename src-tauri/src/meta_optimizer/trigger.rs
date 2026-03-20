@@ -10,8 +10,8 @@
 
 use tracing::{debug, info, warn};
 
-use crate::database::CheckpointDb;
 use super::types::{MetaOptimizerDeps, OptimizerType};
+use crate::database::CheckpointDb;
 
 /// Default number of completed runs required before triggering an optimizer.
 const DEFAULT_THRESHOLD: i64 = 2;
@@ -159,19 +159,20 @@ pub fn check_and_launch_optimizers(
 
     for optimizer_type in OptimizerType::all() {
         match should_launch_optimizer(db, *optimizer_type, &source_task_run_id) {
-            Ok(true) => {
-                match launch_optimizer(&deps, *optimizer_type) {
-                    Ok(id) => launched.push(id),
-                    Err(e) => warn!("Failed to launch {}: {}", optimizer_type, e),
-                }
-            }
+            Ok(true) => match launch_optimizer(&deps, *optimizer_type) {
+                Ok(id) => launched.push(id),
+                Err(e) => warn!("Failed to launch {}: {}", optimizer_type, e),
+            },
             Ok(false) => {}
             Err(e) => warn!("Error checking {}: {}", optimizer_type, e),
         }
     }
 
     // Capture periodic performance snapshot for progress tracking
-    if let Err(e) = super::snapshots::capture_periodic(&deps.app_state.checkpoint_db, super::types::WorkflowCategory::Main) {
+    if let Err(e) = super::snapshots::capture_periodic(
+        &deps.app_state.checkpoint_db,
+        super::types::WorkflowCategory::Main,
+    ) {
         warn!("Failed to capture periodic snapshot: {}", e);
     }
 
@@ -208,13 +209,15 @@ fn auto_evaluate_outcomes(db: &CheckpointDb) {
         // Only re-evaluate if current verdict is "insufficient_data" or absent
         let needs_eval = match &rec.outcome_after_apply {
             None => true,
-            Some(json) => {
-                serde_json::from_str::<serde_json::Value>(json)
-                    .ok()
-                    .and_then(|v| v.get("verdict").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                    .map(|v| v == "insufficient_data")
-                    .unwrap_or(true)
-            }
+            Some(json) => serde_json::from_str::<serde_json::Value>(json)
+                .ok()
+                .and_then(|v| {
+                    v.get("verdict")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .map(|v| v == "insufficient_data")
+                .unwrap_or(true),
         };
 
         if needs_eval {
@@ -250,34 +253,32 @@ fn auto_evaluate_canaries(db: &CheckpointDb) {
         }
 
         match super::canary::evaluate_canary(db, &canary.id) {
-            Ok(eval) => {
-                match eval.verdict.as_str() {
-                    "promote" => {
-                        info!(
+            Ok(eval) => match eval.verdict.as_str() {
+                "promote" => {
+                    info!(
                             "Auto-promoting canary {} (delta={:+.1}pp, canary_sr={:.1}%, baseline_sr={:.1}%)",
                             canary.id, eval.delta, eval.canary_success_rate, eval.baseline_success_rate
                         );
-                        if let Err(e) = super::canary::promote_canary(db, &canary.id) {
-                            warn!("Failed to auto-promote canary {}: {}", canary.id, e);
-                        }
+                    if let Err(e) = super::canary::promote_canary(db, &canary.id) {
+                        warn!("Failed to auto-promote canary {}: {}", canary.id, e);
                     }
-                    "rollback" => {
-                        info!(
+                }
+                "rollback" => {
+                    info!(
                             "Auto-rolling-back canary {} (delta={:+.1}pp, canary_sr={:.1}%, baseline_sr={:.1}%)",
                             canary.id, eval.delta, eval.canary_success_rate, eval.baseline_success_rate
                         );
-                        if let Err(e) = super::canary::rollback_canary(db, &canary.id) {
-                            warn!("Failed to auto-rollback canary {}: {}", canary.id, e);
-                        }
-                    }
-                    _ => {
-                        debug!(
-                            "Canary {} evaluation: continue (delta={:+.1}pp, {} canary runs)",
-                            canary.id, eval.delta, canary.canary_run_count
-                        );
+                    if let Err(e) = super::canary::rollback_canary(db, &canary.id) {
+                        warn!("Failed to auto-rollback canary {}: {}", canary.id, e);
                     }
                 }
-            }
+                _ => {
+                    debug!(
+                        "Canary {} evaluation: continue (delta={:+.1}pp, {} canary runs)",
+                        canary.id, eval.delta, canary.canary_run_count
+                    );
+                }
+            },
             Err(e) => {
                 debug!("Failed to evaluate canary {}: {}", canary.id, e);
             }

@@ -92,6 +92,7 @@ import {
   Plug,
   Network,
   Repeat,
+  Video,
 } from "lucide-react";
 
 // Import shared navigation structure and state management
@@ -179,6 +180,7 @@ const ICON_MAP: Record<IconName, LucideIcon> = {
   Cpu,
   Network,
   Repeat,
+  Video,
 };
 
 function getIconComponent(iconName: IconName): LucideIcon {
@@ -511,6 +513,33 @@ function NavGroup({
               item={item}
               isActive={activeTab === item.id}
               isParentActive={isParentActive}
+              collapsed={collapsed}
+              onClick={() => onItemClick(item)}
+              onKeyDown={(e) => onKeyDown(e, item.id)}
+              tabIndex={getTabIndex(item.id)}
+              dataNavItem={item.id}
+            />
+          );
+        })}
+      </div>
+    );
+  }
+
+  // Ungrouped items: render without a collapsible header
+  if (!group.label) {
+    return (
+      <div className="space-y-0.5">
+        {group.items.map((item) => {
+          const isParentActive =
+            item.hasChildren && getChildItems(item.id).some((child) => child.id === activeTab);
+          const isFlyoutOpen = openFlyoutId === item.id;
+
+          return (
+            <NavItem
+              key={item.id}
+              item={item}
+              isActive={activeTab === item.id}
+              isParentActive={isParentActive || isFlyoutOpen}
               collapsed={collapsed}
               onClick={() => onItemClick(item)}
               onKeyDown={(e) => onKeyDown(e, item.id)}

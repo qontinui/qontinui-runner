@@ -86,18 +86,21 @@ export function RecommendationsTab() {
     }
   }, [filterType, filterStatus]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const handleAction = async (id: string, action: "apply" | "reject" | "rollback" | "canary") => {
     try {
       if (action === "canary") {
         await invoke("start_canary_rollout", { recommendationId: id, percentage: 10 });
       } else {
-        const cmd = action === "apply"
-          ? "apply_meta_optimizer_recommendation"
-          : action === "reject"
-            ? "reject_meta_optimizer_recommendation"
-            : "rollback_meta_optimizer_recommendation";
+        const cmd =
+          action === "apply"
+            ? "apply_meta_optimizer_recommendation"
+            : action === "reject"
+              ? "reject_meta_optimizer_recommendation"
+              : "rollback_meta_optimizer_recommendation";
         await invoke(cmd, { recommendationId: id });
       }
       load();
@@ -185,20 +188,24 @@ export function RecommendationsTab() {
                 <span className={`text-xs px-2 py-0.5 rounded ${STATUS_COLORS[rec.status] || ""}`}>
                   {rec.status}
                 </span>
-                {rec.status === "applied" && rec.outcome_after_apply && (() => {
-                  try {
-                    const outcome: RecommendationOutcome = JSON.parse(rec.outcome_after_apply);
-                    const badge = VERDICT_BADGES[outcome.verdict];
-                    if (badge) {
-                      return (
-                        <span className={`text-xs px-1.5 py-0.5 rounded ${badge.className}`}>
-                          {badge.label}
-                        </span>
-                      );
+                {rec.status === "applied" &&
+                  rec.outcome_after_apply &&
+                  (() => {
+                    try {
+                      const outcome: RecommendationOutcome = JSON.parse(rec.outcome_after_apply);
+                      const badge = VERDICT_BADGES[outcome.verdict];
+                      if (badge) {
+                        return (
+                          <span className={`text-xs px-1.5 py-0.5 rounded ${badge.className}`}>
+                            {badge.label}
+                          </span>
+                        );
+                      }
+                    } catch {
+                      /* ignore */
                     }
-                  } catch { /* ignore */ }
-                  return null;
-                })()}
+                    return null;
+                  })()}
                 <span className="text-xs text-zinc-500">
                   {TYPE_LABELS[rec.optimizer_type] || rec.optimizer_type}
                 </span>
@@ -237,71 +244,96 @@ export function RecommendationsTab() {
                   )}
 
                   {/* Outcome details for applied recs */}
-                  {rec.status === "applied" && rec.outcome_after_apply && (() => {
-                    try {
-                      const outcome: RecommendationOutcome = JSON.parse(rec.outcome_after_apply);
-                      return (
-                        <div className="bg-zinc-800/50 rounded p-3 space-y-2">
-                          <div className="text-xs text-zinc-500">Outcome After Apply</div>
-                          <div className="flex gap-4 text-xs">
-                            {outcome.success_rate_delta != null && (
-                              <div>
-                                <span className="text-zinc-500">Success Rate: </span>
-                                <span className={outcome.success_rate_delta > 0 ? "text-green-400" : outcome.success_rate_delta < -2 ? "text-red-400" : "text-zinc-300"}>
-                                  {outcome.success_rate_delta > 0 ? "+" : ""}{outcome.success_rate_delta.toFixed(1)}pp
-                                </span>
-                              </div>
-                            )}
-                            {outcome.duration_delta_ms != null && (
-                              <div>
-                                <span className="text-zinc-500">Duration: </span>
-                                <span className="text-zinc-300">
-                                  {outcome.duration_delta_ms > 0 ? "+" : ""}{outcome.duration_delta_ms.toFixed(0)}ms
-                                </span>
-                              </div>
-                            )}
-                            {outcome.cost_delta_usd != null && (
-                              <div>
-                                <span className="text-zinc-500">Cost: </span>
-                                <span className="text-zinc-300">
-                                  {outcome.cost_delta_usd > 0 ? "+" : ""}${outcome.cost_delta_usd.toFixed(4)}
-                                </span>
-                              </div>
-                            )}
+                  {rec.status === "applied" &&
+                    rec.outcome_after_apply &&
+                    (() => {
+                      try {
+                        const outcome: RecommendationOutcome = JSON.parse(rec.outcome_after_apply);
+                        return (
+                          <div className="bg-zinc-800/50 rounded p-3 space-y-2">
+                            <div className="text-xs text-zinc-500">Outcome After Apply</div>
+                            <div className="flex gap-4 text-xs">
+                              {outcome.success_rate_delta != null && (
+                                <div>
+                                  <span className="text-zinc-500">Success Rate: </span>
+                                  <span
+                                    className={
+                                      outcome.success_rate_delta > 0
+                                        ? "text-green-400"
+                                        : outcome.success_rate_delta < -2
+                                          ? "text-red-400"
+                                          : "text-zinc-300"
+                                    }
+                                  >
+                                    {outcome.success_rate_delta > 0 ? "+" : ""}
+                                    {outcome.success_rate_delta.toFixed(1)}pp
+                                  </span>
+                                </div>
+                              )}
+                              {outcome.duration_delta_ms != null && (
+                                <div>
+                                  <span className="text-zinc-500">Duration: </span>
+                                  <span className="text-zinc-300">
+                                    {outcome.duration_delta_ms > 0 ? "+" : ""}
+                                    {outcome.duration_delta_ms.toFixed(0)}ms
+                                  </span>
+                                </div>
+                              )}
+                              {outcome.cost_delta_usd != null && (
+                                <div>
+                                  <span className="text-zinc-500">Cost: </span>
+                                  <span className="text-zinc-300">
+                                    {outcome.cost_delta_usd > 0 ? "+" : ""}$
+                                    {outcome.cost_delta_usd.toFixed(4)}
+                                  </span>
+                                </div>
+                              )}
+                            </div>
                           </div>
-                        </div>
-                      );
-                    } catch { return null; }
-                  })()}
+                        );
+                      } catch {
+                        return null;
+                      }
+                    })()}
 
                   {/* Cascade impact for applied recs with target_agent */}
-                  {rec.status === "applied" && rec.target_agent && cascadeEffects[rec.id] && cascadeEffects[rec.id].length > 0 && (
-                    <div className="bg-zinc-800/50 rounded p-3 space-y-2">
-                      <div className="text-xs text-zinc-500">Cascade Impact</div>
-                      <table className="w-full text-xs">
-                        <thead>
-                          <tr className="text-zinc-500">
-                            <th className="text-left py-1">Agent</th>
-                            <th className="text-right py-1">Before</th>
-                            <th className="text-right py-1">After</th>
-                            <th className="text-right py-1">Delta</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {cascadeEffects[rec.id].map((ce) => (
-                            <tr key={ce.affected_agent} className="border-t border-zinc-700/50">
-                              <td className="py-1 text-zinc-300">{ce.affected_agent}</td>
-                              <td className="py-1 text-right text-zinc-400">{ce.before_success_rate.toFixed(1)}%</td>
-                              <td className="py-1 text-right text-zinc-400">{ce.after_success_rate.toFixed(1)}%</td>
-                              <td className={`py-1 text-right ${ce.delta > 0 ? "text-green-400" : ce.delta < -2 ? "text-red-400" : "text-zinc-400"}`}>
-                                {ce.delta > 0 ? "+" : ""}{ce.delta.toFixed(1)}pp
-                              </td>
+                  {rec.status === "applied" &&
+                    rec.target_agent &&
+                    cascadeEffects[rec.id] &&
+                    cascadeEffects[rec.id].length > 0 && (
+                      <div className="bg-zinc-800/50 rounded p-3 space-y-2">
+                        <div className="text-xs text-zinc-500">Cascade Impact</div>
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="text-zinc-500">
+                              <th className="text-left py-1">Agent</th>
+                              <th className="text-right py-1">Before</th>
+                              <th className="text-right py-1">After</th>
+                              <th className="text-right py-1">Delta</th>
                             </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
+                          </thead>
+                          <tbody>
+                            {cascadeEffects[rec.id].map((ce) => (
+                              <tr key={ce.affected_agent} className="border-t border-zinc-700/50">
+                                <td className="py-1 text-zinc-300">{ce.affected_agent}</td>
+                                <td className="py-1 text-right text-zinc-400">
+                                  {ce.before_success_rate.toFixed(1)}%
+                                </td>
+                                <td className="py-1 text-right text-zinc-400">
+                                  {ce.after_success_rate.toFixed(1)}%
+                                </td>
+                                <td
+                                  className={`py-1 text-right ${ce.delta > 0 ? "text-green-400" : ce.delta < -2 ? "text-red-400" : "text-zinc-400"}`}
+                                >
+                                  {ce.delta > 0 ? "+" : ""}
+                                  {ce.delta.toFixed(1)}pp
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
 
                   <div className="flex gap-2 pt-2">
                     {rec.status === "pending" && (

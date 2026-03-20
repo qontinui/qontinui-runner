@@ -4,13 +4,7 @@
 //! AI-powered sessions. Includes prompt execution, task completion tracking,
 //! log migration, and MCP tool context generation.
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-    routing::post,
-    Router,
-};
+use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::Manager;

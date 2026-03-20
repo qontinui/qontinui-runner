@@ -11,6 +11,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { Play, RefreshCw, Trash2, Loader2, Settings2, ChevronRight } from "lucide-react";
 import { WorkflowLibraryPanel } from "./WorkflowLibraryPanel";
 import { WorkflowQueuePanel } from "./WorkflowQueuePanel";
+import { SlashCommandArgsDialog } from "./SlashCommandArgsDialog";
 import type { WorkflowWithStats, QueuedWorkflow, WorkflowStats } from "./types";
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
 import { getTotalStepCount } from "../../types/unified-workflow";
@@ -67,6 +68,12 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
 
   // Execution state
   const [isExecuting, setIsExecuting] = useState(false);
+
+  // Slash command sync state
+  const [isSyncing, setIsSyncing] = useState(false);
+
+  // Args dialog state (for slash commands with $ARGUMENTS)
+  const [argsDialogWorkflow, setArgsDialogWorkflow] = useState<WorkflowWithStats | null>(null);
 
   // Persist queue to instanceStorage
   useEffect(() => {
@@ -222,6 +229,71 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
     setQueue([]);
   }, []);
 
+  // Sync slash commands from disk
+  const syncCommands = useCallback(async () => {
+    setIsSyncing(true);
+    try {
+      const response = await tracedFetch(`${getApiBase()}/slash-commands/sync`, {
+        method: "POST",
+      });
+      const result = await response.json();
+      if (result.success) {
+        const data = result.data;
+        onLog?.(
+          "success",
+          `Commands synced: ${data.created} new, ${data.updated} updated, ${data.deleted} removed`,
+        );
+        // Refresh the workflow list
+        await fetchWorkflows();
+      } else {
+        throw new Error(result.error || "Sync failed");
+      }
+    } catch (error) {
+      onLog?.("error", `Failed to sync commands: ${error}`);
+    } finally {
+      setIsSyncing(false);
+    }
+  }, [onLog, fetchWorkflows]);
+
+  // Run a single workflow directly (used for slash commands with args)
+  const runSingleWorkflow = useCallback(
+    async (workflowId: string, args?: string) => {
+      try {
+        const body: Record<string, unknown> = {};
+        if (args !== undefined) {
+          body.arguments = args;
+        }
+        const response = await tracedFetch(`${getApiBase()}/unified-workflows/${workflowId}/run`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const result = await response.json();
+        if (result.success) {
+          onLog?.("success", "Started workflow execution");
+          onNavigateToActive();
+        } else {
+          throw new Error(result.error || "Failed to start workflow");
+        }
+      } catch (error) {
+        onLog?.("error", `Failed to run workflow: ${error}`);
+      }
+    },
+    [onLog, onNavigateToActive],
+  );
+
+  // Handle adding a workflow to queue — intercept for slash commands with args
+  const handleAddToQueue = useCallback(
+    (workflow: WorkflowWithStats) => {
+      if (workflow.tags?.includes("requires-arguments")) {
+        setArgsDialogWorkflow(workflow);
+      } else {
+        addToQueue(workflow);
+      }
+    },
+    [addToQueue],
+  );
+
   // Execute queue
   const executeQueue = useCallback(async () => {
     if (queue.length === 0) return;
@@ -299,13 +371,15 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
               category={category}
               onCategoryChange={setCategory}
               categories={categories}
-              onAddToQueue={addToQueue}
+              onAddToQueue={handleAddToQueue}
               queuedIds={queuedIds}
               onCollapse={toggleLibrary}
               showFavoritesOnly={showFavoritesOnly}
               onToggleFavoritesFilter={() => setShowFavoritesOnly((prev) => !prev)}
               onToggleFavorite={toggleFavorite}
               hasFavorites={hasFavorites}
+              onSyncCommands={syncCommands}
+              isSyncing={isSyncing}
             />
           </div>
         ) : (
@@ -401,6 +475,18 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
 
       {/* Click outside to close options */}
       {showOptions && <div className="fixed inset-0 z-10" onClick={() => setShowOptions(false)} />}
+
+      {/* Slash command args dialog */}
+      {argsDialogWorkflow && (
+        <SlashCommandArgsDialog
+          workflowName={argsDialogWorkflow.name}
+          onRun={(args) => {
+            runSingleWorkflow(argsDialogWorkflow.id, args);
+            setArgsDialogWorkflow(null);
+          }}
+          onCancel={() => setArgsDialogWorkflow(null)}
+        />
+      )}
     </div>
   );
 }

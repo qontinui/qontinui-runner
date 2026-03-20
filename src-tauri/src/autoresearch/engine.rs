@@ -40,7 +40,7 @@ impl ResearchEngine {
                         max_context_tokens: None,
                         workflow_architecture: None,
                         agentic_verification_config: None,
-            multi_agent_pipeline_config: None,
+                        multi_agent_pipeline_config: None,
                         extra: Default::default(),
                     },
                     current_experiment: None,
@@ -236,7 +236,10 @@ async fn run_campaign_loop(
         // Check for config hot-reload
         if let Some(ref rx) = config_reload_rx {
             if let Ok(new_config) = rx.try_recv() {
-                info!("Hot-reloading research config for campaign '{}'", campaign_id);
+                info!(
+                    "Hot-reloading research config for campaign '{}'",
+                    campaign_id
+                );
                 // Reload mutable fields only (not benchmark_workflow_id or name)
                 config.search_dimensions = new_config.search_dimensions;
                 config.acceptance_criteria = new_config.acceptance_criteria;
@@ -246,7 +249,8 @@ async fn run_campaign_loop(
                     != std::mem::discriminant(&new_config.mutation_strategy)
                 {
                     config.mutation_strategy = new_config.mutation_strategy;
-                    mutator = Mutator::from_strategy(&config.mutation_strategy, &config.ai_guidance);
+                    mutator =
+                        Mutator::from_strategy(&config.mutation_strategy, &config.ai_guidance);
                     info!("Mutation strategy changed — resetting mutator");
                 }
                 // Invalidate cached control
@@ -266,20 +270,17 @@ async fn run_campaign_loop(
             let s = state.lock().await;
             s.results.clone()
         };
-        let experiment_config = match mutator.next_experiment(
-            &current_control,
-            &config.search_dimensions,
-            &history,
-        ) {
-            Some(c) => c,
-            None => {
-                info!("No more experiments to try — campaign complete");
-                let mut s = state.lock().await;
-                s.status.status = CampaignState::Completed;
-                update_campaign_status(&db, &campaign_id, "completed", &s.status);
-                return;
-            }
-        };
+        let experiment_config =
+            match mutator.next_experiment(&current_control, &config.search_dimensions, &history) {
+                Some(c) => c,
+                None => {
+                    info!("No more experiments to try — campaign complete");
+                    let mut s = state.lock().await;
+                    s.status.status = CampaignState::Completed;
+                    update_campaign_status(&db, &campaign_id, "completed", &s.status);
+                    return;
+                }
+            };
 
         experiment_number += 1;
         info!(
@@ -322,10 +323,8 @@ async fn run_campaign_loop(
         }
 
         // Compute experiment aggregate (multi-workflow aware)
-        let aggregate = metrics::compute_aggregate_multi_workflow(
-            &trials,
-            &config.multi_workflow_aggregation,
-        );
+        let aggregate =
+            metrics::compute_aggregate_multi_workflow(&trials, &config.multi_workflow_aggregation);
 
         // Get control aggregate (with periodic re-evaluation)
         let (control_aggregate, control_trials) = get_control_aggregate(
@@ -378,7 +377,12 @@ async fn run_campaign_loop(
         if experiment_config
             .workflow_architecture
             .as_ref()
-            .map(|a| matches!(a, super::agentic_verification::WorkflowArchitecture::MultiAgentPipeline))
+            .map(|a| {
+                matches!(
+                    a,
+                    super::agentic_verification::WorkflowArchitecture::MultiAgentPipeline
+                )
+            })
             .unwrap_or(false)
         {
             let mut all_traces = Vec::new();
@@ -475,7 +479,8 @@ async fn run_campaign_loop(
         // Convergence detection
         if config.convergence.enabled {
             let mut s = state.lock().await;
-            if s.status.experiments_since_last_accept >= config.convergence.no_improvement_threshold {
+            if s.status.experiments_since_last_accept >= config.convergence.no_improvement_threshold
+            {
                 info!(
                     "Convergence detected: {} consecutive experiments without improvement (threshold={})",
                     s.status.experiments_since_last_accept,
@@ -615,9 +620,12 @@ async fn get_control_aggregate(
         if *stop_rx.borrow() {
             break;
         }
-        let wf_id = config.effective_workflow_ids().into_iter().next().unwrap_or_default();
-        match run_single_trial(runner, &wf_id, &control_with_worktree, stop_rx).await
-        {
+        let wf_id = config
+            .effective_workflow_ids()
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        match run_single_trial(runner, &wf_id, &control_with_worktree, stop_rx).await {
             Ok(t) => control_trials.push(t),
             Err(e) => {
                 if e == "Loop stopped" {
@@ -741,10 +749,18 @@ fn record_learning(
         workflow_architecture: None, // Autoresearch tracks architecture via config_json
     };
 
-    if let Err(e) = crate::orchestrator::learning_recorder::record_workflow_learning(&conn, &outcome) {
-        warn!("Failed to record learning for experiment #{}: {}", experiment_number, e);
+    if let Err(e) =
+        crate::orchestrator::learning_recorder::record_workflow_learning(&conn, &outcome)
+    {
+        warn!(
+            "Failed to record learning for experiment #{}: {}",
+            experiment_number, e
+        );
     } else {
-        debug!("Recorded learning outcome for experiment #{}", experiment_number);
+        debug!(
+            "Recorded learning outcome for experiment #{}",
+            experiment_number
+        );
     }
 
     // Record autoresearch-specific pattern: config → outcome mapping
@@ -756,7 +772,11 @@ fn record_learning(
             result.aggregate.pass_rate,
             result.accepted,
         ),
-        confidence: if result.aggregate.trial_count >= 3 { 0.7 } else { 0.4 },
+        confidence: if result.aggregate.trial_count >= 3 {
+            0.7
+        } else {
+            0.4
+        },
         context: Some(serde_json::json!({
             "campaign": config.name,
             "experiment_number": experiment_number,
@@ -767,7 +787,9 @@ fn record_learning(
         })),
     };
 
-    if let Err(e) = crate::orchestrator::learning_recorder::record_learning_pattern(&conn, &config_pattern) {
+    if let Err(e) =
+        crate::orchestrator::learning_recorder::record_learning_pattern(&conn, &config_pattern)
+    {
         warn!("Failed to record autoresearch pattern: {}", e);
     }
 }
@@ -778,9 +800,7 @@ fn record_learning(
 
 /// Start a file watcher on the research config file.
 /// Returns a channel receiver that emits new ResearchConfig on file changes.
-fn start_config_watcher(
-    config_path: &str,
-) -> Option<std::sync::mpsc::Receiver<ResearchConfig>> {
+fn start_config_watcher(config_path: &str) -> Option<std::sync::mpsc::Receiver<ResearchConfig>> {
     use notify::{Event, EventKind, RecursiveMode, Watcher};
 
     let path = PathBuf::from(config_path);
@@ -797,47 +817,48 @@ fn start_config_watcher(
 
     // Debounce: only reload after 500ms of no changes
     let tx_clone = tx.clone();
-    let mut watcher = match notify::recommended_watcher(move |result: Result<Event, notify::Error>| {
-        if let Ok(event) = result {
-            match event.kind {
-                EventKind::Modify(_) | EventKind::Create(_) => {
-                    // Read and parse the config file
-                    match std::fs::read_to_string(&config_path_owned) {
-                        Ok(content) => {
-                            // Try YAML first, then JSON
-                            let parsed: Result<ResearchConfig, String> =
-                                serde_yaml::from_str(&content)
-                                    .map_err(|e| format!("YAML parse error: {}", e))
-                                    .or_else(|_| {
-                                        serde_json::from_str(&content)
-                                            .map_err(|e| format!("JSON parse error: {}", e))
-                                    });
+    let mut watcher =
+        match notify::recommended_watcher(move |result: Result<Event, notify::Error>| {
+            if let Ok(event) = result {
+                match event.kind {
+                    EventKind::Modify(_) | EventKind::Create(_) => {
+                        // Read and parse the config file
+                        match std::fs::read_to_string(&config_path_owned) {
+                            Ok(content) => {
+                                // Try YAML first, then JSON
+                                let parsed: Result<ResearchConfig, String> =
+                                    serde_yaml::from_str(&content)
+                                        .map_err(|e| format!("YAML parse error: {}", e))
+                                        .or_else(|_| {
+                                            serde_json::from_str(&content)
+                                                .map_err(|e| format!("JSON parse error: {}", e))
+                                        });
 
-                            match parsed {
-                                Ok(new_config) => {
-                                    info!("Config file changed — sending reload signal");
-                                    let _ = tx_clone.send(new_config);
-                                }
-                                Err(e) => {
-                                    warn!("Failed to parse reloaded config file: {}", e);
+                                match parsed {
+                                    Ok(new_config) => {
+                                        info!("Config file changed — sending reload signal");
+                                        let _ = tx_clone.send(new_config);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to parse reloaded config file: {}", e);
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            warn!("Failed to read config file for reload: {}", e);
+                            Err(e) => {
+                                warn!("Failed to read config file for reload: {}", e);
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-    }) {
-        Ok(w) => w,
-        Err(e) => {
-            warn!("Failed to create config file watcher: {}", e);
-            return None;
-        }
-    };
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!("Failed to create config file watcher: {}", e);
+                return None;
+            }
+        };
 
     // Watch the parent directory (some editors write to temp then rename)
     let watch_path = path.parent().unwrap_or(&path);

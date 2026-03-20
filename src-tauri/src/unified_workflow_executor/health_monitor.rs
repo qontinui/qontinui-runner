@@ -40,10 +40,7 @@ pub async fn fetch_verifier_ui_context(
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .ok()?;
-        let url = format!(
-            "http://127.0.0.1:{}/ui-bridge/sdk/control/snapshot",
-            port
-        );
+        let url = format!("http://127.0.0.1:{}/ui-bridge/sdk/control/snapshot", port);
         let resp = client.get(&url).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
@@ -70,10 +67,8 @@ pub async fn fetch_verifier_ui_context(
             "http://127.0.0.1:{}/ui-bridge/sdk/console-errors?limit=50",
             port
         );
-        let (control_result, sdk_result) = tokio::join!(
-            client.get(&control_url).send(),
-            client.get(&sdk_url).send(),
-        );
+        let (control_result, sdk_result) =
+            tokio::join!(client.get(&control_url).send(), client.get(&sdk_url).send(),);
         let mut all_errors: Vec<serde_json::Value> = Vec::new();
         for response in [control_result, sdk_result].into_iter().flatten() {
             if response.status().is_success() {
@@ -109,8 +104,7 @@ pub async fn fetch_verifier_ui_context(
     };
 
     // Fetch all concurrently
-    let (snapshot, console_errors, health) =
-        tokio::join!(snapshot_fut, console_fut, health_fut);
+    let (snapshot, console_errors, health) = tokio::join!(snapshot_fut, console_fut, health_fut);
 
     let mut sections = String::new();
 
@@ -143,10 +137,7 @@ pub async fn fetch_verifier_ui_context(
 
         // Error summary
         if let Some(errors) = snap.get("errorSummary") {
-            let count = errors
-                .get("count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let count = errors.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
             if count > 0 {
                 sections.push_str(&format!("**Errors:** {} error(s) detected\n", count));
                 if let Some(items) = errors.get("errors").and_then(|v| v.as_array()) {
@@ -198,13 +189,7 @@ pub async fn fetch_verifier_ui_context(
                     let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     matches!(
                         el_type,
-                        "button"
-                            | "input"
-                            | "select"
-                            | "textarea"
-                            | "link"
-                            | "checkbox"
-                            | "radio"
+                        "button" | "input" | "select" | "textarea" | "link" | "checkbox" | "radio"
                     )
                 })
                 .collect();
@@ -243,10 +228,7 @@ pub async fn fetch_verifier_ui_context(
                     sections.push_str(&format!("  - [{}] {}{}\n", el_type, label, state_flags));
                 }
                 if interactive.len() > 20 {
-                    sections.push_str(&format!(
-                        "  - ... and {} more\n",
-                        interactive.len() - 20
-                    ));
+                    sections.push_str(&format!("  - ... and {} more\n", interactive.len() - 20));
                 }
             }
         }

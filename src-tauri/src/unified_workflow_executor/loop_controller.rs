@@ -239,8 +239,7 @@ impl LoopController {
                         }
 
                         // Override project_path to the runner's worktree if available
-                        let original_project_path =
-                            config.project_path.clone().unwrap_or_default();
+                        let original_project_path = config.project_path.clone().unwrap_or_default();
                         for (original, worktree) in &multi_result.path_mappings {
                             if original_project_path.contains(original)
                                 || original.contains("qontinui-runner")
@@ -297,10 +296,7 @@ impl LoopController {
                             let original_path = &multi_result.path_mappings[i].0;
                             let record = crate::worktree::WorktreeRecord {
                                 id: format!("{}-{}", config.execution_id, i),
-                                worktree_path: result
-                                    .worktree_path
-                                    .to_string_lossy()
-                                    .to_string(),
+                                worktree_path: result.worktree_path.to_string_lossy().to_string(),
                                 branch_name: result.branch_name.clone(),
                                 source_branch: result.source_branch.clone(),
                                 source_commit: result.source_commit.clone(),
@@ -711,11 +707,11 @@ impl LoopController {
                     step_results: all_step_results,
                     duration_ms: start.elapsed().as_millis() as u64,
                     loop_result: last_loop_result,
-                worktree_path: config.worktree_path.clone(),
-                worktree_branch: config.worktree_branch.clone(),
-                workflow_architecture: config.workflow_architecture.clone(),
-                agentic_verification_config: config.agentic_verification_config.clone(),
-                multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                    worktree_path: config.worktree_path.clone(),
+                    worktree_branch: config.worktree_branch.clone(),
+                    workflow_architecture: config.workflow_architecture.clone(),
+                    agentic_verification_config: config.agentic_verification_config.clone(),
+                    multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
                 };
             }
 
@@ -761,11 +757,11 @@ impl LoopController {
                             step_results: all_step_results,
                             duration_ms: start.elapsed().as_millis() as u64,
                             loop_result: last_loop_result,
-                worktree_path: config.worktree_path.clone(),
-                worktree_branch: config.worktree_branch.clone(),
-                workflow_architecture: config.workflow_architecture.clone(),
-                agentic_verification_config: config.agentic_verification_config.clone(),
-                multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                            worktree_path: config.worktree_path.clone(),
+                            worktree_branch: config.worktree_branch.clone(),
+                            workflow_architecture: config.workflow_architecture.clone(),
+                            agentic_verification_config: config.agentic_verification_config.clone(),
+                            multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
                         };
                     }
                 }
@@ -898,11 +894,11 @@ impl LoopController {
                             step_results: all_step_results,
                             duration_ms: start.elapsed().as_millis() as u64,
                             loop_result: last_loop_result,
-                worktree_path: config.worktree_path.clone(),
-                worktree_branch: config.worktree_branch.clone(),
-                workflow_architecture: config.workflow_architecture.clone(),
-                agentic_verification_config: config.agentic_verification_config.clone(),
-                multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                            worktree_path: config.worktree_path.clone(),
+                            worktree_branch: config.worktree_branch.clone(),
+                            workflow_architecture: config.workflow_architecture.clone(),
+                            agentic_verification_config: config.agentic_verification_config.clone(),
+                            multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
                         };
                     }
                     // stop_on_failure=false: skip to next stage
@@ -1148,13 +1144,13 @@ impl LoopController {
                     routing_context: Default::default(),
                     project_path: config.project_path.clone(),
                     acceptance_criteria: config.acceptance_criteria.clone(),
-            multi_agent_mode: config.multi_agent_mode,
-            use_worktree: false, // Worktree is handled at workflow level, not per-stage
-            worktree_path: config.worktree_path.clone(),
-            worktree_branch: config.worktree_branch.clone(),
-            workflow_architecture: config.workflow_architecture.clone(),
-            agentic_verification_config: config.agentic_verification_config.clone(),
-            multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                    multi_agent_mode: config.multi_agent_mode,
+                    use_worktree: false, // Worktree is handled at workflow level, not per-stage
+                    worktree_path: config.worktree_path.clone(),
+                    worktree_branch: config.worktree_branch.clone(),
+                    workflow_architecture: config.workflow_architecture.clone(),
+                    agentic_verification_config: config.agentic_verification_config.clone(),
+                    multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
                 };
 
                 // Handle agentic-first: run the agentic phase before the verification loop.
@@ -1428,9 +1424,9 @@ impl LoopController {
                         loop_result: Some(loop_result),
                         worktree_path: config.worktree_path.clone(),
                         worktree_branch: config.worktree_branch.clone(),
-                workflow_architecture: config.workflow_architecture.clone(),
-                agentic_verification_config: config.agentic_verification_config.clone(),
-                multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                        workflow_architecture: config.workflow_architecture.clone(),
+                        agentic_verification_config: config.agentic_verification_config.clone(),
+                        multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
                     };
                 }
 
@@ -1948,9 +1944,9 @@ impl LoopController {
             loop_result: last_loop_result,
             worktree_path: config.worktree_path.clone(),
             worktree_branch: config.worktree_branch.clone(),
-                workflow_architecture: config.workflow_architecture.clone(),
-                agentic_verification_config: config.agentic_verification_config.clone(),
-                multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+            workflow_architecture: config.workflow_architecture.clone(),
+            agentic_verification_config: config.agentic_verification_config.clone(),
+            multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
         }
     }
 
@@ -2203,11 +2199,9 @@ impl LoopController {
             // automated recovery (reconnect SDK, refresh page). This prevents wasting
             // agentic iterations on environment problems vs actual code issues.
             {
-                let env_result = super::phases::check_environment_readiness(
-                    iteration,
-                    &config.workflow_name,
-                )
-                .await;
+                let env_result =
+                    super::phases::check_environment_readiness(iteration, &config.workflow_name)
+                        .await;
 
                 if !env_result.ready {
                     // Log environment issue to task output
@@ -2934,45 +2928,53 @@ impl LoopController {
 
             // Multi-agent mode: triage failures and spawn specialized fix agents
             // instead of one monolithic AI session.
-            let (agentic_outcome, new_injected_steps) = if config.multi_agent_mode
-                && verification_result.failed_steps > 0
-            {
-                info!(
-                    "MULTI-AGENT: Engaging multi-agent fixer (iteration {}, {} failed steps)",
-                    iteration, verification_result.failed_steps
-                );
+            let (agentic_outcome, new_injected_steps) =
+                if config.multi_agent_mode && verification_result.failed_steps > 0 {
+                    info!(
+                        "MULTI-AGENT: Engaging multi-agent fixer (iteration {}, {} failed steps)",
+                        iteration, verification_result.failed_steps
+                    );
 
-                let ma_result = self.run_multi_agent_fix(
-                    config,
-                    iteration,
-                    &failure_context,
-                    &verification_result,
-                    &all_verification_steps,
-                    logger,
-                ).await;
+                    let ma_result = self
+                        .run_multi_agent_fix(
+                            config,
+                            iteration,
+                            &failure_context,
+                            &verification_result,
+                            &all_verification_steps,
+                            logger,
+                        )
+                        .await;
 
-                match ma_result {
-                    Some((outcome, steps)) => (outcome, steps),
-                    None => {
-                        // Multi-agent triage/fix failed, fall back to standard session
-                        warn!("MULTI-AGENT: Falling back to standard agentic session");
-                        self.agentic_executor
-                            .run_agentic(config, iteration, &failure_context, has_agentic_steps, agentic_steps, logger)
-                            .await
+                    match ma_result {
+                        Some((outcome, steps)) => (outcome, steps),
+                        None => {
+                            // Multi-agent triage/fix failed, fall back to standard session
+                            warn!("MULTI-AGENT: Falling back to standard agentic session");
+                            self.agentic_executor
+                                .run_agentic(
+                                    config,
+                                    iteration,
+                                    &failure_context,
+                                    has_agentic_steps,
+                                    agentic_steps,
+                                    logger,
+                                )
+                                .await
+                        }
                     }
-                }
-            } else {
-                self.agentic_executor
-                    .run_agentic(
-                        config,
-                        iteration,
-                        &failure_context,
-                        has_agentic_steps,
-                        agentic_steps,
-                        logger,
-                    )
-                    .await
-            };
+                } else {
+                    self.agentic_executor
+                        .run_agentic(
+                            config,
+                            iteration,
+                            &failure_context,
+                            has_agentic_steps,
+                            agentic_steps,
+                            logger,
+                        )
+                        .await
+                };
 
             // Restore reflection_mode if we forced it for this iteration only
             if reflection_was_forced {
@@ -3131,8 +3133,7 @@ impl LoopController {
                     .output()
                     .map(|o| truncate_str(o, 5000).to_string());
                 tokio::spawn(async move {
-                    let sync_service =
-                        crate::commands::task_sync::AITaskSyncService::new();
+                    let sync_service = crate::commands::task_sync::AITaskSyncService::new();
                     // Start
                     if let Err(e) = sync_service
                         .sync_session_started(&exec_id, session_num)
@@ -3829,7 +3830,11 @@ impl LoopController {
                     iteration_results,
                     final_verdict: None,
                 };
-                self.canvas_manager.lock().await.on_agentic_verification_exit(&av_result).await;
+                self.canvas_manager
+                    .lock()
+                    .await
+                    .on_agentic_verification_exit(&av_result)
+                    .await;
                 return av_result.to_loop_result();
             }
 
@@ -3848,7 +3853,11 @@ impl LoopController {
                     iteration_results: iteration_results.clone(),
                     final_verdict: iteration_results.last().map(|r| r.verdict.clone()),
                 };
-                self.canvas_manager.lock().await.on_agentic_verification_exit(&av_result).await;
+                self.canvas_manager
+                    .lock()
+                    .await
+                    .on_agentic_verification_exit(&av_result)
+                    .await;
                 return av_result.to_loop_result();
             }
 
@@ -3903,16 +3912,21 @@ impl LoopController {
                 }
 
                 // Apply verifier model/provider overrides
-                config.model_override = av_config.verifier.model.clone().or_else(|| original_model_override.clone());
-                config.provider_override = av_config.verifier.provider.clone().or_else(|| original_provider_override.clone());
+                config.model_override = av_config
+                    .verifier
+                    .model
+                    .clone()
+                    .or_else(|| original_model_override.clone());
+                config.provider_override = av_config
+                    .verifier
+                    .provider
+                    .clone()
+                    .or_else(|| original_provider_override.clone());
 
                 // Run verifier through the agentic executor with a verification prompt
                 let verifier_prompt = ExecutionStepConfig {
                     step_type: "prompt".to_string(),
-                    name: Some(format!(
-                        "Verification Agent (iteration {})",
-                        iteration
-                    )),
+                    name: Some(format!("Verification Agent (iteration {})", iteration)),
                     prompt_content: Some(verifier_context),
                     ..ExecutionStepConfig::default()
                 };
@@ -4021,9 +4035,17 @@ impl LoopController {
                         // Canvas: emit iteration panel and exit summary
                         {
                             let verifier_ms = verdict.as_ref().map(|(_, d)| *d).unwrap_or(0);
-                            self.canvas_manager.lock().await.on_agentic_verification_iteration(
-                                iteration, v, None, verifier_ms, 0,
-                            ).await;
+                            self.canvas_manager
+                                .lock()
+                                .await
+                                .on_agentic_verification_iteration(
+                                    iteration,
+                                    v,
+                                    None,
+                                    verifier_ms,
+                                    0,
+                                )
+                                .await;
                         }
                         let av_result = AgenticVerificationResult {
                             iterations_run: iteration,
@@ -4034,7 +4056,11 @@ impl LoopController {
                             iteration_results,
                             final_verdict: Some(v.clone()),
                         };
-                        self.canvas_manager.lock().await.on_agentic_verification_exit(&av_result).await;
+                        self.canvas_manager
+                            .lock()
+                            .await
+                            .on_agentic_verification_exit(&av_result)
+                            .await;
                         return av_result.to_loop_result();
                     }
                 } else {
@@ -4045,14 +4071,18 @@ impl LoopController {
                 if v.status == VerificationStatus::Unreachable || v.unreachable {
                     info!(
                         "AGENTIC-VERIFICATION: Goal deemed unreachable: {}",
-                        v.unreachable_reason.as_deref().unwrap_or("(no reason given)")
+                        v.unreachable_reason
+                            .as_deref()
+                            .unwrap_or("(no reason given)")
                     );
                     // Canvas: emit iteration panel for unreachable verdict
                     {
                         let verifier_ms = verdict.as_ref().map(|(_, d)| *d).unwrap_or(0);
-                        self.canvas_manager.lock().await.on_agentic_verification_iteration(
-                            iteration, v, None, verifier_ms, 0,
-                        ).await;
+                        self.canvas_manager
+                            .lock()
+                            .await
+                            .on_agentic_verification_iteration(iteration, v, None, verifier_ms, 0)
+                            .await;
                     }
                     iteration_results.push(AgenticVerificationIterationResult {
                         iteration,
@@ -4071,7 +4101,11 @@ impl LoopController {
                         iteration_results,
                         final_verdict: Some(v.clone()),
                     };
-                    self.canvas_manager.lock().await.on_agentic_verification_exit(&av_result).await;
+                    self.canvas_manager
+                        .lock()
+                        .await
+                        .on_agentic_verification_exit(&av_result)
+                        .await;
                     return av_result.to_loop_result();
                 }
             }
@@ -4087,8 +4121,16 @@ impl LoopController {
             let worker_start = std::time::Instant::now();
 
             // Apply worker model/provider overrides
-            config.model_override = av_config.worker.model.clone().or_else(|| original_model_override.clone());
-            config.provider_override = av_config.worker.provider.clone().or_else(|| original_provider_override.clone());
+            config.model_override = av_config
+                .worker
+                .model
+                .clone()
+                .or_else(|| original_model_override.clone());
+            config.provider_override = av_config
+                .worker
+                .provider
+                .clone()
+                .or_else(|| original_provider_override.clone());
 
             // Build worker context from the verification verdict
             let worker_failure_context = if let Some((ref v, _)) = verdict {
@@ -4130,12 +4172,12 @@ impl LoopController {
                     };
                     Some(summary)
                 }
-                AgenticOutcome::Failed { output, error, .. } => {
-                    Some(format!("Failed: {} (output: {}...)", error, &output[..output.len().min(200)]))
-                }
-                AgenticOutcome::Error { error } => {
-                    Some(format!("Error: {}", error))
-                }
+                AgenticOutcome::Failed { output, error, .. } => Some(format!(
+                    "Failed: {} (output: {}...)",
+                    error,
+                    &output[..output.len().min(200)]
+                )),
+                AgenticOutcome::Error { error } => Some(format!("Error: {}", error)),
                 AgenticOutcome::Skipped => None,
             };
 
@@ -4176,7 +4218,8 @@ impl LoopController {
                     last.worker_summary.as_deref(),
                     last.verifier_duration_ms,
                     last.worker_duration_ms,
-                ).await;
+                )
+                .await;
                 cm.on_agentic_verification_tracker(&iteration_results).await;
             }
 
@@ -4235,36 +4278,41 @@ impl LoopController {
                     &self.checkpoint_db,
                     agent_type,
                 ) {
-                    debug!("MULTI-AGENT-PIPELINE: Using prompt variant '{}' v{} for {}",
-                        variant.variant_name, variant.version, agent_type);
+                    debug!(
+                        "MULTI-AGENT-PIPELINE: Using prompt variant '{}' v{} for {}",
+                        variant.variant_name, variant.version, agent_type
+                    );
                     variants.insert(agent_type.to_string(), variant.prompt_content);
                 }
             }
             variants
         };
         if !active_prompt_variants.is_empty() {
-            info!("MULTI-AGENT-PIPELINE: {} active prompt variant(s) loaded from registry",
-                active_prompt_variants.len());
+            info!(
+                "MULTI-AGENT-PIPELINE: {} active prompt variant(s) loaded from registry",
+                active_prompt_variants.len()
+            );
         }
 
         // Check for active canary rollouts targeting pipeline agents.
         // If a canary is active, probabilistically decide whether this run uses the canary config.
-        let active_canary: Option<(String, String)> = { // (canary_id, recommendation_id)
+        let active_canary: Option<(String, String)> = {
+            // (canary_id, recommendation_id)
             match crate::meta_optimizer::canary::get_active_canaries(&self.checkpoint_db) {
-                Ok(canaries) => {
-                    canaries.into_iter().find_map(|c| {
-                        if crate::meta_optimizer::canary::should_apply_canary(
-                            &self.checkpoint_db,
-                            &c.recommendation_id,
-                        ) {
-                            info!("MULTI-AGENT-PIPELINE: Canary rollout {} active for this run ({}%)",
-                                c.id, c.percentage);
-                            Some((c.id, c.recommendation_id))
-                        } else {
-                            None
-                        }
-                    })
-                }
+                Ok(canaries) => canaries.into_iter().find_map(|c| {
+                    if crate::meta_optimizer::canary::should_apply_canary(
+                        &self.checkpoint_db,
+                        &c.recommendation_id,
+                    ) {
+                        info!(
+                            "MULTI-AGENT-PIPELINE: Canary rollout {} active for this run ({}%)",
+                            c.id, c.percentage
+                        );
+                        Some((c.id, c.recommendation_id))
+                    } else {
+                        None
+                    }
+                }),
                 Err(_) => None,
             }
         };
@@ -4280,12 +4328,18 @@ impl LoopController {
             ) {
                 Ok(overrides) => {
                     for (agent_type, prompt_content) in overrides {
-                        info!("MULTI-AGENT-PIPELINE: Canary injecting prompt override for {}", agent_type);
+                        info!(
+                            "MULTI-AGENT-PIPELINE: Canary injecting prompt override for {}",
+                            agent_type
+                        );
                         active_prompt_variants.insert(agent_type, prompt_content);
                     }
                 }
                 Err(e) => {
-                    warn!("MULTI-AGENT-PIPELINE: Failed to load canary prompt overrides: {}", e);
+                    warn!(
+                        "MULTI-AGENT-PIPELINE: Failed to load canary prompt overrides: {}",
+                        e
+                    );
                 }
             }
         }
@@ -4315,18 +4369,19 @@ impl LoopController {
             .map(|(i, step)| {
                 let step_name = step.name.clone().unwrap_or_else(|| format!("step_{}", i));
                 PipelineAcceptanceCriterion {
-                id: format!("criterion_{}", i),
-                spec_assertion_id: step_name.clone(),
-                spec_group_id: step.id.clone().unwrap_or_default(),
-                description: step_name,
-                criterion_type: "deterministic".to_string(),
-                verification_method: step.step_type.clone(),
-                depends_on: vec![],
-                target_elements: vec![],
-                estimated_complexity: "simple".to_string(),
-                severity: "critical".to_string(),
-                enabled: true,
-            }})
+                    id: format!("criterion_{}", i),
+                    spec_assertion_id: step_name.clone(),
+                    spec_group_id: step.id.clone().unwrap_or_default(),
+                    description: step_name,
+                    criterion_type: "deterministic".to_string(),
+                    verification_method: step.step_type.clone(),
+                    depends_on: vec![],
+                    target_elements: vec![],
+                    estimated_complexity: "simple".to_string(),
+                    severity: "critical".to_string(),
+                    enabled: true,
+                }
+            })
             .collect();
         let analyst_duration = analyst_start.elapsed().as_millis() as u64;
 
@@ -4369,7 +4424,10 @@ impl LoopController {
         );
 
         // ── Phase 2: DAG Construction (deterministic) ───────────────────
-        info!("MULTI-AGENT-PIPELINE: Phase 2 — DAG Construction (strategy={})", pipeline_config.dag_strategy);
+        info!(
+            "MULTI-AGENT-PIPELINE: Phase 2 — DAG Construction (strategy={})",
+            pipeline_config.dag_strategy
+        );
 
         // Build a single subtree containing all criteria (flat DAG for initial impl).
         // The DAG builder will be enhanced to parse depends_on from analyst output.
@@ -4413,16 +4471,30 @@ impl LoopController {
         // ── Phase 4: Code Location ─────────────────────────────────────
         info!("MULTI-AGENT-PIPELINE: Phase 4 — Code Location");
 
-        let located_criteria: Vec<LocatedCriterion> = if pipeline_config.locator.max_tokens.unwrap_or(0) > 0 {
+        let located_criteria: Vec<LocatedCriterion> = if pipeline_config
+            .locator
+            .max_tokens
+            .unwrap_or(0)
+            > 0
+        {
             let locator_start = std::time::Instant::now();
 
             // Get the project file tree for the locator to analyze
-            let project_path = config.project_path.clone().unwrap_or_else(|| ".".to_string());
+            let project_path = config
+                .project_path
+                .clone()
+                .unwrap_or_else(|| ".".to_string());
             let file_tree = get_file_tree(&project_path);
 
             // Build the locator prompt
-            let criteria_text = criteria.iter()
-                .map(|c| format!("- {} (id: {}): {}", c.spec_assertion_id, c.id, c.description))
+            let criteria_text = criteria
+                .iter()
+                .map(|c| {
+                    format!(
+                        "- {} (id: {}): {}",
+                        c.spec_assertion_id, c.id, c.description
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -4509,19 +4581,23 @@ Only output the JSON array, nothing else."#,
                             confidence: f64,
                         }
 
-                        match serde_json::from_str::<Vec<LocatorOutputEntry>>(&output[start..=end]) {
+                        match serde_json::from_str::<Vec<LocatorOutputEntry>>(&output[start..=end])
+                        {
                             Ok(entries) => {
-                                entries.into_iter().filter_map(|entry| {
-                                    // Find the matching criterion to embed in the LocatedCriterion
-                                    criteria.iter().find(|c| c.id == entry.criterion_id).map(|c| {
-                                        LocatedCriterion {
-                                            criterion: c.clone(),
-                                            target_files: entry.target_files,
-                                            related_files: entry.related_files,
-                                            confidence: entry.confidence,
-                                        }
+                                entries
+                                    .into_iter()
+                                    .filter_map(|entry| {
+                                        // Find the matching criterion to embed in the LocatedCriterion
+                                        criteria.iter().find(|c| c.id == entry.criterion_id).map(
+                                            |c| LocatedCriterion {
+                                                criterion: c.clone(),
+                                                target_files: entry.target_files,
+                                                related_files: entry.related_files,
+                                                confidence: entry.confidence,
+                                            },
+                                        )
                                     })
-                                }).collect()
+                                    .collect()
                             }
                             Err(e) => {
                                 warn!("MULTI-AGENT-PIPELINE: Failed to parse locator JSON: {}", e);
@@ -4710,7 +4786,10 @@ Only output the JSON array, nothing else."#,
                             )
                             .await
                     } else {
-                        (crate::unified_workflow_executor::AgenticOutcome::Skipped, vec![])
+                        (
+                            crate::unified_workflow_executor::AgenticOutcome::Skipped,
+                            vec![],
+                        )
                     };
 
                     let implementer_duration = implementer_start.elapsed().as_millis() as u64;
@@ -4746,7 +4825,9 @@ Only output the JSON array, nothing else."#,
                     let level_verification_steps: Vec<ExecutionStepConfig> = verification_steps
                         .iter()
                         .enumerate()
-                        .filter(|(i, _)| level_criteria.contains(&format!("criterion_{}", i).as_str()))
+                        .filter(|(i, _)| {
+                            level_criteria.contains(&format!("criterion_{}", i).as_str())
+                        })
                         .map(|(_, step)| step.clone())
                         .collect();
 
@@ -4842,9 +4923,7 @@ Only output the JSON array, nothing else."#,
                     if retries_used >= pipeline_config.max_retries_per_subtree {
                         info!(
                             "MULTI-AGENT-PIPELINE: Level {} exhausted retries ({}/{})",
-                            level_idx,
-                            retries_used,
-                            pipeline_config.max_retries_per_subtree
+                            level_idx, retries_used, pipeline_config.max_retries_per_subtree
                         );
                         subtree_all_passed = false;
                         break; // No more retries, move on
@@ -4863,9 +4942,7 @@ Only output the JSON array, nothing else."#,
 
                     info!(
                         "MULTI-AGENT-PIPELINE: Level {} failed, retrying ({}/{} retries used)",
-                        level_idx,
-                        retries_used,
-                        pipeline_config.max_retries_per_subtree
+                        level_idx, retries_used, pipeline_config.max_retries_per_subtree
                     );
                 } // end retry loop
 
@@ -4875,19 +4952,21 @@ Only output the JSON array, nothing else."#,
 
                 subtree_level_results.push(SubtreeLevelResult {
                     level: level_idx as u32,
-                    implementer_trace: last_implementer_trace.unwrap_or_else(|| PipelineAgentTrace {
-                        agent_type: "implementer".to_string(),
-                        agent_id: format!("impl_{}_{}", subtree.id, level_idx),
-                        run_id: config.execution_id.clone(),
-                        input_snapshot: serde_json::json!(null),
-                        output_snapshot: serde_json::json!(null),
-                        config: pipeline_config.implementer.clone(),
-                        duration_ms: 0,
-                        tokens_in: 0,
-                        tokens_out: 0,
-                        cost_usd: 0.0,
-                        downstream_success: None,
-                        output_quality_score: None,
+                    implementer_trace: last_implementer_trace.unwrap_or_else(|| {
+                        PipelineAgentTrace {
+                            agent_type: "implementer".to_string(),
+                            agent_id: format!("impl_{}_{}", subtree.id, level_idx),
+                            run_id: config.execution_id.clone(),
+                            input_snapshot: serde_json::json!(null),
+                            output_snapshot: serde_json::json!(null),
+                            config: pipeline_config.implementer.clone(),
+                            duration_ms: 0,
+                            tokens_in: 0,
+                            tokens_out: 0,
+                            cost_usd: 0.0,
+                            downstream_success: None,
+                            output_quality_score: None,
+                        }
                     }),
                     verifier_trace: last_verifier_trace.unwrap_or_else(|| PipelineAgentTrace {
                         agent_type: "verifier".to_string(),
@@ -5007,10 +5086,7 @@ Only output the JSON array, nothing else."#,
             total_cost_usd: 0.0,
         };
 
-        info!(
-            "MULTI-AGENT-PIPELINE: {}",
-            result.summary()
-        );
+        info!("MULTI-AGENT-PIPELINE: {}", result.summary());
 
         // Persist agent traces for meta-optimizer analysis
         if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_traces(
@@ -5023,10 +5099,10 @@ Only output the JSON array, nothing else."#,
 
         // Store the full pipeline result in task run result_data for autoresearch retrieval
         if let Ok(result_json) = serde_json::to_string(&result) {
-            if let Err(e) = self.checkpoint_db.update_task_run_result_data(
-                &config.execution_id,
-                &result_json,
-            ) {
+            if let Err(e) = self
+                .checkpoint_db
+                .update_task_run_result_data(&config.execution_id, &result_json)
+            {
                 warn!("Failed to store pipeline result_data: {}", e);
             }
         }
@@ -5141,13 +5217,18 @@ Only output the JSON array, nothing else."#,
                                 optimizer_type, count, eid
                             );
                             // Complete the optimizer run record
-                            if let Err(e) = crate::meta_optimizer::recommendations::complete_optimizer_run(
-                                &db,
-                                &optimizer_run_id,
-                                0, // runs_analyzed is not tracked here
-                                count as i64,
-                            ) {
-                                warn!("Failed to complete optimizer run {}: {}", optimizer_run_id, e);
+                            if let Err(e) =
+                                crate::meta_optimizer::recommendations::complete_optimizer_run(
+                                    &db,
+                                    &optimizer_run_id,
+                                    0, // runs_analyzed is not tracked here
+                                    count as i64,
+                                )
+                            {
+                                warn!(
+                                    "Failed to complete optimizer run {}: {}",
+                                    optimizer_run_id, e
+                                );
                             }
                         }
                         Err(e) => {
@@ -5625,34 +5706,45 @@ Only output the JSON array, nothing else."#,
         verification_result: &crate::step_executor::VerificationPhaseResult,
         all_verification_steps: &[crate::step_executor::ExecutionStepConfig],
         logger: &StepEventLogger,
-    ) -> Option<(super::types::AgenticOutcome, Vec<crate::step_executor::ExecutionStepConfig>)> {
+    ) -> Option<(
+        super::types::AgenticOutcome,
+        Vec<crate::step_executor::ExecutionStepConfig>,
+    )> {
         use super::multi_agent_fixer::*;
 
         // Step 1: Triage — classify failures
         let triage_prompt = build_triage_prompt(failure_context, &verification_result.step_results);
 
-        let triage_result = match self.agentic_executor.run_triage_prompt(
-            &triage_prompt,
-            config.resolve_model_for_phase("verification"), // Use fast model for triage
-        ).await {
-            Ok(response) => {
-                match parse_triage_response(&response) {
-                    Ok(result) => {
-                        info!(
-                            "MULTI-AGENT: Triage classified {} failure group(s): {}",
-                            result.groups.len(),
-                            result.summary
-                        );
-                        result
-                    }
-                    Err(e) => {
-                        warn!("MULTI-AGENT: Triage parse failed ({}), using deterministic fallback", e);
-                        deterministic_triage(&verification_result.step_results)
-                    }
+        let triage_result = match self
+            .agentic_executor
+            .run_triage_prompt(
+                &triage_prompt,
+                config.resolve_model_for_phase("verification"), // Use fast model for triage
+            )
+            .await
+        {
+            Ok(response) => match parse_triage_response(&response) {
+                Ok(result) => {
+                    info!(
+                        "MULTI-AGENT: Triage classified {} failure group(s): {}",
+                        result.groups.len(),
+                        result.summary
+                    );
+                    result
                 }
-            }
+                Err(e) => {
+                    warn!(
+                        "MULTI-AGENT: Triage parse failed ({}), using deterministic fallback",
+                        e
+                    );
+                    deterministic_triage(&verification_result.step_results)
+                }
+            },
             Err(e) => {
-                warn!("MULTI-AGENT: Triage prompt failed ({}), using deterministic fallback", e);
+                warn!(
+                    "MULTI-AGENT: Triage prompt failed ({}), using deterministic fallback",
+                    e
+                );
                 deterministic_triage(&verification_result.step_results)
             }
         };
@@ -5674,7 +5766,10 @@ Only output the JSON array, nothing else."#,
 
             // Skip cascading failures whose dependencies haven't been fixed
             if group.failure_type == FailureType::Cascading {
-                let deps_fixed = group.blocked_by.iter().all(|dep| fixed_groups.contains(dep));
+                let deps_fixed = group
+                    .blocked_by
+                    .iter()
+                    .all(|dep| fixed_groups.contains(dep));
                 if !deps_fixed {
                     info!(
                         "MULTI-AGENT: Skipping cascading group '{}' (dependencies not yet fixed)",
@@ -5685,7 +5780,8 @@ Only output the JSON array, nothing else."#,
             }
 
             // Build focused prompt based on failure type
-            let group_failure_context = extract_group_failure_context(group, &verification_result.step_results);
+            let group_failure_context =
+                extract_group_failure_context(group, &verification_result.step_results);
 
             let working_dir = config.project_path.as_deref();
 
@@ -5693,27 +5789,28 @@ Only output the JSON array, nothing else."#,
                 FailureType::LintFormat | FailureType::Compilation => {
                     build_quick_fix_prompt(group, &group_failure_context, working_dir)
                 }
-                _ => {
-                    build_feature_fix_prompt(
-                        group,
-                        &group_failure_context,
-                        &config.base_prompt,
-                        working_dir,
-                    )
-                }
+                _ => build_feature_fix_prompt(
+                    group,
+                    &group_failure_context,
+                    &config.base_prompt,
+                    working_dir,
+                ),
             };
 
             // Run the focused fix agent
             let agent_label = format!("fix-{}", group.id);
-            let (success, output, duration_ms) = self.agentic_executor.run_focused_session(
-                &config.execution_id,
-                &config.workflow_name,
-                iteration,
-                &agent_label,
-                &prompt,
-                config.resolve_model_for_phase("agentic"),
-                logger,
-            ).await;
+            let (success, output, duration_ms) = self
+                .agentic_executor
+                .run_focused_session(
+                    &config.execution_id,
+                    &config.workflow_name,
+                    iteration,
+                    &agent_label,
+                    &prompt,
+                    config.resolve_model_for_phase("agentic"),
+                    logger,
+                )
+                .await;
 
             info!(
                 "MULTI-AGENT: Fix agent '{}' completed in {}ms (success={})",
@@ -5721,17 +5818,23 @@ Only output the JSON array, nothing else."#,
             );
 
             // Run targeted verification for this group's steps
-            let targeted_result = self.verification_executor.run_targeted_verification(
-                all_verification_steps,
-                &group.step_indices,
-                &config.execution_id,
-                iteration,
-                &config.workflow_name,
-            ).await;
+            let targeted_result = self
+                .verification_executor
+                .run_targeted_verification(
+                    all_verification_steps,
+                    &group.step_indices,
+                    &config.execution_id,
+                    iteration,
+                    &config.workflow_name,
+                )
+                .await;
 
             let group_passed = targeted_result.all_passed;
             if group_passed {
-                info!("MULTI-AGENT: Group '{}' — targeted verification PASSED", group.id);
+                info!(
+                    "MULTI-AGENT: Group '{}' — targeted verification PASSED",
+                    group.id
+                );
                 fixed_groups.push(group.id.clone());
             } else {
                 info!(
@@ -5963,11 +6066,14 @@ pub struct WorkflowResult {
     /// Worktree branch name (if workflow ran in a worktree)
     pub worktree_branch: Option<String>,
     /// Workflow architecture used (traditional, agentic_verification, or multi_agent_pipeline).
-    pub workflow_architecture: Option<crate::autoresearch::agentic_verification::WorkflowArchitecture>,
+    pub workflow_architecture:
+        Option<crate::autoresearch::agentic_verification::WorkflowArchitecture>,
     /// Agentic verification config (if agentic verification was used).
-    pub agentic_verification_config: Option<crate::autoresearch::agentic_verification::AgenticVerificationConfig>,
+    pub agentic_verification_config:
+        Option<crate::autoresearch::agentic_verification::AgenticVerificationConfig>,
     /// Multi-agent pipeline config (if multi-agent pipeline was used).
-    pub multi_agent_pipeline_config: Option<crate::autoresearch::agentic_verification::MultiAgentPipelineConfig>,
+    pub multi_agent_pipeline_config:
+        Option<crate::autoresearch::agentic_verification::MultiAgentPipelineConfig>,
 }
 
 impl WorkflowResult {
@@ -6343,13 +6449,13 @@ pub async fn resume_interrupted_workflows(
                                 verification_history: std::collections::HashMap::new(),
                                 routing_context: Default::default(),
                                 project_path: crate::mcp::shared::current_project_path(),
-            multi_agent_mode: false,
-            use_worktree: false,
-            worktree_path: None,
-            worktree_branch: None,
-            workflow_architecture: None,
-            agentic_verification_config: None,
-            multi_agent_pipeline_config: None,
+                                multi_agent_mode: false,
+                                use_worktree: false,
+                                worktree_path: None,
+                                worktree_branch: None,
+                                workflow_architecture: None,
+                                agentic_verification_config: None,
+                                multi_agent_pipeline_config: None,
                                 acceptance_criteria: workflow.acceptance_criteria.clone(),
                             };
 
@@ -6545,13 +6651,13 @@ pub async fn resume_interrupted_workflows(
                                 cross_workflow_learning: true,
                                 verification_history: std::collections::HashMap::new(),
                                 routing_context: Default::default(),
-            multi_agent_mode: false,
-            use_worktree: false,
-            worktree_path: None,
-            worktree_branch: None,
-            workflow_architecture: None,
-            agentic_verification_config: None,
-            multi_agent_pipeline_config: None,
+                                multi_agent_mode: false,
+                                use_worktree: false,
+                                worktree_path: None,
+                                worktree_branch: None,
+                                workflow_architecture: None,
+                                agentic_verification_config: None,
+                                multi_agent_pipeline_config: None,
                                 project_path: crate::mcp::shared::current_project_path(),
                                 acceptance_criteria: workflow.acceptance_criteria.clone(),
                             };

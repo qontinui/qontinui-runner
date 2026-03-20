@@ -232,9 +232,14 @@ impl SchedulerService {
                 workflow_name,
                 config_path,
                 monitor_index,
+                workflow_id,
             } => {
-                self.execute_workflow(workflow_name, config_path.as_deref(), *monitor_index)
-                    .await
+                if let Some(id) = workflow_id {
+                    self.execute_unified_workflow(id, *monitor_index).await
+                } else {
+                    self.execute_workflow(workflow_name, config_path.as_deref(), *monitor_index)
+                        .await
+                }
             }
             ScheduledTaskType::Prompt {
                 prompt_id,
@@ -388,6 +393,61 @@ impl SchedulerService {
             .unwrap_or(false);
 
         Ok((success, session_id))
+    }
+
+    /// Execute a unified workflow by ID
+    async fn execute_unified_workflow(
+        &self,
+        workflow_id: &str,
+        monitor_index: Option<i32>,
+    ) -> Result<(bool, Option<String>), String> {
+        info!(
+            "Executing unified workflow '{}' (monitor: {:?})",
+            workflow_id, monitor_index
+        );
+
+        let client = reqwest::Client::new();
+        let base_url = crate::mcp::types::get_self_base_url_from_env();
+
+        let mut request_body = serde_json::json!({});
+        if let Some(monitor) = monitor_index {
+            request_body["monitor_index"] = serde_json::json!(monitor);
+        }
+
+        let run_response = client
+            .post(format!(
+                "{}/unified-workflows/{}/run",
+                base_url, workflow_id
+            ))
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to run unified workflow: {}", e))?;
+
+        if !run_response.status().is_success() {
+            let error_text = run_response.text().await.unwrap_or_default();
+            return Err(format!("Failed to run unified workflow: {}", error_text));
+        }
+
+        let response_json: serde_json::Value = run_response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        let task_run_id = response_json
+            .get("data")
+            .and_then(|d| d.get("task_run_id"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        // Unified workflows are non-blocking (they return a task_run_id).
+        // Return success=true to indicate the workflow was launched successfully.
+        let launched = response_json
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        Ok((launched, task_run_id))
     }
 
     /// Execute a prompt task

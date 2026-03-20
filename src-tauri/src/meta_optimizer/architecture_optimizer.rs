@@ -62,7 +62,10 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
         build_api_step(
             "Load optimizer context",
             "GET",
-            &format!("{}/meta-optimizer/optimizer-context?type=architecture", base_url),
+            &format!(
+                "{}/meta-optimizer/optimizer-context?type=architecture",
+                base_url
+            ),
             None,
             Some("optimizer_context"),
         ),
@@ -70,10 +73,7 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
         build_api_step(
             "Load learning outcomes by architecture",
             "GET",
-            &format!(
-                "{}/learning/outcomes?limit=200",
-                base_url
-            ),
+            &format!("{}/learning/outcomes?limit=200", base_url),
             None,
             Some("learning_outcomes"),
         ),
@@ -81,7 +81,10 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
         build_api_step(
             "Load pipeline agent traces",
             "GET",
-            &format!("{}/meta-optimizer/agent-trace-aggregates?limit=100", base_url),
+            &format!(
+                "{}/meta-optimizer/agent-trace-aggregates?limit=100",
+                base_url
+            ),
             None,
             Some("agent_traces"),
         ),

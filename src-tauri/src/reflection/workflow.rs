@@ -475,13 +475,13 @@ pub fn build_reflection_config(
         routing_context: Default::default(),
         project_path: crate::mcp::shared::current_project_path(),
         acceptance_criteria: None,
-            multi_agent_mode: false,
-            use_worktree: false,
-            worktree_path: None,
-            worktree_branch: None,
-            workflow_architecture: None,
-            agentic_verification_config: None,
-            multi_agent_pipeline_config: None,
+        multi_agent_mode: false,
+        use_worktree: false,
+        worktree_path: None,
+        worktree_branch: None,
+        workflow_architecture: None,
+        agentic_verification_config: None,
+        multi_agent_pipeline_config: None,
     }
 }
 
@@ -850,7 +850,13 @@ and record any new fixes needed using `[REFLECTION_FIX:...]` markers."#;
 
     format!(
         "{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        preamble, data_section, REFLECTION_GUARDRAILS, marker_section, causal_section, analysis_steps, evaluation_section
+        preamble,
+        data_section,
+        REFLECTION_GUARDRAILS,
+        marker_section,
+        causal_section,
+        analysis_steps,
+        evaluation_section
     )
 }
 
@@ -1065,13 +1071,13 @@ pub fn build_project_reflection_config(
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
         project_path,
-            multi_agent_mode: false,
-            use_worktree: false,
-            worktree_path: None,
-            worktree_branch: None,
-            workflow_architecture: None,
-            agentic_verification_config: None,
-            multi_agent_pipeline_config: None,
+        multi_agent_mode: false,
+        use_worktree: false,
+        worktree_path: None,
+        worktree_branch: None,
+        workflow_architecture: None,
+        agentic_verification_config: None,
+        multi_agent_pipeline_config: None,
         acceptance_criteria: None,
     }
 }
@@ -1452,13 +1458,13 @@ pub fn build_ui_bridge_reflection_config(
         cross_workflow_learning: true,
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
-            multi_agent_mode: false,
-            use_worktree: false,
-            worktree_path: None,
-            worktree_branch: None,
-            workflow_architecture: None,
-            agentic_verification_config: None,
-            multi_agent_pipeline_config: None,
+        multi_agent_mode: false,
+        use_worktree: false,
+        worktree_path: None,
+        worktree_branch: None,
+        workflow_architecture: None,
+        agentic_verification_config: None,
+        multi_agent_pipeline_config: None,
         project_path: crate::mcp::shared::current_project_path(),
         acceptance_criteria: None,
     }

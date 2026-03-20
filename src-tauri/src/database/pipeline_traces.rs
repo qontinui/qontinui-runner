@@ -239,7 +239,10 @@ pub fn get_agent_aggregates_for_period(
         match result {
             Ok(agg) => Ok(agg),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to query agent aggregates for period: {}", e)),
+            Err(e) => Err(format!(
+                "Failed to query agent aggregates for period: {}",
+                e
+            )),
         }
     })
 }

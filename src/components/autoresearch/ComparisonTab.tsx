@@ -57,9 +57,9 @@ export function ComparisonTab() {
   // Launch form state
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [selectedWorkflow, setSelectedWorkflow] = useState("");
-  const [variationType, setVariationType] = useState<
-    "architecture" | "same" | "custom"
-  >("architecture");
+  const [variationType, setVariationType] = useState<"architecture" | "same" | "custom">(
+    "architecture",
+  );
   const [useWorktree, setUseWorktree] = useState(true);
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -164,9 +164,7 @@ export function ComparisonTab() {
     <div className="p-4 space-y-6 text-zinc-200">
       {/* ── Launch Section ── */}
       <div className="border border-zinc-700 rounded-lg p-4 bg-zinc-900/50">
-        <h3 className="text-sm font-semibold text-zinc-100 mb-3">
-          Launch Comparison
-        </h3>
+        <h3 className="text-sm font-semibold text-zinc-100 mb-3">Launch Comparison</h3>
 
         <div className="flex flex-wrap items-end gap-4">
           {/* Workflow selector */}
@@ -177,9 +175,7 @@ export function ComparisonTab() {
               value={selectedWorkflow}
               onChange={(e) => setSelectedWorkflow(e.target.value)}
             >
-              {workflows.length === 0 && (
-                <option value="">No workflows</option>
-              )}
+              {workflows.length === 0 && <option value="">No workflows</option>}
               {workflows.map((w) => (
                 <option key={w.id} value={w.id}>
                   {w.name}
@@ -234,18 +230,14 @@ export function ComparisonTab() {
           </button>
         </div>
 
-        {error && (
-          <p className="mt-2 text-xs text-red-400">{error}</p>
-        )}
+        {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
       </div>
 
       {/* ── Active Comparison Detail ── */}
       {activeData && (
         <div className="border border-zinc-700 rounded-lg p-4 bg-zinc-900/50">
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-sm font-semibold text-zinc-100">
-              Active Comparison
-            </h3>
+            <h3 className="text-sm font-semibold text-zinc-100">Active Comparison</h3>
             <span
               className={`px-2 py-0.5 text-[11px] rounded border ${
                 statusStyle[activeData.status] || statusStyle.pending
@@ -283,9 +275,7 @@ export function ComparisonTab() {
                     {entry.result ? entry.result.iterations : "-"}
                   </td>
                   <td className="py-1.5 pr-4 text-right text-zinc-300">
-                    {entry.result
-                      ? fmtDuration(entry.result.duration_ms)
-                      : "-"}
+                    {entry.result ? fmtDuration(entry.result.duration_ms) : "-"}
                   </td>
                   <td className="py-1.5 text-center">
                     {entry.result ? (
@@ -314,9 +304,7 @@ export function ComparisonTab() {
       {/* ── History ── */}
       {comparisons.length > 0 && (
         <div className="border border-zinc-700 rounded-lg p-4 bg-zinc-900/50">
-          <h3 className="text-sm font-semibold text-zinc-100 mb-3">
-            Recent Comparisons
-          </h3>
+          <h3 className="text-sm font-semibold text-zinc-100 mb-3">Recent Comparisons</h3>
           <table className="w-full text-xs">
             <thead>
               <tr className="text-zinc-500 border-b border-zinc-800">
@@ -336,12 +324,8 @@ export function ComparisonTab() {
                   }`}
                   onClick={() => setActiveComparison(c.id)}
                 >
-                  <td className="py-1.5 pr-4 text-zinc-400 font-mono">
-                    {c.id.slice(0, 12)}...
-                  </td>
-                  <td className="py-1.5 pr-4 text-zinc-300">
-                    {c.variation_type}
-                  </td>
+                  <td className="py-1.5 pr-4 text-zinc-400 font-mono">{c.id.slice(0, 12)}...</td>
+                  <td className="py-1.5 pr-4 text-zinc-300">{c.variation_type}</td>
                   <td className="py-1.5 pr-4">
                     <span
                       className={`px-1.5 py-0.5 rounded border text-[10px] ${
@@ -351,9 +335,7 @@ export function ComparisonTab() {
                       {c.status}
                     </span>
                   </td>
-                  <td className="py-1.5 pr-4 text-zinc-400">
-                    {c.entries.length} entries
-                  </td>
+                  <td className="py-1.5 pr-4 text-zinc-400">{c.entries.length} entries</td>
                   <td className="py-1.5 text-zinc-400">
                     {new Date(c.created_at).toLocaleString()}
                   </td>

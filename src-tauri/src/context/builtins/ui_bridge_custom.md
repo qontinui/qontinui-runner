@@ -15,8 +15,8 @@ client = UIBridgeClient("http://localhost:YOUR_PORT")
 
 Document your app's elements here:
 
-| Element ID | Type | Description |
-|------------|------|-------------|
+| Element ID        | Type   | Description |
+| ----------------- | ------ | ----------- |
 | `your-element-id` | button | Description |
 
 ### Available Components
@@ -25,8 +25,8 @@ Document your app's components here:
 
 **Component:** `your-component-id`
 
-| Action ID | Description | Parameters |
-|-----------|-------------|------------|
+| Action ID     | Description  | Parameters         |
+| ------------- | ------------ | ------------------ |
 | `action-name` | What it does | `param1`, `param2` |
 
 ### Common Automation Patterns

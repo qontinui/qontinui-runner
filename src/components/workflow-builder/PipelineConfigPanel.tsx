@@ -175,7 +175,11 @@ export function PipelineConfigPanel({ config, onChange }: Props) {
               min={1}
               max={10}
               value={c.max_parallel_implementers ?? 3}
-              onChange={(e) => update({ max_parallel_implementers: e.target.value ? Number(e.target.value) : undefined })}
+              onChange={(e) =>
+                update({
+                  max_parallel_implementers: e.target.value ? Number(e.target.value) : undefined,
+                })
+              }
               className={inputClass}
             />
           </div>
@@ -186,7 +190,11 @@ export function PipelineConfigPanel({ config, onChange }: Props) {
               min={0}
               max={10}
               value={c.max_retries_per_subtree ?? 2}
-              onChange={(e) => update({ max_retries_per_subtree: e.target.value ? Number(e.target.value) : undefined })}
+              onChange={(e) =>
+                update({
+                  max_retries_per_subtree: e.target.value ? Number(e.target.value) : undefined,
+                })
+              }
               className={inputClass}
             />
           </div>
@@ -197,7 +205,11 @@ export function PipelineConfigPanel({ config, onChange }: Props) {
               min={1}
               max={100}
               value={c.max_total_iterations ?? 20}
-              onChange={(e) => update({ max_total_iterations: e.target.value ? Number(e.target.value) : undefined })}
+              onChange={(e) =>
+                update({
+                  max_total_iterations: e.target.value ? Number(e.target.value) : undefined,
+                })
+              }
               className={inputClass}
             />
           </div>

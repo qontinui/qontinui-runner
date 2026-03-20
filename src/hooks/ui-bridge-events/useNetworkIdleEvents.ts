@@ -7,7 +7,10 @@ import { getUIBridgeGlobal } from "./utils";
  *          get_idle_status, wait_for_idle, diagnose_stuck_screen, get_keyboard_shortcuts
  */
 export function useNetworkIdleEvents(
-  context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse" | "networkTrackerRef" | "idleDetectorRef">,
+  context: Pick<
+    UIBridgeEventContext,
+    "bridgeRef" | "sendResponse" | "networkTrackerRef" | "idleDetectorRef"
+  >,
 ) {
   const { sendResponse, networkTrackerRef, idleDetectorRef } = context;
 

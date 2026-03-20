@@ -11,7 +11,11 @@ import type { MultiAgentPipelineResult, PipelineAgentTrace } from "@/types";
 
 function SummaryCards({ result }: { result: MultiAgentPipelineResult }) {
   const cards = [
-    { label: "Total Criteria", value: result.total_criteria, sub: `${result.passed_criteria} passed` },
+    {
+      label: "Total Criteria",
+      value: result.total_criteria,
+      sub: `${result.passed_criteria} passed`,
+    },
     { label: "Subtrees", value: result.subtree_results.length },
     { label: "Total Cost", value: `$${result.total_cost_usd.toFixed(4)}` },
     { label: "Total Tokens", value: result.total_tokens.toLocaleString() },

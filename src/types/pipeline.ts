@@ -6,10 +6,7 @@
 
 // ─── Workflow Architecture ──────────────────────────────────────────────────
 
-export type WorkflowArchitecture =
-  | "traditional"
-  | "agentic_verification"
-  | "multi_agent_pipeline";
+export type WorkflowArchitecture = "traditional" | "agentic_verification" | "multi_agent_pipeline";
 
 // ─── Pipeline Agent Configuration ───────────────────────────────────────────
 
@@ -121,12 +118,7 @@ export interface MultiAgentPipelineResult {
 
 // ─── Comparison ─────────────────────────────────────────────────────────────
 
-export type ComparisonVariation =
-  | "same"
-  | "multi_agent"
-  | "model"
-  | "context_tokens"
-  | "custom";
+export type ComparisonVariation = "same" | "multi_agent" | "model" | "context_tokens" | "custom";
 
 export type ComparisonEntryStatus = "pending" | "running" | "completed" | "failed";
 export type ComparisonStatus = "running" | "comparing" | "completed" | "failed";

@@ -7,8 +7,8 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::database::CheckpointDb;
 use super::types::WorkflowCategory;
+use crate::database::CheckpointDb;
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -118,10 +118,16 @@ pub fn evaluate_recommendation_outcome(
         let after_end = (applied + chrono::Duration::days(7)).to_rfc3339();
 
         let before = crate::database::pipeline_traces::get_agent_aggregates_for_period(
-            db, &agent, &before_start, &applied_at,
+            db,
+            &agent,
+            &before_start,
+            &applied_at,
         )?;
         let after = crate::database::pipeline_traces::get_agent_aggregates_for_period(
-            db, &agent, &applied_at, &after_end,
+            db,
+            &agent,
+            &applied_at,
+            &after_end,
         )?;
 
         compute_verdict(before, after)
@@ -466,14 +472,20 @@ pub fn capture_snapshot(
 
 /// Capture a baseline snapshot (last 30 days).
 /// Snapshot type is suffixed by category (e.g., "baseline", "baseline_reflection").
-pub fn capture_baseline(db: &CheckpointDb, category: WorkflowCategory) -> Result<MetaOptimizerSnapshot, String> {
+pub fn capture_baseline(
+    db: &CheckpointDb,
+    category: WorkflowCategory,
+) -> Result<MetaOptimizerSnapshot, String> {
     let snap_type = format!("baseline{}", category.snapshot_suffix());
     capture_snapshot(db, &snap_type, None, 30, category)
 }
 
 /// Capture a periodic snapshot (last 7 days).
 /// Snapshot type is suffixed by category (e.g., "periodic", "periodic_reflection").
-pub fn capture_periodic(db: &CheckpointDb, category: WorkflowCategory) -> Result<MetaOptimizerSnapshot, String> {
+pub fn capture_periodic(
+    db: &CheckpointDb,
+    category: WorkflowCategory,
+) -> Result<MetaOptimizerSnapshot, String> {
     let snap_type = format!("periodic{}", category.snapshot_suffix());
     capture_snapshot(db, &snap_type, None, 7, category)
 }
@@ -490,7 +502,10 @@ pub fn capture_post_apply(
 // ── Query helpers ──────────────────────────────────────────────────────
 
 /// Get the latest baseline snapshot for the given category.
-pub fn get_latest_baseline(db: &CheckpointDb, category: WorkflowCategory) -> Result<Option<MetaOptimizerSnapshot>, String> {
+pub fn get_latest_baseline(
+    db: &CheckpointDb,
+    category: WorkflowCategory,
+) -> Result<Option<MetaOptimizerSnapshot>, String> {
     let snap_type_owned = format!("baseline{}", category.snapshot_suffix());
     db.with_conn(move |conn| {
         let result = conn.query_row(
@@ -590,7 +605,10 @@ pub fn list_snapshots(
 }
 
 /// Get a full progress summary: baseline vs current, deltas, and all snapshots.
-pub fn get_progress_summary(db: &CheckpointDb, category: WorkflowCategory) -> Result<ProgressSummary, String> {
+pub fn get_progress_summary(
+    db: &CheckpointDb,
+    category: WorkflowCategory,
+) -> Result<ProgressSummary, String> {
     let baseline_snap = get_latest_baseline(db, category)?;
 
     // Get latest periodic snapshot for this category

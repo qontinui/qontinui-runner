@@ -6,8 +6,8 @@ use rusqlite::params;
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use super::types::{MetaOptimizerRun, Recommendation};
 use crate::database::CheckpointDb;
-use super::types::{Recommendation, MetaOptimizerRun};
 
 // ── JSON payloads expected inside `recommended_value` ────────────────
 
@@ -102,7 +102,10 @@ pub fn create_recommendation(
         )
         .map_err(|e| format!("Failed to create recommendation: {}", e))?;
 
-        info!("Created recommendation {} ({})", rec_clone.id, rec_clone.title);
+        info!(
+            "Created recommendation {} ({})",
+            rec_clone.id, rec_clone.title
+        );
         Ok(())
     })?;
 
@@ -195,7 +198,10 @@ pub fn apply_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Resul
 }
 
 /// Fetch a single recommendation by ID.
-fn get_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Result<Recommendation, String> {
+fn get_recommendation(
+    db: &CheckpointDb,
+    recommendation_id: &str,
+) -> Result<Recommendation, String> {
     let id = recommendation_id.to_string();
     db.with_conn(move |conn| {
         conn.query_row(
@@ -265,7 +271,11 @@ pub fn apply_recommendation_with_side_effects(
     apply_recommendation(db, recommendation_id)?;
 
     // Capture a snapshot to measure impact of this recommendation
-    if let Err(e) = super::snapshots::capture_post_apply(db, recommendation_id, super::types::WorkflowCategory::Main) {
+    if let Err(e) = super::snapshots::capture_post_apply(
+        db,
+        recommendation_id,
+        super::types::WorkflowCategory::Main,
+    ) {
         warn!("Failed to capture post-apply snapshot: {}", e);
     }
 
@@ -328,7 +338,11 @@ fn apply_rule_create(
     let rec_id = recommendation_id.to_string();
     db.with_conn(move |conn| {
         let rule_number = payload.rule_number.unwrap_or_else(|| {
-            crate::workflow_generation::rules::next_rule_number(conn, &payload.agent, &payload.section)
+            crate::workflow_generation::rules::next_rule_number(
+                conn,
+                &payload.agent,
+                &payload.section,
+            )
         });
 
         let input = crate::workflow_generation::rules::InsertRuleInput {
@@ -369,7 +383,10 @@ fn apply_rule_update(db: &CheckpointDb, recommended_value: &str) -> Result<(), S
         };
 
         let rule = crate::workflow_generation::rules::update_rule(conn, &rule_id, &input)?;
-        info!("Applied rule_update: updated rule {} ({})", rule.id, rule.title);
+        info!(
+            "Applied rule_update: updated rule {} ({})",
+            rule.id, rule.title
+        );
         Ok(())
     })
 }
@@ -419,7 +436,10 @@ pub fn rollback_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Re
             "config_change" => {
                 if let Some(ref current_value) = rec.current_value {
                     if let Err(e) = rollback_config_change(db, current_value) {
-                        warn!("Failed to rollback config side-effect for {}: {}", rec.id, e);
+                        warn!(
+                            "Failed to rollback config side-effect for {}: {}",
+                            rec.id, e
+                        );
                     }
                 }
             }
@@ -455,12 +475,17 @@ pub fn rollback_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Re
 }
 
 /// Undo a rule side-effect by disabling the rule that was created/updated.
-fn rollback_rule(db: &CheckpointDb, recommendation_id: &str, recommended_value: &str) -> Result<(), String> {
+fn rollback_rule(
+    db: &CheckpointDb,
+    recommendation_id: &str,
+    recommended_value: &str,
+) -> Result<(), String> {
     // For rule_create, find the rule by source_fix_id matching the recommendation ID.
     // For rule_update, parse the rule_id from the payload.
-    let rule_id_from_payload: Option<String> = serde_json::from_str::<RulePayload>(recommended_value)
-        .ok()
-        .and_then(|p| p.rule_id);
+    let rule_id_from_payload: Option<String> =
+        serde_json::from_str::<RulePayload>(recommended_value)
+            .ok()
+            .and_then(|p| p.rule_id);
 
     let rec_id = recommendation_id.to_string();
 
@@ -474,7 +499,12 @@ fn rollback_rule(db: &CheckpointDb, recommendation_id: &str, recommended_value: 
                 params![rec_id],
                 |row| row.get::<_, String>(0),
             )
-            .map_err(|e| format!("Could not find rule created by recommendation {}: {}", rec_id, e))?
+            .map_err(|e| {
+                format!(
+                    "Could not find rule created by recommendation {}: {}",
+                    rec_id, e
+                )
+            })?
         };
 
         let input = crate::workflow_generation::rules::UpdateRuleInput {
@@ -497,7 +527,10 @@ fn rollback_config_change(db: &CheckpointDb, current_value: &str) -> Result<(), 
         .map_err(|e| format!("Invalid current_value payload for config rollback: {}", e))?;
 
     db.set_setting(&payload.key, &payload.value)?;
-    info!("Rollback: restored config '{}' to {}", payload.key, payload.value);
+    info!(
+        "Rollback: restored config '{}' to {}",
+        payload.key, payload.value
+    );
     Ok(())
 }
 
@@ -721,7 +754,8 @@ mod tests {
         assert_eq!(applied.len(), 1);
 
         // Filter by both
-        let prompt_pending = list_recommendations(&db, Some("pipeline_prompt"), Some("pending")).unwrap();
+        let prompt_pending =
+            list_recommendations(&db, Some("pipeline_prompt"), Some("pending")).unwrap();
         assert_eq!(prompt_pending.len(), 1);
         assert_eq!(prompt_pending[0].id, rec3.id);
     }

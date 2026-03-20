@@ -1,7 +1,7 @@
 //! Shared types for the meta-optimizer system.
 
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::config_storage::ConfigStorage;
 use crate::AppState;

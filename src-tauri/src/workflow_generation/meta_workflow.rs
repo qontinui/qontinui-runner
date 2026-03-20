@@ -568,14 +568,13 @@ fn build_builder_prompt(
     // as template variables — those are only substituted into base_prompt (agentic phase),
     // not into setup step content, causing the AI to see literal placeholder text.
     {
-        let project_root = crate::mcp::shared::current_project_path()
-            .unwrap_or_else(|| {
-                // Fallback to CWD if workspace root can't be determined
-                std::env::current_dir()
-                    .ok()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "Unknown".to_string())
-            });
+        let project_root = crate::mcp::shared::current_project_path().unwrap_or_else(|| {
+            // Fallback to CWD if workspace root can't be determined
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "Unknown".to_string())
+        });
         let project_tree = crate::reflection::workflow::generate_file_tree(&project_root);
         let tree_section = if project_tree.is_empty() {
             format!("(Could not read directory tree for: {})", project_root)

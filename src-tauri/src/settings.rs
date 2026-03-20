@@ -40,7 +40,7 @@ pub enum CliExecutionMode {
 #[serde(rename_all = "snake_case")]
 pub enum AccountSelectionMode {
     #[default]
-    Manual,     // Use the explicitly configured config_dir
+    Manual, // Use the explicitly configured config_dir
     LeastUsage, // Auto-select the account with lowest utilization
 }
 

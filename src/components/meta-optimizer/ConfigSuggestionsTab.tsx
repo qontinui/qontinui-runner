@@ -39,15 +39,18 @@ export function ConfigSuggestionsTab() {
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const handleAction = async (id: string, action: "apply" | "reject" | "rollback") => {
     try {
-      const cmd = action === "apply"
-        ? "apply_meta_optimizer_recommendation"
-        : action === "reject"
-          ? "reject_meta_optimizer_recommendation"
-          : "rollback_meta_optimizer_recommendation";
+      const cmd =
+        action === "apply"
+          ? "apply_meta_optimizer_recommendation"
+          : action === "reject"
+            ? "reject_meta_optimizer_recommendation"
+            : "rollback_meta_optimizer_recommendation";
       await invoke(cmd, { recommendationId: id });
       load();
     } catch (e) {
@@ -59,7 +62,10 @@ export function ConfigSuggestionsTab() {
     <div className="p-4 space-y-4">
       <div className="flex items-center gap-3">
         <h2 className="text-sm font-medium text-zinc-200">Architecture & Config Changes</h2>
-        <button onClick={load} className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-1 ml-auto">
+        <button
+          onClick={load}
+          className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-1 ml-auto"
+        >
           Refresh
         </button>
       </div>
@@ -68,18 +74,26 @@ export function ConfigSuggestionsTab() {
         <div className="text-zinc-500 text-sm">Loading...</div>
       ) : recs.length === 0 ? (
         <div className="text-zinc-500 text-sm py-8 text-center">
-          No config change recommendations. The Architecture Optimizer will produce them after analyzing enough runs.
+          No config change recommendations. The Architecture Optimizer will produce them after
+          analyzing enough runs.
         </div>
       ) : (
         <div className="space-y-3">
           {recs.map((rec) => (
-            <div key={rec.id} className="bg-zinc-900 border border-zinc-800 rounded-lg p-4 space-y-3">
+            <div
+              key={rec.id}
+              className="bg-zinc-900 border border-zinc-800 rounded-lg p-4 space-y-3"
+            >
               <div className="flex items-center gap-3">
-                <span className={`text-xs px-2 py-0.5 rounded ${
-                  rec.status === "pending" ? "bg-yellow-900/30 text-yellow-400" :
-                  rec.status === "applied" ? "bg-green-900/30 text-green-400" :
-                  "bg-zinc-800/50 text-zinc-500"
-                }`}>
+                <span
+                  className={`text-xs px-2 py-0.5 rounded ${
+                    rec.status === "pending"
+                      ? "bg-yellow-900/30 text-yellow-400"
+                      : rec.status === "applied"
+                        ? "bg-green-900/30 text-green-400"
+                        : "bg-zinc-800/50 text-zinc-500"
+                  }`}
+                >
                   {rec.status}
                 </span>
                 <span className="text-sm text-zinc-200">{rec.title}</span>

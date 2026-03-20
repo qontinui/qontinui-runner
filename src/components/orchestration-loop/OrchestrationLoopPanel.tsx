@@ -1,17 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "../../lib/utils";
-import {
-  Play,
-  Square,
-  Loader2,
-  CheckCircle2,
-  Zap,
-  Save,
-  Star,
-  Trash2,
-  FolderOpen,
-} from "lucide-react";
+import { Play, Square, Loader2, Zap, Save, Star, Trash2, FolderOpen } from "lucide-react";
 
 // --- Types matching the Rust backend ---
 
@@ -31,7 +21,11 @@ interface OrchestrationLoopConfig {
 
 interface PipelineConfig {
   build: { description: string; context: string | null; context_ids: string[] | null } | null;
-  implement_fixes: { model: string | null; timeout_secs: number | null; additional_context: string | null } | null;
+  implement_fixes: {
+    model: string | null;
+    timeout_secs: number | null;
+    additional_context: string | null;
+  } | null;
 }
 
 interface RunnerInstance {
@@ -130,7 +124,13 @@ function PhaseBadge({ phase }: { phase: string }) {
   const color = PHASE_COLORS[phase] || "text-muted-foreground";
   const bg = PHASE_BG[phase] || "bg-muted";
   return (
-    <span className={cn("inline-flex px-2 py-0.5 rounded-full text-[0.7rem] font-semibold font-mono", color, bg)}>
+    <span
+      className={cn(
+        "inline-flex px-2 py-0.5 rounded-full text-[0.7rem] font-semibold font-mono",
+        color,
+        bg,
+      )}
+    >
       {phase.replace(/_/g, " ")}
     </span>
   );
@@ -138,7 +138,8 @@ function PhaseBadge({ phase }: { phase: string }) {
 
 // --- Shared input styles ---
 
-const inputCls = "px-2 py-1 text-xs bg-muted border border-border rounded text-foreground focus:outline-none focus:ring-1 focus:ring-primary";
+const inputCls =
+  "px-2 py-1 text-xs bg-muted border border-border rounded text-foreground focus:outline-none focus:ring-1 focus:ring-primary";
 const labelCls = "text-[0.78rem] text-muted-foreground";
 const textareaCls = cn(inputCls, "w-full resize-y font-sans");
 
@@ -181,9 +182,21 @@ export function OrchestrationLoopPanel() {
   // --- Form state helpers ---
 
   const getFormState = (): OrchestrationLoopFormState => ({
-    mode, workflowId, targetPort, targetRunnerId, supervisorPort,
-    maxIter, exitStrategy, between, buildDesc, buildContext, enableFixes, fixContext,
-    retryOnFailure, waitForFixer, useWorktree,
+    mode,
+    workflowId,
+    targetPort,
+    targetRunnerId,
+    supervisorPort,
+    maxIter,
+    exitStrategy,
+    between,
+    buildDesc,
+    buildContext,
+    enableFixes,
+    fixContext,
+    retryOnFailure,
+    waitForFixer,
+    useWorktree,
   });
 
   const loadFormState = (s: OrchestrationLoopFormState) => {
@@ -263,7 +276,9 @@ export function OrchestrationLoopPanel() {
     loadSavedConfigs();
     loadRunnerInstances();
     pollRef.current = setInterval(fetchStatus, 3000);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
   }, [fetchStatus, loadSavedConfigs, loadRunnerInstances]);
 
   // --- Save/Load/Delete ---
@@ -321,7 +336,8 @@ export function OrchestrationLoopPanel() {
 
   const buildBetween = (): { type: string; rebuild?: boolean } => {
     if (between === "restart_on_signal") return { type: "restart_on_signal", rebuild: true };
-    if (between === "restart_on_signal_no_rebuild") return { type: "restart_on_signal", rebuild: false };
+    if (between === "restart_on_signal_no_rebuild")
+      return { type: "restart_on_signal", rebuild: false };
     if (between === "restart_runner") return { type: "restart_runner", rebuild: true };
     if (between === "restart_runner_no_rebuild") return { type: "restart_runner", rebuild: false };
     if (between === "wait_healthy") return { type: "wait_healthy" };
@@ -332,7 +348,10 @@ export function OrchestrationLoopPanel() {
     setError(null);
     let config: OrchestrationLoopConfig;
     if (mode === "pipeline") {
-      if (!buildDesc && !workflowId) { setError("Pipeline needs a build description or workflow ID"); return; }
+      if (!buildDesc && !workflowId) {
+        setError("Pipeline needs a build description or workflow ID");
+        return;
+      }
       config = {
         target_runner_port: targetPort ? parseInt(targetPort) : null,
         target_runner_id: targetRunnerId || null,
@@ -345,12 +364,19 @@ export function OrchestrationLoopPanel() {
         wait_for_fixer: waitForFixer,
         use_worktree: useWorktree,
         pipeline: {
-          build: buildDesc ? { description: buildDesc, context: buildContext || null, context_ids: null } : null,
-          implement_fixes: enableFixes ? { model: null, timeout_secs: 600, additional_context: fixContext || null } : null,
+          build: buildDesc
+            ? { description: buildDesc, context: buildContext || null, context_ids: null }
+            : null,
+          implement_fixes: enableFixes
+            ? { model: null, timeout_secs: 600, additional_context: fixContext || null }
+            : null,
         },
       };
     } else {
-      if (!workflowId) { setError("Enter a workflow ID"); return; }
+      if (!workflowId) {
+        setError("Enter a workflow ID");
+        return;
+      }
       config = {
         target_runner_port: targetPort ? parseInt(targetPort) : null,
         target_runner_id: targetRunnerId || null,
@@ -373,24 +399,40 @@ export function OrchestrationLoopPanel() {
   };
 
   const handleStop = async () => {
-    try { await invoke("stop_orchestration_loop"); } catch (e) { setError(String(e)); }
+    try {
+      await invoke("stop_orchestration_loop");
+    } catch (e) {
+      setError(String(e));
+    }
   };
 
   const handleSignal = async () => {
-    try { await invoke("signal_orchestration_restart"); } catch (e) { setError(String(e)); }
+    try {
+      await invoke("signal_orchestration_restart");
+    } catch (e) {
+      setError(String(e));
+    }
   };
 
   const running = status?.running ?? false;
   const phase = status?.phase || "idle";
   const cfgMax = status?.max_iterations ?? maxIter;
-  const progressPct = running && cfgMax > 0
-    ? Math.min(100, Math.round(((status?.current_iteration ?? 0) / cfgMax) * 100))
-    : phase === "complete" ? 100 : 0;
+  const progressPct =
+    running && cfgMax > 0
+      ? Math.min(100, Math.round(((status?.current_iteration ?? 0) / cfgMax) * 100))
+      : phase === "complete"
+        ? 100
+        : 0;
   const results = status?.iteration_results ?? [];
   const favorites = savedConfigs.filter((c) => c.is_favorite);
 
   if (loading) {
-    return <div className="flex items-center justify-center h-full text-muted-foreground text-sm"><Loader2 className="w-4 h-4 animate-spin mr-2" />Loading...</div>;
+    return (
+      <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+        <Loader2 className="w-4 h-4 animate-spin mr-2" />
+        Loading...
+      </div>
+    );
   }
 
   return (
@@ -402,7 +444,9 @@ export function OrchestrationLoopPanel() {
           {running && (
             <>
               <PhaseBadge phase={phase} />
-              <span className="text-xs font-mono text-yellow-400">{status?.current_iteration ?? 0}/{cfgMax}</span>
+              <span className="text-xs font-mono text-yellow-400">
+                {status?.current_iteration ?? 0}/{cfgMax}
+              </span>
             </>
           )}
           {!running && phase !== "idle" && <PhaseBadge phase={phase} />}
@@ -410,26 +454,51 @@ export function OrchestrationLoopPanel() {
         <div className="flex items-center gap-2">
           {!running && (
             <>
-              <button onClick={() => setShowLibrary(!showLibrary)} className={cn("px-2.5 py-1 text-xs font-medium rounded", showLibrary ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground hover:text-foreground")}>
-                <FolderOpen className="w-3 h-3 inline mr-1" />Library
+              <button
+                onClick={() => setShowLibrary(!showLibrary)}
+                className={cn(
+                  "px-2.5 py-1 text-xs font-medium rounded",
+                  showLibrary
+                    ? "bg-primary/15 text-primary"
+                    : "bg-muted text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <FolderOpen className="w-3 h-3 inline mr-1" />
+                Library
               </button>
-              <button onClick={() => setShowSaveInput(!showSaveInput)} className="px-2.5 py-1 text-xs font-medium rounded bg-muted text-muted-foreground hover:text-foreground">
-                <Save className="w-3 h-3 inline mr-1" />Save
+              <button
+                onClick={() => setShowSaveInput(!showSaveInput)}
+                className="px-2.5 py-1 text-xs font-medium rounded bg-muted text-muted-foreground hover:text-foreground"
+              >
+                <Save className="w-3 h-3 inline mr-1" />
+                Save
               </button>
             </>
           )}
           {running && between.startsWith("restart_on_signal") && (
-            <button onClick={handleSignal} className="px-2.5 py-1 text-xs font-medium rounded bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20">
-              <Zap className="w-3 h-3 inline mr-1" />Signal
+            <button
+              onClick={handleSignal}
+              className="px-2.5 py-1 text-xs font-medium rounded bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20"
+            >
+              <Zap className="w-3 h-3 inline mr-1" />
+              Signal
             </button>
           )}
           {running ? (
-            <button onClick={handleStop} className="px-2.5 py-1 text-xs font-medium rounded bg-red-500/10 text-red-400 hover:bg-red-500/20">
-              <Square className="w-3 h-3 inline mr-1" />Stop
+            <button
+              onClick={handleStop}
+              className="px-2.5 py-1 text-xs font-medium rounded bg-red-500/10 text-red-400 hover:bg-red-500/20"
+            >
+              <Square className="w-3 h-3 inline mr-1" />
+              Stop
             </button>
           ) : (
-            <button onClick={handleStart} className="px-2.5 py-1 text-xs font-medium rounded bg-primary/15 text-primary hover:bg-primary/25">
-              <Play className="w-3 h-3 inline mr-1" />Run Loop
+            <button
+              onClick={handleStart}
+              className="px-2.5 py-1 text-xs font-medium rounded bg-primary/15 text-primary hover:bg-primary/25"
+            >
+              <Play className="w-3 h-3 inline mr-1" />
+              Run Loop
             </button>
           )}
         </div>
@@ -452,10 +521,20 @@ export function OrchestrationLoopPanel() {
               className={cn(inputCls, "flex-1")}
               autoFocus
             />
-            <button onClick={handleSave} disabled={!saveName.trim()} className="px-2.5 py-1 text-xs font-medium rounded bg-primary/15 text-primary hover:bg-primary/25 disabled:opacity-40">
+            <button
+              onClick={handleSave}
+              disabled={!saveName.trim()}
+              className="px-2.5 py-1 text-xs font-medium rounded bg-primary/15 text-primary hover:bg-primary/25 disabled:opacity-40"
+            >
               Save
             </button>
-            <button onClick={() => { setShowSaveInput(false); setSaveName(""); }} className="px-2.5 py-1 text-xs font-medium rounded bg-muted text-muted-foreground">
+            <button
+              onClick={() => {
+                setShowSaveInput(false);
+                setSaveName("");
+              }}
+              className="px-2.5 py-1 text-xs font-medium rounded bg-muted text-muted-foreground"
+            >
               Cancel
             </button>
           </div>
@@ -466,31 +545,58 @@ export function OrchestrationLoopPanel() {
           <div className="border border-border rounded">
             <div className="px-3 py-1.5 border-b border-border flex items-center justify-between">
               <span className="text-xs font-semibold">Saved Configurations</span>
-              <span className="text-[0.7rem] text-muted-foreground">{savedConfigs.length} configs</span>
+              <span className="text-[0.7rem] text-muted-foreground">
+                {savedConfigs.length} configs
+              </span>
             </div>
             {savedConfigs.length === 0 ? (
-              <div className="px-3 py-3 text-xs text-muted-foreground text-center">No saved configurations yet</div>
+              <div className="px-3 py-3 text-xs text-muted-foreground text-center">
+                No saved configurations yet
+              </div>
             ) : (
               <div className="divide-y divide-border/50">
                 {savedConfigs.map((cfg) => (
-                  <div key={cfg.id} className="flex items-center gap-2 px-3 py-1.5 hover:bg-muted/30 group">
+                  <div
+                    key={cfg.id}
+                    className="flex items-center gap-2 px-3 py-1.5 hover:bg-muted/30 group"
+                  >
                     <button
                       onClick={() => handleToggleFavorite(cfg.id, cfg.is_favorite)}
                       className="shrink-0"
                       title={cfg.is_favorite ? "Remove from favorites" : "Add to favorites"}
                     >
-                      <Star className={cn("w-3.5 h-3.5", cfg.is_favorite ? "fill-yellow-400 text-yellow-400" : "text-muted-foreground/40 hover:text-yellow-400")} />
+                      <Star
+                        className={cn(
+                          "w-3.5 h-3.5",
+                          cfg.is_favorite
+                            ? "fill-yellow-400 text-yellow-400"
+                            : "text-muted-foreground/40 hover:text-yellow-400",
+                        )}
+                      />
                     </button>
-                    <button onClick={() => handleLoad(cfg)} className="flex-1 text-left text-xs truncate hover:text-primary" title={`Load "${cfg.name}"`}>
+                    <button
+                      onClick={() => handleLoad(cfg)}
+                      className="flex-1 text-left text-xs truncate hover:text-primary"
+                      title={`Load "${cfg.name}"`}
+                    >
                       <span className="font-medium">{cfg.name}</span>
                       <span className="ml-2 text-muted-foreground text-[0.7rem]">
-                        {cfg.config_json?.mode || "?"} &middot; {new Date(cfg.updated_at).toLocaleDateString()}
+                        {cfg.config_json?.mode || "?"} &middot;{" "}
+                        {new Date(cfg.updated_at).toLocaleDateString()}
                       </span>
                     </button>
-                    <button onClick={() => handleOverwrite(cfg)} className="shrink-0 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-primary" title="Overwrite with current settings">
+                    <button
+                      onClick={() => handleOverwrite(cfg)}
+                      className="shrink-0 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-primary"
+                      title="Overwrite with current settings"
+                    >
                       <Save className="w-3 h-3" />
                     </button>
-                    <button onClick={() => handleDeleteConfig(cfg.id)} className="shrink-0 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-400" title="Delete">
+                    <button
+                      onClick={() => handleDeleteConfig(cfg.id)}
+                      className="shrink-0 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-400"
+                      title="Delete"
+                    >
                       <Trash2 className="w-3 h-3" />
                     </button>
                   </div>
@@ -525,12 +631,25 @@ export function OrchestrationLoopPanel() {
 
         {/* Progress bar */}
         {(running || phase === "complete") && (
-          <div className={cn("border-l-2 rounded-r px-3 py-2 flex items-center gap-3", phase === "error" ? "border-red-500" : "border-primary")}>
+          <div
+            className={cn(
+              "border-l-2 rounded-r px-3 py-2 flex items-center gap-3",
+              phase === "error" ? "border-red-500" : "border-primary",
+            )}
+          >
             <PhaseBadge phase={phase} />
             <div className="flex-1 bg-muted rounded h-1.5">
-              <div className={cn("h-1.5 rounded transition-all duration-300", phase === "complete" ? "bg-green-500" : "bg-primary")} style={{ width: `${progressPct}%` }} />
+              <div
+                className={cn(
+                  "h-1.5 rounded transition-all duration-300",
+                  phase === "complete" ? "bg-green-500" : "bg-primary",
+                )}
+                style={{ width: `${progressPct}%` }}
+              />
             </div>
-            <span className="text-xs font-mono text-muted-foreground">{status?.current_iteration ?? 0}/{cfgMax}</span>
+            <span className="text-xs font-mono text-muted-foreground">
+              {status?.current_iteration ?? 0}/{cfgMax}
+            </span>
           </div>
         )}
 
@@ -540,15 +659,34 @@ export function OrchestrationLoopPanel() {
             <div className="flex items-center gap-4 flex-wrap">
               <div className="flex items-center gap-2">
                 <label className="flex items-center gap-1 text-xs cursor-pointer">
-                  <input type="radio" name="olMode" checked={mode === "simple"} onChange={() => setMode("simple")} className="accent-primary" /> Simple
+                  <input
+                    type="radio"
+                    name="olMode"
+                    checked={mode === "simple"}
+                    onChange={() => setMode("simple")}
+                    className="accent-primary"
+                  />{" "}
+                  Simple
                 </label>
                 <label className="flex items-center gap-1 text-xs cursor-pointer">
-                  <input type="radio" name="olMode" checked={mode === "pipeline"} onChange={() => setMode("pipeline")} className="accent-primary" /> Pipeline
+                  <input
+                    type="radio"
+                    name="olMode"
+                    checked={mode === "pipeline"}
+                    onChange={() => setMode("pipeline")}
+                    className="accent-primary"
+                  />{" "}
+                  Pipeline
                 </label>
               </div>
               <div className="flex items-center gap-1.5">
                 <span className={labelCls}>Between</span>
-                <select value={between} onChange={(e) => setBetween(e.target.value)} className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")} style={{ colorScheme: "dark" }}>
+                <select
+                  value={between}
+                  onChange={(e) => setBetween(e.target.value)}
+                  className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
+                  style={{ colorScheme: "dark" }}
+                >
                   <option value="restart_on_signal">Signal (rebuild)</option>
                   <option value="restart_on_signal_no_rebuild">Signal (no rebuild)</option>
                   <option value="restart_runner">Always (rebuild)</option>
@@ -559,11 +697,23 @@ export function OrchestrationLoopPanel() {
               </div>
               <div className="flex items-center gap-1.5">
                 <span className={labelCls}>Max</span>
-                <input type="number" value={maxIter} onChange={(e) => setMaxIter(Number(e.target.value))} min={1} max={50} className={cn(inputCls, "w-12 text-center")} />
+                <input
+                  type="number"
+                  value={maxIter}
+                  onChange={(e) => setMaxIter(Number(e.target.value))}
+                  min={1}
+                  max={50}
+                  className={cn(inputCls, "w-12 text-center")}
+                />
               </div>
               <div className="flex items-center gap-1.5">
                 <span className={labelCls}>Target</span>
-                <select value={targetRunner} onChange={(e) => handleTargetRunnerChange(e.target.value)} className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")} style={{ colorScheme: "dark" }}>
+                <select
+                  value={targetRunner}
+                  onChange={(e) => handleTargetRunnerChange(e.target.value)}
+                  className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
+                  style={{ colorScheme: "dark" }}
+                >
                   <option value="self">This runner (self)</option>
                   {runnerInstances.map((inst) => (
                     <option key={inst.id} value={inst.id}>
@@ -576,21 +726,43 @@ export function OrchestrationLoopPanel() {
 
             <div className="flex items-center gap-4 flex-wrap">
               <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-                <input type="checkbox" checked={retryOnFailure} onChange={(e) => setRetryOnFailure(e.target.checked)} className="accent-primary" />
+                <input
+                  type="checkbox"
+                  checked={retryOnFailure}
+                  onChange={(e) => setRetryOnFailure(e.target.checked)}
+                  className="accent-primary"
+                />
                 <span className="text-muted-foreground">Retry on failure</span>
-                <span className="text-muted-foreground/60 text-[0.7rem]">— Re-run after fixer completes</span>
+                <span className="text-muted-foreground/60 text-[0.7rem]">
+                  — Re-run after fixer completes
+                </span>
               </label>
               {retryOnFailure && (
                 <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-                  <input type="checkbox" checked={waitForFixer} onChange={(e) => setWaitForFixer(e.target.checked)} className="accent-primary" />
+                  <input
+                    type="checkbox"
+                    checked={waitForFixer}
+                    onChange={(e) => setWaitForFixer(e.target.checked)}
+                    className="accent-primary"
+                  />
                   <span className="text-muted-foreground">Wait for fixer</span>
-                  <span className="text-muted-foreground/60 text-[0.7rem]">— Pause until fixer workflow finishes</span>
+                  <span className="text-muted-foreground/60 text-[0.7rem]">
+                    — Pause until fixer workflow finishes
+                  </span>
                 </label>
               )}
               <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-                <input type="checkbox" checked={useWorktree} onChange={(e) => setUseWorktree(e.target.checked)} className="accent-primary" />
+                <input
+                  type="checkbox"
+                  checked={useWorktree}
+                  onChange={(e) => setUseWorktree(e.target.checked)}
+                  className="accent-primary"
+                />
                 <span className="text-muted-foreground">Run in isolated worktree</span>
-                <span className="text-muted-foreground/60 text-[0.7rem]">— Create a new git branch and worktree for this run. Changes stay isolated until merged.</span>
+                <span className="text-muted-foreground/60 text-[0.7rem]">
+                  — Create a new git branch and worktree for this run. Changes stay isolated until
+                  merged.
+                </span>
               </label>
             </div>
 
@@ -598,11 +770,22 @@ export function OrchestrationLoopPanel() {
               <div className="flex items-center gap-4 flex-wrap">
                 <div className="flex items-center gap-1.5 flex-1 min-w-[200px]">
                   <span className={labelCls}>Workflow</span>
-                  <input type="text" value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} placeholder="workflow-id" className={cn(inputCls, "flex-1")} />
+                  <input
+                    type="text"
+                    value={workflowId}
+                    onChange={(e) => setWorkflowId(e.target.value)}
+                    placeholder="workflow-id"
+                    className={cn(inputCls, "flex-1")}
+                  />
                 </div>
                 <div className="flex items-center gap-1.5">
                   <span className={labelCls}>Exit</span>
-                  <select value={exitStrategy} onChange={(e) => setExitStrategy(e.target.value)} className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")} style={{ colorScheme: "dark" }}>
+                  <select
+                    value={exitStrategy}
+                    onChange={(e) => setExitStrategy(e.target.value)}
+                    className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
+                    style={{ colorScheme: "dark" }}
+                  >
                     <option value="reflection">Reflection (0 fixes)</option>
                     <option value="workflow_verification">Verification</option>
                     <option value="fixed_iterations">Fixed Iterations</option>
@@ -614,28 +797,59 @@ export function OrchestrationLoopPanel() {
                 <div className={cn("grid gap-2", enableFixes ? "grid-cols-3" : "grid-cols-2")}>
                   <div>
                     <div className={cn(labelCls, "mb-1")}>Build Description</div>
-                    <textarea value={buildDesc} onChange={(e) => setBuildDesc(e.target.value)} placeholder="Describe the workflow to generate..." rows={8} className={textareaCls} />
+                    <textarea
+                      value={buildDesc}
+                      onChange={(e) => setBuildDesc(e.target.value)}
+                      placeholder="Describe the workflow to generate..."
+                      rows={8}
+                      className={textareaCls}
+                    />
                   </div>
                   <div>
                     <div className={cn(labelCls, "mb-1")}>Build Context (optional)</div>
-                    <textarea value={buildContext} onChange={(e) => setBuildContext(e.target.value)} placeholder="Additional context for the builder..." rows={8} className={textareaCls} />
+                    <textarea
+                      value={buildContext}
+                      onChange={(e) => setBuildContext(e.target.value)}
+                      placeholder="Additional context for the builder..."
+                      rows={8}
+                      className={textareaCls}
+                    />
                   </div>
                   {enableFixes && (
                     <div>
                       <div className={cn(labelCls, "mb-1")}>Fix Context (optional)</div>
-                      <textarea value={fixContext} onChange={(e) => setFixContext(e.target.value)} placeholder="Extra instructions for the fix agent..." rows={8} className={textareaCls} />
+                      <textarea
+                        value={fixContext}
+                        onChange={(e) => setFixContext(e.target.value)}
+                        placeholder="Extra instructions for the fix agent..."
+                        rows={8}
+                        className={textareaCls}
+                      />
                     </div>
                   )}
                 </div>
                 <div className="flex items-center gap-4 flex-wrap">
                   <div className="flex items-center gap-1.5 flex-1 min-w-[200px]">
                     <span className={cn(labelCls, "whitespace-nowrap")}>Workflow (fallback)</span>
-                    <input type="text" value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} placeholder="None (use build)" className={cn(inputCls, "flex-1")} />
+                    <input
+                      type="text"
+                      value={workflowId}
+                      onChange={(e) => setWorkflowId(e.target.value)}
+                      placeholder="None (use build)"
+                      className={cn(inputCls, "flex-1")}
+                    />
                   </div>
                   <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-                    <input type="checkbox" checked={enableFixes} onChange={(e) => setEnableFixes(e.target.checked)} className="accent-primary" />
+                    <input
+                      type="checkbox"
+                      checked={enableFixes}
+                      onChange={(e) => setEnableFixes(e.target.checked)}
+                      className="accent-primary"
+                    />
                     <span className="text-muted-foreground">Enable Fix Implementation</span>
-                    <span className="text-muted-foreground/60 text-[0.7rem]">— Spawns Claude Code after reflection</span>
+                    <span className="text-muted-foreground/60 text-[0.7rem]">
+                      — Spawns Claude Code after reflection
+                    </span>
                   </label>
                 </div>
               </>
@@ -662,30 +876,54 @@ export function OrchestrationLoopPanel() {
               </thead>
               <tbody>
                 {results.map((iter) => {
-                  const duration = iter.started_at && iter.completed_at
-                    ? ((new Date(iter.completed_at).getTime() - new Date(iter.started_at).getTime()) / 1000).toFixed(1) + "s"
-                    : "--";
+                  const duration =
+                    iter.started_at && iter.completed_at
+                      ? (
+                          (new Date(iter.completed_at).getTime() -
+                            new Date(iter.started_at).getTime()) /
+                          1000
+                        ).toFixed(1) + "s"
+                      : "--";
                   const meta: string[] = [];
                   if (iter.fix_count != null) meta.push(`fixes=${iter.fix_count}`);
-                  if (iter.fixes_implemented != null) meta.push(`applied=${iter.fixes_implemented ? "yes" : "no"}`);
+                  if (iter.fixes_implemented != null)
+                    meta.push(`applied=${iter.fixes_implemented ? "yes" : "no"}`);
                   if (iter.rebuild_triggered) meta.push("rebuild");
                   if (iter.generated_workflow_id) meta.push("built");
                   return (
-                    <tr key={iter.iteration} className="border-b border-border/50 hover:bg-muted/30">
+                    <tr
+                      key={iter.iteration}
+                      className="border-b border-border/50 hover:bg-muted/30"
+                    >
                       <td className="px-3 py-1.5 text-primary font-semibold">#{iter.iteration}</td>
                       <td className="px-3 py-1.5 font-mono">{duration}</td>
                       <td className="px-3 py-1.5">
-                        <span className={iter.exit_check?.should_exit ? "text-green-400" : "text-yellow-400"}>
+                        <span
+                          className={
+                            iter.exit_check?.should_exit ? "text-green-400" : "text-yellow-400"
+                          }
+                        >
                           {iter.exit_check?.should_exit ? "EXIT" : "CONTINUE"}
                         </span>
                       </td>
-                      <td className="px-3 py-1.5 max-w-[300px] truncate" title={iter.exit_check?.reason}>{iter.exit_check?.reason || "--"}</td>
-                      <td className="px-3 py-1.5 text-muted-foreground text-[0.7rem]">{meta.length > 0 ? meta.join(", ") : "--"}</td>
+                      <td
+                        className="px-3 py-1.5 max-w-[300px] truncate"
+                        title={iter.exit_check?.reason}
+                      >
+                        {iter.exit_check?.reason || "--"}
+                      </td>
+                      <td className="px-3 py-1.5 text-muted-foreground text-[0.7rem]">
+                        {meta.length > 0 ? meta.join(", ") : "--"}
+                      </td>
                     </tr>
                   );
                 })}
                 {results.length === 0 && (
-                  <tr><td colSpan={5} className="px-3 py-3 text-center text-muted-foreground">No iterations yet</td></tr>
+                  <tr>
+                    <td colSpan={5} className="px-3 py-3 text-center text-muted-foreground">
+                      No iterations yet
+                    </td>
+                  </tr>
                 )}
               </tbody>
             </table>

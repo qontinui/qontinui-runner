@@ -26,9 +26,7 @@ export function RegressionAlertBanner() {
   const load = useCallback(async () => {
     try {
       const outcomes = await invoke<OutcomeRec[]>("get_recommendation_outcomes");
-      const regressed = outcomes.filter(
-        (r) => r.outcome_parsed?.verdict === "regressed",
-      );
+      const regressed = outcomes.filter((r) => r.outcome_parsed?.verdict === "regressed");
       setRegressions(regressed);
     } catch {
       // silently fail
@@ -87,10 +85,7 @@ export function RegressionAlertBanner() {
       {expanded && (
         <div className="mt-3 space-y-2">
           {regressions.map((rec) => (
-            <div
-              key={rec.id}
-              className="bg-red-950/50 rounded p-3 border border-red-900/50"
-            >
+            <div key={rec.id} className="bg-red-950/50 rounded p-3 border border-red-900/50">
               <div className="flex items-center justify-between mb-2">
                 <div>
                   <span className="text-sm text-red-200">{rec.title}</span>
@@ -130,8 +125,8 @@ export function RegressionAlertBanner() {
                   )}
                   {rec.outcome_parsed.cost_delta_usd != null && (
                     <span>
-                      Cost: {rec.outcome_parsed.cost_delta_usd > 0 ? "+" : ""}
-                      ${rec.outcome_parsed.cost_delta_usd.toFixed(4)}
+                      Cost: {rec.outcome_parsed.cost_delta_usd > 0 ? "+" : ""}$
+                      {rec.outcome_parsed.cost_delta_usd.toFixed(4)}
                     </span>
                   )}
                 </div>

@@ -54,7 +54,11 @@ pub fn apply_substitution_to_steps(
 /// Replaces `{{artifact_dir}}` and `{{execution_id}}` in all relevant
 /// Option<String> fields. This is called after the artifact directory
 /// is created but before steps are executed.
-pub fn substitute_step_vars(step: &mut ExecutionStepConfig, artifact_dir: &str, execution_id: &str) {
+pub fn substitute_step_vars(
+    step: &mut ExecutionStepConfig,
+    artifact_dir: &str,
+    execution_id: &str,
+) {
     let sub = |s: &mut Option<String>| {
         if let Some(val) = s {
             if val.contains("{{artifact_dir}}") || val.contains("{{execution_id}}") {

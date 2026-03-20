@@ -13,10 +13,10 @@
 //!
 //! Worktree records are persisted in the database for tracking across restarts.
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tracing::{info, warn, error};
-use serde::{Deserialize, Serialize};
+use tracing::{error, info, warn};
 
 // =============================================================================
 // Types
@@ -146,10 +146,7 @@ pub fn create_worktree(
 ) -> Result<WorktreeCreateResult, String> {
     // Verify repo_path is a git repo
     if !repo_path.join(".git").exists() && !repo_path.join("../.git").exists() {
-        return Err(format!(
-            "Not a git repository: {}",
-            repo_path.display()
-        ));
+        return Err(format!("Not a git repository: {}", repo_path.display()));
     }
 
     // Get current branch and commit
@@ -159,7 +156,13 @@ pub fn create_worktree(
     // Sanitize workflow name for branch name
     let sanitized_name: String = workflow_name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .chars()
         .take(40)
@@ -196,7 +199,15 @@ pub fn create_worktree(
     // Remove existing worktree at this path if it exists (stale from a previous run)
     if worktree_path.exists() {
         info!("Removing stale worktree at {}", worktree_path.display());
-        let _ = run_git_command(repo_path, &["worktree", "remove", "--force", &worktree_path.to_string_lossy()]);
+        let _ = run_git_command(
+            repo_path,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &worktree_path.to_string_lossy(),
+            ],
+        );
         // Also try deleting the branch
         let _ = run_git_command(repo_path, &["branch", "-D", &branch_name]);
     }
@@ -244,7 +255,12 @@ pub fn remove_worktree(
     // Remove the worktree
     let result = run_git_command(
         repo_path,
-        &["worktree", "remove", "--force", &worktree_path.to_string_lossy()],
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            &worktree_path.to_string_lossy(),
+        ],
     );
 
     if let Err(e) = &result {
@@ -304,10 +320,7 @@ pub fn merge_worktree(
     }
 
     // Try the merge
-    let merge_result = run_git_command_with_status(
-        repo_path,
-        &["merge", branch_name, "--no-edit"],
-    );
+    let merge_result = run_git_command_with_status(repo_path, &["merge", branch_name, "--no-edit"]);
 
     match merge_result {
         Ok(output) => {
@@ -316,13 +329,19 @@ pub fn merge_worktree(
                 success: true,
                 merge_commit: Some(merge_commit),
                 conflicts: vec![],
-                summary: format!("Merged '{}' into '{}': {}", branch_name, source_branch, output.trim()),
+                summary: format!(
+                    "Merged '{}' into '{}': {}",
+                    branch_name,
+                    source_branch,
+                    output.trim()
+                ),
             })
         }
         Err(e) => {
             // Check for merge conflicts
-            let conflict_output = run_git_command(repo_path, &["diff", "--name-only", "--diff-filter=U"])
-                .unwrap_or_default();
+            let conflict_output =
+                run_git_command(repo_path, &["diff", "--name-only", "--diff-filter=U"])
+                    .unwrap_or_default();
             let conflicts: Vec<String> = conflict_output
                 .lines()
                 .filter(|l| !l.is_empty())
@@ -336,7 +355,8 @@ pub fn merge_worktree(
                     success: false,
                     merge_commit: None,
                     conflicts,
-                    summary: "Merge conflicts detected. Merge aborted. Use AI merge to resolve.".to_string(),
+                    summary: "Merge conflicts detected. Merge aborted. Use AI merge to resolve."
+                        .to_string(),
                 })
             } else {
                 Err(format!("Merge failed: {}", e))
@@ -354,19 +374,30 @@ pub fn get_worktree_diff_summary(
     // Get commit count
     let log = run_git_command(
         repo_path,
-        &["log", "--oneline", &format!("{}..{}", source_branch, branch_name)],
+        &[
+            "log",
+            "--oneline",
+            &format!("{}..{}", source_branch, branch_name),
+        ],
     )?;
     let commit_count = log.lines().count();
 
     // Get diffstat
     let diffstat = run_git_command(
         repo_path,
-        &["diff", "--stat", &format!("{}...{}", source_branch, branch_name)],
+        &[
+            "diff",
+            "--stat",
+            &format!("{}...{}", source_branch, branch_name),
+        ],
     )?;
 
     Ok(format!(
         "{} commit(s) ahead of '{}':\n{}\nDiff:\n{}",
-        commit_count, source_branch, log.trim(), diffstat.trim()
+        commit_count,
+        source_branch,
+        log.trim(),
+        diffstat.trim()
     ))
 }
 
@@ -410,10 +441,7 @@ pub fn start_merge_with_conflicts(
     repo_path: &Path,
     branch_name: &str,
 ) -> Result<MergeResult, String> {
-    let result = run_git_command_with_status(
-        repo_path,
-        &["merge", branch_name, "--no-edit"],
-    );
+    let result = run_git_command_with_status(repo_path, &["merge", branch_name, "--no-edit"]);
 
     match result {
         Ok(output) => {
@@ -427,10 +455,9 @@ pub fn start_merge_with_conflicts(
         }
         Err(_) => {
             // Check for conflicts — don't abort, let AI resolve them
-            let conflict_output = run_git_command(
-                repo_path,
-                &["diff", "--name-only", "--diff-filter=U"],
-            ).unwrap_or_default();
+            let conflict_output =
+                run_git_command(repo_path, &["diff", "--name-only", "--diff-filter=U"])
+                    .unwrap_or_default();
 
             let conflicts: Vec<String> = conflict_output
                 .lines()
@@ -442,7 +469,8 @@ pub fn start_merge_with_conflicts(
                 success: false,
                 merge_commit: None,
                 conflicts,
-                summary: "Merge has conflicts. Files contain conflict markers for resolution.".to_string(),
+                summary: "Merge has conflicts. Files contain conflict markers for resolution."
+                    .to_string(),
             })
         }
     }
@@ -459,10 +487,8 @@ pub fn complete_merge_after_resolution(
     }
 
     // Check if there are still unresolved conflicts
-    let remaining = run_git_command(
-        repo_path,
-        &["diff", "--name-only", "--diff-filter=U"],
-    ).unwrap_or_default();
+    let remaining =
+        run_git_command(repo_path, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
 
     if !remaining.trim().is_empty() {
         return Err(format!(
@@ -510,7 +536,11 @@ The conflict markers are in the working directory. For each conflicted file:
 
 After resolving all conflicts, stage the files with `git add` and run `git commit --no-edit` to complete the merge.
 "#,
-                conflicts.iter().map(|f| format!("- `{}`", f)).collect::<Vec<_>>().join("\n")
+                conflicts
+                    .iter()
+                    .map(|f| format!("- `{}`", f))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             )
         }
     } else {
@@ -518,7 +548,11 @@ After resolving all conflicts, stage the files with `git add` and run `git commi
     };
 
     let truncated_diff = if full_diff.len() > 50000 {
-        format!("{}...\n[diff truncated, {} more chars]", &full_diff[..50000], full_diff.len() - 50000)
+        format!(
+            "{}...\n[diff truncated, {} more chars]",
+            &full_diff[..50000],
+            full_diff.len() - 50000
+        )
     } else {
         full_diff.to_string()
     };
@@ -632,8 +666,17 @@ If none is clearly best, describe what a hybrid of the best parts would look lik
         workflow_name = workflow_name,
         source_branch = source_branch,
         branch_sections = branch_sections,
-        header_row = branches.iter().enumerate().map(|(i, _)| format!("Impl {} ", i + 1)).collect::<Vec<_>>().join("| "),
-        header_sep = branches.iter().map(|_| "------").collect::<Vec<_>>().join("|"),
+        header_row = branches
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("Impl {} ", i + 1))
+            .collect::<Vec<_>>()
+            .join("| "),
+        header_sep = branches
+            .iter()
+            .map(|_| "------")
+            .collect::<Vec<_>>()
+            .join("|"),
     )
 }
 

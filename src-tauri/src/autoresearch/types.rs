@@ -119,16 +119,10 @@ impl ExperimentConfig {
             map.insert("multi_agent_mode".to_string(), serde_json::json!(multi));
         }
         if let Some(tokens) = self.max_context_tokens {
-            map.insert(
-                "max_context_tokens".to_string(),
-                serde_json::json!(tokens),
-            );
+            map.insert("max_context_tokens".to_string(), serde_json::json!(tokens));
         }
         if let Some(ref arch) = self.workflow_architecture {
-            map.insert(
-                "workflow_architecture".to_string(),
-                serde_json::json!(arch),
-            );
+            map.insert("workflow_architecture".to_string(), serde_json::json!(arch));
         }
         if let Some(ref av_config) = self.agentic_verification_config {
             map.insert(

@@ -15,7 +15,13 @@ import {
   useState,
 } from "react";
 import { usePythonExecutor } from "../hooks/usePythonExecutor";
-import { useConfiguration, type Config, type Workflow, type ConfigImage, type ConfigState } from "../hooks/useConfiguration";
+import {
+  useConfiguration,
+  type Config,
+  type Workflow,
+  type ConfigImage,
+  type ConfigState,
+} from "../hooks/useConfiguration";
 import { useWorkflowSelection } from "../hooks/useWorkflowSelection";
 import { useMonitorDetection } from "../hooks/useMonitorDetection";
 import { useExecutionControl } from "../hooks/useExecutionControl";
