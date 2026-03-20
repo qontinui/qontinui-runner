@@ -6,7 +6,7 @@
 //! setup steps via curl.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
 };
@@ -884,14 +884,62 @@ pub async fn get_reflection_fixes_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Apply / Reject handlers
+// ---------------------------------------------------------------------------
+
+/// POST /meta-optimizer/recommendations/:id/apply
+///
+/// Applies a pending recommendation, executing side-effects (rule creation, config change, etc.).
+pub async fn apply_recommendation_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    recommendations::apply_recommendation_with_side_effects(&state.app_state.checkpoint_db, &id)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to apply recommendation: {}", e))),
+            )
+        })?;
+    Ok(Json(ApiResponse::success(())))
+}
+
+/// POST /meta-optimizer/recommendations/:id/reject
+///
+/// Rejects a pending recommendation.
+pub async fn reject_recommendation_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    recommendations::reject_recommendation(&state.app_state.checkpoint_db, &id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "Failed to reject recommendation: {}",
+                e
+            ))),
+        )
+    })?;
+    Ok(Json(ApiResponse::success(())))
+}
+
+// ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
 
 /// Register meta-optimizer API routes.
 pub fn routes() -> axum::Router<Arc<ApiState>> {
-    use axum::routing::get;
+    use axum::routing::{get, post};
 
     axum::Router::new()
+        .route(
+            "/meta-optimizer/recommendations/:id/apply",
+            post(apply_recommendation_handler),
+        )
+        .route(
+            "/meta-optimizer/recommendations/:id/reject",
+            post(reject_recommendation_handler),
+        )
         .route(
             "/meta-optimizer/agent-trace-aggregates",
             get(get_agent_trace_aggregates_handler),

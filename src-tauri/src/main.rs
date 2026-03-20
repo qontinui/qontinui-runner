@@ -1217,6 +1217,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::meta_optimizer::get_canary_rollouts,
             commands::meta_optimizer::promote_canary_rollout,
             commands::meta_optimizer::rollback_canary_rollout,
+            // Comparison commands
+            commands::comparison::start_comparison,
+            commands::comparison::get_comparison_status,
+            commands::comparison::list_comparisons,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

@@ -548,7 +548,7 @@ export function OrchestrationLoopPanel() {
               </div>
               <div className="flex items-center gap-1.5">
                 <span className={labelCls}>Between</span>
-                <select value={between} onChange={(e) => setBetween(e.target.value)} className={cn(inputCls, "w-auto")}>
+                <select value={between} onChange={(e) => setBetween(e.target.value)} className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")} style={{ colorScheme: "dark" }}>
                   <option value="restart_on_signal">Signal (rebuild)</option>
                   <option value="restart_on_signal_no_rebuild">Signal (no rebuild)</option>
                   <option value="restart_runner">Always (rebuild)</option>
@@ -563,7 +563,7 @@ export function OrchestrationLoopPanel() {
               </div>
               <div className="flex items-center gap-1.5">
                 <span className={labelCls}>Target</span>
-                <select value={targetRunner} onChange={(e) => handleTargetRunnerChange(e.target.value)} className={cn(inputCls, "w-auto")}>
+                <select value={targetRunner} onChange={(e) => handleTargetRunnerChange(e.target.value)} className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")} style={{ colorScheme: "dark" }}>
                   <option value="self">This runner (self)</option>
                   {runnerInstances.map((inst) => (
                     <option key={inst.id} value={inst.id}>
@@ -602,7 +602,7 @@ export function OrchestrationLoopPanel() {
                 </div>
                 <div className="flex items-center gap-1.5">
                   <span className={labelCls}>Exit</span>
-                  <select value={exitStrategy} onChange={(e) => setExitStrategy(e.target.value)} className={cn(inputCls, "w-auto")}>
+                  <select value={exitStrategy} onChange={(e) => setExitStrategy(e.target.value)} className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")} style={{ colorScheme: "dark" }}>
                     <option value="reflection">Reflection (0 fixes)</option>
                     <option value="workflow_verification">Verification</option>
                     <option value="fixed_iterations">Fixed Iterations</option>

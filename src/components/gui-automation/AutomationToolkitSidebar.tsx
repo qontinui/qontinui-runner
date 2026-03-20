@@ -356,7 +356,8 @@ export function AutomationToolkitSidebar({
                   <select
                     value={selectedImageId}
                     onChange={(e) => setSelectedImageId(e.target.value)}
-                    className="w-full px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-primary"
+                    className="w-full px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-primary [&>option]:text-black [&>option]:bg-white"
+                    style={{ colorScheme: "dark" }}
                   >
                     <option value="">Select image...</option>
                     {images.map((img) => (
@@ -472,7 +473,8 @@ export function AutomationToolkitSidebar({
                     <select
                       value={selectedStateId}
                       onChange={(e) => setSelectedStateId(e.target.value)}
-                      className="flex-1 px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-primary"
+                      className="flex-1 px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-primary [&>option]:text-black [&>option]:bg-white"
+                      style={{ colorScheme: "dark" }}
                     >
                       <option value="">Select state...</option>
                       {states.map((state) => (
@@ -512,7 +514,8 @@ export function AutomationToolkitSidebar({
                   value={selectedMacroId || ""}
                   onChange={(e) => setSelectedMacroId(e.target.value || null)}
                   disabled={macros.length === 0}
-                  className="w-full px-3 py-2.5 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50"
+                  className="w-full px-3 py-2.5 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50 [&>option]:text-black [&>option]:bg-white"
+                  style={{ colorScheme: "dark" }}
                 >
                   <option value="">
                     {macros.length === 0 ? "No macros available" : "Select a macro..."}

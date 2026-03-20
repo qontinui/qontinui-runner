@@ -376,6 +376,7 @@ function NavItem({
         ${collapsed ? "justify-center px-0" : ""}
       `}
       aria-current={isActive ? "page" : undefined}
+      aria-label={item.label}
     >
       <Icon className={`w-4 h-4 flex-shrink-0 ${showActiveState ? "text-primary" : ""}`} />
       {!collapsed && (
@@ -426,6 +427,7 @@ function FlyoutItem({ item, isActive, onClick, index }: FlyoutItemProps) {
         animationFillMode: "backwards",
       }}
       aria-current={isActive ? "page" : undefined}
+      aria-label={item.label}
     >
       {/* Icon */}
       <div

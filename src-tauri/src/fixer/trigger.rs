@@ -160,6 +160,23 @@ pub fn should_launch_fixer_excluding(
             return Ok(false);
         }
 
+        // Guard 6: Check that reflection fixes exist for the source run
+        let fix_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reflection_fixes WHERE source_task_run_id = ?1",
+                rusqlite::params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if fix_count == 0 {
+            debug!(
+                "Skipping fixer: no reflection fixes found for source run {}",
+                source_id
+            );
+            return Ok(false);
+        }
+
         Ok(true)
     })
 }
@@ -419,6 +436,11 @@ mod tests {
             CREATE TABLE settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE reflection_fixes (
+                id TEXT PRIMARY KEY,
+                source_task_run_id TEXT NOT NULL,
+                reflection_task_run_id TEXT NOT NULL
             );
             "#,
         )

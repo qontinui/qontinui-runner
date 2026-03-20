@@ -144,6 +144,15 @@ The setup phase loaded:
 
 ## Your Task
 
+## Prerequisites — Check Before Proceeding
+
+Before generating any recommendations, verify:
+1. **Agent trace data exists.** Check {{agent_trace_aggregates}} for non-empty data. If no traces exist for an agent type, you CANNOT recommend prompt changes for it — you have no evidence of what's failing.
+2. **Sufficient sample size.** At least 10 runs per agent type are needed for meaningful analysis. If an agent has fewer than 10 traces, note this limitation and lower your confidence accordingly.
+3. **Clear failure patterns.** Reflection fixes ({{reflection_fixes}}) should show specific, recurring patterns attributable to a specific agent. Vague patterns like "runtime_error" don't justify prompt changes.
+
+If these prerequisites are NOT met, produce a brief analysis explaining what data is missing and output ZERO [PROMPT_RECOMMENDATION] markers. This is the correct behavior — recommending changes without data is worse than recommending nothing.
+
 ### Step 1: Analyze Agent Performance
 
 For each agent type (spec_analyst, locator, implementer, verifier):
@@ -182,10 +191,17 @@ prompt_content: |
 [/PROMPT_RECOMMENDATION]
 ```
 
+## Quality Gate
+
+- **Minimum confidence: 60%.** Do not output any recommendation below 0.6 confidence.
+- **Must cite specific data.** Every recommendation must reference specific numbers from agent_trace_aggregates or reflection_fixes. "The failure rate is high" is not sufficient — "implementer has 22% downstream failure rate across 45 runs, with 8 reflection fixes citing 'incorrect file targeting'" is.
+- **No data = no recommendation.** If agent_trace_aggregates is empty or has zero entries, output zero recommendations. Write a brief explanation of what data is needed instead.
+- **Maximum 2 recommendations per run.** Focus on the highest-impact changes. More than 2 prompt changes at once makes it impossible to measure which one helped.
+
 ## Important Guidelines
 
 - **Evidence-based changes only.** Every recommendation must reference specific data from the traces or reflection fixes.
-- **Conservative changes.** If an agent is performing well (>85% success), don't change its prompt. Say so explicitly.
+- **Only change what's clearly broken.** If an agent has >80% downstream success rate, do NOT recommend changes. If you have fewer than 10 traces for an agent, do NOT recommend changes. Say explicitly: "Agent X has Y% success across Z runs — no changes recommended."
 - **One change at a time.** Don't rewrite everything — make targeted improvements to address specific failure patterns.
 - **Preserve working patterns.** If the current prompt handles certain scenarios well, keep those parts.
 - **No hallucinated data.** Only reference metrics and patterns actually present in the loaded data.

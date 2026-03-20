@@ -20,7 +20,6 @@ use crate::config_storage::ConfigStorage;
 use crate::database::CreateTaskRunEventInput;
 use crate::doctor::DoctorHandle;
 use crate::event_system::EventBroadcaster;
-use crate::mcp::types::MCP_API_PORT;
 use crate::orchestrator::integration::StageTransition;
 use crate::orchestrator::knowledge::{parse_findings_from_output, AgentType, KnowledgeBase};
 use crate::step_executor::ExecutionStepConfig;
@@ -210,93 +209,147 @@ impl LoopController {
         }
 
         // =====================================================================
-        // CREATE WORKTREE (if enabled)
+        // CREATE WORKTREE (if enabled) — multi-repo support
         // =====================================================================
         if config.use_worktree {
-            if let Some(project_path) = config.project_path.clone() {
-                let repo_path = std::path::Path::new(&project_path);
-                match crate::worktree::create_worktree(
-                    repo_path,
+            // Try multi-repo worktree creation first (across all sibling repos)
+            let monorepo_root = crate::mcp::shared::get_monorepo_root();
+
+            if let Some(ref root_str) = monorepo_root {
+                let root_path = std::path::Path::new(root_str);
+                info!("WORKTREE: Creating multi-repo worktrees under {}", root_str);
+
+                match crate::worktree::create_multi_repo_worktrees(
+                    root_path,
                     &config.execution_id,
                     &config.workflow_name,
                 ) {
-                    Ok(result) => {
+                    Ok(multi_result) => {
                         info!(
-                            "WORKTREE: Created isolated worktree at {} (branch: {})",
-                            result.worktree_path.display(),
-                            result.branch_name
+                            "WORKTREE: Created worktrees in {} repos ({} errors)",
+                            multi_result.results.len(),
+                            multi_result.errors.len()
                         );
-                        // Override project_path to point to the worktree
-                        let wt_path = result.worktree_path.to_string_lossy().to_string();
-                        config.project_path = Some(wt_path.clone());
-                        config.worktree_path = Some(wt_path.clone());
-                        config.worktree_branch = Some(result.branch_name.clone());
 
-                        // Track the worktree in the database
-                        let now = chrono::Utc::now().to_rfc3339();
-                        let record = crate::worktree::WorktreeRecord {
-                            id: config.execution_id.clone(),
-                            worktree_path: wt_path.clone(),
-                            branch_name: result.branch_name.clone(),
-                            source_branch: result.source_branch.clone(),
-                            source_commit: result.source_commit.clone(),
-                            repo_path: project_path.clone(),
-                            task_run_id: Some(config.execution_id.clone()),
-                            workflow_name: Some(config.workflow_name.clone()),
-                            status: crate::worktree::WorktreeStatus::Active,
-                            created_at: now.clone(),
-                            updated_at: now,
-                        };
-                        if let Err(e) = self.checkpoint_db.insert_worktree(&record) {
-                            warn!("WORKTREE: Failed to track worktree in database: {}", e);
+                        // Store the primary worktree info (first successful result)
+                        if let Some(primary) = multi_result.results.first() {
+                            config.worktree_path =
+                                Some(primary.worktree_path.to_string_lossy().to_string());
+                            config.worktree_branch = Some(primary.branch_name.clone());
                         }
 
-                        // Update working directories in all steps to use the worktree
-                        let original_path = project_path.clone();
-                        let update_steps = |steps: &mut Vec<ExecutionStepConfig>| {
-                            for step in steps.iter_mut() {
-                                // Update shell command working directory
-                                if let Some(ref wd) = step.shell_command_working_directory {
-                                    if wd.contains(&original_path) {
-                                        step.shell_command_working_directory =
-                                            Some(wd.replace(&original_path, &wt_path));
-                                    }
-                                }
-                                // Update check working directory
-                                if let Some(ref wd) = step.check_working_directory {
-                                    if wd.contains(&original_path) {
-                                        step.check_working_directory =
-                                            Some(wd.replace(&original_path, &wt_path));
-                                    }
-                                }
+                        // Override project_path to the runner's worktree if available
+                        let original_project_path =
+                            config.project_path.clone().unwrap_or_default();
+                        for (original, worktree) in &multi_result.path_mappings {
+                            if original_project_path.contains(original)
+                                || original.contains("qontinui-runner")
+                            {
+                                config.project_path = Some(worktree.clone());
+                                break;
                             }
-                        };
-                        update_steps(&mut setup_automation_steps);
-                        update_steps(&mut setup_prompt_steps);
-                        update_steps(&mut verification_steps);
-                        update_steps(&mut agentic_steps);
-                        update_steps(&mut completion_automation_steps);
-                        update_steps(&mut completion_prompt_steps);
+                        }
+
+                        // Remap all step working directories across ALL repos
+                        let remap_steps =
+                            |steps: &mut Vec<ExecutionStepConfig>,
+                             mappings: &[(String, String)]| {
+                                for step in steps.iter_mut() {
+                                    if let Some(ref wd) = step.shell_command_working_directory {
+                                        for (original, worktree) in mappings {
+                                            if wd.contains(original) {
+                                                step.shell_command_working_directory =
+                                                    Some(wd.replace(original, worktree));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if let Some(ref wd) = step.check_working_directory {
+                                        for (original, worktree) in mappings {
+                                            if wd.contains(original) {
+                                                step.check_working_directory =
+                                                    Some(wd.replace(original, worktree));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                        let mappings = &multi_result.path_mappings;
+                        remap_steps(&mut setup_automation_steps, mappings);
+                        remap_steps(&mut setup_prompt_steps, mappings);
+                        remap_steps(&mut verification_steps, mappings);
+                        remap_steps(&mut agentic_steps, mappings);
+                        remap_steps(&mut completion_automation_steps, mappings);
+                        remap_steps(&mut completion_prompt_steps, mappings);
                         for stage in &mut config.stages {
-                            update_steps(&mut stage.setup_automation_steps);
-                            update_steps(&mut stage.setup_prompt_steps);
-                            update_steps(&mut stage.verification_steps);
-                            update_steps(&mut stage.agentic_steps);
-                            update_steps(&mut stage.completion_automation_steps);
-                            update_steps(&mut stage.completion_prompt_steps);
+                            remap_steps(&mut stage.setup_automation_steps, mappings);
+                            remap_steps(&mut stage.setup_prompt_steps, mappings);
+                            remap_steps(&mut stage.verification_steps, mappings);
+                            remap_steps(&mut stage.agentic_steps, mappings);
+                            remap_steps(&mut stage.completion_automation_steps, mappings);
+                            remap_steps(&mut stage.completion_prompt_steps, mappings);
+                        }
+
+                        // Insert worktree records for each repo
+                        let now = chrono::Utc::now().to_rfc3339();
+                        for (i, result) in multi_result.results.iter().enumerate() {
+                            let original_path = &multi_result.path_mappings[i].0;
+                            let record = crate::worktree::WorktreeRecord {
+                                id: format!("{}-{}", config.execution_id, i),
+                                worktree_path: result
+                                    .worktree_path
+                                    .to_string_lossy()
+                                    .to_string(),
+                                branch_name: result.branch_name.clone(),
+                                source_branch: result.source_branch.clone(),
+                                source_commit: result.source_commit.clone(),
+                                repo_path: original_path.clone(),
+                                task_run_id: Some(config.execution_id.clone()),
+                                workflow_name: Some(config.workflow_name.clone()),
+                                status: crate::worktree::WorktreeStatus::Active,
+                                created_at: now.clone(),
+                                updated_at: now.clone(),
+                            };
+                            if let Err(e) = self.checkpoint_db.insert_worktree(&record) {
+                                warn!(
+                                    "WORKTREE: Failed to record worktree for {}: {}",
+                                    original_path, e
+                                );
+                            }
                         }
                     }
                     Err(e) => {
                         warn!(
-                            "WORKTREE: Failed to create worktree ({}). Running in main directory.",
+                            "WORKTREE: Multi-repo worktree creation failed ({}). Falling back to single-repo.",
                             e
                         );
-                        config.use_worktree = false;
+                        // Fall back to single-repo worktree creation
+                        Self::create_single_repo_worktree(
+                            &mut config,
+                            &mut setup_automation_steps,
+                            &mut setup_prompt_steps,
+                            &mut verification_steps,
+                            &mut agentic_steps,
+                            &mut completion_automation_steps,
+                            &mut completion_prompt_steps,
+                            &self.checkpoint_db,
+                        );
                     }
                 }
             } else {
-                warn!("WORKTREE: No project_path set, cannot create worktree.");
-                config.use_worktree = false;
+                // No monorepo root found — fall back to single-repo behavior
+                warn!("WORKTREE: Cannot determine monorepo root. Falling back to single-repo.");
+                Self::create_single_repo_worktree(
+                    &mut config,
+                    &mut setup_automation_steps,
+                    &mut setup_prompt_steps,
+                    &mut verification_steps,
+                    &mut agentic_steps,
+                    &mut completion_automation_steps,
+                    &mut completion_prompt_steps,
+                    &self.checkpoint_db,
+                );
             }
         }
 
@@ -1095,13 +1148,13 @@ impl LoopController {
                     routing_context: Default::default(),
                     project_path: config.project_path.clone(),
                     acceptance_criteria: config.acceptance_criteria.clone(),
-            multi_agent_mode: false,
-            use_worktree: false,
-            worktree_path: None,
-            worktree_branch: None,
-            workflow_architecture: None,
-            agentic_verification_config: None,
-            multi_agent_pipeline_config: None,
+            multi_agent_mode: config.multi_agent_mode,
+            use_worktree: false, // Worktree is handled at workflow level, not per-stage
+            worktree_path: config.worktree_path.clone(),
+            worktree_branch: config.worktree_branch.clone(),
+            workflow_architecture: config.workflow_architecture.clone(),
+            agentic_verification_config: config.agentic_verification_config.clone(),
+            multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
                 };
 
                 // Handle agentic-first: run the agentic phase before the verification loop.
@@ -1930,6 +1983,10 @@ impl LoopController {
         let mut iteration_results = Vec::new();
         // Start from the configured starting_iteration (for resume) or 0 (for fresh start)
         let mut iteration = config.starting_iteration;
+
+        // Enforce a floor of 1 on max_iterations to prevent zero-iteration failures
+        // where workflows crash at startup without ever running.
+        config.max_iterations = config.max_iterations.max(1);
 
         // Convergence detector: replaces inline stall/flaky heuristics with
         // pattern detection that returns actionable feedback for the AI.
@@ -4353,8 +4410,165 @@ impl LoopController {
         // ── Phase 3: Snapshot ───────────────────────────────────────────
         info!("MULTI-AGENT-PIPELINE: Phase 3 — UI Snapshot (delegated to verification steps)");
 
-        // ── Phase 4: Location (placeholder — full impl will use Locator Agent) ──
-        info!("MULTI-AGENT-PIPELINE: Phase 4 — Code Location (skipped in initial impl)");
+        // ── Phase 4: Code Location ─────────────────────────────────────
+        info!("MULTI-AGENT-PIPELINE: Phase 4 — Code Location");
+
+        let located_criteria: Vec<LocatedCriterion> = if pipeline_config.locator.max_tokens.unwrap_or(0) > 0 {
+            let locator_start = std::time::Instant::now();
+
+            // Get the project file tree for the locator to analyze
+            let project_path = config.project_path.clone().unwrap_or_else(|| ".".to_string());
+            let file_tree = get_file_tree(&project_path);
+
+            // Build the locator prompt
+            let criteria_text = criteria.iter()
+                .map(|c| format!("- {} (id: {}): {}", c.spec_assertion_id, c.id, c.description))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let mut locator_prompt = format!(
+                r#"You are a code locator agent. Given acceptance criteria and a project file tree, identify which files are most relevant to each criterion.
+
+## Acceptance Criteria
+{criteria_text}
+
+## Project Files
+{file_tree}
+
+## Instructions
+For each criterion, identify 1-5 files that are most likely to need changes or inspection.
+Rate your confidence from 0.0 to 1.0 in each mapping.
+
+Output JSON (and nothing else):
+
+```json
+[
+  {{
+    "criterion_id": "<the criterion id>",
+    "spec_assertion_id": "<the spec_assertion_id>",
+    "description": "<the criterion description>",
+    "target_files": [
+      {{"path": "src/components/MyComponent.tsx", "relevance": "primary"}}
+    ],
+    "related_files": [
+      {{"path": "src/types/config.ts", "relevance": "type_definition"}}
+    ],
+    "confidence": 0.8
+  }}
+]
+```
+
+Only output the JSON array, nothing else."#,
+                criteria_text = criteria_text,
+                file_tree = file_tree,
+            );
+
+            // Inject active prompt variant for locator if available
+            if let Some(variant_prompt) = active_prompt_variants.get("locator") {
+                locator_prompt.push_str(&format!(
+                    "\n\n## Additional Instructions\n{}",
+                    variant_prompt
+                ));
+            }
+
+            let locator_step = ExecutionStepConfig {
+                step_type: "prompt".to_string(),
+                name: Some("Locator: Map criteria to code locations".to_string()),
+                prompt_content: Some(locator_prompt.clone()),
+                ..Default::default()
+            };
+
+            // Run the locator through a single agentic iteration
+            let (locator_outcome, _) = self
+                .agentic_executor
+                .run_agentic(
+                    config,
+                    0, // iteration
+                    &locator_prompt,
+                    true,
+                    &[locator_step],
+                    logger,
+                )
+                .await;
+
+            // Parse the locator output into LocatedCriterion structs
+            let parsed: Vec<LocatedCriterion> = if let Some(output) = locator_outcome.output() {
+                // Try to find a JSON array in the output
+                if let Some(start) = output.find('[') {
+                    if let Some(end) = output.rfind(']') {
+                        // Parse intermediate representation since the AI output schema
+                        // differs from our LocatedCriterion struct (which embeds the full criterion)
+                        #[derive(serde::Deserialize)]
+                        struct LocatorOutputEntry {
+                            criterion_id: String,
+                            #[serde(default)]
+                            target_files: Vec<CodeLocation>,
+                            #[serde(default)]
+                            related_files: Vec<CodeLocation>,
+                            #[serde(default)]
+                            confidence: f64,
+                        }
+
+                        match serde_json::from_str::<Vec<LocatorOutputEntry>>(&output[start..=end]) {
+                            Ok(entries) => {
+                                entries.into_iter().filter_map(|entry| {
+                                    // Find the matching criterion to embed in the LocatedCriterion
+                                    criteria.iter().find(|c| c.id == entry.criterion_id).map(|c| {
+                                        LocatedCriterion {
+                                            criterion: c.clone(),
+                                            target_files: entry.target_files,
+                                            related_files: entry.related_files,
+                                            confidence: entry.confidence,
+                                        }
+                                    })
+                                }).collect()
+                            }
+                            Err(e) => {
+                                warn!("MULTI-AGENT-PIPELINE: Failed to parse locator JSON: {}", e);
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            info!(
+                "MULTI-AGENT-PIPELINE: Locator identified {} criteria locations",
+                parsed.len()
+            );
+
+            let locator_duration = locator_start.elapsed().as_millis() as u64;
+            agent_traces.push(PipelineAgentTrace {
+                agent_type: "locator".to_string(),
+                agent_id: "locator_0".to_string(),
+                run_id: config.execution_id.clone(),
+                input_snapshot: serde_json::json!({
+                    "criteria_count": criteria.len(),
+                    "file_tree_lines": file_tree.lines().count(),
+                }),
+                output_snapshot: serde_json::json!({
+                    "located_criteria_count": parsed.len(),
+                }),
+                config: pipeline_config.locator.clone(),
+                duration_ms: locator_duration,
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                downstream_success: None,
+                output_quality_score: None,
+            });
+
+            parsed
+        } else {
+            info!("MULTI-AGENT-PIPELINE: Phase 4 — Code Location (skipped, locator.max_tokens=0)");
+            Vec::new()
+        };
 
         // ── Phase 5: Implementation + Verification per subtree ──────────
         info!("MULTI-AGENT-PIPELINE: Phase 5 — Implementation + Verification");
@@ -4447,6 +4661,38 @@ impl LoopController {
                             "\n\n## Agent Instructions (from optimized prompt)\n{}",
                             variant_prompt
                         ));
+                    }
+
+                    // Add location context from the Locator agent if available
+                    if !located_criteria.is_empty() {
+                        failure_context.push_str("\n\n## Code Locations (from Locator Agent)\n");
+                        for lc in &located_criteria {
+                            if level_criteria.contains(&lc.criterion.id.as_str()) {
+                                failure_context.push_str(&format!(
+                                    "### {} (confidence: {:.0}%)\n",
+                                    lc.criterion.id,
+                                    lc.confidence * 100.0
+                                ));
+                                if !lc.target_files.is_empty() {
+                                    failure_context.push_str("Target files:\n");
+                                    for f in &lc.target_files {
+                                        failure_context.push_str(&format!(
+                                            "- `{}` ({})\n",
+                                            f.path, f.relevance
+                                        ));
+                                    }
+                                }
+                                if !lc.related_files.is_empty() {
+                                    failure_context.push_str("Related files:\n");
+                                    for f in &lc.related_files {
+                                        failure_context.push_str(&format!(
+                                            "- `{}` ({})\n",
+                                            f.path, f.relevance
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // ── Implementer phase ────────────────────────────────────
@@ -5066,6 +5312,100 @@ impl LoopController {
         }
     }
 
+    /// Fallback: create a single-repo worktree (original behavior).
+    /// Used when the monorepo root cannot be determined or multi-repo creation fails.
+    fn create_single_repo_worktree(
+        config: &mut LoopConfig,
+        setup_automation_steps: &mut Vec<ExecutionStepConfig>,
+        setup_prompt_steps: &mut Vec<ExecutionStepConfig>,
+        verification_steps: &mut Vec<ExecutionStepConfig>,
+        agentic_steps: &mut Vec<ExecutionStepConfig>,
+        completion_automation_steps: &mut Vec<ExecutionStepConfig>,
+        completion_prompt_steps: &mut Vec<ExecutionStepConfig>,
+        checkpoint_db: &Arc<crate::database::CheckpointDb>,
+    ) {
+        if let Some(project_path) = config.project_path.clone() {
+            let repo_path = std::path::Path::new(&project_path);
+            match crate::worktree::create_worktree(
+                repo_path,
+                &config.execution_id,
+                &config.workflow_name,
+            ) {
+                Ok(result) => {
+                    info!(
+                        "WORKTREE: Created single-repo worktree at {} (branch: {})",
+                        result.worktree_path.display(),
+                        result.branch_name
+                    );
+                    let wt_path = result.worktree_path.to_string_lossy().to_string();
+                    config.project_path = Some(wt_path.clone());
+                    config.worktree_path = Some(wt_path.clone());
+                    config.worktree_branch = Some(result.branch_name.clone());
+
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let record = crate::worktree::WorktreeRecord {
+                        id: config.execution_id.clone(),
+                        worktree_path: wt_path.clone(),
+                        branch_name: result.branch_name.clone(),
+                        source_branch: result.source_branch.clone(),
+                        source_commit: result.source_commit.clone(),
+                        repo_path: project_path.clone(),
+                        task_run_id: Some(config.execution_id.clone()),
+                        workflow_name: Some(config.workflow_name.clone()),
+                        status: crate::worktree::WorktreeStatus::Active,
+                        created_at: now.clone(),
+                        updated_at: now,
+                    };
+                    if let Err(e) = checkpoint_db.insert_worktree(&record) {
+                        warn!("WORKTREE: Failed to track worktree in database: {}", e);
+                    }
+
+                    let original_path = project_path;
+                    let update_steps = |steps: &mut Vec<ExecutionStepConfig>| {
+                        for step in steps.iter_mut() {
+                            if let Some(ref wd) = step.shell_command_working_directory {
+                                if wd.contains(&original_path) {
+                                    step.shell_command_working_directory =
+                                        Some(wd.replace(&original_path, &wt_path));
+                                }
+                            }
+                            if let Some(ref wd) = step.check_working_directory {
+                                if wd.contains(&original_path) {
+                                    step.check_working_directory =
+                                        Some(wd.replace(&original_path, &wt_path));
+                                }
+                            }
+                        }
+                    };
+                    update_steps(setup_automation_steps);
+                    update_steps(setup_prompt_steps);
+                    update_steps(verification_steps);
+                    update_steps(agentic_steps);
+                    update_steps(completion_automation_steps);
+                    update_steps(completion_prompt_steps);
+                    for stage in &mut config.stages {
+                        update_steps(&mut stage.setup_automation_steps);
+                        update_steps(&mut stage.setup_prompt_steps);
+                        update_steps(&mut stage.verification_steps);
+                        update_steps(&mut stage.agentic_steps);
+                        update_steps(&mut stage.completion_automation_steps);
+                        update_steps(&mut stage.completion_prompt_steps);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "WORKTREE: Failed to create worktree ({}). Running in main directory.",
+                        e
+                    );
+                    config.use_worktree = false;
+                }
+            }
+        } else {
+            warn!("WORKTREE: No project_path set, cannot create worktree.");
+            config.use_worktree = false;
+        }
+    }
+
     /// Check if the task has been stopped externally (via stop_ai_analysis endpoint).
     ///
     /// This allows the loop to gracefully abort when the user clicks the Stop button.
@@ -5660,6 +6000,34 @@ impl WorkflowResult {
 /// All condition fields combine with AND semantics: if any condition
 /// is not satisfied, the stage is skipped.
 ///
+/// Get the project's file tree for the locator agent to analyze.
+///
+/// Uses `git ls-files` to respect `.gitignore`, falling back to a placeholder
+/// if git is not available or the directory is not a git repo.
+/// Output is capped at 500 files to keep the prompt manageable.
+fn get_file_tree(project_path: &str) -> String {
+    let output = std::process::Command::new("git")
+        .args(["ls-files", "--others", "--cached", "--exclude-standard"])
+        .current_dir(project_path)
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let files = String::from_utf8_lossy(&out.stdout);
+            let lines: Vec<&str> = files.lines().take(500).collect();
+            let total = files.lines().count();
+            let mut result = lines.join("\n");
+            if total > 500 {
+                result.push_str(&format!("\n... and {} more files (truncated)", total - 500));
+            }
+            result
+        }
+        _ => {
+            format!("(Could not list files in {})", project_path)
+        }
+    }
+}
+
 /// # Arguments
 /// - `condition` - The stage condition to evaluate
 /// - `previous_passed` - Whether the previous stage's verification passed
@@ -6301,993 +6669,14 @@ pub fn extract_workflow_id_from_task_id(task_id: &str) -> Option<String> {
     }
 }
 
-/// Convert JSON Value steps to ExecutionStepConfig (excluding prompt steps)
-/// Prompt steps are handled separately by extract_prompt_steps_from_json
-///
-/// If `explicit_phase` is provided, it will be set on all steps that don't
-/// already have a phase specified. This ensures steps from setup_steps array
-/// get phase="setup", etc.
-/// Variables available for substitution in step fields.
-pub struct SubstitutionVars {
-    pub artifact_dir: Option<String>,
-    pub execution_id: String,
-    pub iteration: u32,
-}
-
-/// Apply variable substitution to a JSON step value.
-///
-/// Replaces template variables in all string values within the JSON:
-/// - `{{artifact_dir}}` → artifact directory path (forward slashes)
-/// - `{{execution_id}}` → the task run ID
-/// - `{{iteration}}` → current iteration number
-pub fn apply_variable_substitution(
-    step: &serde_json::Value,
-    vars: &SubstitutionVars,
-) -> serde_json::Value {
-    let mut json_str = serde_json::to_string(step).unwrap_or_default();
-
-    if let Some(ref artifact_dir) = vars.artifact_dir {
-        // Use forward slashes on all platforms for consistency
-        let normalized = artifact_dir.replace('\\', "/");
-        json_str = json_str.replace("{{artifact_dir}}", &normalized);
-    }
-    json_str = json_str.replace("{{execution_id}}", &vars.execution_id);
-    json_str = json_str.replace("{{iteration}}", &vars.iteration.to_string());
-
-    serde_json::from_str(&json_str).unwrap_or_else(|_| step.clone())
-}
-
-/// Apply variable substitution to a slice of JSON step values.
-pub fn apply_substitution_to_steps(
-    steps: &[serde_json::Value],
-    vars: &SubstitutionVars,
-) -> Vec<serde_json::Value> {
-    steps
-        .iter()
-        .map(|s| apply_variable_substitution(s, vars))
-        .collect()
-}
-
-/// Apply variable substitution to an ExecutionStepConfig's string fields.
-///
-/// Replaces `{{artifact_dir}}` and `{{execution_id}}` in all relevant
-/// Option<String> fields. This is called after the artifact directory
-/// is created but before steps are executed.
-fn substitute_step_vars(step: &mut ExecutionStepConfig, artifact_dir: &str, execution_id: &str) {
-    let sub = |s: &mut Option<String>| {
-        if let Some(val) = s {
-            if val.contains("{{artifact_dir}}") || val.contains("{{execution_id}}") {
-                *val = val
-                    .replace("{{artifact_dir}}", artifact_dir)
-                    .replace("{{execution_id}}", execution_id);
-            }
-        }
-    };
-
-    sub(&mut step.output_path);
-    sub(&mut step.input_path);
-    sub(&mut step.ai_review_input_path);
-    sub(&mut step.shell_command);
-    sub(&mut step.shell_command_working_directory);
-    sub(&mut step.check_command);
-    sub(&mut step.check_working_directory);
-    sub(&mut step.artifact_input_path);
-    sub(&mut step.fixup_input_path);
-    sub(&mut step.fixup_criteria_path);
-
-    // Also substitute in prompt content (may reference artifact paths)
-    if let Some(ref mut content) = step.prompt_content {
-        if content.contains("{{artifact_dir}}") || content.contains("{{execution_id}}") {
-            *content = content
-                .replace("{{artifact_dir}}", artifact_dir)
-                .replace("{{execution_id}}", execution_id);
-        }
-    }
-}
-
-pub fn convert_json_steps_to_execution_steps(
-    steps: &[serde_json::Value],
-    monitor: i32,
-) -> Vec<ExecutionStepConfig> {
-    convert_json_steps_with_phase(steps, monitor, None)
-}
-
-/// Convert JSON Value steps to ExecutionStepConfig with explicit phase.
-///
-/// Sets the explicit phase on all steps that don't already have one.
-/// This is the preferred function for unified workflow execution.
-pub fn convert_json_steps_with_phase(
-    steps: &[serde_json::Value],
-    _monitor: i32,
-    explicit_phase: Option<&str>,
-) -> Vec<ExecutionStepConfig> {
-    use crate::step_executor::StepPhase;
-
-    steps
-        .iter()
-        // Filter out prompt steps - they're handled separately to avoid duplicate logging
-        .filter(|step| {
-            let step_type = step.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            step_type != "prompt" && step_type != "ai_session"
-        })
-        .filter_map(|step| {
-            let mut config =
-                if let Ok(config) = serde_json::from_value::<ExecutionStepConfig>(step.clone()) {
-                    config
-                } else {
-                    // Fall back to manual field extraction — preserve command, working directory,
-                    // and other key fields so that check/test steps with inline commands still work
-                    let step_type = step.get("type").and_then(|t| t.as_str())?;
-                    ExecutionStepConfig {
-                        step_type: step_type.to_string(),
-                        name: step
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.to_string()),
-                        id: step
-                            .get("id")
-                            .and_then(|i| i.as_str())
-                            .map(|s| s.to_string()),
-                        shell_command: step
-                            .get("command")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.to_string()),
-                        shell_command_working_directory: step
-                            .get("working_directory")
-                            .and_then(|w| w.as_str())
-                            .map(|s| s.to_string()),
-                        check_type: step
-                            .get("check_type")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.to_string()),
-                        test_type: step
-                            .get("test_type")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string()),
-                        test_id: step
-                            .get("test_id")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string()),
-                        ..Default::default()
-                    }
-                };
-
-            // Set explicit phase if not already set
-            if config.phase.is_none() {
-                if let Some(phase_str) = explicit_phase {
-                    if let Some(phase) = StepPhase::from_str_opt(phase_str) {
-                        config.set_phase(phase);
-                    }
-                }
-            }
-
-            Some(config)
-        })
-        .collect()
-}
-
-/// Convert ALL JSON steps (including prompt-type) to ExecutionStepConfig with explicit phase.
-///
-/// Unlike `convert_json_steps_with_phase` which filters out prompt steps,
-/// this function preserves all step types in their original order.
-/// This is needed for the verification phase where prompt-type steps
-/// (AI-evaluated checks) must be included alongside automation steps.
-pub fn convert_all_json_steps_with_phase(
-    steps: &[serde_json::Value],
-    _monitor: i32,
-    explicit_phase: Option<&str>,
-) -> Vec<ExecutionStepConfig> {
-    use crate::step_executor::StepPhase;
-
-    steps
-        .iter()
-        .filter_map(|step| {
-            let mut config =
-                if let Ok(config) = serde_json::from_value::<ExecutionStepConfig>(step.clone()) {
-                    config
-                } else {
-                    // Fall back to manual field extraction — preserve command, working directory,
-                    // and other key fields so that check/test steps with inline commands still work
-                    let step_type = step.get("type").and_then(|t| t.as_str())?;
-                    ExecutionStepConfig {
-                        step_type: step_type.to_string(),
-                        name: step
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.to_string()),
-                        id: step
-                            .get("id")
-                            .and_then(|i| i.as_str())
-                            .map(|s| s.to_string()),
-                        shell_command: step
-                            .get("command")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.to_string()),
-                        shell_command_working_directory: step
-                            .get("working_directory")
-                            .and_then(|w| w.as_str())
-                            .map(|s| s.to_string()),
-                        check_type: step
-                            .get("check_type")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.to_string()),
-                        test_type: step
-                            .get("test_type")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string()),
-                        test_id: step
-                            .get("test_id")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string()),
-                        ..Default::default()
-                    }
-                };
-
-            // Set explicit phase if not already set
-            if config.phase.is_none() {
-                if let Some(phase_str) = explicit_phase {
-                    if let Some(phase) = StepPhase::from_str_opt(phase_str) {
-                        config.set_phase(phase);
-                    }
-                }
-            }
-
-            Some(config)
-        })
-        .collect()
-}
-
-/// Extract prompt steps from JSON Value array
-///
-/// If `explicit_phase` is provided, it will be set on all steps that don't
-/// already have a phase specified.
-pub fn extract_prompt_steps_from_json(steps: &[serde_json::Value]) -> Vec<ExecutionStepConfig> {
-    extract_prompt_steps_with_phase(steps, None)
-}
-
-/// Extract prompt steps with explicit phase.
-pub fn extract_prompt_steps_with_phase(
-    steps: &[serde_json::Value],
-    explicit_phase: Option<&str>,
-) -> Vec<ExecutionStepConfig> {
-    use crate::step_executor::StepPhase;
-
-    steps
-        .iter()
-        .filter(|step| {
-            step.get("type")
-                .and_then(|t| t.as_str())
-                .map(|t| t == "prompt")
-                .unwrap_or(false)
-        })
-        .filter_map(|step| {
-            let mut config = serde_json::from_value::<ExecutionStepConfig>(step.clone()).ok()?;
-
-            // Set explicit phase if not already set
-            if config.phase.is_none() {
-                if let Some(phase_str) = explicit_phase {
-                    if let Some(phase) = StepPhase::from_str_opt(phase_str) {
-                        config.set_phase(phase);
-                    }
-                }
-            }
-
-            Some(config)
-        })
-        .collect()
-}
-
-// =============================================================================
-// Verifier UI Context (Snapshot, Console Errors, App Health)
-// =============================================================================
-
-/// Fetch live UI Bridge data for the agentic verification loop's verifier.
-///
-/// Concurrently fetches the UI snapshot, console errors, and app health status.
-/// Each fetch is gated by its corresponding config flag and is best-effort:
-/// failures are silently ignored (the SDK app may not be connected).
-async fn fetch_verifier_ui_context(
-    use_screenshots: bool,
-    include_console_errors: bool,
-    include_app_health: bool,
-) -> String {
-    if !use_screenshots && !include_console_errors && !include_app_health {
-        return String::new();
-    }
-
-    let port = MCP_API_PORT;
-
-    // Build futures for each data source (no-ops when disabled)
-    let snapshot_fut = async {
-        if !use_screenshots {
-            return None;
-        }
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .ok()?;
-        let url = format!(
-            "http://127.0.0.1:{}/ui-bridge/sdk/control/snapshot",
-            port
-        );
-        let resp = client.get(&url).send().await.ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        resp.json::<serde_json::Value>().await.ok()
-    };
-
-    let console_fut = async {
-        if !include_console_errors {
-            return Vec::new();
-        }
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-        let control_url = format!(
-            "http://127.0.0.1:{}/ui-bridge/control/console-errors?limit=50",
-            port
-        );
-        let sdk_url = format!(
-            "http://127.0.0.1:{}/ui-bridge/sdk/console-errors?limit=50",
-            port
-        );
-        let (control_result, sdk_result) = tokio::join!(
-            client.get(&control_url).send(),
-            client.get(&sdk_url).send(),
-        );
-        let mut all_errors: Vec<serde_json::Value> = Vec::new();
-        for result in [control_result, sdk_result] {
-            if let Ok(response) = result {
-                if response.status().is_success() {
-                    if let Ok(body) = response.json::<serde_json::Value>().await {
-                        if let Some(errors) = body.get("errors").and_then(|v| v.as_array()) {
-                            all_errors.extend(errors.iter().cloned());
-                        } else if let Some(data) = body.get("data") {
-                            if let Some(errors) = data.get("errors").and_then(|v| v.as_array()) {
-                                all_errors.extend(errors.iter().cloned());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        all_errors
-    };
-
-    let health_fut = async {
-        if !include_app_health {
-            return None;
-        }
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .ok()?;
-        let url = format!("http://127.0.0.1:{}/ui-bridge/sdk/health", port);
-        let resp = client.get(&url).send().await.ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let body: serde_json::Value = resp.json().await.ok()?;
-        body.get("data").cloned()
-    };
-
-    // Fetch all concurrently
-    let (snapshot, console_errors, health) =
-        tokio::join!(snapshot_fut, console_fut, health_fut);
-
-    let mut sections = String::new();
-
-    // ── Format snapshot ──
-    if let Some(snap) = snapshot {
-        sections.push_str("\n\n## Current UI State (Snapshot)\n");
-
-        // Page context
-        if let Some(page) = snap.get("pageContext") {
-            if let Some(url) = page.get("url").and_then(|v| v.as_str()) {
-                sections.push_str(&format!("**Page URL:** {}\n", url));
-            }
-            if let Some(title) = page.get("title").and_then(|v| v.as_str()) {
-                sections.push_str(&format!("**Page Title:** {}\n", title));
-            }
-            if let Some(route) = page.get("route").and_then(|v| v.as_str()) {
-                sections.push_str(&format!("**Route:** {}\n", route));
-            }
-        }
-
-        // Viewport
-        if let Some(viewport) = snap.get("viewport") {
-            if let (Some(w), Some(h)) = (
-                viewport.get("width").and_then(|v| v.as_u64()),
-                viewport.get("height").and_then(|v| v.as_u64()),
-            ) {
-                sections.push_str(&format!("**Viewport:** {}x{}\n", w, h));
-            }
-        }
-
-        // Error summary
-        if let Some(errors) = snap.get("errorSummary") {
-            let count = errors
-                .get("count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            if count > 0 {
-                sections.push_str(&format!("**Errors:** {} error(s) detected\n", count));
-                if let Some(items) = errors.get("errors").and_then(|v| v.as_array()) {
-                    for item in items.iter().take(5) {
-                        if let Some(msg) = item.get("message").and_then(|v| v.as_str()) {
-                            sections.push_str(&format!("  - {}\n", msg));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Modals
-        if let Some(modals) = snap.get("modals").and_then(|v| v.as_array()) {
-            if !modals.is_empty() {
-                sections.push_str(&format!("**Active Modals:** {}\n", modals.len()));
-                for modal in modals.iter().take(3) {
-                    if let Some(title) = modal.get("title").and_then(|v| v.as_str()) {
-                        sections.push_str(&format!("  - {}\n", title));
-                    }
-                }
-            }
-        }
-
-        // Toasts
-        if let Some(toasts) = snap.get("toasts").and_then(|v| v.as_array()) {
-            if !toasts.is_empty() {
-                sections.push_str(&format!("**Active Toasts:** {}\n", toasts.len()));
-                for toast in toasts.iter().take(3) {
-                    let msg = toast
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(no message)");
-                    let level = toast
-                        .get("type")
-                        .or_else(|| toast.get("level"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("info");
-                    sections.push_str(&format!("  - [{}] {}\n", level, msg));
-                }
-            }
-        }
-
-        // Interactive elements (summarized)
-        if let Some(elements) = snap.get("elements").and_then(|v| v.as_array()) {
-            let interactive: Vec<_> = elements
-                .iter()
-                .filter(|el| {
-                    let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    matches!(
-                        el_type,
-                        "button"
-                            | "input"
-                            | "select"
-                            | "textarea"
-                            | "link"
-                            | "checkbox"
-                            | "radio"
-                    )
-                })
-                .collect();
-
-            if !interactive.is_empty() {
-                sections.push_str(&format!(
-                    "**Interactive Elements:** {} total\n",
-                    interactive.len()
-                ));
-                for el in interactive.iter().take(20) {
-                    let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-                    let label = el
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| {
-                            el.get("state")
-                                .and_then(|s| s.get("text"))
-                                .and_then(|v| v.as_str())
-                        })
-                        .unwrap_or("(unlabeled)");
-                    let state = el.get("state");
-                    let visible = state
-                        .and_then(|s| s.get("visible"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-                    let enabled = state
-                        .and_then(|s| s.get("enabled"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-                    let state_flags = match (visible, enabled) {
-                        (true, true) => "",
-                        (true, false) => " [disabled]",
-                        (false, true) => " [hidden]",
-                        (false, false) => " [hidden, disabled]",
-                    };
-                    sections.push_str(&format!("  - [{}] {}{}\n", el_type, label, state_flags));
-                }
-                if interactive.len() > 20 {
-                    sections.push_str(&format!(
-                        "  - ... and {} more\n",
-                        interactive.len() - 20
-                    ));
-                }
-            }
-        }
-    }
-
-    // ── Format console errors ──
-    if !console_errors.is_empty() {
-        sections.push_str(&format!(
-            "\n\n## Console Errors ({} total)\n",
-            console_errors.len()
-        ));
-        for (i, err) in console_errors.iter().take(10).enumerate() {
-            let msg = err
-                .get("message")
-                .and_then(|v| v.as_str())
-                .or_else(|| err.as_str())
-                .unwrap_or("(unknown error)");
-            let source = err.get("source").and_then(|v| v.as_str()).unwrap_or("");
-            if source.is_empty() {
-                sections.push_str(&format!("{}. {}\n", i + 1, msg));
-            } else {
-                sections.push_str(&format!("{}. {} ({})\n", i + 1, msg, source));
-            }
-        }
-        if console_errors.len() > 10 {
-            sections.push_str(&format!(
-                "... and {} more errors\n",
-                console_errors.len() - 10
-            ));
-        }
-    }
-
-    // ── Format app health ──
-    if let Some(health_data) = health {
-        sections.push_str("\n\n## App Health\n");
-        let status = health_data
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let score = health_data
-            .get("score")
-            .and_then(|v| v.as_u64())
-            .map(|s| format!("{}", s))
-            .unwrap_or_else(|| "N/A".to_string());
-        sections.push_str(&format!("**Status:** {} (score: {})\n", status, score));
-
-        if let Some(summary) = health_data.get("summary").and_then(|v| v.as_str()) {
-            sections.push_str(&format!("**Summary:** {}\n", summary));
-        }
-        if let Some(top_issue) = health_data.get("topIssue") {
-            if let Some(msg) = top_issue.get("message").and_then(|v| v.as_str()) {
-                let severity = top_issue
-                    .get("severity")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("error");
-                sections.push_str(&format!("**Top Issue:** [{}] {}\n", severity, msg));
-            }
-        }
-        if let Some(breakdown) = health_data.get("breakdown").and_then(|v| v.as_object()) {
-            sections.push_str("**Breakdown:**\n");
-            for (category, detail) in breakdown {
-                let cat_status = detail
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let cat_score = detail
-                    .get("score")
-                    .and_then(|v| v.as_u64())
-                    .map(|s| format!("{}", s))
-                    .unwrap_or_else(|| "?".to_string());
-                sections.push_str(&format!(
-                    "  - {}: {} (score: {})\n",
-                    category, cat_status, cat_score
-                ));
-            }
-        }
-    }
-
-    sections
-}
-
-// =============================================================================
-// Health Baseline & Regression Detection (UI Bridge)
-// =============================================================================
-
-/// Lightweight health baseline captured before the agentic phase.
-/// Used to detect if the AI's changes degraded app health.
-#[derive(Debug)]
-struct HealthBaseline {
-    status: String,
-    score: u64,
-    error_count: u64,
-}
-
-/// Capture a health baseline from the SDK app before the agentic phase.
-/// Returns None if the SDK app isn't connected (best-effort).
-async fn fetch_pre_agentic_health_baseline() -> Option<HealthBaseline> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .ok()?;
-
-    let url = format!("http://127.0.0.1:{}/ui-bridge/sdk/health", MCP_API_PORT);
-
-    let response = client.get(&url).send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-
-    let body: serde_json::Value = response.json().await.ok()?;
-    let data = body.get("data")?;
-
-    Some(HealthBaseline {
-        status: data
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        score: data.get("score").and_then(|v| v.as_u64()).unwrap_or(100),
-        error_count: data
-            .get("breakdown")
-            .map(|b| {
-                let crashes = b.get("crashes").and_then(|v| v.as_u64()).unwrap_or(0);
-                let errors = b.get("errors").and_then(|v| v.as_u64()).unwrap_or(0);
-                crashes + errors
-            })
-            .unwrap_or(0),
-    })
-}
-
-/// Compare post-agentic health with the pre-agentic baseline.
-/// Returns a warning string if the AI's changes degraded health.
-async fn detect_health_regression(baseline: &Option<HealthBaseline>) -> Option<String> {
-    let baseline = baseline.as_ref()?;
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .ok()?;
-
-    let url = format!("http://127.0.0.1:{}/ui-bridge/sdk/health", MCP_API_PORT);
-
-    let response = client.get(&url).send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-
-    let body: serde_json::Value = response.json().await.ok()?;
-    let data = body.get("data")?;
-
-    let post_status = data
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let post_score = data.get("score").and_then(|v| v.as_u64()).unwrap_or(100);
-    let post_error_count = data
-        .get("breakdown")
-        .map(|b| {
-            let crashes = b.get("crashes").and_then(|v| v.as_u64()).unwrap_or(0);
-            let errors = b.get("errors").and_then(|v| v.as_u64()).unwrap_or(0);
-            crashes + errors
-        })
-        .unwrap_or(0);
-
-    // Detect meaningful degradation
-    let status_degraded = baseline.status == "healthy" && post_status != "healthy";
-    let newly_broken = baseline.status != "broken" && post_status == "broken";
-    let new_errors = post_error_count.saturating_sub(baseline.error_count);
-    let score_drop = baseline.score.saturating_sub(post_score);
-
-    if !newly_broken && !status_degraded && new_errors == 0 && score_drop < 20 {
-        return None;
-    }
-
-    let mut warning = String::from("### App Health Regression\n\n");
-    warning.push_str(
-        "**Your changes degraded the app's health.** The following issues were detected after your code changes:\n\n",
-    );
-
-    if newly_broken {
-        let summary = data.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-        warning.push_str(&format!(
-            "- App went from **{}** to **BROKEN** (score: {} → {})\n",
-            baseline.status.to_uppercase(),
-            baseline.score,
-            post_score
-        ));
-        if !summary.is_empty() {
-            warning.push_str(&format!("- Health summary: {}\n", summary));
-        }
-    } else if status_degraded {
-        warning.push_str(&format!(
-            "- App health degraded from **{}** to **{}** (score: {} → {})\n",
-            baseline.status.to_uppercase(),
-            post_status.to_uppercase(),
-            baseline.score,
-            post_score
-        ));
-    }
-
-    if new_errors > 0 {
-        warning.push_str(&format!(
-            "- {} new error(s) introduced (was {}, now {})\n",
-            new_errors, baseline.error_count, post_error_count
-        ));
-    }
-
-    if let Some(top_issue) = data.get("topIssue") {
-        if let Some(msg) = top_issue.get("message").and_then(|v| v.as_str()) {
-            let severity = top_issue
-                .get("severity")
-                .and_then(|v| v.as_str())
-                .unwrap_or("error");
-            warning.push_str(&format!("- Top issue: [{}] {}\n", severity, msg));
-        }
-    }
-
-    warning.push_str(
-        "\nPlease check that your changes don't break the app. Fix any compilation or runtime errors before proceeding.\n",
-    );
-
-    Some(warning)
-}
-
-// =============================================================================
-// Regression Detection
-// =============================================================================
-
-/// Compare current verification results with the previous iteration to detect regressions.
-///
-/// Returns a warning string if regressions are found (steps that were passing before
-/// but now fail), or None if no regressions detected.
-fn detect_regression(
-    checkpoint_db: &crate::database::CheckpointDb,
-    execution_id: &str,
-    current_iteration: u32,
-    current_result: &crate::step_executor::VerificationPhaseResult,
-) -> Option<String> {
-    if current_iteration <= 1 {
-        return None;
-    }
-
-    // Retrieve previous iteration result
-    let prev_result =
-        match checkpoint_db.get_verification_phase_result(execution_id, current_iteration - 1) {
-            Ok(Some(val)) => val,
-            _ => return None,
-        };
-
-    // Extract previous step results
-    let prev_step_results = prev_result.get("step_results").and_then(|v| v.as_array())?;
-
-    // Build a map of step_name -> success for previous iteration
-    let mut prev_step_status: std::collections::HashMap<String, bool> =
-        std::collections::HashMap::new();
-    for step in prev_step_results {
-        if let (Some(name), Some(success)) = (
-            step.get("step_name").and_then(|v| v.as_str()),
-            step.get("success").and_then(|v| v.as_bool()),
-        ) {
-            prev_step_status.insert(name.to_string(), success);
-        }
-    }
-
-    // Find regressions: steps that were passing before but now fail
-    let mut newly_broken: Vec<String> = Vec::new();
-    for result in &current_result.step_results {
-        if !result.success {
-            if let Some(&prev_passed) = prev_step_status.get(&result.step_name) {
-                if prev_passed {
-                    newly_broken.push(result.step_name.clone());
-                }
-            }
-        }
-    }
-
-    // Compare overall scores
-    let prev_passed = prev_result
-        .get("passed_steps")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let prev_total = prev_result
-        .get("total_steps")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let curr_passed = current_result.passed_steps as u64;
-    let curr_total = current_result.total_steps as u64;
-
-    // Only warn if there are actual regressions
-    if newly_broken.is_empty() && curr_passed >= prev_passed {
-        return None;
-    }
-
-    let mut warning = String::new();
-    warning.push_str("## REGRESSION WARNING\n\n");
-    warning.push_str("Your changes in the previous iteration caused regressions.\n\n");
-
-    if !newly_broken.is_empty() {
-        warning.push_str(&format!(
-            "**Previously passing, now failing:** {}\n",
-            newly_broken.join(", ")
-        ));
-    }
-
-    if curr_passed < prev_passed {
-        warning.push_str(&format!(
-            "**Score change:** {}/{} passed -> {}/{} passed ({} more failures)\n",
-            prev_passed,
-            prev_total,
-            curr_passed,
-            curr_total,
-            prev_passed - curr_passed
-        ));
-    }
-
-    warning.push_str(
-        "\nConsider whether your changes were correct or if they had unintended side effects.\n",
-    );
-
-    info!(
-        "REGRESSION-DETECT: iteration {} has {} newly broken steps (was {}/{}, now {}/{})",
-        current_iteration,
-        newly_broken.len(),
-        prev_passed,
-        prev_total,
-        curr_passed,
-        curr_total
-    );
-
-    Some(warning)
-}
-
-// =============================================================================
-// Resume Context Builder
-// =============================================================================
-
-/// Build agentic context from stored verification data when resuming from an
-/// interrupted agentic phase.
-///
-/// Tries multiple data sources in order:
-/// 1. Verification phase result from database (full structured result)
-/// 2. Step checkpoints from database (step names + error messages)
-/// 3. Fallback generic message
-fn build_resume_agentic_context(
-    checkpoint_db: &Arc<crate::database::CheckpointDb>,
-    execution_id: &str,
-    iteration: u32,
-) -> String {
-    // Strategy 1: Try loading the full verification phase result.
-    // The result may be stored under the execution_id or a child ID.
-    if let Ok(Some(result_json)) =
-        checkpoint_db.get_verification_phase_result(execution_id, iteration)
-    {
-        // Try to deserialize into VerificationPhaseResult and use build_failure_context()
-        if let Ok(result) =
-            serde_json::from_value::<crate::step_executor::VerificationPhaseResult>(result_json)
-        {
-            let context = result.build_failure_context();
-            if !context.is_empty() {
-                info!(
-                    "RESUME: Built agentic context from verification phase result ({} chars)",
-                    context.len()
-                );
-                return context;
-            }
-        }
-    }
-
-    // Strategy 2: Build context from step checkpoints (which remap to parent ID).
-    let checkpoint_mgr =
-        crate::workflow_state::CheckpointManager::new(checkpoint_db.clone(), "unified");
-    if let Ok(checkpoints) =
-        checkpoint_mgr.get_completed_steps(execution_id, "verification", Some(iteration))
-    {
-        if !checkpoints.is_empty() {
-            let failed: Vec<_> = checkpoints
-                .iter()
-                .filter(|cp| {
-                    matches!(
-                        cp.status,
-                        crate::workflow_state::StepCheckpointStatus::Failed
-                    )
-                })
-                .collect();
-
-            let total = checkpoints.len();
-            let passed = checkpoints
-                .iter()
-                .filter(|cp| {
-                    matches!(
-                        cp.status,
-                        crate::workflow_state::StepCheckpointStatus::Success
-                    )
-                })
-                .count();
-
-            if !failed.is_empty() {
-                let mut context = String::new();
-                context.push_str("## Verification Results (Resumed)\n\n");
-                context.push_str(&format!(
-                    "**Status:** {} of {} verification steps passed\n\n",
-                    passed, total
-                ));
-                context.push_str("### Failed Steps\n\n");
-
-                for cp in &failed {
-                    let name = cp.step_name.as_deref().unwrap_or("unknown");
-                    let step_type = &cp.step_type;
-                    context.push_str(&format!("#### {} ({})\n", name, step_type));
-
-                    if let Some(ref error) = cp.error {
-                        context.push_str(&format!("**Error:** {}\n", error));
-                    }
-
-                    // If result_json is available (e.g., for successful steps that later
-                    // became relevant), include it
-                    if let Some(ref result_str) = cp.result_json {
-                        if let Ok(result_data) =
-                            serde_json::from_str::<serde_json::Value>(result_str)
-                        {
-                            // Extract stdout/output if present
-                            if let Some(output) = result_data
-                                .get("stdout")
-                                .or_else(|| result_data.get("output"))
-                                .and_then(|v| v.as_str())
-                            {
-                                if !output.is_empty() {
-                                    let truncated = if output.len() > 2000 {
-                                        let t = truncate_str(output, 2000);
-                                        format!(
-                                            "{}...\n[truncated, {} more chars]",
-                                            t,
-                                            output.len() - t.len()
-                                        )
-                                    } else {
-                                        output.to_string()
-                                    };
-                                    context.push_str(&format!(
-                                        "**Output:**\n```\n{}\n```\n",
-                                        truncated
-                                    ));
-                                }
-                            }
-                        }
-                    }
-
-                    context.push('\n');
-                }
-
-                info!(
-                    "RESUME: Built agentic context from step checkpoints ({} chars, {} failed steps)",
-                    context.len(),
-                    failed.len()
-                );
-                return context;
-            } else {
-                // All verification steps passed — no failures to fix
-                info!(
-                    "RESUME: All {} verification steps passed, no failures to fix",
-                    total
-                );
-                return format!(
-                    "All {} verification steps passed. No failures to investigate. \
-                     Proceed with any analysis or improvements based on the workflow context provided.",
-                    total
-                );
-            }
-        }
-    }
-
-    // Strategy 3: Fallback — no verification data available at all
-    info!("RESUME: No verification data found, using fallback context");
-    "Resuming agentic phase. No verification data is available. \
-     Proceed with analysis based on the workflow context and instructions provided."
-        .to_string()
-}
+// Step conversion utilities extracted to step_conversion module
+pub use super::step_conversion::{
+    convert_all_json_steps_with_phase, convert_json_steps_with_phase,
+    extract_prompt_steps_with_phase, substitute_step_vars,
+};
+
+// Health monitoring utilities extracted to health_monitor module
+pub(super) use super::health_monitor::{
+    build_resume_agentic_context, detect_health_regression, detect_regression,
+    fetch_pre_agentic_health_baseline, fetch_verifier_ui_context,
+};

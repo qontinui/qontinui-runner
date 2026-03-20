@@ -1287,6 +1287,9 @@ pub struct ExecuteInlineWorkflowRequest {
     /// Category of the workflow (e.g. "plan-generated", "spec-generated", "error-fix")
     #[serde(default)]
     category: Option<String>,
+    /// Optional config overrides (workflow_architecture, use_worktree, etc.)
+    #[serde(default)]
+    overrides: Option<serde_json::Value>,
 }
 
 pub fn default_max_iterations() -> u32 {
@@ -1982,7 +1985,7 @@ pub async fn execute_inline_workflow(
         // For error-fix workflows (with targeted_error_ids), run agentic first.
         let run_agentic_first = !workflow.targeted_error_ids.is_empty();
 
-        let loop_config = crate::unified_workflow_executor::LoopConfig {
+        let mut loop_config = crate::unified_workflow_executor::LoopConfig {
             max_iterations: workflow.max_iterations,
             base_prompt: combined_prompt,
             workflow_name: workflow.name.clone(),
@@ -2020,6 +2023,40 @@ pub async fn execute_inline_workflow(
             project_path: crate::mcp::shared::current_project_path(),
             acceptance_criteria: workflow.acceptance_criteria.clone(),
         };
+
+        // Apply overrides if present (same logic as run_unified_workflow)
+        if let Some(ref overrides) = request.overrides {
+            if let Some(model) = overrides.get("model").and_then(|v| v.as_str()) {
+                loop_config.model_override = Some(model.to_string());
+            }
+            if let Some(max_iter) = overrides.get("max_iterations").and_then(|v| v.as_u64()) {
+                loop_config.max_iterations = max_iter as u32;
+            }
+            if let Some(multi) = overrides.get("multi_agent_mode").and_then(|v| v.as_bool()) {
+                loop_config.multi_agent_mode = multi;
+            }
+            if let Some(tokens) = overrides.get("max_context_tokens").and_then(|v| v.as_u64()) {
+                loop_config.max_context_tokens = tokens as usize;
+            }
+            if let Some(arch) = overrides.get("workflow_architecture") {
+                if let Ok(parsed) = serde_json::from_value::<crate::autoresearch::agentic_verification::WorkflowArchitecture>(arch.clone()) {
+                    loop_config.workflow_architecture = Some(parsed);
+                }
+            }
+            if let Some(av_config) = overrides.get("agentic_verification_config") {
+                if let Ok(parsed) = serde_json::from_value::<crate::autoresearch::agentic_verification::AgenticVerificationConfig>(av_config.clone()) {
+                    loop_config.agentic_verification_config = Some(parsed);
+                }
+            }
+            if let Some(map_config) = overrides.get("multi_agent_pipeline_config") {
+                if let Ok(parsed) = serde_json::from_value::<crate::autoresearch::agentic_verification::MultiAgentPipelineConfig>(map_config.clone()) {
+                    loop_config.multi_agent_pipeline_config = Some(parsed);
+                }
+            }
+            if let Some(wt) = overrides.get("use_worktree").and_then(|v| v.as_bool()) {
+                loop_config.use_worktree = wt;
+            }
+        }
 
         // Spawn in background (non-blocking) — same pattern as run_unified_workflow
         let checkpoint_db = state.app_state.checkpoint_db.clone();

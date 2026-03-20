@@ -124,7 +124,8 @@ export function CostEffectivenessPanel() {
       <div className="flex items-center justify-between mb-2">
         <div className="text-sm text-zinc-400">Cost-Effectiveness (Pareto)</div>
         <select
-          className="bg-zinc-800 text-zinc-200 text-xs px-2 py-1 rounded border border-zinc-700"
+          className="bg-zinc-800 text-zinc-200 text-xs px-2 py-1 rounded border border-zinc-700 [&>option]:text-black [&>option]:bg-white"
+          style={{ colorScheme: "dark" }}
           value={agentFilter}
           onChange={(e) => setAgentFilter(e.target.value)}
         >

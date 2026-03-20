@@ -258,6 +258,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     is_follow_up INTEGER DEFAULT 0,             -- Whether this is a follow-up run for unfixed issues
     follow_up_source_task_run_id TEXT,           -- Source task run whose unfixed issues this run addresses
 
+    -- Runner port (v113)
+    runner_port INTEGER,                         -- Port of the runner instance that owns this task
+
     -- Fixer (v114)
     is_fixer INTEGER DEFAULT 0,                 -- Whether this is a fixer run (aggregates reflection/follow-up fixes)
     fixer_source_task_run_id TEXT,               -- Source task run that this fixer addresses
@@ -283,6 +286,8 @@ CREATE INDEX IF NOT EXISTS idx_task_runs_parent_task_run_id ON task_runs(parent_
 CREATE INDEX IF NOT EXISTS idx_task_runs_root_task_run_id ON task_runs(root_task_run_id);
 -- Bridge ID index for multi-bridge queries
 CREATE INDEX IF NOT EXISTS idx_task_runs_bridge_id ON task_runs(bridge_id);
+-- Runner port index for filtering by runner instance
+CREATE INDEX IF NOT EXISTS idx_task_runs_runner_port ON task_runs(runner_port);
 
 -- Per-phase token usage tracking for cost analysis.
 -- Records input/output tokens and estimated cost for each AI call in a workflow.
@@ -2959,6 +2964,22 @@ CREATE TABLE IF NOT EXISTS sm_capture_screenshots (
 CREATE INDEX IF NOT EXISTS idx_sm_screenshots_config ON sm_capture_screenshots(config_id);
 
 -- =============================================================================
+-- Orchestration Loop Configs (migration 112)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS orchestration_loop_configs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    is_favorite BOOLEAN DEFAULT 0,
+    config_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ol_configs_favorite ON orchestration_loop_configs(is_favorite);
+CREATE INDEX IF NOT EXISTS idx_ol_configs_updated ON orchestration_loop_configs(updated_at);
+
+-- =============================================================================
 -- Autoresearch Tables (migration 118)
 -- =============================================================================
 
@@ -3116,3 +3137,23 @@ CREATE INDEX IF NOT EXISTS idx_canary_status ON canary_rollouts(status);
 CREATE INDEX IF NOT EXISTS idx_canary_rec ON canary_rollouts(recommendation_id);
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (121, datetime('now'));
+
+-- =============================================================================
+-- Comparison Runs Table (migration 122)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS comparison_runs (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    variation_type TEXT NOT NULL,          -- 'architecture', 'same', 'custom'
+    status TEXT NOT NULL DEFAULT 'running', -- 'running', 'completed', 'failed'
+    entries_json TEXT NOT NULL DEFAULT '[]', -- JSON array of {label, overrides, task_run_id, status}
+    report TEXT,                            -- AI comparison report (filled after all complete)
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_comparison_runs_workflow ON comparison_runs(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_comparison_runs_status ON comparison_runs(status);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (122, datetime('now'));

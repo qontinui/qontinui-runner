@@ -13,14 +13,18 @@
 //! - `awas_bridge` - Bridge between AWAS and ui-bridge systems
 
 pub mod ai_generation;
+pub mod ai_session;
 pub mod api_requests;
 pub mod app_discovery;
 pub mod automation_runs;
+pub mod auto_continue;
 pub mod awas;
 pub mod awas_bridge;
 pub mod backend_relay;
+pub mod backup_restore;
 pub mod canvas;
 pub mod checkpoints;
+pub mod comparison_api;
 pub mod checks;
 pub mod configs;
 pub mod constraints_api;
@@ -44,6 +48,7 @@ pub mod models;
 pub mod monitors;
 pub mod orchestration_loop_api;
 pub mod playwright;
+pub mod playwright_collection;
 pub mod processes;
 pub mod prompt_snippets;
 pub mod prompts;
@@ -67,6 +72,7 @@ pub mod step_type_metadata_api;
 pub mod task_runs;
 pub mod terminals;
 pub mod testing;
+pub mod trace_verification;
 pub mod triggers;
 pub mod types;
 pub mod ui_bridge;

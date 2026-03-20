@@ -62,13 +62,16 @@ pub(crate) mod auto_run;
 mod canvas_panels;
 pub mod conditional_routing;
 pub mod convergence;
+mod health_monitor;
 mod loop_controller;
 pub mod multi_agent_fixer;
 pub mod output_parser;
 mod phase_configs;
+mod phase_helpers;
 mod phases;
 mod resume;
 pub mod states;
+mod step_conversion;
 mod types;
 
 // Panic handling imports

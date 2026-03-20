@@ -390,6 +390,7 @@ pub fn store_component_health_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, Utc};
     use rusqlite::Connection;
 
     fn setup_test_db() -> Connection {
@@ -501,6 +502,9 @@ mod tests {
     #[test]
     fn test_workflow_trends_time_filter() {
         let conn = setup_test_db();
+        let recent = (Utc::now() - Duration::hours(12))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
         insert_convergence_snapshot(
             &conn,
             "test-wf",
@@ -519,7 +523,7 @@ mod tests {
             0.5,
             15,
             13,
-            "2026-03-12T00:00:00Z",
+            &recent,
         );
 
         let trends = get_workflow_trends(&conn, "test-wf", Some("7d")).unwrap();
@@ -531,6 +535,9 @@ mod tests {
     #[test]
     fn test_workflow_trends_all_range() {
         let conn = setup_test_db();
+        let recent = (Utc::now() - Duration::days(2))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
         insert_convergence_snapshot(
             &conn,
             "test-wf",
@@ -549,7 +556,7 @@ mod tests {
             0.5,
             15,
             13,
-            "2026-03-12T00:00:00Z",
+            &recent,
         );
 
         let trends = get_workflow_trends(&conn, "test-wf", Some("all")).unwrap();

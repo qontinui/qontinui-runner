@@ -562,6 +562,10 @@ fn extract_origin(url: &str) -> String {
         // No path — the entire URL is the origin
         return url.to_string();
     }
+    // No scheme — try prepending http:// and re-extracting
+    if url.contains(':') {
+        return format!("http://{}", url.split('/').next().unwrap_or(url));
+    }
     // Fallback
     crate::mcp::types::get_self_base_url_from_env()
 }

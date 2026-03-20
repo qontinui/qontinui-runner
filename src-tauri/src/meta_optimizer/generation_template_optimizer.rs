@@ -186,6 +186,15 @@ rationale: <why this change, referencing specific feedback patterns>
 [/RULE_RECOMMENDATION]
 ```
 
+## Quality Gate
+
+- **Minimum confidence: 60%.** Do not output any recommendation below 0.6 confidence.
+- **Must cite specific evidence.** Every rule recommendation must reference a specific pattern from generation_feedback, a specific existing rule being improved, or a specific failure pattern from recent_outcomes.
+- **Maximum 3 recommendations per run.** Focus on the highest-impact changes. Creating many rules at once causes bloat and makes attribution impossible.
+- **Check for existing rules first.** Before proposing a new rule, verify it doesn't duplicate an existing active rule from {{generation_rules}}. If a similar rule exists, propose an update instead of a create.
+- **Validate agent names.** Only use these agent names: `schema_context`, `hardener`, `verification`. Any other agent name will cause the rule to be ignored.
+- **Validate section names.** Common sections: `important_rules`, `verification_quality`, `conversion_rules`, `ui_bridge_rules`. Check {{generation_rules}} for actual section names in use.
+
 ## Important Guidelines
 
 - **Feedback-driven.** Every recommendation must reference specific feedback patterns.
@@ -194,6 +203,8 @@ rationale: <why this change, referencing specific feedback patterns>
 - **Create vs. update.** Prefer updating existing rules over creating new ones to avoid bloat.
 - **Disable with care.** Only disable rules that are demonstrably causing harm or are obsolete.
 - **No hallucinated data.** Only reference patterns actually present in the loaded data.
+- **No speculative rules.** Don't create rules for problems you think might exist. Only create rules for problems you can see in the data.
+- **Rules must be specific and testable.** "Write better code" is not a rule. "When a curl command pipes output to python, do not use -f flag because it suppresses error output needed by the parser" is a rule.
 
 ## Learning From History
 

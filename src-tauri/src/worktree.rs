@@ -103,6 +103,15 @@ pub struct WorktreeCreateResult {
     pub source_branch: String,
 }
 
+/// Result of creating worktrees across multiple repos in a monorepo.
+#[derive(Debug, Clone)]
+pub struct MultiRepoWorktreeResult {
+    pub monorepo_root: PathBuf,
+    pub path_mappings: Vec<(String, String)>, // (original_path, worktree_path)
+    pub results: Vec<WorktreeCreateResult>,
+    pub errors: Vec<String>,
+}
+
 /// Result of a merge attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeResult {
@@ -327,7 +336,7 @@ pub fn merge_worktree(
                     success: false,
                     merge_commit: None,
                     conflicts,
-                    summary: format!("Merge conflicts detected. Merge aborted. Use AI merge to resolve."),
+                    summary: "Merge conflicts detected. Merge aborted. Use AI merge to resolve.".to_string(),
                 })
             } else {
                 Err(format!("Merge failed: {}", e))
@@ -626,6 +635,82 @@ If none is clearly best, describe what a hybrid of the best parts would look lik
         header_row = branches.iter().enumerate().map(|(i, _)| format!("Impl {} ", i + 1)).collect::<Vec<_>>().join("| "),
         header_sep = branches.iter().map(|_| "------").collect::<Vec<_>>().join("|"),
     )
+}
+
+// =============================================================================
+// Multi-Repo Operations
+// =============================================================================
+
+/// Discover all git repositories under the given root directory.
+/// Returns a list of (repo_name, repo_path) for each directory containing a .git folder.
+pub fn discover_repos(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut repos = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.join(".git").exists() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                repos.push((name, path));
+            }
+        }
+    }
+    repos.sort_by(|a, b| a.0.cmp(&b.0));
+    repos
+}
+
+/// Create worktrees in all git repos under the monorepo root.
+/// Returns a mapping of original_repo_path -> worktree_path.
+pub fn create_multi_repo_worktrees(
+    monorepo_root: &Path,
+    execution_id: &str,
+    workflow_name: &str,
+) -> Result<MultiRepoWorktreeResult, String> {
+    let repos = discover_repos(monorepo_root);
+    if repos.is_empty() {
+        return Err(format!(
+            "No git repos found under {}",
+            monorepo_root.display()
+        ));
+    }
+
+    let mut path_mappings: Vec<(String, String)> = Vec::new();
+    let mut results: Vec<WorktreeCreateResult> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for (name, repo_path) in &repos {
+        match create_worktree(repo_path, execution_id, workflow_name) {
+            Ok(result) => {
+                path_mappings.push((
+                    repo_path.to_string_lossy().to_string(),
+                    result.worktree_path.to_string_lossy().to_string(),
+                ));
+                results.push(result);
+            }
+            Err(e) => {
+                // Non-fatal — some repos might have uncommitted changes or other issues
+                warn!("Failed to create worktree for {}: {}", name, e);
+                errors.push(format!("{}: {}", name, e));
+            }
+        }
+    }
+
+    if results.is_empty() {
+        return Err(format!(
+            "Failed to create worktrees in any repo: {:?}",
+            errors
+        ));
+    }
+
+    Ok(MultiRepoWorktreeResult {
+        monorepo_root: monorepo_root.to_path_buf(),
+        path_mappings,
+        results,
+        errors,
+    })
 }
 
 // =============================================================================

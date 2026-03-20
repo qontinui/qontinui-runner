@@ -16,7 +16,7 @@ import type { SearchDimension } from "@/types";
 const inputClass =
   "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50";
 const selectClass =
-  "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50";
+  "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 [&>option]:text-black [&>option]:bg-white";
 const chipActiveClass =
   "px-2 py-0.5 text-[11px] rounded border transition-colors border-blue-500 bg-blue-900/30 text-blue-300";
 const chipInactiveClass =
@@ -185,6 +185,7 @@ export function CampaignTab() {
               value={workflowId}
               onChange={(e) => setWorkflowId(e.target.value)}
               className={selectClass}
+              style={{ colorScheme: "dark" }}
             >
               <option value="">Select workflow...</option>
               {workflows.map((w) => (
@@ -214,6 +215,7 @@ export function CampaignTab() {
               value={mutationStrategy}
               onChange={(e) => setMutationStrategy(e.target.value)}
               className={selectClass}
+              style={{ colorScheme: "dark" }}
             >
               <option value="sequential">Sequential</option>
               <option value="random_perturbation">Random Perturbation</option>
@@ -328,6 +330,7 @@ export function CampaignTab() {
               value={primaryMetric}
               onChange={(e) => setPrimaryMetric(e.target.value)}
               className={selectClass}
+              style={{ colorScheme: "dark" }}
             >
               <option value="pass_rate">Pass Rate</option>
               <option value="mean_iterations">Mean Iterations</option>

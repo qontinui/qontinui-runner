@@ -1086,8 +1086,8 @@ mod tests {
 pub fn ensure_seed_rules(conn: &Connection) {
     let seed_rules = [
         InsertRuleInput {
-            agent: "builder".to_string(),
-            section: "schema_context".to_string(),
+            agent: "schema_context".to_string(),
+            section: "important_rules".to_string(),
             rule_number: 23,
             title: "No echo EXIT pattern".to_string(),
             content: "NEVER use `echo EXIT:$?`, `echo $?`, or similar patterns to capture exit codes. Let the command's natural exit code propagate. Use `command && echo PASS || echo FAIL` only when explicit text output is needed for parsing.".to_string(),
@@ -1096,8 +1096,8 @@ pub fn ensure_seed_rules(conn: &Connection) {
             source_fix_id: None,
         },
         InsertRuleInput {
-            agent: "builder".to_string(),
-            section: "schema_context".to_string(),
+            agent: "schema_context".to_string(),
+            section: "important_rules".to_string(),
             rule_number: 24,
             title: "Safe grep pipeline".to_string(),
             content: "When using grep to count occurrences, always use `grep -c PATTERN || true` to handle the zero-match case (grep returns exit code 1 when no matches are found). For distinguishing 'not found' from 'error', use `command 2>&1 | grep PATTERN; test $? -ne 2`.".to_string(),
@@ -1106,8 +1106,8 @@ pub fn ensure_seed_rules(conn: &Connection) {
             source_fix_id: None,
         },
         InsertRuleInput {
-            agent: "builder".to_string(),
-            section: "schema_context".to_string(),
+            agent: "schema_context".to_string(),
+            section: "important_rules".to_string(),
             rule_number: 25,
             title: "Declare Python dependency".to_string(),
             content: "If ANY step uses `python` or `python3` commands, a prior setup step MUST verify Python availability (`python3 --version || python --version`). Do not assume Python is installed.".to_string(),

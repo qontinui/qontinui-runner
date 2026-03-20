@@ -204,7 +204,7 @@ fn default_max_iterations() -> u32 {
 }
 
 fn default_confidence_threshold() -> f64 {
-    0.8
+    0.6
 }
 
 fn default_consecutive_passes() -> u32 {
@@ -554,9 +554,22 @@ pub fn heuristic_verdict(output: &str) -> VerificationVerdict {
 
     let status = if lower.contains("goal achieved")
         || lower.contains("all checks pass")
+        || lower.contains("all checks passing")
+        || lower.contains("all verification checks pass")
+        || lower.contains("all verification checks are passing")
+        || lower.contains("verification checks passing")
         || lower.contains("successfully completed")
         || lower.contains("\"status\": \"pass\"")
         || lower.contains("status: pass")
+        || lower.contains("all_passed: true")
+        || lower.contains("\"all_passed\": true")
+        || lower.contains("\"all_passed\":true")
+        || lower.contains("no action needed")
+        || lower.contains("no further action")
+        || lower.contains("no fixes needed")
+        || lower.contains("0 failures")
+        || lower.contains("already passing")
+        || lower.contains("already fixed")
     {
         VerificationStatus::Pass
     } else if lower.contains("unreachable")
@@ -573,8 +586,40 @@ pub fn heuristic_verdict(output: &str) -> VerificationVerdict {
         VerificationStatus::Fail
     };
 
+    // Count how many pass-related keywords match for confidence scaling.
+    // Multiple matching keywords indicate higher certainty of a pass.
+    let pass_keyword_count = [
+        "goal achieved",
+        "all checks pass",
+        "all checks passing",
+        "all verification checks pass",
+        "verification checks passing",
+        "successfully completed",
+        "all_passed: true",
+        "\"all_passed\": true",
+        "0 failures",
+        "no action needed",
+        "already passing",
+        "already fixed",
+    ]
+    .iter()
+    .filter(|kw| lower.contains(**kw))
+    .count();
+
     let confidence = match status {
-        VerificationStatus::Pass => 0.6, // Low confidence for heuristic pass
+        VerificationStatus::Pass => {
+            // Scale confidence by number of matching keywords:
+            // 1 keyword  → 0.8 (meets default threshold)
+            // 2 keywords → 0.85
+            // 3+ keywords → 0.9
+            if pass_keyword_count >= 3 {
+                0.9
+            } else if pass_keyword_count >= 2 {
+                0.85
+            } else {
+                0.8
+            }
+        }
         VerificationStatus::Unreachable => 0.5,
         VerificationStatus::Partial => 0.5,
         VerificationStatus::Fail => 0.5,

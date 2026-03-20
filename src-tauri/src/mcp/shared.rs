@@ -283,6 +283,21 @@ pub fn current_project_path() -> Option<String> {
         .map(|(root, _, _)| root.to_string_lossy().to_string())
 }
 
+/// Get the monorepo root directory (parent of qontinui-runner).
+/// This is the directory containing all sibling repos.
+pub fn get_monorepo_root() -> Option<String> {
+    current_project_path().and_then(|workspace_root| {
+        // current_project_path() already returns the workspace root (parent of runner).
+        // Verify it exists and contains git repos before returning.
+        let root = std::path::Path::new(&workspace_root);
+        if root.is_dir() {
+            Some(workspace_root)
+        } else {
+            None
+        }
+    })
+}
+
 /// Helper function to get workspace paths (reused from config.rs pattern)
 pub fn get_workspace_paths_internal(
 ) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf), String> {

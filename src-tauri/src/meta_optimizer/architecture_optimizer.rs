@@ -116,7 +116,7 @@ DO NOT use any UI Bridge SDK tools — they are not available in optimizer mode.
 
 Check:
 1. The AI analyzed cross-architecture performance data
-2. At least one [ARCH_RECOMMENDATION] or [CONFIG_RECOMMENDATION] marker was produced
+2. At least one [ARCH_RECOMMENDATION], [CONFIG_RECOMMENDATION], or [ARCH_FINDING] marker was produced
    (or an explicit explanation of why no changes are needed)
 3. Each recommendation includes evidence and rationale
 
@@ -133,10 +133,28 @@ If the current architecture settings are optimal, that is acceptable."#
 fn build_agentic_prompt() -> String {
     r#"You are the Architecture Optimizer, part of the meta-optimizer system.
 
-Your job is to analyze cross-architecture performance data and recommend:
-1. Which workflow architecture to use as default and for specific workflow categories
-2. Tuning parameters for the agentic verification loop
-3. Tuning parameters for the multi-agent pipeline
+Your job is to analyze cross-architecture performance data and produce TWO types of output:
+1. **Actionable config recommendations** — for parameters that can actually be changed via settings
+2. **Advisory findings** — for insights that require code changes or human decisions
+
+## CRITICAL: What You Can and Cannot Change
+
+### You CAN recommend changes to (via CONFIG_RECOMMENDATION):
+- The `dev_mode` settings JSON operational knobs:
+  - `meta_optimizer_enabled` (bool)
+  - `meta_optimizer_threshold` (int)
+  - `fixer_enabled` (bool)
+- Generation rules (via the Generation Template Optimizer — not your job)
+
+### You CANNOT change via CONFIG_RECOMMENDATION:
+- `max_iterations` — this is set per-workflow in LoopConfig, not in global settings
+- `dag_strategy`, `level_strategy`, `max_retries_per_subtree` — these are pipeline config, not settings
+- `max_parallel_implementers`, `max_total_iterations` — pipeline config, not settings
+- Architecture selection — this is per-workflow, not a global default
+- Model selection — this is per-provider in AI settings, not a simple key-value change
+- Any parameter with a key like `agentic_verification.X` or `multi_agent_pipeline.X` — these keys DO NOT EXIST in the settings system
+
+If your analysis reveals an important insight about any of these non-configurable parameters, output it as an [ARCH_FINDING], NOT as a [CONFIG_RECOMMENDATION].
 
 ## Data Available
 
@@ -155,7 +173,7 @@ The setup phase loaded:
 
 ## Your Task
 
-### Step 1: Compare Architecture Performance
+### Step 1: Analyze the Data
 
 For each architecture, analyze:
 - Success rate (goal_achieved %)
@@ -164,11 +182,48 @@ For each architecture, analyze:
 - Average cost (USD)
 - Which workflow categories (UI tasks, backend, generation) each handles best
 
-### Step 2: Architecture Selection Recommendations
+### Step 2: Output Findings (for insights that need code changes)
 
-If one architecture consistently outperforms others for certain categories, recommend it.
+For important insights that cannot be implemented via config changes, output:
 
-Output markers:
+```
+[ARCH_FINDING]
+category: <iteration_tuning|architecture_selection|failure_pattern|data_gap>
+title: <short descriptive title>
+severity: <critical|important|informational>
+finding: <what the data shows>
+evidence: <specific numbers from the data>
+suggested_action: <what a developer should do about this>
+[/ARCH_FINDING]
+```
+
+Examples of correct findings:
+- "90% of failures occur when max_iterations=0" → ARCH_FINDING (max_iterations is per-workflow LoopConfig)
+- "Pipeline runs with dag_strategy=parallel outperform sequential by 40%" → ARCH_FINDING (dag_strategy is pipeline config)
+- "Agentic verification succeeds 2x more often for UI tasks" → ARCH_FINDING (architecture selection is per-workflow)
+
+### Step 3: Output Config Recommendations (ONLY for actually configurable parameters)
+
+ONLY output [CONFIG_RECOMMENDATION] if there is a real settings key that can be changed via `db.set_setting(key, value)`. Currently the only configurable parameters via settings are operational knobs in the dev_mode JSON.
+
+If you have no real config changes to recommend, output ZERO [CONFIG_RECOMMENDATION] markers. That is perfectly acceptable.
+
+```
+[CONFIG_RECOMMENDATION]
+architecture: <agentic_verification|multi_agent_pipeline>
+parameter: <parameter name — must be an actual settings key>
+current_value: <current value>
+recommended_value: <recommended value>
+confidence: <0.0 to 1.0>
+rationale: <why this change should improve performance>
+expected_impact: <estimated improvement>
+[/CONFIG_RECOMMENDATION]
+```
+
+### Step 4: Architecture Selection Recommendations (if supported by data)
+
+If one architecture consistently outperforms others for certain categories, recommend it as an ARCH_RECOMMENDATION. Note: these are advisory — architecture selection is per-workflow in LoopConfig and cannot be changed globally via settings.
+
 ```
 [ARCH_RECOMMENDATION]
 workflow_category: <all|ui_tasks|backend|generation|testing>
@@ -180,33 +235,12 @@ evidence: <key data points>
 [/ARCH_RECOMMENDATION]
 ```
 
-### Step 3: Parameter Tuning Recommendations
+## Quality Gate
 
-For the agentic verification loop, consider tuning:
-- `max_iterations` (currently usually 5-10)
-- Model selection (which AI model to use)
-- Provider settings
-
-For the multi-agent pipeline, consider tuning:
-- `dag_strategy` — How to build the DAG
-- `level_strategy` — How to process levels
-- `max_retries_per_subtree` — Retry budget per subtree
-- `max_parallel_implementers` — Concurrency
-- `max_total_iterations` — Total iteration cap
-- Per-agent model/temperature/max_tokens
-
-Output markers:
-```
-[CONFIG_RECOMMENDATION]
-architecture: <agentic_verification|multi_agent_pipeline>
-parameter: <parameter name>
-current_value: <current value>
-recommended_value: <recommended value>
-confidence: <0.0 to 1.0>
-rationale: <why this change should improve performance>
-expected_impact: <estimated improvement>
-[/CONFIG_RECOMMENDATION]
-```
+- **Do NOT produce recommendations below 60% confidence.** If you're not sure, produce a finding instead.
+- **Do NOT produce CONFIG_RECOMMENDATION for parameters that aren't in the settings system.** Output findings instead.
+- **Do NOT duplicate previous recommendations.** Check the optimizer_context for what was already recommended.
+- **If the data is insufficient, say so explicitly and produce no recommendations.** A clear "insufficient data" analysis is more valuable than guessing.
 
 ## Important Guidelines
 

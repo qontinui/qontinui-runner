@@ -445,7 +445,6 @@ fn run_claude_session_inline(
     let session_ctx_stdout = session_ctx.clone();
     let finding_ctx_for_stdout = finding_ctx.clone();
     let progress_ctx_for_stdout = progress_ctx.clone();
-    let reflection_fix_ctx_for_stdout = reflection_fix_ctx.clone();
     let step_injection_ctx_for_stdout = step_injection_ctx.clone();
 
     // On Windows, save the raw pipe handle before moving stdout into the reader thread.
@@ -524,19 +523,13 @@ fn run_claude_session_inline(
             None
         };
 
-        // Create reflection fix parser if we have a reflection fix context
-        let mut reflection_fix_parser = if reflection_fix_ctx_for_stdout.is_some() {
-            Some(ReflectionFixParser::new())
-        } else {
-            None
-        };
-
-        // Create causal chain parser (active when reflection fix parser is active)
-        let mut causal_chain_parser = if reflection_fix_ctx_for_stdout.is_some() {
-            Some(CausalChainParser::new())
-        } else {
-            None
-        };
+        // Always create reflection fix and causal chain parsers.
+        // These are lightweight state machines with zero cost when no markers appear.
+        // Previously gated on reflection_fix_ctx.is_some(), but this caused fixes to
+        // be silently dropped if the context was missing due to an upstream wiring issue.
+        // The processor thread handles missing context by inferring it from session data.
+        let mut reflection_fix_parser = Some(ReflectionFixParser::new());
+        let mut causal_chain_parser = Some(CausalChainParser::new());
 
         // Create step injection parser if we have a step injection context
         let mut step_injection_parser = if step_injection_ctx_for_stdout.is_some() {
@@ -1326,16 +1319,139 @@ fn run_claude_session_inline(
                 }
             }
         } else {
-            // No reflection fix context - just drain the channel to avoid blocking
-            loop {
-                match reflection_fix_rx.recv_timeout(Duration::from_secs(2)) {
-                    Ok(_) => {}
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if session_done_reflection.load(Ordering::Relaxed) {
-                            break;
+            // No explicit reflection fix context — try to infer it from session data.
+            // This handles cases where the context wasn't wired through (defensive fallback).
+            let inferred_ctx: Option<ReflectionFixContext> = session_ctx_for_reflection
+                .as_ref()
+                .and_then(|sc| {
+                    let reflection_task_run_id = sc.context.task_run_id.clone();
+                    // Look up source_task_run_id from DB
+                    let db = CheckpointDb::new().ok()?;
+                    let conn = db.connection().ok()?;
+                    let source_id: Option<String> = conn
+                        .query_row(
+                            "SELECT reflection_source_task_run_id FROM task_runs WHERE id = ?1",
+                            rusqlite::params![reflection_task_run_id],
+                            |row| row.get(0),
+                        )
+                        .ok()
+                        .flatten();
+                    let source_task_run_id = source_id?;
+                    info!(
+                        "Inferred reflection fix context from session data: source={}, reflection={}",
+                        source_task_run_id, reflection_task_run_id
+                    );
+                    Some(ReflectionFixContext {
+                        source_task_run_id,
+                        reflection_task_run_id,
+                        project_path: crate::mcp::shared::current_project_path(),
+                    })
+                });
+
+            if let Some(ctx) = inferred_ctx {
+                // We successfully inferred the context — process fixes normally
+                let db = match CheckpointDb::new() {
+                    Ok(db) => Some(db),
+                    Err(e) => {
+                        warn!("Failed to open database for reflection fix storage (inferred ctx): {}", e);
+                        None
+                    }
+                };
+
+                loop {
+                    let parsed_fix = match reflection_fix_rx.recv_timeout(Duration::from_secs(2)) {
+                        Ok(f) => f,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if session_done_reflection.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    info!(
+                        "Detected reflection fix (inferred ctx): {} (type: {}, confidence: {})",
+                        parsed_fix.description, parsed_fix.fix_type, parsed_fix.confidence
+                    );
+
+                    if let Some(ref db) = db {
+                        let conn = match db.connection() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!("Failed to get database connection: {}", e);
+                                continue;
+                            }
+                        };
+
+                        let input = CreateReflectionFixInput {
+                            source_task_run_id: ctx.source_task_run_id.clone(),
+                            reflection_task_run_id: ctx.reflection_task_run_id.clone(),
+                            source_finding_id: parsed_fix.source_finding_id,
+                            source_knowledge_id: None,
+                            fix_type: parsed_fix.fix_type.clone(),
+                            fix_description: parsed_fix.description.clone(),
+                            file_changed: parsed_fix.file_changed,
+                            old_value: parsed_fix.old_value,
+                            new_value: parsed_fix.new_value,
+                            confidence: parsed_fix.confidence.clone(),
+                            source_agent: parsed_fix.source_agent,
+                            reasoning: parsed_fix.reasoning,
+                            alternatives_considered: parsed_fix.alternatives_considered,
+                        };
+
+                        match reflection_storage::insert_fix(&conn, &input) {
+                            Ok(fix) => {
+                                fix_count += 1;
+                                info!(
+                                    "Stored reflection fix via inferred context: {} (type: {})",
+                                    fix.id, fix.fix_type
+                                );
+                                // Emit event to frontend
+                                let msg = format!(
+                                    "Reflection fix recorded: [{}:{}] {}",
+                                    fix.fix_type, fix.confidence, fix.fix_description
+                                );
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    emit_ai_output(
+                                        &app_handle_reflection,
+                                        &msg,
+                                        "reflection_fix",
+                                        None,
+                                        session_ctx_for_reflection.as_ref(),
+                                    );
+                                }));
+                            }
+                            Err(e) => {
+                                warn!("Failed to store reflection fix (inferred ctx): {}", e);
+                            }
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                // No context and couldn't infer — just drain the channel
+                let mut drain_count = 0u32;
+                loop {
+                    match reflection_fix_rx.recv_timeout(Duration::from_secs(2)) {
+                        Ok(parsed_fix) => {
+                            drain_count += 1;
+                            warn!(
+                                "Dropping reflection fix (no context): {} (type: {}, confidence: {})",
+                                parsed_fix.description, parsed_fix.fix_type, parsed_fix.confidence
+                            );
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if session_done_reflection.load(Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                if drain_count > 0 {
+                    warn!(
+                        "Dropped {} reflection fix(es) because no reflection context was available and could not be inferred",
+                        drain_count
+                    );
                 }
             }
         }

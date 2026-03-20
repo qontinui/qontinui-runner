@@ -514,6 +514,7 @@ fn extract_json_from_response(response: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::step_executor::StepExecutionConfig;
 
     #[test]
     fn test_deterministic_triage_lint() {

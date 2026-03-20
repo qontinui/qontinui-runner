@@ -109,6 +109,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { CompositionBuilderDialog } from "./CompositionBuilderDialog";
 import { SkillExportDialog } from "./SkillExportDialog";
 import { SkillImportDialog } from "./SkillImportDialog";
+import { RunOptionsDialog } from "./RunOptionsDialog";
 
 // Minimal icon resolver for composition builder (maps icon IDs to lucide components)
 const SKILL_ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -1667,10 +1668,12 @@ function WorkflowBuilderContent({
   const [executionSuccess, setExecutionSuccess] = useState<string | null>(null);
   const [showSaveBeforeRunDialog, setShowSaveBeforeRunDialog] = useState(false);
   const [isSavingBeforeRun, setIsSavingBeforeRun] = useState(false);
+  const [showRunOptions, setShowRunOptions] = useState(false);
+  const [pendingOverrides, setPendingOverrides] = useState<Record<string, unknown> | null>(null);
 
   // Execute the workflow run (called after save confirmation)
   const executeWorkflowRun = useCallback(
-    async (workflowId: string) => {
+    async (workflowId: string, overrides?: Record<string, unknown>) => {
       setIsExecuting(true);
       setExecutionError(null);
       setExecutionSuccess(null);
@@ -1679,10 +1682,14 @@ function WorkflowBuilderContent({
         console.log("[WorkflowBuilder] Running workflow:", workflowId, state.workflow.name);
 
         const runUrl = `${getApiBase()}/unified-workflows/${workflowId}/run`;
-        const requestBody = JSON.stringify({
+        const body: Record<string, unknown> = {
           monitor_index: 0,
           // No timeout_seconds - runs until completion or manual stop
-        });
+        };
+        if (overrides && Object.keys(overrides).length > 0) {
+          body.overrides = overrides;
+        }
+        const requestBody = JSON.stringify(body);
 
         tracedFetch(runUrl, {
           method: "POST",
@@ -1723,14 +1730,15 @@ function WorkflowBuilderContent({
         return;
       }
       setShowSaveBeforeRunDialog(false);
-      await executeWorkflowRun(savedWorkflow.id);
+      await executeWorkflowRun(savedWorkflow.id, pendingOverrides ?? undefined);
     } finally {
       setIsSavingBeforeRun(false);
+      setPendingOverrides(null);
     }
-  }, [saveWorkflow, executeWorkflowRun]);
+  }, [saveWorkflow, executeWorkflowRun, pendingOverrides]);
 
-  // Handle run workflow
-  const handleRun = useCallback(async () => {
+  // Handle run workflow (with optional overrides from RunOptionsDialog)
+  const handleRun = useCallback(async (overrides?: Record<string, unknown>) => {
     if (isExecuting) return;
 
     // Check if workflow has steps
@@ -1741,12 +1749,13 @@ function WorkflowBuilderContent({
 
     // Check if workflow is saved (must have an ID to run)
     if (!state.workflow.id || hasUnsavedChanges) {
+      if (overrides) setPendingOverrides(overrides);
       setShowSaveBeforeRunDialog(true);
       return;
     }
 
     // Workflow is already saved, run it directly
-    await executeWorkflowRun(state.workflow.id);
+    await executeWorkflowRun(state.workflow.id, overrides);
   }, [state.workflow.id, isEmpty, hasUnsavedChanges, isExecuting, executeWorkflowRun]);
 
   // Handle loading a deterministic spec workflow into the builder
@@ -2564,15 +2573,24 @@ function WorkflowBuilderContent({
                 <span className="text-sm">Stop</span>
               </button>
             ) : (
-              <button
-                onClick={handleRun}
-                disabled={isEmpty}
-                className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-blue-600 hover:bg-blue-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                title={isEmpty ? "Add steps to run this workflow" : "Run workflow"}
-              >
-                <Play className="w-4 h-4" />
-                <span className="text-sm">Run</span>
-              </button>
+              <div className="flex items-stretch">
+                <button
+                  onClick={() => handleRun()}
+                  disabled={isEmpty}
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-l-md bg-blue-600 hover:bg-blue-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  title={isEmpty ? "Add steps to run this workflow" : "Run workflow"}
+                >
+                  <Play className="w-4 h-4" />
+                  <span className="text-sm">Run</span>
+                </button>
+                <button
+                  onClick={() => setShowRunOptions(true)}
+                  className="flex items-center px-2 py-1.5 rounded-r-md bg-blue-700 hover:bg-blue-600 text-white border-l border-blue-500/50 transition-colors"
+                  title="Run with options (architecture, worktree)"
+                >
+                  <ChevronDown className="w-4 h-4" />
+                </button>
+              </div>
             )}
           </div>
         </div>
@@ -2878,6 +2896,18 @@ function WorkflowBuilderContent({
             </div>
           )}
         </div>
+
+        {/* Run Options Dialog (rendered outside isEmpty ternary so it's always available) */}
+        <RunOptionsDialog
+          open={showRunOptions}
+          onClose={() => setShowRunOptions(false)}
+          onRun={(overrides) => {
+            setShowRunOptions(false);
+            handleRun(overrides);
+          }}
+          isLoading={isExecuting}
+          workflowId={state.workflow.id || null}
+        />
       </div>
     </div>
   );

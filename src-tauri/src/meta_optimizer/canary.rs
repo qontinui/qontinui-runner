@@ -335,7 +335,6 @@ pub fn promote_canary(db: &CheckpointDb, canary_id: &str) -> Result<(), String> 
     // Update canary status
     db.with_conn({
         let canary_id = canary_id_str;
-        let now = now;
         move |conn| {
             conn.execute(
                 "UPDATE canary_rollouts SET status = 'promoted', end_date = ?1 WHERE id = ?2",
@@ -357,7 +356,6 @@ pub fn rollback_canary(db: &CheckpointDb, canary_id: &str) -> Result<(), String>
 
     db.with_conn({
         let canary_id = canary_id_str.clone();
-        let now = now;
         move |conn| {
             // Get recommendation_id
             let rec_id: String = conn

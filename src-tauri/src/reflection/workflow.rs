@@ -18,6 +18,47 @@ use crate::step_executor::ExecutionStepConfig;
 use crate::unified_workflow_executor::LoopConfig;
 
 // =============================================================================
+// Shared Reflection Guardrails
+// =============================================================================
+
+/// Guardrail text included in ALL reflection system prompts.
+/// Prevents scope creep, phantom file creation, and destructive modifications.
+const REFLECTION_GUARDRAILS: &str = r#"
+## Reflection Guardrails (applies to ALL reflection types)
+
+### Scope Discipline
+- **Stay in your lane.** Each reflection type has a specific domain (execution analysis, generation quality,
+  project learning, UI Bridge improvements). Do NOT fix issues outside your domain. If you discover an
+  issue in another domain, mention it in your output but do NOT attempt to fix it.
+- **Analyze what happened, then fix within scope.** Your primary job is analysis. Fixes are secondary
+  and must be within your reflection type's scope.
+
+### Modification Boundaries
+- **Never create new files or directories** unless the fix absolutely requires a new file (e.g., a new
+  test file). Compatibility shims, re-export modules, and wrapper files are NEVER acceptable — fix the
+  reference at the source instead.
+- **Never modify code unrelated to your findings.** If a finding leads you to discover a separate issue
+  in unrelated code, record it as a finding but do not modify it.
+- **Prefer minimal, targeted changes.** A one-line fix is better than a refactor. Change the smallest
+  amount of code that addresses the root cause.
+
+### Path and Reference Verification
+- **Verify before referencing.** Before citing a file path, module, function, or variable in a fix,
+  verify it exists using the project structure or a targeted grep. Do NOT assume paths from memory,
+  documentation, or naming conventions.
+- **Fix the reference, not the filesystem.** If verification code, documentation, or a configuration
+  references a wrong path, update the reference to point to the correct location. Do NOT create files
+  at the wrong path to satisfy the broken reference.
+
+### Change Safety
+- **Never delete or overwrite user code** without clear evidence it is the root cause of the issue.
+- **Test compilation after code changes.** If you modify Rust code, run `cargo check`. If you modify
+  TypeScript, run `npx tsc --noEmit`. Do not emit a fix marker for code that doesn't compile.
+- **Do not modify database schemas, migrations, or seed data** unless the reflection is specifically
+  about a schema issue with clear evidence.
+"#;
+
+// =============================================================================
 // Reflection Context Enrichment
 // =============================================================================
 
@@ -808,8 +849,8 @@ Focus your analysis on qualitative observations about which fixes helped and whi
 and record any new fixes needed using `[REFLECTION_FIX:...]` markers."#;
 
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
-        preamble, data_section, marker_section, causal_section, analysis_steps, evaluation_section
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        preamble, data_section, REFLECTION_GUARDRAILS, marker_section, causal_section, analysis_steps, evaluation_section
     )
 }
 
@@ -996,7 +1037,7 @@ pub fn build_project_reflection_config(
     project_path: Option<String>,
 ) -> LoopConfig {
     LoopConfig {
-        max_iterations: 2, // Project reflection needs fewer iterations
+        max_iterations: 3, // Increased from 2: AI verification step needs room to retry
         base_prompt: build_project_agentic_prompt(source_workflow_name),
         workflow_name: workflow_name.to_string(),
         workflow_id: format!("project-reflection-{}", execution_id),
@@ -1119,7 +1160,7 @@ pub fn build_project_verification_steps(source_task_run_id: &str) -> Vec<Executi
     let base_url = crate::mcp::types::get_self_base_url_from_env();
 
     vec![
-        // Single HTTP health check
+        // Step 1: HTTP health check (non-blocking — AI step below provides fallback)
         {
             let mut step = ExecutionStepConfig {
                 step_type: "command".to_string(),
@@ -1136,6 +1177,20 @@ pub fn build_project_verification_steps(source_task_run_id: &str) -> Vec<Executi
             step.phase = Some("verification".to_string());
             step
         },
+        // Step 2: AI-driven verification (matches pattern from build_verification_steps)
+        build_verification_prompt_step(
+            "Verify project reflection safety",
+            r#"Verify that the project reflection analysis is complete and safe.
+DO NOT use any UI Bridge SDK tools — they are not available in reflection mode.
+Base your verification ONLY on the data already loaded in runtime variables and your own output.
+
+Check:
+1. The AI analyzed the source output and identified relevant project-level patterns
+2. Project knowledge was recorded via [REFLECTION_FIX:...] markers OR the AI confirmed no new project knowledge was found
+3. No destructive changes were made (no files deleted or overwritten without recording)
+
+If any issues are found, report them. Otherwise, confirm the project reflection is safe."#,
+        ),
     ]
 }
 
@@ -1180,7 +1235,7 @@ Keep the summary concise — this is for internal tracking, not user display."#,
 /// Unlike workflow reflection which focuses on fixing workflow mechanics,
 /// project reflection focuses on learning about the user's project/codebase.
 fn build_project_agentic_prompt(source_workflow_name: &str) -> String {
-    format!(
+    let prompt = format!(
         r#"You are a project reflection agent analyzing the completed workflow run for "{}".
 
 Your goal is NOT to fix workflows — instead, you are learning about the **user's project**.
@@ -1307,7 +1362,8 @@ useful, project-specific knowledge. Do NOT emit:
 Fixes are deduplicated by content hash. Check `{{{{previous_fixes}}}}` before emitting.
 Only emit genuinely new insights — do NOT re-emit existing knowledge."#,
         source_workflow_name
-    )
+    );
+    format!("{}\n{}", prompt, REFLECTION_GUARDRAILS)
 }
 
 /// Helper: Build a command step that makes an HTTP request via curl.
@@ -1641,7 +1697,7 @@ Keep the summary concise — this is for internal tracking."#,
 /// structured implementation plan for larger improvements that will be used to
 /// generate a follow-up implementation workflow.
 fn build_ui_bridge_agentic_prompt(source_workflow_name: &str) -> String {
-    format!(
+    let prompt = format!(
         r#"You are a UI Bridge reflection agent analyzing the completed workflow run for "{}".
 
 Your goal is to understand how the UI Bridge was used (both deterministic steps and AI-driven interactions) in the workflow, identify what could be improved, and either implement improvements directly or produce a structured implementation plan for a follow-up workflow.
@@ -1900,7 +1956,8 @@ New: // new code snippet
 Check `{{{{previous_fixes}}}}` before emitting. Only emit genuinely new insights.
 Do NOT re-emit existing fixes."#,
         source_workflow_name
-    )
+    );
+    format!("{}\n{}", prompt, REFLECTION_GUARDRAILS)
 }
 
 /// Helper: Build a prompt step.

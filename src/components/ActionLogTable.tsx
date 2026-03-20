@@ -769,7 +769,8 @@ export default function ActionLogTable({
           id="level-filter"
           value={maxLevel}
           onChange={(e) => setMaxLevel(Number(e.target.value))}
-          className="px-3 py-1 bg-card text-foreground border border-border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+          className="px-3 py-1 bg-card text-foreground border border-border rounded focus:outline-none focus:ring-2 focus:ring-blue-500 [&>option]:text-black [&>option]:bg-white"
+          style={{ colorScheme: "dark" }}
         >
           {Array.from({ length: maxAvailableLevel + 1 }, (_, i) => (
             <option key={i} value={i}>

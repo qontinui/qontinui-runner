@@ -205,7 +205,8 @@ export function AgentTraceComparison({ selectedAgent }: Props) {
           <select
             value={configA}
             onChange={(e) => setConfigA(e.target.value)}
-            className="w-full px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded-md text-xs text-zinc-200"
+            className="w-full px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded-md text-xs text-zinc-200 [&>option]:text-black [&>option]:bg-white"
+            style={{ colorScheme: "dark" }}
           >
             <option value="">Select variant...</option>
             {variantKeys.map((k) => (
@@ -220,7 +221,8 @@ export function AgentTraceComparison({ selectedAgent }: Props) {
           <select
             value={configB}
             onChange={(e) => setConfigB(e.target.value)}
-            className="w-full px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded-md text-xs text-zinc-200"
+            className="w-full px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded-md text-xs text-zinc-200 [&>option]:text-black [&>option]:bg-white"
+            style={{ colorScheme: "dark" }}
           >
             <option value="">Select variant...</option>
             {variantKeys.map((k) => (

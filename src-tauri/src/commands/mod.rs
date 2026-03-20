@@ -53,6 +53,7 @@ pub mod ai_settings;
 pub mod auth;
 pub mod backup; // Comprehensive backup and restore
 pub mod checkpoint_browser; // Orchestrator checkpoint browser (time-travel debugging)
+pub mod comparison; // Side-by-side architecture comparison runs
 pub mod checkpoints;
 pub mod checks; // Code quality checks (linting, formatting, type checking)
 pub mod config;

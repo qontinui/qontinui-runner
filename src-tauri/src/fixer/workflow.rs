@@ -85,7 +85,7 @@ pub fn build_setup_steps(source_task_run_id: &str) -> Vec<ExecutionStepConfig> {
             "Load reflection fixes",
             "GET",
             &format!(
-                "{}/reflection-fixes?source_task_run_id={}",
+                "{}/task-runs/{}/reflection-fixes",
                 base_url, source_task_run_id
             ),
             None,

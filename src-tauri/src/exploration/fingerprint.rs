@@ -58,7 +58,7 @@ fn implicit_landmark(tag: &str) -> Option<&'static str> {
 
 static DYNAMIC_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
-        Regex::new(r"\b\d{1,2}[/:.\-]\d{1,2}(?:[/:.\-]\d{2,4})?\b").unwrap(),
+        Regex::new(r"\b\d{1,4}[/:.\-]\d{1,2}(?:[/:.\-]\d{2,4})?\b").unwrap(),
         Regex::new(r"\b\d+\b").unwrap(),
         Regex::new(r"(?i)\b[a-f0-9]{8,}\b").unwrap(),
         Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")

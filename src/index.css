@@ -6,6 +6,8 @@
 
 @layer base {
   :root {
+    color-scheme: dark;
+
     /* Dark gaming theme with neon accents */
     --background: 10 10 11;
     --foreground: 0 0 100%;

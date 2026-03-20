@@ -49,6 +49,18 @@ pub struct ParsedConfigRecommendation {
     pub expected_impact: String,
 }
 
+/// A parsed advisory finding from architecture_optimizer output.
+/// These represent insights that require code changes, not config changes.
+#[derive(Debug, Clone)]
+pub struct ParsedArchFinding {
+    pub category: String,
+    pub title: String,
+    pub severity: String,
+    pub finding: String,
+    pub evidence: String,
+    pub suggested_action: String,
+}
+
 /// A parsed rule recommendation from generation_template_optimizer output.
 #[derive(Debug, Clone)]
 pub struct ParsedRuleRecommendation {
@@ -125,11 +137,7 @@ fn parse_key_value_pairs(block: &str) -> std::collections::HashMap<String, Strin
                         break;
                     }
                     // Dedent: remove up to 2 leading spaces
-                    let dedented = if next_line.starts_with("  ") {
-                        &next_line[2..]
-                    } else {
-                        next_line
-                    };
+                    let dedented = next_line.strip_prefix("  ").unwrap_or(next_line);
                     multiline.push(dedented);
                     i += 1;
                 }
@@ -267,6 +275,49 @@ pub fn parse_rule_recommendations(output: &str) -> Vec<ParsedRuleRecommendation>
         .collect()
 }
 
+/// Parse `[ARCH_FINDING]` blocks from architecture_optimizer output.
+pub fn parse_arch_findings(output: &str) -> Vec<ParsedArchFinding> {
+    extract_marker_blocks(output, "ARCH_FINDING")
+        .into_iter()
+        .filter_map(|block| {
+            let kv = parse_key_value_pairs(&block);
+            let title = get_str(&kv, "title");
+            let finding = get_str(&kv, "finding");
+            if title.is_empty() || finding.is_empty() {
+                warn!("Skipping ARCH_FINDING with missing title or finding");
+                return None;
+            }
+            Some(ParsedArchFinding {
+                category: get_str(&kv, "category"),
+                title,
+                severity: get_str(&kv, "severity"),
+                finding,
+                evidence: get_str(&kv, "evidence"),
+                suggested_action: get_str(&kv, "suggested_action"),
+            })
+        })
+        .collect()
+}
+
+// ── Deduplication helper ─────────────────────────────────────────────────
+
+/// Check if a pending or rejected recommendation with the same title already exists.
+/// This prevents re-generating recommendations that were previously rejected.
+fn is_duplicate_recommendation(db: &CheckpointDb, title: &str) -> bool {
+    let title = title.to_string();
+    db.with_conn(move |conn| {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE title = ?1 AND status IN ('pending', 'rejected')",
+                rusqlite::params![title],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(count > 0)
+    })
+    .unwrap_or(false)
+}
+
 // ── Save orchestrator ───────────────────────────────────────────────────
 
 /// Parse recommendations from AI output and save them to the database.
@@ -299,6 +350,16 @@ pub fn save_parsed_recommendations(
                 } else {
                     rec.rationale.clone()
                 };
+
+                if rec.confidence < 0.5 {
+                    debug!("Skipping low-confidence recommendation ({:.0}%): {}", rec.confidence * 100.0, title);
+                    continue;
+                }
+
+                if is_duplicate_recommendation(db, &title) {
+                    debug!("Skipping duplicate recommendation: {}", title);
+                    continue;
+                }
 
                 // Serialize as JSON payload matching PromptRewritePayload
                 let recommended_value = serde_json::json!({
@@ -336,6 +397,12 @@ pub fn save_parsed_recommendations(
                     "Switch to {} for {} workflows",
                     rec.recommended_architecture, rec.workflow_category
                 );
+
+                if rec.confidence < 0.5 {
+                    debug!("Skipping low-confidence recommendation ({:.0}%): {}", rec.confidence * 100.0, title);
+                    continue;
+                }
+
                 let description = if rec.rationale.is_empty() {
                     format!(
                         "Recommend {} architecture (currently {})",
@@ -344,6 +411,11 @@ pub fn save_parsed_recommendations(
                 } else {
                     rec.rationale.clone()
                 };
+
+                if is_duplicate_recommendation(db, &title) {
+                    debug!("Skipping duplicate recommendation: {}", title);
+                    continue;
+                }
 
                 // Serialize as JSON payload matching ConfigChangePayload
                 let current_value = serde_json::json!({
@@ -386,6 +458,12 @@ pub fn save_parsed_recommendations(
                     "Tune {} for {}",
                     rec.parameter, rec.architecture
                 );
+
+                if rec.confidence < 0.5 {
+                    debug!("Skipping low-confidence recommendation ({:.0}%): {}", rec.confidence * 100.0, title);
+                    continue;
+                }
+
                 let description = if rec.rationale.is_empty() {
                     format!(
                         "Change {} from {} to {}",
@@ -394,6 +472,11 @@ pub fn save_parsed_recommendations(
                 } else {
                     rec.rationale.clone()
                 };
+
+                if is_duplicate_recommendation(db, &title) {
+                    debug!("Skipping duplicate recommendation: {}", title);
+                    continue;
+                }
 
                 // Serialize as JSON payload matching ConfigChangePayload
                 let config_key = format!("{}.{}", rec.architecture, rec.parameter);
@@ -425,6 +508,43 @@ pub fn save_parsed_recommendations(
                 )?;
                 count += 1;
             }
+
+            // Parse advisory findings
+            let findings = parse_arch_findings(output);
+            info!(
+                "Parsed {} ARCH_FINDING(s) from output",
+                findings.len()
+            );
+            for finding in &findings {
+                let title = finding.title.clone();
+                if is_duplicate_recommendation(db, &title) {
+                    debug!("Skipping duplicate finding: {}", title);
+                    continue;
+                }
+                let metadata = serde_json::json!({
+                    "category": finding.category,
+                    "severity": finding.severity,
+                    "suggested_action": finding.suggested_action,
+                }).to_string();
+                recommendations::create_recommendation(
+                    db,
+                    optimizer_type,
+                    "finding",  // Not actionable as config_change
+                    None,
+                    &title,
+                    &finding.finding,
+                    None,
+                    Some(&metadata),
+                    if finding.evidence.is_empty() {
+                        None
+                    } else {
+                        Some(&finding.evidence)
+                    },
+                    0.0,  // Findings don't have confidence — they're observations
+                    optimizer_run_id,
+                )?;
+                count += 1;
+            }
         }
 
         "generation_template" => {
@@ -436,6 +556,12 @@ pub fn save_parsed_recommendations(
                 } else {
                     rec.title.clone()
                 };
+
+                if rec.confidence < 0.5 {
+                    debug!("Skipping low-confidence recommendation ({:.0}%): {}", rec.confidence * 100.0, title);
+                    continue;
+                }
+
                 let description = if rec.rationale.is_empty() {
                     format!(
                         "{} rule in {}.{}: {}",
@@ -444,6 +570,11 @@ pub fn save_parsed_recommendations(
                 } else {
                     rec.rationale.clone()
                 };
+
+                if is_duplicate_recommendation(db, &title) {
+                    debug!("Skipping duplicate recommendation: {}", title);
+                    continue;
+                }
 
                 // Serialize as JSON payload matching RulePayload
                 let status_override = if rec.action == "disable" {
@@ -497,9 +628,71 @@ pub fn save_parsed_recommendations(
             "Saved {} recommendation(s) for optimizer type '{}'",
             count, optimizer_type
         );
+
+        // Auto-apply high-confidence rule recommendations
+        auto_apply_high_confidence(db, optimizer_run_id);
     }
 
     Ok(count)
+}
+
+/// Auto-apply high-confidence rule recommendations.
+///
+/// Only applies `rule_create` and `rule_update` types with confidence >= 0.85.
+/// Prompt rewrites and config changes always require human review since they
+/// are harder to reverse and have broader impact.
+pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&str>) {
+    let run_id = optimizer_run_id.map(|s| s.to_string());
+
+    // Only auto-apply rule changes (safest, most reversible)
+    let candidates: Vec<(String, f64)> = db
+        .with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    r#"SELECT id, confidence FROM meta_optimizer_recommendations
+                       WHERE status = 'pending'
+                         AND recommendation_type IN ('rule_create', 'rule_update')
+                         AND confidence >= 0.85
+                         AND (?1 IS NULL OR optimizer_run_id = ?1)"#,
+                )
+                .map_err(|e| format!("Query error: {}", e))?;
+
+            let rows = stmt
+                .query_map(rusqlite::params![run_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })
+                .map_err(|e| format!("Query error: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(rows)
+        })
+        .unwrap_or_default();
+
+    for (rec_id, confidence) in &candidates {
+        match super::recommendations::apply_recommendation_with_side_effects(db, rec_id) {
+            Ok(()) => {
+                info!(
+                    "Auto-applied high-confidence recommendation {} (confidence: {:.0}%)",
+                    rec_id,
+                    confidence * 100.0
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to auto-apply recommendation {}: {}",
+                    rec_id, e
+                );
+            }
+        }
+    }
+
+    if !candidates.is_empty() {
+        info!(
+            "Auto-applied {} high-confidence rule recommendation(s)",
+            candidates.len()
+        );
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -688,11 +881,46 @@ rationale: Missing agent_type and variant_name
     }
 
     #[test]
+    fn test_parse_arch_findings() {
+        let output = r#"
+[ARCH_FINDING]
+category: iteration_tuning
+title: Most failures have max_iterations=0
+severity: critical
+finding: 90% of failed runs used max_iterations=0, suggesting the iteration budget is exhausted
+evidence: 45/50 failures had max_iterations=0; 5/50 had max_iterations>=3
+suggested_action: Increase default max_iterations in LoopConfig from 5 to 8
+[/ARCH_FINDING]
+"#;
+        let findings = parse_arch_findings(output);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].category, "iteration_tuning");
+        assert_eq!(findings[0].title, "Most failures have max_iterations=0");
+        assert_eq!(findings[0].severity, "critical");
+        assert!(findings[0].finding.contains("90%"));
+        assert!(findings[0].evidence.contains("45/50"));
+        assert!(findings[0].suggested_action.contains("LoopConfig"));
+    }
+
+    #[test]
+    fn test_parse_arch_findings_missing_fields() {
+        let output = r#"
+[ARCH_FINDING]
+category: data_gap
+severity: informational
+[/ARCH_FINDING]
+"#;
+        let findings = parse_arch_findings(output);
+        assert_eq!(findings.len(), 0); // Missing title and finding
+    }
+
+    #[test]
     fn test_no_markers_returns_empty() {
         let output = "Just some regular text with no markers.";
         assert!(parse_prompt_recommendations(output).is_empty());
         assert!(parse_arch_recommendations(output).is_empty());
         assert!(parse_config_recommendations(output).is_empty());
         assert!(parse_rule_recommendations(output).is_empty());
+        assert!(parse_arch_findings(output).is_empty());
     }
 }
