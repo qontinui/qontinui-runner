@@ -66,6 +66,18 @@
     color: inherit;
     background-color: inherit;
   }
+
+  /* Force native <select> to use dark color scheme (affects the select button itself) */
+  select {
+    color-scheme: dark;
+  }
+
+  /* Ensure dropdown options are always readable (black on white) since
+     native option elements don't reliably inherit dark theme colors */
+  select option {
+    color: #000;
+    background-color: #fff;
+  }
 }
 
 @layer components {
