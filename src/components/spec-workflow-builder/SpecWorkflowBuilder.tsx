@@ -26,6 +26,7 @@ import {
 } from "../../lib/workflow-builder/buildSpecWorkflow";
 
 type Step = "load" | "select" | "configure" | "preview";
+type WorkflowMode = "verify" | "fix";
 
 interface ConfigState {
   agenticPrompt: string;
@@ -74,6 +75,9 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
   const [agenticPrompt, setAgenticPrompt] = useState("");
   const [maxIterations, setMaxIterations] = useState(3);
   const [elementSource, setElementSource] = useState<"control" | "external">("control");
+  // useReducer for config state (WorkflowMode and related config)
+  const [, dispatchConfig] = useReducer(configReducer, initialConfig);
+  void dispatchConfig; // declared for future use; setters below handle actual state
 
   // Extract generator metadata from SpecConfig
   const genMeta = useMemo<GeneratorSpecMetadata | undefined>(
@@ -101,7 +105,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
     // Determine element source: prefer explicit metadata, otherwise default to "control"
     const rawMeta = config.metadata as Record<string, unknown> | undefined;
     const explicitSource = rawMeta?.elementSource as "control" | "external" | undefined;
-    dispatchConfig({ type: "SET_ELEMENT_SOURCE", payload: explicitSource || "control" });
+    setElementSource(explicitSource || "control");
     setCurrentStep("select");
   }, []);
 
@@ -238,15 +242,11 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
             <div className="flex-1 overflow-auto">
               <AgenticPromptEditor
                 prompt={agenticPrompt}
-                onPromptChange={(v: string) => dispatchConfig({ type: "SET_PROMPT", payload: v })}
+                onPromptChange={(v: string) => setAgenticPrompt(v)}
                 maxIterations={maxIterations}
-                onMaxIterationsChange={(v: number) =>
-                  dispatchConfig({ type: "SET_MAX_ITERATIONS", payload: v })
-                }
+                onMaxIterationsChange={(v: number) => setMaxIterations(v)}
                 elementSource={elementSource}
-                onElementSourceChange={(v: "control" | "external") =>
-                  dispatchConfig({ type: "SET_ELEMENT_SOURCE", payload: v })
-                }
+                onElementSourceChange={(v: "control" | "external") => setElementSource(v)}
               />
             </div>
             <div className="px-4 py-3 border-t border-border bg-muted/50">

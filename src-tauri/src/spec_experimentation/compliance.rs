@@ -592,6 +592,280 @@ fn compute_trend(conn: &rusqlite::Connection, spec_id: Option<&str>) -> String {
     }
 }
 
+// -- Broken assertion detection ------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokenAssertion {
+    pub assertion_id: String,
+    pub description: String,
+    pub severity: String,
+    pub last_passed_at: Option<String>,
+    pub first_failed_at: String,
+    pub consecutive_failures: u32,
+    pub detail: String,
+}
+
+/// Identify assertions that were passing in previous runs but are now failing.
+/// These are likely regressions caused by code changes.
+pub fn detect_broken_assertions(
+    db: &CheckpointDb,
+    spec_id: &str,
+) -> Result<Vec<BrokenAssertion>, String> {
+    let spec_id = spec_id.to_string();
+
+    db.with_conn(move |conn| {
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT assertion_details_json, created_at
+                   FROM spec_compliance_results
+                   WHERE spec_id = ?1
+                   ORDER BY created_at DESC
+                   LIMIT 20"#,
+            )
+            .map_err(|e| format!("Failed to prepare broken assertion query: {}", e))?;
+
+        let runs: Vec<(String, String)> = stmt
+            .query_map(params![spec_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Failed to query compliance runs: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if runs.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        let newest_details: Vec<AssertionDetail> =
+            serde_json::from_str(&runs[0].0).unwrap_or_default();
+        let previous_details: Vec<AssertionDetail> =
+            serde_json::from_str(&runs[1].0).unwrap_or_default();
+
+        let prev_map: std::collections::HashMap<String, bool> = previous_details
+            .iter()
+            .map(|d| (d.id.clone(), d.passed))
+            .collect();
+
+        let mut broken = Vec::new();
+
+        for detail in &newest_details {
+            if detail.id.is_empty() {
+                continue;
+            }
+            let was_passing = prev_map.get(&detail.id).copied().unwrap_or(false);
+            if was_passing && !detail.passed {
+                // Count consecutive failures from newest run backward.
+                // We know runs[0] fails and runs[1] passes, so consecutive
+                // starts at 1 and we check runs *before* runs[0] (i.e., check
+                // if the assertion was also failing just before the pass).
+                // Since runs[1] passed, the consecutive failure streak from
+                // the most recent run is exactly 1. However, to handle cases
+                // where runs[1] is the *only* pass sandwiched between failures,
+                // we just report consecutive = 1 and note when it last passed.
+                let consecutive = 1u32;
+                let first_failed_at = runs[0].1.clone();
+                let last_passed_at = Some(runs[1].1.clone());
+
+                broken.push(BrokenAssertion {
+                    assertion_id: detail.id.clone(),
+                    description: detail.description.clone(),
+                    severity: detail.severity.clone(),
+                    last_passed_at,
+                    first_failed_at,
+                    consecutive_failures: consecutive,
+                    detail: detail.detail.clone(),
+                });
+            }
+        }
+
+        Ok(broken)
+    })
+}
+
+// -- Spec attention detection -------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecAttentionItem {
+    pub spec_id: String,
+    pub reason: String,
+    pub broken_count: u32,
+    pub staleness_days: i64,
+    pub latest_score: Option<f64>,
+    pub detail: String,
+}
+
+/// Get specs that need attention: broken assertions, stale, or never run.
+pub fn get_specs_needing_attention(db: &CheckpointDb) -> Result<Vec<SpecAttentionItem>, String> {
+    let spec_ids: Vec<(String, f64)> = db.with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT DISTINCT spec_id,
+                          (SELECT overall_score FROM spec_compliance_results scr2
+                           WHERE scr2.spec_id = scr.spec_id
+                           ORDER BY created_at DESC LIMIT 1) as latest_score
+                   FROM spec_compliance_results scr
+                   WHERE spec_id IS NOT NULL"#,
+            )
+            .map_err(|e| format!("Failed to query spec_ids: {}", e))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .map_err(|e| format!("Failed to iterate spec_ids: {}", e))?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    })?;
+
+    let mut attention_items: Vec<SpecAttentionItem> = Vec::new();
+
+    for (spec_id, latest_score) in &spec_ids {
+        let broken = detect_broken_assertions(db, spec_id)?;
+        if !broken.is_empty() {
+            let critical_count = broken.iter().filter(|b| b.severity == "critical").count();
+            let detail = if critical_count > 0 {
+                format!(
+                    "{} assertion(s) regressed ({} critical): {}",
+                    broken.len(),
+                    critical_count,
+                    broken
+                        .iter()
+                        .take(3)
+                        .map(|b| b.description.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                format!(
+                    "{} assertion(s) regressed: {}",
+                    broken.len(),
+                    broken
+                        .iter()
+                        .take(3)
+                        .map(|b| b.description.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+
+            attention_items.push(SpecAttentionItem {
+                spec_id: spec_id.clone(),
+                reason: "broken_assertions".to_string(),
+                broken_count: broken.len() as u32,
+                staleness_days: 0,
+                latest_score: Some(*latest_score),
+                detail,
+            });
+        }
+    }
+
+    let stale_specs: Vec<(String, i64)> = db.with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT spec_id, detail_json
+                   FROM spec_accuracy_results
+                   WHERE analysis_type = 'freshness'
+                   ORDER BY created_at DESC"#,
+            )
+            .map_err(|e| format!("Failed to query freshness results: {}", e))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Failed to iterate freshness results: {}", e))?;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut stale = Vec::new();
+        for row in rows.flatten() {
+            let (sid, detail_json) = row;
+            if !seen.insert(sid.clone()) {
+                continue;
+            }
+            if let Ok(detail) = serde_json::from_str::<serde_json::Value>(&detail_json) {
+                let is_stale = detail
+                    .get("is_stale")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let staleness_days = detail
+                    .get("staleness_days")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                if is_stale && staleness_days > 0 {
+                    stale.push((sid, staleness_days));
+                }
+            }
+        }
+        Ok(stale)
+    })?;
+
+    for (spec_id, staleness_days) in stale_specs {
+        if let Some(item) = attention_items.iter_mut().find(|a| a.spec_id == spec_id) {
+            item.staleness_days = staleness_days;
+            item.detail = format!("{} (also stale by {}d)", item.detail, staleness_days);
+            continue;
+        }
+
+        let latest_score = spec_ids
+            .iter()
+            .find(|(id, _)| id == &spec_id)
+            .map(|(_, s)| *s);
+
+        attention_items.push(SpecAttentionItem {
+            spec_id,
+            reason: "stale".to_string(),
+            broken_count: 0,
+            staleness_days,
+            latest_score,
+            detail: format!("Spec is {}d older than its component files", staleness_days),
+        });
+    }
+
+    let never_run: Vec<String> = db.with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT DISTINCT sv.spec_id
+                   FROM spec_versions sv
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM spec_compliance_results scr
+                       WHERE scr.spec_id = sv.spec_id
+                   )"#,
+            )
+            .map_err(|e| format!("Failed to query never-run specs: {}", e))?;
+
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("Failed to iterate never-run specs: {}", e))?;
+
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    })?;
+
+    for spec_id in never_run {
+        attention_items.push(SpecAttentionItem {
+            spec_id,
+            reason: "never_run".to_string(),
+            broken_count: 0,
+            staleness_days: 0,
+            latest_score: None,
+            detail: "Spec has never been compliance-checked".to_string(),
+        });
+    }
+
+    attention_items.sort_by(|a, b| {
+        let order = |r: &str| match r {
+            "broken_assertions" => 0,
+            "stale" => 1,
+            "never_run" => 2,
+            _ => 3,
+        };
+        order(&a.reason)
+            .cmp(&order(&b.reason))
+            .then(b.broken_count.cmp(&a.broken_count))
+    });
+
+    Ok(attention_items)
+}
+
 /// Auto-extract compliance for a spec-generated workflow.
 /// Called from the meta_optimizer trigger hook.
 pub fn auto_extract_spec_compliance(db: &CheckpointDb, task_run_id: &str) {

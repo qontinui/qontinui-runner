@@ -34,6 +34,23 @@ pub fn extract_spec_compliance(
     compliance::extract_compliance(&app_state.checkpoint_db, &task_run_id)
 }
 
+// -- Broken assertion & attention commands ------------------------------------
+
+#[tauri::command]
+pub fn detect_broken_spec_assertions(
+    app_state: State<'_, Arc<AppState>>,
+    spec_id: String,
+) -> Result<Vec<compliance::BrokenAssertion>, String> {
+    compliance::detect_broken_assertions(&app_state.checkpoint_db, &spec_id)
+}
+
+#[tauri::command]
+pub fn get_specs_needing_attention(
+    app_state: State<'_, Arc<AppState>>,
+) -> Result<Vec<compliance::SpecAttentionItem>, String> {
+    compliance::get_specs_needing_attention(&app_state.checkpoint_db)
+}
+
 // ── Accuracy commands ─────────────────────────────────────────────────
 
 #[tauri::command]

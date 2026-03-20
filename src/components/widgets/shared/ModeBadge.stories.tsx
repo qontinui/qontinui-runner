@@ -5,7 +5,7 @@
  * Displays a filled badge for mode/category labels using accent colors.
  */
 
-import type { Meta, StoryObj } from "storybook";
+import type { Meta, StoryObj } from "@storybook/react";
 import { ModeBadge } from "./ModeBadge";
 import type { AccentColor } from "@/design-system/colors";
 

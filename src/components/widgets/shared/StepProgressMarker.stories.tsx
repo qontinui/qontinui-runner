@@ -5,7 +5,7 @@
  * These components display intra-step progress for long-running operations.
  */
 
-import type { Meta, StoryObj } from "storybook";
+import type { Meta, StoryObj } from "@storybook/react";
 import { StepProgressIndicator } from "./StepProgressMarker";
 
 // Note: StepProgressMarker fetches data from an API, so we'll focus on

@@ -5,7 +5,7 @@
  * Displays an outline badge for step/action types using accent colors.
  */
 
-import type { Meta, StoryObj } from "storybook";
+import type { Meta, StoryObj } from "@storybook/react";
 import { CheckCircle, Play, Settings, Zap } from "lucide-react";
 import { TypeBadge } from "./TypeBadge";
 import type { AccentColor } from "@/design-system/colors";

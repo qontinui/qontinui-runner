@@ -12,6 +12,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { SpecComplianceSummaryTable } from "./SpecCompliancePanel";
+import { SpecAttentionBanner } from "./SpecAttentionBanner";
 
 interface SpecAccuracyRecord {
   id: string;
@@ -87,6 +88,9 @@ export function SpecExperimentationDashboard() {
 
   return (
     <div className="p-4 space-y-6">
+      {/* Attention banner -- specs with broken assertions, stale, or never run */}
+      <SpecAttentionBanner />
+
       {/* Tab navigation */}
       <div className="flex gap-1 border-b border-zinc-700 pb-1">
         {(

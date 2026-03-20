@@ -1232,6 +1232,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             spec_experimentation::commands::run_spec_mutation_test,
             spec_experimentation::commands::analyze_spec_freshness,
             spec_experimentation::commands::get_spec_accuracy_results,
+            // Spec attention & broken assertion commands
+            spec_experimentation::commands::detect_broken_spec_assertions,
+            spec_experimentation::commands::get_specs_needing_attention,
             // Spec versioning commands
             spec_experimentation::commands::snapshot_current_spec,
             spec_experimentation::commands::get_spec_version_history,

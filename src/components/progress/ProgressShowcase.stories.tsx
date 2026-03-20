@@ -5,7 +5,7 @@
  * for visual comparison and real-world usage examples.
  */
 
-import type { Meta, StoryObj } from "storybook";
+import type { Meta, StoryObj } from "@storybook/react";
 import { useEffect, useState } from "react";
 import { ProgressBar, InlineProgressBar, type ProgressType } from "../ui/ProgressBar";
 import { StepProgressIndicator } from "../widgets/shared/StepProgressMarker";
