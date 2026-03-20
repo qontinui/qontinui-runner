@@ -92,48 +92,12 @@ export function RunOptionsDialog({
     setError(null);
 
     if (isMultiple) {
-      // Multiple architectures → launch each one via HTTP API
-      if (!workflowId) {
-        setError("Save the workflow first to compare architectures.");
-        return;
-      }
-
-      setIsLaunching(true);
-      try {
-        const base = getApiBase();
-        let launched = 0;
-
-        for (const arch of selected) {
-          const overrides: Record<string, unknown> = { use_worktree: true };
-          if (arch !== "traditional") {
-            overrides.workflow_architecture = arch;
-          }
-
-          const resp = await tracedFetch(`${base}/unified-workflows/${workflowId}/run`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ overrides, force_fresh_start: true }),
-          });
-
-          if (resp.ok) {
-            launched++;
-          } else {
-            const text = await resp.text().catch(() => "Unknown error");
-            console.error(`Failed to launch ${arch}:`, text);
-          }
-        }
-
-        if (launched > 0) {
-          onClose();
-        } else {
-          setError("Failed to launch any runs. Check the console for details.");
-        }
-      } catch (e) {
-        console.error("Failed to start comparison:", e);
-        setError(`Error: ${e}`);
-      } finally {
-        setIsLaunching(false);
-      }
+      // Pass all selected architectures to parent — it handles save-before-run + multi-launch
+      onRun({
+        _compareArchitectures: [...selected],
+        use_worktree: true,
+      });
+      return;
     } else {
       // Single architecture → normal run via callback
       const arch = [...selected][0];
@@ -244,9 +208,9 @@ export function RunOptionsDialog({
 
           {/* Error message */}
           {error && (
-            <div className="text-sm text-red-400 bg-red-900/20 border border-red-800/30 rounded-lg px-4 py-2">
+            <pre className="text-xs text-red-400 bg-red-900/20 border border-red-800/30 rounded-lg px-4 py-2 whitespace-pre-wrap overflow-auto max-h-32">
               {error}
-            </div>
+            </pre>
           )}
         </div>
 

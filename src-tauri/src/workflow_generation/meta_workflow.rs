@@ -642,7 +642,7 @@ These criteria define the observable success conditions for this workflow.
 2. The JSON must be a complete UnifiedWorkflow object
 3. Every step must have a unique UUID v4 `id` field
 4. Every step's `phase` field must match the array it's in
-5. Do NOT include a `name` field on steps — names are auto-generated from step content during validation
+5. Every step MUST have a descriptive `name` field that explains what it verifies or does (e.g., "Verify WCAG contrast functions exist", "TypeScript compilation check"). Names like "Run grep", "Step 1", or "Test" are NOT acceptable — the name should describe the PURPOSE, not the tool used.
 6. Set reasonable `timeout_seconds` for each step
 7. The `category` should be appropriate for the task (e.g., "testing", "deployment", "monitoring")
 8. Include meaningful `description` and `tags`
@@ -1061,7 +1061,7 @@ Example: A step named "Verify state nodes render thumbnails" with `assert_type: 
 ## General Rules
 
 1. ONLY modify verification_steps — do NOT change setup_steps, agentic_steps, or completion_steps
-2. Preserve all original step IDs (splitting a step keeps the original ID on the first part)
+2. Preserve all original step IDs AND step names (splitting a step keeps the original ID and name on the first part; new split steps get descriptive names explaining what they verify)
 3. Step count may increase (from splitting) but must never decrease
 4. If a prompt step is genuinely subjective, keep it as `prompt`
 5. For `command` conversions, include `command` and `working_directory`; optionally `check_type` for lint/typecheck/test checks

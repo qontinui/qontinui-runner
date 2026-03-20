@@ -2708,6 +2708,160 @@ pub struct ActiveSessionInfo {
 // Auto-continue settings moved to crate::mcp::auto_continue
 // Auto-continue settings moved to crate::mcp::auto_continue
 
+// ─── Instance Management HTTP Endpoints ─────────────────────────────────────
+
+/// POST /instances/spawn — create config + launch a new runner instance.
+async fn spawn_instance(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<SpawnInstanceRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiResponse<()>>)>
+{
+    use crate::settings::{self, RunnerInstanceConfig};
+
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Instance name must not be empty")),
+        ));
+    }
+    let port = body.port;
+    if port < 1024 {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Port must be >= 1024")),
+        ));
+    }
+
+    // Generate ID
+    let id = format!(
+        "inst-{}-{}",
+        port,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            % 100000
+    );
+
+    let config = RunnerInstanceConfig {
+        id: id.clone(),
+        name: name.clone(),
+        port,
+    };
+
+    // Save config
+    settings::save_runner_instance(config.clone()).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(format!("Failed to save config: {}", e))),
+        )
+    })?;
+
+    // Launch
+    let pid = state
+        .instance_manager
+        .launch_instance(&config)
+        .await
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(format!("Failed to launch: {}", e))),
+            )
+        })?;
+
+    // Register with supervisor if reachable
+    let supervisor_port: u16 = std::env::var("QONTINUI_SUPERVISOR_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9875);
+    let sup_url = format!("http://127.0.0.1:{}/runners", supervisor_port);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok();
+    if let Some(client) = client {
+        let _ = client
+            .post(&sup_url)
+            .json(&serde_json::json!({ "name": name, "port": port }))
+            .send()
+            .await;
+    }
+
+    tracing::info!(
+        "Spawned instance '{}' (id={}, port={}, pid={})",
+        name,
+        id,
+        port,
+        pid
+    );
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "id": id,
+        "name": name,
+        "port": port,
+        "pid": pid,
+    }))))
+}
+
+/// POST /instances/{id}/stop — stop a running instance.
+async fn stop_instance(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<String>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
+    state
+        .instance_manager
+        .stop_instance(&id)
+        .await
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(ApiResponse::error(e)),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success("stopped".to_string())))
+}
+
+/// POST /instances/{id}/launch — launch an existing configured instance.
+async fn launch_instance(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiResponse<()>>)>
+{
+    let configs = crate::settings::get_runner_instances();
+    let config = configs.iter().find(|c| c.id == id).ok_or_else(|| {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(ApiResponse::error(format!(
+                "Instance '{}' not found in config",
+                id
+            ))),
+        )
+    })?;
+
+    let pid = state
+        .instance_manager
+        .launch_instance(config)
+        .await
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e)),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "pid": pid }),
+    )))
+}
+
+#[derive(serde::Deserialize)]
+struct SpawnInstanceRequest {
+    name: String,
+    port: u16,
+}
+
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
     axum::Router::new()
@@ -2724,6 +2878,9 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/launch-debug-chrome", post(launch_debug_chrome))
         .route("/status", get(get_status))
         .route("/instances", get(get_instances))
+        .route("/instances/spawn", post(spawn_instance))
+        .route("/instances/:id/stop", post(stop_instance))
+        .route("/instances/:id/launch", post(launch_instance))
         .route("/tool-version", get(get_tool_version))
         .route("/load-config", post(load_config))
         .route("/load-last-config", post(load_last_config))

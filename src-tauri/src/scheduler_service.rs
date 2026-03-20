@@ -8,10 +8,10 @@
 // but are part of the complete scheduler interface
 #![allow(dead_code)]
 
+use crate::database::CheckpointDb;
 use crate::scheduler::{
-    clear_task_condition_status, compute_next_run, get_task, load_scheduler_state,
-    record_execution, save_scheduler_state, update_task_condition_status, ConditionStatus,
-    RepositoryWatch, ScheduledTask, ScheduledTaskStatus, ScheduledTaskType, TaskExecutionRecord,
+    compute_next_run, ConditionStatus, RepositoryWatch, ScheduledTask, ScheduledTaskStatus,
+    ScheduledTaskType, TaskExecutionRecord,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,6 +25,8 @@ use walkdir::WalkDir;
 
 /// Background scheduler service that executes tasks at their scheduled times
 pub struct SchedulerService {
+    /// Database handle for scheduler persistence
+    db: Arc<CheckpointDb>,
     /// Flag to stop the service
     stop_signal: Arc<AtomicBool>,
     /// Currently running task IDs
@@ -35,8 +37,9 @@ pub struct SchedulerService {
 
 impl SchedulerService {
     /// Create a new scheduler service
-    pub fn new() -> Self {
+    pub fn new(db: Arc<CheckpointDb>) -> Self {
         Self {
+            db,
             stop_signal: Arc::new(AtomicBool::new(false)),
             running_tasks: Arc::new(RwLock::new(Vec::new())),
             check_interval_secs: 60, // Check every minute
@@ -48,7 +51,7 @@ impl SchedulerService {
         info!("Starting scheduler service");
 
         // Update all next_run times on startup
-        if let Err(e) = crate::scheduler::update_all_next_runs() {
+        if let Err(e) = self.update_all_next_runs_db() {
             error!("Failed to update next run times: {}", e);
         }
 
@@ -69,23 +72,53 @@ impl SchedulerService {
         self.stop_signal.store(true, Ordering::SeqCst);
     }
 
+    /// Update next_run for all tasks (DB-backed replacement for scheduler::update_all_next_runs)
+    fn update_all_next_runs_db(&self) -> Result<(), String> {
+        let tasks = self.db.get_all_scheduled_tasks()?;
+        let now = chrono::Utc::now();
+
+        for task in &tasks {
+            let next = if task.enabled {
+                compute_next_run(&task.schedule, now).map(|dt| dt.to_rfc3339())
+            } else {
+                None
+            };
+            self.db
+                .update_task_next_run(&task.id, next.as_deref())?;
+        }
+
+        Ok(())
+    }
+
     /// Check and execute due tasks
     async fn tick(&self) {
-        let state = load_scheduler_state();
-        let settings = state.settings;
+        let settings = match self.db.get_scheduler_settings() {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to load scheduler settings: {}", e);
+                return;
+            }
+        };
 
         // Skip if scheduler is disabled
         if !settings.enabled {
             return;
         }
 
+        let tasks = match self.db.get_all_scheduled_tasks() {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to load scheduled tasks: {}", e);
+                return;
+            }
+        };
+
         let now = chrono::Utc::now();
 
         // Find tasks that are:
         // 1. Due for execution (next_run <= now), OR
         // 2. Already waiting for conditions (have condition_status set)
-        let mut due_tasks: Vec<ScheduledTask> = state
-            .tasks
+        let mut due_tasks: Vec<ScheduledTask> = tasks
             .into_iter()
             .filter(|task| {
                 // Must be enabled
@@ -179,14 +212,18 @@ impl SchedulerService {
                         "Scheduler: Task '{}' waiting for conditions (idle: {:?}, repos: {:?})",
                         task.name, status.idle_met, status.repo_inactive_met
                     );
-                    if let Err(e) = update_task_condition_status(&task.id, status) {
+                    let status_json = serde_json::to_string(&status).ok();
+                    if let Err(e) = self
+                        .db
+                        .update_task_condition_status(&task.id, status_json.as_deref())
+                    {
                         error!("Failed to update condition status: {}", e);
                     }
                     continue;
                 }
 
                 // Conditions met - clear status before execution
-                if let Err(e) = clear_task_condition_status(&task.id) {
+                if let Err(e) = self.db.update_task_condition_status(&task.id, None) {
                     error!("Failed to clear condition status: {}", e);
                 }
                 info!("Scheduler: Task '{}' conditions met, executing", task.name);
@@ -203,12 +240,18 @@ impl SchedulerService {
         record.status = ScheduledTaskStatus::Skipped;
         record.ended_at = Some(chrono::Utc::now().to_rfc3339());
 
-        if let Err(e) = record_execution(&task.id, record) {
+        if let Err(e) = self.db.insert_execution_record(&task.id, &record) {
             error!("Failed to record skipped execution: {}", e);
+        }
+        if let Err(e) = self
+            .db
+            .update_task_last_run(&task.id, Some(&record.execution_id))
+        {
+            error!("Failed to update task last_run: {}", e);
         }
 
         // Update next_run
-        self.update_task_next_run(&task.id).await;
+        self.update_task_next_run_db(&task.id).await;
     }
 
     /// Execute a scheduled task
@@ -290,12 +333,18 @@ impl SchedulerService {
         }
 
         // Record the execution
-        if let Err(e) = record_execution(&task_id, record) {
+        if let Err(e) = self.db.insert_execution_record(&task_id, &record) {
             error!("Failed to record execution: {}", e);
+        }
+        if let Err(e) = self
+            .db
+            .update_task_last_run(&task_id, Some(&record.execution_id))
+        {
+            error!("Failed to update task last_run: {}", e);
         }
 
         // Update next_run
-        self.update_task_next_run(&task_id).await;
+        self.update_task_next_run_db(&task_id).await;
 
         // Remove from running
         {
@@ -304,17 +353,24 @@ impl SchedulerService {
         }
     }
 
-    /// Update the next_run time for a task
-    async fn update_task_next_run(&self, task_id: &str) {
-        let mut state = load_scheduler_state();
+    /// Update the next_run time for a task (DB-backed)
+    async fn update_task_next_run_db(&self, task_id: &str) {
+        let task = match self.db.get_scheduled_task(task_id) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                error!("Task not found for next_run update: {}", task_id);
+                return;
+            }
+            Err(e) => {
+                error!("Failed to load task for next_run update: {}", e);
+                return;
+            }
+        };
 
-        if let Some(task) = state.tasks.iter_mut().find(|t| t.id == task_id) {
-            let now = chrono::Utc::now();
-            task.next_run = compute_next_run(&task.schedule, now).map(|dt| dt.to_rfc3339());
-            task.touch();
-        }
+        let now = chrono::Utc::now();
+        let next = compute_next_run(&task.schedule, now).map(|dt| dt.to_rfc3339());
 
-        if let Err(e) = save_scheduler_state(&state) {
+        if let Err(e) = self.db.update_task_next_run(task_id, next.as_deref()) {
             error!("Failed to update task next_run: {}", e);
         }
     }
@@ -718,17 +774,23 @@ After making fixes, run tests if applicable to verify the fixes work."#
         record.ended_at = Some(chrono::Utc::now().to_rfc3339());
         record.error_message = Some("Condition timeout exceeded".to_string());
 
-        if let Err(e) = record_execution(&task.id, record) {
+        if let Err(e) = self.db.insert_execution_record(&task.id, &record) {
             error!("Failed to record condition timeout: {}", e);
+        }
+        if let Err(e) = self
+            .db
+            .update_task_last_run(&task.id, Some(&record.execution_id))
+        {
+            error!("Failed to update task last_run: {}", e);
         }
 
         // Clear condition status
-        if let Err(e) = clear_task_condition_status(&task.id) {
+        if let Err(e) = self.db.update_task_condition_status(&task.id, None) {
             error!("Failed to clear condition status: {}", e);
         }
 
         // Update next_run
-        self.update_task_next_run(&task.id).await;
+        self.update_task_next_run_db(&task.id).await;
     }
 }
 
@@ -788,12 +850,6 @@ fn is_ignored_path(path: &std::path::Path) -> bool {
     )
 }
 
-impl Default for SchedulerService {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ============================================================================
 // Global Instance
 // ============================================================================
@@ -806,7 +862,7 @@ static SCHEDULER_SERVICE: Lazy<Mutex<Option<Arc<SchedulerService>>>> =
     Lazy::new(|| Mutex::new(None));
 
 /// Start the global scheduler service
-pub async fn start_scheduler_service() {
+pub async fn start_scheduler_service(db: Arc<CheckpointDb>) {
     let mut service_guard = SCHEDULER_SERVICE.lock().await;
 
     if service_guard.is_some() {
@@ -814,7 +870,7 @@ pub async fn start_scheduler_service() {
         return;
     }
 
-    let service = Arc::new(SchedulerService::new());
+    let service = Arc::new(SchedulerService::new(db));
     *service_guard = Some(service.clone());
     drop(service_guard);
 
@@ -844,14 +900,19 @@ pub async fn get_scheduler_service() -> Option<Arc<SchedulerService>> {
 
 /// Run a task immediately (outside its schedule)
 pub async fn run_task_now(task_id: &str) -> Result<(), String> {
-    let task = get_task(task_id).ok_or_else(|| format!("Task not found: {}", task_id))?;
-
     let service_guard = SCHEDULER_SERVICE.lock().await;
     let service = service_guard
         .as_ref()
         .ok_or("Scheduler service not running")?
         .clone();
     drop(service_guard);
+
+    // Look up the task from the DB via the service's db handle
+    let task = service
+        .db
+        .get_scheduled_task(task_id)
+        .map_err(|e| format!("Failed to look up task: {}", e))?
+        .ok_or_else(|| format!("Task not found: {}", task_id))?;
 
     // Check if already running
     if service.is_task_running(task_id).await {
@@ -874,15 +935,23 @@ pub async fn run_task_now(task_id: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn make_test_db() -> Arc<CheckpointDb> {
+        // Use a temp DB for testing
+        let tmp = std::env::temp_dir().join(format!("scheduler_test_{}.db", uuid::Uuid::new_v4()));
+        Arc::new(CheckpointDb::new_at_path(tmp).expect("test db"))
+    }
+
     #[tokio::test]
     async fn test_scheduler_service_creation() {
-        let service = SchedulerService::new();
+        let db = make_test_db();
+        let service = SchedulerService::new(db);
         assert_eq!(service.check_interval_secs, 60);
     }
 
     #[tokio::test]
     async fn test_running_tasks_tracking() {
-        let service = SchedulerService::new();
+        let db = make_test_db();
+        let service = SchedulerService::new(db);
 
         // Initially empty
         let running = service.get_running_tasks().await;

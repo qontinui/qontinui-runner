@@ -118,3 +118,4 @@ src-tauri/{{artifact_dir}}/
 *.tsbuildinfo
 vite.config.d.ts
 vite.config.js
+.worktrees/

@@ -20,10 +20,11 @@ pub fn create_router(
     app_state: Arc<AppState>,
     rag_state: Arc<RAGState>,
     app_handle: tauri::AppHandle,
+    instance_manager: Arc<crate::instance_manager::InstanceManager>,
 ) -> Router {
     // Delegate to mcp_api for now - this router configuration is complex
     // and has many interdependencies that need careful migration
-    crate::mcp_api::create_router(app_state, rag_state, app_handle)
+    crate::mcp_api::create_router(app_state, rag_state, app_handle, instance_manager)
 }
 
 /// Start the MCP API server
@@ -33,7 +34,8 @@ pub async fn start_server(
     rag_state: Arc<RAGState>,
     app_handle: tauri::AppHandle,
     port: u16,
+    instance_manager: Arc<crate::instance_manager::InstanceManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Delegate to mcp_api for now
-    crate::mcp_api::start_server(app_state, rag_state, app_handle, port).await
+    crate::mcp_api::start_server(app_state, rag_state, app_handle, port, instance_manager).await
 }

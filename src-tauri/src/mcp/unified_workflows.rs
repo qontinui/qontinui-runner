@@ -237,11 +237,11 @@ pub fn refetch_unified_workflow_steps(
 /// Push a workflow to the web backend (best-effort).
 /// On failure, marks the local workflow as sync_pending.
 async fn push_to_backend(
-    db: &crate::database::CheckpointDb,
-    workflow: &crate::unified_workflows::UnifiedWorkflow,
+    db: Arc<crate::database::CheckpointDb>,
+    workflow: crate::unified_workflows::UnifiedWorkflow,
 ) {
     let client = crate::mcp::web_backend_workflows::WebBackendWorkflowClient::new();
-    match client.save_workflow(workflow).await {
+    match client.save_workflow(&workflow).await {
         Ok(_) => {
             info!("Synced workflow '{}' to web backend", workflow.name);
             let _ = db.clear_sync_pending(&workflow.id);
@@ -259,11 +259,11 @@ async fn push_to_backend(
 /// Update a workflow on the web backend (best-effort).
 /// On failure, marks the local workflow as sync_pending.
 async fn update_on_backend(
-    db: &crate::database::CheckpointDb,
-    workflow: &crate::unified_workflows::UnifiedWorkflow,
+    db: Arc<crate::database::CheckpointDb>,
+    workflow: crate::unified_workflows::UnifiedWorkflow,
 ) {
     let client = crate::mcp::web_backend_workflows::WebBackendWorkflowClient::new();
-    match client.update_workflow(&workflow.id, workflow).await {
+    match client.update_workflow(&workflow.id, &workflow).await {
         Ok(_) => {
             info!("Synced workflow update '{}' to web backend", workflow.name);
             let _ = db.clear_sync_pending(&workflow.id);
@@ -279,9 +279,9 @@ async fn update_on_backend(
 }
 
 /// Delete a workflow from the web backend (best-effort).
-async fn delete_from_backend(id: &str) {
+async fn delete_from_backend(id: String) {
     let client = crate::mcp::web_backend_workflows::WebBackendWorkflowClient::new();
-    if let Err(e) = client.delete_workflow(id).await {
+    if let Err(e) = client.delete_workflow(&id).await {
         warn!("Failed to delete workflow '{}' from backend: {}", id, e);
     }
 }
@@ -421,8 +421,8 @@ pub async fn create_unified_workflow(
                 "Created unified workflow: {} ({})",
                 created.name, created.id
             );
-            // Push to web backend (best-effort, async)
-            push_to_backend(&state.app_state.checkpoint_db, &created).await;
+            // Push to web backend (best-effort, fire-and-forget)
+            tokio::spawn(push_to_backend(state.app_state.checkpoint_db.clone(), created.clone()));
             Ok(Json(ApiResponse::success(created)))
         }
         Err(e) => {
@@ -496,8 +496,8 @@ pub async fn update_unified_workflow(
                 "Updated unified workflow: {} ({})",
                 updated.name, updated.id
             );
-            // Push update to web backend (best-effort, async)
-            update_on_backend(&state.app_state.checkpoint_db, &updated).await;
+            // Push update to web backend (best-effort, fire-and-forget)
+            tokio::spawn(update_on_backend(state.app_state.checkpoint_db.clone(), updated.clone()));
             Ok(Json(ApiResponse::success(updated)))
         }
         Err(e) if e.contains("not found") => Err((
@@ -554,8 +554,8 @@ pub async fn delete_unified_workflow(
 
     match state.app_state.checkpoint_db.delete_unified_workflow(&id) {
         Ok(true) => {
-            // Delete from web backend (best-effort, async)
-            delete_from_backend(&id).await;
+            // Delete from web backend (best-effort, fire-and-forget)
+            tokio::spawn(delete_from_backend(id.clone()));
             Ok(Json(ApiResponse::success(serde_json::json!({
                 "deleted": true,
                 "id": id
@@ -621,8 +621,8 @@ pub async fn duplicate_unified_workflow(
     {
         Ok(duplicated) => {
             info!("Duplicated unified workflow: {} -> {}", id, duplicated.id);
-            // Push duplicate to web backend (best-effort, async)
-            push_to_backend(&state.app_state.checkpoint_db, &duplicated).await;
+            // Push duplicate to web backend (best-effort, fire-and-forget)
+            tokio::spawn(push_to_backend(state.app_state.checkpoint_db.clone(), duplicated.clone()));
             Ok(Json(ApiResponse::success(duplicated)))
         }
         Err(e) if e.contains("not found") => Err((
@@ -807,8 +807,8 @@ pub async fn import_unified_workflow(
                 "Imported unified workflow: {} ({}) [overwritten: {}]",
                 created.name, created.id, overwritten
             );
-            // Push imported workflow to web backend (best-effort, async)
-            push_to_backend(&state.app_state.checkpoint_db, &created).await;
+            // Push imported workflow to web backend (best-effort, fire-and-forget)
+            tokio::spawn(push_to_backend(state.app_state.checkpoint_db.clone(), created.clone()));
             Ok(Json(ApiResponse::success(
                 crate::unified_workflows::ImportWorkflowResult {
                     workflow: created,
@@ -1518,8 +1518,11 @@ pub async fn run_unified_workflow(
             );
         }
 
-        // For error-fix workflows, run agentic first
-        let run_agentic_first = !workflow.targeted_error_ids.is_empty();
+        // Run agentic first when: error-fix workflows, or workflows with only agentic steps (no verification)
+        let has_verification = !workflow.verification_steps.is_empty();
+        let has_agentic = !workflow.agentic_steps.is_empty();
+        let run_agentic_first = !workflow.targeted_error_ids.is_empty()
+            || (has_agentic && !has_verification);
 
         let mut loop_config = crate::unified_workflow_executor::LoopConfig {
             max_iterations: workflow.max_iterations,
@@ -1600,6 +1603,9 @@ pub async fn run_unified_workflow(
             }
             if let Some(wt) = overrides.get("use_worktree").and_then(|v| v.as_bool()) {
                 loop_config.use_worktree = wt;
+            }
+            if let Some(raf) = overrides.get("run_agentic_first").and_then(|v| v.as_bool()) {
+                loop_config.run_agentic_first = raf;
             }
             info!(
                 "Applied autoresearch overrides to loop_config: {}",
@@ -2093,6 +2099,9 @@ pub async fn execute_inline_workflow(
             }
             if let Some(wt) = overrides.get("use_worktree").and_then(|v| v.as_bool()) {
                 loop_config.use_worktree = wt;
+            }
+            if let Some(raf) = overrides.get("run_agentic_first").and_then(|v| v.as_bool()) {
+                loop_config.run_agentic_first = raf;
             }
         }
 

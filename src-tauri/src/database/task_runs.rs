@@ -1171,6 +1171,31 @@ impl CheckpointDb {
         Ok(true)
     }
 
+    /// Stop a task run with an explanatory reason.
+    /// Used for programmatic workflows interrupted by a restart, where
+    /// the interruption is not a real failure and should not inflate failure metrics.
+    pub fn stop_task_run_with_reason(&self, id: &str, reason: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                status = 'stopped',
+                error_message = ?1,
+                auto_continue = 0,
+                updated_at = ?2,
+                completed_at = ?2
+            WHERE id = ?3
+            "#,
+            params![reason, now, id],
+        )
+        .map_err(|e| format!("Failed to stop task run: {}", e))?;
+
+        info!("Task run {} stopped: {}", id, reason);
+        Ok(())
+    }
+
     /// Stop a task run.
     /// Also disables auto_continue to prevent multi-step tasks from restarting.
     pub fn stop_task_run(&self, id: &str) -> Result<(), String> {

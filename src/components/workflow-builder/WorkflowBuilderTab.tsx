@@ -1682,32 +1682,69 @@ function WorkflowBuilderContent({
         console.log("[WorkflowBuilder] Running workflow:", workflowId, state.workflow.name);
 
         const runUrl = `${getApiBase()}/unified-workflows/${workflowId}/run`;
-        const body: Record<string, unknown> = {
-          monitor_index: 0,
-          // No timeout_seconds - runs until completion or manual stop
-        };
-        if (overrides && Object.keys(overrides).length > 0) {
-          body.overrides = overrides;
-        }
-        const requestBody = JSON.stringify(body);
 
-        tracedFetch(runUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: requestBody,
-        })
-          .then((response) => {
-            console.log("[WorkflowBuilder] Workflow run response:", response.status);
+        // Check for multi-architecture comparison
+        const compareArchitectures = overrides?._compareArchitectures as string[] | undefined;
+        if (compareArchitectures && compareArchitectures.length > 1) {
+          // Launch one run per architecture
+          console.log("[WorkflowBuilder] Comparing architectures:", compareArchitectures);
+          for (const arch of compareArchitectures) {
+            const archOverrides: Record<string, unknown> = { use_worktree: overrides?.use_worktree ?? true };
+            if (arch !== "traditional") {
+              archOverrides.workflow_architecture = arch;
+            }
+            tracedFetch(runUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ overrides: archOverrides, force_fresh_start: true }),
+            })
+              .then((response) => {
+                console.log(`[WorkflowBuilder] ${arch} run response:`, response.status);
+              })
+              .catch((error) => {
+                console.error(`[WorkflowBuilder] ${arch} run error:`, error);
+              });
+            // Small delay between launches
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+
+          setTimeout(() => {
+            onNavigateToActive?.();
+          }, 100);
+
+          setExecutionSuccess(`Launched ${compareArchitectures.length} architecture comparison runs! Check the Active tab.`);
+        } else {
+          // Single run
+          const body: Record<string, unknown> = {
+            monitor_index: 0,
+          };
+          if (overrides && Object.keys(overrides).length > 0) {
+            // Remove internal flags before sending
+            const cleanOverrides = { ...overrides };
+            delete cleanOverrides._compareArchitectures;
+            if (Object.keys(cleanOverrides).length > 0) {
+              body.overrides = cleanOverrides;
+            }
+          }
+
+          tracedFetch(runUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
           })
-          .catch((error) => {
-            console.error("[WorkflowBuilder] Workflow run error:", error);
-          });
+            .then((response) => {
+              console.log("[WorkflowBuilder] Workflow run response:", response.status);
+            })
+            .catch((error) => {
+              console.error("[WorkflowBuilder] Workflow run error:", error);
+            });
 
-        setTimeout(() => {
-          onNavigateToActive?.();
-        }, 100);
+          setTimeout(() => {
+            onNavigateToActive?.();
+          }, 100);
 
-        setExecutionSuccess("Workflow started! Check the Active tab to monitor progress.");
+          setExecutionSuccess("Workflow started! Check the Active tab to monitor progress.");
+        }
         setTimeout(() => setExecutionSuccess(null), 5000);
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : "Failed to start workflow";
@@ -1742,14 +1779,17 @@ function WorkflowBuilderContent({
     async (overrides?: Record<string, unknown>) => {
       if (isExecuting) return;
 
-      // Check if workflow has steps
-      if (isEmpty) {
+      // Check if workflow has steps (skip for comparison — workflow may have been generated and saved already)
+      const isComparison = !!(overrides?._compareArchitectures);
+      if (isEmpty && !isComparison) {
         setExecutionError("Cannot run an empty workflow. Add some steps first.");
         return;
       }
 
       // Check if workflow is saved (must have an ID to run)
-      if (!state.workflow.id || hasUnsavedChanges) {
+      // For comparisons, always force save first since the workflow must exist in the database
+      const needsSave = !state.workflow.id || hasUnsavedChanges || isComparison;
+      if (needsSave) {
         if (overrides) setPendingOverrides(overrides);
         setShowSaveBeforeRunDialog(true);
         return;
@@ -2841,19 +2881,6 @@ function WorkflowBuilderContent({
                 onConfirm={deleteSelectedWorkflows}
               />
 
-              {/* Save Before Run Confirmation Dialog */}
-              <ConfirmDialog
-                open={showSaveBeforeRunDialog}
-                title="Save Required"
-                message="To run a workflow, you need to save it first."
-                description="Would you like to save the workflow now and then run it?"
-                variant="info"
-                confirmText="Save & Run"
-                cancelText="Cancel"
-                isLoading={isSavingBeforeRun}
-                onClose={() => setShowSaveBeforeRunDialog(false)}
-                onConfirm={handleSaveAndRun}
-              />
             </div>
           )}
 
@@ -2910,6 +2937,20 @@ function WorkflowBuilderContent({
           }}
           isLoading={isExecuting}
           workflowId={state.workflow.id || null}
+        />
+
+        {/* Save Before Run Dialog (rendered outside isEmpty ternary for comparison flow) */}
+        <ConfirmDialog
+          open={showSaveBeforeRunDialog}
+          title="Save Required"
+          message="To run a workflow, you need to save it first."
+          description="Would you like to save the workflow now and then run it?"
+          variant="info"
+          confirmText="Save & Run"
+          cancelText="Cancel"
+          isLoading={isSavingBeforeRun}
+          onClose={() => setShowSaveBeforeRunDialog(false)}
+          onConfirm={handleSaveAndRun}
         />
       </div>
     </div>

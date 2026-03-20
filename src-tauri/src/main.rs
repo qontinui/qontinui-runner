@@ -1229,6 +1229,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Clear runner log files from previous session
             executor::FileLogger::clear_logs();
             dom_capture::DomCaptureLogger::clear_captures();
+            // Clear logging.rs-managed files that FileLogger doesn't cover
+            let dev_logs = crate::paths::get_dev_logs_dir();
+            for filename in ["runner-render.jsonl", "ai-output.jsonl"] {
+                let path = dev_logs.join(filename);
+                if path.exists() {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        warn!("Failed to clear {}: {}", filename, e);
+                    }
+                }
+            }
             info!("Cleared previous runner log files");
 
             // Seed default log sources if none configured
@@ -1323,9 +1333,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             let api_port = crate::mcp::types::get_mcp_api_port();
             info!("Starting MCP API server on port {}", api_port);
             let mcp_app_handle = app.handle().clone();
+            let mcp_instance_manager = app.state::<Arc<instance_manager::InstanceManager>>().inner().clone();
             tauri::async_runtime::spawn(async move {
                 info!("MCP API server task starting...");
-                match mcp_api::start_server(mcp_app_state, mcp_rag_state, mcp_app_handle, api_port).await {
+                match mcp_api::start_server(mcp_app_state, mcp_rag_state, mcp_app_handle, api_port, mcp_instance_manager).await {
                     Ok(_) => info!("MCP API server stopped normally"),
                     Err(e) => error!("MCP API server error: {}", e),
                 }
@@ -1339,10 +1350,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Secondary instance — skipping scheduler service");
             } else {
                 info!("Starting scheduler service");
+                let scheduler_db = app.state::<Arc<database::CheckpointDb>>().inner().clone();
                 tauri::async_runtime::spawn(async move {
                     // Wait briefly for MCP API server to bind
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    scheduler_service::start_scheduler_service().await;
+                    scheduler_service::start_scheduler_service(scheduler_db).await;
                 });
             }
 

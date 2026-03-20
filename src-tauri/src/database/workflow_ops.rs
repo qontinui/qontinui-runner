@@ -67,7 +67,7 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(8)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    max_iterations: row.get::<_, i64>(9)? as u32,
+                    max_iterations: (row.get::<_, i64>(9)? as u32).max(1),
                     provider: row.get(10)?,
                     model: row.get(11)?,
                     skip_ai_summary: row.get::<_, i32>(12)? != 0,
@@ -198,7 +198,7 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(8)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    max_iterations: row.get::<_, i64>(9)? as u32,
+                    max_iterations: (row.get::<_, i64>(9)? as u32).max(1),
                     provider: row.get(10)?,
                     model: row.get(11)?,
                     skip_ai_summary: row.get::<_, i32>(12)? != 0,
@@ -316,7 +316,7 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(8)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    max_iterations: row.get::<_, i64>(9)? as u32,
+                    max_iterations: (row.get::<_, i64>(9)? as u32).max(1),
                     provider: row.get(10)?,
                     model: row.get(11)?,
                     skip_ai_summary: row.get::<_, i32>(12)? != 0,
@@ -919,7 +919,7 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(8)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    max_iterations: row.get::<_, i64>(9)? as u32,
+                    max_iterations: (row.get::<_, i64>(9)? as u32).max(1),
                     provider: row.get(10)?,
                     model: row.get(11)?,
                     skip_ai_summary: row.get::<_, i32>(12)? != 0,
@@ -1137,7 +1137,7 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(8)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
-                    max_iterations: row.get::<_, i64>(9)? as u32,
+                    max_iterations: (row.get::<_, i64>(9)? as u32).max(1),
                     provider: row.get(10)?,
                     model: row.get(11)?,
                     skip_ai_summary: row.get::<_, i32>(12)? != 0,

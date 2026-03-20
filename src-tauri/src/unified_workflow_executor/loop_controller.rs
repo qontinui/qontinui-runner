@@ -1634,13 +1634,35 @@ impl LoopController {
             info!("=== WORKFLOW FAILED ===");
         }
 
-        // Record learning outcome for meta-workflows (fire-and-forget)
-        if config.workflow_name.starts_with("AI Generate:") || config.is_dev_mode {
+        // Record learning outcome for all workflows (fire-and-forget)
+        {
             let db = self.checkpoint_db.clone();
+            let category = if config.workflow_name.starts_with("AI Generate:") {
+                "meta"
+            } else if config.is_dev_mode {
+                "dev"
+            } else {
+                "production"
+            };
+            // Infer architecture: use explicit config, infer from sub-configs, or default to "traditional"
+            let architecture = config.workflow_architecture.as_ref().map(|a| {
+                serde_json::to_value(a)
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| format!("{:?}", a).to_lowercase())
+            }).unwrap_or_else(|| {
+                if config.multi_agent_pipeline_config.is_some() {
+                    "multi_agent_pipeline".to_string()
+                } else if config.agentic_verification_config.is_some() {
+                    "agentic_verification".to_string()
+                } else {
+                    "traditional".to_string()
+                }
+            });
             let outcome = crate::orchestrator::learning_recorder::WorkflowOutcome {
                 task_run_id: config.execution_id.clone(),
                 workflow_name: config.workflow_name.clone(),
-                category: "meta".to_string(),
+                category: category.to_string(),
                 status: if overall_passed {
                     "complete".to_string()
                 } else {
@@ -1661,12 +1683,7 @@ impl LoopController {
                 files_modified: Vec::new(),
                 error_type: None,
                 error_message: None,
-                workflow_architecture: config.workflow_architecture.as_ref().map(|a| {
-                    serde_json::to_value(a)
-                        .ok()
-                        .and_then(|v| v.as_str().map(|s| s.to_string()))
-                        .unwrap_or_else(|| format!("{:?}", a).to_lowercase())
-                }),
+                workflow_architecture: Some(architecture),
             };
             tokio::spawn(async move {
                 if let Err(e) = db.with_conn(|conn| {
@@ -2190,6 +2207,13 @@ impl LoopController {
                 false,
                 false, // Don't check for completion marker - verification is the authority
             );
+
+            // -----------------------------------------------------------------
+            // AUTO-CONNECT SDK FOR UI-FOCUSED WORKFLOWS (first iteration only)
+            // -----------------------------------------------------------------
+            if iteration == 1 {
+                super::phases::try_auto_connect_sdk_for_ui_workflow(&config.workflow_name).await;
+            }
 
             // -----------------------------------------------------------------
             // ENVIRONMENT READINESS CHECK (before verification)
@@ -6283,7 +6307,8 @@ pub async fn resume_interrupted_workflows(
 
         // Programmatic workflows (follow-up, reflection, fixer) are built in-memory
         // and never saved to the workflow library. They cannot be resumed from a DB
-        // definition, so fail them immediately instead of waiting for the stale timeout.
+        // definition, so stop them cleanly instead of marking as failed — these
+        // interruptions are not real failures and should not inflate failure metrics.
         if task_run.is_follow_up || task_run.is_reflection || task_run.is_fixer {
             let kind = if task_run.is_follow_up {
                 "follow-up"
@@ -6293,18 +6318,18 @@ pub async fn resume_interrupted_workflows(
                 "fixer"
             };
             info!(
-                "Marking interrupted {} workflow '{}' (id: {}) as failed — programmatic workflows cannot be resumed",
+                "Marking interrupted {} workflow '{}' (id: {}) as stopped — programmatic workflows cannot be resumed",
                 kind, task_run.task_name, task_run.id
             );
-            if let Err(e) = db.fail_task_run(
+            if let Err(e) = db.stop_task_run_with_reason(
                 &task_run.id,
                 &format!(
-                    "Interrupted {} workflow cannot be resumed (no persistent workflow definition)",
+                    "Interrupted by app restart ({} workflow — not resumable)",
                     kind
                 ),
             ) {
                 error!(
-                    "Failed to mark {} workflow {} as failed: {}",
+                    "Failed to mark {} workflow {} as stopped: {}",
                     kind, task_run.id, e
                 );
             } else {

@@ -806,7 +806,7 @@ async fn handle_element(
         Ok(data) => Json(data),
         Err(_) => {
             // Fall back to IPC
-            match ui_bridge_request_sync(&state, "get_element", serde_json::json!({ "id": id }))
+            match ui_bridge_request_sync(&state, "get_element", serde_json::json!({ "elementId": id }))
                 .await
             {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -899,14 +899,16 @@ async fn handle_discover(
             // Fall back to IPC — get all elements and return as discovery result
             match ui_bridge_request_sync(&state, "get_elements", serde_json::json!({})).await {
                 Ok(mut data) => {
-                    // Normalize IPC response
+                    // Normalize IPC response — keep elements wrapped
                     if let Some(inner) = data
                         .as_object()
                         .and_then(|obj| obj.get("elements"))
                         .and_then(|e| e.as_array())
                         .cloned()
                     {
-                        data = serde_json::json!(inner);
+                        data = serde_json::json!({ "elements": inner });
+                    } else if data.is_array() {
+                        data = serde_json::json!({ "elements": data });
                     }
                     Json(serde_json::json!({ "success": true, "data": data }))
                 }
@@ -2409,7 +2411,7 @@ async fn handle_element_state(
         Ok(data) => Json(data),
         Err(_) => {
             // Fall back to IPC — get element details which include state
-            match ui_bridge_request_sync(&state, "get_element", serde_json::json!({ "id": id }))
+            match ui_bridge_request_sync(&state, "get_element", serde_json::json!({ "elementId": id }))
                 .await
             {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),

@@ -123,17 +123,20 @@ pub fn consolidate_ai_output(
         });
     }
 
-    // Read and filter entries
-    let content = fs::read_to_string(&file_path)
-        .map_err(|e| format!("Failed to read ai-output.jsonl: {}", e))?;
+    // Read and filter entries line-by-line to avoid loading entire file into memory
+    let file = fs::File::open(&file_path)
+        .map_err(|e| format!("Failed to open ai-output.jsonl: {}", e))?;
+    let reader = std::io::BufReader::new(file);
 
     let end = end_time.unwrap_or_else(Utc::now);
 
     // Parse entries with timestamp and source
-    let mut entries: Vec<ParsedEntry> = content
+    use std::io::BufRead;
+    let mut entries: Vec<ParsedEntry> = reader
         .lines()
+        .filter_map(|line_result| line_result.ok())
         .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
         .filter_map(|entry| {
             let ts = parse_jsonl_timestamp(&entry)?;
             if ts < start_time || ts > end {

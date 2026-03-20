@@ -4280,6 +4280,7 @@ dependencies = [
  "notify",
  "notify-rust",
  "once_cell",
+ "open",
  "portable-pty",
  "proc-macro2",
  "r2d2",

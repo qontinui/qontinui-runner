@@ -14,6 +14,7 @@ pub mod migrations;
 pub mod orchestrator_ops;
 pub mod pipeline_traces;
 pub mod query_builder;
+pub mod scheduler;
 pub mod task_runs;
 pub mod types;
 pub mod verification_ops;
@@ -2105,7 +2106,8 @@ impl CheckpointDb {
             .prepare(
                 r#"
                 SELECT id, task_id, status, duration_secs, iterations, strategy,
-                       tools_used, files_modified, error_type, error_message, feedback, created_at
+                       tools_used, files_modified, error_type, error_message, feedback, created_at,
+                       workflow_architecture
                 FROM learning_outcomes
                 ORDER BY created_at DESC
                 LIMIT ?1
@@ -2128,6 +2130,7 @@ impl CheckpointDb {
                     "error_message": row.get::<_, Option<String>>(9)?,
                     "feedback": row.get::<_, Option<String>>(10)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     "created_at": row.get::<_, String>(11)?,
+                    "workflow_architecture": row.get::<_, Option<String>>(12)?,
                 }))
             })
             .map_err(|e| format!("Failed to get learning outcomes: {}", e))?
@@ -2878,7 +2881,8 @@ impl CheckpointDb {
         let query = format!(
             r#"
             SELECT id, task_id, status, duration_secs, iterations, strategy,
-                   tools_used, files_modified, error_type, error_message, feedback, created_at
+                   tools_used, files_modified, error_type, error_message, feedback, created_at,
+                   workflow_architecture
             FROM learning_outcomes
             {}
             ORDER BY created_at DESC
@@ -2913,6 +2917,7 @@ impl CheckpointDb {
                         "error_message": row.get::<_, Option<String>>(9)?,
                         "feedback": row.get::<_, Option<String>>(10)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                         "created_at": row.get::<_, String>(11)?,
+                        "workflow_architecture": row.get::<_, Option<String>>(12)?,
                     }))
                 },
             )
@@ -2935,7 +2940,8 @@ impl CheckpointDb {
             .prepare(
                 r#"
                 SELECT id, task_id, status, duration_secs, iterations, strategy,
-                       tools_used, files_modified, error_type, error_message, feedback, created_at
+                       tools_used, files_modified, error_type, error_message, feedback, created_at,
+                       workflow_architecture
                 FROM learning_outcomes
                 ORDER BY created_at DESC
                 LIMIT ?1 OFFSET ?2
@@ -2958,6 +2964,7 @@ impl CheckpointDb {
                     "error_message": row.get::<_, Option<String>>(9)?,
                     "feedback": row.get::<_, Option<String>>(10)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     "created_at": row.get::<_, String>(11)?,
+                    "workflow_architecture": row.get::<_, Option<String>>(12)?,
                 }))
             })
             .map_err(|e| format!("Failed to get learning outcomes: {}", e))?

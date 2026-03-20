@@ -626,13 +626,23 @@ impl UnifiedAiSessionExecutor {
 
         // Determine whether to use interactive mode.
         // Interactive requires BOTH a session manager AND the setting to be enabled.
+        // Reflection workflows MUST use inline mode because the interactive path
+        // does not implement reflection fix parsing (REFLECTION_FIX markers are
+        // silently discarded in the interactive session runner).
         let interactive_enabled = get_ai_settings().interactive_sessions_enabled;
-        let use_interactive = self.session_manager.is_some() && interactive_enabled;
+        let has_reflection_ctx = config.reflection_fix_ctx.is_some();
+        let use_interactive = self.session_manager.is_some() && interactive_enabled && !has_reflection_ctx;
 
         if !use_interactive && self.session_manager.is_some() {
-            info!(
-                "UNIFIED-AI-SESSION: Interactive sessions disabled by setting, falling back to inline mode"
-            );
+            if has_reflection_ctx {
+                info!(
+                    "UNIFIED-AI-SESSION: Reflection workflow forced to inline mode for fix parsing"
+                );
+            } else {
+                info!(
+                    "UNIFIED-AI-SESSION: Interactive sessions disabled by setting, falling back to inline mode"
+                );
+            }
         }
 
         // Run Claude session (interactive if session manager is available AND setting enabled, otherwise inline)

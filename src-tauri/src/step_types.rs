@@ -95,6 +95,8 @@ pub enum StepType {
     Command,
     /// Execute a UI Bridge action (navigate, execute, assert, snapshot)
     UiBridge,
+    /// Run a UI Bridge design audit (contrast, accessibility, visibility checks)
+    UiBridgeDesignAudit,
 
     // ========================================================================
     // AI Steps
@@ -153,6 +155,7 @@ impl StepType {
                 | StepType::Gate
                 | StepType::Screenshot
                 | StepType::UiBridge
+                | StepType::UiBridgeDesignAudit
         )
     }
 
@@ -218,6 +221,7 @@ impl StepType {
             // Command - varies widely, use conservative defaults
             StepType::Command => Some(30_000),  // 30 seconds
             StepType::UiBridge => Some(15_000), // 15 seconds
+            StepType::UiBridgeDesignAudit => Some(10_000), // 10 seconds
 
             // AI - typically long-running
             StepType::Prompt | StepType::AiSession => Some(300_000), // 5 minutes
@@ -278,6 +282,9 @@ impl StepType {
             | "check_group" | "checkgroup" | "api_request" | "apirequest" | "api" | "http"
             | "mcp_call" | "mcpcall" | "mcp" => Some(StepType::Command),
             "ui_bridge" | "uibridge" => Some(StepType::UiBridge),
+            "ui_bridge_design_audit" | "uibridgedesignaudit" => {
+                Some(StepType::UiBridgeDesignAudit)
+            }
 
             // AI
             "prompt" | "ai_prompt" | "aiprompt" => Some(StepType::Prompt),
@@ -321,6 +328,7 @@ impl StepType {
             StepType::Gate => "gate",
             StepType::Command => "command",
             StepType::UiBridge => "ui_bridge",
+            StepType::UiBridgeDesignAudit => "ui_bridge_design_audit",
             StepType::Prompt => "prompt",
             StepType::AiSession => "ai_session",
             StepType::AwasDiscover => "awas_discover",

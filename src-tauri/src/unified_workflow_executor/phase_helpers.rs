@@ -645,6 +645,118 @@ pub async fn check_environment_readiness(
 }
 
 // =============================================================================
+// UI-Focused Workflow Auto-Connect
+// =============================================================================
+
+/// Keywords that indicate a workflow is UI-focused and may need the SDK connected.
+const UI_WORKFLOW_KEYWORDS: &[&str] = &[
+    "ui bridge",
+    "dropdown",
+    "style",
+    "visual",
+    "contrast",
+    "design audit",
+    "css",
+    "theme",
+];
+
+/// Returns true if the workflow name suggests it is UI-focused.
+pub fn is_ui_focused_workflow(workflow_name: &str) -> bool {
+    let lower = workflow_name.to_lowercase();
+    UI_WORKFLOW_KEYWORDS
+        .iter()
+        .any(|keyword| lower.contains(keyword))
+}
+
+/// Attempt to auto-connect the SDK for UI-focused workflows.
+///
+/// If the workflow name contains UI-related keywords and the SDK is not connected,
+/// opens the runner's UI Bridge States page in the system browser and waits up to
+/// 5 seconds for the SDK connection to establish.
+///
+/// Falls back gracefully if connection is still unavailable.
+pub async fn try_auto_connect_sdk_for_ui_workflow(workflow_name: &str) {
+    if !is_ui_focused_workflow(workflow_name) {
+        return;
+    }
+
+    let base_url = format!("http://127.0.0.1:{}", MCP_API_PORT);
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Check if SDK is already connected
+    let status_url = format!("{}/ui-bridge/sdk/status", base_url);
+    let already_connected = match client.get(&status_url).send().await {
+        Ok(resp) => {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                body.get("data")
+                    .and_then(|d| d.get("connected"))
+                    .and_then(|c| c.as_bool())
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    };
+
+    if already_connected {
+        info!(
+            "SDK already connected for UI-focused workflow '{}'",
+            workflow_name
+        );
+        return;
+    }
+
+    info!(
+        "UI-focused workflow '{}' detected — attempting to open UI Bridge States page",
+        workflow_name
+    );
+
+    // Try to open the runner's UI Bridge States page in the system browser
+    let states_url = format!("{}/ui-bridge/states", base_url);
+    if let Err(e) = open::that(&states_url) {
+        warn!(
+            "Failed to open UI Bridge States page in browser: {} — SDK auto-connect skipped",
+            e
+        );
+        return;
+    }
+
+    // Wait up to 5 seconds for SDK connection
+    for i in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Ok(resp) = client.get(&status_url).send().await {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                let connected = body
+                    .get("data")
+                    .and_then(|d| d.get("connected"))
+                    .and_then(|c| c.as_bool())
+                    .unwrap_or(false);
+                if connected {
+                    info!(
+                        "SDK connected after {}ms for UI-focused workflow '{}'",
+                        (i + 1) * 500,
+                        workflow_name
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    warn!(
+        "SDK did not connect within 5s for UI-focused workflow '{}' — continuing without SDK",
+        workflow_name
+    );
+}
+
+// =============================================================================
 // Prompt Response Mode Helper
 // =============================================================================
 

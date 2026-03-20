@@ -168,6 +168,27 @@ pub fn migrate_logs_to_sqlite(
         result.api_requests
     );
 
+    // Clear migrated JSONL files to prevent unbounded growth.
+    // These files are write-ahead buffers — once migrated to DB they are redundant.
+    let migrated_files = [
+        "runner-general.jsonl",
+        "runner-actions.jsonl",
+        "runner-image-recognition.jsonl",
+        "runner-playwright.jsonl",
+        "runner-api-requests.jsonl",
+        "ai-output.jsonl",
+    ];
+    for filename in migrated_files {
+        let path = dev_logs_dir.join(filename);
+        if path.exists() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                debug!("Failed to clear migrated log file {}: {}", filename, e);
+            } else {
+                debug!("Cleared migrated log file: {}", filename);
+            }
+        }
+    }
+
     Ok(result)
 }
 

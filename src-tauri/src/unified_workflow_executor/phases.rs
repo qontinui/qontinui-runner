@@ -57,7 +57,9 @@ pub(super) use super::phase_helpers::{
     check_environment_readiness, clear_console_errors, compute_embedding_sync, estimate_tokens,
     execute_prompt_response_mode, fetch_browser_events_from_ui_bridge,
     fetch_console_errors_from_ui_bridge, fetch_health_from_ui_bridge,
-    fetch_network_failures_from_ui_bridge, record_phase_token_usage, REFLECTION_MODE_PREAMBLE,
+    fetch_network_failures_from_ui_bridge,
+    record_phase_token_usage, try_auto_connect_sdk_for_ui_workflow,
+    REFLECTION_MODE_PREAMBLE,
 };
 
 // Execution Timing Context
@@ -1791,6 +1793,7 @@ impl SetupExecutor {
                     let mut retry_count = 0u32;
                     let max_retries = step.retry_count.unwrap_or(2);
                     let retry_delay_ms = step.retry_delay_ms.unwrap_or(10_000);
+                    let overall_start = std::time::Instant::now();
                     let resp_result = loop {
                         let doctor_handle = self.app_state.doctor_handle.lock().await.clone();
                         let start = std::time::Instant::now();
@@ -1919,7 +1922,7 @@ impl SetupExecutor {
                             });
                         }
                         Err(e) => {
-                            let duration_ms = 0u64; // Duration already elapsed during retries
+                            let duration_ms = overall_start.elapsed().as_millis() as u64;
                             response_step_count += 1; // Increment to avoid step_index collisions with subsequent steps
                             warn!(
                                 "SETUP-PHASE: Response-mode step '{}' failed: {}",
@@ -2054,7 +2057,14 @@ impl SetupExecutor {
                     )
                     .await;
                     let duration_ms = duration_ms as i64;
-                    overall_success = overall_success && result.success;
+                    // Only fail overall setup if at least one session-mode step is required.
+                    // Non-required steps failing should not block the setup phase.
+                    let any_required = session_prompt_steps
+                        .iter()
+                        .any(|s| s.required.unwrap_or(true));
+                    if any_required {
+                        overall_success = overall_success && result.success;
+                    }
                     // Use Some(0) instead of None for iteration to ensure SQLite's
                     // UNIQUE constraint works correctly (NULL != NULL in SQLite)
                     let mut ai_checkpoint = StepCheckpoint::new(

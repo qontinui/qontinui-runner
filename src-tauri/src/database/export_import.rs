@@ -1076,13 +1076,14 @@ impl CheckpointDb {
             let error_type = outcome["error_type"].as_str();
             let error_msg = outcome["error_message"].as_str();
             let feedback_json = serde_json::to_string(&outcome["feedback"]).ok();
+            let workflow_architecture = outcome["workflow_architecture"].as_str();
 
             let result = conn.execute(
                 r#"
-                INSERT INTO learning_outcomes (task_id, status, duration_secs, iterations, strategy, tools_used, agents_involved, error_type, error_message, feedback, created_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))
+                INSERT INTO learning_outcomes (task_id, status, duration_secs, iterations, strategy, tools_used, agents_involved, error_type, error_message, feedback, workflow_architecture, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))
                 "#,
-                params![task_id, status, duration, iterations, strategy, tools_json, agents_json, error_type, error_msg, feedback_json],
+                params![task_id, status, duration, iterations, strategy, tools_json, agents_json, error_type, error_msg, feedback_json, workflow_architecture],
             );
 
             match result {

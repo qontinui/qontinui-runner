@@ -55,7 +55,13 @@ fn get_ai_output_log_path() -> PathBuf {
     crate::paths::get_ai_output_jsonl_path()
 }
 
-/// Append an AI output entry to the log file
+/// Maximum AI output log file size before truncation (50 MB).
+const AI_OUTPUT_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
+/// Number of lines to keep when truncating the AI output log.
+const AI_OUTPUT_LOG_KEEP_LINES: usize = 2000;
+
+/// Append an AI output entry to the log file.
+/// Automatically truncates the file when it exceeds AI_OUTPUT_LOG_MAX_BYTES.
 #[tauri::command]
 pub fn append_ai_output_log(entry: AiOutputEntry) -> CommandResponse {
     let log_path = get_ai_output_log_path();
@@ -69,6 +75,18 @@ pub fn append_ai_output_log(entry: AiOutputEntry) -> CommandResponse {
                 message: Some(format!("Failed to create log directory: {}", e)),
                 data: None,
             };
+        }
+    }
+
+    // Check file size and truncate if too large
+    if let Ok(metadata) = fs::metadata(&log_path) {
+        if metadata.len() > AI_OUTPUT_LOG_MAX_BYTES {
+            info!(
+                "AI output log exceeds {} MB, truncating to last {} lines",
+                AI_OUTPUT_LOG_MAX_BYTES / (1024 * 1024),
+                AI_OUTPUT_LOG_KEEP_LINES
+            );
+            truncate_jsonl_file(&log_path, AI_OUTPUT_LOG_KEEP_LINES);
         }
     }
 
@@ -470,8 +488,14 @@ fn get_render_log_path() -> PathBuf {
     crate::paths::get_render_log_path()
 }
 
+/// Maximum render log file size before truncation (50 MB).
+const RENDER_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
+/// Number of lines to keep when truncating the render log.
+const RENDER_LOG_KEEP_LINES: usize = 200;
+
 /// Append a render log entry to the log file.
 /// Called by UI components when they render data.
+/// Automatically truncates the file when it exceeds RENDER_LOG_MAX_BYTES.
 #[tauri::command]
 pub fn append_render_log(entry: RenderLogEntry) -> CommandResponse {
     let log_path = get_render_log_path();
@@ -485,6 +509,18 @@ pub fn append_render_log(entry: RenderLogEntry) -> CommandResponse {
                 message: Some(format!("Failed to create log directory: {}", e)),
                 data: None,
             };
+        }
+    }
+
+    // Check file size and truncate if too large
+    if let Ok(metadata) = fs::metadata(&log_path) {
+        if metadata.len() > RENDER_LOG_MAX_BYTES {
+            info!(
+                "Render log exceeds {} MB, truncating to last {} lines",
+                RENDER_LOG_MAX_BYTES / (1024 * 1024),
+                RENDER_LOG_KEEP_LINES
+            );
+            truncate_jsonl_file(&log_path, RENDER_LOG_KEEP_LINES);
         }
     }
 
@@ -530,6 +566,35 @@ pub fn append_render_log(entry: RenderLogEntry) -> CommandResponse {
     }
 }
 
+/// Truncate a JSONL file to keep only the last N lines.
+fn truncate_jsonl_file(path: &std::path::Path, keep_lines: usize) {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to read file for truncation: {}", e);
+            return;
+        }
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(keep_lines);
+    let kept: String = lines[start..]
+        .iter()
+        .map(|l| format!("{}\n", l))
+        .collect();
+
+    if let Err(e) = fs::write(path, kept) {
+        warn!("Failed to write truncated file: {}", e);
+    } else {
+        info!(
+            "Truncated {} from {} to {} lines",
+            path.display(),
+            lines.len(),
+            lines.len() - start
+        );
+    }
+}
+
 /// Clear the render log file.
 /// Called at the start of a test run to ensure fresh logs.
 #[tauri::command]
@@ -555,7 +620,10 @@ pub fn clear_render_log() -> CommandResponse {
     }
 }
 
-/// Load all render log entries from the log file.
+/// Maximum number of render log entries to load at once.
+const RENDER_LOG_LOAD_LIMIT: usize = 500;
+
+/// Load render log entries from the log file (last N entries only).
 /// Used by Python tests to verify component rendering.
 #[tauri::command]
 pub fn load_render_log() -> CommandResponse {
@@ -584,8 +652,11 @@ pub fn load_render_log() -> CommandResponse {
     };
 
     let reader = BufReader::new(file);
-    let mut entries: Vec<RenderLogEntry> = Vec::new();
+    // Use a ring buffer approach: keep only the last RENDER_LOG_LOAD_LIMIT entries
+    let mut entries: std::collections::VecDeque<RenderLogEntry> =
+        std::collections::VecDeque::with_capacity(RENDER_LOG_LOAD_LIMIT);
     let mut line_number = 0;
+    let mut total_parsed = 0;
 
     for line_result in reader.lines() {
         line_number += 1;
@@ -595,7 +666,13 @@ pub fn load_render_log() -> CommandResponse {
                     continue;
                 }
                 match serde_json::from_str::<RenderLogEntry>(&line) {
-                    Ok(entry) => entries.push(entry),
+                    Ok(entry) => {
+                        if entries.len() >= RENDER_LOG_LOAD_LIMIT {
+                            entries.pop_front();
+                        }
+                        entries.push_back(entry);
+                        total_parsed += 1;
+                    }
                     Err(e) => {
                         warn!(
                             "Failed to parse render log entry at line {}: {}",
@@ -610,13 +687,22 @@ pub fn load_render_log() -> CommandResponse {
         }
     }
 
-    info!("Loaded {} render log entries", entries.len());
+    let returned = entries.len();
+    info!(
+        "Loaded {} render log entries (total in file: {})",
+        returned, total_parsed
+    );
+
+    let entries_vec: Vec<RenderLogEntry> = entries.into_iter().collect();
 
     CommandResponse {
         success: true,
-        message: Some(format!("Loaded {} entries", entries.len())),
+        message: Some(format!(
+            "Loaded {} entries (total: {})",
+            returned, total_parsed
+        )),
         data: Some(serde_json::json!({
-            "entries": entries
+            "entries": entries_vec
         })),
     }
 }

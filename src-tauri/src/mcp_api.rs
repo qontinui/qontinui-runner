@@ -126,6 +126,7 @@ pub fn create_router(
     app_state: Arc<AppState>,
     rag_state: Arc<RAGState>,
     app_handle: tauri::AppHandle,
+    instance_manager: Arc<crate::instance_manager::InstanceManager>,
 ) -> Router {
     // Get dev_logs path for session manager
     let dev_logs_path = get_workspace_paths_internal()
@@ -176,6 +177,7 @@ pub fn create_router(
         ui_bridge_render_log: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         doctor_handle: None, // Doctor handle accessed via app_state.doctor_handle when needed
         started_at: std::time::Instant::now(),
+        instance_manager,
     });
 
     // Set up UI Bridge response listener
@@ -520,10 +522,11 @@ pub async fn start_server(
     rag_state: Arc<RAGState>,
     app_handle: tauri::AppHandle,
     port: u16,
+    instance_manager: Arc<crate::instance_manager::InstanceManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let emitter = app_handle.clone();
     let api_ready_flag = app_state.clone();
-    let router = create_router(app_state, rag_state, app_handle);
+    let router = create_router(app_state, rag_state, app_handle, instance_manager);
 
     // Try the requested port first, then fallback ports if zombie connections are blocking
     // This can happen on Windows when previous process crashes leave orphaned sockets

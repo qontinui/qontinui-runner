@@ -2140,6 +2140,12 @@ impl Orchestrator {
             Some(serde_json::Value::Object(feedback_data))
         };
 
+        // Infer architecture: use explicit state value, or default to "traditional"
+        let inferred_architecture = state
+            .workflow_architecture
+            .clone()
+            .unwrap_or_else(|| "traditional".to_string());
+
         // Record to database
         if let Err(e) = self.db.record_learning_outcome(
             &state.task_run_id,
@@ -2156,7 +2162,7 @@ impl Orchestrator {
             None, // error_type
             error_message.as_deref(),
             feedback_json.as_ref(),
-            state.workflow_architecture.as_deref(),
+            Some(&inferred_architecture),
         ) {
             warn!("Failed to record learning outcome: {}", e);
         } else {

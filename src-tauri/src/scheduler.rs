@@ -8,13 +8,10 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
 use tracing::{error, info};
 use uuid::Uuid;
 
-const SCHEDULER_FILE: &str = "scheduler.json";
+use crate::database::CheckpointDb;
 
 // ============================================================================
 // Schedule Expression Types
@@ -399,49 +396,7 @@ impl Default for SchedulerSettings {
     }
 }
 
-// ============================================================================
-// Scheduler State
-// ============================================================================
-
-/// Full scheduler state
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SchedulerState {
-    /// Version of the scheduler format (for future migrations)
-    #[serde(default = "default_version")]
-    pub version: String,
-    /// All scheduled tasks
-    #[serde(default)]
-    pub tasks: Vec<ScheduledTask>,
-    /// Execution history (last N runs per task)
-    #[serde(default)]
-    pub history: HashMap<String, Vec<TaskExecutionRecord>>,
-    /// Max history entries per task
-    #[serde(default = "default_max_history")]
-    pub max_history_per_task: usize,
-    /// Global scheduler settings
-    #[serde(default)]
-    pub settings: SchedulerSettings,
-}
-
-fn default_version() -> String {
-    "1.0.0".to_string()
-}
-
-fn default_max_history() -> usize {
-    50
-}
-
-impl Default for SchedulerState {
-    fn default() -> Self {
-        Self {
-            version: default_version(),
-            tasks: Vec::new(),
-            history: HashMap::new(),
-            max_history_per_task: default_max_history(),
-            settings: SchedulerSettings::default(),
-        }
-    }
-}
+// SchedulerState was removed — all persistence is now handled by CheckpointDb.
 
 // ============================================================================
 // Scheduler Status (for API responses)
@@ -464,90 +419,35 @@ pub struct NextTaskInfo {
 }
 
 // ============================================================================
-// File Operations
-// ============================================================================
-
-/// Get the scheduler file path in the app data directory
-fn get_scheduler_path() -> Result<PathBuf, String> {
-    let app_data_dir = dirs::config_dir()
-        .ok_or("Failed to get config directory")?
-        .join("com.qontinui.runner");
-
-    // Create directory if it doesn't exist
-    if !app_data_dir.exists() {
-        fs::create_dir_all(&app_data_dir)
-            .map_err(|e| format!("Failed to create app data directory: {}", e))?;
-    }
-
-    Ok(app_data_dir.join(SCHEDULER_FILE))
-}
-
-/// Load the scheduler state from disk
-pub fn load_scheduler_state() -> SchedulerState {
-    match get_scheduler_path() {
-        Ok(path) => {
-            if path.exists() {
-                match fs::read_to_string(&path) {
-                    Ok(contents) => match serde_json::from_str(&contents) {
-                        Ok(state) => {
-                            info!("Loaded scheduler state from {:?}", path);
-                            state
-                        }
-                        Err(e) => {
-                            error!("Failed to parse scheduler file: {}", e);
-                            SchedulerState::default()
-                        }
-                    },
-                    Err(e) => {
-                        error!("Failed to read scheduler file: {}", e);
-                        SchedulerState::default()
-                    }
-                }
-            } else {
-                info!("No scheduler file found, using empty state");
-                SchedulerState::default()
-            }
-        }
-        Err(e) => {
-            error!("Failed to get scheduler path: {}", e);
-            SchedulerState::default()
-        }
-    }
-}
-
-/// Save the scheduler state to disk
-pub fn save_scheduler_state(state: &SchedulerState) -> Result<(), String> {
-    let path = get_scheduler_path()?;
-
-    let contents = serde_json::to_string_pretty(state)
-        .map_err(|e| format!("Failed to serialize scheduler state: {}", e))?;
-
-    fs::write(&path, contents).map_err(|e| format!("Failed to write scheduler file: {}", e))?;
-
-    info!("Saved scheduler state to {:?}", path);
-    Ok(())
-}
-
-// ============================================================================
-// CRUD Operations
+// CRUD Operations (backed by CheckpointDb)
 // ============================================================================
 
 /// Get all scheduled tasks
-pub fn get_all_tasks() -> Vec<ScheduledTask> {
-    load_scheduler_state().tasks
+pub fn get_all_tasks(db: &CheckpointDb) -> Vec<ScheduledTask> {
+    match db.get_all_scheduled_tasks() {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            error!("Failed to get all scheduled tasks: {}", e);
+            Vec::new()
+        }
+    }
 }
 
 /// Get a task by ID
-pub fn get_task(id: &str) -> Option<ScheduledTask> {
-    load_scheduler_state()
-        .tasks
-        .into_iter()
-        .find(|t| t.id == id)
+pub fn get_task(db: &CheckpointDb, id: &str) -> Option<ScheduledTask> {
+    match db.get_scheduled_task(id) {
+        Ok(task) => task,
+        Err(e) => {
+            error!("Failed to get scheduled task {}: {}", id, e);
+            None
+        }
+    }
 }
 
 /// Create a new scheduled task
 #[allow(clippy::too_many_arguments)]
 pub fn create_task(
+    db: &CheckpointDb,
     name: String,
     description: Option<String>,
     schedule: ScheduleExpression,
@@ -557,25 +457,22 @@ pub fn create_task(
     success_criteria: Option<String>,
     conditions: Option<ScheduleConditions>,
 ) -> Result<ScheduledTask, String> {
-    let mut state = load_scheduler_state();
-
     let mut scheduled_task = ScheduledTask::new(name, description, schedule, task);
     scheduled_task.skip_if_completed = skip_if_completed;
     scheduled_task.auto_fix_on_failure = auto_fix_on_failure;
     scheduled_task.success_criteria = success_criteria;
     scheduled_task.conditions = conditions;
 
-    let created = scheduled_task.clone();
-    state.tasks.push(scheduled_task);
-    save_scheduler_state(&state)?;
+    db.insert_scheduled_task(&scheduled_task)?;
 
-    info!("Created scheduled task: {} ({})", created.name, created.id);
-    Ok(created)
+    info!("Created scheduled task: {} ({})", scheduled_task.name, scheduled_task.id);
+    Ok(scheduled_task)
 }
 
 /// Update an existing task
 #[allow(clippy::too_many_arguments)]
 pub fn update_task(
+    db: &CheckpointDb,
     id: &str,
     name: Option<String>,
     description: Option<Option<String>>,
@@ -587,12 +484,8 @@ pub fn update_task(
     success_criteria: Option<Option<String>>,
     conditions: Option<Option<ScheduleConditions>>,
 ) -> Result<ScheduledTask, String> {
-    let mut state = load_scheduler_state();
-
-    let scheduled_task = state
-        .tasks
-        .iter_mut()
-        .find(|t| t.id == id)
+    let mut scheduled_task = db
+        .get_scheduled_task(id)?
         .ok_or_else(|| format!("Task not found: {}", id))?;
 
     if let Some(name) = name {
@@ -626,112 +519,84 @@ pub fn update_task(
     }
 
     scheduled_task.touch();
-    let updated = scheduled_task.clone();
+    db.update_scheduled_task(&scheduled_task)?;
 
-    save_scheduler_state(&state)?;
-    info!("Updated scheduled task: {} ({})", updated.name, updated.id);
-    Ok(updated)
+    info!("Updated scheduled task: {} ({})", scheduled_task.name, scheduled_task.id);
+    Ok(scheduled_task)
 }
 
 /// Delete a task
-pub fn delete_task(id: &str) -> Result<(), String> {
-    let mut state = load_scheduler_state();
+pub fn delete_task(db: &CheckpointDb, id: &str) -> Result<(), String> {
+    // Verify task exists first
+    db.get_scheduled_task(id)?
+        .ok_or_else(|| format!("Task not found: {}", id))?;
 
-    let initial_len = state.tasks.len();
-    state.tasks.retain(|t| t.id != id);
-
-    if state.tasks.len() == initial_len {
-        return Err(format!("Task not found: {}", id));
-    }
-
-    // Also remove history
-    state.history.remove(id);
-
-    save_scheduler_state(&state)?;
+    db.delete_scheduled_task(id)?;
     info!("Deleted scheduled task: {}", id);
     Ok(())
 }
 
 /// Record an execution
-pub fn record_execution(task_id: &str, record: TaskExecutionRecord) -> Result<(), String> {
-    let mut state = load_scheduler_state();
-
+pub fn record_execution(db: &CheckpointDb, task_id: &str, record: TaskExecutionRecord) -> Result<(), String> {
     // Update last_run on the task
-    if let Some(task) = state.tasks.iter_mut().find(|t| t.id == task_id) {
-        task.last_run = Some(record.clone());
-        task.touch();
-    }
+    db.update_task_last_run(task_id, Some(&record.execution_id))?;
 
     // Add to history
-    let history = state.history.entry(task_id.to_string()).or_default();
-    history.push(record);
+    db.insert_execution_record(task_id, &record)?;
 
-    // Trim history if needed
-    let max = state.max_history_per_task;
-    if history.len() > max {
-        let to_remove = history.len() - max;
-        history.drain(0..to_remove);
-    }
+    // Trim history if needed (keep max 50 entries)
+    db.trim_execution_history(task_id, 50)?;
 
-    save_scheduler_state(&state)?;
     Ok(())
 }
 
 /// Get execution history for a task
-pub fn get_task_history(task_id: &str) -> Vec<TaskExecutionRecord> {
-    load_scheduler_state()
-        .history
-        .get(task_id)
-        .cloned()
-        .unwrap_or_default()
+pub fn get_task_history(db: &CheckpointDb, task_id: &str) -> Vec<TaskExecutionRecord> {
+    match db.get_execution_history(task_id, 50) {
+        Ok(records) => records,
+        Err(e) => {
+            error!("Failed to get task history for {}: {}", task_id, e);
+            Vec::new()
+        }
+    }
 }
 
 /// Update the condition status for a task
-pub fn update_task_condition_status(task_id: &str, status: ConditionStatus) -> Result<(), String> {
-    let mut state = load_scheduler_state();
-
-    if let Some(task) = state.tasks.iter_mut().find(|t| t.id == task_id) {
-        task.condition_status = Some(status);
-        task.touch();
-    }
-
-    save_scheduler_state(&state)?;
-    Ok(())
+pub fn update_task_condition_status(db: &CheckpointDb, task_id: &str, status: ConditionStatus) -> Result<(), String> {
+    let status_json = serde_json::to_string(&status)
+        .map_err(|e| format!("Failed to serialize condition status: {}", e))?;
+    db.update_task_condition_status(task_id, Some(&status_json))
 }
 
 /// Clear the condition status for a task (after execution or timeout)
-pub fn clear_task_condition_status(task_id: &str) -> Result<(), String> {
-    let mut state = load_scheduler_state();
-
-    if let Some(task) = state.tasks.iter_mut().find(|t| t.id == task_id) {
-        task.condition_status = None;
-        task.touch();
-    }
-
-    save_scheduler_state(&state)?;
-    Ok(())
+pub fn clear_task_condition_status(db: &CheckpointDb, task_id: &str) -> Result<(), String> {
+    db.update_task_condition_status(task_id, None)
 }
 
 /// Get scheduler settings
-pub fn get_scheduler_settings() -> SchedulerSettings {
-    load_scheduler_state().settings
+pub fn get_scheduler_settings(db: &CheckpointDb) -> SchedulerSettings {
+    match db.get_scheduler_settings() {
+        Ok(settings) => settings,
+        Err(e) => {
+            error!("Failed to get scheduler settings: {}", e);
+            SchedulerSettings::default()
+        }
+    }
 }
 
 /// Update scheduler settings
-pub fn update_scheduler_settings(settings: SchedulerSettings) -> Result<(), String> {
-    let mut state = load_scheduler_state();
-    state.settings = settings;
-    save_scheduler_state(&state)?;
+pub fn update_scheduler_settings(db: &CheckpointDb, settings: SchedulerSettings) -> Result<(), String> {
+    db.update_scheduler_settings(&settings)?;
     info!("Updated scheduler settings");
     Ok(())
 }
 
 /// Get current scheduler status
-pub fn get_scheduler_status() -> SchedulerStatus {
-    let state = load_scheduler_state();
+pub fn get_scheduler_status(db: &CheckpointDb) -> SchedulerStatus {
+    let tasks = get_all_tasks(db);
+    let settings = get_scheduler_settings(db);
 
-    let running_tasks = state
-        .tasks
+    let running_tasks = tasks
         .iter()
         .filter(|t| {
             t.last_run
@@ -741,11 +606,10 @@ pub fn get_scheduler_status() -> SchedulerStatus {
         })
         .count() as u32;
 
-    let pending_tasks = state.tasks.iter().filter(|t| t.enabled).count() as u32;
+    let pending_tasks = tasks.iter().filter(|t| t.enabled).count() as u32;
 
     // Find next task to run
-    let next_task = state
-        .tasks
+    let next_task = tasks
         .iter()
         .filter(|t| t.enabled && t.next_run.is_some())
         .min_by_key(|t| t.next_run.as_ref().unwrap())
@@ -756,7 +620,7 @@ pub fn get_scheduler_status() -> SchedulerStatus {
         });
 
     SchedulerStatus {
-        enabled: state.settings.enabled,
+        enabled: settings.enabled,
         running_tasks,
         pending_tasks,
         next_task,
@@ -797,19 +661,19 @@ pub fn compute_next_run(
 }
 
 /// Update next_run for all tasks
-pub fn update_all_next_runs() -> Result<(), String> {
-    let mut state = load_scheduler_state();
+pub fn update_all_next_runs(db: &CheckpointDb) -> Result<(), String> {
+    let tasks = get_all_tasks(db);
     let now = chrono::Utc::now();
 
-    for task in state.tasks.iter_mut() {
-        if task.enabled {
-            task.next_run = compute_next_run(&task.schedule, now).map(|dt| dt.to_rfc3339());
+    for task in &tasks {
+        let next_run = if task.enabled {
+            compute_next_run(&task.schedule, now).map(|dt| dt.to_rfc3339())
         } else {
-            task.next_run = None;
-        }
+            None
+        };
+        db.update_task_next_run(&task.id, next_run.as_deref())?;
     }
 
-    save_scheduler_state(&state)?;
     Ok(())
 }
 

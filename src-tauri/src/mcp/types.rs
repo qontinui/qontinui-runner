@@ -84,6 +84,8 @@ pub struct ApiState {
     pub sdk_connection: Arc<tokio::sync::Mutex<crate::mcp::sdk_client::SdkConnectionManager>>,
     /// Doctor health monitoring handle for AI process health tracking.
     pub doctor_handle: Option<DoctorHandle>,
+    /// Instance manager for spawning/stopping secondary runner processes.
+    pub instance_manager: Arc<crate::instance_manager::InstanceManager>,
 }
 
 /// Response for API endpoints

@@ -61,15 +61,16 @@ pub struct UpdateSchedulerSettingsRequest {
 
 /// List all scheduled tasks
 pub async fn list_scheduled_tasks(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<Vec<crate::scheduler::ScheduledTask>>> {
-    let tasks = crate::scheduler::get_all_tasks();
+    let db = &state.app_state.checkpoint_db;
+    let tasks = crate::scheduler::get_all_tasks(db);
     Json(ApiResponse::success(tasks))
 }
 
 /// Create a new scheduled task
 pub async fn create_scheduled_task(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateScheduledTaskRequest>,
 ) -> Result<
     (
@@ -78,7 +79,9 @@ pub async fn create_scheduled_task(
     ),
     (StatusCode, Json<ApiResponse<()>>),
 > {
+    let db = &state.app_state.checkpoint_db;
     let task = crate::scheduler::create_task(
+        db,
         request.name,
         request.description,
         request.schedule,
@@ -100,11 +103,12 @@ pub async fn create_scheduled_task(
 
 /// Get a single scheduled task by ID
 pub async fn get_scheduled_task(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<crate::scheduler::ScheduledTask>>, (StatusCode, Json<ApiResponse<()>>)>
 {
-    let task = crate::scheduler::get_task(&id).ok_or_else(|| {
+    let db = &state.app_state.checkpoint_db;
+    let task = crate::scheduler::get_task(db, &id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(api_error(format!("Task not found: {}", id))),
@@ -116,12 +120,14 @@ pub async fn get_scheduled_task(
 
 /// Update an existing scheduled task
 pub async fn update_scheduled_task(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Json(request): Json<UpdateScheduledTaskRequest>,
 ) -> Result<Json<ApiResponse<crate::scheduler::ScheduledTask>>, (StatusCode, Json<ApiResponse<()>>)>
 {
+    let db = &state.app_state.checkpoint_db;
     let task = crate::scheduler::update_task(
+        db,
         &id,
         request.name,
         request.description,
@@ -145,10 +151,11 @@ pub async fn update_scheduled_task(
 
 /// Delete a scheduled task
 pub async fn delete_scheduled_task(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    crate::scheduler::delete_task(&id).map_err(|e| {
+    let db = &state.app_state.checkpoint_db;
+    crate::scheduler::delete_task(db, &id).map_err(|e| {
         (
             StatusCode::NOT_FOUND,
             Json(api_error(format!("Failed to delete task: {}", e))),
@@ -177,28 +184,31 @@ pub async fn run_task_now(
 
 /// Get execution history for a task
 pub async fn get_task_history(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Json<ApiResponse<Vec<crate::scheduler::TaskExecutionRecord>>> {
-    let history = crate::scheduler::get_task_history(&id);
+    let db = &state.app_state.checkpoint_db;
+    let history = crate::scheduler::get_task_history(db, &id);
     Json(ApiResponse::success(history))
 }
 
 /// Get scheduler settings
 pub async fn get_scheduler_settings(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<crate::scheduler::SchedulerSettings>> {
-    let settings = crate::scheduler::get_scheduler_settings();
+    let db = &state.app_state.checkpoint_db;
+    let settings = crate::scheduler::get_scheduler_settings(db);
     Json(ApiResponse::success(settings))
 }
 
 /// Update scheduler settings
 pub async fn update_scheduler_settings(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
     Json(request): Json<UpdateSchedulerSettingsRequest>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = &state.app_state.checkpoint_db;
     // Load current settings and apply partial update
-    let mut settings = crate::scheduler::get_scheduler_settings();
+    let mut settings = crate::scheduler::get_scheduler_settings(db);
 
     if let Some(enabled) = request.enabled {
         settings.enabled = enabled;
@@ -213,7 +223,7 @@ pub async fn update_scheduler_settings(
         settings.timezone = timezone;
     }
 
-    crate::scheduler::update_scheduler_settings(settings).map_err(|e| {
+    crate::scheduler::update_scheduler_settings(db, settings).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to update settings: {}", e))),
@@ -225,9 +235,10 @@ pub async fn update_scheduler_settings(
 
 /// Get current scheduler status
 pub async fn get_scheduler_status(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<crate::scheduler::SchedulerStatus>> {
-    let status = crate::scheduler::get_scheduler_status();
+    let db = &state.app_state.checkpoint_db;
+    let status = crate::scheduler::get_scheduler_status(db);
     Json(ApiResponse::success(status))
 }
 

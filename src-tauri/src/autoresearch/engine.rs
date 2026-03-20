@@ -746,7 +746,12 @@ fn record_learning(
         } else {
             None
         },
-        workflow_architecture: None, // Autoresearch tracks architecture via config_json
+        workflow_architecture: result.config.workflow_architecture.as_ref().map(|a| {
+            serde_json::to_value(a)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| format!("{:?}", a).to_lowercase())
+        }).or_else(|| Some("traditional".to_string())),
     };
 
     if let Err(e) =

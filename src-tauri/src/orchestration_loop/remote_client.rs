@@ -563,7 +563,7 @@ impl SupervisorClient {
         let resp = self
             .client
             .post(&url)
-            .json(&serde_json::json!({ "rebuild": rebuild }))
+            .json(&serde_json::json!({ "rebuild": rebuild, "source": "workflow_loop" }))
             .send()
             .await
             .map_err(|e| format!("Failed to restart runner: {}", e))?;

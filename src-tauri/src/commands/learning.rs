@@ -380,7 +380,7 @@ pub fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), S
             None,
             None,
             None,
-            None,
+            Some("traditional"),
         )?;
     }
 
@@ -399,7 +399,7 @@ pub fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), S
             Some("verification"),
             Some("Verification failed"),
             None,
-            None,
+            Some("traditional"),
         )?;
     }
 

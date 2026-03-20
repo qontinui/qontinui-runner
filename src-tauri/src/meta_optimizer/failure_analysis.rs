@@ -207,9 +207,14 @@ fn query_abort_reasons(
         &format!(
             "SELECT \
                  CASE \
-                     WHEN error_message LIKE '%max iterations%' OR error_message LIKE '%iteration budget%' THEN 'max_iterations_reached' \
+                     WHEN error_message LIKE '%max iterations%' OR error_message LIKE '%max_iterations%' OR error_message LIKE '%iteration budget%' OR error_message LIKE '%iterations exhausted%' THEN 'max_iterations_reached' \
+                     WHEN error_message LIKE '%Max sessions%' OR error_message LIKE '%sessions exhausted%' THEN 'max_sessions_reached' \
+                     WHEN error_message LIKE '%setup failed%' THEN 'setup_failure' \
+                     WHEN error_message LIKE '%Unfixable errors%' THEN 'unfixable_errors' \
                      WHEN error_message LIKE '%stopped%' OR status = 'stopped' THEN 'stopped_by_user' \
-                     WHEN error_message LIKE '%critical%' THEN 'critical_failure' \
+                     WHEN error_message LIKE '%Critical failure%' OR error_message LIKE '%critical%' THEN 'critical_failure' \
+                     WHEN error_message LIKE '%no iterations ran%' THEN 'zero_iterations' \
+                     WHEN error_message LIKE '%interrupted%' OR error_message LIKE '%restart%' THEN 'interrupted' \
                      WHEN error_message IS NOT NULL THEN 'runtime_error' \
                      WHEN goal_achieved = 0 THEN 'goal_not_achieved' \
                      ELSE 'unknown' \
