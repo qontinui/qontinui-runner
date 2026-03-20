@@ -11,7 +11,7 @@
  * 4. Preview and apply the generated workflow
  */
 
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useReducer } from "react";
 import { FileJson, CheckSquare, Bot, Eye } from "lucide-react";
 import { SpecFileLoader } from "./SpecFileLoader";
 import { SpecSelector } from "./SpecSelector";
@@ -26,6 +26,41 @@ import {
 } from "../../lib/workflow-builder/buildSpecWorkflow";
 
 type Step = "load" | "select" | "configure" | "preview";
+
+interface ConfigState {
+  agenticPrompt: string;
+  maxIterations: number;
+  elementSource: "control" | "external";
+  workflowMode: WorkflowMode;
+}
+
+type ConfigAction =
+  | { type: "SET_PROMPT"; payload: string }
+  | { type: "SET_MAX_ITERATIONS"; payload: number }
+  | { type: "SET_ELEMENT_SOURCE"; payload: "control" | "external" }
+  | { type: "SET_WORKFLOW_MODE"; payload: WorkflowMode };
+
+function configReducer(state: ConfigState, action: ConfigAction): ConfigState {
+  switch (action.type) {
+    case "SET_PROMPT":
+      return { ...state, agenticPrompt: action.payload };
+    case "SET_MAX_ITERATIONS":
+      return { ...state, maxIterations: action.payload };
+    case "SET_ELEMENT_SOURCE":
+      return { ...state, elementSource: action.payload };
+    case "SET_WORKFLOW_MODE":
+      return { ...state, workflowMode: action.payload };
+    default:
+      return state;
+  }
+}
+
+const initialConfig: ConfigState = {
+  agenticPrompt: "",
+  maxIterations: 3,
+  elementSource: "control",
+  workflowMode: "verify",
+};
 
 interface SpecWorkflowBuilderProps {
   onApplyWorkflow?: (workflow: UnifiedWorkflow) => void;
@@ -66,7 +101,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
     // Determine element source: prefer explicit metadata, otherwise default to "control"
     const rawMeta = config.metadata as Record<string, unknown> | undefined;
     const explicitSource = rawMeta?.elementSource as "control" | "external" | undefined;
-    setElementSource(explicitSource || "control");
+    dispatchConfig({ type: "SET_ELEMENT_SOURCE", payload: explicitSource || "control" });
     setCurrentStep("select");
   }, []);
 
@@ -203,11 +238,15 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
             <div className="flex-1 overflow-auto">
               <AgenticPromptEditor
                 prompt={agenticPrompt}
-                onPromptChange={setAgenticPrompt}
+                onPromptChange={(v: string) => dispatchConfig({ type: "SET_PROMPT", payload: v })}
                 maxIterations={maxIterations}
-                onMaxIterationsChange={setMaxIterations}
+                onMaxIterationsChange={(v: number) =>
+                  dispatchConfig({ type: "SET_MAX_ITERATIONS", payload: v })
+                }
                 elementSource={elementSource}
-                onElementSourceChange={setElementSource}
+                onElementSourceChange={(v: "control" | "external") =>
+                  dispatchConfig({ type: "SET_ELEMENT_SOURCE", payload: v })
+                }
               />
             </div>
             <div className="px-4 py-3 border-t border-border bg-muted/50">
