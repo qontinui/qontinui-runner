@@ -1232,6 +1232,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             spec_experimentation::commands::run_spec_mutation_test,
             spec_experimentation::commands::analyze_spec_freshness,
             spec_experimentation::commands::get_spec_accuracy_results,
+            // Spec versioning commands
+            spec_experimentation::commands::snapshot_current_spec,
+            spec_experimentation::commands::get_spec_version_history,
+            spec_experimentation::commands::diff_spec_versions,
+            spec_experimentation::commands::diff_spec_json,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

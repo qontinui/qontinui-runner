@@ -4905,6 +4905,37 @@ impl CheckpointDb {
             info!("Successfully migrated to version 124 (comparison_runs)");
         }
 
+        // --- Migration 125: Spec versioning table ---
+        if current_version < 125 {
+            info!("Migrating to version 125 (spec versioning)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS spec_versions (
+                    id TEXT PRIMARY KEY,
+                    spec_id TEXT NOT NULL,
+                    version_number INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    spec_json TEXT NOT NULL,
+                    change_summary TEXT,
+                    change_type TEXT NOT NULL DEFAULT 'manual',
+                    parent_version_id TEXT,
+                    assertion_count INTEGER NOT NULL,
+                    group_count INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_spec_versions_spec ON spec_versions(spec_id);
+                CREATE INDEX IF NOT EXISTS idx_spec_versions_hash ON spec_versions(content_hash);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_spec_versions_num ON spec_versions(spec_id, version_number);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (125, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 125: {}", e))?;
+
+            info!("Successfully migrated to version 125 (spec_versions)");
+        }
+
         // Repair migration: is_favorite column may be missing on databases created from
         // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
         // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,

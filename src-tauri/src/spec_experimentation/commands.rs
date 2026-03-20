@@ -6,6 +6,7 @@ use tauri::State;
 use crate::commands::AppState;
 use super::accuracy;
 use super::compliance;
+use super::versioning;
 
 // ── Compliance commands ───────────────────────────────────────────────
 
@@ -131,4 +132,55 @@ pub fn get_spec_accuracy_results(
         spec_id.as_deref(),
         analysis_type.as_deref(),
     )
+}
+
+// ── Versioning commands ───────────────────────────────────────────────
+
+#[tauri::command]
+pub fn snapshot_current_spec(
+    app_state: State<'_, Arc<AppState>>,
+    spec_id: String,
+    spec_json: String,
+    change_summary: Option<String>,
+    change_type: Option<String>,
+) -> Result<versioning::SpecVersion, String> {
+    versioning::snapshot_spec_version(
+        &app_state.checkpoint_db,
+        &spec_id,
+        &spec_json,
+        change_summary.as_deref(),
+        change_type.as_deref().unwrap_or("manual"),
+    )
+}
+
+#[tauri::command]
+pub fn get_spec_version_history(
+    app_state: State<'_, Arc<AppState>>,
+    spec_id: String,
+    limit: Option<i64>,
+) -> Result<Vec<versioning::SpecVersion>, String> {
+    versioning::get_version_history(&app_state.checkpoint_db, &spec_id, limit)
+}
+
+#[tauri::command]
+pub fn diff_spec_versions(
+    app_state: State<'_, Arc<AppState>>,
+    spec_id: String,
+    from_version: i64,
+    to_version: i64,
+) -> Result<versioning::SpecDiff, String> {
+    versioning::diff_spec_versions(
+        &app_state.checkpoint_db,
+        &spec_id,
+        from_version,
+        to_version,
+    )
+}
+
+#[tauri::command]
+pub fn diff_spec_json(
+    old_json: String,
+    new_json: String,
+) -> Result<versioning::SpecDiff, String> {
+    versioning::diff_specs(&old_json, &new_json)
 }

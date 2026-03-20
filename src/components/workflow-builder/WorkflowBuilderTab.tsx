@@ -1788,10 +1788,15 @@ function WorkflowBuilderContent({
     async (overrides?: Record<string, unknown>) => {
       if (isExecuting) return;
 
-      // Check if workflow has steps (skip for comparison — workflow may have been generated and saved already)
-      const isComparison = !!overrides?._compareArchitectures;
-      if (isEmpty && !isComparison) {
-        setExecutionError("Cannot run an empty workflow. Add some steps first.");
+      const isComparison = !!(overrides?._compareArchitectures);
+
+      // Check if workflow has steps
+      if (isEmpty) {
+        setExecutionError(
+          isComparison
+            ? "Cannot compare architectures on an empty workflow. Use 'Generate & Run' first to create the workflow, then run a comparison."
+            : "Cannot run an empty workflow. Add some steps first.",
+        );
         return;
       }
 

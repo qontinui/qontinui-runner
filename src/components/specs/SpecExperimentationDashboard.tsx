@@ -122,9 +122,21 @@ export function SpecExperimentationDashboard() {
           {loading ? (
             <div className="text-zinc-500 text-sm">Loading accuracy data...</div>
           ) : specIds.length === 0 ? (
-            <div className="text-zinc-500 text-sm">
-              No accuracy analysis results yet. Run element coverage, mutation testing, or other
-              accuracy analyses to populate this view.
+            <div className="bg-zinc-800 rounded-lg p-4 border border-zinc-700 space-y-3">
+              <div className="text-sm text-zinc-300 font-medium">No accuracy data yet</div>
+              <div className="text-sm text-zinc-500">
+                Spec accuracy measures whether your specs themselves are thorough enough.
+                Available analyses:
+              </div>
+              <ul className="text-sm text-zinc-400 space-y-1 ml-4 list-disc">
+                <li><span className="text-zinc-300">Element Coverage</span> — What % of interactive elements have spec assertions?</li>
+                <li><span className="text-zinc-300">Cross-Page Consistency</span> — Do all specs cover error handling, loading states, etc.?</li>
+                <li><span className="text-zinc-300">Mutation Testing</span> — Can your spec catch injected UI faults?</li>
+                <li><span className="text-zinc-300">Freshness</span> — Are specs up-to-date with their components?</li>
+              </ul>
+              <div className="text-xs text-zinc-600 pt-2">
+                Use the Coverage Gaps, Cross-Page, and Freshness tabs to run individual analyses.
+              </div>
             </div>
           ) : (
             <div className="bg-zinc-800 rounded-lg border border-zinc-700 overflow-hidden">
@@ -182,9 +194,17 @@ function CoverageGapsView({ records }: { records: SpecAccuracyRecord[] }) {
 
   if (coverageRecords.length === 0) {
     return (
-      <div className="text-zinc-500 text-sm">
-        No element coverage analyses run yet. Use the element coverage analyzer on a spec to see
-        coverage gaps.
+      <div className="bg-zinc-800 rounded-lg p-4 border border-zinc-700 space-y-3">
+        <div className="text-sm text-zinc-300 font-medium">No element coverage data yet</div>
+        <div className="text-sm text-zinc-500">
+          Element coverage compares spec assertion targets against the actual interactive
+          elements on each page. It answers: "What % of buttons, inputs, and links on this
+          page have at least one spec assertion?"
+        </div>
+        <div className="text-sm text-zinc-500">
+          Run element coverage analysis on a specific spec from the Editor tab, or trigger
+          it via the <code className="text-zinc-400 bg-zinc-700 px-1 rounded">analyze_spec_element_coverage</code> command.
+        </div>
       </div>
     );
   }
@@ -271,8 +291,9 @@ function CrossPageConsistencyView({ records }: { records: SpecAccuracyRecord[] }
     try {
       setLoading(true);
       setError(null);
-      // This requires passing all spec configs — for now show cached results
-      setError("Run cross-page consistency analysis from the CLI or API to populate this view.");
+      await invoke("analyze_cross_page_consistency", { specsDir: "src/specs" });
+      // Reload to pick up new results
+      window.location.reload();
     } catch (e) {
       setError(String(e));
     } finally {

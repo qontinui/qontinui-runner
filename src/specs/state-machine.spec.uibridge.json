@@ -1400,20 +1400,20 @@
           "enabled": true
         },
         {
-          "id": "sm-sidebar-state-detail-save-delete",
-          "description": "The state detail panel provides 'Save Changes' and 'Delete State' buttons for persisting edits or removing the state",
+          "id": "sm-sidebar-state-detail-save",
+          "description": "The state detail panel provides a 'Save Changes' button for persisting edits (no Delete button on this page since onDelete is not passed)",
           "category": "behavior",
           "severity": "critical",
           "assertionType": "semantic",
           "target": {
             "type": "search",
             "criteria": {
-              "role": "button"
+              "textContent": "Save Changes"
             },
-            "label": "State save and delete buttons"
+            "label": "State save button"
           },
-          "expected": "A 'Save Changes' button (shown as 'Saving...' during save, only visible when changes exist) persists edits via the onSave callback. A 'Delete State' button (red text) removes the state. Both trigger the respective IPC commands.",
-          "precondition": "A state is selected, side panel is open",
+          "expected": "A 'Save Changes' button (shown as 'Saving...' during save, only visible when hasChanges is true) persists edits via the onSave callback which calls sm_update_state. The button is brand-primary styled and disabled during save. Note: the Delete State button does NOT appear because the main page does not pass an onDelete prop to StateDetailPanel.",
+          "precondition": "A state is selected, side panel is open, changes have been made",
           "source": "manual",
           "reviewed": true,
           "enabled": true

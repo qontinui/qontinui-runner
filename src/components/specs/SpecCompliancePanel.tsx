@@ -233,7 +233,18 @@ export function SpecComplianceSummaryTable() {
   }
 
   if (summaries.length === 0) {
-    return null;
+    return (
+      <div className="bg-zinc-800 rounded-lg p-4 border border-zinc-700">
+        <div className="text-xs text-zinc-500 uppercase tracking-wide mb-2">
+          Spec Compliance Overview
+        </div>
+        <div className="text-sm text-zinc-500 py-3">
+          No compliance data yet. Run a spec-generated workflow to measure how well the app
+          satisfies its specs. Each assertion's pass/fail is recorded with severity-weighted scoring
+          (critical 3x, warning 1x, info 0.5x).
+        </div>
+      </div>
+    );
   }
 
   return (

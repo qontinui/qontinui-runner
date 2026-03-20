@@ -3204,3 +3204,47 @@ CREATE INDEX IF NOT EXISTS idx_spec_accuracy_spec ON spec_accuracy_results(spec_
 CREATE INDEX IF NOT EXISTS idx_spec_accuracy_type ON spec_accuracy_results(analysis_type);
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (123, datetime('now'));
+
+-- =============================================================================
+-- Comparison Runs Table (migration 124)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS comparison_runs (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    variation_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    entries_json TEXT NOT NULL DEFAULT '[]',
+    report TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_comparison_runs_workflow ON comparison_runs(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_comparison_runs_status ON comparison_runs(status);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (124, datetime('now'));
+
+-- =============================================================================
+-- Spec Versioning Table (migration 125)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS spec_versions (
+    id TEXT PRIMARY KEY,
+    spec_id TEXT NOT NULL,
+    version_number INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    spec_json TEXT NOT NULL,
+    change_summary TEXT,
+    change_type TEXT NOT NULL DEFAULT 'manual',
+    parent_version_id TEXT,
+    assertion_count INTEGER NOT NULL,
+    group_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_spec_versions_spec ON spec_versions(spec_id);
+CREATE INDEX IF NOT EXISTS idx_spec_versions_hash ON spec_versions(content_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_spec_versions_num ON spec_versions(spec_id, version_number);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (125, datetime('now'));
