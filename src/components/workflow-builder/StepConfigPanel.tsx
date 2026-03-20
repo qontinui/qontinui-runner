@@ -560,7 +560,7 @@ function DataFlowSection({
           <div>
             <h4 className="text-sm font-medium text-zinc-400 mb-2">Inputs (from other steps)</h4>
             {inputEntries.map(([key, value], idx) => (
-              <div key={idx} className="flex gap-2 mb-2">
+              <div key={`input-${key}-${idx}`} className="flex gap-2 mb-2">
                 <input
                   type="text"
                   value={key}
@@ -598,7 +598,7 @@ function DataFlowSection({
               Extract (from this step's output)
             </h4>
             {extractEntries.map(([key, value], idx) => (
-              <div key={idx} className="flex gap-2 mb-2">
+              <div key={`extract-${key}-${idx}`} className="flex gap-2 mb-2">
                 <input
                   type="text"
                   value={key}

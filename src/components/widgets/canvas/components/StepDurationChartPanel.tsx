@@ -52,7 +52,7 @@ export function StepDurationChartPanel({ data, size }: CanvasPanelComponentProps
         const isRunning = step.status === "running";
 
         return (
-          <div key={idx} className="flex items-center gap-2">
+          <div key={`${step.name}-${idx}`} className="flex items-center gap-2">
             {/* Step name */}
             <div
               className={cn("truncate text-muted-foreground flex-shrink-0", fontSize)}

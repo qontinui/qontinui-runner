@@ -105,6 +105,9 @@ export function AiConversationWidget({
     <div
       className={cn("flex flex-col h-full", className)}
       onClick={() => !isActive && onRequestFocus?.()}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (!isActive) onRequestFocus?.(); }}}
+      role="button"
+      tabIndex={0}
     >
       {/* Content */}
       <ScrollArea className="flex-1">

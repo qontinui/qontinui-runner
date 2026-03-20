@@ -91,6 +91,7 @@ export function CompletionSummary({
     <div
       className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center"
       onClick={onDismiss}
+      onKeyDown={(e) => { if (e.key === "Escape") onDismiss(); }}
       role="dialog"
       aria-modal="true"
       aria-label="Workflow completion summary"
@@ -98,6 +99,7 @@ export function CompletionSummary({
       <div
         className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-sm mx-4 overflow-hidden"
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => e.stopPropagation()}
       >
         {/* Status Header */}
         <div

@@ -305,7 +305,7 @@ async fn run_campaign_loop(
 
         // Run experiment trials (across all benchmark workflows)
         let workflow_ids = config.effective_workflow_ids();
-        let trials = run_trials_multi_workflow(
+        let mut trials = run_trials_multi_workflow(
             &runner,
             &workflow_ids,
             &experiment_config,
@@ -314,6 +314,20 @@ async fn run_campaign_loop(
             &stop_rx,
         )
         .await;
+
+        // Enrich trials with spec compliance data (if available)
+        for trial in &mut trials {
+            if let Ok(Some(compliance)) =
+                crate::spec_experimentation::compliance::get_compliance_for_run(
+                    &db,
+                    &trial.task_run_id,
+                )
+            {
+                trial.spec_compliance_score = Some(compliance.overall_score);
+                trial.spec_assertions_passed = Some(compliance.assertions_passed as u32);
+                trial.spec_assertions_total = Some(compliance.assertions_total as u32);
+            }
+        }
 
         if *stop_rx.borrow() {
             let mut s = state.lock().await;
@@ -572,6 +586,9 @@ async fn run_trials(
                     iterations_used: 0,
                     duration_ms: 0,
                     workflow_id: None,
+                    spec_compliance_score: None,
+                    spec_assertions_passed: None,
+                    spec_assertions_total: None,
                 });
             }
         }
@@ -638,6 +655,9 @@ async fn get_control_aggregate(
                     iterations_used: 0,
                     duration_ms: 0,
                     workflow_id: None,
+                    spec_compliance_score: None,
+                    spec_assertions_passed: None,
+                    spec_assertions_total: None,
                 });
             }
         }
@@ -699,6 +719,9 @@ async fn run_single_trial(
         iterations_used,
         duration_ms,
         workflow_id: None, // Set by caller for multi-workflow campaigns
+        spec_compliance_score: None,
+        spec_assertions_passed: None,
+        spec_assertions_total: None,
     })
 }
 

@@ -109,8 +109,15 @@ export function TriggerHistory({
                           <span
                             className="font-mono text-gray-400 cursor-pointer hover:text-white"
                             title={entry.task_run_id}
+                            role="button"
+                            tabIndex={0}
                             onClick={() => {
                               navigator.clipboard.writeText(entry.task_run_id!).catch(() => {});
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                navigator.clipboard.writeText(entry.task_run_id!).catch(() => {});
+                              }
                             }}
                           >
                             {entry.task_run_id.slice(0, 16)}...

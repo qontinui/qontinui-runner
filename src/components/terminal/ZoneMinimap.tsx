@@ -108,7 +108,7 @@ export function ZoneMinimap({
             const h = rowSpan * cellH;
 
             return (
-              <g key={idx} onClick={() => onFocusZone(idx)} className="cursor-pointer">
+              <g key={`zone-${idx}`} onClick={() => onFocusZone(idx)} className="cursor-pointer">
                 <rect
                   x={x + 1}
                   y={y + 1}

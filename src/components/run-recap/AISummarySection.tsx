@@ -125,9 +125,9 @@ function SummaryContent({ text }: { text: string }) {
     <div className="space-y-3">
       {segments.map((segment, index) =>
         segment.type === "user_message" ? (
-          <UserMessageBubble key={index} content={segment.content} />
+          <UserMessageBubble key={`user-${index}`} content={segment.content} />
         ) : (
-          <p key={index} className="text-foreground/90 leading-relaxed whitespace-pre-wrap">
+          <p key={`text-${index}`} className="text-foreground/90 leading-relaxed whitespace-pre-wrap">
             {segment.content}
           </p>
         ),

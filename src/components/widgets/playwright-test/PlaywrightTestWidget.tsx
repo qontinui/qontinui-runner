@@ -60,6 +60,9 @@ function ScriptRow({
             : "border-transparent hover:bg-muted/30",
       )}
       onClick={onSelect}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(); }}}
+      role="button"
+      tabIndex={0}
     >
       {/* Status icon */}
       <StepStatusBadge status={script.status} iconOnly size="md" />

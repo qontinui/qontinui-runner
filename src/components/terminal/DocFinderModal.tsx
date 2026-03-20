@@ -145,11 +145,11 @@ function renderHighlighted(text: string, indices: number[]): ReactNode {
   const indexSet = new Set(indices);
   return text.split("").map((char, i) =>
     indexSet.has(i) ? (
-      <span key={i} className="text-[#7aa2f7] font-medium">
+      <span key={`hl-${i}`} className="text-[#7aa2f7] font-medium">
         {char}
       </span>
     ) : (
-      <span key={i}>{char}</span>
+      <span key={`ch-${i}`}>{char}</span>
     ),
   );
 }

@@ -188,7 +188,7 @@ function ConstraintRow({ result }: { result: ConstraintResult }) {
           className={cn("ml-8 mr-3 mb-1 rounded border", severityColors.bg, severityColors.border)}
         >
           {result.violations.map((v, idx) => (
-            <ViolationRow key={idx} violation={v} />
+            <ViolationRow key={`${v.file ?? ""}-${idx}`} violation={v} />
           ))}
         </div>
       )}

@@ -61,7 +61,7 @@ export function PhaseTimelinePanel({ data, size }: CanvasPanelComponentProps) {
 
           return (
             <div
-              key={idx}
+              key={phase.name}
               className={cn(
                 "relative flex items-center justify-center transition-all",
                 statusColor,
@@ -89,8 +89,8 @@ export function PhaseTimelinePanel({ data, size }: CanvasPanelComponentProps) {
       <div
         className={cn("flex flex-wrap gap-x-4 gap-y-1.5", isCompact ? "text-[10px]" : "text-xs")}
       >
-        {phases.map((phase, idx) => (
-          <div key={idx} className="flex items-center gap-1.5">
+        {phases.map((phase) => (
+          <div key={`detail-${phase.name}`} className="flex items-center gap-1.5">
             <span
               className={cn(
                 "inline-block h-2 w-2 rounded-full flex-shrink-0",

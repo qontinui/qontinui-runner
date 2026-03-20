@@ -41,7 +41,7 @@ export function TimelinePanel({ data, size }: CanvasPanelComponentProps) {
         const isLast = idx === events.length - 1;
 
         return (
-          <div key={idx} className="flex gap-3">
+          <div key={`${event.title}-${idx}`} className="flex gap-3">
             {/* Line + icon column */}
             <div className="flex flex-col items-center">
               <div className="relative flex-shrink-0">

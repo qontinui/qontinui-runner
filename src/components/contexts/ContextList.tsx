@@ -416,7 +416,14 @@ export function ContextList({ onLog }: ContextListProps) {
       {/* Duplicate Scope Selection Dialog */}
       {duplicateTarget?.showDialog && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/50" onClick={() => setDuplicateTarget(null)} />
+          <div
+            className="absolute inset-0 bg-black/50"
+            onClick={() => setDuplicateTarget(null)}
+            onKeyDown={(e) => { if (e.key === "Escape") setDuplicateTarget(null); }}
+            role="button"
+            tabIndex={-1}
+            aria-label="Close dialog"
+          />
           <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-sm mx-4 p-6 space-y-4">
             <h3 className="text-lg font-semibold">Duplicate Context</h3>
             <p className="text-sm text-muted-foreground">

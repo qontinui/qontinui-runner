@@ -73,7 +73,7 @@ export function ErrorPatternsPanel({ patterns }: ErrorPatternsPanelProps) {
                   </summary>
                   <ul className="mt-1 space-y-1 pl-4">
                     {pattern.contexts.slice(0, 3).map((ctx, idx) => (
-                      <li key={idx} className="truncate">
+                      <li key={`${ctx}-${idx}`} className="truncate">
                         {ctx}
                       </li>
                     ))}

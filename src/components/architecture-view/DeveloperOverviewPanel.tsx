@@ -194,7 +194,7 @@ export function DeveloperOverviewPanel({ project }: Props) {
           ) : (
             <div className="space-y-1.5">
               {sortedDirectories.map((dir, i) => (
-                <div key={i} className="flex items-start gap-2 py-1">
+                <div key={`${dir.path}-${i}`} className="flex items-start gap-2 py-1">
                   <code className="text-xs font-mono text-blue-400 shrink-0">{dir.path}</code>
                   {dir.required && (
                     <span className="text-[9px] px-1 py-0.5 rounded bg-green-500/15 text-green-400 font-medium shrink-0">

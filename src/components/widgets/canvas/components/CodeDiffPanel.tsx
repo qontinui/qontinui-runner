@@ -355,7 +355,7 @@ export function CodeDiffPanel({ data }: CanvasPanelComponentProps) {
 
           return (
             <div
-              key={idx}
+              key={`line-${idx}`}
               className={cn(
                 "flex",
                 isAdd && "bg-green-500/10 text-green-400",

@@ -668,7 +668,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                                   <div className="flex flex-wrap gap-1 mt-0.5">
                                     {entry.related_files.map((file, i) => (
                                       <span
-                                        key={i}
+                                        key={`${file}-${i}`}
                                         className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded"
                                       >
                                         {file}

@@ -13,6 +13,7 @@ pub fn compute_aggregate(trials: &[TrialResult]) -> AggregateMetrics {
             mean_iterations: 0.0,
             mean_duration_ms: 0.0,
             trial_count: 0,
+            mean_spec_compliance: None,
         };
     }
 
@@ -21,11 +22,23 @@ pub fn compute_aggregate(trials: &[TrialResult]) -> AggregateMetrics {
     let total_iter: f64 = trials.iter().map(|t| t.iterations_used as f64).sum();
     let total_dur: f64 = trials.iter().map(|t| t.duration_ms as f64).sum();
 
+    // Compute mean spec compliance from trials that have the field
+    let compliance_scores: Vec<f64> = trials
+        .iter()
+        .filter_map(|t| t.spec_compliance_score)
+        .collect();
+    let mean_spec_compliance = if compliance_scores.is_empty() {
+        None
+    } else {
+        Some(compliance_scores.iter().sum::<f64>() / compliance_scores.len() as f64)
+    };
+
     AggregateMetrics {
         pass_rate: passed / n,
         mean_iterations: total_iter / n,
         mean_duration_ms: total_dur / n,
         trial_count: trials.len() as u32,
+        mean_spec_compliance,
     }
 }
 
@@ -88,11 +101,22 @@ pub fn compute_aggregate_multi_workflow(
     let total_iter: f64 = trials.iter().map(|t| t.iterations_used as f64).sum();
     let total_dur: f64 = trials.iter().map(|t| t.duration_ms as f64).sum();
 
+    let compliance_scores: Vec<f64> = trials
+        .iter()
+        .filter_map(|t| t.spec_compliance_score)
+        .collect();
+    let mean_spec_compliance = if compliance_scores.is_empty() {
+        None
+    } else {
+        Some(compliance_scores.iter().sum::<f64>() / compliance_scores.len() as f64)
+    };
+
     AggregateMetrics {
         pass_rate: combined_pass_rate,
         mean_iterations: total_iter / n,
         mean_duration_ms: total_dur / n,
         trial_count: trials.len() as u32,
+        mean_spec_compliance,
     }
 }
 
@@ -139,6 +163,13 @@ pub fn compare_to_control(
                 .iter()
                 .map(|t| t.duration_ms as f64)
                 .collect::<Vec<_>>(),
+            criteria,
+        ),
+        PrimaryMetric::SpecCompliance => compare_spec_compliance(
+            experiment,
+            control,
+            experiment_trials,
+            control_trials,
             criteria,
         ),
     }
@@ -238,6 +269,97 @@ fn compare_lower_is_better(
     let mut reason = format!(
         "{}: experiment={:.1}, control={:.1}, ratio={:.3} (threshold={:.3})",
         metric_name, exp_val, ctrl_val, ratio, criteria.min_improvement_ratio,
+    );
+    if let Some(p) = p_value {
+        reason.push_str(&format!(
+            ", p={:.4} (threshold={:.2})",
+            p, criteria.significance_threshold
+        ));
+        if ratio_ok && !sig_ok {
+            reason.push_str(" [ratio OK but not significant]");
+        }
+    }
+
+    (accepted, reason, p_value)
+}
+
+/// Compare spec compliance scores using Fisher's test on assertion pass/fail counts.
+fn compare_spec_compliance(
+    experiment: &AggregateMetrics,
+    control: &AggregateMetrics,
+    experiment_trials: &[TrialResult],
+    control_trials: &[TrialResult],
+    criteria: &AcceptanceCriteria,
+) -> (bool, String, Option<f64>) {
+    let exp_compliance = experiment.mean_spec_compliance.unwrap_or(0.0);
+    let ctrl_compliance = control.mean_spec_compliance.unwrap_or(0.0);
+
+    if ctrl_compliance == 0.0 && exp_compliance > 0.0 {
+        return (
+            true,
+            format!(
+                "spec_compliance: experiment={:.3}, control=0 (infinite improvement)",
+                exp_compliance
+            ),
+            None,
+        );
+    }
+    if ctrl_compliance == 0.0 && exp_compliance == 0.0 {
+        return (
+            false,
+            "spec_compliance: both experiment and control are 0 — no improvement".to_string(),
+            None,
+        );
+    }
+
+    let ratio = exp_compliance / ctrl_compliance;
+    let ratio_ok = ratio >= criteria.min_improvement_ratio;
+
+    // Use Fisher's test on total assertion pass/fail across trials
+    let exp_passed: u32 = experiment_trials
+        .iter()
+        .filter_map(|t| t.spec_assertions_passed)
+        .sum();
+    let exp_total: u32 = experiment_trials
+        .iter()
+        .filter_map(|t| t.spec_assertions_total)
+        .sum();
+    let ctrl_passed: u32 = control_trials
+        .iter()
+        .filter_map(|t| t.spec_assertions_passed)
+        .sum();
+    let ctrl_total: u32 = control_trials
+        .iter()
+        .filter_map(|t| t.spec_assertions_total)
+        .sum();
+
+    let p_value = if exp_total >= 2 && ctrl_total >= 2 {
+        let p_exp = exp_passed as f64 / exp_total as f64;
+        let p_ctrl = ctrl_passed as f64 / ctrl_total as f64;
+        let total = (exp_total + ctrl_total) as f64;
+        let p_pool = (exp_passed + ctrl_passed) as f64 / total;
+
+        if p_pool == 0.0 || p_pool == 1.0 {
+            if p_exp > p_ctrl { Some(0.0) } else { Some(1.0) }
+        } else {
+            let se = (p_pool * (1.0 - p_pool) * (1.0 / exp_total as f64 + 1.0 / ctrl_total as f64)).sqrt();
+            if se > 0.0 {
+                let z = (p_exp - p_ctrl) / se;
+                Some(1.0 - normal_cdf(z))
+            } else {
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let sig_ok = p_value.is_none_or(|p| p <= criteria.significance_threshold);
+    let accepted = ratio_ok && sig_ok;
+
+    let mut reason = format!(
+        "spec_compliance: experiment={:.3}, control={:.3}, ratio={:.3} (threshold={:.3})",
+        exp_compliance, ctrl_compliance, ratio, criteria.min_improvement_ratio,
     );
     if let Some(p) = p_value {
         reason.push_str(&format!(
@@ -501,6 +623,9 @@ mod tests {
                 iterations_used: 3,
                 duration_ms: 1000,
                 workflow_id: None,
+                spec_compliance_score: None,
+                spec_assertions_passed: None,
+                spec_assertions_total: None,
             },
             TrialResult {
                 task_run_id: "t2".into(),
@@ -508,6 +633,9 @@ mod tests {
                 iterations_used: 10,
                 duration_ms: 5000,
                 workflow_id: None,
+                spec_compliance_score: None,
+                spec_assertions_passed: None,
+                spec_assertions_total: None,
             },
         ];
         let agg = compute_aggregate(&trials);
@@ -526,6 +654,9 @@ mod tests {
                 iterations_used: 3,
                 duration_ms: 1000,
                 workflow_id: None,
+                spec_compliance_score: None,
+                spec_assertions_passed: None,
+                spec_assertions_total: None,
             },
             TrialResult {
                 task_run_id: "e2".into(),
@@ -533,6 +664,9 @@ mod tests {
                 iterations_used: 4,
                 duration_ms: 1200,
                 workflow_id: None,
+                spec_compliance_score: None,
+                spec_assertions_passed: None,
+                spec_assertions_total: None,
             },
             TrialResult {
                 task_run_id: "e3".into(),
@@ -540,6 +674,9 @@ mod tests {
                 iterations_used: 3,
                 duration_ms: 1100,
                 workflow_id: None,
+                spec_compliance_score: None,
+                spec_assertions_passed: None,
+                spec_assertions_total: None,
             },
         ];
         let ctrl_trials = vec![
@@ -549,6 +686,9 @@ mod tests {
                 iterations_used: 5,
                 duration_ms: 2000,
                 workflow_id: None,
+                spec_compliance_score: None,
+                spec_assertions_passed: None,
+                spec_assertions_total: None,
             },
             TrialResult {
                 task_run_id: "c2".into(),
@@ -556,6 +696,9 @@ mod tests {
                 iterations_used: 10,
                 duration_ms: 5000,
                 workflow_id: None,
+                spec_compliance_score: None,
+                spec_assertions_passed: None,
+                spec_assertions_total: None,
             },
             TrialResult {
                 task_run_id: "c3".into(),
@@ -563,6 +706,9 @@ mod tests {
                 iterations_used: 10,
                 duration_ms: 5000,
                 workflow_id: None,
+                spec_compliance_score: None,
+                spec_assertions_passed: None,
+                spec_assertions_total: None,
             },
         ];
         let exp_agg = compute_aggregate(&exp_trials);
@@ -583,6 +729,9 @@ mod tests {
                 iterations_used: 10,
                 duration_ms: 5000,
                 workflow_id: None,
+                spec_compliance_score: None,
+                spec_assertions_passed: None,
+                spec_assertions_total: None,
             },
             TrialResult {
                 task_run_id: "e2".into(),
@@ -590,6 +739,9 @@ mod tests {
                 iterations_used: 5,
                 duration_ms: 2000,
                 workflow_id: None,
+                spec_compliance_score: None,
+                spec_assertions_passed: None,
+                spec_assertions_total: None,
             },
         ];
         let ctrl_trials = vec![
@@ -599,6 +751,9 @@ mod tests {
                 iterations_used: 3,
                 duration_ms: 1000,
                 workflow_id: None,
+                spec_compliance_score: None,
+                spec_assertions_passed: None,
+                spec_assertions_total: None,
             },
             TrialResult {
                 task_run_id: "c2".into(),
@@ -606,6 +761,9 @@ mod tests {
                 iterations_used: 4,
                 duration_ms: 1500,
                 workflow_id: None,
+                spec_compliance_score: None,
+                spec_assertions_passed: None,
+                spec_assertions_total: None,
             },
         ];
         let exp_agg = compute_aggregate(&exp_trials);

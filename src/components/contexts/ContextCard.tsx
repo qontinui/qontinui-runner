@@ -329,7 +329,14 @@ export function ContextCard({
               {showMenu && (
                 <>
                   {/* Backdrop to close menu */}
-                  <div className="fixed inset-0 z-10" onClick={() => setShowMenu(false)} />
+                  <div
+                    className="fixed inset-0 z-10"
+                    onClick={() => setShowMenu(false)}
+                    onKeyDown={(e) => { if (e.key === "Escape") setShowMenu(false); }}
+                    role="button"
+                    tabIndex={-1}
+                    aria-label="Close menu"
+                  />
                   {/* Menu */}
                   <div className="absolute right-0 top-full mt-1 z-20 w-40 bg-card border border-border rounded-lg shadow-lg py-1">
                     {canEdit && (

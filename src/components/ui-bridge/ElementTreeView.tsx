@@ -237,6 +237,9 @@ export function ElementTreeView({
           )}
           style={{ paddingLeft: `${depth * 16 + 8}px` }}
           onClick={() => onSelectElement?.(isSelected ? null : element.id)}
+          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectElement?.(isSelected ? null : element.id); }}}
+          role="button"
+          tabIndex={0}
         >
           {/* Expand/Collapse toggle */}
           <button
@@ -733,6 +736,9 @@ function SelectedElementDetails({
             alt="Element preview"
             className="max-h-48 max-w-48 object-contain rounded border border-border cursor-pointer hover:border-primary transition-colors"
             onClick={handleOpenPreview}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleOpenPreview(); }}}
+            role="button"
+            tabIndex={0}
             title="Click to view full size"
           />
         </div>

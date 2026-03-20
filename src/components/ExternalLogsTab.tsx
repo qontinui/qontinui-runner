@@ -357,7 +357,7 @@ export function ExternalLogsTab({
             ) : (
               <pre className="font-mono text-xs leading-relaxed whitespace-pre-wrap">
                 {selectedSource.lines.map((line, index) => (
-                  <div key={index} className="hover:bg-muted/50 px-2 py-0.5">
+                  <div key={`line-${index}`} className="hover:bg-muted/50 px-2 py-0.5">
                     {line}
                   </div>
                 ))}

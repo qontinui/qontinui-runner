@@ -773,7 +773,7 @@ export default function ActionLogTable({
           style={{ colorScheme: "dark" }}
         >
           {Array.from({ length: maxAvailableLevel + 1 }, (_, i) => (
-            <option key={i} value={i}>
+            <option key={`level-${i}`} value={i}>
               {i}
             </option>
           ))}

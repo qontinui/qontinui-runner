@@ -209,7 +209,7 @@ export function CostEffectivenessPanel() {
             const cy = scaleY(p.success_rate);
 
             return (
-              <g key={i}>
+              <g key={`${p.agent_type}-${p.period_label}-${i}`}>
                 <circle
                   cx={cx}
                   cy={cy}

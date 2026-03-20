@@ -90,7 +90,7 @@ export function TablePanel({ data, size }: CanvasPanelComponentProps) {
             <tr className="border-b border-border">
               {columns.map((col, idx) => (
                 <th
-                  key={idx}
+                  key={`col-${col}-${idx}`}
                   className={cn(
                     "text-xs font-semibold text-muted-foreground uppercase tracking-wide",
                     isCompact ? "px-2 py-1" : "px-3 py-2",

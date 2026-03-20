@@ -361,8 +361,8 @@ export const MockFullDisplay: Story = {
 
     return (
       <div className="space-y-4">
-        {mockMarkers.map((marker, idx) => (
-          <div key={idx} className="space-y-1">
+        {mockMarkers.map((marker) => (
+          <div key={marker.type} className="space-y-1">
             <span className="text-xs font-medium">{getLabel(marker.type)}</span>
             <div className="flex items-center gap-2">
               <div className="flex-1">

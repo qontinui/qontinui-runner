@@ -375,7 +375,7 @@ function PlanPreview({ plan }: { plan: ExplorationPlan }) {
           {showStates && (
             <ul className="mt-2 space-y-1 pl-6 text-sm text-muted-foreground">
               {plan.states.map((state, idx) => (
-                <li key={idx} className="flex items-center gap-2">
+                <li key={`state-${idx}-${state.slice(0, 20)}`} className="flex items-center gap-2">
                   <span className="w-5 text-xs text-muted-foreground/50">{idx + 1}.</span>
                   {state}
                 </li>
@@ -402,7 +402,7 @@ function PlanPreview({ plan }: { plan: ExplorationPlan }) {
           {showTransitions && (
             <ul className="mt-2 space-y-1 pl-6 text-sm text-muted-foreground">
               {plan.transitions.map((transition, idx) => (
-                <li key={idx} className="flex items-center gap-2">
+                <li key={`transition-${idx}-${transition.slice(0, 20)}`} className="flex items-center gap-2">
                   <span className="w-5 text-xs text-muted-foreground/50">{idx + 1}.</span>
                   {transition}
                 </li>

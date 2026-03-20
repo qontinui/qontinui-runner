@@ -260,7 +260,7 @@ export function ComparisonTab() {
             </thead>
             <tbody>
               {activeData.entries.map((entry, i) => (
-                <tr key={i} className="border-b border-zinc-800/50">
+                <tr key={`${entry.label}-${i}`} className="border-b border-zinc-800/50">
                   <td className="py-1.5 pr-4 text-zinc-200">{entry.label}</td>
                   <td className="py-1.5 pr-4">
                     <span

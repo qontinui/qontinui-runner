@@ -157,7 +157,14 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/50" onClick={isLoading ? undefined : onClose} />
+      <div
+        className="absolute inset-0 bg-black/50"
+        onClick={isLoading ? undefined : onClose}
+        onKeyDown={(e) => { if (e.key === "Escape" && !isLoading) onClose(); }}
+        role="button"
+        tabIndex={-1}
+        aria-label="Close dialog"
+      />
 
       {/* Dialog */}
       <div className="relative bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden">

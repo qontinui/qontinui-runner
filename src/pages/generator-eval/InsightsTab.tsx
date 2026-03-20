@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { fetchApi, type PromptInsight } from "./types";
 
@@ -99,9 +99,8 @@ export function InsightsTab() {
           </thead>
           <tbody>
             {data.map((insight, i) => (
-              <>
+              <React.Fragment key={`${insight.agent}-${insight.insight_type}-${i}`}>
                 <tr
-                  key={i}
                   className="border-t border-border hover:bg-muted/20 cursor-pointer"
                   onClick={() => setExpandedRow(expandedRow === i ? null : i)}
                 >
@@ -138,7 +137,7 @@ export function InsightsTab() {
                   </td>
                 </tr>
                 {expandedRow === i && insight.suggested_rule && (
-                  <tr key={`${i}-expanded`} className="border-t border-border/50">
+                  <tr className="border-t border-border/50">
                     <td colSpan={5} className="px-3 py-2 bg-muted/10">
                       <div className="text-[10px] text-muted-foreground mb-1">Suggested Rule</div>
                       <div className="font-mono text-xs whitespace-pre-wrap">
@@ -147,7 +146,7 @@ export function InsightsTab() {
                     </td>
                   </tr>
                 )}
-              </>
+              </React.Fragment>
             ))}
           </tbody>
         </table>

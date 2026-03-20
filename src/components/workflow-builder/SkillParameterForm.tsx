@@ -76,7 +76,7 @@ export function SkillParameterFormStandalone({
       {validationErrors.length > 0 && (
         <div className="space-y-1">
           {validationErrors.map((err, i) => (
-            <p key={i} className="text-xs text-red-400">
+            <p key={`verr-${i}`} className="text-xs text-red-400">
               {err}
             </p>
           ))}
@@ -127,7 +127,7 @@ export function SkillParameterForm({
       {errors && errors.length > 0 && (
         <div className="space-y-1">
           {errors.map((err, i) => (
-            <p key={i} className="text-xs text-red-400">
+            <p key={`err-${i}`} className="text-xs text-red-400">
               {err}
             </p>
           ))}

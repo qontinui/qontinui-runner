@@ -1081,12 +1081,25 @@ export function AiTab({
                     {dateLoops.map((loop) => (
                       <div
                         key={loop.id}
+                        role="button"
+                        tabIndex={0}
                         onClick={() => {
                           if (isManagingRuns) {
                             handleToggleSessionSelection(loop.id);
                           } else {
                             handleSelectSession(loop.id);
                             setSessionDropdownOpen(false);
+                          }
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            if (isManagingRuns) {
+                              handleToggleSessionSelection(loop.id);
+                            } else {
+                              handleSelectSession(loop.id);
+                              setSessionDropdownOpen(false);
+                            }
                           }
                         }}
                         className={`flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted/50 transition-colors cursor-pointer ${

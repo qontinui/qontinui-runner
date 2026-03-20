@@ -73,7 +73,7 @@ export function DeveloperArchitecturePanel({
             className="px-3 py-1.5 text-sm bg-muted border border-border rounded-md"
           >
             {specs.map((s, i) => (
-              <option key={i} value={i}>
+              <option key={`${s.projectName}-${i}`} value={i}>
                 {s.projectName} ({s.appUrl})
               </option>
             ))}

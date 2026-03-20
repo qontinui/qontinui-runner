@@ -135,7 +135,7 @@ export function WaterfallPanel({ data, size }: CanvasPanelComponentProps) {
         const showTextInside = barWidthApprox > 60;
 
         return (
-          <div key={idx} className="flex items-center gap-2">
+          <div key={`${entry.name}-${idx}`} className="flex items-center gap-2">
             {/* Step name */}
             <div
               className={cn("truncate text-muted-foreground flex-shrink-0", fontSize)}

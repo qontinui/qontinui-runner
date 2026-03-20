@@ -440,6 +440,8 @@ export function AiOutputTab({
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
             onMouseLeave={handleMouseLeave}
+            role="list"
+            aria-label="Session list"
             className={`flex-1 flex items-center gap-1.5 overflow-x-auto scrollbar-none ${
               isDragging ? "cursor-grabbing select-none" : "cursor-grab"
             }`}

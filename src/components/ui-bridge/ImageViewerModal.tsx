@@ -133,6 +133,9 @@ export function ImageViewerModal({
                 onClose();
               }
             }}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClose(); }}}
+            role="button"
+            tabIndex={0}
           >
             <img
               src={imageSrc}

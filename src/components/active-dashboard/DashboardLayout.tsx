@@ -1416,6 +1416,10 @@ export function DashboardLayout({
       <div
         onMouseDown={handleMouseDown}
         onDoubleClick={() => setLeftWidthPercent(65)}
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setLeftWidthPercent(65); }}
+        role="separator"
+        aria-label="Resize panel. Double-click or press Enter to reset."
+        tabIndex={0}
         className="flex-shrink-0 flex items-center justify-center cursor-col-resize group hover:bg-muted/50 transition-colors rounded"
         style={{ width: HANDLE_WIDTH }}
         title="Drag to resize. Double-click to reset."

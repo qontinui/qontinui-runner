@@ -1137,7 +1137,7 @@ function HistoryPopover({
             ) : (
               [...entries].reverse().map((entry, i) => (
                 <div
-                  key={i}
+                  key={`event-${entry.type}-${i}`}
                   className="flex items-start gap-2 px-3 py-1.5 hover:bg-[#2a2d3d]/30 transition-colors"
                 >
                   <span className="text-[9px] text-[#565f89] font-mono shrink-0 mt-0.5">

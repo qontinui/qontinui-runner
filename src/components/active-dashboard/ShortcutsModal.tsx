@@ -67,6 +67,7 @@ export function ShortcutsModal({ isOpen, onClose }: ShortcutsModalProps) {
     <div
       className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center"
       onClick={onClose}
+      onKeyDown={(e) => { if (e.key === "Escape") onClose(); }}
       role="dialog"
       aria-modal="true"
       aria-label="Keyboard shortcuts"
@@ -74,6 +75,7 @@ export function ShortcutsModal({ isOpen, onClose }: ShortcutsModalProps) {
       <div
         className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden"
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => e.stopPropagation()}
       >
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-border">

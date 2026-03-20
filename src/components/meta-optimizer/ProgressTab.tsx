@@ -10,6 +10,7 @@ import { RegressionAlertBanner } from "./RegressionAlertBanner";
 import { CanaryStatusPanel } from "./CanaryStatusPanel";
 import { CostEffectivenessPanel } from "./CostEffectivenessPanel";
 import { AgentInteractionMatrix } from "./AgentInteractionMatrix";
+import { SpecComplianceSummaryTable } from "../specs/SpecCompliancePanel";
 
 interface SnapshotMetrics {
   success_rate: number;
@@ -323,6 +324,9 @@ export function ProgressTab() {
           <span className="text-zinc-200 font-medium">{summary.applied_recommendations_count}</span>
         </div>
       )}
+
+      {/* Spec Compliance Overview */}
+      <SpecComplianceSummaryTable />
 
       {/* E. Per-agent effectiveness */}
       <AgentEffectivenessPanel />

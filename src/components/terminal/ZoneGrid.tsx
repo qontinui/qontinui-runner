@@ -665,6 +665,8 @@ function CompactZoneCard({
         <div className="relative shrink-0" ref={switchRef}>
           <span
             className="text-[9px] text-[#565f89] font-mono w-3 shrink-0 cursor-grab active:cursor-grabbing hover:text-[#a9b1d6] transition-colors"
+            role="button"
+            tabIndex={0}
             draggable
             onDragStart={(e) => {
               e.dataTransfer.setData("text/zone-index", String(zoneIndex));
@@ -675,12 +677,19 @@ function CompactZoneCard({
               e.stopPropagation();
               setShowSwitch((prev) => !prev);
             }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.stopPropagation();
+                setShowSwitch((prev) => !prev);
+              }
+            }}
             title="Click to quick-switch session, drag to swap zones"
           >
             {zoneIndex + 1}
           </span>
           {showSwitch && allTabs && assignments && sessionStates && onAssignTab && (
             <div
+              role="presentation"
               className="absolute top-full left-0 mt-1 min-w-[140px] max-h-[150px] overflow-y-auto bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50"
               onMouseDown={(e) => e.stopPropagation()}
               onClick={(e) => e.stopPropagation()}
@@ -935,7 +944,7 @@ function CompactZoneCard({
               const actionable = needsInput && isActionableLine(line);
               return (
                 <div
-                  key={i}
+                  key={`preview-line-${i}`}
                   className={`truncate ${
                     actionable
                       ? "text-[#e0af68] font-semibold bg-[#e0af68]/10 rounded px-0.5 -mx-0.5"
@@ -1007,6 +1016,7 @@ function CompactZoneCard({
 
       {/* Last output lines — scrollable, highlight actionable prompts + search */}
       <div
+        role="presentation"
         ref={outputRef}
         className="flex-1 min-h-0 overflow-y-auto scrollbar-dark"
         onMouseDown={(e) => e.stopPropagation()}
@@ -1029,7 +1039,7 @@ function CompactZoneCard({
                 const actionable = needsInput && isActionableLine(line);
                 return (
                   <div
-                    key={i}
+                    key={`output-line-${i}`}
                     className={`truncate ${
                       actionable
                         ? "text-[#e0af68] font-semibold bg-[#e0af68]/10 rounded px-0.5 -mx-0.5"

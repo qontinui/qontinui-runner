@@ -1072,7 +1072,7 @@ impl CheckpointDb {
             let iterations = outcome["iterations"].as_i64().map(|i| i as i32);
             let strategy = outcome["strategy"].as_str();
             let tools_json = serde_json::to_string(&outcome["tools_used"]).ok();
-            let agents_json = serde_json::to_string(&outcome["agents_involved"]).ok();
+            let files_json = serde_json::to_string(&outcome["files_modified"]).ok();
             let error_type = outcome["error_type"].as_str();
             let error_msg = outcome["error_message"].as_str();
             let feedback_json = serde_json::to_string(&outcome["feedback"]).ok();
@@ -1080,10 +1080,10 @@ impl CheckpointDb {
 
             let result = conn.execute(
                 r#"
-                INSERT INTO learning_outcomes (task_id, status, duration_secs, iterations, strategy, tools_used, agents_involved, error_type, error_message, feedback, workflow_architecture, created_at)
+                INSERT INTO learning_outcomes (task_id, status, duration_secs, iterations, strategy, tools_used, files_modified, error_type, error_message, feedback, workflow_architecture, created_at)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))
                 "#,
-                params![task_id, status, duration, iterations, strategy, tools_json, agents_json, error_type, error_msg, feedback_json, workflow_architecture],
+                params![task_id, status, duration, iterations, strategy, tools_json, files_json, error_type, error_msg, feedback_json, workflow_architecture],
             );
 
             match result {

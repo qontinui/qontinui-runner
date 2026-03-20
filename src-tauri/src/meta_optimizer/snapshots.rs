@@ -35,6 +35,8 @@ pub struct SnapshotMetrics {
     pub successful_runs: i64,
     pub failed_runs: i64,
     pub partial_runs: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_spec_compliance: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +66,8 @@ pub struct RecommendationOutcome {
     pub success_rate_delta: Option<f64>,
     pub duration_delta_ms: Option<f64>,
     pub cost_delta_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_compliance_delta: Option<f64>,
 }
 
 /// Evaluate whether an applied recommendation improved or regressed performance.
@@ -106,6 +110,7 @@ pub fn evaluate_recommendation_outcome(
                 success_rate_delta: None,
                 duration_delta_ms: None,
                 cost_delta_usd: None,
+                spec_compliance_delta: None,
             });
         }
     };
@@ -185,6 +190,10 @@ pub fn evaluate_recommendation_outcome(
                 } else {
                     "neutral"
                 };
+                let sc_delta = match (b.avg_spec_compliance, p.avg_spec_compliance) {
+                    (Some(b_sc), Some(p_sc)) => Some(p_sc - b_sc),
+                    _ => None,
+                };
                 RecommendationOutcome {
                     verdict: verdict.to_string(),
                     metrics_before: None,
@@ -192,6 +201,7 @@ pub fn evaluate_recommendation_outcome(
                     success_rate_delta: Some(sr_delta),
                     duration_delta_ms: Some((p.avg_duration_secs - b.avg_duration_secs) * 1000.0),
                     cost_delta_usd: Some((p.avg_cost_cents - b.avg_cost_cents) / 100.0),
+                    spec_compliance_delta: sc_delta,
                 }
             }
             _ => RecommendationOutcome {
@@ -201,6 +211,7 @@ pub fn evaluate_recommendation_outcome(
                 success_rate_delta: None,
                 duration_delta_ms: None,
                 cost_delta_usd: None,
+                spec_compliance_delta: None,
             },
         }
     };
@@ -250,6 +261,7 @@ fn compute_verdict(
                 success_rate_delta: Some(sr_delta),
                 duration_delta_ms: Some(dur_delta),
                 cost_delta_usd: Some(cost_delta),
+                spec_compliance_delta: None,
             }
         }
         _ => RecommendationOutcome {
@@ -259,6 +271,7 @@ fn compute_verdict(
             success_rate_delta: None,
             duration_delta_ms: None,
             cost_delta_usd: None,
+            spec_compliance_delta: None,
         },
     }
 }
@@ -365,6 +378,15 @@ pub fn capture_snapshot(
             )
             .map_err(|e| format!("Failed to query cost metrics: {}", e))?;
 
+        // ── Spec compliance average (if any spec compliance data exists) ──
+        let avg_spec_compliance: Option<f64> = conn
+            .query_row(
+                "SELECT AVG(overall_score) FROM spec_compliance_results WHERE created_at > ?1",
+                params![period_start],
+                |row| row.get::<_, Option<f64>>(0),
+            )
+            .unwrap_or(None);
+
         let metrics = SnapshotMetrics {
             success_rate,
             avg_duration_secs: avg_duration,
@@ -374,6 +396,7 @@ pub fn capture_snapshot(
             successful_runs,
             failed_runs,
             partial_runs,
+            avg_spec_compliance,
         };
 
         let metrics_json = serde_json::to_string(&metrics)

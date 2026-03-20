@@ -64,7 +64,7 @@ function ActivitySparkline({ data, color }: { data: number[]; color: string }) {
         const h = Math.max((v / max) * 9, 0.5);
         return (
           <rect
-            key={i}
+            key={`bar-${i}`}
             x={i * barWidth + 0.5}
             y={10 - h}
             width={Math.max(barWidth - 1, 1)}
@@ -465,9 +465,17 @@ export function TerminalTabBar({
                   return (
                     <div
                       key={tab.id}
+                      role="button"
+                      tabIndex={0}
                       onClick={() => {
                         onSelect(tab.id);
                         setShowDropdown(false);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          onSelect(tab.id);
+                          setShowDropdown(false);
+                        }
                       }}
                       className={`flex items-start gap-2 px-3 py-2 cursor-pointer transition-colors ${
                         isActive ? "bg-[#7aa2f7]/10" : "hover:bg-[#2a2d3d]/50"

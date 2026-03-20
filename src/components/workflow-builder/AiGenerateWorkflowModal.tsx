@@ -246,7 +246,14 @@ export function AiGenerateWorkflowModal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/50" onClick={handleClose} />
+      <div
+        role="button"
+        tabIndex={0}
+        aria-label="Close AI generate workflow modal"
+        className="absolute inset-0 bg-black/50"
+        onClick={handleClose}
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handleClose(); }}
+      />
 
       {/* Dialog */}
       <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[85vh] flex flex-col overflow-hidden">
@@ -568,7 +575,7 @@ export function AiGenerateWorkflowModal({
                   </div>
                   <ul className="text-xs text-yellow-400/80 space-y-1 ml-6 list-disc">
                     {validationErrors.map((err, i) => (
-                      <li key={i}>{err}</li>
+                      <li key={`err-${i}`}>{err}</li>
                     ))}
                   </ul>
                 </div>

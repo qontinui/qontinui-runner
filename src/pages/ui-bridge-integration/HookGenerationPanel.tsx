@@ -120,7 +120,7 @@ function StepIndicator({ steps }: { steps: StepStatus[] }) {
   return (
     <div className="flex flex-col gap-1 mb-3">
       {steps.map((step, i) => (
-        <div key={i} className="flex items-center gap-2 text-xs">
+        <div key={`${step.label}-${i}`} className="flex items-center gap-2 text-xs">
           {step.state === "done" ? (
             <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
           ) : step.state === "active" ? (
@@ -714,7 +714,7 @@ export function HookGenerationPanel({
             .filter((m) => m.role === "ai")
             .map((msg, i) => (
               <div
-                key={i}
+                key={`${msg.role}-${i}`}
                 className="text-xs text-muted-foreground bg-white/[0.02] rounded p-2 mb-2 max-h-[200px] overflow-y-auto"
               >
                 <MarkdownViewer content={msg.content} />
@@ -848,7 +848,7 @@ export function HookGenerationPanel({
           {writeResult.files_written.length > 0 && (
             <div className="mb-2">
               {writeResult.files_written.map((f, i) => (
-                <p key={i} className="text-[10px] text-muted-foreground">
+                <p key={`${f}-${i}`} className="text-[10px] text-muted-foreground">
                   + {f}
                 </p>
               ))}
@@ -858,7 +858,7 @@ export function HookGenerationPanel({
           {writeResult.warnings.length > 0 && (
             <div>
               {writeResult.warnings.map((w, i) => (
-                <p key={i} className="text-[10px] text-yellow-400/80">
+                <p key={`${w}-${i}`} className="text-[10px] text-yellow-400/80">
                   {w}
                 </p>
               ))}

@@ -403,7 +403,7 @@ export function ReflectionDashboard() {
                         <span className="text-xs font-medium">Recurring findings:</span>
                         <ul className="mt-0.5 text-xs text-muted-foreground list-disc list-inside">
                           {convergenceStatus.stall_findings.slice(0, 5).map((f, i) => (
-                            <li key={i}>{f}</li>
+                            <li key={`finding-${i}-${f.slice(0, 20)}`}>{f}</li>
                           ))}
                         </ul>
                       </div>

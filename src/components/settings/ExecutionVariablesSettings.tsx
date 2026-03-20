@@ -443,7 +443,7 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                 </div>
               ) : (
                 settings.customVariables.map((variable, index) => (
-                  <div key={index} className="p-3 bg-muted/30 rounded-lg space-y-3">
+                  <div key={`${variable.name}-${index}`} className="p-3 bg-muted/30 rounded-lg space-y-3">
                     <div className="flex items-start gap-2">
                       <div className="flex-1 space-y-3">
                         {/* Variable Name */}

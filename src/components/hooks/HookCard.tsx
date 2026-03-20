@@ -238,7 +238,7 @@ export function HookCard({
                 <h4 className="text-xs font-medium text-muted-foreground mb-2">Conditions</h4>
                 <div className="space-y-1">
                   {hook.conditions.map((condition, index) => (
-                    <div key={index} className="text-xs bg-muted/50 rounded px-2 py-1 font-mono">
+                    <div key={`${condition.variable}-${index}`} className="text-xs bg-muted/50 rounded px-2 py-1 font-mono">
                       {condition.variable} {condition.operator} {JSON.stringify(condition.value)}
                     </div>
                   ))}

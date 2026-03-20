@@ -60,7 +60,7 @@ export function HookConditionBuilder({ conditions, onChange }: HookConditionBuil
       ) : (
         <div className="space-y-2">
           {conditions.map((condition, index) => (
-            <div key={index} className="flex items-center gap-2 p-3 bg-muted/30 rounded-lg">
+            <div key={`${condition.variable}-${index}`} className="flex items-center gap-2 p-3 bg-muted/30 rounded-lg">
               {/* Variable selector */}
               <select
                 value={condition.variable}

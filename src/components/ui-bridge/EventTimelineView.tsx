@@ -312,6 +312,9 @@ export function EventTimelineView({
               <div
                 className="flex items-center gap-2 py-2 px-2 cursor-pointer hover:bg-muted/30 transition-colors"
                 onClick={() => toggleExpand(event.id)}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleExpand(event.id); }}}
+                role="button"
+                tabIndex={0}
               >
                 {/* Expand toggle */}
                 <button className="w-4 h-4 flex items-center justify-center">
@@ -362,7 +365,7 @@ export function EventTimelineView({
                 <div className="px-8 pb-2">
                   <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
                     {details.map(({ label, value }, i) => (
-                      <div key={i} className="contents">
+                      <div key={`${label}-${i}`} className="contents">
                         <span className="text-muted-foreground">{label}:</span>
                         <span className="font-mono">{value}</span>
                       </div>

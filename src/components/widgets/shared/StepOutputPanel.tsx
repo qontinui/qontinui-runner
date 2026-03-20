@@ -139,6 +139,9 @@ export function StepOutputPanel({
           collapsible && "cursor-pointer hover:bg-muted/50",
         )}
         onClick={collapsible ? () => setIsCollapsed(!isCollapsed) : undefined}
+        onKeyDown={collapsible ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setIsCollapsed(!isCollapsed); }} : undefined}
+        role={collapsible ? "button" : undefined}
+        tabIndex={collapsible ? 0 : undefined}
       >
         {headerContent}
       </div>
@@ -159,13 +162,13 @@ export function StepOutputPanel({
                   {/* Line numbers */}
                   <div className="pr-3 mr-3 border-r border-border/50 text-muted-foreground select-none flex-shrink-0">
                     {lines.map((_, i) => (
-                      <div key={i}>{i + 1}</div>
+                      <div key={`ln-${i}`}>{i + 1}</div>
                     ))}
                   </div>
                   {/* Content */}
                   <div className="flex-1 min-w-0 overflow-hidden">
                     {lines.map((line, i) => (
-                      <div key={i} className="break-all whitespace-pre-wrap">
+                      <div key={`line-${i}`} className="break-all whitespace-pre-wrap">
                         {line || " "}
                       </div>
                     ))}

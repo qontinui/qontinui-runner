@@ -89,7 +89,7 @@ export function PhaseDistributionPanel({ data, size }: CanvasPanelComponentProps
           {/* Segments */}
           {arcs.map((arc, idx) => (
             <circle
-              key={idx}
+              key={`arc-${idx}`}
               cx={center}
               cy={center}
               r={radius}
@@ -119,11 +119,11 @@ export function PhaseDistributionPanel({ data, size }: CanvasPanelComponentProps
 
       {/* Legend */}
       <div className={cn("flex flex-col gap-1.5 min-w-0", fontSize)}>
-        {segments.map((seg, idx) => (
-          <div key={idx} className="flex items-center gap-1.5">
+        {segments.map((seg, segIdx) => (
+          <div key={seg.phase} className="flex items-center gap-1.5">
             <span
               className="inline-block h-2.5 w-2.5 rounded-sm flex-shrink-0"
-              style={{ backgroundColor: getColor(seg, idx) }}
+              style={{ backgroundColor: getColor(seg, segIdx) }}
             />
             <span className="font-medium text-foreground truncate">{seg.phase}</span>
             <span className="text-muted-foreground font-mono">{seg.percentage.toFixed(0)}%</span>

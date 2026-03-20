@@ -377,7 +377,7 @@ function AgentDetailSidebar({ agent, agents, feedbackLoops, onClose }: AgentDeta
             <div className="flex flex-wrap gap-1">
               {agent.capabilities.map((cap, i) => (
                 <span
-                  key={i}
+                  key={`${cap}-${i}`}
                   className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted/50 text-zinc-300 border border-border/30"
                 >
                   {cap}
@@ -397,7 +397,7 @@ function AgentDetailSidebar({ agent, agents, feedbackLoops, onClose }: AgentDeta
             <div className="flex flex-wrap gap-1">
               {agent.decisionAuthority.map((auth, i) => (
                 <span
-                  key={i}
+                  key={`${auth}-${i}`}
                   className="text-[10px] px-1.5 py-0.5 rounded-full border"
                   style={{
                     background: "rgba(245,158,11,0.15)",
@@ -422,7 +422,7 @@ function AgentDetailSidebar({ agent, agents, feedbackLoops, onClose }: AgentDeta
             <div className="flex flex-wrap gap-1">
               {agent.triggers.map((trigger, i) => (
                 <span
-                  key={i}
+                  key={`${trigger}-${i}`}
                   className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted/50 text-zinc-300 border border-border/30"
                 >
                   {trigger}

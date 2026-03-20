@@ -147,7 +147,7 @@ export function RunDetailsSidebar({
             <div className="mt-2 space-y-1">
               {usage.phases.map((p, i) => (
                 <div
-                  key={i}
+                  key={`${p.phase}-${p.stage_index ?? ""}-${p.iteration ?? ""}-${i}`}
                   className="flex items-center justify-between text-[11px] text-muted-foreground"
                 >
                   <span className="capitalize truncate flex-1 min-w-0">

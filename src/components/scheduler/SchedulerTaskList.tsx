@@ -86,6 +86,9 @@ export function SchedulerTaskList({
           <div
             key={task.id}
             onClick={() => onSelectTask(isSelected ? null : task)}
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onSelectTask(isSelected ? null : task); }}
+            role="button"
+            tabIndex={0}
             className={`p-4 rounded-lg border cursor-pointer transition-all ${
               isSelected
                 ? "border-primary bg-primary/5"

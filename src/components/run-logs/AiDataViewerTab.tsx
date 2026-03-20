@@ -408,7 +408,7 @@ function ConsolidatedAiOutputDisplay({
         {chunks.length} chunks from {totalEntries} raw entries
       </div>
       {chunks.map((chunk, i) => (
-        <AiOutputChunkItem key={i} chunk={chunk} defaultExpanded={shouldDefaultExpand} />
+        <AiOutputChunkItem key={`chunk-${i}`} chunk={chunk} defaultExpanded={shouldDefaultExpand} />
       ))}
     </div>
   );
@@ -1084,7 +1084,7 @@ function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
                       </div>
                       <div className="space-y-1">
                         {extractions.map((ext, i) => (
-                          <div key={i} className="flex items-center gap-2 text-xs">
+                          <div key={`ext-${ext.variable_name}-${i}`} className="flex items-center gap-2 text-xs">
                             {ext.success ? (
                               <CheckCircle
                                 className={`w-3 h-3 ${getStatusColors("success").icon}`}
@@ -1109,7 +1109,7 @@ function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
                       </div>
                       <div className="space-y-1">
                         {assertions.map((a, i) => (
-                          <div key={i} className="flex items-center gap-2 text-xs flex-wrap">
+                          <div key={`assert-${a.type}-${i}`} className="flex items-center gap-2 text-xs flex-wrap">
                             {a.passed ? (
                               <CheckCircle
                                 className={`w-3 h-3 ${getStatusColors("success").icon}`}
@@ -1731,7 +1731,7 @@ function ApiRequestsSection() {
                       </div>
                       <div className="space-y-1">
                         {req.extractions.map((ext, i) => (
-                          <div key={i} className="flex items-center gap-2 text-xs">
+                          <div key={`reqext-${ext.variable_name}-${i}`} className="flex items-center gap-2 text-xs">
                             {ext.success ? (
                               <CheckCircle
                                 className={`w-3 h-3 ${getStatusColors("success").icon}`}
@@ -1754,7 +1754,7 @@ function ApiRequestsSection() {
                       </div>
                       <div className="space-y-1">
                         {req.assertions.map((a, i) => (
-                          <div key={i} className="flex items-center gap-2 text-xs">
+                          <div key={`reqassert-${a.assertion_type}-${i}`} className="flex items-center gap-2 text-xs">
                             {a.passed ? (
                               <CheckCircle
                                 className={`w-3 h-3 ${getStatusColors("success").icon}`}
@@ -2000,7 +2000,7 @@ function EventsSection() {
           <div className="border border-border rounded-lg overflow-hidden">
             <pre className="text-xs bg-background p-3 overflow-x-auto max-h-[500px] overflow-y-auto">
               {generalLogs.entries.map((entry, i) => (
-                <div key={i} className="py-1 border-b border-border/50 last:border-0">
+                <div key={`genlog-${i}`} className="py-1 border-b border-border/50 last:border-0">
                   {JSON.stringify(entry, null, 2)}
                 </div>
               ))}
@@ -2098,7 +2098,7 @@ function ImageRecognitionSection() {
         <div className="border border-border rounded-lg overflow-hidden">
           <pre className="text-xs bg-background p-3 overflow-x-auto max-h-[500px] overflow-y-auto">
             {jsonlLogs.entries.map((entry, i) => (
-              <div key={i} className="py-1 border-b border-border/50 last:border-0">
+              <div key={`imglog-${i}`} className="py-1 border-b border-border/50 last:border-0">
                 {JSON.stringify(entry, null, 2)}
               </div>
             ))}
@@ -2171,7 +2171,7 @@ function PlaywrightTestsSection() {
         <div className="border border-border rounded-lg overflow-hidden">
           <pre className="text-xs bg-background p-3 overflow-x-auto max-h-[500px] overflow-y-auto">
             {jsonlLogs.entries.map((entry, i) => (
-              <div key={i} className="py-1 border-b border-border/50 last:border-0">
+              <div key={`pwlog-${i}`} className="py-1 border-b border-border/50 last:border-0">
                 {JSON.stringify(entry, null, 2)}
               </div>
             ))}

@@ -485,7 +485,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
             </div>
             {(workflow.health_check_urls ?? []).map((hc, index) => (
               <HealthCheckUrlEditor
-                key={index}
+                key={`hc-${hc.url ?? ""}-${index}`}
                 healthCheck={hc}
                 onChange={(updated) => {
                   const urls = [...(workflow.health_check_urls ?? [])];
@@ -977,8 +977,11 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
     <div className="bg-zinc-800 rounded border border-zinc-700 overflow-hidden">
       {/* Collapsed view - clickable header */}
       <div
+        role="button"
+        tabIndex={0}
         className="flex items-center gap-2 p-2 cursor-pointer hover:bg-zinc-750 transition-colors"
         onClick={() => setIsExpanded(!isExpanded)}
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setIsExpanded(!isExpanded); }}
       >
         <button
           type="button"
@@ -2886,8 +2889,16 @@ function WorkflowBuilderContent({
 
           {/* Add Step Dropdown (fixed overlay, renders regardless of empty state) */}
           {dropdownOpen && (
-            <div className="fixed inset-0 z-40" onClick={() => setDropdownOpen(false)}>
+            <div
+              className="fixed inset-0 z-40"
+              role="button"
+              tabIndex={0}
+              aria-label="Close add step dropdown"
+              onClick={() => setDropdownOpen(false)}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setDropdownOpen(false); }}
+            >
               <div
+                role="presentation"
                 className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2"
                 onClick={(e) => e.stopPropagation()}
               >

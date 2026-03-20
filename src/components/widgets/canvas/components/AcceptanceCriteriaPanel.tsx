@@ -182,7 +182,7 @@ export function AcceptanceCriteriaPanel({ data, size }: CanvasPanelComponentProp
             Assumptions
           </span>
           {assumptions.map((a, i) => (
-            <p key={i} className="text-[10px] text-muted-foreground italic pl-2">
+            <p key={`assumption-${i}`} className="text-[10px] text-muted-foreground italic pl-2">
               {a}
             </p>
           ))}

@@ -684,7 +684,7 @@ export function ExplorationConfigDialog({
                       <div className="mt-2 space-y-1 max-h-24 overflow-y-auto">
                         {lastResult.errors.map((error, i) => (
                           <div
-                            key={i}
+                            key={`${error}-${i}`}
                             className="text-xs text-destructive bg-destructive/10 p-1.5 rounded"
                           >
                             {error}

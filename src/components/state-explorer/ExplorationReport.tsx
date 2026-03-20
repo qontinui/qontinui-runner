@@ -462,7 +462,7 @@ function StateExplorationCard({
             <div className="space-y-1">
               <h4 className="text-xs font-medium text-muted-foreground">Expected Elements</h4>
               {state.expected_elements_found.map((el, idx) => (
-                <div key={idx} className="flex items-center gap-2 text-xs">
+                <div key={`el-${idx}-${el.element}`} className="flex items-center gap-2 text-xs">
                   {el.found ? (
                     <CheckCircle className={`w-3 h-3 ${getStatusColors("success").icon}`} />
                   ) : (

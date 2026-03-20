@@ -384,6 +384,7 @@ pub enum PrimaryMetric {
     PassRate,
     MeanIterations,
     MeanDuration,
+    SpecCompliance,
 }
 
 /// Outcome of a single trial (one workflow run).
@@ -400,6 +401,15 @@ pub struct TrialResult {
     /// Which workflow was tested (for multi-workflow campaigns).
     #[serde(default)]
     pub workflow_id: Option<String>,
+    /// Spec compliance score (0.0-1.0) if this was a spec-generated workflow.
+    #[serde(default)]
+    pub spec_compliance_score: Option<f64>,
+    /// Number of spec assertions that passed.
+    #[serde(default)]
+    pub spec_assertions_passed: Option<u32>,
+    /// Total number of spec assertions.
+    #[serde(default)]
+    pub spec_assertions_total: Option<u32>,
 }
 
 /// Aggregate metrics across multiple trials.
@@ -409,6 +419,8 @@ pub struct AggregateMetrics {
     pub mean_iterations: f64,
     pub mean_duration_ms: f64,
     pub trial_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_spec_compliance: Option<f64>,
 }
 
 /// Full result of one experiment (one config tested, possibly multiple trials).

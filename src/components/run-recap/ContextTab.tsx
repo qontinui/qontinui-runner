@@ -86,7 +86,7 @@ export function ContextTab({ taskRunId }: ContextTabProps) {
               </thead>
               <tbody className="divide-y divide-border">
                 {variables.map((variable, i) => (
-                  <tr key={i} className="hover:bg-muted/30">
+                  <tr key={`${variable.name}-${i}`} className="hover:bg-muted/30">
                     <td className="px-4 py-2 font-mono text-primary">{variable.name}</td>
                     <td
                       className="px-4 py-2 font-mono text-foreground/80 max-w-xs truncate"

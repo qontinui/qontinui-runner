@@ -65,7 +65,7 @@ export function WaffleChartPanel({ data, size }: CanvasPanelComponentProps) {
 
           return (
             <div
-              key={idx}
+              key={`${cell.label}-${idx}`}
               className={cn("rounded-sm", cellSize, isRunning && "animate-pulse")}
               style={{ backgroundColor: color }}
               title={cell.label}

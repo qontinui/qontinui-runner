@@ -87,8 +87,8 @@ export function AiConversationSummary({
       <ScrollArea className="h-[400px] w-full">
         <div className="space-y-2 pr-2">
           {recentEntries.length > 0 ? (
-            recentEntries.map((entry, idx) => (
-              <div key={idx} className="text-xs text-muted-foreground">
+            recentEntries.map((entry) => (
+              <div key={entry.id} className="text-xs text-muted-foreground">
                 <span className="whitespace-pre-wrap break-words">
                   {entry.line.slice(0, 500)}
                   {entry.line.length > 500 ? "..." : ""}

@@ -255,7 +255,7 @@ function ScreenshotsGrid({ screenshots }: { screenshots: string[] }) {
           const imageSrc = convertFileSrc(path);
           return (
             <div
-              key={idx}
+              key={path}
               className="aspect-video bg-muted rounded border border-border overflow-hidden"
             >
               <img

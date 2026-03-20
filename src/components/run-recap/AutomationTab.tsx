@@ -146,7 +146,7 @@ export function AutomationTab({ taskRunId: _taskRunId, stats }: AutomationTabPro
           <div className="grid grid-cols-4 gap-2">
             {screenshots.map((screenshot, i) => (
               <button
-                key={i}
+                key={`${screenshot.path}-${i}`}
                 onClick={() => setSelectedScreenshot(screenshot.path)}
                 className="aspect-video bg-muted rounded overflow-hidden hover:ring-2 ring-primary transition-all"
               >
@@ -168,6 +168,10 @@ export function AutomationTab({ taskRunId: _taskRunId, stats }: AutomationTabPro
         <div
           className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-8"
           onClick={() => setSelectedScreenshot(null)}
+          onKeyDown={(e) => { if (e.key === "Escape") setSelectedScreenshot(null); }}
+          role="button"
+          tabIndex={0}
+          aria-label="Close screenshot preview"
         >
           <img
             src={selectedScreenshot}

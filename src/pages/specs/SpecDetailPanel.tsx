@@ -597,7 +597,7 @@ function SetupActionsEditor({
 
             return (
               <div
-                key={i}
+                key={`${action.type}-${i}`}
                 className="flex items-center gap-2 px-2 py-1 rounded border border-white/5 bg-white/[0.02] text-xs"
               >
                 <span className="text-[10px] text-muted-foreground/40 w-4 text-right">{i + 1}</span>

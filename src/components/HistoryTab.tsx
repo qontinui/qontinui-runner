@@ -478,6 +478,9 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
                     selectedRuns.has(run.id) ? "ring-2 ring-primary" : ""
                   }`}
                   onClick={() => toggleSelection(run.id)}
+                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") toggleSelection(run.id); }}
+                  role="button"
+                  tabIndex={0}
                 >
                   {/* Type indicator */}
                   <div
@@ -570,6 +573,9 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
                   selectedRuns.has(run.id) ? "ring-2 ring-primary" : ""
                 }`}
                 onClick={() => toggleSelection(run.id)}
+                onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") toggleSelection(run.id); }}
+                role="button"
+                tabIndex={0}
               >
                 {/* Type indicator */}
                 <div

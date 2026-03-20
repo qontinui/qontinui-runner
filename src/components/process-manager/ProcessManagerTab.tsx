@@ -525,6 +525,9 @@ Be concise and actionable.`;
               <div
                 key={proc.id}
                 onClick={() => setSelectedId(selectedId === proc.id ? null : proc.id)}
+                onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setSelectedId(selectedId === proc.id ? null : proc.id); }}
+                role="button"
+                tabIndex={0}
                 className={cn(
                   "flex items-center gap-3 px-4 py-2.5 cursor-pointer border-b border-white/5 hover:bg-white/5 transition-colors",
                   selectedId === proc.id && "bg-white/5 border-l-2 border-l-cyan-500",

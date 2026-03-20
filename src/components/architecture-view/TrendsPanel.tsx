@@ -166,7 +166,7 @@ export function TrendsPanel({ workflowName, selectedComponent }: TrendsPanelProp
           )}
         </div>
         {expanded && (
-          <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+          <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()} role="group">
             {TREND_TIME_RANGES.map((r) => (
               <button
                 key={r}

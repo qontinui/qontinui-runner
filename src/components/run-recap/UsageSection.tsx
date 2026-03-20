@@ -58,7 +58,7 @@ export function UsageSection({ taskRunId }: { taskRunId: string }) {
           </thead>
           <tbody>
             {data.phases.map((p, i) => (
-              <tr key={i} className="text-zinc-300 border-t border-zinc-700/50">
+              <tr key={`${p.phase}-${p.stage_index ?? ""}-${p.iteration ?? ""}-${i}`} className="text-zinc-300 border-t border-zinc-700/50">
                 <td className="py-1 pr-3">
                   <span className="capitalize">{p.phase}</span>
                   {p.stage_index != null && (

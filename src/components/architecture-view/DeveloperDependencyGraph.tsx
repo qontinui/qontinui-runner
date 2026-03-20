@@ -322,7 +322,7 @@ function DetailSidebar({ feature, depsOut, depsIn, onClose }: DetailSidebarProps
             <div className="space-y-0.5">
               {feature.entryPoints.map((ep, i) => (
                 <div
-                  key={i}
+                  key={`${ep}-${i}`}
                   className="text-[11px] font-mono text-zinc-400 bg-muted/30 rounded px-1.5 py-0.5 truncate"
                   title={ep}
                 >
@@ -342,7 +342,7 @@ function DetailSidebar({ feature, depsOut, depsIn, onClose }: DetailSidebarProps
             <div className="flex flex-wrap gap-1">
               {feature.techUsed.map((tech, i) => (
                 <span
-                  key={i}
+                  key={`${tech}-${i}`}
                   className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted/50 text-zinc-300 border border-border/30"
                 >
                   {tech}

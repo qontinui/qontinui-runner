@@ -3162,3 +3162,45 @@ CREATE INDEX IF NOT EXISTS idx_comparison_runs_workflow ON comparison_runs(workf
 CREATE INDEX IF NOT EXISTS idx_comparison_runs_status ON comparison_runs(status);
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (122, datetime('now'));
+
+-- =============================================================================
+-- Spec Experimentation Tables (migration 123)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS spec_compliance_results (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    spec_id TEXT,
+    iteration INTEGER NOT NULL,
+    overall_score REAL NOT NULL,
+    raw_pass_rate REAL NOT NULL,
+    critical_passed INTEGER NOT NULL DEFAULT 0,
+    critical_total INTEGER NOT NULL DEFAULT 0,
+    warning_passed INTEGER NOT NULL DEFAULT 0,
+    warning_total INTEGER NOT NULL DEFAULT 0,
+    info_passed INTEGER NOT NULL DEFAULT 0,
+    info_total INTEGER NOT NULL DEFAULT 0,
+    assertions_passed INTEGER NOT NULL,
+    assertions_total INTEGER NOT NULL,
+    group_scores_json TEXT NOT NULL DEFAULT '[]',
+    assertion_details_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_spec_compliance_task ON spec_compliance_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_spec_compliance_score ON spec_compliance_results(overall_score);
+CREATE INDEX IF NOT EXISTS idx_spec_compliance_spec ON spec_compliance_results(spec_id);
+
+CREATE TABLE IF NOT EXISTS spec_accuracy_results (
+    id TEXT PRIMARY KEY,
+    spec_id TEXT NOT NULL,
+    analysis_type TEXT NOT NULL,
+    score REAL NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_spec_accuracy_spec ON spec_accuracy_results(spec_id);
+CREATE INDEX IF NOT EXISTS idx_spec_accuracy_type ON spec_accuracy_results(analysis_type);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (123, datetime('now'));

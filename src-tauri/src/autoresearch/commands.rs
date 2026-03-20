@@ -283,6 +283,7 @@ pub async fn compare_autoresearch_campaigns(
                             mean_iterations: 0.0,
                             mean_duration_ms: 0.0,
                             trial_count: 0,
+                            mean_spec_compliance: None,
                         });
                     // We only need the aggregate for comparison; construct a minimal ExperimentResult
                     let config: super::types::ExperimentConfig =

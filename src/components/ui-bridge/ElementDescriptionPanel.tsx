@@ -884,7 +884,7 @@ export function ElementDescriptionPanel({
                   <span className="text-xs text-muted-foreground">Main Actions:</span>
                   <div className="flex flex-wrap gap-1 mt-1">
                     {pageSummary.mainActions.map((action, i) => (
-                      <Badge key={i} variant="outline" className="text-xs">
+                      <Badge key={`${action}-${i}`} variant="outline" className="text-xs">
                         {action}
                       </Badge>
                     ))}
@@ -953,7 +953,7 @@ export function ElementDescriptionPanel({
                     <div className="flex flex-wrap gap-1 mt-1">
                       {selectedDescription.aliases.map((alias, i) => (
                         <button
-                          key={i}
+                          key={`${alias}-${i}`}
                           className="group flex items-center gap-1 px-2 py-0.5 text-xs bg-muted/30 hover:bg-muted/50 rounded transition-colors"
                           onClick={() => handleCopyAlias(alias)}
                           title="Click to copy"
@@ -977,7 +977,7 @@ export function ElementDescriptionPanel({
                     <span className="text-xs text-muted-foreground">Suggested Actions:</span>
                     <div className="flex flex-wrap gap-1 mt-1">
                       {selectedDescription.suggestedActions.map((action, i) => (
-                        <Badge key={i} variant="outline" className="text-xs">
+                        <Badge key={`${action}-${i}`} variant="outline" className="text-xs">
                           <Zap className="w-3 h-3 mr-1" />
                           {action}
                         </Badge>
@@ -1078,7 +1078,7 @@ export function ElementDescriptionPanel({
             <div className="mt-2 p-3 bg-muted/10 rounded-lg border border-border/30 space-y-2">
               {elementSelectors.map((selectorResult, index) => (
                 <div
-                  key={index}
+                  key={`${selectorResult.type}-${index}`}
                   className="group flex items-start gap-2 p-2 bg-muted/20 rounded-md hover:bg-muted/30 transition-colors"
                 >
                   <div className="flex-1 min-w-0">
@@ -1258,7 +1258,7 @@ export function ElementDescriptionPanel({
                   </span>
                   <div className="flex flex-wrap items-center gap-1">
                     {domContext.path.map((segment: PathSegment, index: number) => (
-                      <span key={index} className="flex items-center gap-1">
+                      <span key={`${segment.elementId ?? segment.tagName}-${index}`} className="flex items-center gap-1">
                         {index > 0 && <ArrowRight className="w-3 h-3 text-muted-foreground/50" />}
                         {segment.elementId ? (
                           <button

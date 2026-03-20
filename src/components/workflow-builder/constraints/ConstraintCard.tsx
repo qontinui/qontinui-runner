@@ -355,7 +355,7 @@ function FileScopeEditor({
       <label className="block text-[10px] font-medium text-zinc-500 mb-1">Allowed Paths</label>
       <div className="space-y-1.5">
         {allowedPaths.map((path, index) => (
-          <div key={index} className="flex items-center gap-1.5">
+          <div key={`path-${path}-${index}`} className="flex items-center gap-1.5">
             <input
               type="text"
               value={path}

@@ -145,6 +145,10 @@ export function SpotlightOverlay({
     <div
       className={cn("fixed inset-0 z-tutorial-spotlight", "pointer-events-auto tutorial-fade-in")}
       onClick={handleOverlayClick}
+      onKeyDown={(e) => { if (e.key === "Escape" && !allowClickThrough) { e.stopPropagation(); onOverlayClick?.(); } }}
+      role="button"
+      tabIndex={allowClickThrough ? -1 : 0}
+      aria-label="Tutorial overlay"
       style={{ pointerEvents: allowClickThrough ? "none" : "auto" }}
     >
       <svg

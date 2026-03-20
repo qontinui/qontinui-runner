@@ -304,7 +304,14 @@ export function AddStateStepsModal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <div
+        role="button"
+        tabIndex={0}
+        aria-label="Close modal"
+        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+        onClick={onClose}
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onClose(); }}
+      />
 
       {/* Modal */}
       <div className="relative w-full max-w-2xl max-h-[85vh] bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl flex flex-col">
@@ -404,10 +411,13 @@ export function AddStateStepsModal({
                       >
                         {/* State row */}
                         <div
+                          role="button"
+                          tabIndex={0}
                           className={`flex items-center gap-3 px-3 py-2 cursor-pointer transition-colors ${
                             isSelected ? "bg-purple-500/20" : "hover:bg-zinc-800"
                           }`}
                           onClick={() => setSelectedStateId(state.id)}
+                          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setSelectedStateId(state.id); }}
                         >
                           {/* Expand button */}
                           <button
@@ -675,7 +685,7 @@ export function AddStateStepsModal({
                   <div className="p-3 bg-zinc-800/30 border border-zinc-700 rounded-lg space-y-2 max-h-40 overflow-y-auto">
                     {addVerificationSteps &&
                       preview.verificationSteps.map((step, i) => (
-                        <div key={i} className="flex items-center gap-2 text-sm text-zinc-400">
+                        <div key={`vstep-${step.name ?? i}`} className="flex items-center gap-2 text-sm text-zinc-400">
                           <span className="w-5 h-5 rounded bg-green-500/20 text-green-400 flex items-center justify-center text-xs">
                             V
                           </span>

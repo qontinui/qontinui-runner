@@ -2515,7 +2515,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                                 className={`text-sm ${getAccentColors("amber").text} list-disc list-inside space-y-1`}
                               >
                                 {coverageWarnings.map((warning, i) => (
-                                  <li key={i}>{warning}</li>
+                                  <li key={`warning-${i}-${warning.slice(0, 20)}`}>{warning}</li>
                                 ))}
                               </ul>
                               <button

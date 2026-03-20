@@ -118,6 +118,9 @@ export function PromptRegistryTab() {
                       <div
                         className="flex items-center gap-3 px-4 py-2 cursor-pointer hover:bg-zinc-800/50"
                         onClick={() => setExpanded(expanded === v.id ? null : v.id)}
+                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(expanded === v.id ? null : v.id); }}}
+                        role="button"
+                        tabIndex={0}
                       >
                         {v.is_active && (
                           <span className="text-xs px-2 py-0.5 rounded bg-green-900/30 text-green-400">

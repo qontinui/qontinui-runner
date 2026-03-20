@@ -38,7 +38,7 @@ function LayoutThumbnail({ layout, isActive }: { layout: LayoutPreset; isActive:
     <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
       {rects.map((r, i) => (
         <rect
-          key={i}
+          key={`rect-${i}`}
           x={r.x}
           y={r.y}
           width={r.w}

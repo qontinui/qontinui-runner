@@ -69,6 +69,9 @@ export function ElementPicker({ elements, onPick, onCancel }: ElementPickerProps
         style={{ background: "transparent" }}
         onMouseMove={handleMouseMove}
         onClick={handleClick}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleClick(e as any); }}}
+        role="button"
+        tabIndex={0}
       />
       {hoveredEl && (
         <div

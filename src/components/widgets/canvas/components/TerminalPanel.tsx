@@ -34,7 +34,7 @@ export function TerminalPanel({ data, size }: CanvasPanelComponentProps) {
         )}
       >
         {displayLines.map((line, idx) => (
-          <div key={idx} className="whitespace-pre-wrap break-all">
+          <div key={`line-${idx}`} className="whitespace-pre-wrap break-all">
             {line}
           </div>
         ))}

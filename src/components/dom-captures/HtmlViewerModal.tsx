@@ -197,7 +197,7 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
               {showLineNumbers && (
                 <div className="flex-shrink-0 select-none text-right pr-4 py-4 text-xs text-muted-foreground bg-[#1a1a1a] border-r border-border">
                   {filteredLines.map((_, i) => (
-                    <div key={i} className="px-2 leading-5">
+                    <div key={`ln-${i}`} className="px-2 leading-5">
                       {searchQuery ? i + 1 : i + 1}
                     </div>
                   ))}
@@ -211,7 +211,7 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
               >
                 {filteredLines.map((line, i) => (
                   <div
-                    key={i}
+                    key={`code-${i}`}
                     dangerouslySetInnerHTML={{ __html: highlightHtml(line) }}
                     className={
                       searchQuery && line.toLowerCase().includes(searchQuery.toLowerCase())

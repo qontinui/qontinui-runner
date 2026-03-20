@@ -180,6 +180,9 @@ function CheckStepRow({
               : "border-transparent hover:bg-muted/30",
         )}
         onClick={onToggle}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(); }}}
+        role="button"
+        tabIndex={0}
       >
         {/* Expand/collapse indicator */}
         <div className="flex-shrink-0 text-muted-foreground">

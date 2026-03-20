@@ -88,7 +88,11 @@ export function KeyboardShortcutsOverlay({ onClose }: { onClose: () => void }) {
     <div
       ref={overlayRef}
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      role="button"
+      tabIndex={0}
+      aria-label="Close keyboard shortcuts overlay"
       onClick={handleBackdropClick}
+      onKeyDown={(e) => { if ((e.key === "Enter" || e.key === " ") && e.target === overlayRef.current) onClose(); }}
     >
       <div className="bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-2xl w-[520px] max-h-[80vh] overflow-auto">
         {/* Header */}

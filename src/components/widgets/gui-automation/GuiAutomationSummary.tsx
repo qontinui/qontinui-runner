@@ -106,10 +106,14 @@ function ScreenshotThumbnail({ screenshot }: { screenshot: ScreenshotInfo | unde
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80"
           onClick={() => setShowPopup(false)}
+          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ' || e.key === 'Escape') { e.preventDefault(); setShowPopup(false); }}}
+          role="button"
+          tabIndex={0}
         >
           <div
             className="relative max-w-[90vw] max-h-[90vh] bg-background rounded-lg overflow-hidden shadow-2xl"
             onClick={(e) => e.stopPropagation()}
+            role="presentation"
           >
             {/* Close button */}
             <button

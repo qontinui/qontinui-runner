@@ -239,7 +239,7 @@ export function TerminalFindingsPanel({
                         </div>
                         {selected.pendingQuestion.options.map((opt, i) => (
                           <button
-                            key={i}
+                            key={`opt-${opt.label}-${i}`}
                             onClick={() => onRespond?.(selected.id, opt.label)}
                             className="flex items-start gap-2 text-xs text-[#a9b1d6] bg-[#1a1b26] rounded px-2.5 py-1.5 hover:bg-[#2a2d3d] cursor-pointer w-full text-left transition-colors"
                           >

@@ -290,7 +290,7 @@ export function AutoresearchDashboard() {
               <span className="text-zinc-500">Trials ({selectedResult.trials.length}):</span>
               <div className="mt-1 space-y-1">
                 {selectedResult.trials.map((t, i) => (
-                  <div key={i} className="flex gap-2">
+                  <div key={`trial-${i}`} className="flex gap-2">
                     <span className={t.passed ? "text-green-400" : "text-red-400"}>
                       {t.passed ? "PASS" : "FAIL"}
                     </span>

@@ -86,6 +86,7 @@ mod semantic_conventions;
 mod settings;
 mod skills;
 mod slash_commands;
+mod spec_experimentation;
 mod spec_utils;
 mod state_explorer;
 mod state_machine_configs;
@@ -1222,6 +1223,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::comparison::start_comparison,
             commands::comparison::get_comparison_status,
             commands::comparison::list_comparisons,
+            // Spec experimentation commands
+            spec_experimentation::commands::get_spec_compliance_history,
+            spec_experimentation::commands::get_spec_compliance_summary,
+            spec_experimentation::commands::extract_spec_compliance,
+            spec_experimentation::commands::analyze_spec_element_coverage,
+            spec_experimentation::commands::analyze_cross_page_consistency,
+            spec_experimentation::commands::run_spec_mutation_test,
+            spec_experimentation::commands::analyze_spec_freshness,
+            spec_experimentation::commands::get_spec_accuracy_results,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

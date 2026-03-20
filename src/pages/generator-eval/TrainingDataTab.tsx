@@ -1,4 +1,4 @@
-import { useState } from "react";
+import React, { useState } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
 import { fetchApi, type TrainingExample } from "./types";
 
@@ -146,9 +146,8 @@ export function TrainingDataTab() {
               </thead>
               <tbody>
                 {data.map((example, i) => (
-                  <>
+                  <React.Fragment key={`${example.artifact_id}-${i}`}>
                     <tr
-                      key={i}
                       className="border-t border-border hover:bg-muted/20 cursor-pointer"
                       onClick={() => setExpandedRow(expandedRow === i ? null : i)}
                     >
@@ -171,7 +170,7 @@ export function TrainingDataTab() {
                       </td>
                     </tr>
                     {expandedRow === i && (
-                      <tr key={`${i}-expanded`} className="border-t border-border/50">
+                      <tr className="border-t border-border/50">
                         <td colSpan={5} className="px-3 py-2 bg-muted/10">
                           <div className="space-y-2">
                             <div>
@@ -194,7 +193,7 @@ export function TrainingDataTab() {
                         </td>
                       </tr>
                     )}
-                  </>
+                  </React.Fragment>
                 ))}
               </tbody>
             </table>

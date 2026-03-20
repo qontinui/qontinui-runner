@@ -276,7 +276,7 @@ export function PanelCard({ panel, isExpanded, onToggle, onMaximize, readOnly }:
         )}
 
         {/* Action buttons */}
-        <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-0.5" role="presentation">
           <CopyPanelButton panel={panel} />
           {onMaximize && (
             <button

@@ -142,7 +142,7 @@ function ConsoleErrorsList({
       <div className="space-y-1">
         {errors.slice(0, 15).map((err, i) => (
           <div
-            key={i}
+            key={`err-${err.type}-${i}`}
             className={`text-xs p-2 rounded flex items-start gap-2 ${
               err.type === "warn" ? "bg-amber-500/10 text-amber-400" : "bg-red-500/10 text-red-400"
             }`}

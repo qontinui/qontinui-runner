@@ -41,7 +41,14 @@ export function BatchDeleteDialog({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/50" onClick={isDeleting ? undefined : onClose} />
+      <div
+        className="absolute inset-0 bg-black/50"
+        onClick={isDeleting ? undefined : onClose}
+        onKeyDown={(e) => { if (e.key === "Escape" && !isDeleting) onClose(); }}
+        role="button"
+        tabIndex={-1}
+        aria-label="Close dialog"
+      />
 
       {/* Dialog */}
       <div className="relative bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden">
@@ -72,7 +79,7 @@ export function BatchDeleteDialog({
             <div className="max-h-40 overflow-y-auto bg-zinc-800 rounded-md border border-zinc-700">
               <ul className="divide-y divide-zinc-700">
                 {itemNames.map((name, index) => (
-                  <li key={index} className="px-3 py-2 text-sm text-zinc-300 truncate">
+                  <li key={`${name}-${index}`} className="px-3 py-2 text-sm text-zinc-300 truncate">
                     {name}
                   </li>
                 ))}

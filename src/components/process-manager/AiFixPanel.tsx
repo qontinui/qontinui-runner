@@ -111,13 +111,13 @@ export function AiFixPanel({
         {visibleMessages.map((msg, i) =>
           msg.role === "ai" ? (
             <div
-              key={i}
+              key={`ai-${i}`}
               className="prose prose-invert prose-sm max-w-none text-xs [&_pre]:bg-black/30 [&_pre]:rounded-md [&_pre]:p-2 [&_pre]:overflow-x-auto [&_code]:text-amber-300 [&_code]:text-xs [&_a]:text-cyan-400 [&_h1]:text-sm [&_h2]:text-sm [&_h3]:text-xs [&_p]:text-xs [&_li]:text-xs [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1"
             >
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
             </div>
           ) : (
-            <div key={i} className="flex justify-end">
+            <div key={`user-${i}`} className="flex justify-end">
               <div className="max-w-[85%] rounded-md px-3 py-1.5 bg-cyan-900/30 border border-cyan-700/30 text-xs text-zinc-300">
                 {msg.content}
               </div>

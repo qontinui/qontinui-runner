@@ -68,6 +68,9 @@ export function RegressionAlertBanner() {
         <div
           className="flex items-center gap-2 cursor-pointer flex-1"
           onClick={() => setExpanded(!expanded)}
+          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(!expanded); }}}
+          role="button"
+          tabIndex={0}
         >
           <span className="text-red-400 font-medium text-sm">
             {regressions.length} applied recommendation(s) show regression

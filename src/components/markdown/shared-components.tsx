@@ -151,7 +151,7 @@ export function SyntaxHighlightedCodeBlock({ code, language }: { code: string; l
             style={{ ...style, backgroundColor: "hsl(var(--muted) / 0.5)" }}
           >
             {tokens.map((line, i) => (
-              <div key={i} {...getLineProps({ line })} className="table-row">
+              <div key={`line-${i}`} {...getLineProps({ line })} className="table-row">
                 <span className="table-cell pr-4 text-muted-foreground/50 select-none text-right w-8">
                   {i + 1}
                 </span>

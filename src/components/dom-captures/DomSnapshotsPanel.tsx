@@ -262,6 +262,17 @@ export function DomSnapshotsPanel({ taskRunId }: Props) {
                       setExpandedId(expandedId === capture.id ? null : capture.id);
                     }
                   }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      if (compareMode) {
+                        handleCompareSelect(capture);
+                      } else {
+                        setExpandedId(expandedId === capture.id ? null : capture.id);
+                      }
+                    }
+                  }}
+                  role="button"
+                  tabIndex={0}
                 >
                   {compareMode ? (
                     <div

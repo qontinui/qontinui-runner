@@ -378,7 +378,7 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                                 };
                                 return (
                                   <div
-                                    key={idx}
+                                    key={`match-${idx}-${typedMatch.location.x}-${typedMatch.location.y}`}
                                     className="text-xs font-mono bg-muted/20 p-2 rounded border border-border"
                                   >
                                     <span className="text-muted-foreground">{idx + 1}.</span> [
@@ -768,6 +768,9 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                             alt="Action screenshot"
                             className="w-full max-w-md rounded-lg border border-border cursor-pointer hover:opacity-90 transition-opacity"
                             onClick={() => setScreenshotViewerOpen(true)}
+                            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setScreenshotViewerOpen(true); }}
+                            role="button"
+                            tabIndex={0}
                           />
                           <button
                             onClick={() => setScreenshotViewerOpen(true)}

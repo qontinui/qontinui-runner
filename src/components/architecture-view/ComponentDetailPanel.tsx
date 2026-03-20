@@ -125,7 +125,7 @@ export function ComponentDetailPanel({ details, loading }: Props) {
           </div>
           <div className="space-y-0.5">
             {details.impacts.map((entry: ImpactEntry, i: number) => (
-              <ImpactRow key={i} entry={entry} />
+              <ImpactRow key={`${entry.component_path}-${i}`} entry={entry} />
             ))}
           </div>
         </div>
@@ -140,7 +140,7 @@ export function ComponentDetailPanel({ details, loading }: Props) {
           </div>
           <div className="space-y-0.5">
             {details.impacted_by.map((entry: ImpactEntry, i: number) => (
-              <ImpactRow key={i} entry={entry} />
+              <ImpactRow key={`${entry.component_path}-${i}`} entry={entry} />
             ))}
           </div>
         </div>

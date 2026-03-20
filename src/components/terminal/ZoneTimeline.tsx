@@ -189,7 +189,7 @@ export function ZoneTimeline({
                     if (widthPct <= 0) return null;
                     return (
                       <div
-                        key={i}
+                        key={`seg-${seg.state}-${i}`}
                         className="h-full"
                         style={{
                           width: `${widthPct}%`,

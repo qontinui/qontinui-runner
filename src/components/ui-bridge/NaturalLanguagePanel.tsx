@@ -1363,7 +1363,7 @@ export function NaturalLanguagePanel({
             <div className="space-y-1">
               {EXAMPLE_COMMANDS.map((example, i) => (
                 <button
-                  key={i}
+                  key={`${example}-${i}`}
                   className="w-full p-2 text-left text-sm bg-muted/10 hover:bg-muted/20 rounded transition-colors"
                   onClick={() => handleLoadExample(example)}
                 >

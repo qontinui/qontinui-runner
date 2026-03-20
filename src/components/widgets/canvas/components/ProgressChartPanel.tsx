@@ -51,7 +51,7 @@ export function ProgressChartPanel({ data, size }: CanvasPanelComponentProps) {
 
           return (
             <div
-              key={idx}
+              key={`bar-${segment.label}`}
               className={cn("h-full transition-all", !isCustomColor && bgClass)}
               style={{
                 width: `${pct}%`,
@@ -70,7 +70,7 @@ export function ProgressChartPanel({ data, size }: CanvasPanelComponentProps) {
           const isCustomColor = segment.color && !segment.color.startsWith("bg-");
 
           return (
-            <div key={idx} className="flex items-center gap-1.5">
+            <div key={`legend-${segment.label}`} className="flex items-center gap-1.5">
               <div
                 className={cn("h-2.5 w-2.5 rounded-sm flex-shrink-0", !isCustomColor && bgClass)}
                 style={isCustomColor ? { backgroundColor: segment.color } : undefined}

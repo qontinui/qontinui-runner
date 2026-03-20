@@ -520,7 +520,7 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
               </h4>
               <div className="space-y-2">
                 {test.check_results.map((check, idx) => (
-                  <CheckResultCard key={idx} check={check} />
+                  <CheckResultCard key={`${check.name || "check"}-${idx}`} check={check} />
                 ))}
               </div>
             </div>
@@ -701,7 +701,7 @@ function CheckResultCard({ check }: CheckResultCardProps) {
               </h5>
               <div className="space-y-1 max-h-60 overflow-y-auto">
                 {check.issues.map((issue, idx) => (
-                  <IssueRow key={idx} issue={issue} />
+                  <IssueRow key={`${issue.message?.slice(0, 20) || "issue"}-${idx}`} issue={issue} />
                 ))}
               </div>
             </div>

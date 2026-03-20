@@ -62,11 +62,11 @@ function renderHighlightedLabel(label: string, indices: number[]): ReactNode {
   const indexSet = new Set(indices);
   return label.split("").map((char, i) =>
     indexSet.has(i) ? (
-      <span key={i} className="text-[#7aa2f7] font-medium">
+      <span key={`hl-${i}`} className="text-[#7aa2f7] font-medium">
         {char}
       </span>
     ) : (
-      <span key={i}>{char}</span>
+      <span key={`ch-${i}`}>{char}</span>
     ),
   );
 }
@@ -509,8 +509,14 @@ export function CommandPalette({
   return (
     <div
       className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh] bg-black/50 backdrop-blur-sm"
+      role="button"
+      tabIndex={0}
+      aria-label="Close command palette"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
+      }}
+      onKeyDown={(e) => {
+        if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) onClose();
       }}
     >
       <div className="bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-2xl w-[440px] max-h-[60vh] flex flex-col overflow-hidden">
@@ -541,8 +547,11 @@ export function CommandPalette({
               {filtered.map((action, i) => (
                 <div
                   key={action.id}
+                  role="button"
+                  tabIndex={0}
                   onClick={() => executeAction(action)}
                   onMouseEnter={() => setSelectedIndex(i)}
+                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") executeAction(action); }}
                   className={`flex items-center justify-between px-4 py-1.5 cursor-pointer transition-colors ${
                     i === selectedIndex
                       ? "bg-[#7aa2f7]/15 text-[#c0caf5]"

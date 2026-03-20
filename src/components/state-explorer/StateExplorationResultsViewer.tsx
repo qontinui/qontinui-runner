@@ -701,7 +701,7 @@ function DiscrepancySeverityGroup({
       </div>
       <div className="space-y-2">
         {items.map((item, idx) => (
-          <div key={idx} className="p-2 bg-background rounded text-sm">
+          <div key={`item-${idx}-${item.description.slice(0, 20)}`} className="p-2 bg-background rounded text-sm">
             <div className="text-foreground">{item.description}</div>
             {item.suggested_action && (
               <div className="mt-1 text-xs text-muted-foreground">
@@ -740,7 +740,7 @@ function ScreenshotFilmstrip({
     >
       {screenshots.map((shot, idx) => (
         <button
-          key={idx}
+          key={`shot-${idx}-${shot.label}`}
           onClick={() => onSelect(idx)}
           role="option"
           aria-selected={idx === selectedIndex}
@@ -829,7 +829,7 @@ function StateDetailCard({
             <div className="space-y-1">
               <h4 className="text-xs font-medium text-muted-foreground">Found/Missing Elements</h4>
               {state.expected_elements_found.map((el, idx) => (
-                <div key={idx} className="flex items-center gap-2 text-xs">
+                <div key={`el-${idx}-${el.element}`} className="flex items-center gap-2 text-xs">
                   {el.found ? (
                     <CheckCircle className="w-3 h-3 text-green-400" />
                   ) : (

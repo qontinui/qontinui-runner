@@ -244,7 +244,7 @@ function UnifiedDiffView({ diffResult, showOnlyChanges }: DiffViewProps) {
             return (
               <div key={partIndex} className="text-muted-foreground">
                 {contextLines.map((line, i) => (
-                  <div key={i} className="px-4 py-0.5 hover:bg-muted/50">
+                  <div key={`ctx-${i}`} className="px-4 py-0.5 hover:bg-muted/50">
                     <span className="inline-block w-12 text-muted-foreground/50 text-right mr-4 select-none">
                       {i === 3 ? "" : ""}
                     </span>
@@ -379,7 +379,7 @@ function SplitDiffView({ diffResult, showOnlyChanges }: DiffViewProps) {
           const textClass = left.type === "removed" ? "text-red-300" : "text-foreground";
 
           return (
-            <div key={index} className={`px-4 py-0.5 hover:bg-muted/50 ${bgClass} min-h-[1.5rem]`}>
+            <div key={`left-${index}`} className={`px-4 py-0.5 hover:bg-muted/50 ${bgClass} min-h-[1.5rem]`}>
               <span className="inline-block w-8 text-muted-foreground/50 text-right mr-4 select-none">
                 {left.type !== "empty" ? index + 1 : ""}
               </span>
@@ -402,7 +402,7 @@ function SplitDiffView({ diffResult, showOnlyChanges }: DiffViewProps) {
           const textClass = right.type === "added" ? "text-green-300" : "text-foreground";
 
           return (
-            <div key={index} className={`px-4 py-0.5 hover:bg-muted/50 ${bgClass} min-h-[1.5rem]`}>
+            <div key={`right-${index}`} className={`px-4 py-0.5 hover:bg-muted/50 ${bgClass} min-h-[1.5rem]`}>
               <span className="inline-block w-8 text-muted-foreground/50 text-right mr-4 select-none">
                 {right.type !== "empty" ? index + 1 : ""}
               </span>

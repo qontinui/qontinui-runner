@@ -54,7 +54,7 @@ export function FileTreePanel({ data, size }: CanvasPanelComponentProps) {
 
           return (
             <div
-              key={idx}
+              key={entry.path}
               className={cn("flex items-center gap-1.5 py-0.5", statusClass)}
               style={{ paddingLeft: `${depth * 12}px` }}
             >

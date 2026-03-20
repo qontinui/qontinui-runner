@@ -126,6 +126,11 @@ function ContextItem({
   return (
     <div
       onClick={handleClick}
+      onKeyDown={(e) => { if ((e.key === "Enter" || e.key === " ") && !disabled) handleClick(); }}
+      role="button"
+      tabIndex={disabled ? -1 : 0}
+      aria-pressed={isSelected}
+      aria-disabled={disabled}
       className={`
         flex items-start gap-2 p-2 rounded-lg cursor-pointer transition-colors
         ${disabled ? "opacity-50 cursor-not-allowed" : "hover:bg-muted/50"}

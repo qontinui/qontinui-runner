@@ -164,7 +164,7 @@ export function ProcessOutputViewer({
         ) : (
           filteredLines.map((line, i) => (
             <div
-              key={i}
+              key={`${line.timestamp}-${i}`}
               className={cn(
                 "whitespace-pre-wrap break-all",
                 line.stream === "stderr" ? "text-red-400/80" : "text-zinc-300",

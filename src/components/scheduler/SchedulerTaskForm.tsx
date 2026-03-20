@@ -883,7 +883,7 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
                 All repositories must be inactive (no file changes) for the specified time
               </p>
               {repositories.map((repo, idx) => (
-                <div key={idx} className="flex items-center gap-2">
+                <div key={`${repo.path || "repo"}-${idx}`} className="flex items-center gap-2">
                   <input
                     type="text"
                     value={repo.path}

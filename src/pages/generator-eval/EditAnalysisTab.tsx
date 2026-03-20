@@ -150,8 +150,8 @@ export function EditAnalysisTab() {
                   labelLine={false}
                   fontSize={10}
                 >
-                  {typeChartData.map((_, i) => (
-                    <Cell key={i} fill={COLORS[i % COLORS.length]} />
+                  {typeChartData.map((entry, i) => (
+                    <Cell key={`${entry.name}-${i}`} fill={COLORS[i % COLORS.length]} />
                   ))}
                 </Pie>
                 <Tooltip

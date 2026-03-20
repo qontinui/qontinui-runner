@@ -200,7 +200,7 @@ function IssueCard({
               <span className="text-muted-foreground font-medium">Trigger Conditions:</span>
               <ul className="list-disc list-inside mt-0.5">
                 {issue.trigger_conditions.map((tc, i) => (
-                  <li key={i} className="text-foreground">
+                  <li key={`${tc}-${i}`} className="text-foreground">
                     {tc}
                   </li>
                 ))}

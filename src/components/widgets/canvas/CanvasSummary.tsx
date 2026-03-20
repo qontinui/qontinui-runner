@@ -84,7 +84,7 @@ export function CanvasSummary({ data }: CanvasSummaryProps) {
             };
             return (
               <div
-                key={i}
+                key={`${cell.status}-${i}`}
                 className={cn("w-2 h-2 rounded-sm", statusColors[cell.status] ?? "bg-gray-400")}
               />
             );

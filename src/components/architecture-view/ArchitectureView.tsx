@@ -437,7 +437,7 @@ function SdkArchitecturePanel({
             className="px-3 py-1.5 text-sm bg-muted border border-border rounded-md"
           >
             {specs.map((s, i) => (
-              <option key={i} value={i}>
+              <option key={`${s.projectName}-${i}`} value={i}>
                 {s.projectName} ({s.appUrl})
               </option>
             ))}
@@ -478,6 +478,9 @@ function SdkArchitecturePanel({
                 <div
                   key={node.id}
                   onClick={() => setSelectedNode(selectedNode?.id === node.id ? null : node)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelectedNode(selectedNode?.id === node.id ? null : node); }}}
+                  role="button"
+                  tabIndex={0}
                   className={`flex items-center gap-2 px-2 py-1.5 rounded text-sm cursor-pointer transition-colors ${
                     selectedNode?.id === node.id
                       ? "bg-blue-500/15 border border-blue-500/30"
@@ -531,6 +534,9 @@ function SdkArchitecturePanel({
                     <div
                       key={node.id}
                       onClick={() => setSelectedNode(selectedNode?.id === node.id ? null : node)}
+                      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelectedNode(selectedNode?.id === node.id ? null : node); }}}
+                      role="button"
+                      tabIndex={0}
                       className={`px-2 py-1.5 rounded text-sm cursor-pointer transition-colors ${
                         selectedNode?.id === node.id
                           ? "bg-blue-500/15 border border-blue-500/30"
@@ -611,7 +617,7 @@ function SdkArchitecturePanel({
                   </div>
                   <div className="space-y-0.5">
                     {selectedNode.entryPoints.map((ep, i) => (
-                      <div key={i} className="text-xs font-mono text-blue-400 truncate" title={ep}>
+                      <div key={`${ep}-${i}`} className="text-xs font-mono text-blue-400 truncate" title={ep}>
                         {ep}
                       </div>
                     ))}
@@ -628,7 +634,7 @@ function SdkArchitecturePanel({
                   <div className="flex flex-wrap gap-1">
                     {selectedNode.techUsed.map((t, i) => (
                       <span
-                        key={i}
+                        key={`${t}-${i}`}
                         className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground"
                       >
                         {t}
@@ -647,7 +653,7 @@ function SdkArchitecturePanel({
                   <div className="flex flex-wrap gap-1">
                     {selectedNode.usedBy.map((f, i) => (
                       <span
-                        key={i}
+                        key={`${f}-${i}`}
                         className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400"
                       >
                         {f}
@@ -674,7 +680,7 @@ function SdkArchitecturePanel({
                           ? edge.target.replace("feature:", "")
                           : edge.source.replace("feature:", "");
                         return (
-                          <div key={i} className="text-xs text-muted-foreground">
+                          <div key={`${edge.source}-${edge.target}-${i}`} className="text-xs text-muted-foreground">
                             {isSource ? (
                               <>
                                 <span className="text-muted-foreground/60">{edge.type}</span>{" "}
@@ -706,7 +712,7 @@ function SdkArchitecturePanel({
           </h3>
           <div className="space-y-1.5">
             {project.techStack.map((tech, i) => (
-              <div key={i} className="px-2 py-1.5 bg-muted/50 rounded">
+              <div key={`${tech.name}-${i}`} className="px-2 py-1.5 bg-muted/50 rounded">
                 <div className="text-sm font-medium">
                   {tech.name}
                   {tech.version ? ` v${tech.version}` : ""}
@@ -723,7 +729,7 @@ function SdkArchitecturePanel({
               </h3>
               <div className="space-y-1">
                 {project.directories.map((dir, i) => (
-                  <div key={i} className="px-2 py-1 text-xs">
+                  <div key={`${dir.path}-${i}`} className="px-2 py-1 text-xs">
                     <span className="font-mono text-blue-400">{dir.path}</span>
                     <span className="text-muted-foreground ml-1">&mdash; {dir.purpose}</span>
                   </div>
@@ -740,7 +746,7 @@ function SdkArchitecturePanel({
               </h3>
               <div className="space-y-1">
                 {project.edges.map((edge, i) => (
-                  <div key={i} className="px-2 py-1 text-xs text-muted-foreground">
+                  <div key={`${edge.source}-${edge.target}-${i}`} className="px-2 py-1 text-xs text-muted-foreground">
                     <span className="text-foreground">{edge.source.replace("feature:", "")}</span>
                     {" \u2192 "}
                     <span className="text-foreground">{edge.target.replace("feature:", "")}</span>

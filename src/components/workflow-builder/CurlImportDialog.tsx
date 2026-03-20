@@ -111,7 +111,14 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/50" onClick={handleClose} />
+      <div
+        role="button"
+        tabIndex={0}
+        aria-label="Close cURL import dialog"
+        className="absolute inset-0 bg-black/50"
+        onClick={handleClose}
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handleClose(); }}
+      />
 
       {/* Dialog */}
       <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] flex flex-col overflow-hidden">

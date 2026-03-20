@@ -84,7 +84,7 @@ function MessageBubble({
           <div className="mt-2 pt-2 border-t border-white/5 space-y-1">
             {specActions.map((action, i) => (
               <button
-                key={i}
+                key={`${action.kind}-${i}`}
                 data-ui-id={`spec-chat-apply-${action.kind}`}
                 onClick={action.onApply}
                 className="w-full flex items-center gap-1.5 px-2 py-1 text-[10px] font-medium rounded
@@ -658,7 +658,7 @@ export function SpecChatPanel({
               : undefined;
           return (
             <MessageBubble
-              key={i}
+              key={`${msg.role}-${i}`}
               role={msg.role}
               content={msg.content}
               specActions={specActions}

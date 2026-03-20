@@ -80,7 +80,7 @@ export function CostBreakdownPanel({ data, size }: CanvasPanelComponentProps) {
         const barColor = CATEGORY_COLORS[step.category] ?? DEFAULT_COLOR;
 
         return (
-          <div key={idx} className="flex items-center gap-2">
+          <div key={`${step.name}-${idx}`} className="flex items-center gap-2">
             {/* Step name + side-effect badge */}
             <div
               className={cn(

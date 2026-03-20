@@ -44,7 +44,7 @@ export function SparklinePanel({ data, size }: CanvasPanelComponentProps) {
         }));
 
         return (
-          <div key={seriesIdx} className="flex items-center gap-2">
+          <div key={s.name} className="flex items-center gap-2">
             {/* Series name */}
             <div
               className={cn("truncate text-muted-foreground flex-shrink-0", fontSize)}
@@ -59,8 +59,8 @@ export function SparklinePanel({ data, size }: CanvasPanelComponentProps) {
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={chartData} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
                   <Bar dataKey="value" barSize={8}>
-                    {chartData.map((entry, idx) => (
-                      <Cell key={idx} fill={entry.outcome === "pass" ? PASS_COLOR : FAIL_COLOR} />
+                    {chartData.map((entry) => (
+                      <Cell key={entry.iteration} fill={entry.outcome === "pass" ? PASS_COLOR : FAIL_COLOR} />
                     ))}
                   </Bar>
                 </BarChart>

@@ -106,7 +106,14 @@ export function DoctorHealthBadge({ className }: DoctorHealthBadgeProps) {
       {showDropdown && (
         <>
           {/* Backdrop to close dropdown */}
-          <div className="fixed inset-0 z-40" onClick={() => setShowDropdown(false)} />
+          <div
+            className="fixed inset-0 z-40"
+            onClick={() => setShowDropdown(false)}
+            onKeyDown={(e) => { if (e.key === "Escape") setShowDropdown(false); }}
+            role="button"
+            tabIndex={-1}
+            aria-label="Close dropdown"
+          />
 
           <div className="absolute top-full mt-2 right-0 z-50 w-80 bg-card border border-border rounded-lg shadow-lg overflow-hidden">
             <div className="px-3 py-2 border-b border-border bg-card">

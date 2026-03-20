@@ -176,6 +176,12 @@ pub fn check_and_launch_optimizers(
         warn!("Failed to capture periodic snapshot: {}", e);
     }
 
+    // Auto-extract spec compliance for spec-generated workflows
+    crate::spec_experimentation::compliance::auto_extract_spec_compliance(
+        &deps.app_state.checkpoint_db,
+        &source_task_run_id,
+    );
+
     // Auto-evaluate applied recommendations that are due for re-evaluation.
     // Only re-evaluate recs applied >7 days ago whose verdict is still "insufficient_data".
     auto_evaluate_outcomes(db);

@@ -184,6 +184,9 @@ export function RecommendationsTab() {
                     loadCascade(rec.id);
                   }
                 }}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); const newExpanded = expanded === rec.id ? null : rec.id; setExpanded(newExpanded); if (newExpanded && rec.status === "applied" && rec.target_agent) { loadCascade(rec.id); } }}}
+                role="button"
+                tabIndex={0}
               >
                 <span className={`text-xs px-2 py-0.5 rounded ${STATUS_COLORS[rec.status] || ""}`}>
                   {rec.status}
