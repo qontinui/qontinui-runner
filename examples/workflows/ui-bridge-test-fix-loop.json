@@ -1,0 +1,67 @@
+{
+  "name": "UI Bridge Test & Fix Loop",
+  "description": "Autonomous loop: test all UI Bridge endpoints across web and runner, identify failures, fix code, rebuild, restart, and re-test until all 18 categories score 5/5 on both apps.",
+  "category": "testing",
+  "tags": ["ui-bridge", "automation", "testing", "autonomous"],
+
+  "setup_steps": [
+    {
+      "type": "command",
+      "mode": "check",
+      "name": "Verify web frontend is running",
+      "phase": "setup",
+      "check_type": "custom_command",
+      "check_command": "curl -sf -o /dev/null http://localhost:3001/api/ui-bridge/health",
+      "check_working_directory": "C:\\Users\\jspin\\Documents\\qontinui_parent"
+    },
+    {
+      "type": "command",
+      "mode": "check",
+      "name": "Verify runner is running",
+      "phase": "setup",
+      "check_type": "custom_command",
+      "check_command": "curl -sf -o /dev/null http://localhost:9876/ui-bridge/health",
+      "check_working_directory": "C:\\Users\\jspin\\Documents\\qontinui_parent"
+    }
+  ],
+
+  "verification_steps": [
+    {
+      "type": "command",
+      "mode": "check",
+      "name": "Run UI Bridge test suite",
+      "phase": "verification",
+      "check_type": "custom_command",
+      "check_command": "python C:\\Users\\jspin\\Documents\\qontinui_parent\\qontinui-runner\\examples\\workflows\\ui-bridge-test-runner.py",
+      "check_working_directory": "C:\\Users\\jspin\\Documents\\qontinui_parent"
+    }
+  ],
+
+  "agentic_steps": [
+    {
+      "type": "prompt",
+      "name": "Analyze failures and fix UI Bridge issues",
+      "phase": "agentic",
+      "content": "You are fixing UI Bridge issues in the Qontinui project. The verification step just ran a comprehensive test suite against the UI Bridge SDK endpoints on both the web frontend (localhost:3001) and the runner (localhost:9876). Some tests failed.\n\n## Your Task\n\nRead the test results from the most recent report in `.dev-logs/ui-bridge-test-report-*.md` (pick the latest by filename). Identify which categories scored below 5/5 and fix the underlying code issues.\n\n## Architecture\n\nThe UI Bridge SDK is a monorepo at `ui-bridge/`:\n- `ui-bridge/packages/ui-bridge/` — Core SDK (browser-side registry, action executor, command handlers)\n- `ui-bridge/packages/ui-bridge-server/` — Server handlers (Express, Next.js, standalone)\n\nTwo apps use the SDK:\n- **Web frontend** (`qontinui-web/frontend/`) — Next.js app, uses SSE relay via CommandRelayListener\n- **Runner** (`qontinui-runner/`) — Tauri desktop app, uses IPC via useUIBridgeEventHandler.ts\n\n## Key Files\n\n| Area | File |\n|------|------|\n| Browser command dispatch | `ui-bridge/packages/ui-bridge/src/react/commandHandlers.ts` |\n| Action executor (click, type, scroll, etc.) | `ui-bridge/packages/ui-bridge/src/control/action-executor.ts` |\n| Server handlers (find, discover, actions) | `ui-bridge/packages/ui-bridge-server/src/handlers.ts` |\n| Relay handlers (web SSE) | `ui-bridge/packages/ui-bridge/src/server/relay-handlers.ts` |\n| Route definitions (web) | `ui-bridge/packages/ui-bridge/src/server/types.ts` |\n| Route definitions (server pkg) | `ui-bridge/packages/ui-bridge-server/src/types.ts` |\n| Runner IPC handler | `qontinui-runner/src/hooks/useUIBridgeEventHandler.ts` |\n| Runner Rust API handlers | `qontinui-runner/src-tauri/src/mcp/ui_bridge.rs` |\n| Web UI Bridge provider | `qontinui-web/frontend/src/lib/ui-bridge/provider.tsx` |\n| Web route awareness | `qontinui-web/frontend/src/lib/ui-bridge/RouteAwarenessProvider.tsx` |\n| Runner App.tsx | `qontinui-runner/src/App.tsx` |\n\n## Test Categories (18)\n\n| # | Category | Tests |\n|---|----------|-------|\n| 1 | Element Discovery | snapshot, discover interactive_only true/false, find, element detail, state |\n| 2 | Click Actions | click button, verify state change |\n| 3 | Text Input | type into input, verify value persists (React _valueTracker), clear |\n| 4 | Selection Controls | select dropdown, check/uncheck checkbox, toggle switch |\n| 5 | Focus Management | focus/blur input, verify focused state in /element/{id}/state |\n| 6 | Scrolling | scroll direction+amount with scrollInfo response, scrollIntoView |\n| 7 | Form Operations | type+clear on form fields, submit, reset |\n| 8 | Navigation | navigate preserves SSE connection, back/forward |\n| 9 | Components | list registered components |\n| 10 | Finding & Search | find by text, role; ZZZNONEXISTENT returns 0 |\n| 11 | Console Errors | returns console.error entries, not perf events |\n| 12 | Specs | specs ARE registered, should be non-empty |\n| 13 | Drag & Drop | drag action with target |\n| 14 | JS Evaluation | POST /control/page/evaluate (runner only) |\n| 15 | Idle Detection | stable snapshot counts |\n| 16 | Connection Health | response time, error envelope (success:false at top), health endpoint |\n| 17 | Workflows | list workflows |\n| 18 | Render Log | both /render-log and /control/render-log work |\n\n## Common Failure Patterns & Fixes\n\n- **\"Cannot type into BUTTON\"** — Test is on wrong page. Navigate to a page with <input> elements first.\n- **discover interactive_only=false same count as true** — Content discovery not enabled in AutoRegisterProvider. Add `contentDiscovery={{ enabled: true, maxContentElements: 200 }}`.\n- **scroll returns \"Unknown action\"** — Missing `case 'scroll'` in commandHandlers.ts action switch.\n- **scroll SSE timeout** — Using requestAnimationFrame (doesn't fire in background tabs). Use setTimeout(16) instead.\n- **Type value doesn't persist** — Missing React _valueTracker reset before setting value. Add `element._valueTracker?.setValue(previousValue)` pattern.\n- **getElementState missing focused** — commandHandlers.ts getElementState case doesn't include `focused: state.focused`.\n- **Console errors returns perf events (runner)** — Using getSince/getRecent instead of getConsoleSince/getConsoleRecent.\n- **Error envelope {success:true, data:{success:false}}** — Rust handler uses ApiResponse::success() unconditionally. Need wrap_ipc_result helper.\n- **/control/render-log 404 on web** — Route alias missing from ui-bridge/packages/ui-bridge/src/server/types.ts (not just ui-bridge-server/src/types.ts).\n- **Specs empty** — Specs ARE registered. If empty, investigate the spec registry loading.\n\n## After Fixing Code\n\n1. **Rebuild ui-bridge SDK**: `cd ui-bridge/packages/ui-bridge && npm run build`\n2. **Rebuild ui-bridge-server**: `cd ui-bridge/packages/ui-bridge-server && npm run build`\n3. **Restart web frontend**: `cd C:\\Users\\jspin\\Documents\\qontinui_parent && powershell.exe -File ./dev-start.ps1 -Frontend`\n4. **Wait 15 seconds** for the frontend to fully start\n5. **Restart runner** (if Rust changes): `curl -s -X POST http://localhost:9875/runner/restart -H 'Content-Type: application/json' -d '{\"rebuild\": true}'` — then wait 3-5 minutes for Rust compile\n6. **Restart runner** (TS-only changes): `curl -s -X POST http://localhost:9875/runner/restart -H 'Content-Type: application/json' -d '{\"rebuild\": false}'` — then wait 30 seconds\n\n## Important Rules\n\n- NEVER include Co-Authored-By or Claude attribution in commits\n- NEVER kill node.exe or powershell.exe processes\n- Read the test report FIRST before making any changes\n- Make minimal, targeted fixes — don't refactor unrelated code\n- Always rebuild the SDK packages after changes\n- Type-check before considering done: `npx tsc --noEmit` in each changed project\n- The web and runner use DIFFERENT route/type files — changes often need to go in both"
+    }
+  ],
+
+  "completion_steps": [
+    {
+      "type": "command",
+      "mode": "shell",
+      "name": "Generate final report",
+      "phase": "completion",
+      "shell_command": "python C:\\Users\\jspin\\Documents\\qontinui_parent\\qontinui-runner\\examples\\workflows\\ui-bridge-test-runner.py --report-only",
+      "shell_command_working_directory": "C:\\Users\\jspin\\Documents\\qontinui_parent"
+    }
+  ],
+
+  "max_iterations": 20,
+  "timeout_seconds": null,
+  "reflection_mode": false,
+  "skip_ai_summary": false,
+  "log_watch_enabled": false,
+  "preflight_check_enabled": false,
+  "health_check_enabled": false
+}
