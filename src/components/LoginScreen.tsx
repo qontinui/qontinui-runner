@@ -7,6 +7,9 @@
 
 import { useState, FormEvent } from "react";
 import { Lock, Mail, AlertCircle, Loader2 } from "lucide-react";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("LoginScreen");
 
 interface LoginScreenProps {
   onLogin: (email: string, password: string) => Promise<void>;
@@ -20,17 +23,17 @@ export function LoginScreen({ onLogin }: LoginScreenProps) {
 
   const handleLogin = async (e: FormEvent) => {
     e.preventDefault();
-    console.log("[LOGIN_SCREEN] handleLogin() called");
+    log.debug("handleLogin() called");
     setLoading(true);
     setError("");
 
     try {
-      console.log("[LOGIN_SCREEN] Calling onLogin with credentials...");
+      log.debug("Calling onLogin...");
       await onLogin(email, password);
-      console.log("[LOGIN_SCREEN] Login completed successfully");
+      log.debug("Login completed successfully");
       // AuthProvider.login() handles setting the auth state, no callback needed
     } catch (err) {
-      console.error("[LOGIN_SCREEN] Login failed:", err);
+      log.error("Login failed:", err);
       setError(err as string);
     } finally {
       setLoading(false);

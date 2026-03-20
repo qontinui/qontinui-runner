@@ -134,7 +134,6 @@ export function BatchOperationsBar({
     setBroadcastInput("");
     setShowBroadcast(false);
     setTimeout(() => setLastAction(null), 3000);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     broadcastInput,
     needsInputTabs,
@@ -146,6 +145,7 @@ export function BatchOperationsBar({
     hasSelection,
     selectedZones,
     tabs,
+    zoneLabels,
   ]);
 
   if (needsInputTabs.length === 0 && errorTabs.length === 0) {

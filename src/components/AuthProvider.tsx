@@ -16,6 +16,9 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AuthStatus, AuthContextValue, LoginResponse } from "../types";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("Auth");
 
 // Store context in window to survive HMR reloads
 declare global {
@@ -55,9 +58,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // Log mount/unmount
   useEffect(() => {
     mountCountRef.current += 1;
-    console.log(`[AUTH] AuthProvider MOUNTED (mount #${mountCountRef.current})`);
+    log.debug(`AuthProvider MOUNTED (mount #${mountCountRef.current})`);
     return () => {
-      console.log(`[AUTH] AuthProvider UNMOUNTED (was mount #${mountCountRef.current})`);
+      log.debug(`AuthProvider UNMOUNTED (was mount #${mountCountRef.current})`);
     };
   }, []);
 
@@ -66,15 +69,15 @@ export function AuthProvider({ children }: AuthProviderProps) {
    * Called on mount and after login
    */
   const checkAuthStatus = useCallback(async () => {
-    console.log("[AUTH] checkAuthStatus() called");
+    log.debug("checkAuthStatus() called");
     try {
       setError(null);
       const status = await invoke<AuthStatus>("check_auth_status");
-      console.log("[AUTH] checkAuthStatus() result:", status);
+      log.debug("checkAuthStatus() result:", status);
       setAuthStatus(status);
       return status;
     } catch (err) {
-      console.error("[AUTH] Failed to check auth status:", err);
+      log.error("Failed to check auth status:", err);
       setError(err as string);
       setAuthStatus({
         authenticated: false,
@@ -94,28 +97,26 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const refreshAuth = useCallback(async () => {
     refreshCallCountRef.current += 1;
     const callNum = refreshCallCountRef.current;
-    console.log(`[AUTH] refreshAuth() called (call #${callNum})`);
+    log.debug(`refreshAuth() called (call #${callNum})`);
     try {
       setError(null);
-      console.log(`[AUTH] refreshAuth() #${callNum} - invoking refresh_token command...`);
+      log.debug(`refreshAuth() #${callNum} - invoking refresh_token command...`);
       await invoke("refresh_token");
-      console.log(
-        `[AUTH] refreshAuth() #${callNum} - refresh_token succeeded, checking auth status...`,
-      );
+      log.debug(`refreshAuth() #${callNum} - refresh_token succeeded, checking auth status...`);
       // Wrap the status check in its own try/catch — if refresh succeeded but the
       // status check fails (e.g., transient 5xx), keep the existing auth state
       // rather than propagating the failure as unauthenticated.
       try {
         await checkAuthStatus();
       } catch (statusErr) {
-        console.warn(
-          `[AUTH] refreshAuth() #${callNum} - status check failed after successful refresh, keeping existing auth state:`,
+        log.warn(
+          `refreshAuth() #${callNum} - status check failed after successful refresh, keeping existing auth state:`,
           statusErr,
         );
       }
-      console.log(`[AUTH] refreshAuth() #${callNum} - completed successfully`);
+      log.debug(`refreshAuth() #${callNum} - completed successfully`);
     } catch (err) {
-      console.warn(`[AUTH] refreshAuth() #${callNum} - Token refresh failed:`, err);
+      log.warn(`refreshAuth() #${callNum} - Token refresh failed:`, err);
       // Don't immediately log the user out. The current access token may still be
       // valid — a refresh failure alone (e.g., transient network issue, backend
       // momentarily unavailable) should not destroy the user's session and cause
@@ -142,7 +143,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         device_info: response.device_info,
       });
     } catch (err) {
-      console.error("[AUTH] Login failed:", err);
+      log.error("Login failed:", err);
       setError(err as string);
       throw err; // Re-throw so LoginScreen can handle it
     } finally {
@@ -164,7 +165,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         device_info: null,
       });
     } catch (err) {
-      console.error("[AUTH] Logout failed:", err);
+      log.error("Logout failed:", err);
       setError(err as string);
       // Clear local state even if backend call fails
       setAuthStatus({
@@ -181,7 +182,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
    * Check auth status on mount
    */
   useEffect(() => {
-    console.log("[AUTH] useEffect[checkAuthStatus] - checking auth status on mount");
+    log.debug("useEffect[checkAuthStatus] - checking auth status on mount");
     checkAuthStatus();
   }, [checkAuthStatus]);
 
@@ -202,7 +203,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
     // If already authenticated, clear pending flag (covers both initial auth and successful auto-login)
     if (authStatus?.authenticated) {
-      console.log("[AUTH] Dev mode: Authenticated, clearing devAutoLoginPending");
+      log.debug("Dev mode: Authenticated, clearing devAutoLoginPending");
       setDevAutoLoginPending(false);
       return;
     }
@@ -217,25 +218,23 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
     // Skip auto-login if credentials are not configured
     if (!DEV_AUTO_LOGIN.email || !DEV_AUTO_LOGIN.password) {
-      console.log("[AUTH] Dev mode: No dev credentials configured, skipping auto-login");
-      console.log(
-        "[AUTH] Dev mode: Set VITE_DEV_EMAIL and VITE_DEV_PASSWORD in .env to enable auto-login",
-      );
+      log.debug("Dev mode: No dev credentials configured, skipping auto-login");
+      log.debug("Dev mode: Set VITE_DEV_EMAIL and VITE_DEV_PASSWORD in .env to enable auto-login");
       return;
     }
 
     // Auto-login in development
-    console.log("[AUTH] Dev mode: Not authenticated, attempting auto-login...");
+    log.debug("Dev mode: Not authenticated, attempting auto-login...");
     hasAttemptedDevLogin.current = true;
     // Set pending flag BEFORE starting login so UI shows "Signing in..."
     setDevAutoLoginPending(true);
     login(DEV_AUTO_LOGIN.email, DEV_AUTO_LOGIN.password)
       .then(() => {
         // Login successful - the authStatus effect will clear devAutoLoginPending
-        console.log("[AUTH] Dev mode auto-login succeeded");
+        log.debug("Dev mode auto-login succeeded");
       })
       .catch((err) => {
-        console.error("[AUTH] Dev mode auto-login failed:", err);
+        log.error("Dev mode auto-login failed:", err);
         // Clear pending flag on failure so user can see login screen
         setDevAutoLoginPending(false);
       });
@@ -250,7 +249,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     if (!loading) return;
 
     const timeout = setTimeout(() => {
-      console.warn("[AUTH] Loading timeout - forcing loading to false");
+      log.warn("Loading timeout - forcing loading to false");
       setLoading(false);
       setDevAutoLoginPending(false);
     }, 3000);
@@ -262,27 +261,21 @@ export function AuthProvider({ children }: AuthProviderProps) {
    * Set up auto-refresh timer when authenticated
    */
   useEffect(() => {
-    console.log("[AUTH] useEffect[auto-refresh] triggered:", {
-      authStatus: authStatus,
-      "authStatus?.authenticated": authStatus?.authenticated,
-      "refreshAuth reference": refreshAuth.toString().slice(0, 100),
-    });
+    log.debug("useEffect[auto-refresh] triggered", { authenticated: authStatus?.authenticated });
 
     if (!authStatus?.authenticated) {
-      console.log("[AUTH] useEffect[auto-refresh] - NOT authenticated, skipping timer setup");
+      log.debug("useEffect[auto-refresh] - NOT authenticated, skipping timer setup");
       return;
     }
 
-    console.log(
-      "[AUTH] useEffect[auto-refresh] - IS authenticated, setting up token refresh timer",
-    );
+    log.debug("useEffect[auto-refresh] - IS authenticated, setting up token refresh timer");
     const intervalId = setInterval(() => {
-      console.log("[AUTH] Auto-refresh timer fired - calling refreshAuth()");
+      log.debug("Auto-refresh timer fired - calling refreshAuth()");
       refreshAuth();
     }, TOKEN_REFRESH_INTERVAL);
 
     return () => {
-      console.log("[AUTH] useEffect[auto-refresh] cleanup - clearing token refresh timer");
+      log.debug("useEffect[auto-refresh] cleanup - clearing token refresh timer");
       clearInterval(intervalId);
     };
   }, [authStatus, refreshAuth]);

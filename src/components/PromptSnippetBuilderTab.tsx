@@ -79,30 +79,6 @@ export function PromptSnippetBuilderTab({
     setSelectedIds(new Set());
   }, []);
 
-  // Delete selected prompt snippets
-  const deleteSelectedPromptSnippets = useCallback(async () => {
-    setIsDeleting(true);
-    try {
-      for (const id of selectedIds) {
-        await tracedFetch(`${getApiBase()}/prompt-snippets/${id}`, { method: "DELETE" });
-      }
-      exitSelectionMode();
-      setShowBatchDeleteDialog(false);
-      await fetchPromptSnippets();
-      onLog?.("success", `Deleted ${selectedIds.size} prompt snippet(s)`);
-    } catch (error) {
-      onLog?.("error", `Failed to delete prompt snippets: ${error}`);
-    } finally {
-      setIsDeleting(false);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedIds, exitSelectionMode, onLog]);
-
-  // Get names of selected prompt snippets for dialog
-  const getSelectedNames = useCallback(() => {
-    return promptSnippets.filter((s) => selectedIds.has(s.id)).map((s) => s.name);
-  }, [promptSnippets, selectedIds]);
-
   // Fetch prompt snippets
   const fetchPromptSnippets = useCallback(async () => {
     try {
@@ -130,6 +106,29 @@ export function PromptSnippetBuilderTab({
   useEffect(() => {
     fetchPromptSnippets();
   }, [fetchPromptSnippets]);
+
+  // Delete selected prompt snippets
+  const deleteSelectedPromptSnippets = useCallback(async () => {
+    setIsDeleting(true);
+    try {
+      for (const id of selectedIds) {
+        await tracedFetch(`${getApiBase()}/prompt-snippets/${id}`, { method: "DELETE" });
+      }
+      exitSelectionMode();
+      setShowBatchDeleteDialog(false);
+      await fetchPromptSnippets();
+      onLog?.("success", `Deleted ${selectedIds.size} prompt snippet(s)`);
+    } catch (error) {
+      onLog?.("error", `Failed to delete prompt snippets: ${error}`);
+    } finally {
+      setIsDeleting(false);
+    }
+  }, [selectedIds, exitSelectionMode, onLog, fetchPromptSnippets]);
+
+  // Get names of selected prompt snippets for dialog
+  const getSelectedNames = useCallback(() => {
+    return promptSnippets.filter((s) => selectedIds.has(s.id)).map((s) => s.name);
+  }, [promptSnippets, selectedIds]);
 
   // Load prompt snippet for editing
   useEffect(() => {

@@ -119,7 +119,8 @@ pub fn extract_compliance(
 
     // 3. Extract assertion results from step_results
     let mut all_details: Vec<AssertionDetail> = Vec::new();
-    let mut group_map: std::collections::HashMap<String, (i64, i64)> = std::collections::HashMap::new();
+    let mut group_map: std::collections::HashMap<String, (i64, i64)> =
+        std::collections::HashMap::new();
 
     if let Some(step_results) = result.get("step_results").and_then(|v| v.as_array()) {
         for step in step_results {
@@ -297,9 +298,8 @@ pub fn get_compliance_for_run(
 ) -> Result<Option<SpecComplianceResult>, String> {
     let trid = task_run_id.to_string();
     db.with_conn(move |conn| {
-        let row = conn
-            .query_row(
-                r#"SELECT id, task_run_id, spec_id, iteration,
+        let row = conn.query_row(
+            r#"SELECT id, task_run_id, spec_id, iteration,
                           overall_score, raw_pass_rate,
                           critical_passed, critical_total,
                           warning_passed, warning_total,
@@ -310,35 +310,31 @@ pub fn get_compliance_for_run(
                    FROM spec_compliance_results
                    WHERE task_run_id = ?1
                    ORDER BY created_at DESC LIMIT 1"#,
-                params![trid],
-                |row| {
-                    Ok(SpecComplianceResult {
-                        id: row.get(0)?,
-                        task_run_id: row.get(1)?,
-                        spec_id: row.get(2)?,
-                        iteration: row.get(3)?,
-                        overall_score: row.get(4)?,
-                        raw_pass_rate: row.get(5)?,
-                        critical_passed: row.get(6)?,
-                        critical_total: row.get(7)?,
-                        warning_passed: row.get(8)?,
-                        warning_total: row.get(9)?,
-                        info_passed: row.get(10)?,
-                        info_total: row.get(11)?,
-                        assertions_passed: row.get(12)?,
-                        assertions_total: row.get(13)?,
-                        group_scores: serde_json::from_str(
-                            &row.get::<_, String>(14)?,
-                        )
+            params![trid],
+            |row| {
+                Ok(SpecComplianceResult {
+                    id: row.get(0)?,
+                    task_run_id: row.get(1)?,
+                    spec_id: row.get(2)?,
+                    iteration: row.get(3)?,
+                    overall_score: row.get(4)?,
+                    raw_pass_rate: row.get(5)?,
+                    critical_passed: row.get(6)?,
+                    critical_total: row.get(7)?,
+                    warning_passed: row.get(8)?,
+                    warning_total: row.get(9)?,
+                    info_passed: row.get(10)?,
+                    info_total: row.get(11)?,
+                    assertions_passed: row.get(12)?,
+                    assertions_total: row.get(13)?,
+                    group_scores: serde_json::from_str(&row.get::<_, String>(14)?)
                         .unwrap_or_default(),
-                        assertion_details: serde_json::from_str(
-                            &row.get::<_, String>(15)?,
-                        )
+                    assertion_details: serde_json::from_str(&row.get::<_, String>(15)?)
                         .unwrap_or_default(),
-                        created_at: row.get(16)?,
-                    })
-                },
-            );
+                    created_at: row.get(16)?,
+                })
+            },
+        );
 
         match row {
             Ok(r) => Ok(Some(r)),
@@ -358,9 +354,10 @@ pub fn get_compliance_history(
     let limit = limit.unwrap_or(50);
 
     db.with_conn(move |conn| {
-        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ref sid) = spec_id {
-            (
-                r#"SELECT id, task_run_id, spec_id, iteration,
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+            if let Some(ref sid) = spec_id {
+                (
+                    r#"SELECT id, task_run_id, spec_id, iteration,
                           overall_score, raw_pass_rate,
                           critical_passed, critical_total,
                           warning_passed, warning_total,
@@ -372,12 +369,15 @@ pub fn get_compliance_history(
                    WHERE spec_id = ?1
                    ORDER BY created_at DESC
                    LIMIT ?2"#
-                    .to_string(),
-                vec![Box::new(sid.clone()) as Box<dyn rusqlite::types::ToSql>, Box::new(limit)],
-            )
-        } else {
-            (
-                r#"SELECT id, task_run_id, spec_id, iteration,
+                        .to_string(),
+                    vec![
+                        Box::new(sid.clone()) as Box<dyn rusqlite::types::ToSql>,
+                        Box::new(limit),
+                    ],
+                )
+            } else {
+                (
+                    r#"SELECT id, task_run_id, spec_id, iteration,
                           overall_score, raw_pass_rate,
                           critical_passed, critical_total,
                           warning_passed, warning_total,
@@ -388,16 +388,17 @@ pub fn get_compliance_history(
                    FROM spec_compliance_results
                    ORDER BY created_at DESC
                    LIMIT ?1"#
-                    .to_string(),
-                vec![Box::new(limit) as Box<dyn rusqlite::types::ToSql>],
-            )
-        };
+                        .to_string(),
+                    vec![Box::new(limit) as Box<dyn rusqlite::types::ToSql>],
+                )
+            };
 
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("Failed to prepare compliance history query: {}", e))?;
 
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
 
         let rows = stmt
             .query_map(params_refs.as_slice(), |row| {
@@ -416,14 +417,10 @@ pub fn get_compliance_history(
                     info_total: row.get(11)?,
                     assertions_passed: row.get(12)?,
                     assertions_total: row.get(13)?,
-                    group_scores: serde_json::from_str(
-                        &row.get::<_, String>(14)?,
-                    )
-                    .unwrap_or_default(),
-                    assertion_details: serde_json::from_str(
-                        &row.get::<_, String>(15)?,
-                    )
-                    .unwrap_or_default(),
+                    group_scores: serde_json::from_str(&row.get::<_, String>(14)?)
+                        .unwrap_or_default(),
+                    assertion_details: serde_json::from_str(&row.get::<_, String>(15)?)
+                        .unwrap_or_default(),
                     created_at: row.get(16)?,
                 })
             })
@@ -435,9 +432,7 @@ pub fn get_compliance_history(
 }
 
 /// Get a summary of compliance across all specs: latest score, trend, run count.
-pub fn get_compliance_summary(
-    db: &CheckpointDb,
-) -> Result<Vec<SpecComplianceSummary>, String> {
+pub fn get_compliance_summary(db: &CheckpointDb) -> Result<Vec<SpecComplianceSummary>, String> {
     db.with_conn(move |conn| {
         // Get distinct spec_ids with their latest scores and run counts
         let mut stmt = conn
@@ -486,10 +481,7 @@ pub fn get_compliance_summary(
 }
 
 /// Get average spec compliance score over a period (used by snapshots).
-pub fn get_avg_compliance_since(
-    db: &CheckpointDb,
-    since: &str,
-) -> Result<Option<f64>, String> {
+pub fn get_avg_compliance_since(db: &CheckpointDb, since: &str) -> Result<Option<f64>, String> {
     let since = since.to_string();
     db.with_conn(move |conn| {
         let result: Result<f64, _> = conn.query_row(
@@ -529,10 +521,7 @@ fn parse_assertion_detail(v: &serde_json::Value) -> AssertionDetail {
             .and_then(|v| v.as_str())
             .unwrap_or("exists")
             .to_string(),
-        passed: v
-            .get("passed")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        passed: v.get("passed").and_then(|v| v.as_bool()).unwrap_or(false),
         detail: v
             .get("detail")
             .and_then(|v| v.as_str())

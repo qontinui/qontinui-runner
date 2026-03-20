@@ -148,9 +148,7 @@ pub fn analyze_element_coverage(
                         let label = target
                             .get("label")
                             .and_then(|l| l.as_str())
-                            .or_else(|| {
-                                assertion.get("description").and_then(|d| d.as_str())
-                            })
+                            .or_else(|| assertion.get("description").and_then(|d| d.as_str()))
                             .unwrap_or("unknown")
                             .to_string();
                         targets.push(label);
@@ -190,17 +188,14 @@ pub fn analyze_element_coverage(
 
     // Identify interactive elements from snapshot
     let interactive_types = [
-        "button", "input", "select", "textarea", "a", "link", "checkbox", "radio",
-        "switch", "slider", "tab", "menuitem",
+        "button", "input", "select", "textarea", "a", "link", "checkbox", "radio", "switch",
+        "slider", "tab", "menuitem",
     ];
 
     let interactive_elements: Vec<&serde_json::Value> = snapshot_elements
         .iter()
         .filter(|el| {
-            let el_type = el
-                .get("type")
-                .and_then(|t| t.as_str())
-                .unwrap_or("");
+            let el_type = el.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let el_role = el
                 .get("state")
                 .and_then(|s| s.get("role"))
@@ -249,10 +244,7 @@ pub fn analyze_element_coverage(
                 })
                 .unwrap_or("(unlabeled)")
                 .to_string();
-            let el_type = el
-                .get("type")
-                .and_then(|t| t.as_str())
-                .unwrap_or("unknown");
+            let el_type = el.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
             uncovered_elements.push(format!("{} [{}]", label, el_type));
         }
     }
@@ -464,10 +456,7 @@ pub fn run_mutation_test(
 // ── Freshness Detection (Method 4) ────────────────────────────────────
 
 /// Analyze freshness of a spec file relative to its component files.
-pub fn analyze_freshness(
-    spec_file_path: &Path,
-    component_paths: &[PathBuf],
-) -> FreshnessResult {
+pub fn analyze_freshness(spec_file_path: &Path, component_paths: &[PathBuf]) -> FreshnessResult {
     let spec_mtime = std::fs::metadata(spec_file_path)
         .and_then(|m| m.modified())
         .ok();
@@ -725,10 +714,7 @@ fn element_matches_spec_criteria(
 
         let matches = match key.as_str() {
             "role" => {
-                let el_type = element
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
+                let el_type = element.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 let el_role = element
                     .get("state")
                     .and_then(|s| s.get("role"))
@@ -746,24 +732,15 @@ fn element_matches_spec_criteria(
                 text.to_lowercase().contains(&value_str.to_lowercase())
             }
             "label" => {
-                let label = element
-                    .get("label")
-                    .and_then(|l| l.as_str())
-                    .unwrap_or("");
+                let label = element.get("label").and_then(|l| l.as_str()).unwrap_or("");
                 label.to_lowercase().contains(&value_str.to_lowercase())
             }
             "type" => {
-                let el_type = element
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
+                let el_type = element.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 el_type.eq_ignore_ascii_case(value_str)
             }
             "id" | "elementId" => {
-                let el_id = element
-                    .get("id")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or("");
+                let el_id = element.get("id").and_then(|i| i.as_str()).unwrap_or("");
                 el_id == value_str
             }
             _ => true, // Unknown criteria key → don't filter on it
@@ -807,10 +784,7 @@ fn create_mutation(
                         let mut el = el.clone();
                         if let Some(state) = el.get_mut("state") {
                             if let Some(obj) = state.as_object_mut() {
-                                obj.insert(
-                                    "visible".to_string(),
-                                    serde_json::Value::Bool(false),
-                                );
+                                obj.insert("visible".to_string(), serde_json::Value::Bool(false));
                             }
                         }
                         el
@@ -898,7 +872,10 @@ fn evaluate_assertion_against_elements(
             if matching.is_empty() {
                 (true, "No matching element (as expected)".to_string())
             } else {
-                (false, format!("Found {} unexpected element(s)", matching.len()))
+                (
+                    false,
+                    format!("Found {} unexpected element(s)", matching.len()),
+                )
             }
         }
         "visible" => {
@@ -933,7 +910,10 @@ fn evaluate_assertion_against_elements(
                 (false, format!("No element contains '{}'", expected))
             }
         }
-        _ => (true, "Unsupported assertion type for mutation test".to_string()),
+        _ => (
+            true,
+            "Unsupported assertion type for mutation test".to_string(),
+        ),
     }
 }
 
@@ -953,14 +933,9 @@ fn find_component_files(spec_name: &str, components_dir: &Path) -> Vec<PathBuf> 
     // Walk the components directory
     if let Ok(entries) = walkdir(components_dir) {
         for entry in entries {
-            let file_name = entry
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let file_name = entry.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if patterns.iter().any(|p| file_name == p.as_str())
-                || file_name
-                    .to_lowercase()
-                    .contains(&spec_name.to_lowercase())
+                || file_name.to_lowercase().contains(&spec_name.to_lowercase())
                     && (file_name.ends_with(".tsx") || file_name.ends_with(".ts"))
             {
                 results.push(entry);

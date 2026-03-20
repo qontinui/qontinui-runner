@@ -3,10 +3,10 @@
 use std::sync::Arc;
 use tauri::State;
 
-use crate::commands::AppState;
 use super::accuracy;
 use super::compliance;
 use super::versioning;
+use crate::commands::AppState;
 
 // ── Compliance commands ───────────────────────────────────────────────
 
@@ -16,11 +16,7 @@ pub fn get_spec_compliance_history(
     spec_id: Option<String>,
     limit: Option<i64>,
 ) -> Result<Vec<compliance::SpecComplianceResult>, String> {
-    compliance::get_compliance_history(
-        &app_state.checkpoint_db,
-        spec_id.as_deref(),
-        limit,
-    )
+    compliance::get_compliance_history(&app_state.checkpoint_db, spec_id.as_deref(), limit)
 }
 
 #[tauri::command]

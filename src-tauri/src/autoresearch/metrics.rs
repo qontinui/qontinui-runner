@@ -340,9 +340,14 @@ fn compare_spec_compliance(
         let p_pool = (exp_passed + ctrl_passed) as f64 / total;
 
         if p_pool == 0.0 || p_pool == 1.0 {
-            if p_exp > p_ctrl { Some(0.0) } else { Some(1.0) }
+            if p_exp > p_ctrl {
+                Some(0.0)
+            } else {
+                Some(1.0)
+            }
         } else {
-            let se = (p_pool * (1.0 - p_pool) * (1.0 / exp_total as f64 + 1.0 / ctrl_total as f64)).sqrt();
+            let se = (p_pool * (1.0 - p_pool) * (1.0 / exp_total as f64 + 1.0 / ctrl_total as f64))
+                .sqrt();
             if se > 0.0 {
                 let z = (p_exp - p_ctrl) / se;
                 Some(1.0 - normal_cdf(z))

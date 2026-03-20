@@ -31,6 +31,9 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ActionLogViewData, CommandResponse } from "../types/displayProfile";
 import { actionLogManager } from "../managers";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("ActionLogView");
 
 export interface UseActionLogViewOptions {
   /**
@@ -81,22 +84,22 @@ export function useActionLogView(options: UseActionLogViewOptions = {}): UseActi
    * Fetch action log view data from Tauri backend.
    */
   const fetchData = useCallback(async () => {
-    console.log("[HOOK] fetchData called, isMountedRef.current:", isMountedRef.current);
+    log.debug("fetchData called, isMounted:", isMountedRef.current);
 
     // Don't fetch if component is unmounted
     if (!isMountedRef.current) {
-      console.log("[HOOK] Component unmounted, aborting fetch");
+      log.debug("Component unmounted, aborting fetch");
       return;
     }
 
-    console.log("[HOOK] Fetching action log view...");
+    log.debug("Fetching action log view...");
     setLoading(true);
     setError(null);
 
     try {
       const response = await invoke<CommandResponse<ActionLogViewData>>("get_action_log_view");
 
-      console.log("[HOOK] Response received:", response);
+      log.debug("Response received:", response);
 
       // Only update state if component is still mounted
       if (!isMountedRef.current) {
@@ -104,14 +107,14 @@ export function useActionLogView(options: UseActionLogViewOptions = {}): UseActi
       }
 
       if (response.success && response.data) {
-        console.log("[HOOK] Setting viewData:", response.data);
+        log.debug("Setting viewData:", response.data);
         setViewData(response.data);
         setError(null);
       } else {
         const errorMessage = response.message || "Failed to fetch action log view";
-        console.log("[HOOK] Error - response not successful:", errorMessage);
+        log.debug("Error - response not successful:", errorMessage);
         setError(errorMessage);
-        console.error("get_action_log_view failed:", errorMessage);
+        log.error("get_action_log_view failed:", errorMessage);
       }
     } catch (err) {
       // Only update state if component is still mounted
@@ -121,13 +124,13 @@ export function useActionLogView(options: UseActionLogViewOptions = {}): UseActi
 
       // Tauri commands return string errors when Rust returns Err(String)
       const errorMessage = err instanceof Error ? err.message : String(err);
-      console.log("[HOOK] Exception caught:", errorMessage, "Raw error:", err);
+      log.debug("Exception caught:", errorMessage, err);
       setError(errorMessage);
-      console.error("Failed to fetch action log view:", err);
+      log.error("Failed to fetch action log view:", err);
     } finally {
       // Only update state if component is still mounted
       if (isMountedRef.current) {
-        console.log("[HOOK] Fetch complete, setting loading=false");
+        log.debug("Fetch complete, setting loading=false");
         setLoading(false);
       }
     }
@@ -137,7 +140,7 @@ export function useActionLogView(options: UseActionLogViewOptions = {}): UseActi
    * Public refresh function that can be called manually.
    */
   const refresh = useCallback(async () => {
-    console.log("[HOOK] refresh() called");
+    log.debug("refresh() called");
     await fetchData();
   }, [fetchData]);
 
@@ -166,14 +169,14 @@ export function useActionLogView(options: UseActionLogViewOptions = {}): UseActi
 
   // Subscribe to ActionLogManager refresh triggers (e.g., from tree events)
   useEffect(() => {
-    console.log("[HOOK] Subscribing to ActionLogManager refresh triggers");
+    log.debug("Subscribing to ActionLogManager refresh triggers");
     const unsubscribe = actionLogManager.onRefreshNeeded(() => {
-      console.log("[HOOK] ActionLogManager triggered refresh");
+      log.debug("ActionLogManager triggered refresh");
       refresh();
     });
 
     return () => {
-      console.log("[HOOK] Unsubscribing from ActionLogManager");
+      log.debug("Unsubscribing from ActionLogManager");
       unsubscribe();
     };
   }, [refresh]);

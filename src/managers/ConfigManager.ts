@@ -9,6 +9,9 @@
  */
 
 import { instanceStorage } from "@/lib/instance-storage";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("ConfigManager");
 
 // Key for storing the config's projectId in localStorage
 // This is SEPARATE from "qontinui-selected-project" which stores the runner's UI selection
@@ -22,16 +25,13 @@ class ConfigManagerClass {
   constructor() {
     ConfigManagerClass.instanceCount++;
     this.instanceId = ConfigManagerClass.instanceCount;
-    console.log(`[CONFIG_MANAGER] Instance #${this.instanceId} created`);
+    log.debug(`Instance #${this.instanceId} created`);
 
     // Restore projectId from localStorage if this is a new instance (e.g., after HMR)
     const stored = instanceStorage.getItem(CONFIG_PROJECT_ID_KEY);
     if (stored) {
       this.currentProjectId = stored;
-      console.log(
-        `[CONFIG_MANAGER #${this.instanceId}] Restored projectId from localStorage:`,
-        stored,
-      );
+      log.debug(`Instance #${this.instanceId} Restored projectId from localStorage:`, stored);
     }
   }
 
@@ -41,16 +41,16 @@ class ConfigManagerClass {
    * Also persists to localStorage to survive module reloads.
    */
   setProjectId(projectId: string | null): void {
-    console.log(`[CONFIG_MANAGER #${this.instanceId}] setProjectId called with:`, projectId);
+    log.debug(`Instance #${this.instanceId} setProjectId called with:`, projectId);
     this.currentProjectId = projectId;
 
     // Persist to localStorage for robustness against HMR/module reloads
     if (projectId) {
       instanceStorage.setItem(CONFIG_PROJECT_ID_KEY, projectId);
-      console.log(`[CONFIG_MANAGER #${this.instanceId}] Project ID set and persisted:`, projectId);
+      log.debug(`Instance #${this.instanceId} Project ID set and persisted:`, projectId);
     } else {
       instanceStorage.removeItem(CONFIG_PROJECT_ID_KEY);
-      console.log(`[CONFIG_MANAGER #${this.instanceId}] Project ID cleared`);
+      log.debug(`Instance #${this.instanceId} Project ID cleared`);
     }
   }
 
@@ -64,8 +64,8 @@ class ConfigManagerClass {
   getProjectId(): string | null {
     // 1. Check in-memory value first
     if (this.currentProjectId) {
-      console.log(
-        `[CONFIG_MANAGER #${this.instanceId}] getProjectId returning in-memory projectId:`,
+      log.debug(
+        `Instance #${this.instanceId} getProjectId returning in-memory projectId:`,
         this.currentProjectId,
       );
       return this.currentProjectId;
@@ -74,8 +74,8 @@ class ConfigManagerClass {
     // 2. Check localStorage for persisted config projectId
     const configProjectId = instanceStorage.getItem(CONFIG_PROJECT_ID_KEY);
     if (configProjectId) {
-      console.log(
-        `[CONFIG_MANAGER #${this.instanceId}] getProjectId returning localStorage config projectId:`,
+      log.debug(
+        `Instance #${this.instanceId} getProjectId returning localStorage config projectId:`,
         configProjectId,
       );
       // Restore to in-memory for future calls
@@ -84,8 +84,8 @@ class ConfigManagerClass {
     }
 
     // 3. Fall back to runner's UI selection (only for configs without explicit projectId)
-    console.log(
-      `[CONFIG_MANAGER #${this.instanceId}] getProjectId: no config projectId, checking selected-project fallback`,
+    log.debug(
+      `Instance #${this.instanceId} getProjectId: no config projectId, checking selected-project fallback`,
     );
     const parsed = instanceStorage.getJSON<{ selectedProjectId?: string } | null>(
       "qontinui-selected-project",
@@ -93,15 +93,13 @@ class ConfigManagerClass {
     );
     if (parsed) {
       const fallbackId = parsed.selectedProjectId || null;
-      console.log(
-        `[CONFIG_MANAGER #${this.instanceId}] getProjectId returning selected-project fallback:`,
+      log.debug(
+        `Instance #${this.instanceId} getProjectId returning selected-project fallback:`,
         fallbackId,
       );
       return fallbackId;
     }
-    console.log(
-      `[CONFIG_MANAGER #${this.instanceId}] getProjectId returning null (no projectId found)`,
-    );
+    log.debug(`Instance #${this.instanceId} getProjectId returning null (no projectId found)`);
     return null;
   }
 
@@ -112,7 +110,7 @@ class ConfigManagerClass {
   clear(): void {
     this.currentProjectId = null;
     instanceStorage.removeItem(CONFIG_PROJECT_ID_KEY);
-    console.log(`[CONFIG_MANAGER #${this.instanceId}] State cleared`);
+    log.debug(`Instance #${this.instanceId} State cleared`);
   }
 }
 

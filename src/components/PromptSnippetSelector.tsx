@@ -108,6 +108,19 @@ export function PromptSnippetSelector({
     return matchesSearch && matchesCategory;
   });
 
+  const handleClose = useCallback(() => {
+    setIsOpen(false);
+    onClose?.();
+  }, [onClose]);
+
+  const handleSelect = useCallback(
+    (snippet: PromptSnippet) => {
+      onSelect(snippet.content);
+      handleClose();
+    },
+    [onSelect, handleClose],
+  );
+
   // Handle keyboard navigation
   useEffect(() => {
     if (!isOpen) return;
@@ -137,8 +150,7 @@ export function PromptSnippetSelector({
 
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen, filteredSnippets, selectedIndex]);
+  }, [isOpen, filteredSnippets, selectedIndex, handleSelect, handleClose]);
 
   // Scroll selected item into view
   useEffect(() => {
@@ -169,18 +181,7 @@ export function PromptSnippetSelector({
 
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen]);
-
-  const handleSelect = (snippet: PromptSnippet) => {
-    onSelect(snippet.content);
-    handleClose();
-  };
-
-  const handleClose = () => {
-    setIsOpen(false);
-    onClose?.();
-  };
+  }, [isOpen, handleClose]);
 
   const toggleOpen = () => {
     setIsOpen(!isOpen);

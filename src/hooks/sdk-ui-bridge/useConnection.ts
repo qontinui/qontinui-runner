@@ -88,8 +88,7 @@ export function useConnection(
         return false;
       }
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
+    [fetchElements, clearElementState],
   );
 
   // =========================================================================

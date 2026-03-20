@@ -27,6 +27,9 @@ import type { DashboardStatus } from "../../hooks/dashboard/useDashboardState";
 import type { StepStats } from "@/components/widgets/shared/types";
 import type { CommandResponse } from "../../types/displayProfile";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("Dashboard");
 
 // Register widgets at module load time (before any component renders)
 // This ensures widgets are available when hooks run
@@ -221,30 +224,30 @@ export function DashboardPage({
 
   // Handle stop execution - works for unified workflows, GUI automation, and flow execution
   const handleStop = useCallback(async () => {
-    console.log("[DASHBOARD] Stop execution called");
+    log.debug("Stop execution called");
     const taskId = state.taskInfo?.taskId;
     let stopped = false;
 
     // 1. If a flow is active, cancel it via Tauri command
     if (isFlowActive && flowExecutionData.instanceId) {
       try {
-        console.log(`[DASHBOARD] Cancelling flow execution: ${flowExecutionData.instanceId}`);
+        log.debug(`Cancelling flow execution: ${flowExecutionData.instanceId}`);
         const result = await invoke<boolean>("cancel_flow_execution", {
           instanceId: flowExecutionData.instanceId,
         });
         if (result) {
-          console.log("[DASHBOARD] Flow execution cancelled successfully");
+          log.debug("Flow execution cancelled successfully");
           stopped = true;
         }
       } catch (error) {
-        console.error("[DASHBOARD] Failed to cancel flow execution:", error);
+        console.error("[Dashboard] Failed to cancel flow execution:", error);
       }
     }
 
     // 2. Stop unified workflow (AI task) via HTTP API if we have a task ID
     if (taskId) {
       try {
-        console.log(`[DASHBOARD] Stopping unified workflow: ${taskId}`);
+        log.debug(`Stopping unified workflow: ${taskId}`);
         const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/stop`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -252,12 +255,12 @@ export function DashboardPage({
         if (response.ok) {
           const data = await response.json();
           if (data.success) {
-            console.log("[DASHBOARD] Unified workflow stopped successfully");
+            log.debug("Unified workflow stopped successfully");
             stopped = true;
           }
         }
       } catch (error) {
-        console.error("[DASHBOARD] Failed to stop unified workflow:", error);
+        console.error("[Dashboard] Failed to stop unified workflow:", error);
       }
     }
 
@@ -265,12 +268,12 @@ export function DashboardPage({
     try {
       const result = await invoke<CommandResponse>("stop_execution");
       if (result.success) {
-        console.log("[DASHBOARD] GUI execution stopped successfully");
+        log.debug("GUI execution stopped successfully");
         stopped = true;
       }
     } catch {
       // This may fail if no GUI execution is running, which is fine
-      console.log("[DASHBOARD] No GUI execution to stop (or already stopped)");
+      log.debug("No GUI execution to stop (or already stopped)");
     }
 
     if (stopped) {
@@ -288,24 +291,24 @@ export function DashboardPage({
         const flowIsPaused =
           flowExecutionData.status === "paused" || flowExecutionData.status === "waiting_for_input";
         if (flowIsPaused) {
-          console.log(`[DASHBOARD] Resume flow execution: ${flowExecutionData.instanceId}`);
+          log.debug(`Resume flow execution: ${flowExecutionData.instanceId}`);
           const result = await invoke<boolean>("resume_flow_execution", {
             instanceId: flowExecutionData.instanceId,
           });
           if (result) {
-            console.log("[DASHBOARD] Flow execution resumed successfully");
+            log.debug("Flow execution resumed successfully");
           }
         } else {
-          console.log(`[DASHBOARD] Pause flow execution: ${flowExecutionData.instanceId}`);
+          log.debug(`Pause flow execution: ${flowExecutionData.instanceId}`);
           const result = await invoke<boolean>("pause_flow_execution", {
             instanceId: flowExecutionData.instanceId,
           });
           if (result) {
-            console.log("[DASHBOARD] Flow execution paused successfully");
+            log.debug("Flow execution paused successfully");
           }
         }
       } catch (error) {
-        console.error("[DASHBOARD] Failed to pause/resume flow execution:", error);
+        console.error("[Dashboard] Failed to pause/resume flow execution:", error);
       }
       return;
     }
@@ -323,7 +326,7 @@ export function DashboardPage({
           const taskIsPaused = stateData.is_paused === true;
 
           if (taskIsPaused) {
-            console.log(`[DASHBOARD] Unpausing unified workflow: ${taskId}`);
+            log.debug(`Unpausing unified workflow: ${taskId}`);
             const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/unpause`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -331,13 +334,13 @@ export function DashboardPage({
             if (response.ok) {
               const data = await response.json();
               if (data.success) {
-                console.log("[DASHBOARD] Unified workflow resumed successfully");
+                log.debug("Unified workflow resumed successfully");
                 setIsPaused(false);
                 return;
               }
             }
           } else {
-            console.log(`[DASHBOARD] Pausing unified workflow: ${taskId}`);
+            log.debug(`Pausing unified workflow: ${taskId}`);
             const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/pause`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -345,7 +348,7 @@ export function DashboardPage({
             if (response.ok) {
               const data = await response.json();
               if (data.success) {
-                console.log("[DASHBOARD] Unified workflow paused successfully");
+                log.debug("Unified workflow paused successfully");
                 setIsPaused(true);
                 return;
               }
@@ -353,7 +356,7 @@ export function DashboardPage({
           }
         }
       } catch (error) {
-        console.error("[DASHBOARD] Failed to pause/resume unified workflow:", error);
+        console.error("[Dashboard] Failed to pause/resume unified workflow:", error);
       }
       // Do not fall through to GUI automation IPC for unified workflows
       return;
@@ -362,22 +365,22 @@ export function DashboardPage({
     // Fallback: Handle GUI automation pause/resume via Tauri IPC
     try {
       if (isPaused) {
-        console.log("[DASHBOARD] Resume execution called");
+        log.debug("Resume execution called");
         const result = await invoke<CommandResponse>("resume_execution");
         if (result.success) {
-          console.log("[DASHBOARD] Execution resumed successfully");
+          log.debug("Execution resumed successfully");
           setIsPaused(false);
         }
       } else {
-        console.log("[DASHBOARD] Pause execution called");
+        log.debug("Pause execution called");
         const result = await invoke<CommandResponse>("pause_execution");
         if (result.success) {
-          console.log("[DASHBOARD] Execution paused successfully");
+          log.debug("Execution paused successfully");
           setIsPaused(true);
         }
       }
     } catch {
-      console.log("[DASHBOARD] Pause/resume not available for this workflow type");
+      log.debug("Pause/resume not available for this workflow type");
     }
   }, [
     isPaused,

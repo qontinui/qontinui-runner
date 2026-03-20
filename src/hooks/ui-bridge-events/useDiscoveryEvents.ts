@@ -18,8 +18,34 @@ export function useDiscoveryEvents(
 
       switch (type) {
         case "discover": {
-          const { options } = payload;
-          const result = await currentBridge.discover(options);
+          // Extract options from nested payload.options or top-level payload fields
+          const discoverSource = (payload.options ?? payload) as Record<string, unknown>;
+          const discoverOptions: Record<string, unknown> = {};
+          const discoverKeys = [
+            "interactive_only",
+            "interactiveOnly",
+            "includeHidden",
+            "include_hidden",
+            "element_type",
+            "types",
+            "text",
+            "role",
+            "label",
+            "selector",
+            "limit",
+          ];
+          for (const key of discoverKeys) {
+            if (discoverSource[key] !== undefined) {
+              const mappedKey =
+                key === "interactive_only"
+                  ? "interactiveOnly"
+                  : key === "include_hidden"
+                    ? "includeHidden"
+                    : key;
+              discoverOptions[mappedKey] = discoverSource[key];
+            }
+          }
+          const result = await currentBridge.discover(discoverOptions);
 
           await sendResponse({
             requestId,
@@ -32,11 +58,40 @@ export function useDiscoveryEvents(
         }
 
         case "find": {
-          const findParams = payload.params ?? payload.body ?? {};
-          const discovered = await currentBridge.discover({
-            ...(findParams as Record<string, unknown>),
-            includeHidden: true,
-          });
+          // The Rust backend merges the HTTP request body at the top level
+          // of the payload (alongside requestId and type). Extract known
+          // FindRequest fields from the payload itself, falling back to
+          // nested params/body for backward compatibility.
+          const nested = payload.params ?? payload.body;
+          const source = (nested && typeof nested === "object" ? nested : payload) as Record<
+            string,
+            unknown
+          >;
+          const findOptions: Record<string, unknown> = { includeHidden: true };
+          const findKeys = [
+            "element_type",
+            "types",
+            "text",
+            "exact_text",
+            "role",
+            "label",
+            "root",
+            "selector",
+            "interactiveOnly",
+            "interactive_only",
+            "includeContent",
+            "contentOnly",
+            "includeHidden",
+            "limit",
+          ];
+          for (const key of findKeys) {
+            if (source[key] !== undefined) {
+              // Map snake_case interactive_only to camelCase interactiveOnly
+              const mappedKey = key === "interactive_only" ? "interactiveOnly" : key;
+              findOptions[mappedKey] = source[key];
+            }
+          }
+          const discovered = await currentBridge.discover(findOptions);
           await sendResponse({
             requestId,
             type,

@@ -14,6 +14,9 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { setApiPort } from "@/lib/runner-api";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("ApiReady");
 
 /** Fetch the actual port from the backend and configure the API base URL. */
 async function syncApiPort(): Promise<void> {
@@ -21,7 +24,7 @@ async function syncApiPort(): Promise<void> {
     const port = await invoke<number>("get_api_port");
     if (port && port > 0) {
       setApiPort(port);
-      console.log("[API] API port set to", port);
+      log.debug("API port set to", port);
     }
   } catch {
     // Backend not ready yet — will retry
@@ -49,7 +52,7 @@ export function useApiReady(): boolean {
 
     listen<number>("api-ready", (event) => {
       if (!cancelled) {
-        console.log("[API] API server ready (event, port:", event.payload, ")");
+        log.debug("API server ready (event, port:", event.payload, ")");
         if (event.payload && event.payload > 0) {
           setApiPort(event.payload);
         }
@@ -64,7 +67,7 @@ export function useApiReady(): boolean {
         invoke<boolean>("is_api_ready")
           .then((ready) => {
             if (ready && !cancelled) {
-              console.log("[API] API server already ready (IPC post-listen check)");
+              log.debug("API server already ready (IPC post-listen check)");
               markReady();
             }
           })
@@ -77,7 +80,7 @@ export function useApiReady(): boolean {
       invoke<boolean>("is_api_ready")
         .then((ready) => {
           if (ready && !cancelled) {
-            console.log("[API] API server ready (poll)");
+            log.debug("API server ready (poll)");
             markReady();
           }
         })
