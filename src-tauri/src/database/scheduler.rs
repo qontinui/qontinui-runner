@@ -4,6 +4,7 @@
 //! CRUD for scheduled_tasks, scheduler_history, and scheduler_settings.
 
 use rusqlite::{params, OptionalExtension};
+use tracing::warn;
 
 use super::CheckpointDb;
 use crate::scheduler::{
@@ -44,14 +45,25 @@ fn row_to_scheduled_task(row: &rusqlite::Row) -> rusqlite::Result<ScheduledTask>
         "cron" => ScheduleExpression::Cron(schedule_value),
         "once" => ScheduleExpression::Once(schedule_value),
         "interval" => {
-            let secs: u64 = schedule_value.parse().unwrap_or(0);
+            let secs: u64 = match schedule_value.parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Invalid schedule interval value '{}': {}; defaulting to 60s", schedule_value, e);
+                    60
+                }
+            };
             ScheduleExpression::Interval(secs)
         }
         _ => ScheduleExpression::Once(schedule_value),
     };
 
-    let task: ScheduledTaskType =
-        serde_json::from_str(&task_config_json).unwrap_or_default();
+    let task: ScheduledTaskType = match serde_json::from_str(&task_config_json) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("Failed to deserialize task config '{}': {}; using default", task_config_json, e);
+            ScheduledTaskType::default()
+        }
+    };
 
     Ok(ScheduledTask {
         id: row.get(0)?,

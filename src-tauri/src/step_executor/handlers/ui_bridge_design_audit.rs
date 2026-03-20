@@ -27,10 +27,19 @@ impl StepHandler for UiBridgeDesignAuditHandler {
         context: &HandlerContext,
     ) -> StepHandlerResult {
         let self_base = crate::mcp::types::get_self_base_url(&context.app_state);
-        let client = reqwest::Client::builder()
+        let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_default();
+        {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to create HTTP client: {}", e);
+                return StepHandlerResult::failure(format!(
+                    "Failed to create HTTP client: {}",
+                    e
+                ));
+            }
+        };
 
         // Step 1: Check SDK connectivity
         let status_url = format!("{}/ui-bridge/sdk/status", self_base);

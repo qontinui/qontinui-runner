@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Result of a log migration operation.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -170,23 +170,32 @@ pub fn migrate_logs_to_sqlite(
 
     // Clear migrated JSONL files to prevent unbounded growth.
     // These files are write-ahead buffers — once migrated to DB they are redundant.
-    let migrated_files = [
-        "runner-general.jsonl",
-        "runner-actions.jsonl",
-        "runner-image-recognition.jsonl",
-        "runner-playwright.jsonl",
-        "runner-api-requests.jsonl",
-        "ai-output.jsonl",
-    ];
-    for filename in migrated_files {
-        let path = dev_logs_dir.join(filename);
-        if path.exists() {
-            if let Err(e) = std::fs::remove_file(&path) {
-                debug!("Failed to clear migrated log file {}: {}", filename, e);
-            } else {
-                debug!("Cleared migrated log file: {}", filename);
+    // Only delete if migration had no errors to avoid data loss.
+    if result.errors.is_empty() {
+        let migrated_files = [
+            "runner-general.jsonl",
+            "runner-actions.jsonl",
+            "runner-image-recognition.jsonl",
+            "runner-playwright.jsonl",
+            "runner-api-requests.jsonl",
+            "ai-output.jsonl",
+        ];
+        for filename in migrated_files {
+            let path = dev_logs_dir.join(filename);
+            if path.exists() {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    debug!("Failed to clear migrated log file {}: {}", filename, e);
+                } else {
+                    debug!("Cleared migrated log file: {}", filename);
+                }
             }
         }
+    } else {
+        warn!(
+            "Skipping log file deletion due to {} migration error(s): {:?}",
+            result.errors.len(),
+            result.errors
+        );
     }
 
     Ok(result)

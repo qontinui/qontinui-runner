@@ -132,25 +132,67 @@ pub fn consolidate_ai_output(
 
     // Parse entries with timestamp and source
     use std::io::BufRead;
-    let mut entries: Vec<ParsedEntry> = reader
-        .lines()
-        .filter_map(|line_result| line_result.ok())
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
-        .filter_map(|entry| {
-            let ts = parse_jsonl_timestamp(&entry)?;
-            if ts < start_time || ts > end {
-                return None;
+    let mut entries: Vec<ParsedEntry> = Vec::new();
+    let mut failed_reads = 0usize;
+    let mut failed_json_parses = 0usize;
+    let mut failed_entry_parses = 0usize;
+
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => {
+                failed_reads += 1;
+                continue;
             }
-            let source = entry.get("source")?.as_str()?.to_string();
-            let line = entry.get("line")?.as_str()?.to_string();
-            Some(ParsedEntry {
-                timestamp: ts,
-                source,
-                line,
-            })
-        })
-        .collect();
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => {
+                failed_json_parses += 1;
+                continue;
+            }
+        };
+        let ts = match parse_jsonl_timestamp(&entry) {
+            Some(t) => t,
+            None => {
+                failed_entry_parses += 1;
+                continue;
+            }
+        };
+        if ts < start_time || ts > end {
+            continue;
+        }
+        let source = match entry.get("source").and_then(|s| s.as_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                failed_entry_parses += 1;
+                continue;
+            }
+        };
+        let line_val = match entry.get("line").and_then(|l| l.as_str()) {
+            Some(l) => l.to_string(),
+            None => {
+                failed_entry_parses += 1;
+                continue;
+            }
+        };
+        entries.push(ParsedEntry {
+            timestamp: ts,
+            source,
+            line: line_val,
+        });
+    }
+
+    let total_failed = failed_reads + failed_json_parses + failed_entry_parses;
+    if total_failed > 0 {
+        warn!(
+            "Log consolidation: {} total parse failures ({} read errors, {} JSON parse errors, {} missing fields)",
+            total_failed, failed_reads, failed_json_parses, failed_entry_parses
+        );
+    }
 
     let total_entries = entries.len();
 
