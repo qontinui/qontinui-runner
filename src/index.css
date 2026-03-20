@@ -1,8 +1,122 @@
-@import "@qontinui/design-tokens/css";
+@import "@qontinui/design-tokens/css" layer(base);
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+@plugin "tailwindcss-animate";
+
+@source "../../qontinui-workflow-ui/src/**/*.{js,ts,tsx}";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Custom container utility - replaces the v3 container config.
+ * Tailwind v4 no longer auto-generates the container utility from config,
+ * so we define it explicitly.
+ */
+@utility container {
+  margin-inline: auto;
+  padding-inline: 2rem;
+  @media (width >= 1400px) {
+    max-width: 1400px;
+  }
+}
+
+@theme {
+  /* Colors from tailwind.config.js */
+  --color-border: hsl(var(--border));
+  --color-border-primary: var(--qontinui-border-subtle);
+  --color-border-secondary: var(--qontinui-border-default);
+
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  /* Design system colors from shared package */
+  --color-brand-primary: var(--qontinui-brand-primary);
+  --color-brand-secondary: var(--qontinui-brand-secondary);
+  --color-brand-success: var(--qontinui-brand-success);
+
+  --color-surface-canvas: var(--qontinui-surface-canvas);
+  --color-surface-raised: var(--qontinui-surface-raised);
+  --color-surface-hover: var(--qontinui-surface-hover);
+  --color-surface-active: var(--qontinui-surface-active);
+
+  --color-border-ds-subtle: var(--qontinui-border-subtle);
+  --color-border-ds-default: var(--qontinui-border-default);
+  --color-border-ds-strong: var(--qontinui-border-strong);
+  --color-border-ds-interactive: var(--qontinui-border-interactive);
+
+  --color-text-primary: var(--qontinui-text-primary);
+  --color-text-secondary: var(--qontinui-text-secondary);
+  --color-text-muted: var(--qontinui-text-muted);
+  --color-text-inverse: var(--qontinui-text-inverse);
+
+  --color-success: var(--qontinui-success);
+  --color-success-muted: var(--qontinui-success-muted);
+  --color-warning: var(--qontinui-warning);
+  --color-warning-muted: var(--qontinui-warning-muted);
+  --color-error: var(--qontinui-error);
+  --color-error-muted: var(--qontinui-error-muted);
+  --color-info: var(--qontinui-info);
+  --color-info-muted: var(--qontinui-info-muted);
+
+  --color-glow-primary: var(--qontinui-glow-primary);
+  --color-glow-secondary: var(--qontinui-glow-secondary);
+  --color-glow-success: var(--qontinui-glow-success);
+
+  /* Border radius */
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+
+  /* Animations */
+  --animate-accordion-down: accordion-down 0.2s ease-out;
+  --animate-accordion-up: accordion-up 0.2s ease-out;
+  --animate-indeterminate-progress: indeterminate-progress 1.5s ease-in-out infinite;
+  --animate-pulse-subtle: pulse-subtle 2s ease-in-out infinite;
+
+  @keyframes accordion-down {
+    from { height: 0; }
+    to { height: var(--radix-accordion-content-height); }
+  }
+
+  @keyframes accordion-up {
+    from { height: var(--radix-accordion-content-height); }
+    to { height: 0; }
+  }
+
+  @keyframes indeterminate-progress {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(400%); }
+  }
+
+  @keyframes pulse-subtle {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.8; }
+  }
+}
 
 @layer base {
   :root {
@@ -203,7 +317,9 @@
 
   /* Panel content with max height and scroll */
   .panel-content-scroll {
-    @apply max-h-48 overflow-auto px-2 pb-2 scrollbar-dark;
+    @apply max-h-48 overflow-auto px-2 pb-2;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
   }
 
   /* ============================================
@@ -232,7 +348,7 @@
 
   /* Item card icon */
   .item-card-icon {
-    @apply w-5 h-5 flex-shrink-0 mt-0.5;
+    @apply w-5 h-5 shrink-0 mt-0.5;
   }
 
   /* Item card content */
@@ -252,7 +368,7 @@
 
   /* Item card action button */
   .item-card-action {
-    @apply flex-shrink-0 p-2 rounded-lg transition-colors disabled:opacity-50;
+    @apply shrink-0 p-2 rounded-lg transition-colors disabled:opacity-50;
   }
 
   /* ============================================
@@ -803,37 +919,37 @@
   }
 
   /* Dark themed scrollbar — kept for explicit opt-in, matches global defaults */
-  .scrollbar-dark {
+  @utility scrollbar-dark {
     scrollbar-width: thin;
     scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
-  }
 
-  .scrollbar-dark::-webkit-scrollbar {
-    width: 4px;
-    height: 4px;
-  }
+    &::-webkit-scrollbar {
+      width: 4px;
+      height: 4px;
+    }
 
-  .scrollbar-dark::-webkit-scrollbar-track {
-    background: transparent;
-  }
+    &::-webkit-scrollbar-track {
+      background: transparent;
+    }
 
-  .scrollbar-dark::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.12);
-    border-radius: 2px;
-  }
+    &::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.12);
+      border-radius: 2px;
+    }
 
-  .scrollbar-dark::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.22);
+    &::-webkit-scrollbar-thumb:hover {
+      background: rgba(255, 255, 255, 0.22);
+    }
   }
 
   /* Hide scrollbar utility */
-  .scrollbar-none {
+  @utility scrollbar-none {
     scrollbar-width: none;
     -ms-overflow-style: none;
-  }
 
-  .scrollbar-none::-webkit-scrollbar {
-    display: none;
+    &::-webkit-scrollbar {
+      display: none;
+    }
   }
 
   /* ============================================
