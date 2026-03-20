@@ -60,7 +60,7 @@
     "vite": "^7.1.5"
   },
   "devDependencies": {
-    "@eslint/js": "^9.36.0",
+    "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.57.0",
     "@storybook/addon-essentials": "^8.5.3",
     "@storybook/addon-links": "^8.5.3",
@@ -72,14 +72,15 @@
     "@typescript-eslint/parser": "^8.57.1",
     "@vitest/coverage-v8": "^4.1.0",
     "cross-env": "^7.0.3",
-    "eslint": "^9.36.0",
+    "eslint": "^10.1.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^5.2.0",
     "prettier": "^3.6.2",
     "storybook": "^8.5.3",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.0"
+    "vitest": "^4.1.0",
+    "globals": "^17.4.0"
   },
   "name": "qontinui-runner",
   "private": true,

@@ -32,6 +32,9 @@ export default [
     rules: {
       ...typescript.configs.recommended.rules,
       ...reactHooks.configs.recommended.rules,
+      // New in ESLint v10 / @eslint/js v10 — downgrade to warn to avoid breaking existing code
+      "no-useless-assignment": "warn",
+      "preserve-caught-error": "warn",
       "react/react-in-jsx-scope": "off",
       "react/prop-types": "off",
       "@typescript-eslint/no-explicit-any": "warn",
