@@ -661,7 +661,7 @@ export function AiGeneratePanel({
                           placeholder="Workflow title (optional)"
                           value={entry.title}
                           onChange={(e) => updateBatchEntry(entry.id, "title", e.target.value)}
-                          className="flex-1 min-w-0 px-2 py-1 bg-zinc-900/50 border border-zinc-700/50 rounded text-zinc-200 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                          className="flex-1 min-w-0 px-2 py-1 bg-zinc-900/50 border border-zinc-700/50 rounded text-zinc-200 text-xs focus:outline-hidden focus:ring-1 focus:ring-blue-500/50"
                         />
                         <button
                           onClick={() => removeBatchEntry(entry.id)}
@@ -677,7 +677,7 @@ export function AiGeneratePanel({
                         value={entry.prompt}
                         onChange={(e) => updateBatchEntry(entry.id, "prompt", e.target.value)}
                         rows={6}
-                        className="w-full px-2 py-1.5 bg-zinc-900/50 border border-zinc-700/50 rounded text-zinc-200 text-xs resize-none focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                        className="w-full px-2 py-1.5 bg-zinc-900/50 border border-zinc-700/50 rounded text-zinc-200 text-xs resize-none focus:outline-hidden focus:ring-1 focus:ring-blue-500/50"
                       />
                     </div>
                   ))}
@@ -790,7 +790,7 @@ export function AiGeneratePanel({
                 </div>
                 <textarea
                   id="generate-description"
-                  className="w-full flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 text-sm min-h-[200px] resize-none focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                  className="w-full flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 text-sm min-h-[200px] resize-none focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
                   placeholder="e.g., Run TypeScript type checking on the web frontend and fix any errors\ne.g., Check the runner API health, then verify UI Bridge elements are registered\ne.g., Run pytest with coverage and fix failing tests"
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
@@ -896,7 +896,7 @@ export function AiGeneratePanel({
 
                   {contextTab === "custom" && (
                     <textarea
-                      className="w-full min-h-[100px] px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 text-xs font-mono resize-none focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                      className="w-full min-h-[100px] px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 text-xs font-mono resize-none focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
                       placeholder="Paste additional context here (e.g., CLAUDE.md content, project notes, API docs)..."
                       value={inlineContext}
                       onChange={(e) => setInlineContext(e.target.value)}
@@ -910,7 +910,7 @@ export function AiGeneratePanel({
                       </p>
                       <div className="flex gap-2">
                         <input
-                          className="flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                          className="flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
                           placeholder="C:\path\to\CLAUDE.md"
                           value={filePath}
                           onChange={(e) => setFilePath(e.target.value)}
@@ -1005,7 +1005,7 @@ export function AiGeneratePanel({
                                   }`}
                                 >
                                   <div
-                                    className={`flex-shrink-0 w-4 h-4 rounded border flex items-center justify-center ${
+                                    className={`shrink-0 w-4 h-4 rounded border flex items-center justify-center ${
                                       isSelected
                                         ? "border-emerald-500 bg-emerald-500/20 text-emerald-400"
                                         : "border-zinc-600 bg-zinc-800"
@@ -1064,7 +1064,7 @@ export function AiGeneratePanel({
                               }`}
                             >
                               <div
-                                className={`flex-shrink-0 w-3.5 h-3.5 rounded border flex items-center justify-center ${
+                                className={`shrink-0 w-3.5 h-3.5 rounded border flex items-center justify-center ${
                                   isSelected
                                     ? "border-emerald-500/60 bg-emerald-500/15 text-emerald-400"
                                     : "border-zinc-600 bg-zinc-800"
@@ -1109,7 +1109,7 @@ export function AiGeneratePanel({
                       </label>
                       <input
                         id="generate-category"
-                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
                         placeholder="e.g., testing, deployment"
                         value={category}
                         onChange={(e) => setCategory(e.target.value)}
@@ -1121,7 +1121,7 @@ export function AiGeneratePanel({
                       </label>
                       <input
                         id="generate-tags"
-                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
                         placeholder="e.g., python, lint"
                         value={tagsInput}
                         onChange={(e) => setTagsInput(e.target.value)}
@@ -1134,7 +1134,7 @@ export function AiGeneratePanel({
                       <input
                         id="generate-max-iterations"
                         type="number"
-                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
                         placeholder="10"
                         value={maxIterations}
                         onChange={(e) => setMaxIterations(e.target.value)}
@@ -1151,7 +1151,7 @@ export function AiGeneratePanel({
                           setProvider(e.target.value);
                           setModel(""); // Reset model when provider changes
                         }}
-                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
                       >
                         <option value="">Default (from Settings)</option>
                         {PROVIDERS.map((p) => (
@@ -1169,7 +1169,7 @@ export function AiGeneratePanel({
                         id="generate-model"
                         value={model}
                         onChange={(e) => setModel(e.target.value)}
-                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
                       >
                         <option value="">Default (from Settings)</option>
                         {modelsForProvider.map((m) => (
@@ -1196,7 +1196,7 @@ export function AiGeneratePanel({
                       <input
                         id="generate-max-fix-iterations"
                         type="number"
-                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
                         placeholder="3"
                         value={maxFixIterations}
                         onChange={(e) => setMaxFixIterations(e.target.value)}
@@ -1222,7 +1222,7 @@ export function AiGeneratePanel({
                         onChange={(e) =>
                           setDiscoveryMode(e.target.value as "auto" | "enabled" | "disabled")
                         }
-                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                        className="w-full px-3 py-1.5 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm h-8 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
                       >
                         <option value="auto">Auto</option>
                         <option value="enabled">Enabled (all tools)</option>
@@ -1308,7 +1308,7 @@ export function AiGeneratePanel({
                         onChange={(e) =>
                           setVerificationDepth(e.target.value as typeof verificationDepth)
                         }
-                        className="w-full mt-1 px-2 py-1.5 text-sm bg-zinc-800 border border-zinc-600 rounded focus:outline-none focus:ring-1 focus:ring-purple-500/50 text-zinc-200"
+                        className="w-full mt-1 px-2 py-1.5 text-sm bg-zinc-800 border border-zinc-600 rounded focus:outline-hidden focus:ring-1 focus:ring-purple-500/50 text-zinc-200"
                       >
                         <option value="smoke">Smoke — minimal build/render checks</option>
                         <option value="standard">Standard — spec-driven verification</option>
@@ -1350,11 +1350,11 @@ export function AiGeneratePanel({
                         const phaseProvider = cfg?.provider ?? "";
                         const phaseModel = cfg?.model ?? "";
                         const selectClass =
-                          "flex-1 h-7 px-2 rounded bg-zinc-800 border border-zinc-700 text-zinc-200 text-[11px] focus:outline-none focus:ring-2 focus:ring-blue-500/50";
+                          "flex-1 h-7 px-2 rounded bg-zinc-800 border border-zinc-700 text-zinc-200 text-[11px] focus:outline-hidden focus:ring-2 focus:ring-blue-500/50";
                         return (
                           <div key={phase.key} className="flex items-center gap-2">
                             <span
-                              className="text-[11px] text-zinc-400 w-24 flex-shrink-0 truncate"
+                              className="text-[11px] text-zinc-400 w-24 shrink-0 truncate"
                               title={phase.label}
                             >
                               {phase.label}
@@ -1436,11 +1436,11 @@ export function AiGeneratePanel({
       {error && (
         <div className="shrink-0 mx-6 mb-2">
           <div className="flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/30 rounded-md">
-            <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+            <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
             <div className="flex-1 text-sm text-red-400">{error}</div>
             <button
               onClick={() => setError(null)}
-              className="text-red-400/60 hover:text-red-400 flex-shrink-0"
+              className="text-red-400/60 hover:text-red-400 shrink-0"
             >
               <X className="w-3.5 h-3.5" />
             </button>

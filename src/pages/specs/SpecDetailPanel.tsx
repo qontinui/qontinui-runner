@@ -364,7 +364,7 @@ function AddAssertionForm({
         rows={2}
         className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1.5
           text-foreground placeholder:text-muted-foreground/40 resize-none
-          focus:outline-none focus:border-green-500/50"
+          focus:outline-hidden focus:border-green-500/50"
         onKeyDown={(e) => {
           if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();
@@ -444,7 +444,7 @@ function AddAssertionForm({
         placeholder="Target element text..."
         className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1
           text-foreground placeholder:text-muted-foreground/40
-          focus:outline-none focus:border-green-500/50"
+          focus:outline-hidden focus:border-green-500/50"
       />
       {isSpatial && (
         <input
@@ -454,7 +454,7 @@ function AddAssertionForm({
           placeholder="Related target element text..."
           className="w-full text-xs bg-transparent border border-cyan-500/20 rounded px-2 py-1
             text-foreground placeholder:text-muted-foreground/40
-            focus:outline-none focus:border-cyan-500/50"
+            focus:outline-hidden focus:border-cyan-500/50"
         />
       )}
       {assertionType === "minSpacing" && (
@@ -466,7 +466,7 @@ function AddAssertionForm({
             onChange={(e) => setMinGap(Number(e.target.value))}
             min={0}
             className="w-20 text-xs bg-transparent border border-white/10 rounded px-2 py-0.5
-              text-foreground focus:outline-none focus:border-green-500/50"
+              text-foreground focus:outline-hidden focus:border-green-500/50"
           />
         </div>
       )}
@@ -650,7 +650,7 @@ function SetupActionsEditor({
                   placeholder="Target element text..."
                   className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1
                     text-foreground placeholder:text-muted-foreground/40
-                    focus:outline-none focus:border-cyan-500/50"
+                    focus:outline-hidden focus:border-cyan-500/50"
                 />
               )}
 
@@ -662,7 +662,7 @@ function SetupActionsEditor({
                   placeholder="Text to type..."
                   className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1
                     text-foreground placeholder:text-muted-foreground/40
-                    focus:outline-none focus:border-green-500/50"
+                    focus:outline-hidden focus:border-green-500/50"
                 />
               )}
 
@@ -674,7 +674,7 @@ function SetupActionsEditor({
                   placeholder="http://localhost:3001/..."
                   className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1
                     text-foreground placeholder:text-muted-foreground/40
-                    focus:outline-none focus:border-purple-500/50"
+                    focus:outline-hidden focus:border-purple-500/50"
                 />
               )}
 
@@ -689,7 +689,7 @@ function SetupActionsEditor({
                     onChange={(e) => setNewMs(Number(e.target.value))}
                     min={0}
                     className="w-20 text-xs bg-transparent border border-white/10 rounded px-2 py-0.5
-                      text-foreground focus:outline-none focus:border-cyan-500/50"
+                      text-foreground focus:outline-hidden focus:border-cyan-500/50"
                   />
                 </div>
               )}
@@ -861,7 +861,7 @@ function AddGroupForm({
         placeholder="Group name..."
         className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1.5
           text-foreground placeholder:text-muted-foreground/40
-          focus:outline-none focus:border-green-500/50"
+          focus:outline-hidden focus:border-green-500/50"
         onKeyDown={(e) => {
           if (e.key === "Enter") {
             e.preventDefault();
@@ -890,7 +890,7 @@ function AddGroupForm({
           placeholder="Description (optional)"
           className="flex-1 text-[10px] bg-transparent border border-white/10 rounded px-1.5 py-0.5
             text-foreground placeholder:text-muted-foreground/40
-            focus:outline-none focus:border-green-500/50"
+            focus:outline-hidden focus:border-green-500/50"
         />
       </div>
       <div className="flex items-center gap-2 justify-end">

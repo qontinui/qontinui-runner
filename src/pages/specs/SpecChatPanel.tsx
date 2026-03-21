@@ -704,7 +704,7 @@ export function SpecChatPanel({
             className="flex-1 min-h-[28px] px-2 py-1.5 text-xs leading-relaxed rounded resize-none
               bg-white/5 border border-white/10 text-foreground
               placeholder:text-muted-foreground/40
-              focus:outline-none focus:border-purple-500/50
+              focus:outline-hidden focus:border-purple-500/50
               disabled:opacity-40"
             style={{ overflow: "hidden" }}
             onInput={resizeTextarea}
