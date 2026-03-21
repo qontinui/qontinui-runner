@@ -468,6 +468,18 @@ pub struct UnifiedWorkflow {
     #[serde(default)]
     pub enforce_token_budget: bool,
 
+    /// Restrict working directory resolution to the workspace boundary.
+    /// When true, steps cannot resolve paths outside the workspace root.
+    /// Default: false (permissive, current behavior).
+    #[serde(default)]
+    pub strict_cwd: bool,
+
+    /// Tags for per-execution tool whitelisting.
+    /// When non-empty, only skills matching at least one tag are included
+    /// in AI prompt context, reducing prompt bloat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_tags: Vec<String>,
+
     /// Run the workflow in an isolated git worktree.
     /// When true, a new branch and worktree are created before execution.
     /// Changes stay on the worktree branch and can be merged back after review.

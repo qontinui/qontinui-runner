@@ -189,6 +189,12 @@ pub struct Recommendation {
     pub outcome_after_apply: Option<String>,
     pub optimizer_run_id: Option<String>,
     pub created_at: String,
+    /// ID of the eval result validating this recommendation (if evaluated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_result_id: Option<String>,
+    /// Eval status: "untested", "passed", "failed", "inconclusive".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_status: Option<String>,
 }
 
 /// A prompt variant stored in the prompt registry.
@@ -218,6 +224,49 @@ pub struct MetaOptimizerRun {
     pub status: String,
     pub created_at: String,
     pub completed_at: Option<String>,
+}
+
+/// L0 summary of learning outcomes: counts and averages grouped by status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningOutcomeSummaryL0 {
+    pub status: String,
+    pub run_count: i64,
+    pub avg_duration_secs: f64,
+    pub avg_iterations: f64,
+}
+
+/// L1 detail of a learning outcome: core fields without tools_used, files_modified,
+/// error_message (which are large text blobs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningOutcomeDetailL1 {
+    pub id: String,
+    pub task_id: String,
+    pub status: String,
+    pub duration_secs: Option<f64>,
+    pub iterations: Option<i64>,
+    pub workflow_architecture: Option<String>,
+    pub error_type: Option<String>,
+    pub created_at: String,
+}
+
+/// L0 summary of generation feedback: counts grouped by feedback_type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationFeedbackSummaryL0 {
+    pub feedback_type: String,
+    pub total_count: i64,
+    pub avg_rating: Option<f64>,
+}
+
+/// L1 detail of generation feedback: core fields without old_value, new_value
+/// (which can be large JSON blobs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationFeedbackDetailL1 {
+    pub id: String,
+    pub feedback_type: String,
+    pub edited_field: Option<String>,
+    pub rating: Option<i64>,
+    pub workflow_category: Option<String>,
+    pub created_at: String,
 }
 
 /// L0 summary of iteration history across runs: approach patterns and confidence trends.

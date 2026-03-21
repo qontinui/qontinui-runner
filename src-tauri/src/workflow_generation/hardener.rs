@@ -26,7 +26,9 @@ use crate::skills::SkillRegistry;
 use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::generator::extract_json_from_response;
 use crate::workflow_generation::rules;
-use crate::workflow_generation::schema_context::format_skills_for_generator;
+use crate::workflow_generation::schema_context::{
+    format_skills_for_generator, format_skills_for_generator_filtered,
+};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -349,6 +351,7 @@ pub fn run_hardener_agent(
     provider_override: Option<&str>,
     skill_registry: &SkillRegistry,
     insights_section: Option<&str>,
+    tool_tags: Option<&[String]>,
 ) -> (UnifiedWorkflow, Option<HardeningSummary>, Option<String>) {
     // Step 0: Apply deterministic fixups before AI hardening
     let mut workflow = fix_sdk_urls(workflow);
@@ -398,6 +401,7 @@ pub fn run_hardener_agent(
         conn,
         skill_registry,
         insights_section,
+        tool_tags,
     );
     let task_context = TaskContext::from_prompt(&prompt);
 
@@ -1222,6 +1226,7 @@ fn build_hardener_prompt(
     conn: Option<&Connection>,
     skill_registry: &SkillRegistry,
     insights_section: Option<&str>,
+    tool_tags: Option<&[String]>,
 ) -> String {
     let mut prompt = format!(
         r#"You are a verification hardener agent for Qontinui Runner.
@@ -1488,7 +1493,12 @@ verify that the tab has spatial visualization content. Add content-specific chec
     }
 
     // Include skill catalog context so the hardener can match steps to known skills
-    let skills_section = format_skills_for_generator(skill_registry);
+    let skills_section = match tool_tags {
+        Some(tags) if !tags.is_empty() => {
+            format_skills_for_generator_filtered(skill_registry, None, tags, None)
+        }
+        _ => format_skills_for_generator(skill_registry),
+    };
     if !skills_section.is_empty() {
         prompt.push_str(&format!(
             "\n\n{}\nWhen hardening steps, prefer configurations that align with these known skill templates. If a verification step matches a skill's purpose, use the equivalent deterministic configuration from the skill catalog.\n",
@@ -2131,7 +2141,7 @@ mod tests {
             json!({"id": "s1", "type": "prompt", "content": "Check page"}),
         ]);
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None);
+        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None);
         assert!(prompt.contains("Rule 4"));
         assert!(prompt.contains("page navigation"));
     }
@@ -2142,7 +2152,7 @@ mod tests {
             json!({"id": "s1", "type": "command", "command": "curl -s http://localhost:9876/ui-bridge/sdk/ai/search", "mode": "shell"}),
         ]);
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None);
+        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None);
         assert!(prompt.contains("ai/search"));
         assert!(prompt.contains("total"));
         assert!(prompt.contains("grep"));
@@ -2186,7 +2196,7 @@ mod tests {
         workflow.agentic_steps =
             vec![json!({"id": "a1", "type": "prompt", "content": "Implement thumbnails"})];
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None);
+        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None);
         assert!(prompt.contains("Rule 5"));
         assert!(prompt.contains("agentic step"));
         assert!(prompt.contains("verification coverage"));

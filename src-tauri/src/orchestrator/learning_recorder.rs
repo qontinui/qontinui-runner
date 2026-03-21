@@ -33,6 +33,191 @@ pub struct WorkflowOutcome {
     pub total_cost_usd: Option<f64>,
 }
 
+/// Infer technology tags from file paths based on file extensions.
+///
+/// Returns a deduplicated sorted list of technology identifiers.
+pub fn infer_technology_tags(files: &[String]) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut tags = BTreeSet::new();
+
+    for file in files {
+        let lower = file.to_lowercase();
+        // Match by extension
+        if lower.ends_with(".rs") {
+            tags.insert("rust".to_string());
+        }
+        if lower.ends_with(".ts") || lower.ends_with(".tsx") {
+            tags.insert("typescript".to_string());
+        }
+        if lower.ends_with(".js") || lower.ends_with(".jsx") {
+            tags.insert("javascript".to_string());
+        }
+        if lower.ends_with(".py") {
+            tags.insert("python".to_string());
+        }
+        if lower.ends_with(".css") || lower.ends_with(".scss") {
+            tags.insert("css".to_string());
+        }
+        if lower.ends_with(".html") {
+            tags.insert("html".to_string());
+        }
+        if lower.ends_with(".sql") {
+            tags.insert("sql".to_string());
+        }
+        if lower.ends_with(".json") {
+            tags.insert("json".to_string());
+        }
+        if lower.ends_with(".toml") {
+            tags.insert("toml".to_string());
+        }
+        if lower.ends_with(".yaml") || lower.ends_with(".yml") {
+            tags.insert("yaml".to_string());
+        }
+        // Framework/tool detection from path segments
+        if lower.contains("tauri") {
+            tags.insert("tauri".to_string());
+        }
+        if lower.contains("next") || lower.contains("nextjs") {
+            tags.insert("nextjs".to_string());
+        }
+        if lower.contains("react") {
+            tags.insert("react".to_string());
+        }
+    }
+
+    tags.into_iter().collect()
+}
+
+/// Infer domain/area tags from file paths and workflow metadata.
+///
+/// Returns a deduplicated sorted list of domain identifiers.
+pub fn infer_domain_tags(
+    files: &[String],
+    workflow_name: &str,
+    category: &str,
+    has_ui_bridge: bool,
+) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut tags = BTreeSet::new();
+
+    // Infer from file paths
+    for file in files {
+        let lower = file.to_lowercase().replace('\\', "/");
+        if lower.contains("/database/") || lower.contains("/migrations") || lower.contains(".sql")
+        {
+            tags.insert("database".to_string());
+        }
+        if lower.contains("/ui-bridge/") || lower.contains("/ui_bridge/") {
+            tags.insert("ui-bridge".to_string());
+        }
+        if lower.contains("/test") || lower.contains("_test.") || lower.contains(".test.") {
+            tags.insert("testing".to_string());
+        }
+        if lower.contains("/api/") || lower.contains("/mcp/") || lower.contains("/http/") {
+            tags.insert("api".to_string());
+        }
+        if lower.contains("/frontend/") || lower.contains(".tsx") || lower.contains(".jsx") {
+            tags.insert("frontend".to_string());
+        }
+        if lower.contains("/backend/") {
+            tags.insert("backend".to_string());
+        }
+        if lower.contains("/orchestrator/") || lower.contains("/workflow") {
+            tags.insert("orchestration".to_string());
+        }
+        if lower.contains("/meta_optimizer/") || lower.contains("/autoresearch/") {
+            tags.insert("meta-optimizer".to_string());
+        }
+        if lower.contains("/generation/") || lower.contains("generator") {
+            tags.insert("generation".to_string());
+        }
+    }
+
+    // Infer from workflow name
+    let name_lower = workflow_name.to_lowercase();
+    if name_lower.contains("generate") || name_lower.starts_with("ai generate") {
+        tags.insert("generation".to_string());
+    }
+    if name_lower.contains("fix") || name_lower.contains("error") {
+        tags.insert("error-fix".to_string());
+    }
+    if name_lower.contains("test") {
+        tags.insert("testing".to_string());
+    }
+    if name_lower.contains("refactor") {
+        tags.insert("refactoring".to_string());
+    }
+
+    // Infer from category
+    let cat_lower = category.to_lowercase();
+    if cat_lower.contains("autoresearch") {
+        tags.insert("autoresearch".to_string());
+    }
+
+    // From UI Bridge flag
+    if has_ui_bridge {
+        tags.insert("ui-bridge".to_string());
+    }
+
+    tags.into_iter().collect()
+}
+
+/// Compute a complexity tier from step counts, iteration count, and duration.
+///
+/// - "simple": few steps, low iterations, fast
+/// - "moderate": medium complexity
+/// - "complex": many steps, high iterations, or long duration
+pub fn compute_complexity_tier(
+    step_count: Option<i64>,
+    iterations: u32,
+    duration_secs: f64,
+    agentic_step_count: Option<i64>,
+) -> String {
+    let steps = step_count.unwrap_or(0);
+    let agentic = agentic_step_count.unwrap_or(0);
+
+    // Heuristic: score based on multiple factors
+    let mut score: u32 = 0;
+
+    // Step count contribution
+    if steps > 15 {
+        score += 3;
+    } else if steps > 8 {
+        score += 2;
+    } else if steps > 3 {
+        score += 1;
+    }
+
+    // Agentic step count contribution (more agentic = more complex)
+    if agentic > 5 {
+        score += 2;
+    } else if agentic > 2 {
+        score += 1;
+    }
+
+    // Iteration contribution
+    if iterations > 5 {
+        score += 2;
+    } else if iterations > 2 {
+        score += 1;
+    }
+
+    // Duration contribution
+    if duration_secs > 600.0 {
+        score += 2;
+    } else if duration_secs > 120.0 {
+        score += 1;
+    }
+
+    if score >= 5 {
+        "complex".to_string()
+    } else if score >= 2 {
+        "moderate".to_string()
+    } else {
+        "simple".to_string()
+    }
+}
+
 /// Categorize an error message into a standard error type.
 ///
 /// Matches patterns from meta_optimizer_api.rs top failure patterns query.
@@ -103,13 +288,34 @@ pub fn record_learning_outcome(
         .as_deref()
         .unwrap_or("traditional");
 
+    // Auto-enrich technology and domain tags from files_modified and workflow metadata
+    let technology_tags = infer_technology_tags(&outcome.files_modified);
+    let technology_tags_json = serde_json::to_string(&technology_tags).unwrap_or_else(|_| "[]".into());
+
+    let domain_tags = infer_domain_tags(
+        &outcome.files_modified,
+        &outcome.workflow_name,
+        &outcome.category,
+        outcome.has_ui_bridge,
+    );
+    let domain_tags_json = serde_json::to_string(&domain_tags).unwrap_or_else(|_| "[]".into());
+
+    // Compute complexity tier from step counts, iterations, and duration
+    let complexity_tier = compute_complexity_tier(
+        outcome.step_count,
+        outcome.iterations,
+        outcome.duration_secs,
+        outcome.agentic_step_count,
+    );
+
     conn.execute(
         r#"INSERT INTO learning_outcomes
             (id, task_id, status, duration_secs, iterations, strategy,
              tools_used, files_modified, error_type, error_message, feedback,
              workflow_architecture, step_count, verification_step_count,
-             agentic_step_count, has_ui_bridge, total_tokens, total_cost_usd, created_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"#,
+             agentic_step_count, has_ui_bridge, total_tokens, total_cost_usd,
+             technology_tags, domain_tags, complexity_tier, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"#,
         params![
             id,
             outcome.task_run_id,
@@ -129,6 +335,9 @@ pub fn record_learning_outcome(
             outcome.has_ui_bridge as i32,
             outcome.total_tokens.map(|t| t as i64),
             outcome.total_cost_usd,
+            technology_tags_json,
+            domain_tags_json,
+            complexity_tier,
             now,
         ],
     )

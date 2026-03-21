@@ -45,6 +45,8 @@ pub fn build_config(execution_id: &str, workflow_name: &str) -> LoopConfig {
         project_path: crate::mcp::shared::current_project_path(),
         acceptance_criteria: None,
         multi_agent_mode: false,
+        strict_cwd: false,
+        tool_tags: Vec::new(),
         use_worktree: false,
         worktree_path: None,
         worktree_branch: None,
@@ -72,11 +74,11 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
             None,
             Some("optimizer_context"),
         ),
-        // Step 1: Load cross-architecture learning outcomes
+        // Step 1: Load cross-architecture learning outcome summaries (L0 — counts by status)
         build_api_step(
-            "Load learning outcomes by architecture",
+            "Load learning outcome summaries (L0)",
             "GET",
-            &format!("{}/learning/outcomes?limit=200", base_url),
+            &format!("{}/learning/outcomes?limit=200&tier=l0", base_url),
             None,
             Some("learning_outcomes"),
         ),
@@ -177,7 +179,7 @@ If your analysis reveals an important insight about any of these non-configurabl
 
 The setup phase loaded **L0 summaries** where applicable:
 - `{{optimizer_context}}` — Your performance history: previous recommendations and their outcomes, current metrics vs baseline, per-architecture performance, top failure patterns
-- `{{learning_outcomes}}` — Cross-architecture learning outcomes (success rate, duration, iterations, cost per architecture)
+- `{{learning_outcomes}}` — **L0 summary**: status, run_count, avg_duration_secs, avg_iterations (grouped by status)
 - `{{agent_traces}}` — **L0 summary**: agent_type, run_count, success_pct (one row per agent type)
 - `{{autoresearch_campaigns}}` — Autoresearch experiment results (A/B testing data)
 - `{{agentic_settings}}` — Current configuration defaults for each architecture
@@ -186,6 +188,18 @@ The setup phase loaded **L0 summaries** where applicable:
 ## Drill-Down: L1/L2 Detail Endpoints
 
 If the L0 summaries reveal issues, drill into details:
+
+**Learning Outcomes — L1 (core fields per outcome):**
+```bash
+curl -s '{{base_url}}/learning/outcomes?tier=l1&limit=50'
+```
+Returns: id, task_id, status, duration_secs, iterations, workflow_architecture, error_type, created_at.
+
+**Learning Outcomes — L2 (full records including tools, files, error messages):**
+```bash
+curl -s '{{base_url}}/learning/outcomes?tier=l2&limit=20'
+```
+Returns: full records with strategy, tools_used, files_modified, error_message.
 
 **Iteration History — L1 (per-run iteration sequences):**
 ```bash

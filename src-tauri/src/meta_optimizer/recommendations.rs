@@ -78,6 +78,8 @@ pub fn create_recommendation(
         outcome_after_apply: None,
         optimizer_run_id: optimizer_run_id.map(|s| s.to_string()),
         created_at: now.clone(),
+        eval_result_id: None,
+        eval_status: None,
     };
 
     let rec_clone = rec.clone();
@@ -128,7 +130,8 @@ pub fn list_recommendations(
         let mut sql = String::from(
             r#"SELECT id, optimizer_type, recommendation_type, target_agent, title, description,
                       current_value, recommended_value, evidence, confidence, status,
-                      applied_at, outcome_after_apply, optimizer_run_id, created_at
+                      applied_at, outcome_after_apply, optimizer_run_id, created_at,
+                      eval_result_id, eval_status
                FROM meta_optimizer_recommendations WHERE 1=1"#,
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -167,6 +170,8 @@ pub fn list_recommendations(
                     outcome_after_apply: row.get(12)?,
                     optimizer_run_id: row.get(13)?,
                     created_at: row.get(14)?,
+                    eval_result_id: row.get(15).ok().flatten(),
+                    eval_status: row.get(16).ok().flatten(),
                 })
             })
             .map_err(|e| format!("Failed to query recommendations: {}", e))?
@@ -210,7 +215,8 @@ fn get_recommendation(
         conn.query_row(
             r#"SELECT id, optimizer_type, recommendation_type, target_agent, title, description,
                       current_value, recommended_value, evidence, confidence, status,
-                      applied_at, outcome_after_apply, optimizer_run_id, created_at
+                      applied_at, outcome_after_apply, optimizer_run_id, created_at,
+                      eval_result_id, eval_status
                FROM meta_optimizer_recommendations WHERE id = ?1"#,
             params![id],
             |row| {
@@ -230,6 +236,8 @@ fn get_recommendation(
                     outcome_after_apply: row.get(12)?,
                     optimizer_run_id: row.get(13)?,
                     created_at: row.get(14)?,
+                    eval_result_id: row.get(15).ok().flatten(),
+                    eval_status: row.get(16).ok().flatten(),
                 })
             },
         )

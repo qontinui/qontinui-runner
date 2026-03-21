@@ -5202,6 +5202,224 @@ impl CheckpointDb {
             );
         }
 
+        // --- Migration 134: Eval specs, eval results, recommendation eval columns ---
+        if current_version < 134 {
+            info!("Migrating to version 134 (eval specs + eval results tables, recommendation eval columns)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS eval_specs (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    target_agent TEXT,
+                    spec_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS eval_results (
+                    id TEXT PRIMARY KEY,
+                    spec_id TEXT NOT NULL,
+                    recommendation_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    p_value REAL,
+                    trials_run INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_eval_results_spec ON eval_results(spec_id);
+                CREATE INDEX IF NOT EXISTS idx_eval_results_rec ON eval_results(recommendation_id);
+
+                ALTER TABLE meta_optimizer_recommendations ADD COLUMN eval_result_id TEXT;
+                ALTER TABLE meta_optimizer_recommendations ADD COLUMN eval_status TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (134, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 134: {}", e))?;
+
+            info!("Successfully migrated to version 134 (eval specs + eval results)");
+        }
+
+        // Migration to version 135: Add artifacts table for UI Bridge IPC artifact persistence
+        if current_version < 135 {
+            info!("Migrating to version 135 (artifacts table for UI Bridge IPC)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    source_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    environment_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    passed INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_artifacts_created_at ON artifacts(created_at);
+                CREATE INDEX IF NOT EXISTS idx_artifacts_passed ON artifacts(passed);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (135, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 135: {}", e))?;
+
+            info!("Successfully migrated to version 135 (artifacts table)");
+        }
+
+        // --- Migration 136: Golden datasets + robustness reports tables ---
+        if current_version < 136 {
+            info!("Migrating to version 136 (golden datasets + robustness reports)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS golden_datasets (
+                    id TEXT PRIMARY KEY,
+                    agent_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    entries_json TEXT NOT NULL DEFAULT '[]',
+                    entry_count INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_golden_agent ON golden_datasets(agent_type);
+
+                CREATE TABLE IF NOT EXISTS robustness_reports (
+                    id TEXT PRIMARY KEY,
+                    prompt_variant_id TEXT,
+                    recommendation_id TEXT,
+                    total_tests INTEGER NOT NULL,
+                    passed INTEGER NOT NULL,
+                    failed INTEGER NOT NULL,
+                    report_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_robustness_variant ON robustness_reports(prompt_variant_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (136, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 136: {}", e))?;
+
+            info!("Successfully migrated to version 136 (golden datasets + robustness reports)");
+        }
+
+        // --- Migration 137: Auto-tagging enrichment columns for learning outcomes ---
+        if current_version < 137 {
+            info!("Migrating to version 137 (learning outcome auto-tagging columns)...");
+
+            // Check which columns already exist (schema.sql may have added them for fresh DBs)
+            let existing_columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(learning_outcomes)")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(1))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default();
+
+            if !existing_columns.contains(&"technology_tags".to_string()) {
+                conn.execute_batch(
+                    "ALTER TABLE learning_outcomes ADD COLUMN technology_tags TEXT;",
+                )
+                .map_err(|e| format!("Failed to add technology_tags column: {}", e))?;
+            }
+
+            if !existing_columns.contains(&"domain_tags".to_string()) {
+                conn.execute_batch(
+                    "ALTER TABLE learning_outcomes ADD COLUMN domain_tags TEXT;",
+                )
+                .map_err(|e| format!("Failed to add domain_tags column: {}", e))?;
+            }
+
+            if !existing_columns.contains(&"complexity_tier".to_string()) {
+                conn.execute_batch(
+                    "ALTER TABLE learning_outcomes ADD COLUMN complexity_tier TEXT;",
+                )
+                .map_err(|e| format!("Failed to add complexity_tier column: {}", e))?;
+            }
+
+            // Backfill complexity_tier for existing records based on step_count, iterations, duration
+            conn.execute_batch(
+                r#"
+                UPDATE learning_outcomes
+                SET complexity_tier = CASE
+                    WHEN (
+                        (CASE WHEN COALESCE(step_count, 0) > 15 THEN 3
+                              WHEN COALESCE(step_count, 0) > 8 THEN 2
+                              WHEN COALESCE(step_count, 0) > 3 THEN 1 ELSE 0 END)
+                        + (CASE WHEN COALESCE(agentic_step_count, 0) > 5 THEN 2
+                                WHEN COALESCE(agentic_step_count, 0) > 2 THEN 1 ELSE 0 END)
+                        + (CASE WHEN COALESCE(iterations, 0) > 5 THEN 2
+                                WHEN COALESCE(iterations, 0) > 2 THEN 1 ELSE 0 END)
+                        + (CASE WHEN COALESCE(duration_secs, 0) > 600 THEN 2
+                                WHEN COALESCE(duration_secs, 0) > 120 THEN 1 ELSE 0 END)
+                    ) >= 5 THEN 'complex'
+                    WHEN (
+                        (CASE WHEN COALESCE(step_count, 0) > 15 THEN 3
+                              WHEN COALESCE(step_count, 0) > 8 THEN 2
+                              WHEN COALESCE(step_count, 0) > 3 THEN 1 ELSE 0 END)
+                        + (CASE WHEN COALESCE(agentic_step_count, 0) > 5 THEN 2
+                                WHEN COALESCE(agentic_step_count, 0) > 2 THEN 1 ELSE 0 END)
+                        + (CASE WHEN COALESCE(iterations, 0) > 5 THEN 2
+                                WHEN COALESCE(iterations, 0) > 2 THEN 1 ELSE 0 END)
+                        + (CASE WHEN COALESCE(duration_secs, 0) > 600 THEN 2
+                                WHEN COALESCE(duration_secs, 0) > 120 THEN 1 ELSE 0 END)
+                    ) >= 2 THEN 'moderate'
+                    ELSE 'simple'
+                END
+                WHERE complexity_tier IS NULL;
+                "#,
+            )
+            .map_err(|e| format!("Failed to backfill complexity_tier: {}", e))?;
+
+            // Backfill technology_tags from files_modified JSON where available
+            // For records with non-empty files_modified, infer tags from file extensions
+            // Note: SQLite JSON functions are limited, so we use simple LIKE patterns
+            conn.execute_batch(
+                r#"
+                UPDATE learning_outcomes
+                SET technology_tags = '[]'
+                WHERE technology_tags IS NULL AND (files_modified IS NULL OR files_modified = '[]');
+                "#,
+            )
+            .map_err(|e| format!("Failed to backfill empty technology_tags: {}", e))?;
+
+            // Backfill domain_tags — set empty for records without files_modified
+            conn.execute_batch(
+                r#"
+                UPDATE learning_outcomes
+                SET domain_tags = '[]'
+                WHERE domain_tags IS NULL AND (files_modified IS NULL OR files_modified = '[]');
+                "#,
+            )
+            .map_err(|e| format!("Failed to backfill empty domain_tags: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (137, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to update schema version to 137: {}", e))?;
+
+            info!("Successfully migrated to version 137 (learning outcome auto-tagging)");
+        }
+
+        // Migration to version 138: Add pipeline_checkpoint column to task_runs
+        if current_version < 138 {
+            info!("Migrating to version 138 (pipeline_checkpoint column on task_runs)...");
+            conn.execute_batch(
+                r#"
+                -- Pipeline checkpoint JSON for resuming multi-agent pipeline from last completed phase
+                ALTER TABLE task_runs ADD COLUMN pipeline_checkpoint TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (138, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 138: {}", e))?;
+
+            info!("Successfully migrated to version 138 (pipeline_checkpoint column added)");
+        }
+
         // Repair migration: is_favorite column may be missing on databases created from
         // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
         // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,

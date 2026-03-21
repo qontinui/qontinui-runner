@@ -590,6 +590,12 @@ pub struct PathSettings {
     /// Override example: `D:\qontinui_parent_directory\.dev-logs`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev_logs_dir: Option<String>,
+
+    /// When true, enforce workspace-scoped working directory resolution globally.
+    /// Steps cannot resolve paths outside the workspace root.
+    /// Default: false (permissive). Individual workflows can override via `strict_cwd`.
+    #[serde(default)]
+    pub strict_mode: bool,
 }
 
 // ============================================================================

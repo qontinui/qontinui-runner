@@ -34,6 +34,7 @@ use crate::workflow_generation::rules;
 use crate::workflow_generation::schema_context::{
     build_gotchas_section, build_rules_section_for_tier, build_schema_context,
     build_schema_context_full, format_skills_for_generator,
+    format_skills_for_generator_filtered,
 };
 use crate::workflow_generation::self_improve;
 use crate::workflow_generation::spec_synthesis;
@@ -142,6 +143,12 @@ pub struct GenerateWorkflowRequest {
     /// Auto-detected when complexity score < 0.3, or can be explicitly set.
     #[serde(default)]
     pub simple_mode: Option<bool>,
+
+    /// Tags for per-execution tool whitelisting.
+    /// When non-empty, only skills matching at least one tag are included
+    /// in the generator's AI prompt context, reducing prompt bloat.
+    #[serde(default)]
+    pub tool_tags: Option<Vec<String>>,
 }
 
 fn default_true() -> Option<bool> {
@@ -175,6 +182,7 @@ impl Default for GenerateWorkflowRequest {
             verification_depth: None,
             discover_ui_bridge_specs: None,
             simple_mode: None,
+            tool_tags: None,
         }
     }
 }
@@ -1102,6 +1110,7 @@ pub fn generate_workflow(
         generation_provider,
         &skill_registry,
         hardener_insights.as_deref(),
+        request.tool_tags.as_deref(),
     );
     artifact_builder.hardener_duration_ms = Some(hardener_start.elapsed().as_millis() as u64);
     artifact_builder.hardening_summary = serde_json::to_value(&hardening_summary).ok();
@@ -1641,8 +1650,15 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
     }
 
     // Inject skill catalog context (built-in + user skills from DB)
+    // When tool_tags are specified, only include matching skills to reduce prompt bloat.
     let skill_registry = SkillRegistry::with_db(conn);
-    let skills_section = format_skills_for_generator(&skill_registry);
+    let skills_section = match request.tool_tags.as_deref() {
+        Some(tags) if !tags.is_empty() => {
+            let tags_owned: Vec<String> = tags.iter().map(|s| s.to_string()).collect();
+            format_skills_for_generator_filtered(&skill_registry, None, &tags_owned, None)
+        }
+        _ => format_skills_for_generator(&skill_registry),
+    };
     if !skills_section.is_empty() {
         sections.push(skills_section);
     }
@@ -1779,6 +1795,7 @@ fn run_verification_agent(
         conn,
         skill_registry,
         blind_spots_section,
+        None, // tool_tags not available in verification context
     );
     let task_context = TaskContext::from_prompt(&prompt);
     let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
@@ -1822,6 +1839,7 @@ fn build_verification_prompt(
     conn: Option<&Connection>,
     skill_registry: &SkillRegistry,
     blind_spots_section: Option<&str>,
+    tool_tags: Option<&[String]>,
 ) -> String {
     // Load check rules from DB if available
     let check_rules_section = if let Some(conn) = conn {
@@ -1850,7 +1868,12 @@ fn build_verification_prompt(
         )
     };
 
-    let skills_section = format_skills_for_generator(skill_registry);
+    let skills_section = match tool_tags {
+        Some(tags) if !tags.is_empty() => {
+            format_skills_for_generator_filtered(skill_registry, None, tags, None)
+        }
+        _ => format_skills_for_generator(skill_registry),
+    };
     let skills_context = if skills_section.is_empty() {
         String::new()
     } else {

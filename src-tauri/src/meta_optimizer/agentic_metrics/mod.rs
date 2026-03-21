@@ -5,6 +5,7 @@
 //! argument correctness) as 0.0–1.0 scored metrics for the meta-optimizer.
 //!
 //! Phase 1 (this module): deterministic metrics computed without LLM calls.
+//! Phase 2b (future): RAG metrics for hybrid search + visual RAG quality.
 //! Phase 3 (future): LLM-as-judge metrics for qualitative evaluation.
 //!
 //! ## Module structure
@@ -12,6 +13,7 @@
 //! - `mod` — Core types, composite scoring, `compute_deterministic()`
 //! - `task_completion` — Score from outcome status + verification results
 //! - `step_efficiency` — Score from iterations vs baseline, zero-iter → 0.0
+//! - `rag_*` (future) — RAG retrieval quality metrics
 
 pub mod step_efficiency;
 pub mod task_completion;
@@ -22,6 +24,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgenticMetric {
+    // --- Agentic metrics ---
     TaskCompletion,
     StepEfficiency,
     ToolCorrectness,
@@ -29,6 +32,11 @@ pub enum AgenticMetric {
     PlanAdherence,
     GoalAccuracy,
     PlanQuality,
+    // --- RAG metrics (scored only for retrieval-involving runs) ---
+    RagContextualPrecision,
+    RagContextualRecall,
+    RagFaithfulness,
+    RagAnswerRelevancy,
 }
 
 impl AgenticMetric {
@@ -41,20 +49,42 @@ impl AgenticMetric {
             Self::PlanAdherence => "plan_adherence",
             Self::GoalAccuracy => "goal_accuracy",
             Self::PlanQuality => "plan_quality",
+            Self::RagContextualPrecision => "rag_contextual_precision",
+            Self::RagContextualRecall => "rag_contextual_recall",
+            Self::RagFaithfulness => "rag_faithfulness",
+            Self::RagAnswerRelevancy => "rag_answer_relevancy",
         }
     }
 
     /// Default weight for composite score calculation.
+    ///
+    /// RAG metrics only contribute when scored (retrieval-involving runs).
+    /// Weights are renormalized to sum to 1.0 across scored metrics.
     pub fn default_weight(&self) -> f64 {
         match self {
-            Self::TaskCompletion => 0.30,
-            Self::GoalAccuracy => 0.25,
-            Self::StepEfficiency => 0.15,
-            Self::ToolCorrectness => 0.10,
-            Self::PlanAdherence => 0.10,
-            Self::PlanQuality => 0.05,
-            Self::ArgumentCorrectness => 0.05,
+            Self::TaskCompletion => 0.25,
+            Self::GoalAccuracy => 0.20,
+            Self::StepEfficiency => 0.12,
+            Self::ToolCorrectness => 0.08,
+            Self::PlanAdherence => 0.08,
+            Self::PlanQuality => 0.04,
+            Self::ArgumentCorrectness => 0.03,
+            Self::RagContextualPrecision => 0.05,
+            Self::RagContextualRecall => 0.05,
+            Self::RagFaithfulness => 0.05,
+            Self::RagAnswerRelevancy => 0.05,
         }
+    }
+
+    /// Whether this is a RAG metric (only scored for retrieval-involving runs).
+    pub fn is_rag_metric(&self) -> bool {
+        matches!(
+            self,
+            Self::RagContextualPrecision
+                | Self::RagContextualRecall
+                | Self::RagFaithfulness
+                | Self::RagAnswerRelevancy
+        )
     }
 }
 
@@ -181,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_composite_score_renormalizes() {
-        // Two metrics with known weights: TaskCompletion(0.30), StepEfficiency(0.15)
+        // Two metrics with known weights: TaskCompletion(0.25), StepEfficiency(0.12)
         let scores = vec![
             MetricResult {
                 metric: AgenticMetric::TaskCompletion,
@@ -201,7 +231,7 @@ mod tests {
             },
         ];
         let composite = composite_score(&scores);
-        // (1.0 * 0.30 + 0.5 * 0.15) / (0.30 + 0.15) = 0.375 / 0.45 ≈ 0.8333
-        assert!((composite - 0.8333).abs() < 0.01);
+        // (1.0 * 0.25 + 0.5 * 0.12) / (0.25 + 0.12) = 0.31 / 0.37 ≈ 0.8378
+        assert!((composite - 0.8378).abs() < 0.01);
     }
 }

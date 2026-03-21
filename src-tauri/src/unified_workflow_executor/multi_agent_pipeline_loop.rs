@@ -8,6 +8,8 @@
 //! Each phase reads from previous phases' outputs and writes its own,
 //! replacing the previous pattern of passing failure context as concatenated strings.
 
+use std::collections::{HashMap, HashSet, VecDeque};
+
 use tracing::{debug, info, warn};
 
 use crate::autoresearch::agentic_verification::*;
@@ -139,10 +141,237 @@ impl PipelineContext {
     }
 }
 
+/// Collected output from processing a single subtree.
+///
+/// Returned by `process_subtree` and merged into the pipeline-level accumulators
+/// after all parallel subtrees complete.
+struct SubtreeOutput {
+    result: SubtreeResult,
+    traces: Vec<PipelineAgentTrace>,
+    implementer_changes: Vec<ImplementerChange>,
+    verifier_failures: Vec<VerifierFailure>,
+    iterations_used: u32,
+    was_stopped: bool,
+}
+
+// =============================================================================
+// DAG Construction
+// =============================================================================
+
+/// Build a flat DAG: single subtree, all criteria at level 0.
+/// Used as the "flat" baseline strategy for A/B comparison.
+fn build_flat_dag(criteria: &[PipelineAcceptanceCriterion]) -> ExecutionDAG {
+    ExecutionDAG {
+        nodes: criteria
+            .iter()
+            .map(|c| {
+                (
+                    c.id.clone(),
+                    DAGNode {
+                        criterion_id: c.id.clone(),
+                        dependencies: c.depends_on.clone(),
+                        dependents: vec![],
+                        level: 0,
+                        subtree_id: "subtree_0".to_string(),
+                    },
+                )
+            })
+            .collect(),
+        roots: criteria.iter().map(|c| c.id.clone()).collect(),
+        levels: vec![criteria.iter().map(|c| c.id.clone()).collect()],
+        subtrees: vec![DAGSubtree {
+            id: "subtree_0".to_string(),
+            root_criteria: criteria.iter().map(|c| c.id.clone()).collect(),
+            all_criteria: criteria.iter().map(|c| c.id.clone()).collect(),
+            max_level: 0,
+            estimated_complexity: "moderate".to_string(),
+        }],
+    }
+}
+
+/// Build a dependency-aware DAG with topological sort and independent subtree partitioning.
+///
+/// 1. Compute levels via Kahn's algorithm (criteria with no deps → level 0, etc.)
+/// 2. Partition criteria into independent subtrees using Union-Find on dependency edges
+/// 3. Subtrees with no shared dependencies can execute in parallel
+fn build_dependency_dag(criteria: &[PipelineAcceptanceCriterion]) -> ExecutionDAG {
+    let ids: Vec<&str> = criteria.iter().map(|c| c.id.as_str()).collect();
+    let id_set: HashSet<&str> = ids.iter().copied().collect();
+
+    // Build adjacency and in-degree for topological sort
+    let mut in_degree: HashMap<&str, usize> = HashMap::new();
+    let mut dependents_map: HashMap<&str, Vec<&str>> = HashMap::new();
+    for id in &ids {
+        in_degree.insert(id, 0);
+        dependents_map.insert(id, Vec::new());
+    }
+
+    for c in criteria {
+        for dep in &c.depends_on {
+            if id_set.contains(dep.as_str()) {
+                *in_degree.get_mut(c.id.as_str()).unwrap() += 1;
+                dependents_map.get_mut(dep.as_str()).unwrap().push(&c.id);
+            }
+        }
+    }
+
+    // Kahn's algorithm: compute levels
+    let mut levels: Vec<Vec<String>> = Vec::new();
+    let mut node_level: HashMap<&str, usize> = HashMap::new();
+    let mut queue: VecDeque<&str> = VecDeque::new();
+    let mut processed = 0usize;
+
+    for (&id, &deg) in &in_degree {
+        if deg == 0 {
+            queue.push_back(id);
+        }
+    }
+
+    while !queue.is_empty() {
+        let layer_size = queue.len();
+        let mut layer = Vec::with_capacity(layer_size);
+        let level_idx = levels.len();
+
+        for _ in 0..layer_size {
+            let node = queue.pop_front().unwrap();
+            layer.push(node.to_string());
+            node_level.insert(node, level_idx);
+            processed += 1;
+
+            for &dep in dependents_map.get(node).unwrap() {
+                let deg = in_degree.get_mut(dep).unwrap();
+                *deg -= 1;
+                if *deg == 0 {
+                    queue.push_back(dep);
+                }
+            }
+        }
+
+        levels.push(layer);
+    }
+
+    // Handle cycle (shouldn't happen, but fall back to flat)
+    if processed != criteria.len() {
+        warn!(
+            "MULTI-AGENT-PIPELINE: Dependency cycle detected ({}/{} criteria ordered) — falling back to flat DAG",
+            processed,
+            criteria.len()
+        );
+        return build_flat_dag(criteria);
+    }
+
+    // Union-Find to partition criteria into independent subtrees.
+    // Two criteria share a subtree if they have a dependency relationship (transitively).
+    let mut uf_parent: HashMap<&str, &str> = HashMap::new();
+    for id in &ids {
+        uf_parent.insert(id, id);
+    }
+
+    fn uf_find<'a>(parent: &mut HashMap<&'a str, &'a str>, x: &'a str) -> &'a str {
+        let p = parent[x];
+        if p == x {
+            return x;
+        }
+        let root = uf_find(parent, p);
+        parent.insert(x, root);
+        root
+    }
+
+    fn uf_union<'a>(parent: &mut HashMap<&'a str, &'a str>, a: &'a str, b: &'a str) {
+        let ra = uf_find(parent, a);
+        let rb = uf_find(parent, b);
+        if ra != rb {
+            parent.insert(ra, rb);
+        }
+    }
+
+    for c in criteria {
+        for dep in &c.depends_on {
+            if id_set.contains(dep.as_str()) {
+                uf_union(&mut uf_parent, &c.id, dep);
+            }
+        }
+    }
+
+    // Group criteria by subtree root
+    let mut subtree_groups: HashMap<String, Vec<&str>> = HashMap::new();
+    for id in &ids {
+        let root = uf_find(&mut uf_parent, id).to_string();
+        subtree_groups.entry(root).or_default().push(id);
+    }
+
+    // Sort subtree groups deterministically by first criterion ID
+    let mut sorted_groups: Vec<(String, Vec<&str>)> = subtree_groups.into_iter().collect();
+    sorted_groups.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Build subtrees and nodes
+    let mut nodes = HashMap::new();
+    let mut subtrees = Vec::new();
+    let mut roots = Vec::new();
+
+    for (idx, (_root, group)) in sorted_groups.iter().enumerate() {
+        let subtree_id = format!("subtree_{}", idx);
+        let mut root_criteria = Vec::new();
+        let all_criteria: Vec<String> = group.iter().map(|s| s.to_string()).collect();
+        let mut max_level = 0usize;
+
+        for &crit_id in group {
+            let level = node_level.get(crit_id).copied().unwrap_or(0);
+            if level > max_level {
+                max_level = level;
+            }
+
+            let c = criteria.iter().find(|c| c.id == crit_id).unwrap();
+            let has_internal_dep = c.depends_on.iter().any(|d| group.contains(&d.as_str()));
+            if !has_internal_dep {
+                root_criteria.push(crit_id.to_string());
+                roots.push(crit_id.to_string());
+            }
+
+            nodes.insert(
+                crit_id.to_string(),
+                DAGNode {
+                    criterion_id: crit_id.to_string(),
+                    dependencies: c.depends_on.clone(),
+                    dependents: dependents_map
+                        .get(crit_id)
+                        .map(|v| v.iter().map(|s| s.to_string()).collect())
+                        .unwrap_or_default(),
+                    level: level as u32,
+                    subtree_id: subtree_id.clone(),
+                },
+            );
+        }
+
+        let complexity = if all_criteria.len() <= 2 {
+            "simple"
+        } else if all_criteria.len() <= 5 {
+            "moderate"
+        } else {
+            "complex"
+        };
+
+        subtrees.push(DAGSubtree {
+            id: subtree_id,
+            root_criteria,
+            all_criteria,
+            max_level: max_level as u32,
+            estimated_complexity: complexity.to_string(),
+        });
+    }
+
+    ExecutionDAG {
+        nodes,
+        roots,
+        levels,
+        subtrees,
+    }
+}
+
 /// Query token usage from the database for a specific execution_id and iteration.
 ///
 /// Returns (input_tokens, output_tokens). Falls back to (0, 0) on error.
-fn query_iteration_tokens(
+pub(super) fn query_iteration_tokens(
     db: &crate::database::CheckpointDb,
     execution_id: &str,
     iteration: u32,
@@ -269,9 +498,53 @@ impl LoopController {
             pipeline_config.max_total_iterations,
         );
 
+        // ── Check for existing checkpoint (resume support) ────────────────
+        let checkpoint = match crate::database::pipeline_traces::get_pipeline_checkpoint(
+            &self.checkpoint_db,
+            &config.execution_id,
+        ) {
+            Ok(Some(cp)) => {
+                info!(
+                    "MULTI-AGENT-PIPELINE: Found checkpoint at phase {} ({} subtrees completed, {} iterations consumed)",
+                    cp.last_completed_phase,
+                    cp.completed_subtrees.len(),
+                    cp.total_iterations,
+                );
+                Some(cp)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!("MULTI-AGENT-PIPELINE: Failed to load checkpoint: {}. Starting fresh.", e);
+                None
+            }
+        };
+
         let mut total_iterations: u32 = 0;
         let mut agent_traces: Vec<PipelineAgentTrace> = Vec::new();
         let mut pipeline_ctx = PipelineContext::new();
+
+        // If resuming from checkpoint, restore iteration count and reload persisted traces.
+        if let Some(ref cp) = checkpoint {
+            if cp.last_completed_phase >= 4 {
+                total_iterations = cp.total_iterations;
+                // Reload agent traces persisted during the previous (crashed) run
+                match crate::database::pipeline_traces::get_traces_for_task_run(
+                    &self.checkpoint_db,
+                    &config.execution_id,
+                ) {
+                    Ok(traces) => {
+                        info!(
+                            "MULTI-AGENT-PIPELINE: Restored {} agent traces from previous run",
+                            traces.len()
+                        );
+                        agent_traces = traces;
+                    }
+                    Err(e) => {
+                        warn!("MULTI-AGENT-PIPELINE: Failed to reload traces on resume: {}", e);
+                    }
+                }
+            }
+        }
 
         // ── Phase 1: Spec Analysis ──────────────────────────────────────
         // The Spec Analyst agent parses spec files into structured acceptance
@@ -349,6 +622,7 @@ impl LoopController {
                 iteration_results: vec![],
                 total_tokens: None,
                 total_cost_usd: None,
+                files_modified: Vec::new(),
             };
         }
 
@@ -364,33 +638,12 @@ impl LoopController {
             pipeline_config.dag_strategy
         );
 
-        // Build a single subtree containing all criteria (flat DAG for initial impl).
-        // The DAG builder will be enhanced to parse depends_on from analyst output.
-        let dag = ExecutionDAG {
-            nodes: criteria
-                .iter()
-                .map(|c| {
-                    (
-                        c.id.clone(),
-                        DAGNode {
-                            criterion_id: c.id.clone(),
-                            dependencies: c.depends_on.clone(),
-                            dependents: vec![],
-                            level: 0,
-                            subtree_id: "subtree_0".to_string(),
-                        },
-                    )
-                })
-                .collect(),
-            roots: criteria.iter().map(|c| c.id.clone()).collect(),
-            levels: vec![criteria.iter().map(|c| c.id.clone()).collect()],
-            subtrees: vec![DAGSubtree {
-                id: "subtree_0".to_string(),
-                root_criteria: criteria.iter().map(|c| c.id.clone()).collect(),
-                all_criteria: criteria.iter().map(|c| c.id.clone()).collect(),
-                max_level: 0,
-                estimated_complexity: "moderate".to_string(),
-            }],
+        let dag = if pipeline_config.dag_strategy == "flat" {
+            // Flat strategy: single subtree, all at level 0 (baseline for comparison)
+            build_flat_dag(&criteria)
+        } else {
+            // Strict/permissive: topological sort + subtree partitioning
+            build_dependency_dag(&criteria)
         };
 
         info!(
@@ -406,7 +659,20 @@ impl LoopController {
         // ── Phase 4: Code Location ─────────────────────────────────────
         info!("MULTI-AGENT-PIPELINE: Phase 4 — Code Location");
 
-        let located_criteria: Vec<LocatedCriterion> = if pipeline_config
+        // If we have a checkpoint with located_criteria from a previous run,
+        // skip the expensive AI locator call and reuse the saved results.
+        let has_checkpoint_located = checkpoint.as_ref().is_some_and(|cp| {
+            cp.last_completed_phase >= 4 && cp.located_criteria.is_some()
+        });
+
+        let mut located_criteria: Vec<LocatedCriterion> = if has_checkpoint_located {
+            let saved = checkpoint.as_ref().unwrap().located_criteria.as_ref().unwrap();
+            info!(
+                "MULTI-AGENT-PIPELINE: Phase 4 — Restoring {} located criteria from checkpoint (skipping AI locator)",
+                saved.len()
+            );
+            saved.clone()
+        } else if pipeline_config
             .locator
             .max_tokens
             .unwrap_or(0)
@@ -634,11 +900,13 @@ Only output the JSON array, nothing else."#,
                 "located_criteria_count": located_criteria.len(),
             }));
             if locator_check.tripwire_triggered {
-                warn!(
-                    "MULTI-AGENT-PIPELINE: Guardrail tripped — {}",
+                info!(
+                    "MULTI-AGENT-PIPELINE: Locator guardrail tripped — {}. Skipping locator results; implementer will proceed without location guidance.",
                     locator_check.check_description
                 );
-                // Record guardrail result but don't halt — locator may be disabled
+                // Clear locator results so downstream agents don't use partial/empty data
+                located_criteria = Vec::new();
+                pipeline_ctx.locator_results = Vec::new();
             }
         }
 
@@ -656,10 +924,53 @@ Only output the JSON array, nothing else."#,
             );
             if budget_check.tripwire_triggered {
                 warn!(
-                    "MULTI-AGENT-PIPELINE: Guardrail tripped — {}",
+                    "MULTI-AGENT-PIPELINE: Token budget guardrail tripped — {}. Returning early before implementation phase.",
                     budget_check.check_description
                 );
-                // Continue anyway — the implementer will fail naturally if budget is truly exhausted
+                let budget_total_tokens: u64 = agent_traces
+                    .iter()
+                    .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
+                    .sum();
+                let budget_total_cost: f64 = agent_traces.iter().map(|t| t.cost_usd).sum();
+                let result = MultiAgentPipelineResult {
+                    total_iterations,
+                    goal_achieved: false,
+                    was_stopped: false,
+                    max_iterations_reached: true, // budget exhausted is conceptually similar
+                    subtree_results: Vec::new(),
+                    integration_result: None,
+                    agent_traces,
+                    dag: dag.clone(),
+                    total_criteria: criteria.len() as u32,
+                    passed_criteria: 0,
+                    total_tokens: budget_total_tokens,
+                    total_cost_usd: budget_total_cost,
+                };
+                return result.to_loop_result();
+            }
+        }
+
+        // ── Save checkpoint at Phase 4 boundary ──────────────────────────
+        // This is the most valuable checkpoint: phases 1-4 are done, Phase 5 (implementation)
+        // is the most expensive. Saving here means a crash during implementation doesn't lose
+        // the locator's AI-generated results.
+        {
+            let cp = PipelineCheckpoint {
+                last_completed_phase: 4,
+                criteria: Some(criteria.clone()),
+                located_criteria: Some(located_criteria.clone()),
+                completed_subtrees: vec![],
+                total_iterations,
+                agent_trace_count: agent_traces.len(),
+            };
+            if let Err(e) = crate::database::pipeline_traces::save_pipeline_checkpoint(
+                &self.checkpoint_db,
+                &config.execution_id,
+                &cp,
+            ) {
+                warn!("MULTI-AGENT-PIPELINE: Failed to save Phase 4 checkpoint: {}", e);
+            } else {
+                info!("MULTI-AGENT-PIPELINE: Saved checkpoint at Phase 4 boundary");
             }
         }
 
@@ -668,508 +979,105 @@ Only output the JSON array, nothing else."#,
 
         let mut subtree_results: Vec<SubtreeResult> = Vec::new();
 
-        for subtree in &dag.subtrees {
-            if self.is_task_stopped(&config.execution_id) {
-                info!("MULTI-AGENT-PIPELINE: Stopped by user");
-                // Sum tokens/cost from traces collected so far
-                let stopped_total_tokens: u64 = agent_traces
-                    .iter()
-                    .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
-                    .sum();
-                let stopped_total_cost: f64 = agent_traces.iter().map(|t| t.cost_usd).sum();
-                let result = MultiAgentPipelineResult {
-                    total_iterations,
-                    goal_achieved: false,
-                    was_stopped: true,
-                    max_iterations_reached: false,
-                    subtree_results,
-                    integration_result: None,
-                    agent_traces,
-                    dag: dag.clone(),
-                    total_criteria: criteria.len() as u32,
-                    passed_criteria: 0,
-                    total_tokens: stopped_total_tokens,
-                    total_cost_usd: stopped_total_cost,
-                };
-                return result.to_loop_result();
+        // Collect IDs of subtrees already completed in a previous run (from checkpoint).
+        let checkpoint_completed_ids: std::collections::HashSet<String> = checkpoint
+            .as_ref()
+            .map(|cp| cp.completed_subtrees.iter().map(|s| s.subtree_id.clone()).collect())
+            .unwrap_or_default();
+
+        // Pre-populate subtree_results with checkpoint data for already-completed subtrees.
+        if let Some(ref cp) = checkpoint {
+            for completed in &cp.completed_subtrees {
+                subtree_results.push(completed.clone());
             }
+            if !cp.completed_subtrees.is_empty() {
+                info!(
+                    "MULTI-AGENT-PIPELINE: Restored {} completed subtree(s) from checkpoint",
+                    cp.completed_subtrees.len()
+                );
+            }
+        }
 
-            info!(
-                "MULTI-AGENT-PIPELINE: Processing subtree '{}' ({} criteria)",
-                subtree.id,
-                subtree.all_criteria.len()
-            );
+        // Filter out subtrees already completed in a previous run.
+        let pending_subtrees: Vec<&DAGSubtree> = dag
+            .subtrees
+            .iter()
+            .filter(|s| !checkpoint_completed_ids.contains(&s.id))
+            .collect();
 
-            let mut subtree_level_results: Vec<SubtreeLevelResult> = Vec::new();
-            let mut subtree_all_passed = true;
-            let mut retries_used: u32 = 0;
+        // Process subtrees sequentially via the extracted process_subtree method.
+        // NOTE: Parallel subtree processing requires LoopController to be Arc-wrapped
+        // (for tokio::spawn 'static bounds), which is a larger refactor tracked separately.
+        // The process_subtree extraction already prepares for that future change.
+        {
+            for subtree in &pending_subtrees {
+                let output = self
+                    .process_subtree(
+                        subtree,
+                        config,
+                        &pipeline_config,
+                        &dag.levels,
+                        &located_criteria,
+                        &active_prompt_variants,
+                        &active_canary,
+                        is_canary_run,
+                        verification_steps,
+                        has_agentic_steps,
+                        agentic_steps,
+                        logger,
+                        &pipeline_ctx,
+                    )
+                    .await;
 
-            // Process levels within this subtree
-            for (level_idx, level_criteria_ids) in dag.levels.iter().enumerate() {
-                // Filter to criteria in this subtree
-                let level_criteria: Vec<&str> = level_criteria_ids
-                    .iter()
-                    .filter(|id| subtree.all_criteria.contains(id))
-                    .map(|s| s.as_str())
-                    .collect();
+                total_iterations += output.iterations_used;
+                agent_traces.extend(output.traces);
+                pipeline_ctx.implementer_changes.extend(output.implementer_changes);
+                pipeline_ctx.verifier_failures.extend(output.verifier_failures);
+                subtree_results.push(output.result.clone());
 
-                if level_criteria.is_empty() {
-                    continue;
+                // Update checkpoint with this completed subtree so progress survives crashes.
+                {
+                    let cp = PipelineCheckpoint {
+                        last_completed_phase: 5,
+                        criteria: Some(criteria.clone()),
+                        located_criteria: Some(located_criteria.clone()),
+                        completed_subtrees: subtree_results.clone(),
+                        total_iterations,
+                        agent_trace_count: agent_traces.len(),
+                    };
+                    if let Err(e) = crate::database::pipeline_traces::save_pipeline_checkpoint(
+                        &self.checkpoint_db,
+                        &config.execution_id,
+                        &cp,
+                    ) {
+                        warn!("MULTI-AGENT-PIPELINE: Failed to update checkpoint after subtree '{}': {}", subtree.id, e);
+                    }
                 }
 
-                // Retry loop for this level: implementer + verifier, with retries on failure
-                let mut level_attempt: u32 = 0;
-                let mut level_passed = false;
-                let mut level_criterion_results: Vec<PipelineCriterionResult> = Vec::new();
-                let mut last_implementer_trace: Option<PipelineAgentTrace> = None;
-                let mut last_verifier_trace: Option<PipelineAgentTrace> = None;
-                let mut prior_failure_feedback: Option<String> = None;
-
-                loop {
-                    if total_iterations >= pipeline_config.max_total_iterations {
-                        info!(
-                            "MULTI-AGENT-PIPELINE: Total iteration budget ({}) exhausted",
-                            pipeline_config.max_total_iterations
-                        );
-                        subtree_all_passed = false;
-                        break;
-                    }
-
-                    total_iterations += 1;
-                    level_attempt += 1;
-
-                    // Build failure context from structured PipelineContext
-                    let mut failure_context = pipeline_ctx.build_implementer_context(
-                        &subtree.id,
-                        level_idx,
-                        &level_criteria,
-                        prior_failure_feedback.as_deref(),
-                        level_attempt,
-                        pipeline_config.max_retries_per_subtree,
-                    );
-
-                    // Inject active prompt variant for implementer if available
-                    if let Some(variant_prompt) = active_prompt_variants.get("implementer") {
-                        failure_context.push_str(&format!(
-                            "\n\n## Agent Instructions (from optimized prompt)\n{}",
-                            variant_prompt
-                        ));
-                    }
-
-                    // Build structured handoff context: locator → implementer
-                    let mut implementer_handoff =
-                        crate::autoresearch::agentic_verification::HandoffContext {
-                            from_agent: "locator".to_string(),
-                            to_agent: "implementer".to_string(),
-                            payload: serde_json::json!({
-                                "subtree_id": subtree.id,
-                                "level": level_idx,
-                                "criteria": &level_criteria,
-                                "located_files": located_criteria.iter()
-                                    .filter(|lc| level_criteria.contains(&lc.criterion.id.as_str()))
-                                    .map(|lc| &lc.target_files)
-                                    .collect::<Vec<_>>(),
-                            }),
-                            forwarded_items: vec![],
-                            validated: false,
-                        };
-
-                    // Guardrail: validate handoff payload before passing to implementer
-                    let handoff_check = crate::autoresearch::agentic_verification::guardrail_handoff_payload_present(&implementer_handoff);
-                    implementer_handoff.validated = !handoff_check.tripwire_triggered;
-                    if handoff_check.tripwire_triggered {
-                        warn!(
-                            "MULTI-AGENT-PIPELINE: Guardrail tripped — {}",
-                            handoff_check.check_description
-                        );
-                    }
-
-                    // ── Implementer phase ────────────────────────────────────
-                    let implementer_start = std::time::Instant::now();
-
-                    let (agentic_outcome, _new_steps) = if has_agentic_steps {
-                        self.agentic_executor
-                            .run_agentic(
-                                config,
-                                total_iterations,
-                                &failure_context,
-                                has_agentic_steps,
-                                agentic_steps,
-                                logger,
-                            )
-                            .await
-                    } else {
-                        (
-                            crate::unified_workflow_executor::AgenticOutcome::Skipped,
-                            vec![],
-                        )
-                    };
-
-                    let implementer_duration = implementer_start.elapsed().as_millis() as u64;
-
-                    // Query token usage recorded during the implementer's run_agentic call.
-                    // Fall back to tokens carried on AgenticOutcome when DB has no records
-                    // (e.g., API providers that don't call record_phase_token_usage).
-                    let (mut impl_tokens_in, mut impl_tokens_out) = query_iteration_tokens(
-                        &self.checkpoint_db,
-                        &config.execution_id,
-                        total_iterations,
-                    );
-                    if impl_tokens_in == 0 && impl_tokens_out == 0 {
-                        let (ot_in, ot_out) = agentic_outcome.token_usage();
-                        impl_tokens_in = ot_in.unwrap_or(0);
-                        impl_tokens_out = ot_out.unwrap_or(0);
-                    }
-                    let impl_model = config
-                        .resolve_model_for_phase("agentic")
-                        .unwrap_or_else(|| "claude-cli".to_string());
-                    let impl_cost = crate::ai_pricing::calculate_cost_usd(
-                        impl_tokens_in,
-                        impl_tokens_out,
-                        &impl_model,
-                    );
-                    if impl_tokens_in > 0 || impl_tokens_out > 0 {
-                        info!(
-                            "MULTI-AGENT-PIPELINE: Implementer tokens: in={}, out={}, cost=${:.4}",
-                            impl_tokens_in, impl_tokens_out, impl_cost
-                        );
-                    }
-
-                    let implementer_trace = PipelineAgentTrace {
-                        agent_type: "implementer".to_string(),
-                        agent_id: format!("impl_{}_{}_{}", subtree.id, level_idx, level_attempt),
-                        run_id: config.execution_id.clone(),
-                        input_snapshot: serde_json::json!({
-                            "subtree_id": subtree.id,
-                            "level": level_idx,
-                            "attempt": level_attempt,
-                            "criteria": level_criteria,
-                            "has_prior_feedback": prior_failure_feedback.is_some(),
-                        }),
-                        output_snapshot: serde_json::json!({
-                            "outcome": format!("{:?}", agentic_outcome),
-                        }),
-                        config: pipeline_config.implementer.clone(),
-                        duration_ms: implementer_duration,
-                        tokens_in: u32::try_from(impl_tokens_in).unwrap_or(u32::MAX),
-                        tokens_out: u32::try_from(impl_tokens_out).unwrap_or(u32::MAX),
-                        cost_usd: impl_cost,
-                        downstream_success: None,
-                        output_quality_score: None,
-                        parent_span_id: None,
-                        span_type: "agent".to_string(),
-                        guardrail_results: vec![],
-                        handoff_received: Some(implementer_handoff.clone()),
-                    };
-                    if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
-                        &self.checkpoint_db,
-                        &config.execution_id,
-                        &implementer_trace,
-                    ) {
-                        warn!("Failed to persist implementer trace: {}", e);
-                    }
-                    agent_traces.push(implementer_trace.clone());
-                    last_implementer_trace = Some(implementer_trace);
-
-                    // Record implementer change in pipeline context
-                    pipeline_ctx.implementer_changes.push(ImplementerChange {
-                        subtree_id: subtree.id.clone(),
-                        level: level_idx,
-                        attempt: level_attempt,
-                        criteria_ids: level_criteria.iter().map(|s| s.to_string()).collect(),
-                        success: agentic_outcome.is_success(),
-                        tokens_in: impl_tokens_in,
-                        tokens_out: impl_tokens_out,
-                    });
-
-                    // ── Verifier phase ───────────────────────────────────────
-                    let verifier_start = std::time::Instant::now();
-
-                    let level_verification_steps: Vec<ExecutionStepConfig> = verification_steps
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| {
-                            level_criteria.contains(&format!("criterion_{}", i).as_str())
-                        })
-                        .map(|(_, step)| step.clone())
-                        .collect();
-
-                    let (verification_result, _step_results) = self
-                        .verification_executor
-                        .run_verification(
-                            &level_verification_steps,
-                            &config.execution_id,
-                            total_iterations,
-                            &config.workflow_name,
-                            logger,
-                            config.stage_index,
-                        )
-                        .await;
-
-                    level_criterion_results = Vec::new();
-                    level_passed = verification_result.all_passed;
-
-                    for step_result in &verification_result.step_results {
-                        let details = step_result
-                            .verification_details
-                            .as_ref()
-                            .and_then(|vd| vd.stdout.as_ref())
-                            .or(step_result.error.as_ref())
-                            .map(|s| s.chars().take(500).collect::<String>())
-                            .unwrap_or_default();
-
-                        level_criterion_results.push(PipelineCriterionResult {
-                            criterion_id: step_result.step_name.clone(),
-                            passed: step_result.success,
-                            method_used: step_result.step_type.clone(),
-                            confidence: if step_result.success { 1.0 } else { 0.0 },
-                            details,
-                            duration_ms: step_result.duration_ms,
-                        });
-                    }
-
-                    let verifier_duration = verifier_start.elapsed().as_millis() as u64;
-
-                    // Build structured handoff context: implementer → verifier
-                    let verifier_handoff =
-                        crate::autoresearch::agentic_verification::HandoffContext {
-                            from_agent: "implementer".to_string(),
-                            to_agent: "verifier".to_string(),
-                            payload: serde_json::json!({
-                                "subtree_id": subtree.id,
-                                "level": level_idx,
-                                "attempt": level_attempt,
-                                "implementer_success": agentic_outcome.is_success(),
-                            }),
-                            forwarded_items: vec![],
-                            validated: true,
-                        };
-
-                    // Guardrail: check verifier output has a parseable verdict
-                    let verifier_output_json = serde_json::json!({
-                        "passed": level_passed,
-                        "results": level_criterion_results.len(),
-                    });
-                    let verdict_check =
-                        crate::autoresearch::agentic_verification::guardrail_verifier_verdict(
-                            &verifier_output_json,
-                        );
-                    let mut verifier_guardrails = vec![];
-                    if verdict_check.tripwire_triggered {
-                        warn!(
-                            "MULTI-AGENT-PIPELINE: Guardrail tripped — {}",
-                            verdict_check.check_description
-                        );
-                    }
-                    verifier_guardrails.push(verdict_check);
-
-                    let verifier_trace = PipelineAgentTrace {
-                        agent_type: "verifier".to_string(),
-                        agent_id: format!("verify_{}_{}_{}", subtree.id, level_idx, level_attempt),
-                        run_id: config.execution_id.clone(),
-                        input_snapshot: serde_json::json!({
-                            "subtree_id": subtree.id,
-                            "level": level_idx,
-                            "attempt": level_attempt,
-                            "criteria_count": level_criterion_results.len(),
-                        }),
-                        output_snapshot: verifier_output_json,
-                        config: pipeline_config.verifier.clone(),
-                        duration_ms: verifier_duration,
-                        tokens_in: 0,
-                        tokens_out: 0,
-                        cost_usd: 0.0,
-                        downstream_success: Some(level_passed),
-                        output_quality_score: None,
-                        parent_span_id: None,
-                        span_type: "agent".to_string(),
-                        guardrail_results: verifier_guardrails,
-                        handoff_received: Some(verifier_handoff),
-                    };
-                    if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
-                        &self.checkpoint_db,
-                        &config.execution_id,
-                        &verifier_trace,
-                    ) {
-                        warn!("Failed to persist verifier trace: {}", e);
-                    }
-                    agent_traces.push(verifier_trace.clone());
-                    last_verifier_trace = Some(verifier_trace);
-
-                    // Record verifier failures in pipeline context
-                    for cr in &level_criterion_results {
-                        if !cr.passed {
-                            pipeline_ctx.verifier_failures.push(VerifierFailure {
-                                criterion_id: cr.criterion_id.clone(),
-                                method: cr.method_used.clone(),
-                                details: cr.details.clone(),
-                                attempt: level_attempt,
-                            });
-                        }
-                    }
-
-                    // Record canary run outcome if this is a canary run
-                    if let Some((ref canary_id, _)) = active_canary {
-                        let _ = crate::meta_optimizer::canary::record_canary_run(
-                            &self.checkpoint_db,
-                            canary_id,
-                            is_canary_run,
-                            level_passed,
-                            impl_cost,
-                            (implementer_duration + verifier_duration) as f64,
-                        );
-                    }
-
-                    info!(
-                        "MULTI-AGENT-PIPELINE: Subtree '{}' level {} attempt {} — {} (impl={}ms, verify={}ms, tokens={}+{})",
-                        subtree.id,
-                        level_idx,
-                        level_attempt,
-                        if level_passed { "PASSED" } else { "FAILED" },
-                        implementer_duration,
-                        verifier_duration,
-                        impl_tokens_in,
-                        impl_tokens_out,
-                    );
-
-                    // Per-iteration token budget check
-                    let running_total_tokens: u64 = agent_traces
+                if output.was_stopped {
+                    info!("MULTI-AGENT-PIPELINE: Stopped by user");
+                    let stopped_total_tokens: u64 = agent_traces
                         .iter()
                         .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
                         .sum();
-                    if running_total_tokens > config.max_context_tokens as u64 {
-                        if config.enforce_token_budget {
-                            warn!(
-                                "MULTI-AGENT-PIPELINE: Token budget ENFORCED — stopping execution: {} / {} tokens used",
-                                running_total_tokens, config.max_context_tokens
-                            );
-                            // Break out of the retry loop to stop this subtree
-                            break;
-                        } else {
-                            warn!(
-                                "MULTI-AGENT-PIPELINE: Token budget warning: {} / {} tokens used after iteration {}",
-                                running_total_tokens, config.max_context_tokens, total_iterations
-                            );
-                        }
-                    }
-
-                    if level_passed {
-                        break; // Level succeeded, move to next level
-                    }
-
-                    // Check if we have retries remaining
-                    retries_used += 1;
-                    if retries_used >= pipeline_config.max_retries_per_subtree {
-                        info!(
-                            "MULTI-AGENT-PIPELINE: Level {} exhausted retries ({}/{})",
-                            level_idx, retries_used, pipeline_config.max_retries_per_subtree
-                        );
-                        subtree_all_passed = false;
-                        break; // No more retries, move on
-                    }
-
-                    // Build tiered feedback from failed criteria for the next attempt.
-                    // First retry: L0 summary (criterion IDs + pass/fail counts).
-                    // Subsequent retries: L1 with full details to give the implementer
-                    // more context about what specifically went wrong.
-                    let failed_criteria: Vec<&PipelineCriterionResult> = level_criterion_results
-                        .iter()
-                        .filter(|c| !c.passed)
-                        .collect();
-                    let passed_count = level_criterion_results.iter().filter(|c| c.passed).count();
-
-                    prior_failure_feedback = if retries_used == 1 {
-                        // L0: summary only — saves tokens on first retry
-                        let failed_ids: Vec<&str> = failed_criteria
-                            .iter()
-                            .map(|c| c.criterion_id.as_str())
-                            .collect();
-                        Some(format!(
-                            "{}/{} criteria failed: {}\nFix these criteria and re-run verification.",
-                            failed_criteria.len(),
-                            failed_criteria.len() + passed_count,
-                            failed_ids.join(", ")
-                        ))
-                    } else {
-                        // L1: full details — the L0 summary wasn't enough
-                        let detailed: Vec<String> = failed_criteria
-                            .iter()
-                            .map(|c| {
-                                format!("- {} ({}): {}", c.criterion_id, c.method_used, c.details)
-                            })
-                            .collect();
-                        Some(format!(
-                            "{}/{} criteria still failing after {} attempts. Details:\n{}",
-                            failed_criteria.len(),
-                            failed_criteria.len() + passed_count,
-                            retries_used,
-                            detailed.join("\n")
-                        ))
+                    let stopped_total_cost: f64 = agent_traces.iter().map(|t| t.cost_usd).sum();
+                    let result = MultiAgentPipelineResult {
+                        total_iterations,
+                        goal_achieved: false,
+                        was_stopped: true,
+                        max_iterations_reached: false,
+                        subtree_results,
+                        integration_result: None,
+                        agent_traces,
+                        dag: dag.clone(),
+                        total_criteria: criteria.len() as u32,
+                        passed_criteria: 0,
+                        total_tokens: stopped_total_tokens,
+                        total_cost_usd: stopped_total_cost,
                     };
-
-                    info!(
-                        "MULTI-AGENT-PIPELINE: Level {} failed, retrying ({}/{} retries used)",
-                        level_idx, retries_used, pipeline_config.max_retries_per_subtree
-                    );
-                } // end retry loop
-
-                if !level_passed {
-                    subtree_all_passed = false;
+                    return result.to_loop_result();
                 }
-
-                subtree_level_results.push(SubtreeLevelResult {
-                    level: level_idx as u32,
-                    implementer_trace: last_implementer_trace.unwrap_or_else(|| {
-                        PipelineAgentTrace {
-                            agent_type: "implementer".to_string(),
-                            agent_id: format!("impl_{}_{}", subtree.id, level_idx),
-                            run_id: config.execution_id.clone(),
-                            input_snapshot: serde_json::json!(null),
-                            output_snapshot: serde_json::json!(null),
-                            config: pipeline_config.implementer.clone(),
-                            duration_ms: 0,
-                            tokens_in: 0,
-                            tokens_out: 0,
-                            cost_usd: 0.0,
-                            downstream_success: None,
-                            output_quality_score: None,
-                            parent_span_id: None,
-                            span_type: "agent".to_string(),
-                            guardrail_results: vec![],
-                            handoff_received: None,
-                        }
-                    }),
-                    verifier_trace: last_verifier_trace.unwrap_or_else(|| PipelineAgentTrace {
-                        agent_type: "verifier".to_string(),
-                        agent_id: format!("verify_{}_{}", subtree.id, level_idx),
-                        run_id: config.execution_id.clone(),
-                        input_snapshot: serde_json::json!(null),
-                        output_snapshot: serde_json::json!(null),
-                        config: pipeline_config.verifier.clone(),
-                        duration_ms: 0,
-                        tokens_in: 0,
-                        tokens_out: 0,
-                        cost_usd: 0.0,
-                        downstream_success: None,
-                        output_quality_score: None,
-                        parent_span_id: None,
-                        span_type: "agent".to_string(),
-                        guardrail_results: vec![],
-                        handoff_received: None,
-                    }),
-                    retries: level_attempt.saturating_sub(1),
-                    passed: level_passed,
-                    criterion_results: level_criterion_results,
-                });
             }
-
-            subtree_results.push(SubtreeResult {
-                subtree_id: subtree.id.clone(),
-                level_results: subtree_level_results,
-                retries_used,
-                all_passed: subtree_all_passed,
-                regressions: vec![],
-            });
         }
 
         // ── Phase 6: Integration Verification ───────────────────────────
@@ -1317,7 +1225,535 @@ Only output the JSON array, nothing else."#,
             }
         }
 
+        // Clear the checkpoint now that the pipeline completed successfully.
+        // This prevents stale checkpoint data from being used on a future re-run.
+        if let Err(e) = crate::database::pipeline_traces::clear_pipeline_checkpoint(
+            &self.checkpoint_db,
+            &config.execution_id,
+        ) {
+            warn!("Failed to clear pipeline checkpoint: {}", e);
+        }
+
         result.to_loop_result()
+    }
+
+    /// Process a single subtree: iterate through levels, run implementer + verifier
+    /// with retries, and return all collected outputs as a `SubtreeOutput`.
+    ///
+    /// This method is called from both serial and parallel paths. It takes only
+    /// shared references (`&self`, `&LoopConfig`) so multiple instances can run
+    /// concurrently within the same tokio task via `buffer_unordered`.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_subtree(
+        &self,
+        subtree: &DAGSubtree,
+        config: &LoopConfig,
+        pipeline_config: &MultiAgentPipelineConfig,
+        dag_levels: &[Vec<String>],
+        located_criteria: &[LocatedCriterion],
+        active_prompt_variants: &std::collections::HashMap<String, String>,
+        active_canary: &Option<(String, String)>,
+        is_canary_run: bool,
+        verification_steps: &[ExecutionStepConfig],
+        has_agentic_steps: bool,
+        agentic_steps: &[ExecutionStepConfig],
+        logger: &StepEventLogger,
+        pipeline_ctx: &PipelineContext,
+    ) -> SubtreeOutput {
+        // Check stop before starting this subtree
+        if self.is_task_stopped(&config.execution_id) {
+            return SubtreeOutput {
+                result: SubtreeResult {
+                    subtree_id: subtree.id.clone(),
+                    level_results: vec![],
+                    retries_used: 0,
+                    all_passed: false,
+                    regressions: vec![],
+                },
+                traces: vec![],
+                implementer_changes: vec![],
+                verifier_failures: vec![],
+                iterations_used: 0,
+                was_stopped: true,
+            };
+        }
+
+        info!(
+            "MULTI-AGENT-PIPELINE: Processing subtree '{}' ({} criteria)",
+            subtree.id,
+            subtree.all_criteria.len()
+        );
+
+        let mut subtree_level_results: Vec<SubtreeLevelResult> = Vec::new();
+        let mut subtree_all_passed = true;
+        let mut retries_used: u32 = 0;
+        let mut local_iterations: u32 = 0;
+        let mut local_traces: Vec<PipelineAgentTrace> = Vec::new();
+        let mut local_impl_changes: Vec<ImplementerChange> = Vec::new();
+        let mut local_verifier_failures: Vec<VerifierFailure> = Vec::new();
+
+        // Process levels within this subtree
+        for (level_idx, level_criteria_ids) in dag_levels.iter().enumerate() {
+            // Filter to criteria in this subtree
+            let level_criteria: Vec<&str> = level_criteria_ids
+                .iter()
+                .filter(|id| subtree.all_criteria.contains(id))
+                .map(|s| s.as_str())
+                .collect();
+
+            if level_criteria.is_empty() {
+                continue;
+            }
+
+            // Retry loop for this level: implementer + verifier, with retries on failure
+            let mut level_attempt: u32 = 0;
+            let mut level_passed = false;
+            let mut level_criterion_results: Vec<PipelineCriterionResult> = Vec::new();
+            let mut last_implementer_trace: Option<PipelineAgentTrace> = None;
+            let mut last_verifier_trace: Option<PipelineAgentTrace> = None;
+            let mut prior_failure_feedback: Option<String> = None;
+
+            loop {
+                if local_iterations >= pipeline_config.max_total_iterations {
+                    info!(
+                        "MULTI-AGENT-PIPELINE: Total iteration budget ({}) exhausted for subtree '{}'",
+                        pipeline_config.max_total_iterations,
+                        subtree.id
+                    );
+                    subtree_all_passed = false;
+                    break;
+                }
+
+                local_iterations += 1;
+                level_attempt += 1;
+
+                // Build failure context from structured PipelineContext
+                let mut failure_context = pipeline_ctx.build_implementer_context(
+                    &subtree.id,
+                    level_idx,
+                    &level_criteria,
+                    prior_failure_feedback.as_deref(),
+                    level_attempt,
+                    pipeline_config.max_retries_per_subtree,
+                );
+
+                // Inject active prompt variant for implementer if available
+                if let Some(variant_prompt) = active_prompt_variants.get("implementer") {
+                    failure_context.push_str(&format!(
+                        "\n\n## Agent Instructions (from optimized prompt)\n{}",
+                        variant_prompt
+                    ));
+                }
+
+                // Build structured handoff context: locator -> implementer
+                let mut implementer_handoff = crate::autoresearch::agentic_verification::HandoffContext {
+                    from_agent: "locator".to_string(),
+                    to_agent: "implementer".to_string(),
+                    payload: serde_json::json!({
+                        "subtree_id": subtree.id,
+                        "level": level_idx,
+                        "criteria": &level_criteria,
+                        "located_files": located_criteria.iter()
+                            .filter(|lc| level_criteria.contains(&lc.criterion.id.as_str()))
+                            .map(|lc| &lc.target_files)
+                            .collect::<Vec<_>>(),
+                    }),
+                    forwarded_items: vec![],
+                    validated: false,
+                };
+
+                // Guardrail: validate handoff payload before passing to implementer
+                let handoff_check = crate::autoresearch::agentic_verification::guardrail_handoff_payload_present(&implementer_handoff);
+                implementer_handoff.validated = !handoff_check.tripwire_triggered;
+                if handoff_check.tripwire_triggered {
+                    info!(
+                        "MULTI-AGENT-PIPELINE: Handoff guardrail tripped — {}. Continuing with failure_context alone; handoff payload is supplementary.",
+                        handoff_check.check_description
+                    );
+                }
+
+                // ── Implementer phase ────────────────────────────────────
+                let implementer_start = std::time::Instant::now();
+
+                let (agentic_outcome, _new_steps) = if has_agentic_steps {
+                    self.agentic_executor
+                        .run_agentic(
+                            config,
+                            local_iterations,
+                            &failure_context,
+                            has_agentic_steps,
+                            agentic_steps,
+                            logger,
+                        )
+                        .await
+                } else {
+                    (
+                        crate::unified_workflow_executor::AgenticOutcome::Skipped,
+                        vec![],
+                    )
+                };
+
+                let implementer_duration = implementer_start.elapsed().as_millis() as u64;
+
+                // Query token usage recorded during the implementer's run_agentic call.
+                let (mut impl_tokens_in, mut impl_tokens_out) = query_iteration_tokens(
+                    &self.checkpoint_db,
+                    &config.execution_id,
+                    local_iterations,
+                );
+                if impl_tokens_in == 0 && impl_tokens_out == 0 {
+                    let (ot_in, ot_out) = agentic_outcome.token_usage();
+                    impl_tokens_in = ot_in.unwrap_or(0);
+                    impl_tokens_out = ot_out.unwrap_or(0);
+                }
+                let impl_model = config
+                    .resolve_model_for_phase("agentic")
+                    .unwrap_or_else(|| "claude-cli".to_string());
+                let impl_cost = crate::ai_pricing::calculate_cost_usd(
+                    impl_tokens_in,
+                    impl_tokens_out,
+                    &impl_model,
+                );
+                if impl_tokens_in > 0 || impl_tokens_out > 0 {
+                    info!(
+                        "MULTI-AGENT-PIPELINE: Implementer tokens: in={}, out={}, cost=${:.4}",
+                        impl_tokens_in, impl_tokens_out, impl_cost
+                    );
+                }
+
+                let implementer_trace = PipelineAgentTrace {
+                    agent_type: "implementer".to_string(),
+                    agent_id: format!("impl_{}_{}_{}", subtree.id, level_idx, level_attempt),
+                    run_id: config.execution_id.clone(),
+                    input_snapshot: serde_json::json!({
+                        "subtree_id": subtree.id,
+                        "level": level_idx,
+                        "attempt": level_attempt,
+                        "criteria": level_criteria,
+                        "has_prior_feedback": prior_failure_feedback.is_some(),
+                    }),
+                    output_snapshot: serde_json::json!({
+                        "outcome": format!("{:?}", agentic_outcome),
+                    }),
+                    config: pipeline_config.implementer.clone(),
+                    duration_ms: implementer_duration,
+                    tokens_in: u32::try_from(impl_tokens_in).unwrap_or(u32::MAX),
+                    tokens_out: u32::try_from(impl_tokens_out).unwrap_or(u32::MAX),
+                    cost_usd: impl_cost,
+                    downstream_success: None,
+                    output_quality_score: None,
+                    parent_span_id: None,
+                    span_type: "agent".to_string(),
+                    guardrail_results: vec![],
+                    handoff_received: Some(implementer_handoff.clone()),
+                };
+                if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
+                    &self.checkpoint_db,
+                    &config.execution_id,
+                    &implementer_trace,
+                ) {
+                    warn!("Failed to persist implementer trace: {}", e);
+                }
+                local_traces.push(implementer_trace.clone());
+                last_implementer_trace = Some(implementer_trace);
+
+                // Record implementer change
+                local_impl_changes.push(ImplementerChange {
+                    subtree_id: subtree.id.clone(),
+                    level: level_idx,
+                    attempt: level_attempt,
+                    criteria_ids: level_criteria.iter().map(|s| s.to_string()).collect(),
+                    success: agentic_outcome.is_success(),
+                    tokens_in: impl_tokens_in,
+                    tokens_out: impl_tokens_out,
+                });
+
+                // ── Verifier phase ───────────────────────────────────────
+                let verifier_start = std::time::Instant::now();
+
+                let level_verification_steps: Vec<ExecutionStepConfig> = verification_steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        level_criteria.contains(&format!("criterion_{}", i).as_str())
+                    })
+                    .map(|(_, step)| step.clone())
+                    .collect();
+
+                let (verification_result, _step_results) = self
+                    .verification_executor
+                    .run_verification(
+                        &level_verification_steps,
+                        &config.execution_id,
+                        local_iterations,
+                        &config.workflow_name,
+                        logger,
+                        config.stage_index,
+                    )
+                    .await;
+
+                level_criterion_results = Vec::new();
+                level_passed = verification_result.all_passed;
+
+                for step_result in &verification_result.step_results {
+                    let details = step_result
+                        .verification_details
+                        .as_ref()
+                        .and_then(|vd| vd.stdout.as_ref())
+                        .or(step_result.error.as_ref())
+                        .map(|s| s.chars().take(500).collect::<String>())
+                        .unwrap_or_default();
+
+                    level_criterion_results.push(PipelineCriterionResult {
+                        criterion_id: step_result.step_name.clone(),
+                        passed: step_result.success,
+                        method_used: step_result.step_type.clone(),
+                        confidence: if step_result.success { 1.0 } else { 0.0 },
+                        details,
+                        duration_ms: step_result.duration_ms,
+                    });
+                }
+
+                let verifier_duration = verifier_start.elapsed().as_millis() as u64;
+
+                // Build structured handoff context: implementer -> verifier
+                let verifier_handoff = crate::autoresearch::agentic_verification::HandoffContext {
+                    from_agent: "implementer".to_string(),
+                    to_agent: "verifier".to_string(),
+                    payload: serde_json::json!({
+                        "subtree_id": subtree.id,
+                        "level": level_idx,
+                        "attempt": level_attempt,
+                        "implementer_success": agentic_outcome.is_success(),
+                    }),
+                    forwarded_items: vec![],
+                    validated: true,
+                };
+
+                // Guardrail: check verifier output has a parseable verdict
+                let verifier_output_json = serde_json::json!({
+                    "passed": level_passed,
+                    "results": level_criterion_results.len(),
+                });
+                let verdict_check = crate::autoresearch::agentic_verification::guardrail_verifier_verdict(&verifier_output_json);
+                let mut verifier_guardrails = vec![];
+                if verdict_check.tripwire_triggered {
+                    warn!(
+                        "MULTI-AGENT-PIPELINE: Verifier verdict guardrail tripped — {}. Treating level as FAILED; will retry if retries remain.",
+                        verdict_check.check_description
+                    );
+                    level_passed = false;
+                }
+                verifier_guardrails.push(verdict_check);
+
+                let verifier_trace = PipelineAgentTrace {
+                    agent_type: "verifier".to_string(),
+                    agent_id: format!("verify_{}_{}_{}", subtree.id, level_idx, level_attempt),
+                    run_id: config.execution_id.clone(),
+                    input_snapshot: serde_json::json!({
+                        "subtree_id": subtree.id,
+                        "level": level_idx,
+                        "attempt": level_attempt,
+                        "criteria_count": level_criterion_results.len(),
+                    }),
+                    output_snapshot: verifier_output_json,
+                    config: pipeline_config.verifier.clone(),
+                    duration_ms: verifier_duration,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cost_usd: 0.0,
+                    downstream_success: Some(level_passed),
+                    output_quality_score: None,
+                    parent_span_id: None,
+                    span_type: "agent".to_string(),
+                    guardrail_results: verifier_guardrails,
+                    handoff_received: Some(verifier_handoff),
+                };
+                if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
+                    &self.checkpoint_db,
+                    &config.execution_id,
+                    &verifier_trace,
+                ) {
+                    warn!("Failed to persist verifier trace: {}", e);
+                }
+                local_traces.push(verifier_trace.clone());
+                last_verifier_trace = Some(verifier_trace);
+
+                // Record verifier failures
+                for cr in &level_criterion_results {
+                    if !cr.passed {
+                        local_verifier_failures.push(VerifierFailure {
+                            criterion_id: cr.criterion_id.clone(),
+                            method: cr.method_used.clone(),
+                            details: cr.details.clone(),
+                            attempt: level_attempt,
+                        });
+                    }
+                }
+
+                // Record canary run outcome if this is a canary run
+                if let Some((ref canary_id, _)) = active_canary {
+                    let _ = crate::meta_optimizer::canary::record_canary_run(
+                        &self.checkpoint_db,
+                        canary_id,
+                        is_canary_run,
+                        level_passed,
+                        impl_cost,
+                        (implementer_duration + verifier_duration) as f64,
+                    );
+                }
+
+                info!(
+                    "MULTI-AGENT-PIPELINE: Subtree '{}' level {} attempt {} — {} (impl={}ms, verify={}ms, tokens={}+{})",
+                    subtree.id,
+                    level_idx,
+                    level_attempt,
+                    if level_passed { "PASSED" } else { "FAILED" },
+                    implementer_duration,
+                    verifier_duration,
+                    impl_tokens_in,
+                    impl_tokens_out,
+                );
+
+                // Per-iteration token budget check (local to this subtree)
+                let running_total_tokens: u64 = local_traces
+                    .iter()
+                    .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
+                    .sum();
+                if running_total_tokens > config.max_context_tokens as u64 {
+                    if config.enforce_token_budget {
+                        warn!(
+                            "MULTI-AGENT-PIPELINE: Token budget ENFORCED — stopping subtree '{}': {} / {} tokens used",
+                            subtree.id, running_total_tokens, config.max_context_tokens
+                        );
+                        break;
+                    } else {
+                        warn!(
+                            "MULTI-AGENT-PIPELINE: Token budget warning: {} / {} tokens used after iteration {}",
+                            running_total_tokens, config.max_context_tokens, local_iterations
+                        );
+                    }
+                }
+
+                if level_passed {
+                    break; // Level succeeded, move to next level
+                }
+
+                // Check if we have retries remaining
+                retries_used += 1;
+                if retries_used >= pipeline_config.max_retries_per_subtree {
+                    info!(
+                        "MULTI-AGENT-PIPELINE: Level {} exhausted retries ({}/{})",
+                        level_idx, retries_used, pipeline_config.max_retries_per_subtree
+                    );
+                    subtree_all_passed = false;
+                    break;
+                }
+
+                // Build tiered feedback from failed criteria for the next attempt.
+                let failed_criteria: Vec<&PipelineCriterionResult> = level_criterion_results
+                    .iter()
+                    .filter(|c| !c.passed)
+                    .collect();
+                let passed_count = level_criterion_results.iter().filter(|c| c.passed).count();
+
+                prior_failure_feedback = if retries_used == 1 {
+                    let failed_ids: Vec<&str> = failed_criteria
+                        .iter()
+                        .map(|c| c.criterion_id.as_str())
+                        .collect();
+                    Some(format!(
+                        "{}/{} criteria failed: {}\nFix these criteria and re-run verification.",
+                        failed_criteria.len(),
+                        failed_criteria.len() + passed_count,
+                        failed_ids.join(", ")
+                    ))
+                } else {
+                    let detailed: Vec<String> = failed_criteria
+                        .iter()
+                        .map(|c| {
+                            format!("- {} ({}): {}", c.criterion_id, c.method_used, c.details)
+                        })
+                        .collect();
+                    Some(format!(
+                        "{}/{} criteria still failing after {} attempts. Details:\n{}",
+                        failed_criteria.len(),
+                        failed_criteria.len() + passed_count,
+                        retries_used,
+                        detailed.join("\n")
+                    ))
+                };
+
+                info!(
+                    "MULTI-AGENT-PIPELINE: Level {} failed, retrying ({}/{} retries used)",
+                    level_idx, retries_used, pipeline_config.max_retries_per_subtree
+                );
+            } // end retry loop
+
+            if !level_passed {
+                subtree_all_passed = false;
+            }
+
+            subtree_level_results.push(SubtreeLevelResult {
+                level: level_idx as u32,
+                implementer_trace: last_implementer_trace.unwrap_or_else(|| {
+                    PipelineAgentTrace {
+                        agent_type: "implementer".to_string(),
+                        agent_id: format!("impl_{}_{}", subtree.id, level_idx),
+                        run_id: config.execution_id.clone(),
+                        input_snapshot: serde_json::json!(null),
+                        output_snapshot: serde_json::json!(null),
+                        config: pipeline_config.implementer.clone(),
+                        duration_ms: 0,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        cost_usd: 0.0,
+                        downstream_success: None,
+                        output_quality_score: None,
+                        parent_span_id: None,
+                        span_type: "agent".to_string(),
+                        guardrail_results: vec![],
+                        handoff_received: None,
+                    }
+                }),
+                verifier_trace: last_verifier_trace.unwrap_or_else(|| PipelineAgentTrace {
+                    agent_type: "verifier".to_string(),
+                    agent_id: format!("verify_{}_{}", subtree.id, level_idx),
+                    run_id: config.execution_id.clone(),
+                    input_snapshot: serde_json::json!(null),
+                    output_snapshot: serde_json::json!(null),
+                    config: pipeline_config.verifier.clone(),
+                    duration_ms: 0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cost_usd: 0.0,
+                    downstream_success: None,
+                    output_quality_score: None,
+                    parent_span_id: None,
+                    span_type: "agent".to_string(),
+                    guardrail_results: vec![],
+                    handoff_received: None,
+                }),
+                retries: level_attempt.saturating_sub(1),
+                passed: level_passed,
+                criterion_results: level_criterion_results,
+            });
+        }
+
+        SubtreeOutput {
+            result: SubtreeResult {
+                subtree_id: subtree.id.clone(),
+                level_results: subtree_level_results,
+                retries_used,
+                all_passed: subtree_all_passed,
+                regressions: vec![],
+            },
+            traces: local_traces,
+            implementer_changes: local_impl_changes,
+            verifier_failures: local_verifier_failures,
+            iterations_used: local_iterations,
+            was_stopped: false,
+        }
     }
 }
 

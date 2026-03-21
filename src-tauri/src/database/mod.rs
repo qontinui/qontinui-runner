@@ -49,6 +49,7 @@ pub mod workflow_ops;
 
 // Newly extracted submodules
 pub mod agentic_metrics_ops;
+pub mod artifact_ops;
 pub mod approval_gates;
 pub mod cached_specs;
 pub mod canvas_ops;

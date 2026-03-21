@@ -51,14 +51,38 @@ impl CheckpointDb {
         // Ensure workflow_architecture is never NULL
         let architecture = workflow_architecture.unwrap_or("traditional");
 
+        // Auto-enrich technology and domain tags from files_modified
+        let files_vec: Vec<String> = files_modified
+            .map(|f| f.to_vec())
+            .unwrap_or_default();
+        let technology_tags = crate::orchestrator::learning_recorder::infer_technology_tags(&files_vec);
+        let technology_tags_json = serde_json::to_string(&technology_tags).unwrap_or_else(|_| "[]".into());
+
+        let domain_tags = crate::orchestrator::learning_recorder::infer_domain_tags(
+            &files_vec,
+            strategy.unwrap_or(""),
+            "", // no category available in this path
+            has_ui_bridge,
+        );
+        let domain_tags_json = serde_json::to_string(&domain_tags).unwrap_or_else(|_| "[]".into());
+
+        // Compute complexity tier
+        let complexity_tier = crate::orchestrator::learning_recorder::compute_complexity_tier(
+            step_count,
+            iterations.unwrap_or(0),
+            duration_secs.unwrap_or(0.0),
+            agentic_step_count,
+        );
+
         conn.execute(
             r#"
             INSERT INTO learning_outcomes (
                 id, task_id, status, duration_secs, iterations, strategy,
                 tools_used, files_modified, error_type, error_message, feedback,
                 workflow_architecture, step_count, verification_step_count,
-                agentic_step_count, has_ui_bridge, total_tokens, total_cost_usd, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                agentic_step_count, has_ui_bridge, total_tokens, total_cost_usd,
+                technology_tags, domain_tags, complexity_tier, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
             "#,
             params![
                 id,
@@ -79,6 +103,9 @@ impl CheckpointDb {
                 has_ui_bridge as i32,
                 total_tokens.map(|t| t as i64),
                 total_cost_usd,
+                technology_tags_json,
+                domain_tags_json,
+                complexity_tier,
                 now
             ],
         )
@@ -102,7 +129,8 @@ impl CheckpointDb {
                        tools_used, files_modified, error_type, error_message, feedback, created_at,
                        workflow_architecture, step_count, verification_step_count,
                        agentic_step_count, has_ui_bridge,
-                       total_tokens, total_cost_usd, composite_agentic_score
+                       total_tokens, total_cost_usd, composite_agentic_score,
+                       technology_tags, domain_tags, complexity_tier
                 FROM learning_outcomes
                 ORDER BY created_at DESC
                 LIMIT ?1
@@ -133,6 +161,9 @@ impl CheckpointDb {
                     "total_tokens": row.get::<_, Option<i64>>(17)?,
                     "total_cost_usd": row.get::<_, Option<f64>>(18)?,
                     "composite_agentic_score": row.get::<_, Option<f64>>(19)?,
+                    "technology_tags": row.get::<_, Option<String>>(20)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "domain_tags": row.get::<_, Option<String>>(21)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "complexity_tier": row.get::<_, Option<String>>(22)?,
                 }))
             })
             .map_err(|e| format!("Failed to get learning outcomes: {}", e))?
@@ -246,7 +277,9 @@ impl CheckpointDb {
             SELECT id, task_id, status, duration_secs, iterations, strategy,
                    tools_used, files_modified, error_type, error_message, feedback, created_at,
                    workflow_architecture, step_count, verification_step_count,
-                   agentic_step_count, has_ui_bridge
+                   agentic_step_count, has_ui_bridge,
+                   total_tokens, total_cost_usd, composite_agentic_score,
+                   technology_tags, domain_tags, complexity_tier
             FROM learning_outcomes
             {}
             ORDER BY created_at DESC
@@ -286,6 +319,12 @@ impl CheckpointDb {
                         "verification_step_count": row.get::<_, Option<i64>>(14)?,
                         "agentic_step_count": row.get::<_, Option<i64>>(15)?,
                         "has_ui_bridge": row.get::<_, Option<i32>>(16)?.map(|v| v != 0),
+                        "total_tokens": row.get::<_, Option<i64>>(17)?,
+                        "total_cost_usd": row.get::<_, Option<f64>>(18)?,
+                        "composite_agentic_score": row.get::<_, Option<f64>>(19)?,
+                        "technology_tags": row.get::<_, Option<String>>(20)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                        "domain_tags": row.get::<_, Option<String>>(21)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                        "complexity_tier": row.get::<_, Option<String>>(22)?,
                     }))
                 },
             )
@@ -311,7 +350,8 @@ impl CheckpointDb {
                        tools_used, files_modified, error_type, error_message, feedback, created_at,
                        workflow_architecture, step_count, verification_step_count,
                        agentic_step_count, has_ui_bridge,
-                       total_tokens, total_cost_usd, composite_agentic_score
+                       total_tokens, total_cost_usd, composite_agentic_score,
+                       technology_tags, domain_tags, complexity_tier
                 FROM learning_outcomes
                 ORDER BY created_at DESC
                 LIMIT ?1 OFFSET ?2
@@ -342,6 +382,9 @@ impl CheckpointDb {
                     "total_tokens": row.get::<_, Option<i64>>(17)?,
                     "total_cost_usd": row.get::<_, Option<f64>>(18)?,
                     "composite_agentic_score": row.get::<_, Option<f64>>(19)?,
+                    "technology_tags": row.get::<_, Option<String>>(20)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "domain_tags": row.get::<_, Option<String>>(21)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "complexity_tier": row.get::<_, Option<String>>(22)?,
                 }))
             })
             .map_err(|e| format!("Failed to get learning outcomes: {}", e))?

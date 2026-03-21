@@ -373,6 +373,7 @@ impl AgenticVerificationResult {
                 .collect(),
             total_tokens: self.total_tokens,
             total_cost_usd: self.total_cost_usd,
+            files_modified: Vec::new(),
         }
     }
 
@@ -1106,6 +1107,27 @@ pub struct MultiAgentPipelineResult {
     pub total_cost_usd: f64,
 }
 
+/// Checkpoint for resuming a multi-agent pipeline from the last completed phase.
+///
+/// Saved to the database after expensive phases (especially Phase 4 locator) so that
+/// if the pipeline crashes during Phase 5 (implementation), it can resume without
+/// re-running the AI-intensive locator phase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineCheckpoint {
+    /// Which phase was last completed (1-6 matching pipeline phases).
+    pub last_completed_phase: u32,
+    /// Spec analysis results (saved after Phase 1).
+    pub criteria: Option<Vec<PipelineAcceptanceCriterion>>,
+    /// Located criteria (saved after Phase 4).
+    pub located_criteria: Option<Vec<LocatedCriterion>>,
+    /// Subtree results completed so far.
+    pub completed_subtrees: Vec<SubtreeResult>,
+    /// Total iterations consumed.
+    pub total_iterations: u32,
+    /// Agent traces collected so far.
+    pub agent_trace_count: usize,
+}
+
 impl MultiAgentPipelineResult {
     /// Convert to a LoopResult for compatibility with the unified workflow executor.
     pub fn to_loop_result(&self) -> crate::unified_workflow_executor::LoopResult {
@@ -1154,6 +1176,7 @@ impl MultiAgentPipelineResult {
             } else {
                 None
             },
+            files_modified: Vec::new(),
         }
     }
 

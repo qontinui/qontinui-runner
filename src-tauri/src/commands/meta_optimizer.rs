@@ -318,3 +318,125 @@ pub fn trigger_meta_optimizer(
 
     crate::meta_optimizer::trigger::launch_optimizer_manual(&deps, opt_type)
 }
+
+// ── Eval Specs ────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn get_eval_specs(
+    app_state: State<'_, Arc<AppState>>,
+    target_agent: Option<String>,
+) -> Result<Vec<crate::meta_optimizer::eval_spec::EvalSpec>, String> {
+    crate::meta_optimizer::eval_spec::list_eval_specs(
+        &app_state.checkpoint_db,
+        target_agent.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub fn create_eval_spec(
+    app_state: State<'_, Arc<AppState>>,
+    spec: crate::meta_optimizer::eval_spec::EvalSpec,
+) -> Result<(), String> {
+    crate::meta_optimizer::eval_spec::save_eval_spec(&app_state.checkpoint_db, &spec)
+}
+
+#[tauri::command]
+pub fn delete_eval_spec(
+    app_state: State<'_, Arc<AppState>>,
+    spec_id: String,
+) -> Result<(), String> {
+    crate::meta_optimizer::eval_spec::delete_eval_spec(&app_state.checkpoint_db, &spec_id)
+}
+
+#[tauri::command]
+pub fn get_eval_results(
+    app_state: State<'_, Arc<AppState>>,
+    spec_id: Option<String>,
+    recommendation_id: Option<String>,
+) -> Result<Vec<crate::meta_optimizer::eval_spec::EvalResult>, String> {
+    crate::meta_optimizer::eval_spec::list_eval_results(
+        &app_state.checkpoint_db,
+        spec_id.as_deref(),
+        recommendation_id.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub fn run_recommendation_eval(
+    app_state: State<'_, Arc<AppState>>,
+    recommendation_id: String,
+) -> Result<crate::meta_optimizer::eval_spec::EvalResult, String> {
+    crate::meta_optimizer::eval_runner::validate_recommendation(
+        &app_state.checkpoint_db,
+        &recommendation_id,
+    )
+}
+
+#[tauri::command]
+pub fn generate_default_eval_spec(
+    app_state: State<'_, Arc<AppState>>,
+    target_agent: String,
+) -> Result<crate::meta_optimizer::eval_spec::EvalSpec, String> {
+    let spec = crate::meta_optimizer::eval_spec::generate_default_spec(
+        &app_state.checkpoint_db,
+        &target_agent,
+    )?;
+    crate::meta_optimizer::eval_spec::save_eval_spec(&app_state.checkpoint_db, &spec)?;
+    Ok(spec)
+}
+
+// ── Robustness Testing ────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn run_robustness_test(
+    app_state: State<'_, Arc<AppState>>,
+    agent_type: String,
+    prompt_variant_id: Option<String>,
+    recommendation_id: Option<String>,
+) -> Result<crate::meta_optimizer::robustness::RobustnessReport, String> {
+    crate::meta_optimizer::robustness::run_robustness_test(
+        &app_state.checkpoint_db,
+        &agent_type,
+        prompt_variant_id.as_deref(),
+        recommendation_id.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub fn get_robustness_reports(
+    app_state: State<'_, Arc<AppState>>,
+    prompt_variant_id: Option<String>,
+    recommendation_id: Option<String>,
+) -> Result<Vec<crate::meta_optimizer::robustness::RobustnessReport>, String> {
+    crate::meta_optimizer::robustness::list_robustness_reports(
+        &app_state.checkpoint_db,
+        prompt_variant_id.as_deref(),
+        recommendation_id.as_deref(),
+    )
+}
+
+// ── Golden Datasets ───────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn get_golden_datasets(
+    app_state: State<'_, Arc<AppState>>,
+    agent_type: Option<String>,
+) -> Result<Vec<crate::meta_optimizer::golden_dataset::GoldenDataset>, String> {
+    crate::meta_optimizer::golden_dataset::list_golden_datasets(
+        &app_state.checkpoint_db,
+        agent_type.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub fn build_golden_dataset(
+    app_state: State<'_, Arc<AppState>>,
+    agent_type: String,
+    max_entries: Option<usize>,
+) -> Result<crate::meta_optimizer::golden_dataset::GoldenDataset, String> {
+    crate::meta_optimizer::golden_dataset::build_from_history(
+        &app_state.checkpoint_db,
+        &agent_type,
+        max_entries.unwrap_or(50),
+    )
+}

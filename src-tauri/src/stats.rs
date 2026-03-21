@@ -174,6 +174,193 @@ pub fn proportion_diff_ci(
 }
 
 // =============================================================================
+// Statistical verdict (shared across canary, snapshots, comparisons)
+// =============================================================================
+
+/// Result of a statistical comparison between two groups' success rates.
+#[derive(Debug, Clone)]
+pub struct StatisticalAnalysis {
+    /// One-sided p-value: is the experiment better than control?
+    pub p_value: Option<f64>,
+    /// 95% confidence interval for the difference (in percentage points).
+    pub confidence_interval: Option<(f64, f64)>,
+    /// Cohen's h effect size.
+    pub effect_size: Option<f64>,
+}
+
+/// Compute p-value, confidence interval, and effect size for a proportion comparison.
+///
+/// `exp` = (successes, total) for the experimental group.
+/// `ctrl` = (successes, total) for the control group.
+///
+/// Returns `None` fields when either group has fewer than `min_samples` observations.
+pub fn proportion_analysis(
+    exp: (u64, u64),
+    ctrl: (u64, u64),
+    min_samples: u64,
+) -> StatisticalAnalysis {
+    let (exp_succ, exp_total) = exp;
+    let (ctrl_succ, ctrl_total) = ctrl;
+
+    if exp_total < min_samples || ctrl_total < min_samples {
+        return StatisticalAnalysis {
+            p_value: None,
+            confidence_interval: None,
+            effect_size: None,
+        };
+    }
+
+    let p = proportion_z_test_onesided(exp_succ, exp_total, ctrl_succ, ctrl_total);
+
+    let ci = proportion_diff_ci(exp_succ, exp_total, ctrl_succ, ctrl_total, 0.95);
+    let ci_pp = (ci.0 * 100.0, ci.1 * 100.0);
+
+    let exp_prop = exp_succ as f64 / exp_total as f64;
+    let ctrl_prop = ctrl_succ as f64 / ctrl_total as f64;
+    let h = cohens_h(exp_prop, ctrl_prop);
+
+    StatisticalAnalysis {
+        p_value: Some(p),
+        confidence_interval: Some(ci_pp),
+        effect_size: Some(h),
+    }
+}
+
+/// Configurable thresholds for statistical verdict decisions.
+#[derive(Debug, Clone)]
+pub struct VerdictThresholds {
+    /// p-value threshold for significance (default: 0.05).
+    pub alpha: f64,
+    /// Minimum success-rate delta (pp) to declare regression with stats.
+    pub regression_delta_pp: f64,
+    /// Minimum success-rate delta (pp) to declare improvement with stats.
+    pub improvement_delta_pp: f64,
+    /// Fallback regression threshold when stats unavailable.
+    pub fallback_regression_pp: f64,
+    /// Fallback improvement threshold when stats unavailable.
+    pub fallback_improvement_pp: f64,
+    /// Minimum total runs before any verdict (returns `insufficient_data` below this).
+    pub min_runs: u64,
+}
+
+impl VerdictThresholds {
+    /// Thresholds for canary evaluation (more cautious: promotes unless clearly worse).
+    pub fn canary() -> Self {
+        Self {
+            alpha: 0.05,
+            regression_delta_pp: -3.0,
+            improvement_delta_pp: -2.0, // canary promotes if "not meaningfully worse"
+            fallback_regression_pp: -5.0,
+            fallback_improvement_pp: -2.0,
+            min_runs: 0, // canary uses its own min_runs_met check
+        }
+    }
+
+    /// Thresholds for recommendation/snapshot evaluation.
+    pub fn recommendation() -> Self {
+        Self {
+            alpha: 0.05,
+            regression_delta_pp: -3.0,
+            improvement_delta_pp: 2.0,
+            fallback_regression_pp: -5.0,
+            fallback_improvement_pp: 3.0,
+            min_runs: 5,
+        }
+    }
+}
+
+/// Possible verdict outcomes from a statistical comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Experiment is better (or at least not meaningfully worse for canary).
+    Positive,
+    /// Experiment is significantly worse.
+    Negative,
+    /// Not enough signal to decide.
+    Neutral,
+    /// Not enough data to run statistical tests.
+    InsufficientData,
+}
+
+impl Verdict {
+    /// Convert to canary-style string.
+    pub fn as_canary_str(&self) -> &'static str {
+        match self {
+            Verdict::Positive => "promote",
+            Verdict::Negative => "rollback",
+            Verdict::Neutral | Verdict::InsufficientData => "continue",
+        }
+    }
+
+    /// Convert to recommendation-style string.
+    pub fn as_recommendation_str(&self) -> &'static str {
+        match self {
+            Verdict::Positive => "improved",
+            Verdict::Negative => "regressed",
+            Verdict::Neutral => "neutral",
+            Verdict::InsufficientData => "insufficient_data",
+        }
+    }
+}
+
+/// Compute a statistical verdict given success rates and analysis results.
+///
+/// # Arguments
+/// * `sr_delta_pp` — success rate difference in percentage points (exp - ctrl)
+/// * `analysis` — pre-computed statistical analysis (from `proportion_analysis`)
+/// * `exp_total` — total runs in the experimental group
+/// * `thresholds` — configurable decision thresholds
+pub fn compute_verdict(
+    sr_delta_pp: f64,
+    analysis: &StatisticalAnalysis,
+    exp_total: u64,
+    thresholds: &VerdictThresholds,
+) -> Verdict {
+    if thresholds.min_runs > 0 && exp_total < thresholds.min_runs {
+        return Verdict::InsufficientData;
+    }
+
+    if let Some(p_improvement) = analysis.p_value {
+        // The analysis already computed p for "exp better than ctrl".
+        // We need p for the reverse: "ctrl better than exp" (i.e., regression).
+        // For a z-test, p_reverse ≈ 1.0 - p_improvement (by symmetry).
+        let p_regression = 1.0 - p_improvement;
+
+        if p_regression < thresholds.alpha && sr_delta_pp < thresholds.regression_delta_pp {
+            return Verdict::Negative;
+        }
+
+        if p_improvement < thresholds.alpha && sr_delta_pp > thresholds.improvement_delta_pp {
+            return Verdict::Positive;
+        }
+
+        // Canary special case: promote if not meaningfully worse
+        // (CI lower bound above fallback_regression threshold)
+        if thresholds.improvement_delta_pp < 0.0 {
+            // Only applies when improvement_delta is negative (canary mode)
+            if sr_delta_pp > thresholds.improvement_delta_pp
+                && analysis
+                    .confidence_interval
+                    .is_some_and(|ci| ci.0 > thresholds.fallback_regression_pp)
+            {
+                return Verdict::Positive;
+            }
+        }
+
+        Verdict::Neutral
+    } else {
+        // Fallback to simple threshold comparison when stats unavailable
+        if sr_delta_pp < thresholds.fallback_regression_pp {
+            Verdict::Negative
+        } else if sr_delta_pp > thresholds.fallback_improvement_pp {
+            Verdict::Positive
+        } else {
+            Verdict::Neutral
+        }
+    }
+}
+
+// =============================================================================
 // Distribution functions (pure Rust)
 // =============================================================================
 
@@ -520,5 +707,89 @@ mod tests {
             "t_cdf(0, 10) should be ~0.5, got {}",
             cdf
         );
+    }
+
+    // ── Statistical verdict tests ──────────────────────────────────────
+
+    #[test]
+    fn test_proportion_analysis_sufficient_data() {
+        let a = proportion_analysis((8, 10), (3, 10), 2);
+        assert!(a.p_value.is_some());
+        assert!(a.confidence_interval.is_some());
+        assert!(a.effect_size.is_some());
+        assert!(a.p_value.unwrap() < 0.05);
+    }
+
+    #[test]
+    fn test_proportion_analysis_insufficient_data() {
+        let a = proportion_analysis((1, 1), (0, 1), 2);
+        assert!(a.p_value.is_none());
+        assert!(a.confidence_interval.is_none());
+    }
+
+    #[test]
+    fn test_verdict_clear_improvement() {
+        let analysis = proportion_analysis((9, 10), (3, 10), 2);
+        let v = compute_verdict(60.0, &analysis, 10, &VerdictThresholds::recommendation());
+        assert_eq!(v, Verdict::Positive);
+        assert_eq!(v.as_recommendation_str(), "improved");
+    }
+
+    #[test]
+    fn test_verdict_clear_regression() {
+        let analysis = proportion_analysis((2, 10), (8, 10), 2);
+        let v = compute_verdict(-60.0, &analysis, 10, &VerdictThresholds::recommendation());
+        assert_eq!(v, Verdict::Negative);
+        assert_eq!(v.as_recommendation_str(), "regressed");
+    }
+
+    #[test]
+    fn test_verdict_neutral_no_difference() {
+        let analysis = proportion_analysis((5, 10), (5, 10), 2);
+        let v = compute_verdict(0.0, &analysis, 10, &VerdictThresholds::recommendation());
+        assert_eq!(v, Verdict::Neutral);
+    }
+
+    #[test]
+    fn test_verdict_insufficient_data() {
+        let analysis = proportion_analysis((1, 3), (1, 3), 2);
+        let v = compute_verdict(0.0, &analysis, 3, &VerdictThresholds::recommendation());
+        assert_eq!(v, Verdict::InsufficientData);
+    }
+
+    #[test]
+    fn test_verdict_canary_promote_not_worse() {
+        // Canary is slightly worse (-1pp) but CI doesn't indicate catastrophic regression
+        let analysis = proportion_analysis((8, 10), (9, 10), 2);
+        let v = compute_verdict(-1.0, &analysis, 10, &VerdictThresholds::canary());
+        // -1.0 > -2.0 (improvement_delta), so canary should promote
+        assert_eq!(v, Verdict::Positive);
+        assert_eq!(v.as_canary_str(), "promote");
+    }
+
+    #[test]
+    fn test_verdict_canary_rollback() {
+        let analysis = proportion_analysis((1, 10), (9, 10), 2);
+        let v = compute_verdict(-80.0, &analysis, 10, &VerdictThresholds::canary());
+        assert_eq!(v, Verdict::Negative);
+        assert_eq!(v.as_canary_str(), "rollback");
+    }
+
+    #[test]
+    fn test_verdict_fallback_no_stats() {
+        let analysis = StatisticalAnalysis {
+            p_value: None,
+            confidence_interval: None,
+            effect_size: None,
+        };
+        // Large regression triggers fallback
+        let v = compute_verdict(-10.0, &analysis, 10, &VerdictThresholds::recommendation());
+        assert_eq!(v, Verdict::Negative);
+        // Large improvement triggers fallback
+        let v = compute_verdict(10.0, &analysis, 10, &VerdictThresholds::recommendation());
+        assert_eq!(v, Verdict::Positive);
+        // Small delta is neutral
+        let v = compute_verdict(1.0, &analysis, 10, &VerdictThresholds::recommendation());
+        assert_eq!(v, Verdict::Neutral);
     }
 }

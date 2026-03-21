@@ -140,6 +140,8 @@ impl CheckpointDb {
                     multi_agent_mode: true,
                     enforce_token_budget: false,
                     rollback_policy: None,
+                    strict_cwd: false,
+                    tool_tags: Vec::new(),
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
@@ -258,6 +260,8 @@ impl CheckpointDb {
                     multi_agent_mode: true,
                     enforce_token_budget: false,
                     rollback_policy: None,
+                    strict_cwd: false,
+                    tool_tags: Vec::new(),
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
@@ -380,6 +384,8 @@ impl CheckpointDb {
                     multi_agent_mode: true,
                     enforce_token_budget: false,
                     rollback_policy: None,
+                    strict_cwd: false,
+                    tool_tags: Vec::new(),
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
@@ -1026,6 +1032,8 @@ impl CheckpointDb {
                     multi_agent_mode: true,
                     enforce_token_budget: false,
                     rollback_policy: None,
+                    strict_cwd: false,
+                    tool_tags: Vec::new(),
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
@@ -1251,6 +1259,8 @@ impl CheckpointDb {
                     multi_agent_mode: true,
                     enforce_token_budget: false,
                     rollback_policy: None,
+                    strict_cwd: false,
+                    tool_tags: Vec::new(),
                     use_worktree: false,
                     targeted_error_ids: vec![],
                 })

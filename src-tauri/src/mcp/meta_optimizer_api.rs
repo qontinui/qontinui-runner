@@ -20,8 +20,9 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::meta_optimizer::prompt_registry;
 use crate::meta_optimizer::recommendations;
 use crate::meta_optimizer::types::{
-    ContextTier, MetaOptimizerRun, PromptVariant, Recommendation, ReflectionFixDetailL1,
-    ReflectionFixSummaryL0,
+    ContextTier, GenerationFeedbackDetailL1, GenerationFeedbackSummaryL0,
+    LearningOutcomeDetailL1, LearningOutcomeSummaryL0, MetaOptimizerRun, PromptVariant,
+    Recommendation, ReflectionFixDetailL1, ReflectionFixSummaryL0,
 };
 
 // ---------------------------------------------------------------------------
@@ -58,12 +59,14 @@ pub struct LearningOutcomesQuery {
     pub limit: Option<u32>,
     pub status: Option<String>,
     pub workflow_architecture: Option<String>,
+    pub tier: Option<ContextTier>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct GenerationFeedbackQuery {
     pub limit: Option<u32>,
     pub feedback_type: Option<String>,
+    pub tier: Option<ContextTier>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -688,156 +691,406 @@ pub async fn get_cost_analysis_handler(
     Ok(Json(ApiResponse::success(summary)))
 }
 
-/// GET /learning/outcomes?limit=N&status=X&workflow_architecture=Y
+/// GET /learning/outcomes?limit=N&status=X&workflow_architecture=Y&tier=l0|l1|l2
 ///
-/// Returns learning outcomes from the learning_outcomes table.
+/// Returns learning outcomes at the requested tier:
+/// - L0 (default): counts and averages grouped by status
+/// - L1: core fields (id, task_id, status, duration, iterations, architecture, error_type, created_at)
+/// - L2: full records with all fields (existing behavior)
 pub async fn get_learning_outcomes_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<LearningOutcomesQuery>,
-) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let limit = query.limit.unwrap_or(50);
     let status = query.status.clone();
     let workflow_architecture = query.workflow_architecture.clone();
+    let tier = query.tier.unwrap_or_default();
 
-    let outcomes = state
-        .app_state
-        .checkpoint_db
-        .with_conn(move |conn| {
-            let mut sql = String::from(
-                r#"SELECT id, task_id, status, duration_secs, iterations, strategy,
-                          tools_used, files_modified, error_type, error_message,
-                          workflow_architecture, created_at, step_count,
-                          verification_step_count, agentic_step_count, has_ui_bridge
-                   FROM learning_outcomes
-                   WHERE 1=1"#,
-            );
-            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            let mut param_idx = 1u32;
+    let make_err = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "Failed to get learning outcomes: {}",
+                e
+            ))),
+        )
+    };
 
-            if let Some(ref s) = status {
-                param_idx += 1;
-                sql.push_str(&format!(" AND status = ?{}", param_idx));
-                param_values.push(Box::new(s.clone()));
-            }
-            if let Some(ref wa) = workflow_architecture {
-                param_idx += 1;
-                sql.push_str(&format!(" AND workflow_architecture = ?{}", param_idx));
-                param_values.push(Box::new(wa.clone()));
-            }
+    match tier {
+        ContextTier::L0 => {
+            let status_c = status.clone();
+            let wa_c = workflow_architecture.clone();
+            let summaries = state
+                .app_state
+                .checkpoint_db
+                .with_conn(move |conn| {
+                    let mut sql = String::from(
+                        r#"SELECT status,
+                                  COUNT(*) as run_count,
+                                  COALESCE(AVG(duration_secs), 0.0) as avg_duration_secs,
+                                  COALESCE(AVG(iterations), 0.0) as avg_iterations
+                           FROM learning_outcomes
+                           WHERE 1=1"#,
+                    );
+                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    let mut idx = 1;
 
-            sql.push_str(" ORDER BY created_at DESC LIMIT ?1");
+                    if let Some(ref s) = status_c {
+                        sql.push_str(&format!(" AND status = ?{}", idx));
+                        param_values.push(Box::new(s.clone()));
+                        idx += 1;
+                    }
+                    if let Some(ref wa) = wa_c {
+                        sql.push_str(&format!(" AND workflow_architecture = ?{}", idx));
+                        param_values.push(Box::new(wa.clone()));
+                        idx += 1;
+                    }
+                    let _ = idx;
 
-            let mut stmt = conn
-                .prepare(&sql)
-                .map_err(|e| format!("Failed to prepare learning_outcomes query: {}", e))?;
+                    sql.push_str(" GROUP BY status ORDER BY run_count DESC");
 
-            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            all_params.push(Box::new(limit as i64));
-            all_params.extend(param_values);
-
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                all_params.iter().map(|p| p.as_ref()).collect();
-
-            let results: Vec<serde_json::Value> = stmt
-                .query_map(param_refs.as_slice(), |row| {
-                    Ok(serde_json::json!({
-                        "id": row.get::<_, String>(0).unwrap_or_default(),
-                        "task_id": row.get::<_, String>(1).unwrap_or_default(),
-                        "status": row.get::<_, String>(2).unwrap_or_default(),
-                        "duration_secs": row.get::<_, Option<f64>>(3).unwrap_or(None),
-                        "iterations": row.get::<_, Option<i64>>(4).unwrap_or(None),
-                        "strategy": row.get::<_, Option<String>>(5).unwrap_or(None),
-                        "tools_used": row.get::<_, Option<String>>(6).unwrap_or(None),
-                        "files_modified": row.get::<_, Option<String>>(7).unwrap_or(None),
-                        "error_type": row.get::<_, Option<String>>(8).unwrap_or(None),
-                        "error_message": row.get::<_, Option<String>>(9).unwrap_or(None),
-                        "workflow_architecture": row.get::<_, Option<String>>(10).unwrap_or(None),
-                        "created_at": row.get::<_, String>(11).unwrap_or_default(),
-                        "step_count": row.get::<_, Option<i64>>(12).unwrap_or(None),
-                        "verification_step_count": row.get::<_, Option<i64>>(13).unwrap_or(None),
-                        "agentic_step_count": row.get::<_, Option<i64>>(14).unwrap_or(None),
-                        "has_ui_bridge": row.get::<_, Option<i32>>(15).unwrap_or(None).map(|v| v != 0),
-                    }))
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("Query error: {}", e))?;
+                    let rows: Vec<LearningOutcomeSummaryL0> = stmt
+                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
+                            Ok(LearningOutcomeSummaryL0 {
+                                status: row.get(0)?,
+                                run_count: row.get(1)?,
+                                avg_duration_secs: row.get(2)?,
+                                avg_iterations: row.get(3)?,
+                            })
+                        })
+                        .map_err(|e| format!("Query error: {}", e))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    Ok(rows)
                 })
-                .map_err(|e| format!("Failed to query learning_outcomes: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect();
+                .map_err(make_err)?;
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(summaries).unwrap_or_default(),
+            )))
+        }
+        ContextTier::L1 => {
+            let status_c = status.clone();
+            let wa_c = workflow_architecture.clone();
+            let details = state
+                .app_state
+                .checkpoint_db
+                .with_conn(move |conn| {
+                    let mut sql = String::from(
+                        r#"SELECT id, task_id, status, duration_secs, iterations,
+                                  workflow_architecture, error_type, created_at
+                           FROM learning_outcomes
+                           WHERE 1=1"#,
+                    );
+                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    let mut idx = 1;
 
-            Ok(results)
-        })
-        .unwrap_or_default();
+                    if let Some(ref s) = status_c {
+                        sql.push_str(&format!(" AND status = ?{}", idx));
+                        param_values.push(Box::new(s.clone()));
+                        idx += 1;
+                    }
+                    if let Some(ref wa) = wa_c {
+                        sql.push_str(&format!(" AND workflow_architecture = ?{}", idx));
+                        param_values.push(Box::new(wa.clone()));
+                        idx += 1;
+                    }
+                    let _ = idx;
 
-    Ok(Json(ApiResponse::success(outcomes)))
+                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
+
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("Query error: {}", e))?;
+                    let rows: Vec<LearningOutcomeDetailL1> = stmt
+                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
+                            Ok(LearningOutcomeDetailL1 {
+                                id: row.get(0)?,
+                                task_id: row.get(1)?,
+                                status: row.get(2)?,
+                                duration_secs: row.get(3)?,
+                                iterations: row.get(4)?,
+                                workflow_architecture: row.get(5)?,
+                                error_type: row.get(6)?,
+                                created_at: row.get(7)?,
+                            })
+                        })
+                        .map_err(|e| format!("Query error: {}", e))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    Ok(rows)
+                })
+                .map_err(make_err)?;
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(details).unwrap_or_default(),
+            )))
+        }
+        ContextTier::L2 => {
+            // Full records (existing behavior)
+            let outcomes = state
+                .app_state
+                .checkpoint_db
+                .with_conn(move |conn| {
+                    let mut sql = String::from(
+                        r#"SELECT id, task_id, status, duration_secs, iterations, strategy,
+                                  tools_used, files_modified, error_type, error_message,
+                                  workflow_architecture, created_at, step_count,
+                                  verification_step_count, agentic_step_count, has_ui_bridge,
+                                  technology_tags, domain_tags, complexity_tier
+                           FROM learning_outcomes
+                           WHERE 1=1"#,
+                    );
+                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    let mut param_idx = 1u32;
+
+                    if let Some(ref s) = status {
+                        param_idx += 1;
+                        sql.push_str(&format!(" AND status = ?{}", param_idx));
+                        param_values.push(Box::new(s.clone()));
+                    }
+                    if let Some(ref wa) = workflow_architecture {
+                        param_idx += 1;
+                        sql.push_str(&format!(" AND workflow_architecture = ?{}", param_idx));
+                        param_values.push(Box::new(wa.clone()));
+                    }
+
+                    sql.push_str(" ORDER BY created_at DESC LIMIT ?1");
+
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("Failed to prepare learning_outcomes query: {}", e))?;
+
+                    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    all_params.push(Box::new(limit as i64));
+                    all_params.extend(param_values);
+
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        all_params.iter().map(|p| p.as_ref()).collect();
+
+                    let results: Vec<serde_json::Value> = stmt
+                        .query_map(param_refs.as_slice(), |row| {
+                            Ok(serde_json::json!({
+                                "id": row.get::<_, String>(0).unwrap_or_default(),
+                                "task_id": row.get::<_, String>(1).unwrap_or_default(),
+                                "status": row.get::<_, String>(2).unwrap_or_default(),
+                                "duration_secs": row.get::<_, Option<f64>>(3).unwrap_or(None),
+                                "iterations": row.get::<_, Option<i64>>(4).unwrap_or(None),
+                                "strategy": row.get::<_, Option<String>>(5).unwrap_or(None),
+                                "tools_used": row.get::<_, Option<String>>(6).unwrap_or(None),
+                                "files_modified": row.get::<_, Option<String>>(7).unwrap_or(None),
+                                "error_type": row.get::<_, Option<String>>(8).unwrap_or(None),
+                                "error_message": row.get::<_, Option<String>>(9).unwrap_or(None),
+                                "workflow_architecture": row.get::<_, Option<String>>(10).unwrap_or(None),
+                                "created_at": row.get::<_, String>(11).unwrap_or_default(),
+                                "step_count": row.get::<_, Option<i64>>(12).unwrap_or(None),
+                                "verification_step_count": row.get::<_, Option<i64>>(13).unwrap_or(None),
+                                "agentic_step_count": row.get::<_, Option<i64>>(14).unwrap_or(None),
+                                "has_ui_bridge": row.get::<_, Option<i32>>(15).unwrap_or(None).map(|v| v != 0),
+                                "technology_tags": row.get::<_, Option<String>>(16).unwrap_or(None).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                                "domain_tags": row.get::<_, Option<String>>(17).unwrap_or(None).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                                "complexity_tier": row.get::<_, Option<String>>(18).unwrap_or(None),
+                            }))
+                        })
+                        .map_err(|e| format!("Failed to query learning_outcomes: {}", e))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+
+                    Ok(results)
+                })
+                .unwrap_or_default();
+
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(outcomes).unwrap_or_default(),
+            )))
+        }
+    }
 }
 
-/// GET /workflow-generation/feedback?limit=N&feedback_type=X
+/// GET /workflow-generation/feedback?limit=N&feedback_type=X&tier=l0|l1|l2
 ///
-/// Returns workflow generation feedback (edits, deletes, ratings).
+/// Returns workflow generation feedback at the requested tier:
+/// - L0 (default): counts grouped by feedback_type with avg rating
+/// - L1: core fields (id, feedback_type, edited_field, rating, workflow_category, created_at)
+/// - L2: full records with all fields (existing behavior)
 pub async fn get_generation_feedback_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<GenerationFeedbackQuery>,
-) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let limit = query.limit.unwrap_or(50);
     let feedback_type = query.feedback_type.clone();
+    let tier = query.tier.unwrap_or_default();
 
-    let feedback = state
-        .app_state
-        .checkpoint_db
-        .with_conn(move |conn| {
-            let mut sql = String::from(
-                r#"SELECT id, workflow_id, task_run_id, feedback_type, edited_field,
-                          old_value, new_value, delete_reason, rating, rating_comment,
-                          workflow_category, workflow_description, created_at
-                   FROM workflow_generation_feedback
-                   WHERE 1=1"#,
-            );
-            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let make_err = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "Failed to get generation feedback: {}",
+                e
+            ))),
+        )
+    };
 
-            if let Some(ref ft) = feedback_type {
-                sql.push_str(" AND feedback_type = ?2");
-                param_values.push(Box::new(ft.clone()));
-            }
+    match tier {
+        ContextTier::L0 => {
+            let ft_c = feedback_type.clone();
+            let summaries = state
+                .app_state
+                .checkpoint_db
+                .with_conn(move |conn| {
+                    let mut sql = String::from(
+                        r#"SELECT feedback_type,
+                                  COUNT(*) as total_count,
+                                  AVG(rating) as avg_rating
+                           FROM workflow_generation_feedback
+                           WHERE 1=1"#,
+                    );
+                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    let mut idx = 1;
 
-            sql.push_str(" ORDER BY created_at DESC LIMIT ?1");
+                    if let Some(ref ft) = ft_c {
+                        sql.push_str(&format!(" AND feedback_type = ?{}", idx));
+                        param_values.push(Box::new(ft.clone()));
+                        idx += 1;
+                    }
+                    let _ = idx;
 
-            let mut stmt = conn
-                .prepare(&sql)
-                .map_err(|e| format!("Failed to prepare generation_feedback query: {}", e))?;
+                    sql.push_str(" GROUP BY feedback_type ORDER BY total_count DESC");
 
-            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            all_params.push(Box::new(limit as i64));
-            all_params.extend(param_values);
-
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                all_params.iter().map(|p| p.as_ref()).collect();
-
-            let results: Vec<serde_json::Value> = stmt
-                .query_map(param_refs.as_slice(), |row| {
-                    Ok(serde_json::json!({
-                        "id": row.get::<_, String>(0).unwrap_or_default(),
-                        "workflow_id": row.get::<_, String>(1).unwrap_or_default(),
-                        "task_run_id": row.get::<_, Option<String>>(2).unwrap_or(None),
-                        "feedback_type": row.get::<_, String>(3).unwrap_or_default(),
-                        "edited_field": row.get::<_, Option<String>>(4).unwrap_or(None),
-                        "old_value": row.get::<_, Option<String>>(5).unwrap_or(None),
-                        "new_value": row.get::<_, Option<String>>(6).unwrap_or(None),
-                        "delete_reason": row.get::<_, Option<String>>(7).unwrap_or(None),
-                        "rating": row.get::<_, Option<i64>>(8).unwrap_or(None),
-                        "rating_comment": row.get::<_, Option<String>>(9).unwrap_or(None),
-                        "workflow_category": row.get::<_, Option<String>>(10).unwrap_or(None),
-                        "workflow_description": row.get::<_, Option<String>>(11).unwrap_or(None),
-                        "created_at": row.get::<_, String>(12).unwrap_or_default(),
-                    }))
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("Query error: {}", e))?;
+                    let rows: Vec<GenerationFeedbackSummaryL0> = stmt
+                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
+                            Ok(GenerationFeedbackSummaryL0 {
+                                feedback_type: row.get(0)?,
+                                total_count: row.get(1)?,
+                                avg_rating: row.get(2)?,
+                            })
+                        })
+                        .map_err(|e| format!("Query error: {}", e))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    Ok(rows)
                 })
-                .map_err(|e| format!("Failed to query generation_feedback: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect();
+                .map_err(make_err)?;
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(summaries).unwrap_or_default(),
+            )))
+        }
+        ContextTier::L1 => {
+            let ft_c = feedback_type.clone();
+            let details = state
+                .app_state
+                .checkpoint_db
+                .with_conn(move |conn| {
+                    let mut sql = String::from(
+                        r#"SELECT id, feedback_type, edited_field, rating,
+                                  workflow_category, created_at
+                           FROM workflow_generation_feedback
+                           WHERE 1=1"#,
+                    );
+                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    let mut idx = 1;
 
-            Ok(results)
-        })
-        .unwrap_or_default();
+                    if let Some(ref ft) = ft_c {
+                        sql.push_str(&format!(" AND feedback_type = ?{}", idx));
+                        param_values.push(Box::new(ft.clone()));
+                        idx += 1;
+                    }
+                    let _ = idx;
 
-    Ok(Json(ApiResponse::success(feedback)))
+                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
+
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("Query error: {}", e))?;
+                    let rows: Vec<GenerationFeedbackDetailL1> = stmt
+                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
+                            Ok(GenerationFeedbackDetailL1 {
+                                id: row.get(0)?,
+                                feedback_type: row.get(1)?,
+                                edited_field: row.get(2)?,
+                                rating: row.get(3)?,
+                                workflow_category: row.get(4)?,
+                                created_at: row.get(5)?,
+                            })
+                        })
+                        .map_err(|e| format!("Query error: {}", e))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    Ok(rows)
+                })
+                .map_err(make_err)?;
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(details).unwrap_or_default(),
+            )))
+        }
+        ContextTier::L2 => {
+            // Full records (existing behavior)
+            let feedback = state
+                .app_state
+                .checkpoint_db
+                .with_conn(move |conn| {
+                    let mut sql = String::from(
+                        r#"SELECT id, workflow_id, task_run_id, feedback_type, edited_field,
+                                  old_value, new_value, delete_reason, rating, rating_comment,
+                                  workflow_category, workflow_description, created_at
+                           FROM workflow_generation_feedback
+                           WHERE 1=1"#,
+                    );
+                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+                    if let Some(ref ft) = feedback_type {
+                        sql.push_str(" AND feedback_type = ?2");
+                        param_values.push(Box::new(ft.clone()));
+                    }
+
+                    sql.push_str(" ORDER BY created_at DESC LIMIT ?1");
+
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("Failed to prepare generation_feedback query: {}", e))?;
+
+                    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    all_params.push(Box::new(limit as i64));
+                    all_params.extend(param_values);
+
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                        all_params.iter().map(|p| p.as_ref()).collect();
+
+                    let results: Vec<serde_json::Value> = stmt
+                        .query_map(param_refs.as_slice(), |row| {
+                            Ok(serde_json::json!({
+                                "id": row.get::<_, String>(0).unwrap_or_default(),
+                                "workflow_id": row.get::<_, String>(1).unwrap_or_default(),
+                                "task_run_id": row.get::<_, Option<String>>(2).unwrap_or(None),
+                                "feedback_type": row.get::<_, String>(3).unwrap_or_default(),
+                                "edited_field": row.get::<_, Option<String>>(4).unwrap_or(None),
+                                "old_value": row.get::<_, Option<String>>(5).unwrap_or(None),
+                                "new_value": row.get::<_, Option<String>>(6).unwrap_or(None),
+                                "delete_reason": row.get::<_, Option<String>>(7).unwrap_or(None),
+                                "rating": row.get::<_, Option<i64>>(8).unwrap_or(None),
+                                "rating_comment": row.get::<_, Option<String>>(9).unwrap_or(None),
+                                "workflow_category": row.get::<_, Option<String>>(10).unwrap_or(None),
+                                "workflow_description": row.get::<_, Option<String>>(11).unwrap_or(None),
+                                "created_at": row.get::<_, String>(12).unwrap_or_default(),
+                            }))
+                        })
+                        .map_err(|e| format!("Failed to query generation_feedback: {}", e))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+
+                    Ok(results)
+                })
+                .unwrap_or_default();
+
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(feedback).unwrap_or_default(),
+            )))
+        }
+    }
 }
 
 /// GET /prompt-analysis?limit=N
@@ -1432,6 +1685,111 @@ pub async fn get_iteration_history_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Eval spec handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct EvalSpecQuery {
+    pub target_agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EvalResultQuery {
+    pub spec_id: Option<String>,
+    pub recommendation_id: Option<String>,
+}
+
+async fn get_eval_specs_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<EvalSpecQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let make_err = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get eval specs: {}", e))),
+        )
+    };
+
+    let specs = crate::meta_optimizer::eval_spec::list_eval_specs(
+        &state.app_state.checkpoint_db,
+        q.target_agent.as_deref(),
+    )
+    .map_err(make_err)?;
+
+    Ok(Json(ApiResponse::success(
+        serde_json::to_value(specs).unwrap_or_default(),
+    )))
+}
+
+async fn create_eval_spec_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(spec): Json<crate::meta_optimizer::eval_spec::EvalSpec>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let make_err = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to create eval spec: {}", e))),
+        )
+    };
+
+    crate::meta_optimizer::eval_spec::save_eval_spec(&state.app_state.checkpoint_db, &spec)
+        .map_err(make_err)?;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "id": spec.id,
+        "status": "saved"
+    }))))
+}
+
+async fn get_eval_results_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<EvalResultQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let make_err = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get eval results: {}", e))),
+        )
+    };
+
+    let results = crate::meta_optimizer::eval_spec::list_eval_results(
+        &state.app_state.checkpoint_db,
+        q.spec_id.as_deref(),
+        q.recommendation_id.as_deref(),
+    )
+    .map_err(make_err)?;
+
+    Ok(Json(ApiResponse::success(
+        serde_json::to_value(results).unwrap_or_default(),
+    )))
+}
+
+async fn evaluate_recommendation_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let make_err = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "Failed to evaluate recommendation: {}",
+                e
+            ))),
+        )
+    };
+
+    let result = crate::meta_optimizer::eval_runner::validate_recommendation(
+        &state.app_state.checkpoint_db,
+        &id,
+    )
+    .map_err(make_err)?;
+
+    Ok(Json(ApiResponse::success(
+        serde_json::to_value(result).unwrap_or_default(),
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
 
@@ -1486,5 +1844,16 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route(
             "/meta-optimizer/iteration-history",
             get(get_iteration_history_handler),
+        )
+        // Eval spec routes (promptfoo-inspired declarative evaluation)
+        .route("/meta-optimizer/eval-specs", get(get_eval_specs_handler))
+        .route(
+            "/meta-optimizer/eval-specs",
+            post(create_eval_spec_handler),
+        )
+        .route("/meta-optimizer/eval-results", get(get_eval_results_handler))
+        .route(
+            "/meta-optimizer/recommendations/{id}/evaluate",
+            post(evaluate_recommendation_handler),
         )
 }

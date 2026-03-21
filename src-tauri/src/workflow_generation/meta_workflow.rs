@@ -371,6 +371,8 @@ pub fn build_meta_workflow_template(
         acceptance_criteria: None,
         ai_reviewed: true,
         multi_agent_mode: true,
+        strict_cwd: false,
+        tool_tags: Vec::new(),
         use_worktree: false,
         model_overrides: std::collections::HashMap::new(),
         enforce_token_budget: false,

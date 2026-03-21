@@ -190,6 +190,21 @@ impl LoopController {
             .set_task_run_id(config.execution_id.clone());
 
         // =====================================================================
+        // PROPAGATE PATH SCOPE POLICY to phase executors
+        // =====================================================================
+        // When strict_cwd is enabled (per-workflow or global setting), enforce
+        // workspace-scoped working directory resolution on all step handlers.
+        if config.strict_cwd {
+            let policy = crate::paths::PathScopePolicy::WorkspaceScoped;
+            self.setup_executor
+                .set_path_scope_policy(policy.clone());
+            self.verification_executor
+                .set_path_scope_policy(policy.clone());
+            self.completion_executor
+                .set_path_scope_policy(policy);
+        }
+
+        // =====================================================================
         // CREATE ARTIFACT DIRECTORY
         // =====================================================================
         if config.artifact_dir.is_none() {
@@ -1145,6 +1160,8 @@ impl LoopController {
                     project_path: config.project_path.clone(),
                     acceptance_criteria: config.acceptance_criteria.clone(),
                     multi_agent_mode: config.multi_agent_mode,
+                    strict_cwd: config.strict_cwd,
+                    tool_tags: config.tool_tags.clone(),
                     use_worktree: false, // Worktree is handled at workflow level, not per-stage
                     worktree_path: config.worktree_path.clone(),
                     worktree_branch: config.worktree_branch.clone(),
@@ -1718,7 +1735,10 @@ impl LoopController {
                     .map(|r| r.was_stopped)
                     .unwrap_or(false),
                 tools_used: Vec::new(),
-                files_modified: Vec::new(),
+                files_modified: last_loop_result
+                    .as_ref()
+                    .map(|r| r.files_modified.clone())
+                    .unwrap_or_default(),
                 error_type: None,
                 error_message: None,
                 workflow_architecture: Some(architecture),
@@ -2164,6 +2184,7 @@ impl LoopController {
                     iteration_results,
                     total_tokens: None,
                     total_cost_usd: None,
+                    files_modified: resource_tracker.files_modified(),
                 };
             }
 
@@ -2183,6 +2204,7 @@ impl LoopController {
                     iteration_results,
                     total_tokens: None,
                     total_cost_usd: None,
+                    files_modified: resource_tracker.files_modified(),
                 };
             }
 
@@ -2206,6 +2228,7 @@ impl LoopController {
                             iteration_results,
                             total_tokens: None,
                             total_cost_usd: None,
+                            files_modified: resource_tracker.files_modified(),
                         };
                     }
                 }
@@ -2245,6 +2268,7 @@ impl LoopController {
                     iteration_results,
                     total_tokens: None,
                     total_cost_usd: None,
+                    files_modified: resource_tracker.files_modified(),
                 };
             }
 
@@ -2775,6 +2799,7 @@ impl LoopController {
                     iteration_results,
                     total_tokens: None,
                     total_cost_usd: None,
+                    files_modified: resource_tracker.files_modified(),
                 };
             }
 
@@ -2807,6 +2832,7 @@ impl LoopController {
                     iteration_results,
                     total_tokens: None,
                     total_cost_usd: None,
+                    files_modified: resource_tracker.files_modified(),
                 };
             }
 
@@ -3217,6 +3243,20 @@ impl LoopController {
                 &UnifiedWorkflowState::agentic_complete(iteration),
             );
 
+            // Compute token usage for the agentic phase trace
+            let (mut trace_tokens_in, mut trace_tokens_out) = super::multi_agent_pipeline_loop::query_iteration_tokens(
+                &self.checkpoint_db,
+                &config.execution_id,
+                iteration,
+            );
+            if trace_tokens_in == 0 && trace_tokens_out == 0 {
+                let (ot_in, ot_out) = agentic_outcome.token_usage();
+                trace_tokens_in = ot_in.unwrap_or(0);
+                trace_tokens_out = ot_out.unwrap_or(0);
+            }
+            let trace_model = config.resolve_model_for_phase("agentic").unwrap_or_else(|| "claude-cli".to_string());
+            let trace_cost = crate::ai_pricing::calculate_cost_usd(trace_tokens_in, trace_tokens_out, &trace_model);
+
             // Emit pipeline agent trace for the agentic phase (populates
             // pipeline_agent_traces for meta-optimizer analysis — works for
             // traditional architecture, not just MultiAgentPipeline).
@@ -3236,9 +3276,9 @@ impl LoopController {
                     }),
                     config: Default::default(),
                     duration_ms: agentic_duration_ms,
-                    tokens_in: 0, // not tracked at this level
-                    tokens_out: 0,
-                    cost_usd: 0.0,
+                    tokens_in: trace_tokens_in as u32,
+                    tokens_out: trace_tokens_out as u32,
+                    cost_usd: trace_cost,
                     downstream_success: None, // backfilled after loop completes
                     output_quality_score: None,
                     parent_span_id: None,
@@ -3535,6 +3575,7 @@ impl LoopController {
                     iteration_results,
                     total_tokens: None,
                     total_cost_usd: None,
+                    files_modified: resource_tracker.files_modified(),
                 };
             }
 
@@ -3551,6 +3592,7 @@ impl LoopController {
                     iteration_results,
                     total_tokens: None,
                     total_cost_usd: None,
+                    files_modified: resource_tracker.files_modified(),
                 };
             }
 
@@ -3570,6 +3612,7 @@ impl LoopController {
                     iteration_results,
                     total_tokens: None,
                     total_cost_usd: None,
+                    files_modified: resource_tracker.files_modified(),
                 };
             }
 
@@ -3797,6 +3840,7 @@ impl LoopController {
                         iteration_results,
                         total_tokens: None,
                         total_cost_usd: None,
+                        files_modified: resource_tracker.files_modified(),
                     };
                 }
                 if !approval_response.approved {

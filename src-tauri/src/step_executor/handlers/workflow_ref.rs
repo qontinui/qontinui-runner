@@ -222,6 +222,8 @@ impl StepHandler for WorkflowRefHandler {
             project_path: crate::mcp::shared::current_project_path(),
             acceptance_criteria: None,
             multi_agent_mode: false,
+            strict_cwd: false,
+            tool_tags: Vec::new(),
             use_worktree: false,
             worktree_path: None,
             worktree_branch: None,

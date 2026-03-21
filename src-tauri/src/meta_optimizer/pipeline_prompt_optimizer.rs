@@ -67,6 +67,8 @@ pub fn build_config(execution_id: &str, workflow_name: &str, style_index: u32) -
         project_path: crate::mcp::shared::current_project_path(),
         acceptance_criteria: None,
         multi_agent_mode: false,
+        strict_cwd: false,
+        tool_tags: Vec::new(),
         use_worktree: false,
         worktree_path: None,
         worktree_branch: None,
@@ -140,11 +142,11 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
             None,
             Some("cost_analysis"),
         ),
-        // Step 6: Load recent workflow outcomes for batch scoring during critique
+        // Step 6: Load recent workflow outcomes for batch scoring (L1 — core fields without large blobs)
         build_api_step(
-            "Load recent outcomes for batch scoring",
+            "Load recent outcomes for batch scoring (L1)",
             "GET",
-            &format!("{}/learning/outcomes?limit=20", base_url),
+            &format!("{}/learning/outcomes?limit=20&tier=l1", base_url),
             None,
             Some("recent_outcomes"),
         ),
@@ -190,7 +192,23 @@ If the analysis concluded that all agents are performing well and no changes are
 fn build_agentic_prompt(base_url: &str, thinking_style: &str) -> String {
     let prompt = r#"You are the Pipeline Prompt Optimizer, part of the meta-optimizer system.
 
-Your job is to analyze historical performance data from the multi-agent pipeline's four agents (spec_analyst, locator, implementer, verifier) and recommend improved system prompts for underperforming agents.
+Your job is to analyze historical performance data from ALL workflow agents and recommend improved system prompts for underperforming agents.
+
+## Agent Types
+
+Traces come from two workflow architectures:
+
+**Multi-Agent Pipeline agents:**
+- `spec_analyst` — Analyzes specifications and requirements
+- `locator` — Finds relevant code locations
+- `implementer` — Makes code changes
+- `verifier` — Verifies changes are correct
+
+**Traditional (Agentic Verification) loop agents:**
+- `verification` — Runs verification checks in the agentic loop
+- `agentic_fixer` — Applies fixes in the agentic loop
+
+You can recommend prompt changes for ANY of these agent types. The same recommendation format works for all of them.
 
 You will follow a **Generate → Critique → Refine** loop to produce high-quality recommendations.
 
@@ -203,7 +221,7 @@ The setup phase loaded **L0 summaries** (lightweight index data) to minimize tok
 - `{{prompt_variants}}` — Current active prompt variants in the registry (may be empty if using defaults)
 - `{{prompt_analysis}}` — Historical prompt analysis insights
 - `{{cost_analysis}}` — Cost efficiency analysis: per-agent cost breakdown, total cost, cost trend, active cost recommendations
-- `{{recent_outcomes}}` — Last 20 workflow outcomes (success/failure with context) for batch scoring
+- `{{recent_outcomes}}` — **L1 detail**: Last 20 workflow outcomes (id, task_id, status, duration, iterations, architecture, error_type, created_at) for batch scoring
 - `{{iteration_history}}` — **L0 summary**: approach patterns from agentic verification loops (avg iterations, most common approaches, confidence trends by run status)
 
 ## Drill-Down: L1/L2 Detail Endpoints
@@ -271,7 +289,7 @@ For each underperforming agent, draft 2-3 distinct candidate prompt variants. Ea
 ```
 [PROMPT_CANDIDATE]
 candidate_id: <A, B, or C>
-agent_type: <spec_analyst|locator|implementer|verifier>
+agent_type: <spec_analyst|locator|implementer|verifier|verification|agentic_fixer>
 approach: <brief description of the approach taken>
 prompt_content: |
   <the full new prompt text>
@@ -311,7 +329,7 @@ For each recommendation, output:
 
 ```
 [PROMPT_RECOMMENDATION]
-agent_type: <spec_analyst|locator|implementer|verifier>
+agent_type: <spec_analyst|locator|implementer|verifier|verification|agentic_fixer>
 variant_name: <descriptive name, e.g. "clarity_focused_v2">
 confidence: <0.0 to 1.0>
 rationale: <why this change should improve performance, referencing specific failure patterns and batch score>

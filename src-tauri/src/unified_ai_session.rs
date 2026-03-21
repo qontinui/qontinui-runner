@@ -493,6 +493,10 @@ pub struct UnifiedAiSessionExecutor {
     /// Optional session manager for interactive bidirectional sessions.
     /// When present, sessions use the stream-json protocol for multi-turn interaction.
     pub(crate) session_manager: Option<Arc<crate::claude_session::SessionManager>>,
+    /// Optional middleware chain for deterministic prompt/response transformations.
+    /// When present, pre_call middleware is applied during prompt transformation
+    /// and post_call middleware is applied to the session output.
+    pub(crate) middleware_chain: Option<crate::ai_provider::middleware::AiMiddlewareChain>,
 }
 
 impl UnifiedAiSessionExecutor {
@@ -507,7 +511,17 @@ impl UnifiedAiSessionExecutor {
             app_handle,
             pid_tracker,
             session_manager: None,
+            middleware_chain: None,
         }
+    }
+
+    /// Set the middleware chain for deterministic prompt/response transformations.
+    pub fn with_middleware_chain(
+        mut self,
+        chain: crate::ai_provider::middleware::AiMiddlewareChain,
+    ) -> Self {
+        self.middleware_chain = Some(chain);
+        self
     }
 
     /// Set the session manager for interactive mode.
@@ -1036,6 +1050,15 @@ impl UnifiedAiSessionExecutor {
         // Append finding instructions if configured
         if config.append_finding_instructions {
             result = format!("{}{}", result, FINDING_INSTRUCTIONS);
+        }
+
+        // Apply middleware pre-call transformations (if a middleware chain is configured)
+        if let Some(ref chain) = self.middleware_chain {
+            let mw_ctx = crate::ai_provider::middleware::MiddlewareContext::new(
+                config.phase.as_str(),
+            )
+            .with_task_run_id(&config.task_run_id);
+            result = chain.run_pre_call(&result, &mw_ctx);
         }
 
         result

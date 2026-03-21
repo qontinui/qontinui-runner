@@ -136,6 +136,9 @@ pub struct LoopResult {
     /// Total cost in USD (populated by multi-agent pipeline and agentic verification).
     #[serde(default)]
     pub total_cost_usd: Option<f64>,
+    /// All unique file paths modified across all iterations (from resource tracker).
+    #[serde(default)]
+    pub files_modified: Vec<String>,
 }
 
 impl LoopResult {
@@ -338,6 +341,11 @@ pub struct LoopConfig {
     /// Populated during loop execution for cross-iteration context injection.
     #[allow(dead_code)]
     pub iteration_diffs: Vec<IterationDiff>,
+    /// Restrict working directory resolution to the workspace boundary.
+    /// Propagated to HandlerContext.path_scope_policy during step execution.
+    pub strict_cwd: bool,
+    /// Tags for per-execution tool whitelisting.
+    pub tool_tags: Vec<String>,
     /// Run the workflow in an isolated git worktree.
     pub use_worktree: bool,
     /// Worktree path (set at runtime, not user-configurable).
@@ -406,6 +414,10 @@ impl LoopConfig {
                 workflow.rollback_policy.as_deref().unwrap_or("none"),
             ),
             iteration_diffs: Vec::new(),
+            // strict_cwd is true if either the workflow or global setting enables it
+            strict_cwd: workflow.strict_cwd
+                || crate::settings::get_path_settings().strict_mode,
+            tool_tags: workflow.tool_tags.clone(),
             use_worktree: workflow.use_worktree,
             worktree_path: None,
             worktree_branch: None,

@@ -195,49 +195,22 @@ pub fn evaluate_recommendation_outcome(
                 let sr_delta = (p.success_rate - b.success_rate) * 100.0; // convert to pp
 
                 // Statistical analysis from snapshot-level aggregate counts
-                let (p_value, confidence_interval, effect_size) = if b.total_runs >= 2
-                    && p.total_runs >= 2
-                {
-                    let b_total = b.total_runs as u64;
-                    let p_total = p.total_runs as u64;
-                    let b_succ = b.successful_runs as u64;
-                    let p_succ = p.successful_runs as u64;
+                let analysis = crate::stats::proportion_analysis(
+                    (p.successful_runs as u64, p.total_runs as u64),
+                    (b.successful_runs as u64, b.total_runs as u64),
+                    2,
+                );
+                let p_value = analysis.p_value;
+                let confidence_interval = analysis.confidence_interval;
+                let effect_size = analysis.effect_size;
 
-                    let pv =
-                        crate::stats::proportion_z_test_onesided(p_succ, p_total, b_succ, b_total);
-                    let ci =
-                        crate::stats::proportion_diff_ci(p_succ, p_total, b_succ, b_total, 0.95);
-                    let ci_pp = (ci.0 * 100.0, ci.1 * 100.0);
-                    let h = crate::stats::cohens_h(p.success_rate, b.success_rate);
-
-                    (Some(pv), Some(ci_pp), Some(h))
-                } else {
-                    (None, None, None)
-                };
-
-                let verdict = if p.total_runs < 5 {
-                    "insufficient_data"
-                } else if let Some(pv) = p_value {
-                    let p_regression = crate::stats::proportion_z_test_onesided(
-                        b.successful_runs as u64,
-                        b.total_runs as u64,
-                        p.successful_runs as u64,
-                        p.total_runs as u64,
-                    );
-                    if p_regression < 0.05 && sr_delta < -3.0 {
-                        "regressed"
-                    } else if pv < 0.05 && sr_delta > 2.0 {
-                        "improved"
-                    } else {
-                        "neutral"
-                    }
-                } else if sr_delta < -5.0 {
-                    "regressed"
-                } else if sr_delta > 3.0 {
-                    "improved"
-                } else {
-                    "neutral"
-                };
+                let verdict_enum = crate::stats::compute_verdict(
+                    sr_delta,
+                    &analysis,
+                    p.total_runs as u64,
+                    &crate::stats::VerdictThresholds::recommendation(),
+                );
+                let verdict = verdict_enum.as_recommendation_str();
 
                 let sc_delta = match (b.avg_spec_compliance, p.avg_spec_compliance) {
                     (Some(b_sc), Some(p_sc)) => Some(p_sc - b_sc),
@@ -300,56 +273,22 @@ fn compute_verdict(
             let cost_delta = a.avg_cost_usd - b.avg_cost_usd;
 
             // Statistical analysis when we have enough data
-            let (p_value, confidence_interval, effect_size) = if b.run_count >= 2
-                && a.run_count >= 2
-            {
-                let b_total = b.run_count as u64;
-                let a_total = a.run_count as u64;
-                let b_succ = b.success_count as u64;
-                let a_succ = a.success_count as u64;
+            let analysis = crate::stats::proportion_analysis(
+                (a.success_count as u64, a.run_count as u64),
+                (b.success_count as u64, b.run_count as u64),
+                2,
+            );
+            let p_value = analysis.p_value;
+            let confidence_interval = analysis.confidence_interval;
+            let effect_size = analysis.effect_size;
 
-                let p = crate::stats::proportion_z_test_onesided(a_succ, a_total, b_succ, b_total);
-
-                let ci = crate::stats::proportion_diff_ci(a_succ, a_total, b_succ, b_total, 0.95);
-                let ci_pp = (ci.0 * 100.0, ci.1 * 100.0);
-
-                let b_prop = b_succ as f64 / b_total as f64;
-                let a_prop = a_succ as f64 / a_total as f64;
-                let h = crate::stats::cohens_h(a_prop, b_prop);
-
-                (Some(p), Some(ci_pp), Some(h))
-            } else {
-                (None, None, None)
-            };
-
-            let verdict = if a.run_count < 5 {
-                "insufficient_data"
-            } else if let Some(p) = p_value {
-                // Check for regression (is before significantly better than after?)
-                let p_regression = crate::stats::proportion_z_test_onesided(
-                    b.success_count as u64,
-                    b.run_count as u64,
-                    a.success_count as u64,
-                    a.run_count as u64,
-                );
-
-                if p_regression < 0.05 && sr_delta < -3.0 {
-                    "regressed"
-                } else if p < 0.05 && sr_delta > 2.0 {
-                    "improved"
-                } else {
-                    "neutral"
-                }
-            } else {
-                // Fallback to simple thresholds
-                if sr_delta < -5.0 {
-                    "regressed"
-                } else if sr_delta > 3.0 {
-                    "improved"
-                } else {
-                    "neutral"
-                }
-            };
+            let verdict_enum = crate::stats::compute_verdict(
+                sr_delta,
+                &analysis,
+                a.run_count as u64,
+                &crate::stats::VerdictThresholds::recommendation(),
+            );
+            let verdict = verdict_enum.as_recommendation_str();
 
             RecommendationOutcome {
                 verdict: verdict.to_string(),

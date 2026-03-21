@@ -249,7 +249,7 @@ fn auto_evaluate_outcomes(db: &CheckpointDb) {
 }
 
 /// Check active canary rollouts and auto-promote or rollback when the minimum
-/// sample size threshold (20 canary runs) is met.
+/// sample size threshold (10 canary runs) is met.
 fn auto_evaluate_canaries(db: &CheckpointDb) {
     let canaries = match super::canary::get_active_canaries(db) {
         Ok(c) => c,
@@ -258,7 +258,7 @@ fn auto_evaluate_canaries(db: &CheckpointDb) {
 
     for canary in &canaries {
         // Only auto-evaluate if canary has reached minimum run threshold
-        if canary.canary_run_count < 20 {
+        if canary.canary_run_count < 10 {
             continue;
         }
 

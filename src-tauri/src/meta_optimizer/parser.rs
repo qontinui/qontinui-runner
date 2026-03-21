@@ -708,22 +708,76 @@ pub fn save_parsed_recommendations(
     Ok(count)
 }
 
-/// Auto-apply high-confidence rule recommendations.
+/// Auto-apply high-confidence rule recommendations and auto-canary prompt rewrites.
 ///
-/// Only applies `rule_create` and `rule_update` types with confidence >= 0.85.
-/// Prompt rewrites and config changes always require human review since they
-/// are harder to reverse and have broader impact.
+/// - `rule_create` and `rule_update` with confidence >= 0.85 are applied directly
+///   (safest, most reversible).
+/// - `prompt_rewrite` with confidence >= 0.85 are started as canary rollouts at 20%
+///   so they can be evaluated before full promotion.
+/// - `config_change` always requires human review.
 pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&str>) {
     let run_id = optimizer_run_id.map(|s| s.to_string());
 
-    // Only auto-apply rule changes (safest, most reversible)
-    let candidates: Vec<(String, f64)> = db
-        .with_conn(|conn| {
+    // Auto-apply rule changes (safest, most reversible)
+    let rule_candidates: Vec<(String, f64)> = db
+        .with_conn({
+            let run_id = run_id.clone();
+            move |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        r#"SELECT id, confidence FROM meta_optimizer_recommendations
+                           WHERE status = 'pending'
+                             AND recommendation_type IN ('rule_create', 'rule_update')
+                             AND confidence >= 0.85
+                             AND (?1 IS NULL OR optimizer_run_id = ?1)"#,
+                    )
+                    .map_err(|e| format!("Query error: {}", e))?;
+
+                let rows = stmt
+                    .query_map(rusqlite::params![run_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                    })
+                    .map_err(|e| format!("Query error: {}", e))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                Ok(rows)
+            }
+        })
+        .unwrap_or_default();
+
+    for (rec_id, confidence) in &rule_candidates {
+        match super::recommendations::apply_recommendation_with_side_effects(db, rec_id) {
+            Ok(()) => {
+                info!(
+                    "Auto-applied high-confidence recommendation {} (confidence: {:.0}%)",
+                    rec_id,
+                    confidence * 100.0
+                );
+            }
+            Err(e) => {
+                warn!("Failed to auto-apply recommendation {}: {}", rec_id, e);
+            }
+        }
+    }
+
+    if !rule_candidates.is_empty() {
+        info!(
+            "Auto-applied {} high-confidence rule recommendation(s)",
+            rule_candidates.len()
+        );
+    }
+
+    // Auto-canary prompt rewrites with high confidence (>= 0.85)
+    // These are started as canary rollouts at 20% rather than applied directly,
+    // since prompt changes have broader impact and benefit from A/B evaluation.
+    let prompt_candidates: Vec<(String, f64)> = db
+        .with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
                     r#"SELECT id, confidence FROM meta_optimizer_recommendations
                        WHERE status = 'pending'
-                         AND recommendation_type IN ('rule_create', 'rule_update')
+                         AND recommendation_type = 'prompt_rewrite'
                          AND confidence >= 0.85
                          AND (?1 IS NULL OR optimizer_run_id = ?1)"#,
                 )
@@ -741,25 +795,27 @@ pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&s
         })
         .unwrap_or_default();
 
-    for (rec_id, confidence) in &candidates {
-        match super::recommendations::apply_recommendation_with_side_effects(db, rec_id) {
-            Ok(()) => {
+    for (rec_id, confidence) in &prompt_candidates {
+        match super::canary::start_canary(db, rec_id, 20) {
+            Ok(canary_id) => {
                 info!(
-                    "Auto-applied high-confidence recommendation {} (confidence: {:.0}%)",
-                    rec_id,
-                    confidence * 100.0
+                    "Auto-started canary {} for prompt recommendation {} (confidence: {:.0}%, rollout: 20%)",
+                    canary_id, rec_id, confidence * 100.0
                 );
             }
             Err(e) => {
-                warn!("Failed to auto-apply recommendation {}: {}", rec_id, e);
+                warn!(
+                    "Failed to auto-start canary for prompt recommendation {}: {}",
+                    rec_id, e
+                );
             }
         }
     }
 
-    if !candidates.is_empty() {
+    if !prompt_candidates.is_empty() {
         info!(
-            "Auto-applied {} high-confidence rule recommendation(s)",
-            candidates.len()
+            "Auto-started {} canary rollout(s) for high-confidence prompt recommendation(s)",
+            prompt_candidates.len()
         );
     }
 }

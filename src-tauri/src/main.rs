@@ -109,6 +109,7 @@ mod tiered_info;
 mod timeout_config;
 mod tracing_layers;
 mod trigger_system;
+mod ui_bridge_plugin;
 mod unified_ai_session;
 mod unified_workflow_executor;
 mod unified_workflows;
@@ -493,6 +494,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(ui_bridge_plugin::init())
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
@@ -1237,6 +1239,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::meta_optimizer::get_canary_rollouts,
             commands::meta_optimizer::promote_canary_rollout,
             commands::meta_optimizer::rollback_canary_rollout,
+            // Eval spec commands (promptfoo-inspired declarative evaluation)
+            commands::meta_optimizer::get_eval_specs,
+            commands::meta_optimizer::create_eval_spec,
+            commands::meta_optimizer::delete_eval_spec,
+            commands::meta_optimizer::get_eval_results,
+            commands::meta_optimizer::run_recommendation_eval,
+            commands::meta_optimizer::generate_default_eval_spec,
+            // Robustness testing and golden datasets
+            commands::meta_optimizer::run_robustness_test,
+            commands::meta_optimizer::get_robustness_reports,
+            commands::meta_optimizer::get_golden_datasets,
+            commands::meta_optimizer::build_golden_dataset,
             // Comparison commands
             commands::comparison::start_comparison,
             commands::comparison::get_comparison_status,

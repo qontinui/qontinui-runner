@@ -271,6 +271,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- Cross-Iteration Context Compression (v128)
     iteration_history TEXT,                     -- JSON array of compressed iteration summaries for agentic verification loops
 
+    -- Pipeline Checkpoint (v138)
+    pipeline_checkpoint TEXT,                   -- JSON: PipelineCheckpoint for resuming multi-agent pipeline from last completed phase
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -1205,6 +1208,9 @@ CREATE TABLE IF NOT EXISTS learning_outcomes (
     total_tokens INTEGER,  -- Total tokens consumed (from multi-agent pipeline)
     total_cost_usd REAL,  -- Total cost in USD (from multi-agent pipeline)
     composite_agentic_score REAL,  -- Cached weighted composite of agentic metric scores (0.0-1.0)
+    technology_tags TEXT,  -- JSON array of inferred technology tags (e.g. ["rust","typescript","python"])
+    domain_tags TEXT,  -- JSON array of inferred domain tags (e.g. ["database","ui-bridge","testing"])
+    complexity_tier TEXT,  -- 'simple', 'moderate', or 'complex' based on step counts and iteration patterns
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_learning_outcomes_task_id ON learning_outcomes(task_id);
@@ -3303,3 +3309,87 @@ CREATE TABLE IF NOT EXISTS agentic_metric_baselines (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_baselines_unique ON agentic_metric_baselines(workflow_id, metric_type);
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (133, datetime('now'));
+
+-- =============================================================================
+-- Eval Specs and Results Tables (migration 134)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS eval_specs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    target_agent TEXT,
+    spec_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS eval_results (
+    id TEXT PRIMARY KEY,
+    spec_id TEXT NOT NULL,
+    recommendation_id TEXT,
+    status TEXT NOT NULL DEFAULT 'running',  -- 'running', 'passed', 'failed', 'inconclusive'
+    result_json TEXT NOT NULL DEFAULT '{}',
+    p_value REAL,
+    trials_run INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_eval_results_spec ON eval_results(spec_id);
+CREATE INDEX IF NOT EXISTS idx_eval_results_rec ON eval_results(recommendation_id);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (134, datetime('now'));
+
+-- Artifacts table for UI Bridge IPC artifact persistence
+CREATE TABLE IF NOT EXISTS artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    source_json TEXT NOT NULL,        -- JSON: ArtifactSource
+    result_json TEXT NOT NULL,        -- JSON: the execution result payload
+    environment_json TEXT NOT NULL,   -- JSON: ArtifactEnvironment
+    created_at TEXT NOT NULL,         -- ISO 8601
+    passed INTEGER                    -- denormalized for fast filtering
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_created_at ON artifacts(created_at);
+CREATE INDEX IF NOT EXISTS idx_artifacts_passed ON artifacts(passed);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (135, datetime('now'));
+
+-- =============================================================================
+-- Golden Datasets and Robustness Reports (migration 136)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS golden_datasets (
+    id TEXT PRIMARY KEY,
+    agent_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    entries_json TEXT NOT NULL DEFAULT '[]',
+    entry_count INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_golden_agent ON golden_datasets(agent_type);
+
+CREATE TABLE IF NOT EXISTS robustness_reports (
+    id TEXT PRIMARY KEY,
+    prompt_variant_id TEXT,
+    recommendation_id TEXT,
+    total_tests INTEGER NOT NULL,
+    passed INTEGER NOT NULL,
+    failed INTEGER NOT NULL,
+    report_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_robustness_variant ON robustness_reports(prompt_variant_id);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (136, datetime('now'));
+
+-- =============================================================================
+-- Migration 137: Auto-tagging enrichment columns (learning_outcomes)
+-- Columns already included in learning_outcomes CREATE TABLE above.
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (137, datetime('now'));
+
+-- =============================================================================
+-- Migration 138: Pipeline checkpoint column on task_runs
+-- Column already included in task_runs CREATE TABLE above.
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (138, datetime('now'));

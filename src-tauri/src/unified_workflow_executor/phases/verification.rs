@@ -52,6 +52,11 @@ impl VerificationExecutor {
         self.executor.set_task_run_id(task_run_id);
     }
 
+    /// Set the path scope policy on the inner step executor.
+    pub fn set_path_scope_policy(&mut self, policy: crate::paths::PathScopePolicy) {
+        self.executor.set_path_scope_policy(policy);
+    }
+
     /// Run verification steps.
     ///
     /// Returns (verification_result, step_results)

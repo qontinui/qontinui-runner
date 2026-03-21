@@ -66,6 +66,8 @@ pub fn build_config(execution_id: &str, workflow_name: &str, style_index: u32) -
         project_path: crate::mcp::shared::current_project_path(),
         acceptance_criteria: None,
         multi_agent_mode: false,
+        strict_cwd: false,
+        tool_tags: Vec::new(),
         use_worktree: false,
         worktree_path: None,
         worktree_branch: None,
@@ -93,11 +95,14 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
             None,
             Some("optimizer_context"),
         ),
-        // Step 1: Load workflow generation feedback (edits, deletes, ratings)
+        // Step 1: Load generation feedback summaries (L0 — counts by feedback_type)
         build_api_step(
-            "Load generation feedback",
+            "Load generation feedback summaries (L0)",
             "GET",
-            &format!("{}/workflow-generation/feedback?limit=100", base_url),
+            &format!(
+                "{}/workflow-generation/feedback?limit=100&tier=l0",
+                base_url
+            ),
             None,
             Some("generation_feedback"),
         ),
@@ -117,11 +122,11 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
             None,
             Some("prompt_analysis"),
         ),
-        // Step 4: Load recent task run outcomes for context
+        // Step 4: Load recent task run outcome summaries (L0 — counts by status)
         build_api_step(
-            "Load recent task outcomes",
+            "Load recent outcome summaries (L0)",
             "GET",
-            &format!("{}/learning/outcomes?limit=50", base_url),
+            &format!("{}/learning/outcomes?limit=50&tier=l0", base_url),
             None,
             Some("recent_outcomes"),
         ),
@@ -160,14 +165,44 @@ Your job is to analyze workflow generation feedback and recommend improvements t
 
 You will follow a **Generate → Critique → Refine** loop to produce high-quality recommendations.
 
-## Data Available
+## Data Available (Tiered Context — L0 Summaries)
 
-The setup phase loaded:
+The setup phase loaded **L0 summaries** (lightweight index data) to minimize token usage:
 - `{{optimizer_context}}` — Your performance history: previous recommendations and their outcomes, current metrics vs baseline, generation quality trends
-- `{{generation_feedback}}` — User feedback on generated workflows: edits, deletes, ratings, and which fields were commonly edited
+- `{{generation_feedback}}` — **L0 summary**: feedback_type, total_count, avg_rating (grouped by feedback type)
 - `{{generation_rules}}` — Current active generation rules for all agents (schema_context, hardener, verification). Rules may include an `examples` field with positive/negative examples.
 - `{{prompt_analysis}}` — Historical prompt analysis insights
-- `{{recent_outcomes}}` — Recent task run outcomes (success/failure patterns) — use for batch scoring during critique
+- `{{recent_outcomes}}` — **L0 summary**: status, run_count, avg_duration_secs, avg_iterations (grouped by status)
+
+## Drill-Down: L1/L2 Detail Endpoints
+
+If the L0 summaries reveal patterns worth investigating, drill into details using curl:
+
+**Generation Feedback — L1 (core fields per feedback entry):**
+```bash
+curl -s 'BASE_URL/workflow-generation/feedback?tier=l1&limit=50'
+```
+Returns: id, feedback_type, edited_field, rating, workflow_category, created_at.
+
+**Generation Feedback — L2 (full records including old_value/new_value):**
+```bash
+curl -s 'BASE_URL/workflow-generation/feedback?tier=l2&limit=50'
+```
+Returns: full records with old_value, new_value, delete_reason, rating_comment.
+
+**Learning Outcomes — L1 (core fields per outcome):**
+```bash
+curl -s 'BASE_URL/learning/outcomes?tier=l1&limit=50'
+```
+Returns: id, task_id, status, duration_secs, iterations, workflow_architecture, error_type, created_at.
+
+**Learning Outcomes — L2 (full records):**
+```bash
+curl -s 'BASE_URL/learning/outcomes?tier=l2&limit=20'
+```
+Returns: full records including strategy, tools_used, files_modified, error_message.
+
+Only drill into L1/L2 when the L0 summaries show a problem worth investigating. Do NOT load L2 data for all feedback — only for specific feedback types that need analysis.
 
 ## Generation Rules System
 

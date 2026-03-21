@@ -79,6 +79,8 @@ pub struct StepExecutor {
     pub(crate) handler_registry: HandlerRegistry,
     /// PID tracker for AI process management (passed to WorkflowStepHandler)
     pub(crate) pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
+    /// Path scope policy for working directory resolution boundary enforcement.
+    pub(crate) path_scope_policy: crate::paths::PathScopePolicy,
 }
 
 impl StepExecutor {
@@ -94,6 +96,7 @@ impl StepExecutor {
             shared_variables: SharedVariableStore::new(),
             handler_registry: HandlerRegistry::with_standard_handlers(),
             pid_tracker: None,
+            path_scope_policy: crate::paths::PathScopePolicy::default(),
         }
     }
 
@@ -113,6 +116,7 @@ impl StepExecutor {
             shared_variables: SharedVariableStore::new(),
             handler_registry: HandlerRegistry::with_standard_handlers(),
             pid_tracker: None,
+            path_scope_policy: crate::paths::PathScopePolicy::default(),
         }
     }
 
@@ -123,6 +127,11 @@ impl StepExecutor {
         self.runtime_context = RuntimeContext::with_task_run_id(&task_run_id);
         self.task_run_id = Some(task_run_id);
         self
+    }
+
+    /// Set the path scope policy for working directory boundary enforcement.
+    pub fn set_path_scope_policy(&mut self, policy: crate::paths::PathScopePolicy) {
+        self.path_scope_policy = policy;
     }
 
     /// Set the task run ID for database logging (mutable setter).
@@ -169,6 +178,7 @@ impl StepExecutor {
             self.task_run_id.clone(),
             self.pid_tracker.clone(),
         )
+        .with_path_scope_policy(self.path_scope_policy.clone())
     }
 
     /// Expand shared variables in a string.

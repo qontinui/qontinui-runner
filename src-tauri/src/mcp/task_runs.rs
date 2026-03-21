@@ -634,6 +634,8 @@ pub async fn resume_task_run(
         project_path: crate::mcp::shared::current_project_path(),
         acceptance_criteria: workflow.acceptance_criteria.clone(),
         multi_agent_mode: false,
+        strict_cwd: false,
+        tool_tags: Vec::new(),
         use_worktree: false,
         worktree_path: None,
         worktree_branch: None,
@@ -2363,6 +2365,7 @@ pub async fn generate_workflow_from_session(
         verification_depth: None,
         discover_ui_bridge_specs: None,
         simple_mode: None,
+        tool_tags: None,
     };
 
     let doctor_handle = state.doctor_handle.clone();

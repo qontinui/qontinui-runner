@@ -1957,3 +1957,58 @@ pub struct VerificationPhaseSummary {
     pub failed_steps: i32,
     pub created_at: String,
 }
+
+/// A persisted artifact from the UI Bridge IPC artifact store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Artifact {
+    pub artifact_id: String,
+    pub source_json: String,
+    pub result_json: String,
+    pub environment_json: String,
+    pub created_at: String,
+    pub passed: Option<bool>,
+}
+
+/// Query parameters for listing artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactQuery {
+    /// Filter by spec ID (JSON-extracted from source_json)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_id: Option<String>,
+    /// Filter by date range start (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date_from: Option<String>,
+    /// Filter by date range end (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date_to: Option<String>,
+    /// If true, only return passed artifacts
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passed_only: Option<bool>,
+    /// If true, only return failed artifacts
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_only: Option<bool>,
+    /// Maximum number of results to return
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Offset for pagination
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+}
+
+/// Count parameters for counting artifacts (mirrors query filters).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactCountQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passed_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_only: Option<bool>,
+}

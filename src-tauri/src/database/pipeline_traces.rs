@@ -7,7 +7,7 @@ use rusqlite::{params, Connection};
 use tracing::debug;
 
 use crate::autoresearch::agentic_verification::{
-    GuardrailResult, HandoffContext, PipelineAgentTrace,
+    GuardrailResult, HandoffContext, PipelineAgentTrace, PipelineCheckpoint,
 };
 use crate::database::CheckpointDb;
 
@@ -731,5 +731,96 @@ pub fn get_agent_cascade_effect(
             .collect();
 
         Ok(results)
+    })
+}
+
+/// Save (upsert) a pipeline checkpoint for a task run.
+///
+/// Stores the checkpoint as JSON in the `pipeline_checkpoint` column on `task_runs`.
+/// This allows the pipeline to resume from the last completed phase if it crashes.
+pub fn save_pipeline_checkpoint(
+    db: &CheckpointDb,
+    task_run_id: &str,
+    checkpoint: &PipelineCheckpoint,
+) -> Result<(), String> {
+    let task_run_id = task_run_id.to_string();
+    let checkpoint_json = serde_json::to_string(checkpoint)
+        .map_err(|e| format!("Failed to serialize pipeline checkpoint: {}", e))?;
+
+    db.with_conn(move |conn| {
+        conn.execute(
+            "UPDATE task_runs SET pipeline_checkpoint = ?1, updated_at = ?2 WHERE id = ?3",
+            params![
+                checkpoint_json,
+                chrono::Utc::now().to_rfc3339(),
+                task_run_id,
+            ],
+        )
+        .map_err(|e| format!("Failed to save pipeline checkpoint: {}", e))?;
+
+        debug!(
+            "Saved pipeline checkpoint (phase {}) for task run {}",
+            checkpoint.last_completed_phase, task_run_id
+        );
+        Ok(())
+    })
+}
+
+/// Load a pipeline checkpoint for a task run, if one exists.
+///
+/// Returns `None` if no checkpoint exists or if it cannot be deserialized.
+pub fn get_pipeline_checkpoint(
+    db: &CheckpointDb,
+    task_run_id: &str,
+) -> Result<Option<PipelineCheckpoint>, String> {
+    let task_run_id = task_run_id.to_string();
+
+    db.with_conn(move |conn| {
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT pipeline_checkpoint FROM task_runs WHERE id = ?1",
+                params![task_run_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(None);
+
+        match result {
+            Some(json) if !json.is_empty() => {
+                match serde_json::from_str::<PipelineCheckpoint>(&json) {
+                    Ok(checkpoint) => {
+                        debug!(
+                            "Loaded pipeline checkpoint (phase {}) for task run {}",
+                            checkpoint.last_completed_phase, task_run_id
+                        );
+                        Ok(Some(checkpoint))
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Failed to deserialize pipeline checkpoint for {}: {}",
+                            task_run_id, e
+                        );
+                        Ok(None)
+                    }
+                }
+            }
+            _ => Ok(None),
+        }
+    })
+}
+
+/// Clear the pipeline checkpoint for a task run (e.g., after successful completion).
+pub fn clear_pipeline_checkpoint(
+    db: &CheckpointDb,
+    task_run_id: &str,
+) -> Result<(), String> {
+    let task_run_id = task_run_id.to_string();
+
+    db.with_conn(move |conn| {
+        conn.execute(
+            "UPDATE task_runs SET pipeline_checkpoint = NULL, updated_at = ?1 WHERE id = ?2",
+            params![chrono::Utc::now().to_rfc3339(), task_run_id],
+        )
+        .map_err(|e| format!("Failed to clear pipeline checkpoint: {}", e))?;
+        Ok(())
     })
 }

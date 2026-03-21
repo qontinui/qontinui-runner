@@ -932,6 +932,11 @@ impl ResourceTracker {
         self.all_files_modified.len()
     }
 
+    /// Get all unique file paths modified across all iterations.
+    pub fn files_modified(&self) -> Vec<String> {
+        self.all_files_modified.iter().cloned().collect()
+    }
+
     /// Get the total agentic phase time in milliseconds.
     pub fn total_agentic_time_ms(&self) -> u64 {
         self.total_agentic_time_ms
