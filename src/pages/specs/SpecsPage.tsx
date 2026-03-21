@@ -15,7 +15,7 @@
  * 5. Spec-to-workflow pipeline (build verification workflows from specs)
  */
 
-import { useEffect, useCallback, useState } from "react";
+import { useEffect, useCallback, useReducer, useState } from "react";
 import { ShieldCheck, FlaskConical } from "lucide-react";
 import { useSpecsState } from "./useSpecsState";
 import { ConnectionBar } from "./ConnectionBar";
@@ -32,22 +32,139 @@ import { useKnownIssues } from "@/hooks/useKnownIssues";
 import { SpecExperimentationDashboard } from "@/components/specs/SpecExperimentationDashboard";
 import type { LoadedSpec } from "./types";
 
+// ============================================================================
+// SpecsPage reducer
+// ============================================================================
+
+type GenerateSpecRequest = {
+  expectedSpecId: string;
+  label: string;
+  description: string;
+} | null;
+
+interface SpecsPageState {
+  isSavingWorkflow: boolean;
+  forcePromptOnly: boolean;
+  includeRegressionChecks: boolean;
+  viewMode: "editor" | "experimentation";
+  generateSpecRequest: GenerateSpecRequest;
+}
+
+type SpecsPageAction =
+  | { type: "SET_SAVING_WORKFLOW"; value: boolean }
+  | { type: "TOGGLE_FORCE_PROMPT" }
+  | { type: "TOGGLE_REGRESSION_CHECKS" }
+  | { type: "SET_VIEW_MODE"; value: "editor" | "experimentation" }
+  | { type: "SET_GENERATE_SPEC_REQUEST"; value: GenerateSpecRequest };
+
+function specsPageReducer(state: SpecsPageState, action: SpecsPageAction): SpecsPageState {
+  switch (action.type) {
+    case "SET_SAVING_WORKFLOW":
+      return { ...state, isSavingWorkflow: action.value };
+    case "TOGGLE_FORCE_PROMPT":
+      return { ...state, forcePromptOnly: !state.forcePromptOnly };
+    case "TOGGLE_REGRESSION_CHECKS":
+      return { ...state, includeRegressionChecks: !state.includeRegressionChecks };
+    case "SET_VIEW_MODE":
+      return { ...state, viewMode: action.value };
+    case "SET_GENERATE_SPEC_REQUEST":
+      return { ...state, generateSpecRequest: action.value };
+  }
+}
+
+const SPECS_PAGE_INITIAL: SpecsPageState = {
+  isSavingWorkflow: false,
+  forcePromptOnly: false,
+  includeRegressionChecks: false,
+  viewMode: "editor",
+  generateSpecRequest: null,
+};
+
+// ============================================================================
+// SpecsPage component
+// ============================================================================
+
+
+/** Save a workflow via the API and navigate to builder */
+async function saveWorkflowAndNavigate(
+  workflowPayload: Record<string, unknown>,
+  onNavigate?: (id: string) => void,
+) {
+  const response = await fetch(`${getApiBase()}/unified-workflows`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(workflowPayload),
+  });
+  const data = await response.json();
+  if (data.success && data.data?.id && onNavigate) {
+    onNavigate(data.data.id);
+  } else if (!data.success) {
+    console.error("[Specs] Failed to save workflow:", data.error);
+  }
+}
+
+// ============================================================================
+// SpecsPageHeader -- extracted sub-component for page header
+// ============================================================================
+
+function SpecsPageHeader({
+  editMode,
+  viewMode,
+  onSetViewMode,
+}: {
+  editMode: boolean;
+  viewMode: "editor" | "experimentation";
+  onSetViewMode: (mode: "editor" | "experimentation") => void;
+}) {
+  return (
+    <div className="flex items-center gap-3 px-4 py-3 border-b border-border">
+      <ShieldCheck className="w-5 h-5 text-purple-400" />
+      <h1 className="text-lg font-semibold">Specs</h1>
+      <span className="text-xs px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 border border-purple-500/30 font-medium">
+        {editMode ? "editor" : "viewer"}
+      </span>
+      <div className="ml-auto flex items-center gap-1">
+        <button
+          onClick={() => onSetViewMode("editor")}
+          className={`px-2 py-1 text-xs rounded ${
+            viewMode === "editor"
+              ? "bg-zinc-700 text-zinc-100"
+              : "text-zinc-500 hover:text-zinc-300"
+          }`}
+        >
+          Editor
+        </button>
+        <button
+          onClick={() => onSetViewMode("experimentation")}
+          className={`px-2 py-1 text-xs rounded flex items-center gap-1 ${
+            viewMode === "experimentation"
+              ? "bg-zinc-700 text-zinc-100"
+              : "text-zinc-500 hover:text-zinc-300"
+          }`}
+        >
+          <FlaskConical className="w-3 h-3" />
+          Experimentation
+        </button>
+      </div>
+    </div>
+  );
+}
+
 interface SpecsPageProps {
   onNavigateToWorkflowBuilder?: (workflowId: string) => void;
 }
 
 export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
   const state = useSpecsState();
-  const [isSavingWorkflow, setIsSavingWorkflow] = useState(false);
-  const [forcePromptOnly, setForcePromptOnly] = useState(false);
-  const [includeRegressionChecks, setIncludeRegressionChecks] = useState(false);
-  const [viewMode, setViewMode] = useState<"editor" | "experimentation">("editor");
+  const [pageState, dispatch] = useReducer(specsPageReducer, SPECS_PAGE_INITIAL);
+  const { isSavingWorkflow, forcePromptOnly, includeRegressionChecks, viewMode, generateSpecRequest } =
+    pageState;
   const { issues: knownIssues, loadIssuesForSpec } = useKnownIssues();
-  // Spec generation trigger — set when user clicks "Generate Spec" from detail panel or chat
-  const [generateSpecRequest, setGenerateSpecRequest] = useState<{
-    expectedSpecId: string;
-    label: string;
-    description: string;
+
+  // Triage resolution context — set when user clicks "Update Spec" in SpecTriageView
+  const [triageContext, setTriageContext] = useState<{
+    specId: string;
+    groupId: string;
   } | null>(null);
 
   // Auto-load bundled specs on first mount only (skip if restored from cache)
@@ -83,45 +200,23 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
           knownIssues: includeRegressionChecks ? activeIssues : [],
         });
 
-        // Save to backend and navigate to builder
-        setIsSavingWorkflow(true);
+        dispatch({ type: "SET_SAVING_WORKFLOW", value: true });
         try {
-          const response = await fetch(`${getApiBase()}/unified-workflows`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              name: workflow.name,
-              description: workflow.description,
-              category: workflow.category,
-              tags: workflow.tags,
-              setup_steps: workflow.setup_steps,
-              verification_steps: workflow.verification_steps,
-              agentic_steps: workflow.agentic_steps,
-              completion_steps: workflow.completion_steps,
-              max_iterations: workflow.max_iterations,
-              reflection_mode: true,
-            }),
-          });
-
-          const data = await response.json();
-          if (data.success && data.data?.id) {
-            if (onNavigateToWorkflowBuilder) {
-              onNavigateToWorkflowBuilder(data.data.id);
-            }
-          } else {
-            console.error("[Specs] Failed to save workflow:", data.error);
-          }
+          await saveWorkflowAndNavigate(
+            { ...workflow, reflection_mode: true },
+            onNavigateToWorkflowBuilder,
+          );
         } catch (err) {
           console.error("[Specs] Error saving workflow:", err);
         } finally {
-          setIsSavingWorkflow(false);
+          dispatch({ type: "SET_SAVING_WORKFLOW", value: false });
         }
       } else {
         // For non-page specs, generate a prompt-based workflow
         const kindLabel = target.kind.replace("-", " ");
         const specContext = JSON.stringify(target.config, null, 2);
 
-        setIsSavingWorkflow(true);
+        dispatch({ type: "SET_SAVING_WORKFLOW", value: true });
         try {
           const setupPrompt = `Implement the following ${kindLabel} specification:\n\n\`\`\`json\n${specContext}\n\`\`\``;
           const workflow = {
@@ -153,24 +248,11 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
             reflection_mode: true,
           };
 
-          const response = await fetch(`${getApiBase()}/unified-workflows`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(workflow),
-          });
-
-          const data = await response.json();
-          if (data.success && data.data?.id) {
-            if (onNavigateToWorkflowBuilder) {
-              onNavigateToWorkflowBuilder(data.data.id);
-            }
-          } else {
-            console.error("[Specs] Failed to save workflow:", data.error);
-          }
+          await saveWorkflowAndNavigate(workflow, onNavigateToWorkflowBuilder);
         } catch (err) {
           console.error("[Specs] Error saving workflow:", err);
         } finally {
-          setIsSavingWorkflow(false);
+          dispatch({ type: "SET_SAVING_WORKFLOW", value: false });
         }
       }
     },
@@ -184,39 +266,70 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
     ],
   );
 
+  // Triage: "Update Spec" — trigger merge review in chat panel
+  const handleTriageUpdateSpec = useCallback(
+    (groupId: string) => {
+      if (!state.selectedSpec || state.selectedSpec.kind !== "page-spec") return;
+      setTriageContext({ specId: state.selectedSpec.specId, groupId });
+    },
+    [state.selectedSpec],
+  );
+
+  // Triage: "Fix Code" — create a scoped workflow for the broken group
+  const handleTriageFixCode = useCallback(
+    async (groupId: string) => {
+      if (!state.selectedSpec || state.selectedSpec.kind !== "page-spec" || isSavingWorkflow) return;
+
+      const specConfig = state.selectedSpec.config as unknown as BuildSpecConfig;
+      const groupName =
+        specConfig.groups.find((g: { id: string }) => g.id === groupId)?.name || groupId;
+
+      const workflow = buildSpecWorkflow({
+        specConfig,
+        selectedGroupIds: new Set([groupId]),
+        agenticPrompt: `These assertions in group "${groupName}" were previously passing but now fail. Investigate the regression and fix the code to make them pass again.`,
+        workflowName: `Fix: ${specConfig.description || state.selectedSpec.specId} — ${groupName}`,
+      });
+
+      dispatch({ type: "SET_SAVING_WORKFLOW", value: true });
+      try {
+        const response = await fetch(`${getApiBase()}/unified-workflows`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: workflow.name,
+            description: workflow.description,
+            category: workflow.category,
+            tags: [...(workflow.tags || []), "triage-fix"],
+            setup_steps: workflow.setup_steps,
+            verification_steps: workflow.verification_steps,
+            agentic_steps: workflow.agentic_steps,
+            completion_steps: workflow.completion_steps,
+            max_iterations: workflow.max_iterations,
+            reflection_mode: true,
+          }),
+        });
+
+        const data = await response.json();
+        if (data.success && data.data?.id && onNavigateToWorkflowBuilder) {
+          onNavigateToWorkflowBuilder(data.data.id);
+        }
+      } catch (err) {
+        console.error("[Specs] Error creating fix workflow:", err);
+      } finally {
+        dispatch({ type: "SET_SAVING_WORKFLOW", value: false });
+      }
+    },
+    [state.selectedSpec, isSavingWorkflow, onNavigateToWorkflowBuilder],
+  );
+
   return (
     <div className="h-full flex flex-col">
-      {/* Header */}
-      <div className="flex items-center gap-3 px-4 py-3 border-b border-border">
-        <ShieldCheck className="w-5 h-5 text-purple-400" />
-        <h1 className="text-lg font-semibold">Specs</h1>
-        <span className="text-xs px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 border border-purple-500/30 font-medium">
-          {state.editMode ? "editor" : "viewer"}
-        </span>
-        <div className="ml-auto flex items-center gap-1">
-          <button
-            onClick={() => setViewMode("editor")}
-            className={`px-2 py-1 text-xs rounded ${
-              viewMode === "editor"
-                ? "bg-zinc-700 text-zinc-100"
-                : "text-zinc-500 hover:text-zinc-300"
-            }`}
-          >
-            Editor
-          </button>
-          <button
-            onClick={() => setViewMode("experimentation")}
-            className={`px-2 py-1 text-xs rounded flex items-center gap-1 ${
-              viewMode === "experimentation"
-                ? "bg-zinc-700 text-zinc-100"
-                : "text-zinc-500 hover:text-zinc-300"
-            }`}
-          >
-            <FlaskConical className="w-3 h-3" />
-            Experimentation
-          </button>
-        </div>
-      </div>
+      <SpecsPageHeader
+        editMode={state.editMode}
+        viewMode={viewMode}
+        onSetViewMode={(mode) => dispatch({ type: "SET_VIEW_MODE", value: mode })}
+      />
 
       {viewMode === "experimentation" ? (
         <div className="flex-1 overflow-y-auto">
@@ -237,9 +350,9 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
             onLoadFromFile={state.loadFromFile}
             onSaveToFile={state.saveToFile}
             forcePromptOnly={forcePromptOnly}
-            onToggleForcePromptOnly={() => setForcePromptOnly(!forcePromptOnly)}
+            onToggleForcePromptOnly={() => dispatch({ type: "TOGGLE_FORCE_PROMPT" })}
             includeRegressionChecks={includeRegressionChecks}
-            onToggleRegressionChecks={() => setIncludeRegressionChecks(!includeRegressionChecks)}
+            onToggleRegressionChecks={() => dispatch({ type: "TOGGLE_REGRESSION_CHECKS" })}
             regressionIssueCount={knownIssues.filter((i) => i.status === "active").length}
             onBuildWorkflow={() => handleBuildWorkflow()}
             onToggleEditMode={() => state.setEditMode(!state.editMode)}
@@ -295,14 +408,19 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
                           label: string;
                           description: string;
                         };
-                        setGenerateSpecRequest({
-                          expectedSpecId: sel.expectedSpecId,
-                          label: sel.label,
-                          description: sel.description,
+                        dispatch({
+                          type: "SET_GENERATE_SPEC_REQUEST",
+                          value: {
+                            expectedSpecId: sel.expectedSpecId,
+                            label: sel.label,
+                            description: sel.description,
+                          },
                         });
                       }
                     : undefined
                 }
+                onUpdateSpec={handleTriageUpdateSpec}
+                onFixCode={handleTriageFixCode}
               />
             </div>
 
@@ -313,7 +431,11 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
                 onAddSpec={state.addSpec}
                 onBuildWorkflow={handleBuildWorkflow}
                 generateSpecRequest={generateSpecRequest}
-                onGenerateSpecHandled={() => setGenerateSpecRequest(null)}
+                onGenerateSpecHandled={() =>
+                  dispatch({ type: "SET_GENERATE_SPEC_REQUEST", value: null })
+                }
+                triageContext={triageContext}
+                onTriageContextHandled={() => setTriageContext(null)}
               />
             </div>
           </div>

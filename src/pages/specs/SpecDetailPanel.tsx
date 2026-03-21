@@ -2,7 +2,7 @@
  * SpecDetailPanel — Shows details of the selected spec or group
  */
 
-import { useState } from "react";
+import { useState, useReducer } from "react";
 import {
   Shield,
   CheckCircle2,
@@ -41,6 +41,7 @@ import {
 import type { LoadedSpec } from "./types";
 import { SpecIssuesPanel } from "./SpecIssuesPanel";
 import { GlobalIssuesPanel } from "./GlobalIssuesPanel";
+import { SpecTriageView } from "@/components/specs/SpecTriageView";
 import type {
   SpecGroup,
   SpecAssertion,
@@ -307,6 +308,33 @@ function AssertionRow({
 // Add Assertion Form (inline)
 // ============================================================================
 
+interface AssertionFormState {
+  description: string;
+  severity: "critical" | "warning" | "info";
+  assertionType: string;
+  category: string;
+  targetText: string;
+  relatedTargetText: string;
+  minGap: number;
+}
+
+const ASSERTION_FORM_INIT: AssertionFormState = {
+  description: "",
+  severity: "warning",
+  assertionType: "exists",
+  category: "custom",
+  targetText: "",
+  relatedTargetText: "",
+  minGap: 0,
+};
+
+function assertionFormReducer(
+  state: AssertionFormState,
+  action: { type: "SET"; field: keyof AssertionFormState; value: string | number },
+): AssertionFormState {
+  return { ...state, [action.field]: action.value };
+}
+
 function AddAssertionForm({
   onAdd,
   onCancel,
@@ -314,13 +342,10 @@ function AddAssertionForm({
   onAdd: (assertion: SpecAssertion) => void;
   onCancel: () => void;
 }) {
-  const [description, setDescription] = useState("");
-  const [severity, setSeverity] = useState<"critical" | "warning" | "info">("warning");
-  const [assertionType, setAssertionType] = useState("exists");
-  const [category, setCategory] = useState("custom");
-  const [targetText, setTargetText] = useState("");
-  const [relatedTargetText, setRelatedTargetText] = useState("");
-  const [minGap, setMinGap] = useState(0);
+  const [formState, formDispatch] = useReducer(assertionFormReducer, ASSERTION_FORM_INIT);
+  const { description, severity, assertionType, category, targetText, relatedTargetText, minGap } = formState;
+  const setF = (field: keyof AssertionFormState, value: string | number) =>
+    formDispatch({ type: "SET", field, value });
 
   const isSpatial = assertionType === "noOverlap" || assertionType === "minSpacing";
 
@@ -350,16 +375,16 @@ function AddAssertionForm({
       assertion.minGap = minGap;
     }
     onAdd(assertion as unknown as SpecAssertion);
-    setDescription("");
-    setTargetText("");
-    setRelatedTargetText("");
+    setF("description", "");
+    setF("targetText", "");
+    setF("relatedTargetText", "");
   };
 
   return (
     <div className="px-3 py-2 rounded border border-dashed border-green-500/30 bg-green-500/5 space-y-2">
       <textarea
         value={description}
-        onChange={(e) => setDescription(e.target.value)}
+        onChange={(e) => setF("description", e.target.value)}
         placeholder="Assertion description..."
         rows={2}
         className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1.5
@@ -375,7 +400,7 @@ function AddAssertionForm({
       <div className="flex items-center gap-2 flex-wrap">
         <select
           value={assertionType}
-          onChange={(e) => setAssertionType(e.target.value)}
+          onChange={(e) => setF("assertionType", e.target.value)}
           className="text-[10px] bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-foreground"
         >
           <optgroup label="Existence">
@@ -414,7 +439,7 @@ function AddAssertionForm({
         </select>
         <select
           value={severity}
-          onChange={(e) => setSeverity(e.target.value as "critical" | "warning" | "info")}
+          onChange={(e) => setF("severity", e.target.value)}
           className="text-[10px] bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-foreground"
         >
           <option value="critical">critical</option>
@@ -423,7 +448,7 @@ function AddAssertionForm({
         </select>
         <select
           value={category}
-          onChange={(e) => setCategory(e.target.value)}
+          onChange={(e) => setF("category", e.target.value)}
           className="text-[10px] bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-foreground"
         >
           <option value="element-presence">element-presence</option>
@@ -440,7 +465,7 @@ function AddAssertionForm({
       <input
         type="text"
         value={targetText}
-        onChange={(e) => setTargetText(e.target.value)}
+        onChange={(e) => setF("targetText", e.target.value)}
         placeholder="Target element text..."
         className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1
           text-foreground placeholder:text-muted-foreground/40
@@ -450,7 +475,7 @@ function AddAssertionForm({
         <input
           type="text"
           value={relatedTargetText}
-          onChange={(e) => setRelatedTargetText(e.target.value)}
+          onChange={(e) => setF("relatedTargetText", e.target.value)}
           placeholder="Related target element text..."
           className="w-full text-xs bg-transparent border border-cyan-500/20 rounded px-2 py-1
             text-foreground placeholder:text-muted-foreground/40
@@ -459,11 +484,11 @@ function AddAssertionForm({
       )}
       {assertionType === "minSpacing" && (
         <div className="flex items-center gap-2">
-          <label className="text-[10px] text-muted-foreground">Min gap (px):</label>
-          <input
+          <label htmlFor="assertion-min-gap" className="text-[10px] text-muted-foreground">Min gap (px):</label>
+          <input id="assertion-min-gap"
             type="number"
             value={minGap}
-            onChange={(e) => setMinGap(Number(e.target.value))}
+            onChange={(e) => setF("minGap", Number(e.target.value))}
             min={0}
             className="w-20 text-xs bg-transparent border border-white/10 rounded px-2 py-0.5
               text-foreground focus:outline-hidden focus:border-green-500/50"
@@ -515,13 +540,18 @@ function SetupActionsEditor({
   editMode?: boolean;
   onChange?: (actions: SetupAction[]) => void;
 }) {
-  const [expanded, setExpanded] = useState(actions.length > 0);
-  const [showAddForm, setShowAddForm] = useState(false);
-  const [newType, setNewType] = useState<SetupAction["type"]>("click");
-  const [newTargetText, setNewTargetText] = useState("");
-  const [newValue, setNewValue] = useState("");
-  const [newUrl, setNewUrl] = useState("");
-  const [newMs, setNewMs] = useState(1000);
+  const [edState, edDispatch] = useReducer(
+    (s: Record<string, unknown>, a: { k: string; v: unknown }) => ({ ...s, [a.k]: a.v }),
+    { expanded: actions.length > 0, showAddForm: false, newType: "click", newTargetText: "", newValue: "", newUrl: "", newMs: 1000 },
+  );
+  const expanded = edState.expanded as boolean;
+  const showAddForm = edState.showAddForm as boolean;
+  const newType = edState.newType as SetupAction["type"];
+  const newTargetText = edState.newTargetText as string;
+  const newValue = edState.newValue as string;
+  const newUrl = edState.newUrl as string;
+  const newMs = edState.newMs as number;
+  const setEd = (k: string, v: unknown) => edDispatch({ k, v });
 
   const handleAdd = () => {
     let action: SetupAction;
@@ -554,10 +584,10 @@ function SetupActionsEditor({
         break;
     }
     onChange?.([...actions, action]);
-    setNewTargetText("");
-    setNewValue("");
-    setNewUrl("");
-    setShowAddForm(false);
+    setEd("newTargetText", "");
+    setEd("newValue", "");
+    setEd("newUrl", "");
+    setEd("showAddForm", false);
   };
 
   const handleRemove = (index: number) => {
@@ -569,7 +599,7 @@ function SetupActionsEditor({
   return (
     <div className="space-y-1">
       <button
-        onClick={() => setExpanded(!expanded)}
+        onClick={() => setEd("expanded", !expanded)}
         className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
       >
         {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
@@ -597,7 +627,7 @@ function SetupActionsEditor({
 
             return (
               <div
-                key={`${action.type}-${i}`}
+                key={`${action.type}-${detail || "no-detail"}`}
                 className="flex items-center gap-2 px-2 py-1 rounded border border-white/5 bg-white/[0.02] text-xs"
               >
                 <span className="text-[10px] text-muted-foreground/40 w-4 text-right">{i + 1}</span>
@@ -618,7 +648,7 @@ function SetupActionsEditor({
 
           {editMode && !showAddForm && (
             <button
-              onClick={() => setShowAddForm(true)}
+              onClick={() => setEd("showAddForm", true)}
               className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-[10px] text-muted-foreground/60
                 rounded border border-dashed border-white/10 hover:border-cyan-500/30 hover:text-cyan-400
                 transition-colors"
@@ -632,7 +662,7 @@ function SetupActionsEditor({
             <div className="px-2 py-2 rounded border border-dashed border-cyan-500/30 bg-cyan-500/5 space-y-2">
               <select
                 value={newType}
-                onChange={(e) => setNewType(e.target.value as SetupAction["type"])}
+                onChange={(e) => setEd("newType", e.target.value)}
                 className="text-[10px] bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-foreground w-full"
               >
                 <option value="click">Click element</option>
@@ -646,7 +676,7 @@ function SetupActionsEditor({
                 <input
                   type="text"
                   value={newTargetText}
-                  onChange={(e) => setNewTargetText(e.target.value)}
+                  onChange={(e) => setEd("newTargetText", e.target.value)}
                   placeholder="Target element text..."
                   className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1
                     text-foreground placeholder:text-muted-foreground/40
@@ -658,7 +688,7 @@ function SetupActionsEditor({
                 <input
                   type="text"
                   value={newValue}
-                  onChange={(e) => setNewValue(e.target.value)}
+                  onChange={(e) => setEd("newValue", e.target.value)}
                   placeholder="Text to type..."
                   className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1
                     text-foreground placeholder:text-muted-foreground/40
@@ -670,7 +700,7 @@ function SetupActionsEditor({
                 <input
                   type="text"
                   value={newUrl}
-                  onChange={(e) => setNewUrl(e.target.value)}
+                  onChange={(e) => setEd("newUrl", e.target.value)}
                   placeholder="http://localhost:3001/..."
                   className="w-full text-xs bg-transparent border border-white/10 rounded px-2 py-1
                     text-foreground placeholder:text-muted-foreground/40
@@ -686,7 +716,7 @@ function SetupActionsEditor({
                   <input
                     type="number"
                     value={newMs}
-                    onChange={(e) => setNewMs(Number(e.target.value))}
+                    onChange={(e) => setEd("newMs", Number(e.target.value))}
                     min={0}
                     className="w-20 text-xs bg-transparent border border-white/10 rounded px-2 py-0.5
                       text-foreground focus:outline-hidden focus:border-cyan-500/50"
@@ -697,7 +727,7 @@ function SetupActionsEditor({
               <div className="flex items-center gap-2">
                 <div className="flex-1" />
                 <button
-                  onClick={() => setShowAddForm(false)}
+                  onClick={() => setEd("showAddForm", false)}
                   className="text-[10px] text-muted-foreground hover:text-foreground transition-colors px-2 py-0.5"
                 >
                   Cancel
@@ -1251,7 +1281,7 @@ function ArchitectureOverview({
           </h3>
           <div className="space-y-1">
             {config.techStack.map((entry, i) => (
-              <TechStackRow key={`${entry.name}-${i}`} entry={entry} />
+              <TechStackRow key={entry.name} entry={entry} />
             ))}
           </div>
         </div>
@@ -1266,7 +1296,7 @@ function ArchitectureOverview({
           <div className="space-y-1">
             {config.directories.map((dir, i) => (
               <div
-                key={`${dir.path}-${i}`}
+                key={dir.path}
                 className="flex items-center gap-2 px-3 py-1.5 rounded bg-white/[0.02] border border-white/5"
               >
                 <Folder className="w-3 h-3 shrink-0 text-amber-400/60" />
@@ -1349,7 +1379,7 @@ function ArchitectureOverview({
           <div className="space-y-1">
             {config.dependencies.map((dep, i) => (
               <div
-                key={`${dep.featureId}-${dep.dependsOn}-${i}`}
+                key={`${dep.featureId}-${dep.dependsOn}`}
                 className="flex items-center gap-2 px-3 py-1.5 rounded bg-white/[0.02] border border-white/5"
               >
                 <span className="text-xs font-mono text-foreground">{dep.featureId}</span>
@@ -1403,7 +1433,7 @@ function SchemaFieldRow({ field, depth = 0 }: { field: SchemaField; depth?: numb
       </div>
       {field.fields?.map((nested, i) => (
         <SchemaFieldRow
-          key={`${field.name}-${nested.name}-${i}`}
+          key={`${field.name}-${nested.name}`}
           field={nested}
           depth={depth + 1}
         />
@@ -1444,7 +1474,7 @@ function EndpointRow({ endpoint }: { endpoint: ApiEndpoint }) {
           <span className="text-[10px] font-medium text-muted-foreground">Path params:</span>
           <div className="mt-0.5 border-l-2 border-white/5">
             {endpoint.pathParams.map((p, i) => (
-              <SchemaFieldRow key={`path-${p.name}-${i}`} field={p} />
+              <SchemaFieldRow key={`path-${p.name}`} field={p} />
             ))}
           </div>
         </div>
@@ -1454,7 +1484,7 @@ function EndpointRow({ endpoint }: { endpoint: ApiEndpoint }) {
           <span className="text-[10px] font-medium text-muted-foreground">Query params:</span>
           <div className="mt-0.5 border-l-2 border-white/5">
             {endpoint.queryParams.map((p, i) => (
-              <SchemaFieldRow key={`query-${p.name}-${i}`} field={p} />
+              <SchemaFieldRow key={`query-${p.name}`} field={p} />
             ))}
           </div>
         </div>
@@ -1464,7 +1494,7 @@ function EndpointRow({ endpoint }: { endpoint: ApiEndpoint }) {
           <span className="text-[10px] font-medium text-muted-foreground">Request body:</span>
           <div className="mt-0.5 border-l-2 border-cyan-500/20">
             {endpoint.requestBody.map((f, i) => (
-              <SchemaFieldRow key={`req-${f.name}-${i}`} field={f} />
+              <SchemaFieldRow key={`req-${f.name}`} field={f} />
             ))}
           </div>
         </div>
@@ -1474,7 +1504,7 @@ function EndpointRow({ endpoint }: { endpoint: ApiEndpoint }) {
           <span className="text-[10px] font-medium text-muted-foreground">Response:</span>
           <div className="mt-0.5 border-l-2 border-green-500/20">
             {endpoint.responseBody.map((f, i) => (
-              <SchemaFieldRow key={`res-${f.name}-${i}`} field={f} />
+              <SchemaFieldRow key={`res-${f.name}`} field={f} />
             ))}
           </div>
         </div>
@@ -1511,7 +1541,7 @@ function ModelCard({ model }: { model: DataModel }) {
 
       <div className="border-l-2 border-white/5">
         {model.fields.map((f, i) => (
-          <SchemaFieldRow key={`${model.id}-${f.name}-${i}`} field={f} />
+          <SchemaFieldRow key={`${model.id}-${f.name}`} field={f} />
         ))}
       </div>
 
@@ -1520,7 +1550,7 @@ function ModelCard({ model }: { model: DataModel }) {
           <span className="text-[10px] font-medium text-muted-foreground">Relations:</span>
           {model.relations.map((rel, i) => (
             <span
-              key={`${rel.modelId}-${i}`}
+              key={`${rel.modelId}-${rel.type}`}
               className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground border border-white/10"
             >
               {rel.type} → {rel.modelId}
@@ -1676,7 +1706,7 @@ function EntityCard({ entity }: { entity: DataEntity }) {
 
       <div className="border-l-2 border-white/5">
         {entity.columns.map((col, i) => (
-          <ColumnRow key={`${entity.id}-${col.name}-${i}`} column={col} />
+          <ColumnRow key={`${entity.id}-${col.name}`} column={col} />
         ))}
       </div>
 
@@ -1685,7 +1715,7 @@ function EntityCard({ entity }: { entity: DataEntity }) {
           <span className="text-[10px] font-medium text-muted-foreground">Indexes:</span>
           {entity.indexes.map((idx, i) => (
             <span
-              key={`${idx.name}-${i}`}
+              key={idx.name}
               className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground border border-white/10"
             >
               {idx.unique ? "UNIQUE " : ""}
@@ -1814,7 +1844,7 @@ function DataOverview({
           <div className="space-y-1">
             {config.seeds.map((seed, i) => (
               <div
-                key={`${seed.entityId}-${i}`}
+                key={`${seed.entityId}-${seed.environment}`}
                 className="flex items-center gap-2 px-3 py-1.5 rounded bg-white/[0.02] border border-white/5"
               >
                 <span className="text-xs font-mono text-foreground">{seed.entityId}</span>
@@ -2062,7 +2092,7 @@ function DependencyOverview({
                   <div className="flex flex-wrap gap-1 mt-1.5">
                     {cluster.artifacts.map((ref, i) => (
                       <span
-                        key={`${ref.artifactId}-${i}`}
+                        key={`${ref.artifactId}-${ref.kind}`}
                         className={`text-[10px] px-1.5 py-0.5 rounded bg-white/5 border border-white/10 ${ARTIFACT_COLORS[ref.kind] || "text-muted-foreground"}`}
                       >
                         {ref.label || ref.artifactId}
@@ -2421,6 +2451,8 @@ interface SpecDetailPanelProps {
   onUpdateSetupActions?: (specId: string, groupId: string, actions: SetupAction[]) => void;
   onClearSelection?: () => void;
   onGenerateSpec?: () => void;
+  onUpdateSpec?: (groupId: string) => void;
+  onFixCode?: (groupId: string) => void;
 }
 
 export function SpecDetailPanel({
@@ -2437,8 +2469,10 @@ export function SpecDetailPanel({
   onUpdateSetupActions,
   onClearSelection,
   onGenerateSpec,
+  onUpdateSpec,
+  onFixCode,
 }: SpecDetailPanelProps) {
-  const [activeTab, setActiveTab] = useState<"assertions" | "issues">("assertions");
+  const [activeTab, setActiveTab] = useState<"assertions" | "issues" | "triage">("assertions");
 
   // Unspecced page selected — show generate prompt
   if (selectionType === "unspecced-page" && unspeccedPageInfo) {
@@ -2521,6 +2555,17 @@ export function SpecDetailPanel({
             <Bug className="w-3 h-3 inline-block mr-1 -mt-0.5" />
             Issues
           </button>
+          <button
+            onClick={() => setActiveTab("triage")}
+            className={`px-3 py-1.5 text-xs font-medium rounded-t border border-b-0 transition-colors ${
+              activeTab === "triage"
+                ? "bg-background text-foreground border-border"
+                : "text-muted-foreground border-transparent hover:text-foreground"
+            }`}
+          >
+            <AlertTriangle className="w-3 h-3 inline-block mr-1 -mt-0.5" />
+            Triage
+          </button>
         </div>
 
         {/* Tab content */}
@@ -2543,6 +2588,14 @@ export function SpecDetailPanel({
               specId={selectedSpec.specId}
               pageUrl={pageUrl}
               onViewAllIssues={onClearSelection}
+            />
+          )}
+          {activeTab === "triage" && (
+            <SpecTriageView
+              specId={selectedSpec.specId}
+              specConfig={selectedSpec.config as unknown as { description?: string; groups: Array<{ id: string; name: string; category?: string; assertions: Array<{ id: string; description: string; severity: string; assertionType: string; enabled?: boolean }> }> }}
+              onUpdateSpec={onUpdateSpec}
+              onFixCode={onFixCode}
             />
           )}
         </div>

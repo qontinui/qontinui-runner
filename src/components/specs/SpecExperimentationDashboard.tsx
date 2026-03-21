@@ -13,6 +13,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { SpecComplianceSummaryTable } from "./SpecCompliancePanel";
 import { SpecAttentionBanner } from "./SpecAttentionBanner";
+import { SpecHealthCard } from "./SpecHealthCard";
 
 interface SpecAccuracyRecord {
   id: string;
@@ -88,6 +89,9 @@ export function SpecExperimentationDashboard() {
 
   return (
     <div className="p-4 space-y-6">
+      {/* Spec health summary card */}
+      <SpecHealthCard />
+
       {/* Attention banner -- specs with broken assertions, stale, or never run */}
       <SpecAttentionBanner />
 
@@ -255,8 +259,8 @@ function CoverageGapsView({ records }: { records: SpecAccuracyRecord[] }) {
                   Uncovered interactive elements ({detail.uncovered_elements.length}):
                 </div>
                 <div className="flex flex-wrap gap-1">
-                  {detail.uncovered_elements.slice(0, 20).map((el, i) => (
-                    <span key={i} className="text-xs bg-zinc-700 text-zinc-300 px-2 py-0.5 rounded">
+                  {detail.uncovered_elements.slice(0, 20).map((el) => (
+                    <span key={el} className="text-xs bg-zinc-700 text-zinc-300 px-2 py-0.5 rounded">
                       {el}
                     </span>
                   ))}
