@@ -1149,6 +1149,7 @@ mod tests {
                 confidence REAL DEFAULT 1.0,
                 auto_generated_at TEXT,
                 evidence_count INTEGER DEFAULT 0,
+                examples_json TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );

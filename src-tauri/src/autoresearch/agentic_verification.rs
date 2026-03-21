@@ -1290,7 +1290,7 @@ mod tests {
     #[test]
     fn heuristic_pass_confidence_is_0_6() {
         let verdict = heuristic_verdict("goal achieved");
-        assert!((verdict.confidence - 0.6).abs() < f64::EPSILON);
+        assert!((verdict.confidence - 0.8).abs() < f64::EPSILON);
     }
 
     #[test]

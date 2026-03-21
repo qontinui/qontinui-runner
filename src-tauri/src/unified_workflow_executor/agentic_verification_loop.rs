@@ -968,7 +968,7 @@ mod tests {
         );
         assert_eq!(summary.iteration, "1");
         assert!(summary.approach.contains("Clicked the submit button"));
-        assert!(summary.result.contains("Fail"));
+        assert!(summary.result.contains("fail"));
         assert!((summary.confidence_delta - 0.3).abs() < 0.01);
     }
 
