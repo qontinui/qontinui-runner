@@ -120,3 +120,6 @@ src-tauri/{{artifact_dir}}/
 vite.config.d.ts
 vite.config.js
 .worktrees/
+
+# Storybook build output
+storybook-static/
