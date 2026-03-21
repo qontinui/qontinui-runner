@@ -47,7 +47,7 @@ async fn handle_ws_events(socket: WebSocket, state: Arc<ApiState>) {
                     // Serialize event to JSON string
                     match serde_json::to_string(&event) {
                         Ok(json_str) => {
-                            if sender.send(Message::Text(json_str)).await.is_err() {
+                            if sender.send(Message::Text(json_str.into())).await.is_err() {
                                 debug!("WebSocket client disconnected");
                                 break;
                             }
