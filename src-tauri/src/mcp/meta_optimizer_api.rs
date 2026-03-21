@@ -1035,9 +1035,16 @@ pub async fn get_reflection_fixes_handler(
                 .checkpoint_db
                 .with_conn(move |conn| {
                     let mut sql = String::from(
-                        r#"SELECT id, source_task_run_id, fix_type, fix_description,
-                                  confidence, status, effectiveness, source_agent,
-                                  reasoning, created_at
+                        r#"SELECT id, source_task_run_id, reflection_task_run_id,
+                                  source_finding_id, source_knowledge_id,
+                                  fix_type, fix_description, file_changed,
+                                  old_value, new_value, confidence, status,
+                                  effectiveness, effectiveness_evidence,
+                                  applied_at, evaluated_at, created_at,
+                                  content_hash, source_agent, reflection_scope,
+                                  project_path, target_component, reuse_count,
+                                  reasoning, alternatives_considered,
+                                  applicability_context
                            FROM reflection_fixes WHERE 1=1"#,
                     );
                     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -1060,14 +1067,30 @@ pub async fn get_reflection_fixes_handler(
                             Ok(serde_json::json!({
                                 "id": row.get::<_, String>(0)?,
                                 "source_task_run_id": row.get::<_, String>(1)?,
-                                "fix_type": row.get::<_, String>(2)?,
-                                "fix_description": row.get::<_, String>(3)?,
-                                "confidence": row.get::<_, String>(4)?,
-                                "status": row.get::<_, String>(5)?,
-                                "effectiveness": row.get::<_, Option<String>>(6)?,
-                                "source_agent": row.get::<_, Option<String>>(7)?,
-                                "reasoning": row.get::<_, Option<String>>(8)?,
-                                "created_at": row.get::<_, String>(9)?,
+                                "reflection_task_run_id": row.get::<_, String>(2)?,
+                                "source_finding_id": row.get::<_, Option<String>>(3)?,
+                                "source_knowledge_id": row.get::<_, Option<String>>(4)?,
+                                "fix_type": row.get::<_, String>(5)?,
+                                "fix_description": row.get::<_, String>(6)?,
+                                "file_changed": row.get::<_, Option<String>>(7)?,
+                                "old_value": row.get::<_, Option<String>>(8)?,
+                                "new_value": row.get::<_, Option<String>>(9)?,
+                                "confidence": row.get::<_, String>(10)?,
+                                "status": row.get::<_, String>(11)?,
+                                "effectiveness": row.get::<_, Option<String>>(12)?,
+                                "effectiveness_evidence": row.get::<_, Option<String>>(13)?,
+                                "applied_at": row.get::<_, String>(14)?,
+                                "evaluated_at": row.get::<_, Option<String>>(15)?,
+                                "created_at": row.get::<_, String>(16)?,
+                                "content_hash": row.get::<_, Option<String>>(17)?,
+                                "source_agent": row.get::<_, Option<String>>(18)?,
+                                "reflection_scope": row.get::<_, Option<String>>(19)?,
+                                "project_path": row.get::<_, Option<String>>(20)?,
+                                "target_component": row.get::<_, Option<String>>(21)?,
+                                "reuse_count": row.get::<_, Option<i64>>(22)?,
+                                "reasoning": row.get::<_, Option<String>>(23)?,
+                                "alternatives_considered": row.get::<_, Option<String>>(24)?,
+                                "applicability_context": row.get::<_, Option<String>>(25)?,
                             }))
                         })
                         .map_err(|e| format!("Query error: {}", e))?
@@ -1075,7 +1098,7 @@ pub async fn get_reflection_fixes_handler(
                         .collect();
                     Ok(rows)
                 })
-                .unwrap_or_default();
+                .map_err(make_err)?;
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(fixes).unwrap_or_default(),
             )))

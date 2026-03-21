@@ -86,6 +86,30 @@ impl CheckpointDb {
             .map_err(|e| format!("Failed to collect phase token usage rows: {}", e))
     }
 
+    /// Get summed token usage for a specific iteration of a task run.
+    ///
+    /// More efficient than `get_phase_token_usage` when only one iteration is needed,
+    /// as it filters and aggregates in SQL rather than fetching all rows.
+    pub fn get_iteration_token_totals(
+        &self,
+        task_run_id: &str,
+        iteration: u32,
+    ) -> Result<(u64, u64), String> {
+        let conn = self.get_conn()?;
+        let (input, output) = conn
+            .query_row(
+                r#"SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+                FROM phase_token_usage
+                WHERE task_run_id = ?1 AND iteration = ?2"#,
+                params![task_run_id, iteration as i64],
+                |row| {
+                    Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+                },
+            )
+            .map_err(|e| format!("Failed to query iteration token totals: {}", e))?;
+        Ok((input, output))
+    }
+
     /// Update the aggregate token totals on a task run.
     pub fn update_task_run_token_totals(&self, task_run_id: &str) -> Result<(), String> {
         let conn = self.get_conn()?;

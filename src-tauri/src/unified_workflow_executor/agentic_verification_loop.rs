@@ -16,6 +16,16 @@ use super::types::{AgenticOutcome, LoopConfig, LoopResult};
 // Iteration History — compressed cross-iteration context for agentic loops
 // =============================================================================
 
+/// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
+/// Safe for multi-byte UTF-8 (uses char boundaries, not byte indices).
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+    format!("{}...", truncated)
+}
+
 /// Summary of a single iteration's approach and outcome.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct IterationSummary {
@@ -85,19 +95,11 @@ impl IterationHistory {
 
             // Merge approaches (truncate combined to ~100 chars)
             let merged_approach = format!("{} | {}", first.approach, second.approach);
-            let merged_approach = if merged_approach.len() > 100 {
-                format!("{}...", &merged_approach[..97])
-            } else {
-                merged_approach
-            };
+            let merged_approach = truncate_with_ellipsis(&merged_approach, 100);
 
             // Merge results
             let merged_result = format!("{} | {}", first.result, second.result);
-            let merged_result = if merged_result.len() > 100 {
-                format!("{}...", &merged_result[..97])
-            } else {
-                merged_result
-            };
+            let merged_result = truncate_with_ellipsis(&merged_result, 100);
 
             // Merge files (deduplicated)
             let mut merged_files = first.files_touched.clone();
@@ -151,11 +153,7 @@ fn extract_iteration_summary(
     let approach = match worker_summary {
         Some(s) => {
             let condensed: String = s.lines().take(2).collect::<Vec<_>>().join(" ");
-            if condensed.len() > 100 {
-                format!("{}...", &condensed[..97])
-            } else {
-                condensed
-            }
+            truncate_with_ellipsis(&condensed, 100)
         }
         None => "(no worker ran)".to_string(),
     };
@@ -642,19 +640,13 @@ impl LoopController {
 
             let worker_summary = match &worker_outcome {
                 AgenticOutcome::Success { output, .. } => {
-                    // Extract first 500 chars as summary
-                    let summary = if output.len() > 500 {
-                        format!("{}...", &output[..500])
-                    } else {
-                        output.clone()
-                    };
-                    Some(summary)
+                    // Extract first 500 chars as summary (char-safe for UTF-8)
+                    Some(truncate_with_ellipsis(output, 500))
                 }
-                AgenticOutcome::Failed { output, error, .. } => Some(format!(
-                    "Failed: {} (output: {}...)",
-                    error,
-                    &output[..output.len().min(200)]
-                )),
+                AgenticOutcome::Failed { output, error, .. } => {
+                    let output_preview: String = output.chars().take(200).collect();
+                    Some(format!("Failed: {} (output: {}...)", error, output_preview))
+                }
                 AgenticOutcome::Error { error } => Some(format!("Error: {}", error)),
                 AgenticOutcome::Skipped => None,
             };

@@ -5080,6 +5080,22 @@ impl CheckpointDb {
             info!("Successfully migrated to version 128 (iteration_history)");
         }
 
+        // --- Migration 129: Add workflow_architecture column to unified_workflows ---
+        if current_version < 129 {
+            info!("Migrating to version 129 (workflow_architecture on unified_workflows)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN workflow_architecture TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (129, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 129: {}", e))?;
+
+            info!("Successfully migrated to version 129 (workflow_architecture on unified_workflows)");
+        }
+
         // Repair migration: is_favorite column may be missing on databases created from
         // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
         // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,

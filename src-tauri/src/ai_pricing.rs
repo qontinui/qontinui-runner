@@ -239,21 +239,22 @@ pub fn calculate_cost_breakdown(
 /// assert!(cost > 0.0);
 /// ```
 pub fn calculate_cost_usd(input_tokens: u64, output_tokens: u64, model_id: &str) -> f64 {
-    match calculate_cost_cents(input_tokens, output_tokens, model_id) {
-        Some(cents) => cents as f64 / 100.0,
+    // Compute directly in f64 USD to preserve sub-cent precision
+    // (calculate_cost_cents rounds to whole cents, losing accuracy for small token counts)
+    let pricing = match get_pricing(model_id) {
+        Some(p) => p,
         None => {
-            // Fall back to manual calculation if model is unknown but tokens exist
             if input_tokens > 0 || output_tokens > 0 {
-                // Use Sonnet pricing as a reasonable default
-                let pricing = CLAUDE_3_5_SONNET_PRICING;
-                let input_cost = (input_tokens as f64 / 1_000_000.0) * pricing.input_per_million;
-                let output_cost = (output_tokens as f64 / 1_000_000.0) * pricing.output_per_million;
-                input_cost + output_cost
+                // Use Sonnet pricing as a reasonable default for unknown models
+                CLAUDE_3_5_SONNET_PRICING
             } else {
-                0.0
+                return 0.0;
             }
         }
-    }
+    };
+    let input_cost = (input_tokens as f64 / 1_000_000.0) * pricing.input_per_million;
+    let output_cost = (output_tokens as f64 / 1_000_000.0) * pricing.output_per_million;
+    input_cost + output_cost
 }
 
 // ============================================================================

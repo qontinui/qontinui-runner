@@ -50,42 +50,6 @@ pub fn categorize_error(msg: &str) -> String {
     .to_string()
 }
 
-/// Enrich a WorkflowOutcome before recording.
-///
-/// - Auto-categorizes `error_type` from `error_message` if not already set
-/// - Ensures `workflow_architecture` is never None (defaults to "traditional")
-pub fn enrich_outcome(outcome: &mut WorkflowOutcome) {
-    // Auto-categorize error_type from error_message patterns
-    if outcome.error_type.is_none() {
-        if let Some(ref msg) = outcome.error_message {
-            if !msg.is_empty() {
-                outcome.error_type = Some(categorize_error(msg));
-            }
-        }
-    }
-
-    // Ensure workflow_architecture is always set
-    if outcome.workflow_architecture.is_none() {
-        outcome.workflow_architecture = Some("traditional".to_string());
-    }
-}
-
-/// Populate complexity indicator fields from workflow steps.
-///
-/// Sets `step_count`, `verification_step_count`, `agentic_step_count`,
-/// and `has_ui_bridge` based on the provided step type strings.
-pub fn populate_complexity_indicators(
-    outcome: &mut WorkflowOutcome,
-    step_types: &[&str],
-    verification_step_types: &[&str],
-) {
-    outcome.step_count = Some(step_types.len() as i64);
-    outcome.verification_step_count = Some(verification_step_types.len() as i64);
-    outcome.agentic_step_count = Some(step_types.iter().filter(|s| **s == "prompt").count() as i64);
-    outcome.has_ui_bridge =
-        step_types.contains(&"ui_bridge") || verification_step_types.contains(&"ui_bridge");
-}
-
 /// Record a learning outcome from a completed workflow execution.
 ///
 /// Writes to the `learning_outcomes` table with execution metrics and

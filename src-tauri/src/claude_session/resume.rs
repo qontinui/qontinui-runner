@@ -147,7 +147,7 @@ pub fn build_replay_prompt(turns: &[ConversationTurn], max_chars: Option<usize>)
     // Importance-weighted truncation: score each turn, keep highest-value ones
     // within budget. Always keeps first and last turns.
     let total_turns = formatted_turns.len();
-    let scored: Vec<(usize, f64)> = turns
+    let mut scored: Vec<(usize, f64)> = turns
         .iter()
         .enumerate()
         .map(|(i, turn)| {
@@ -192,19 +192,26 @@ pub fn build_replay_prompt(turns: &[ConversationTurn], max_chars: Option<usize>)
         .collect();
 
     // Sort by score descending, greedily select turns within budget
-    let mut scored_sorted = scored.clone();
-    scored_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let separator = "\n\n[... earlier conversation truncated ...]\n\n";
-    let mut budget = limit.saturating_sub(separator.len());
+    let mut budget = limit;
     let mut selected_indices: Vec<usize> = Vec::new();
 
-    for (idx, _score) in &scored_sorted {
+    for (idx, _score) in &scored {
         let turn_len = formatted_turns[*idx].len() + 1; // +1 for newline
         if turn_len <= budget {
             budget -= turn_len;
             selected_indices.push(*idx);
         }
+    }
+
+    // Always include first and last turns, even if they exceed remaining budget.
+    // These are essential for conversation continuity.
+    if !selected_indices.contains(&0) {
+        selected_indices.push(0);
+    }
+    if total_turns > 1 && !selected_indices.contains(&(total_turns - 1)) {
+        selected_indices.push(total_turns - 1);
     }
 
     // Sort selected indices to preserve conversation order

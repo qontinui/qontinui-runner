@@ -18,20 +18,10 @@ fn query_iteration_tokens(
     execution_id: &str,
     iteration: u32,
 ) -> (u64, u64) {
-    match db.get_phase_token_usage(execution_id) {
-        Ok(rows) => {
-            let mut input = 0u64;
-            let mut output = 0u64;
-            for row in &rows {
-                if row.iteration == Some(iteration) {
-                    input += row.input_tokens;
-                    output += row.output_tokens;
-                }
-            }
-            (input, output)
-        }
+    match db.get_iteration_token_totals(execution_id, iteration) {
+        Ok(totals) => totals,
         Err(e) => {
-            warn!("Failed to query phase token usage: {}", e);
+            warn!("Failed to query iteration token totals: {}", e);
             (0, 0)
         }
     }
@@ -463,8 +453,8 @@ Only output the JSON array, nothing else."#,
                 }),
                 config: pipeline_config.locator.clone(),
                 duration_ms: locator_duration,
-                tokens_in: locator_tokens_in as u32,
-                tokens_out: locator_tokens_out as u32,
+                tokens_in: u32::try_from(locator_tokens_in).unwrap_or(u32::MAX),
+                tokens_out: u32::try_from(locator_tokens_out).unwrap_or(u32::MAX),
                 cost_usd: locator_cost,
                 downstream_success: None,
                 output_quality_score: None,
@@ -674,8 +664,8 @@ Only output the JSON array, nothing else."#,
                         }),
                         config: pipeline_config.implementer.clone(),
                         duration_ms: implementer_duration,
-                        tokens_in: impl_tokens_in as u32,
-                        tokens_out: impl_tokens_out as u32,
+                        tokens_in: u32::try_from(impl_tokens_in).unwrap_or(u32::MAX),
+                        tokens_out: u32::try_from(impl_tokens_out).unwrap_or(u32::MAX),
                         cost_usd: impl_cost,
                         downstream_success: None,
                         output_quality_score: None,

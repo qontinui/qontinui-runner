@@ -26,6 +26,10 @@ impl CheckpointDb {
         error_message: Option<&str>,
         feedback: Option<&serde_json::Value>,
         workflow_architecture: Option<&str>,
+        step_count: Option<i64>,
+        verification_step_count: Option<i64>,
+        agentic_step_count: Option<i64>,
+        has_ui_bridge: bool,
     ) -> Result<String, String> {
         let conn = self.get_conn()?;
         let id = format!("lo-{}", uuid::Uuid::new_v4());
@@ -50,8 +54,9 @@ impl CheckpointDb {
             INSERT INTO learning_outcomes (
                 id, task_id, status, duration_secs, iterations, strategy,
                 tools_used, files_modified, error_type, error_message, feedback,
-                workflow_architecture, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                workflow_architecture, step_count, verification_step_count,
+                agentic_step_count, has_ui_bridge, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             "#,
             params![
                 id,
@@ -66,6 +71,10 @@ impl CheckpointDb {
                 error_message,
                 feedback_json,
                 architecture,
+                step_count,
+                verification_step_count,
+                agentic_step_count,
+                has_ui_bridge as i32,
                 now
             ],
         )

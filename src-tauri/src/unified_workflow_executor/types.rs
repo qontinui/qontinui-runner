@@ -305,13 +305,80 @@ impl LoopConfig {
             use_worktree: workflow.use_worktree,
             worktree_path: None,
             worktree_branch: None,
-            workflow_architecture: None,
+            workflow_architecture: workflow.workflow_architecture.clone(),
             agentic_verification_config: None,
             multi_agent_pipeline_config: None,
             verification_history: HashMap::new(),
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
             acceptance_criteria: workflow.acceptance_criteria.clone(),
+        }
+    }
+
+    /// Infer the best workflow architecture if not explicitly set.
+    ///
+    /// Heuristic: when the workflow has >3 verification steps spanning
+    /// distinct concerns (different file paths, step names, or check types),
+    /// the multi-agent pipeline is a better fit than the traditional loop
+    /// because it can parallelize independent subtrees.
+    ///
+    /// Only upgrades from None → MultiAgentPipeline; never overrides an
+    /// explicit user choice.
+    pub fn infer_architecture(&mut self) {
+        use crate::autoresearch::agentic_verification::WorkflowArchitecture;
+
+        // Don't override explicit choices
+        if self.workflow_architecture.is_some() {
+            return;
+        }
+
+        // Count total verification steps across all stages
+        let total_verification_steps: usize = self
+            .stages
+            .iter()
+            .map(|s| s.verification_steps.len())
+            .sum();
+
+        // Need >3 verification steps to justify pipeline overhead
+        if total_verification_steps <= 3 {
+            return;
+        }
+
+        // Check for distinct concerns by collecting unique step name prefixes
+        // and working directories. More diversity = better pipeline fit.
+        let mut distinct_concerns = std::collections::HashSet::new();
+        for stage in &self.stages {
+            for step in &stage.verification_steps {
+                // Use step name prefix (before first ':' or '_') as a concern proxy
+                if let Some(ref name) = step.name {
+                    let concern = name
+                        .split(|c: char| c == ':' || c == '_' || c == ' ')
+                        .next()
+                        .unwrap_or(name)
+                        .to_lowercase();
+                    distinct_concerns.insert(concern);
+                }
+                // Working directory as a distinct concern
+                if let Some(ref wd) = step.working_directory {
+                    distinct_concerns.insert(wd.clone());
+                }
+                // Check type as a distinct concern
+                distinct_concerns.insert(step.step_type.clone());
+            }
+        }
+
+        // Require ≥3 distinct concerns alongside >3 steps
+        if distinct_concerns.len() >= 3 {
+            tracing::info!(
+                "Architecture inference: {} verification steps with {} distinct concerns → MultiAgentPipeline",
+                total_verification_steps,
+                distinct_concerns.len()
+            );
+            self.workflow_architecture = Some(WorkflowArchitecture::MultiAgentPipeline);
+            // Set default pipeline config if not already present
+            if self.multi_agent_pipeline_config.is_none() {
+                self.multi_agent_pipeline_config = Some(Default::default());
+            }
         }
     }
 

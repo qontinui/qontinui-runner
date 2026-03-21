@@ -465,6 +465,14 @@ pub struct UnifiedWorkflow {
     #[serde(default)]
     pub use_worktree: bool,
 
+    /// Workflow execution architecture override.
+    /// When set, forces the workflow to use a specific execution architecture
+    /// instead of the default Traditional loop. When None, the system infers
+    /// the best architecture based on workflow complexity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_architecture:
+        Option<crate::autoresearch::agentic_verification::WorkflowArchitecture>,
+
     /// Whether the AI semantic review actually ran successfully during generation.
     /// When false, the workflow passed through the pipeline without AI verification
     /// (e.g., all verification iterations failed at infrastructure level).
@@ -662,6 +670,10 @@ pub struct CreateUnifiedWorkflowRequest {
     /// Whether the AI semantic review ran successfully during generation
     #[serde(default)]
     pub ai_reviewed: Option<bool>,
+    /// Workflow execution architecture override (e.g., "multi_agent_pipeline").
+    #[serde(default)]
+    pub workflow_architecture:
+        Option<crate::autoresearch::agentic_verification::WorkflowArchitecture>,
 }
 
 impl From<&UnifiedWorkflow> for CreateUnifiedWorkflowRequest {
@@ -705,6 +717,7 @@ impl From<&UnifiedWorkflow> for CreateUnifiedWorkflowRequest {
             quality_report: w.quality_report.clone(),
             acceptance_criteria: w.acceptance_criteria.clone(),
             ai_reviewed: Some(w.ai_reviewed),
+            workflow_architecture: w.workflow_architecture.clone(),
         }
     }
 }
@@ -771,6 +784,9 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub acceptance_criteria: Option<Value>,
     /// Whether the AI semantic review ran successfully during generation
     pub ai_reviewed: Option<bool>,
+    /// Workflow execution architecture override (e.g., "multi_agent_pipeline").
+    pub workflow_architecture:
+        Option<crate::autoresearch::agentic_verification::WorkflowArchitecture>,
 }
 
 /// Query parameters for searching unified workflows

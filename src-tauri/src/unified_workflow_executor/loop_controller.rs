@@ -1278,6 +1278,9 @@ impl LoopController {
                     0,
                 );
 
+                // Infer architecture if not explicitly set by user or autoresearch
+                stage_loop_config.infer_architecture();
+
                 let loop_result = if matches!(
                     stage_loop_config.workflow_architecture,
                     Some(crate::autoresearch::agentic_verification::WorkflowArchitecture::AgenticVerification)

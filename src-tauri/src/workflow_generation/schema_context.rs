@@ -732,7 +732,7 @@ pub fn build_gotchas_section(conn: Option<&Connection>) -> String {
 }
 
 fn build_rules_section(conn: Option<&Connection>) -> String {
-    build_rules_section_for_tier(conn, rules::RuleTier::Full)
+    build_rules_section_for_tier(conn, rules::RuleTier::Important)
 }
 
 /// Build rules section with progressive loading support.

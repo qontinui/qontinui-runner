@@ -32,7 +32,8 @@ use crate::workflow_generation::prompt_analysis;
 use crate::workflow_generation::revision;
 use crate::workflow_generation::rules;
 use crate::workflow_generation::schema_context::{
-    build_schema_context, build_schema_context_full, format_skills_for_generator,
+    build_gotchas_section, build_schema_context, build_schema_context_full,
+    format_skills_for_generator,
 };
 use crate::workflow_generation::self_improve;
 use crate::workflow_generation::spec_synthesis;
@@ -1032,6 +1033,7 @@ pub fn generate_workflow(
                 doctor_handle,
                 generation_model,
                 generation_provider,
+                conn,
             ) {
                 Ok(fixed) => {
                     // Track which rules were violated by these issues.
@@ -2223,11 +2225,12 @@ fn run_fixer_agent(
     doctor_handle: Option<&DoctorHandle>,
     model_override: Option<&str>,
     provider_override: Option<&str>,
+    conn: Option<&Connection>,
 ) -> Result<UnifiedWorkflow, String> {
     let workflow_json = serde_json::to_string_pretty(workflow)
         .map_err(|e| format!("Failed to serialize workflow: {}", e))?;
 
-    let prompt = build_fix_prompt(&workflow_json, issues, user_description);
+    let prompt = build_fix_prompt(&workflow_json, issues, user_description, conn);
     let task_context = TaskContext::from_prompt(&prompt);
     let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
         &prompt,
@@ -2254,13 +2257,21 @@ fn run_fixer_agent(
 }
 
 /// Build the prompt for the fixer agent.
-fn build_fix_prompt(workflow_json: &str, issues: &[String], user_description: &str) -> String {
+fn build_fix_prompt(
+    workflow_json: &str,
+    issues: &[String],
+    user_description: &str,
+    conn: Option<&Connection>,
+) -> String {
     let issues_text = issues
         .iter()
         .enumerate()
         .map(|(i, issue)| format!("{}. {}", i + 1, issue))
         .collect::<Vec<_>>()
         .join("\n");
+
+    // Include gotchas so the fixer knows the critical schema constraints
+    let gotchas = build_gotchas_section(conn);
 
     format!(
         r#"You are a workflow fixer agent for Qontinui Runner.
@@ -2269,6 +2280,7 @@ fn build_fix_prompt(workflow_json: &str, issues: &[String], user_description: &s
 
 A verification agent found issues in the workflow below. Fix ALL of them and return the corrected, complete UnifiedWorkflow JSON.
 
+{gotchas}
 ## Rules
 - Fix every listed issue. Do NOT skip any.
 - Preserve the overall structure, step ordering, IDs, and intent of the workflow.
@@ -2286,6 +2298,7 @@ A verification agent found issues in the workflow below. Fix ALL of them and ret
 
 ## Current workflow JSON
 {workflow_json}"#,
+        gotchas = gotchas,
         user_description = user_description,
         issues_text = issues_text,
         workflow_json = workflow_json,

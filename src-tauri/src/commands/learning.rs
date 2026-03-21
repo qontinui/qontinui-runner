@@ -294,6 +294,10 @@ pub fn record_task_outcome(
         error_message.as_deref(),
         feedback_json.as_ref(),
         outcome.workflow_architecture.as_deref(),
+        None, // step_count
+        None, // verification_step_count
+        None, // agentic_step_count
+        false, // has_ui_bridge
     )?;
 
     Ok(())
@@ -381,6 +385,10 @@ pub fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), S
             None,
             None,
             Some("traditional"),
+            None,  // step_count
+            None,  // verification_step_count
+            None,  // agentic_step_count
+            false, // has_ui_bridge
         )?;
     }
 
@@ -400,6 +408,10 @@ pub fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), S
             Some("Verification failed"),
             None,
             Some("traditional"),
+            None,  // step_count
+            None,  // verification_step_count
+            None,  // agentic_step_count
+            false, // has_ui_bridge
         )?;
     }
 

@@ -2163,6 +2163,10 @@ impl Orchestrator {
             error_message.as_deref(),
             feedback_json.as_ref(),
             Some(&inferred_architecture),
+            None, // step_count
+            None, // verification_step_count
+            None, // agentic_step_count
+            false, // has_ui_bridge
         ) {
             warn!("Failed to record learning outcome: {}", e);
         } else {
