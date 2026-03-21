@@ -268,6 +268,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- Meta-Optimizer (v119)
     is_meta_optimizer INTEGER DEFAULT 0,        -- Whether this is a meta-optimizer run
 
+    -- Cross-Iteration Context Compression (v128)
+    iteration_history TEXT,                     -- JSON array of compressed iteration summaries for agentic verification loops
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -1192,6 +1195,10 @@ CREATE TABLE IF NOT EXISTS learning_outcomes (
     feedback TEXT,  -- JSON array
     workflow_architecture TEXT,  -- 'traditional', 'agentic_verification', 'multi_agent_pipeline'
     context_embedding BLOB,  -- Embedding of task context (384-dim MiniLM as f32 BLOB)
+    step_count INTEGER,  -- Total steps across all stages
+    verification_step_count INTEGER,  -- Number of verification steps
+    agentic_step_count INTEGER,  -- Number of agentic (prompt) steps
+    has_ui_bridge INTEGER DEFAULT 0,  -- Whether workflow uses UI Bridge steps
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_learning_outcomes_task_id ON learning_outcomes(task_id);
@@ -2258,6 +2265,8 @@ CREATE TABLE IF NOT EXISTS generation_rules (
     confidence REAL DEFAULT 1.0,          -- Confidence score for auto-generated rules
     auto_generated_at TEXT,               -- When auto-generated (NULL for manual/seed rules)
     evidence_count INTEGER DEFAULT 0,     -- How many examples support this rule
+    severity TEXT NOT NULL DEFAULT 'normal',  -- 'critical', 'important', 'normal', 'hint'
+    failure_count INTEGER NOT NULL DEFAULT 0,  -- Tracks how many generation failures this rule would have prevented
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (source_fix_id) REFERENCES reflection_fixes(id) ON DELETE SET NULL
@@ -2266,6 +2275,7 @@ CREATE TABLE IF NOT EXISTS generation_rules (
 CREATE INDEX IF NOT EXISTS idx_generation_rules_agent ON generation_rules(agent);
 CREATE INDEX IF NOT EXISTS idx_generation_rules_status ON generation_rules(status);
 CREATE INDEX IF NOT EXISTS idx_generation_rules_agent_section ON generation_rules(agent, section, rule_number);
+CREATE INDEX IF NOT EXISTS idx_generation_rules_severity ON generation_rules(severity);
 
 -- =============================================================================
 -- Step Type Knowledge (v63)
@@ -3247,4 +3257,4 @@ CREATE INDEX IF NOT EXISTS idx_spec_versions_spec ON spec_versions(spec_id);
 CREATE INDEX IF NOT EXISTS idx_spec_versions_hash ON spec_versions(content_hash);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_spec_versions_num ON spec_versions(spec_id, version_number);
 
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (125, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (128, datetime('now'));

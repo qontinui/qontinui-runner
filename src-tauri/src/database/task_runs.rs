@@ -1335,6 +1335,31 @@ impl CheckpointDb {
         Ok(())
     }
 
+    /// Update the iteration history for a task run.
+    /// Stores the compressed cross-iteration context as JSON for post-analysis
+    /// by the meta-optimizer (which approaches were tried, what worked, etc.).
+    pub fn update_task_run_iteration_history(
+        &self,
+        id: &str,
+        iteration_history_json: &str,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                iteration_history = ?1,
+                updated_at = ?2
+            WHERE id = ?3
+            "#,
+            params![iteration_history_json, now, id],
+        )
+        .map_err(|e| format!("Failed to update task run iteration history: {}", e))?;
+
+        Ok(())
+    }
+
     /// Get runtime context for a task run.
     pub fn get_task_run_runtime_context(&self, id: &str) -> Result<Option<String>, String> {
         let conn = self.get_conn()?;

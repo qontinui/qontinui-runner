@@ -15,7 +15,7 @@ use crate::unified_workflow_executor::LoopConfig;
 pub fn build_config(execution_id: &str, workflow_name: &str) -> LoopConfig {
     LoopConfig {
         max_iterations: 3,
-        base_prompt: build_agentic_prompt(),
+        base_prompt: build_agentic_prompt(&crate::mcp::types::get_self_base_url_from_env()),
         workflow_name: workflow_name.to_string(),
         workflow_id: format!("meta-opt-arch-{}", execution_id),
         execution_id: execution_id.to_string(),
@@ -77,12 +77,12 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
             None,
             Some("learning_outcomes"),
         ),
-        // Step 2: Load pipeline agent trace aggregates
+        // Step 2: Load pipeline agent trace summaries (L0 — agent_type + count + success_pct)
         build_api_step(
-            "Load pipeline agent traces",
+            "Load pipeline agent trace summaries (L0)",
             "GET",
             &format!(
-                "{}/meta-optimizer/agent-trace-aggregates?limit=100",
+                "{}/meta-optimizer/agent-trace-aggregates?limit=100&tier=l0",
                 base_url
             ),
             None,
@@ -133,8 +133,8 @@ If the current architecture settings are optimal, that is acceptable."#
     }]
 }
 
-fn build_agentic_prompt() -> String {
-    r#"You are the Architecture Optimizer, part of the meta-optimizer system.
+fn build_agentic_prompt(base_url: &str) -> String {
+    let prompt = r#"You are the Architecture Optimizer, part of the meta-optimizer system.
 
 Your job is to analyze cross-architecture performance data and produce TWO types of output:
 1. **Actionable config recommendations** — for parameters that can actually be changed via settings
@@ -159,14 +159,31 @@ Your job is to analyze cross-architecture performance data and produce TWO types
 
 If your analysis reveals an important insight about any of these non-configurable parameters, output it as an [ARCH_FINDING], NOT as a [CONFIG_RECOMMENDATION].
 
-## Data Available
+## Data Available (Tiered Context — L0 Summaries)
 
-The setup phase loaded:
+The setup phase loaded **L0 summaries** where applicable:
 - `{{optimizer_context}}` — Your performance history: previous recommendations and their outcomes, current metrics vs baseline, per-architecture performance, top failure patterns
 - `{{learning_outcomes}}` — Cross-architecture learning outcomes (success rate, duration, iterations, cost per architecture)
-- `{{agent_traces}}` — Per-agent cost/duration/success from pipeline runs
+- `{{agent_traces}}` — **L0 summary**: agent_type, run_count, success_pct (one row per agent type)
 - `{{autoresearch_campaigns}}` — Autoresearch experiment results (A/B testing data)
 - `{{agentic_settings}}` — Current configuration defaults for each architecture
+
+## Drill-Down: L1/L2 Detail Endpoints
+
+If the L0 agent trace summaries reveal issues, drill into details:
+
+**Agent Traces — L1 (core fields per trace):**
+```bash
+curl -s '{{base_url}}/meta-optimizer/agent-trace-aggregates?tier=l1&agent_type=<AGENT_TYPE>&limit=20'
+```
+
+**Agent Traces — L2 (full aggregated statistics):**
+```bash
+curl -s '{{base_url}}/meta-optimizer/agent-trace-aggregates?tier=l2&limit=100'
+```
+Returns: avg_duration_ms, avg_cost_usd, avg_tokens_in/out per agent type.
+
+Only drill into L1/L2 when the L0 summaries show a problem worth investigating.
 
 ## Three Architectures
 
@@ -260,8 +277,8 @@ Use this to:
 - **Don't flip-flop.** If you recommended switching to architecture A last time and it regressed, don't recommend it again without new evidence.
 - **Measure before changing.** Check the baseline vs current delta before recommending architecture switches.
 - **Distinguish noise from signal.** Small sample sizes (< 10 runs per architecture) don't justify switching defaults.
-- **Consider interaction effects.** Architecture changes affect all workflow types — a switch that helps backend tasks might hurt UI tasks."#
-        .to_string()
+- **Consider interaction effects.** Architecture changes affect all workflow types — a switch that helps backend tasks might hurt UI tasks."#;
+    prompt.replace("{{base_url}}", base_url)
 }
 
 /// Helper: Build a command step that makes an HTTP request via curl.

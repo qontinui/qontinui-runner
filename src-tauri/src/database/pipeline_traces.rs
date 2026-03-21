@@ -79,6 +79,110 @@ fn insert_traces(
     Ok(count)
 }
 
+/// L0: Get one-line summaries of agent traces grouped by agent_type.
+/// Returns agent_type, count, and success percentage only.
+pub fn get_trace_summaries_l0(
+    db: &CheckpointDb,
+    limit: u32,
+) -> Result<Vec<crate::meta_optimizer::types::TraceSummaryL0>, String> {
+    use crate::meta_optimizer::types::TraceSummaryL0;
+
+    db.with_conn(move |conn| {
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT
+                    agent_type,
+                    COUNT(*) as run_count,
+                    ROUND(100.0 * SUM(CASE WHEN downstream_success = 1 THEN 1 ELSE 0 END)
+                        / NULLIF(COUNT(*), 0), 1) as success_pct
+                FROM pipeline_agent_traces
+                WHERE id IN (
+                    SELECT id FROM pipeline_agent_traces
+                    ORDER BY created_at DESC
+                    LIMIT ?1
+                )
+                GROUP BY agent_type
+                ORDER BY agent_type"#,
+            )
+            .map_err(|e| format!("Failed to prepare L0 summary query: {}", e))?;
+
+        let results = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(TraceSummaryL0 {
+                    agent_type: row.get(0)?,
+                    run_count: row.get(1)?,
+                    success_pct: row.get::<_, f64>(2).unwrap_or(0.0),
+                })
+            })
+            .map_err(|e| format!("Failed to query L0 summaries: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    })
+}
+
+/// L1: Get core trace fields for a given agent type (no snapshots/config).
+pub fn get_trace_details_l1(
+    db: &CheckpointDb,
+    agent_type: Option<&str>,
+    limit: u32,
+) -> Result<Vec<crate::meta_optimizer::types::TraceDetailL1>, String> {
+    use crate::meta_optimizer::types::TraceDetailL1;
+
+    let agent_type = agent_type.map(|s| s.to_string());
+
+    db.with_conn(move |conn| {
+        let (sql, has_filter) = if agent_type.is_some() {
+            (
+                r#"SELECT id, agent_type, duration_ms, downstream_success, created_at
+                   FROM pipeline_agent_traces
+                   WHERE agent_type = ?2
+                   ORDER BY created_at DESC
+                   LIMIT ?1"#,
+                true,
+            )
+        } else {
+            (
+                r#"SELECT id, agent_type, duration_ms, downstream_success, created_at
+                   FROM pipeline_agent_traces
+                   ORDER BY created_at DESC
+                   LIMIT ?1"#,
+                false,
+            )
+        };
+
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| format!("Failed to prepare L1 detail query: {}", e))?;
+
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<TraceDetailL1> {
+            let ds: Option<i32> = row.get(3)?;
+            Ok(TraceDetailL1 {
+                id: row.get(0)?,
+                agent_type: row.get(1)?,
+                duration_ms: row.get(2)?,
+                downstream_success: ds.map(|v| v != 0),
+                created_at: row.get(4)?,
+            })
+        };
+
+        let results: Vec<TraceDetailL1> = if has_filter {
+            stmt.query_map(params![limit as i64, agent_type.unwrap()], map_row)
+                .map_err(|e| format!("Failed to query L1 details: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect()
+        } else {
+            stmt.query_map(params![limit as i64], map_row)
+                .map_err(|e| format!("Failed to query L1 details: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+
+        Ok(results)
+    })
+}
+
 /// Get aggregate metrics for pipeline agent traces, grouped by agent type.
 /// Used by the meta-optimizer to analyze agent performance.
 pub fn get_agent_trace_aggregates(

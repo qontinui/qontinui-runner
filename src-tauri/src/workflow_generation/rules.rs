@@ -8,11 +8,24 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::reflection::types::ReflectionFix;
 use crate::str_utils::truncate_str;
+
+/// Severity tiers for progressive rule loading.
+///
+/// Controls how many rules are loaded based on the generation phase:
+/// - `Critical` — only critical rules (always-on, high-signal, ~5 rules)
+/// - `Important` — critical + important rules (default for initial generation)
+/// - `Full` — all rules including normal and hint (used in fixer iterations)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuleTier {
+    Critical,
+    Important,
+    Full,
+}
 
 /// A single generation rule stored in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +40,8 @@ pub struct GenerationRule {
     pub status: String,
     pub provenance: String,
     pub source_fix_id: Option<String>,
+    pub severity: String,
+    pub failure_count: i32,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -42,6 +57,7 @@ pub struct InsertRuleInput {
     pub condition: Option<String>,
     pub provenance: String,
     pub source_fix_id: Option<String>,
+    pub severity: Option<String>,
 }
 
 /// Input for updating an existing rule.
@@ -52,6 +68,8 @@ pub struct UpdateRuleInput {
     pub condition: Option<String>,
     pub status: Option<String>,
     pub rule_number: Option<i32>,
+    /// Severity level: 'critical', 'important', 'normal', 'hint'
+    pub severity: Option<String>,
 }
 
 /// Query parameters for listing rules.
@@ -61,6 +79,8 @@ pub struct ListRulesQuery {
     pub section: Option<String>,
     pub status: Option<String>,
     pub provenance: Option<String>,
+    /// Filter by severity level: 'critical', 'important', 'normal', 'hint'
+    pub severity: Option<String>,
 }
 
 // ============================================================================
@@ -70,7 +90,7 @@ pub struct ListRulesQuery {
 /// Load active rules for a specific agent and section, ordered by rule_number.
 pub fn load_rules(conn: &Connection, agent: &str, section: &str) -> Vec<GenerationRule> {
     let mut stmt = match conn.prepare(
-        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, created_at, updated_at
+        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, created_at, updated_at
          FROM generation_rules
          WHERE agent = ?1 AND section = ?2 AND status = 'active'
          ORDER BY rule_number",
@@ -94,8 +114,10 @@ pub fn load_rules(conn: &Connection, agent: &str, section: &str) -> Vec<Generati
             status: row.get(7)?,
             provenance: row.get(8)?,
             source_fix_id: row.get(9)?,
-            created_at: row.get(10)?,
-            updated_at: row.get(11)?,
+            severity: row.get(10)?,
+            failure_count: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
         })
     });
 
@@ -108,10 +130,71 @@ pub fn load_rules(conn: &Connection, agent: &str, section: &str) -> Vec<Generati
     }
 }
 
+/// Load active rules filtered by severity tier for progressive loading.
+///
+/// - `Critical` loads only `severity = 'critical'` rules
+/// - `Important` loads `'critical'` and `'important'` rules
+/// - `Full` loads all severities (`'critical'`, `'important'`, `'normal'`, `'hint'`)
+pub fn load_rules_progressive(
+    conn: &Connection,
+    agent: &str,
+    section: &str,
+    tier: RuleTier,
+) -> Vec<GenerationRule> {
+    let severity_clause = match tier {
+        RuleTier::Critical => "AND severity = 'critical'",
+        RuleTier::Important => "AND severity IN ('critical', 'important')",
+        RuleTier::Full => "", // no filter — all severities
+    };
+
+    let sql = format!(
+        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, created_at, updated_at
+         FROM generation_rules
+         WHERE agent = ?1 AND section = ?2 AND status = 'active' {}
+         ORDER BY rule_number",
+        severity_clause
+    );
+
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to prepare load_rules_progressive query: {}", e);
+            return vec![];
+        }
+    };
+
+    let rows = stmt.query_map(params![agent, section], |row| {
+        Ok(GenerationRule {
+            id: row.get(0)?,
+            agent: row.get(1)?,
+            section: row.get(2)?,
+            rule_number: row.get(3)?,
+            title: row.get(4)?,
+            content: row.get(5)?,
+            condition: row.get(6)?,
+            status: row.get(7)?,
+            provenance: row.get(8)?,
+            source_fix_id: row.get(9)?,
+            severity: row.get(10)?,
+            failure_count: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
+        })
+    });
+
+    match rows {
+        Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            warn!("Failed to execute load_rules_progressive query: {}", e);
+            vec![]
+        }
+    }
+}
+
 /// Load all active rules for an agent, grouped by section.
 pub fn load_rules_by_agent(conn: &Connection, agent: &str) -> HashMap<String, Vec<GenerationRule>> {
     let mut stmt = match conn.prepare(
-        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, created_at, updated_at
+        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, created_at, updated_at
          FROM generation_rules
          WHERE agent = ?1 AND status = 'active'
          ORDER BY section, rule_number",
@@ -135,8 +218,10 @@ pub fn load_rules_by_agent(conn: &Connection, agent: &str) -> HashMap<String, Ve
             status: row.get(7)?,
             provenance: row.get(8)?,
             source_fix_id: row.get(9)?,
-            created_at: row.get(10)?,
-            updated_at: row.get(11)?,
+            severity: row.get(10)?,
+            failure_count: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
         })
     });
 
@@ -155,7 +240,7 @@ pub fn list_rules(
     query: &ListRulesQuery,
 ) -> Result<Vec<GenerationRule>, String> {
     let mut sql = String::from(
-        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, created_at, updated_at
+        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, created_at, updated_at
          FROM generation_rules WHERE 1=1",
     );
     let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -175,6 +260,10 @@ pub fn list_rules(
     if let Some(ref provenance) = query.provenance {
         params_vec.push(Box::new(provenance.clone()));
         sql.push_str(&format!(" AND provenance = ?{}", params_vec.len()));
+    }
+    if let Some(ref severity) = query.severity {
+        params_vec.push(Box::new(severity.clone()));
+        sql.push_str(&format!(" AND severity = ?{}", params_vec.len()));
     }
     sql.push_str(" ORDER BY agent, section, rule_number");
 
@@ -198,8 +287,10 @@ pub fn list_rules(
                 status: row.get(7)?,
                 provenance: row.get(8)?,
                 source_fix_id: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                severity: row.get(10)?,
+                failure_count: row.get(11)?,
+                created_at: row.get(12)?,
+                updated_at: row.get(13)?,
             })
         })
         .map_err(|e| format!("Failed to execute list_rules query: {}", e))?;
@@ -210,7 +301,7 @@ pub fn list_rules(
 /// Get a single rule by ID.
 pub fn get_rule(conn: &Connection, id: &str) -> Result<Option<GenerationRule>, String> {
     let result = conn.query_row(
-        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, created_at, updated_at
+        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, created_at, updated_at
          FROM generation_rules WHERE id = ?1",
         params![id],
         |row| {
@@ -225,8 +316,10 @@ pub fn get_rule(conn: &Connection, id: &str) -> Result<Option<GenerationRule>, S
                 status: row.get(7)?,
                 provenance: row.get(8)?,
                 source_fix_id: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                severity: row.get(10)?,
+                failure_count: row.get(11)?,
+                created_at: row.get(12)?,
+                updated_at: row.get(13)?,
             })
         },
     );
@@ -273,7 +366,7 @@ pub fn insert_rule(conn: &Connection, input: &InsertRuleInput) -> Result<Generat
     if let Some(ref fix_id) = input.source_fix_id {
         let existing: Option<GenerationRule> = conn
             .query_row(
-                "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, created_at, updated_at
+                "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, created_at, updated_at
                  FROM generation_rules WHERE source_fix_id = ?1 LIMIT 1",
                 params![fix_id],
                 |row| {
@@ -288,8 +381,10 @@ pub fn insert_rule(conn: &Connection, input: &InsertRuleInput) -> Result<Generat
                         status: row.get(7)?,
                         provenance: row.get(8)?,
                         source_fix_id: row.get(9)?,
-                        created_at: row.get(10)?,
-                        updated_at: row.get(11)?,
+                        severity: row.get(10)?,
+                        failure_count: row.get(11)?,
+                        created_at: row.get(12)?,
+                        updated_at: row.get(13)?,
                     })
                 },
             )
@@ -307,9 +402,11 @@ pub fn insert_rule(conn: &Connection, input: &InsertRuleInput) -> Result<Generat
     let id = format!("rule-{}", Uuid::new_v4());
     let now = Utc::now().to_rfc3339();
 
+    let severity = input.severity.as_deref().unwrap_or("normal").to_string();
+
     conn.execute(
-        "INSERT INTO generation_rules (id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11)",
+        "INSERT INTO generation_rules (id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11, ?12)",
         params![
             id,
             input.agent,
@@ -320,6 +417,7 @@ pub fn insert_rule(conn: &Connection, input: &InsertRuleInput) -> Result<Generat
             input.condition,
             input.provenance,
             input.source_fix_id,
+            severity,
             now,
             now,
         ],
@@ -337,6 +435,8 @@ pub fn insert_rule(conn: &Connection, input: &InsertRuleInput) -> Result<Generat
         status: "active".to_string(),
         provenance: input.provenance.clone(),
         source_fix_id: input.source_fix_id.clone(),
+        severity,
+        failure_count: 0,
         created_at: now.clone(),
         updated_at: now,
     })
@@ -371,6 +471,10 @@ pub fn update_rule(
     if let Some(rule_number) = input.rule_number {
         params_vec.push(Box::new(rule_number));
         sets.push(format!("rule_number = ?{}", params_vec.len()));
+    }
+    if let Some(ref severity) = input.severity {
+        params_vec.push(Box::new(severity.clone()));
+        sets.push(format!("severity = ?{}", params_vec.len()));
     }
 
     params_vec.push(Box::new(id.to_string()));
@@ -577,6 +681,7 @@ pub fn create_rules_from_reflection_fixes(
             condition: None,
             provenance: "reflection".to_string(),
             source_fix_id: Some(fix.id.clone()),
+            severity: None,
         };
 
         match insert_rule(conn, &input) {
@@ -670,6 +775,7 @@ pub fn promote_insights_to_rules(
             condition: None,
             provenance: "auto_insight".to_string(),
             source_fix_id: None,
+            severity: None,
         };
 
         match insert_rule(conn, &input) {
@@ -707,6 +813,178 @@ fn map_insight_to_rule_location(agent: &str, insight_type: &str) -> (String, Str
         ("hardener", _) => ("hardener".to_string(), "conversion_rules".to_string()),
         ("builder", _) => ("schema_context".to_string(), "important_rules".to_string()),
         _ => ("schema_context".to_string(), "important_rules".to_string()),
+    }
+}
+
+// ============================================================================
+// Failure Tracking & Auto-Promotion
+// ============================================================================
+
+/// Increment the failure_count of a rule and auto-promote to 'critical' if threshold reached.
+pub fn increment_rule_failure_count(conn: &Connection, rule_id: &str) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE generation_rules SET failure_count = failure_count + 1, updated_at = ?1 WHERE id = ?2",
+        params![now, rule_id],
+    )
+    .map_err(|e| format!("Failed to increment failure_count for rule {}: {}", rule_id, e))?;
+
+    // Auto-promote to 'critical' if failure_count reaches threshold
+    let failure_count: i32 = conn
+        .query_row(
+            "SELECT failure_count FROM generation_rules WHERE id = ?1",
+            params![rule_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if failure_count >= 5 {
+        conn.execute(
+            "UPDATE generation_rules SET severity = 'critical', updated_at = ?1 WHERE id = ?2 AND severity != 'critical'",
+            params![now, rule_id],
+        )
+        .map_err(|e| format!("Failed to auto-promote rule {} to critical: {}", rule_id, e))?;
+        info!(
+            "Auto-promoted rule {} to critical severity (failure_count={})",
+            rule_id, failure_count
+        );
+    }
+
+    Ok(())
+}
+
+/// Identify which rules were violated by a generation/verification error.
+/// Returns IDs of rules whose content keywords appear in the error message.
+pub fn identify_violated_rules(
+    conn: &Connection,
+    error_message: &str,
+    agent: &str,
+) -> Vec<String> {
+    let rules = load_rules(conn, agent, "important_rules");
+    let all_rules = {
+        let mut r = rules;
+        r.extend(load_rules(conn, agent, "verification_quality"));
+        r
+    };
+
+    let error_lower = error_message.to_lowercase();
+    let mut violated = Vec::new();
+
+    for rule in &all_rules {
+        // Extract key phrases from rule title for matching
+        let title_lower = rule.title.to_lowercase();
+        let keywords: Vec<&str> = title_lower.split_whitespace().collect();
+
+        // Match if 2+ significant keywords from the title appear in the error
+        let significant_matches = keywords
+            .iter()
+            .filter(|kw| kw.len() > 3) // skip short words
+            .filter(|kw| error_lower.contains(*kw))
+            .count();
+
+        if significant_matches >= 2 {
+            violated.push(rule.id.clone());
+        }
+    }
+
+    violated
+}
+
+// ============================================================================
+// Known Issue → Rule Sync
+// ============================================================================
+
+/// Create generation rules from active known issues that have verification templates.
+///
+/// Each known issue with a `verification_step_template` becomes an "important" rule
+/// in the verification agent. Deduplicates by `source_fix_id` (using the known issue ID).
+pub fn sync_rules_from_known_issues(conn: &Connection) -> Result<u32, String> {
+    let active_issues =
+        crate::known_issues::storage::find_relevant_issues_for_generation(conn, "regression")?;
+    let mut created = 0u32;
+
+    for issue in &active_issues {
+        // Only sync issues that have a verification step template or hint
+        if issue.verification_step_template.is_none() && issue.verification_hint.is_none() {
+            continue;
+        }
+
+        let source_id = format!("known_issue:{}", issue.id);
+
+        // Check if a rule already exists for this issue
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM generation_rules WHERE source_fix_id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if exists > 0 {
+            continue;
+        }
+
+        // Build rule content from the issue
+        let scope_info = issue
+            .scope_value
+            .as_deref()
+            .unwrap_or("the affected area");
+        let hint = issue
+            .verification_hint
+            .as_deref()
+            .unwrap_or(&issue.description);
+        let rule_content = format!(
+            "When generating workflows that touch {}, ensure verification includes a check for: {}",
+            scope_info, hint
+        );
+
+        // Infer the agent from issue category
+        let rule_agent = infer_agent_from_issue(&issue.category);
+        let rule_section = "verification_quality".to_string();
+        let rule_number = next_rule_number(conn, &rule_agent, &rule_section);
+
+        let input = InsertRuleInput {
+            agent: rule_agent,
+            section: rule_section,
+            rule_number,
+            title: format!("Prevent: {}", truncate_str(&issue.title, 60)),
+            content: rule_content,
+            condition: issue.scope_value.clone(),
+            provenance: "known_issue".to_string(),
+            source_fix_id: Some(source_id),
+            severity: Some("important".to_string()),
+        };
+
+        match insert_rule(conn, &input) {
+            Ok(rule) => {
+                created += 1;
+                info!(
+                    "Created generation rule {} from known issue {} ({})",
+                    rule.id, issue.id, issue.title
+                );
+            }
+            Err(e) => warn!(
+                "Failed to create rule from known issue {}: {}",
+                issue.id, e
+            ),
+        }
+    }
+
+    if created > 0 {
+        info!("Synced {} generation rules from known issues", created);
+    }
+
+    Ok(created)
+}
+
+/// Map a known issue category to the appropriate rule agent.
+fn infer_agent_from_issue(category: &crate::known_issues::types::IssueCategory) -> String {
+    use crate::known_issues::types::IssueCategory;
+    match category {
+        IssueCategory::Timing | IssueCategory::State | IssueCategory::DataIntegrity => {
+            "verification".to_string()
+        }
+        _ => "schema_context".to_string(),
     }
 }
 
@@ -772,6 +1050,8 @@ mod tests {
                 status: "active".into(),
                 provenance: "seed".into(),
                 source_fix_id: None,
+                severity: "normal".into(),
+                failure_count: 0,
                 created_at: "now".into(),
                 updated_at: "now".into(),
             },
@@ -786,6 +1066,8 @@ mod tests {
                 status: "active".into(),
                 provenance: "seed".into(),
                 source_fix_id: None,
+                severity: "normal".into(),
+                failure_count: 0,
                 created_at: "now".into(),
                 updated_at: "now".into(),
             },
@@ -817,6 +1099,8 @@ mod tests {
                 status TEXT NOT NULL DEFAULT 'active',
                 provenance TEXT NOT NULL DEFAULT 'seed',
                 source_fix_id TEXT,
+                severity TEXT NOT NULL DEFAULT 'normal',
+                failure_count INTEGER NOT NULL DEFAULT 0,
                 confidence REAL DEFAULT 1.0,
                 auto_generated_at TEXT,
                 evidence_count INTEGER DEFAULT 0,
@@ -1094,6 +1378,7 @@ pub fn ensure_seed_rules(conn: &Connection) {
             condition: None,
             provenance: "seed".to_string(),
             source_fix_id: None,
+            severity: Some("important".to_string()),
         },
         InsertRuleInput {
             agent: "schema_context".to_string(),
@@ -1104,6 +1389,7 @@ pub fn ensure_seed_rules(conn: &Connection) {
             condition: None,
             provenance: "seed".to_string(),
             source_fix_id: None,
+            severity: Some("important".to_string()),
         },
         InsertRuleInput {
             agent: "schema_context".to_string(),
@@ -1114,6 +1400,7 @@ pub fn ensure_seed_rules(conn: &Connection) {
             condition: None,
             provenance: "seed".to_string(),
             source_fix_id: None,
+            severity: Some("normal".to_string()),
         },
     ];
 

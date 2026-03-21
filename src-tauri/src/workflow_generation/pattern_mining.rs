@@ -317,6 +317,7 @@ pub fn patterns_to_rules(
             condition,
             provenance: "pattern_mining".to_string(),
             source_fix_id: None,
+            severity: None,
         };
 
         match rules::insert_rule(conn, &input) {

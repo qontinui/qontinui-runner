@@ -19,7 +19,10 @@ use crate::database::pipeline_traces::{self, AgentTraceAggregate};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::meta_optimizer::prompt_registry;
 use crate::meta_optimizer::recommendations;
-use crate::meta_optimizer::types::{MetaOptimizerRun, PromptVariant, Recommendation};
+use crate::meta_optimizer::types::{
+    ContextTier, MetaOptimizerRun, PromptVariant, ReflectionFixDetailL1, ReflectionFixSummaryL0,
+    Recommendation, TraceSummaryL0, TraceDetailL1,
+};
 
 // ---------------------------------------------------------------------------
 // Query parameter structs
@@ -28,6 +31,8 @@ use crate::meta_optimizer::types::{MetaOptimizerRun, PromptVariant, Recommendati
 #[derive(Debug, Deserialize)]
 pub struct TraceAggregateQuery {
     pub limit: Option<u32>,
+    pub tier: Option<ContextTier>,
+    pub agent_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,28 +84,52 @@ pub struct OptimizerContext {
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// GET /meta-optimizer/agent-trace-aggregates?limit=N
+/// GET /meta-optimizer/agent-trace-aggregates?limit=N&tier=l0|l1|l2
 ///
-/// Returns aggregated per-agent-type trace statistics.
+/// Returns agent trace data at the requested tier:
+/// - L0 (default): one-line summaries (agent_type + count + success_pct)
+/// - L1: core fields per trace (id, agent_type, duration_ms, downstream_success, created_at)
+/// - L2: full aggregated statistics (existing behavior)
 pub async fn get_agent_trace_aggregates_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<TraceAggregateQuery>,
-) -> Result<Json<ApiResponse<Vec<AgentTraceAggregate>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let limit = query.limit.unwrap_or(50);
+    let tier = query.tier.unwrap_or_default();
 
-    let aggregates =
-        pipeline_traces::get_agent_trace_aggregates(&state.app_state.checkpoint_db, limit)
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!(
-                        "Failed to get agent trace aggregates: {}",
-                        e
-                    ))),
-                )
-            })?;
+    let make_err = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "Failed to get agent trace aggregates: {}",
+                e
+            ))),
+        )
+    };
 
-    Ok(Json(ApiResponse::success(aggregates)))
+    match tier {
+        ContextTier::L0 => {
+            let summaries =
+                pipeline_traces::get_trace_summaries_l0(&state.app_state.checkpoint_db, limit)
+                    .map_err(make_err)?;
+            Ok(Json(ApiResponse::success(serde_json::to_value(summaries).unwrap_or_default())))
+        }
+        ContextTier::L1 => {
+            let details = pipeline_traces::get_trace_details_l1(
+                &state.app_state.checkpoint_db,
+                query.agent_type.as_deref(),
+                limit,
+            )
+            .map_err(make_err)?;
+            Ok(Json(ApiResponse::success(serde_json::to_value(details).unwrap_or_default())))
+        }
+        ContextTier::L2 => {
+            let aggregates =
+                pipeline_traces::get_agent_trace_aggregates(&state.app_state.checkpoint_db, limit)
+                    .map_err(make_err)?;
+            Ok(Json(ApiResponse::success(serde_json::to_value(aggregates).unwrap_or_default())))
+        }
+    }
 }
 
 /// GET /meta-optimizer/prompt-variants?agent_type=X
@@ -544,6 +573,59 @@ pub async fn get_optimizer_context_handler(
                     }
                     let _ = writeln!(out);
                 }
+
+                // ── 7. Token Efficiency per Agent ──────────────────────────
+                let mut token_stmt = conn
+                    .prepare(
+                        r#"SELECT agent_type,
+                            COUNT(*) as run_count,
+                            ROUND(AVG(tokens_in), 0) as avg_tokens_in,
+                            ROUND(AVG(tokens_out), 0) as avg_tokens_out,
+                            ROUND(AVG(cost_usd), 4) as avg_cost_usd,
+                            SUM(tokens_in) as total_tokens_in,
+                            SUM(tokens_out) as total_tokens_out,
+                            ROUND(SUM(cost_usd), 2) as total_cost_usd
+                        FROM pipeline_agent_traces
+                        WHERE created_at > ?1
+                            AND (tokens_in > 0 OR tokens_out > 0)
+                        GROUP BY agent_type
+                        ORDER BY total_cost_usd DESC"#,
+                    )
+                    .map_err(|e| format!("Failed to prepare token efficiency query: {}", e))?;
+
+                let token_rows: Vec<(String, i64, f64, f64, f64, i64, i64, f64)> = token_stmt
+                    .query_map(params![since], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, f64>(2).unwrap_or(0.0),
+                            row.get::<_, f64>(3).unwrap_or(0.0),
+                            row.get::<_, f64>(4).unwrap_or(0.0),
+                            row.get::<_, i64>(5).unwrap_or(0),
+                            row.get::<_, i64>(6).unwrap_or(0),
+                            row.get::<_, f64>(7).unwrap_or(0.0),
+                        ))
+                    })
+                    .map_err(|e| format!("Failed to query token efficiency: {}", e))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                if !token_rows.is_empty() {
+                    let _ = writeln!(out, "## Token Efficiency");
+                    let _ = writeln!(
+                        out,
+                        "| Agent | Runs | Avg In | Avg Out | Avg Cost | Total Cost |"
+                    );
+                    let _ = writeln!(out, "|---|---|---|---|---|---|");
+                    for (agent, runs, avg_in, avg_out, avg_cost, _total_in, _total_out, total_cost) in &token_rows {
+                        let _ = writeln!(
+                            out,
+                            "| {} | {} | {:.0} | {:.0} | ${:.4} | ${:.2} |",
+                            agent, runs, avg_in, avg_out, avg_cost, total_cost
+                        );
+                    }
+                    let _ = writeln!(out);
+                }
             }
 
             if out.is_empty() {
@@ -583,7 +665,8 @@ pub async fn get_learning_outcomes_handler(
             let mut sql = String::from(
                 r#"SELECT id, task_id, status, duration_secs, iterations, strategy,
                           tools_used, files_modified, error_type, error_message,
-                          workflow_architecture, created_at
+                          workflow_architecture, created_at, step_count,
+                          verification_step_count, agentic_step_count, has_ui_bridge
                    FROM learning_outcomes
                    WHERE 1=1"#,
             );
@@ -629,6 +712,10 @@ pub async fn get_learning_outcomes_handler(
                         "error_message": row.get::<_, Option<String>>(9).unwrap_or(None),
                         "workflow_architecture": row.get::<_, Option<String>>(10).unwrap_or(None),
                         "created_at": row.get::<_, String>(11).unwrap_or_default(),
+                        "step_count": row.get::<_, Option<i64>>(12).unwrap_or(None),
+                        "verification_step_count": row.get::<_, Option<i64>>(13).unwrap_or(None),
+                        "agentic_step_count": row.get::<_, Option<i64>>(14).unwrap_or(None),
+                        "has_ui_bridge": row.get::<_, Option<i32>>(15).unwrap_or(None).map(|v| v != 0),
                     }))
                 })
                 .map_err(|e| format!("Failed to query learning_outcomes: {}", e))?
@@ -820,65 +907,174 @@ pub async fn get_autoresearch_campaigns_handler(
 pub struct ReflectionFixesQuery {
     limit: Option<u32>,
     source_agent: Option<String>,
+    tier: Option<ContextTier>,
 }
 
-/// GET /meta-optimizer/reflection-fixes — returns recent reflection fixes across ALL workflows.
-/// Unlike /reflection-fixes which requires workflow_name, this returns all for meta-optimizer analysis.
+/// GET /meta-optimizer/reflection-fixes?tier=l0|l1|l2 — returns reflection fixes at requested tier.
+///
+/// - L0 (default): counts grouped by fix_type and effectiveness
+/// - L1: core fields (fix_type, fix_description, confidence, effectiveness, source_agent, created_at)
+/// - L2: full records including old_value, new_value, reasoning, etc.
 pub async fn get_reflection_fixes_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ReflectionFixesQuery>,
-) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let limit = query.limit.unwrap_or(50) as i64;
     let source_agent = query.source_agent.clone();
+    let tier = query.tier.unwrap_or_default();
 
-    let fixes = state
-        .app_state
-        .checkpoint_db
-        .with_conn(move |conn| {
-            let mut sql = String::from(
-                r#"SELECT id, source_task_run_id, fix_type, fix_description,
-                          confidence, status, effectiveness, source_agent,
-                          reasoning, created_at
-                   FROM reflection_fixes WHERE 1=1"#,
-            );
-            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            let mut idx = 1;
+    let make_err = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get reflection fixes: {}", e))),
+        )
+    };
 
-            if let Some(ref agent) = source_agent {
-                sql.push_str(&format!(" AND source_agent = ?{}", idx));
-                param_values.push(Box::new(agent.clone()));
-                idx += 1;
-            }
-            let _ = idx;
+    match tier {
+        ContextTier::L0 => {
+            let summaries = state
+                .app_state
+                .checkpoint_db
+                .with_conn(move |conn| {
+                    let mut sql = String::from(
+                        r#"SELECT fix_type,
+                                  COUNT(*) as total_count,
+                                  SUM(CASE WHEN effectiveness = 'effective' THEN 1 ELSE 0 END) as effective_count
+                           FROM reflection_fixes WHERE 1=1"#,
+                    );
+                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    let mut idx = 1;
 
-            sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
+                    if let Some(ref agent) = source_agent {
+                        sql.push_str(&format!(" AND source_agent = ?{}", idx));
+                        param_values.push(Box::new(agent.clone()));
+                        idx += 1;
+                    }
+                    let _ = idx;
 
-            let mut stmt = conn
-                .prepare(&sql)
-                .map_err(|e| format!("Query error: {}", e))?;
-            let rows: Vec<serde_json::Value> = stmt
-                .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                    Ok(serde_json::json!({
-                        "id": row.get::<_, String>(0)?,
-                        "source_task_run_id": row.get::<_, String>(1)?,
-                        "fix_type": row.get::<_, String>(2)?,
-                        "fix_description": row.get::<_, String>(3)?,
-                        "confidence": row.get::<_, String>(4)?,
-                        "status": row.get::<_, String>(5)?,
-                        "effectiveness": row.get::<_, Option<String>>(6)?,
-                        "source_agent": row.get::<_, Option<String>>(7)?,
-                        "reasoning": row.get::<_, Option<String>>(8)?,
-                        "created_at": row.get::<_, String>(9)?,
-                    }))
+                    sql.push_str(" GROUP BY fix_type ORDER BY total_count DESC");
+
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("Query error: {}", e))?;
+                    let rows: Vec<ReflectionFixSummaryL0> = stmt
+                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
+                            Ok(ReflectionFixSummaryL0 {
+                                fix_type: row.get(0)?,
+                                total_count: row.get(1)?,
+                                effective_count: row.get(2)?,
+                            })
+                        })
+                        .map_err(|e| format!("Query error: {}", e))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    Ok(rows)
                 })
-                .map_err(|e| format!("Query error: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect();
-            Ok(rows)
-        })
-        .unwrap_or_default();
+                .map_err(make_err)?;
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(summaries).unwrap_or_default(),
+            )))
+        }
+        ContextTier::L1 => {
+            let details = state
+                .app_state
+                .checkpoint_db
+                .with_conn(move |conn| {
+                    let mut sql = String::from(
+                        r#"SELECT id, fix_type, fix_description, confidence,
+                                  effectiveness, source_agent, created_at
+                           FROM reflection_fixes WHERE 1=1"#,
+                    );
+                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    let mut idx = 1;
 
-    Ok(Json(ApiResponse::success(fixes)))
+                    if let Some(ref agent) = source_agent {
+                        sql.push_str(&format!(" AND source_agent = ?{}", idx));
+                        param_values.push(Box::new(agent.clone()));
+                        idx += 1;
+                    }
+                    let _ = idx;
+
+                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
+
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("Query error: {}", e))?;
+                    let rows: Vec<ReflectionFixDetailL1> = stmt
+                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
+                            Ok(ReflectionFixDetailL1 {
+                                id: row.get(0)?,
+                                fix_type: row.get(1)?,
+                                fix_description: row.get(2)?,
+                                confidence: row.get(3)?,
+                                effectiveness: row.get(4)?,
+                                source_agent: row.get(5)?,
+                                created_at: row.get(6)?,
+                            })
+                        })
+                        .map_err(|e| format!("Query error: {}", e))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    Ok(rows)
+                })
+                .map_err(make_err)?;
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(details).unwrap_or_default(),
+            )))
+        }
+        ContextTier::L2 => {
+            // Full records (existing behavior)
+            let fixes = state
+                .app_state
+                .checkpoint_db
+                .with_conn(move |conn| {
+                    let mut sql = String::from(
+                        r#"SELECT id, source_task_run_id, fix_type, fix_description,
+                                  confidence, status, effectiveness, source_agent,
+                                  reasoning, created_at
+                           FROM reflection_fixes WHERE 1=1"#,
+                    );
+                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    let mut idx = 1;
+
+                    if let Some(ref agent) = source_agent {
+                        sql.push_str(&format!(" AND source_agent = ?{}", idx));
+                        param_values.push(Box::new(agent.clone()));
+                        idx += 1;
+                    }
+                    let _ = idx;
+
+                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
+
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("Query error: {}", e))?;
+                    let rows: Vec<serde_json::Value> = stmt
+                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
+                            Ok(serde_json::json!({
+                                "id": row.get::<_, String>(0)?,
+                                "source_task_run_id": row.get::<_, String>(1)?,
+                                "fix_type": row.get::<_, String>(2)?,
+                                "fix_description": row.get::<_, String>(3)?,
+                                "confidence": row.get::<_, String>(4)?,
+                                "status": row.get::<_, String>(5)?,
+                                "effectiveness": row.get::<_, Option<String>>(6)?,
+                                "source_agent": row.get::<_, Option<String>>(7)?,
+                                "reasoning": row.get::<_, Option<String>>(8)?,
+                                "created_at": row.get::<_, String>(9)?,
+                            }))
+                        })
+                        .map_err(|e| format!("Query error: {}", e))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    Ok(rows)
+                })
+                .unwrap_or_default();
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(fixes).unwrap_or_default(),
+            )))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

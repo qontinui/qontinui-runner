@@ -14,7 +14,7 @@ use crate::unified_workflow_executor::LoopConfig;
 pub fn build_config(execution_id: &str, workflow_name: &str) -> LoopConfig {
     LoopConfig {
         max_iterations: 3,
-        base_prompt: build_agentic_prompt(),
+        base_prompt: build_agentic_prompt(&crate::mcp::types::get_self_base_url_from_env()),
         workflow_name: workflow_name.to_string(),
         workflow_id: format!("meta-opt-prompt-{}", execution_id),
         execution_id: execution_id.to_string(),
@@ -68,22 +68,25 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
             None,
             Some("optimizer_context"),
         ),
-        // Step 1: Load per-agent trace aggregates (last 50 runs)
+        // Step 1: Load per-agent trace summaries (L0 — agent_type + count + success_pct)
         build_api_step(
-            "Load pipeline agent trace aggregates",
+            "Load pipeline agent trace summaries (L0)",
             "GET",
             &format!(
-                "{}/meta-optimizer/agent-trace-aggregates?limit=50",
+                "{}/meta-optimizer/agent-trace-aggregates?limit=50&tier=l0",
                 base_url
             ),
             None,
             Some("agent_trace_aggregates"),
         ),
-        // Step 2: Load recent reflection fixes (all workflows, for cross-workflow pattern analysis)
+        // Step 2: Load reflection fix summaries (L0 — counts by fix_type and effectiveness)
         build_api_step(
-            "Load reflection fixes by agent",
+            "Load reflection fix summaries (L0)",
             "GET",
-            &format!("{}/meta-optimizer/reflection-fixes?limit=100", base_url),
+            &format!(
+                "{}/meta-optimizer/reflection-fixes?limit=100&tier=l0",
+                base_url
+            ),
             None,
             Some("reflection_fixes"),
         ),
@@ -131,44 +134,74 @@ If the analysis concluded that all agents are performing well and no changes are
     }]
 }
 
-fn build_agentic_prompt() -> String {
-    r#"You are the Pipeline Prompt Optimizer, part of the meta-optimizer system.
+fn build_agentic_prompt(base_url: &str) -> String {
+    let prompt = r#"You are the Pipeline Prompt Optimizer, part of the meta-optimizer system.
 
 Your job is to analyze historical performance data from the multi-agent pipeline's four agents (spec_analyst, locator, implementer, verifier) and recommend improved system prompts for underperforming agents.
 
-## Data Available
+## Data Available (Tiered Context — L0 Summaries)
 
-The setup phase loaded:
+The setup phase loaded **L0 summaries** (lightweight index data) to minimize token usage:
 - `{{optimizer_context}}` — Your performance history: previous recommendations and their outcomes, current metrics vs baseline, top failure patterns, per-agent failure rates
-- `{{agent_trace_aggregates}}` — Per-agent metrics: run_count, avg_duration, avg_cost, success/failure counts
-- `{{reflection_fixes}}` — Reflection fix records showing what went wrong and which agent was responsible
+- `{{agent_trace_aggregates}}` — **L0 summary**: agent_type, run_count, success_pct (one row per agent type)
+- `{{reflection_fixes}}` — **L0 summary**: fix_type, total_count, effective_count (grouped by fix type)
 - `{{prompt_variants}}` — Current active prompt variants in the registry (may be empty if using defaults)
 - `{{prompt_analysis}}` — Historical prompt analysis insights
+
+## Drill-Down: L1/L2 Detail Endpoints
+
+If the L0 summaries reveal an agent with low success or a fix type with high count, you can drill into details using curl:
+
+**Agent Traces — L1 (core fields per trace):**
+```bash
+curl -s '{{base_url}}/meta-optimizer/agent-trace-aggregates?tier=l1&agent_type=<AGENT_TYPE>&limit=20'
+```
+Returns: id, agent_type, duration_ms, downstream_success, created_at per trace.
+
+**Agent Traces — L2 (full aggregated statistics):**
+```bash
+curl -s '{{base_url}}/meta-optimizer/agent-trace-aggregates?tier=l2&limit=50'
+```
+Returns: full aggregates with avg_duration_ms, avg_cost_usd, avg_tokens_in/out.
+
+**Reflection Fixes — L1 (core fields per fix):**
+```bash
+curl -s '{{base_url}}/meta-optimizer/reflection-fixes?tier=l1&limit=50'
+```
+Returns: id, fix_type, fix_description, confidence, effectiveness, source_agent, created_at.
+
+**Reflection Fixes — L2 (full records):**
+```bash
+curl -s '{{base_url}}/meta-optimizer/reflection-fixes?tier=l2&limit=50'
+```
+Returns: full records including reasoning, old_value, new_value.
+
+Only drill into L1/L2 when the L0 summaries show a problem worth investigating. Do NOT load L2 data for all agents — only for the 1-2 agents that need prompt changes.
 
 ## Your Task
 
 ## Prerequisites — Check Before Proceeding
 
-Before generating any recommendations, verify:
+Before generating any recommendations, verify using the L0 summaries:
 1. **Agent trace data exists.** Check {{agent_trace_aggregates}} for non-empty data. If no traces exist for an agent type, you CANNOT recommend prompt changes for it — you have no evidence of what's failing.
-2. **Sufficient sample size.** At least 10 runs per agent type are needed for meaningful analysis. If an agent has fewer than 10 traces, note this limitation and lower your confidence accordingly.
-3. **Clear failure patterns.** Reflection fixes ({{reflection_fixes}}) should show specific, recurring patterns attributable to a specific agent. Vague patterns like "runtime_error" don't justify prompt changes.
+2. **Sufficient sample size.** At least 10 runs per agent type are needed for meaningful analysis (check run_count in L0). If an agent has fewer than 10 traces, note this limitation and lower your confidence accordingly.
+3. **Clear failure patterns.** Reflection fix summaries ({{reflection_fixes}}) should show fix types with high counts attributable to a specific agent. Drill into L1 to confirm patterns before recommending changes.
 
 If these prerequisites are NOT met, produce a brief analysis explaining what data is missing and output ZERO [PROMPT_RECOMMENDATION] markers. This is the correct behavior — recommending changes without data is worse than recommending nothing.
 
-### Step 1: Analyze Agent Performance
+### Step 1: Triage with L0 Summaries
 
-For each agent type (spec_analyst, locator, implementer, verifier):
-- What is its success rate (downstream_success)?
-- What is its average cost and duration?
-- Are there patterns in reflection fixes attributed to this agent?
+Review the L0 summaries to identify which agents need investigation:
+- Which agents have low success_pct (< 70%)?
+- Which fix types have the highest counts?
+- Use L1 drill-down on the 1-2 worst-performing agents to understand failure patterns.
 
 ### Step 2: Identify Underperformers
 
 Focus on agents with:
-- Low downstream success rates (< 70%)
-- High cost relative to output quality
-- Recurring reflection fix patterns indicating prompt weakness
+- Low downstream success rates (< 70% in L0 success_pct)
+- High cost relative to output quality (drill into L2 for cost data if needed)
+- Recurring reflection fix patterns indicating prompt weakness (use L1 for fix details)
 - Patterns where the agent misunderstands its role or produces poor-quality output
 
 ### Step 3: Generate Improved Prompts
@@ -217,8 +250,8 @@ Use this to:
 - **Build on successes.** If a recommendation improved a specific agent, look for similar patterns in other agents.
 - **Respect user decisions.** If a recommendation was rejected, understand why before suggesting similar changes.
 - **Track convergence.** Compare current metrics to baseline — if things are improving, make smaller adjustments. If stagnating, try bolder changes.
-- **Don't recommend what's already applied.** Check the active prompt variants before suggesting new ones."#
-        .to_string()
+- **Don't recommend what's already applied.** Check the active prompt variants before suggesting new ones."#;
+    prompt.replace("{{base_url}}", base_url)
 }
 
 /// Helper: Build a command step that makes an HTTP request via curl.

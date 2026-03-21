@@ -35,6 +35,16 @@ impl CheckpointDb {
         let files_json = files_modified.map(|f| serde_json::to_string(f).unwrap_or_default());
         let feedback_json = feedback.map(|f| f.to_string());
 
+        // Auto-enrich error_type from error_message if not provided
+        let enriched_error_type = error_type.map(|s| s.to_string()).or_else(|| {
+            error_message
+                .filter(|msg| !msg.is_empty())
+                .map(|msg| crate::orchestrator::learning_recorder::categorize_error(msg))
+        });
+
+        // Ensure workflow_architecture is never NULL
+        let architecture = workflow_architecture.unwrap_or("traditional");
+
         conn.execute(
             r#"
             INSERT INTO learning_outcomes (
@@ -52,10 +62,10 @@ impl CheckpointDb {
                 strategy,
                 tools_json,
                 files_json,
-                error_type,
+                enriched_error_type,
                 error_message,
                 feedback_json,
-                workflow_architecture,
+                architecture,
                 now
             ],
         )
@@ -77,7 +87,8 @@ impl CheckpointDb {
                 r#"
                 SELECT id, task_id, status, duration_secs, iterations, strategy,
                        tools_used, files_modified, error_type, error_message, feedback, created_at,
-                       workflow_architecture
+                       workflow_architecture, step_count, verification_step_count,
+                       agentic_step_count, has_ui_bridge
                 FROM learning_outcomes
                 ORDER BY created_at DESC
                 LIMIT ?1
@@ -101,6 +112,10 @@ impl CheckpointDb {
                     "feedback": row.get::<_, Option<String>>(10)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     "created_at": row.get::<_, String>(11)?,
                     "workflow_architecture": row.get::<_, Option<String>>(12)?,
+                    "step_count": row.get::<_, Option<i64>>(13)?,
+                    "verification_step_count": row.get::<_, Option<i64>>(14)?,
+                    "agentic_step_count": row.get::<_, Option<i64>>(15)?,
+                    "has_ui_bridge": row.get::<_, Option<i32>>(16)?.map(|v| v != 0),
                 }))
             })
             .map_err(|e| format!("Failed to get learning outcomes: {}", e))?
@@ -213,7 +228,8 @@ impl CheckpointDb {
             r#"
             SELECT id, task_id, status, duration_secs, iterations, strategy,
                    tools_used, files_modified, error_type, error_message, feedback, created_at,
-                   workflow_architecture
+                   workflow_architecture, step_count, verification_step_count,
+                   agentic_step_count, has_ui_bridge
             FROM learning_outcomes
             {}
             ORDER BY created_at DESC
@@ -249,6 +265,10 @@ impl CheckpointDb {
                         "feedback": row.get::<_, Option<String>>(10)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                         "created_at": row.get::<_, String>(11)?,
                         "workflow_architecture": row.get::<_, Option<String>>(12)?,
+                        "step_count": row.get::<_, Option<i64>>(13)?,
+                        "verification_step_count": row.get::<_, Option<i64>>(14)?,
+                        "agentic_step_count": row.get::<_, Option<i64>>(15)?,
+                        "has_ui_bridge": row.get::<_, Option<i32>>(16)?.map(|v| v != 0),
                     }))
                 },
             )
@@ -272,7 +292,8 @@ impl CheckpointDb {
                 r#"
                 SELECT id, task_id, status, duration_secs, iterations, strategy,
                        tools_used, files_modified, error_type, error_message, feedback, created_at,
-                       workflow_architecture
+                       workflow_architecture, step_count, verification_step_count,
+                       agentic_step_count, has_ui_bridge
                 FROM learning_outcomes
                 ORDER BY created_at DESC
                 LIMIT ?1 OFFSET ?2
@@ -296,6 +317,10 @@ impl CheckpointDb {
                     "feedback": row.get::<_, Option<String>>(10)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     "created_at": row.get::<_, String>(11)?,
                     "workflow_architecture": row.get::<_, Option<String>>(12)?,
+                    "step_count": row.get::<_, Option<i64>>(13)?,
+                    "verification_step_count": row.get::<_, Option<i64>>(14)?,
+                    "agentic_step_count": row.get::<_, Option<i64>>(15)?,
+                    "has_ui_bridge": row.get::<_, Option<i32>>(16)?.map(|v| v != 0),
                 }))
             })
             .map_err(|e| format!("Failed to get learning outcomes: {}", e))?

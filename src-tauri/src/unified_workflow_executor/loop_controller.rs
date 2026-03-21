@@ -1662,6 +1662,27 @@ impl LoopController {
                         "traditional".to_string()
                     }
                 });
+            // Compute complexity indicators from stages
+            let total_step_count: usize = config.stages.iter().map(|s| {
+                s.setup_automation_steps.len()
+                    + s.setup_prompt_steps.len()
+                    + s.verification_steps.len()
+                    + s.agentic_steps.len()
+                    + s.completion_automation_steps.len()
+                    + s.completion_prompt_steps.len()
+            }).sum();
+            let total_verification_steps: usize = config.stages.iter()
+                .map(|s| s.verification_steps.len()).sum();
+            let total_agentic_steps: usize = config.stages.iter()
+                .map(|s| s.agentic_steps.len()).sum();
+            let has_ui_bridge = config.stages.iter().any(|s| {
+                s.verification_steps.iter()
+                    .chain(s.agentic_steps.iter())
+                    .chain(s.setup_automation_steps.iter())
+                    .chain(s.completion_automation_steps.iter())
+                    .any(|step| step.step_type == "ui_bridge")
+            });
+
             let outcome = crate::orchestrator::learning_recorder::WorkflowOutcome {
                 task_run_id: config.execution_id.clone(),
                 workflow_name: config.workflow_name.clone(),
@@ -1687,6 +1708,10 @@ impl LoopController {
                 error_type: None,
                 error_message: None,
                 workflow_architecture: Some(architecture),
+                step_count: Some(total_step_count as i64),
+                verification_step_count: Some(total_verification_steps as i64),
+                agentic_step_count: Some(total_agentic_steps as i64),
+                has_ui_bridge,
             };
             tokio::spawn(async move {
                 if let Err(e) = db.with_conn(|conn| {
@@ -3980,6 +4005,8 @@ impl LoopController {
             super::types::AgenticOutcome::Success {
                 output: combined_output,
                 parsed: None,
+                input_tokens: None,
+                output_tokens: None,
             }
         } else {
             super::types::AgenticOutcome::Error {

@@ -221,6 +221,42 @@ pub fn calculate_cost_breakdown(
     Some((total_cents, input_cents, output_cents))
 }
 
+/// Calculate cost in USD based on token usage and model.
+///
+/// Returns 0.0 if the model is not recognized (falls back to Sonnet pricing
+/// when tokens are non-zero to ensure cost is always estimated).
+///
+/// # Arguments
+/// * `input_tokens` - Number of input tokens consumed
+/// * `output_tokens` - Number of output tokens generated
+/// * `model_id` - Model identifier string
+///
+/// # Example
+/// ```
+/// use qontinui_runner::ai_pricing::calculate_cost_usd;
+///
+/// let cost = calculate_cost_usd(10_000, 5_000, "claude-3-5-sonnet");
+/// assert!(cost > 0.0);
+/// ```
+pub fn calculate_cost_usd(input_tokens: u64, output_tokens: u64, model_id: &str) -> f64 {
+    match calculate_cost_cents(input_tokens, output_tokens, model_id) {
+        Some(cents) => cents as f64 / 100.0,
+        None => {
+            // Fall back to manual calculation if model is unknown but tokens exist
+            if input_tokens > 0 || output_tokens > 0 {
+                // Use Sonnet pricing as a reasonable default
+                let pricing = CLAUDE_3_5_SONNET_PRICING;
+                let input_cost = (input_tokens as f64 / 1_000_000.0) * pricing.input_per_million;
+                let output_cost =
+                    (output_tokens as f64 / 1_000_000.0) * pricing.output_per_million;
+                input_cost + output_cost
+            } else {
+                0.0
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -334,5 +370,21 @@ mod tests {
         assert_eq!(input, 30);
         assert_eq!(output, 75);
         assert_eq!(total, 105);
+    }
+
+    #[test]
+    fn test_calculate_cost_usd() {
+        // Claude 3.5 Sonnet: $3/$15 per 1M tokens
+        // 1M input = $3.00, 1M output = $15.00 => $18.00
+        let cost = calculate_cost_usd(1_000_000, 1_000_000, "claude-3-5-sonnet");
+        assert!((cost - 18.0).abs() < 0.01);
+
+        // Zero tokens = zero cost
+        let cost = calculate_cost_usd(0, 0, "claude-3-5-sonnet");
+        assert_eq!(cost, 0.0);
+
+        // Unknown model with non-zero tokens falls back to Sonnet pricing
+        let cost = calculate_cost_usd(1_000_000, 0, "unknown-model");
+        assert!(cost > 0.0); // Should use Sonnet fallback pricing
     }
 }

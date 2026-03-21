@@ -10,6 +10,33 @@ use crate::step_registry::StepEventLogger;
 use super::loop_controller::LoopController;
 use super::types::{LoopConfig, LoopResult};
 
+/// Query token usage from the database for a specific execution_id and iteration.
+///
+/// Returns (input_tokens, output_tokens). Falls back to (0, 0) on error.
+fn query_iteration_tokens(
+    db: &crate::database::CheckpointDb,
+    execution_id: &str,
+    iteration: u32,
+) -> (u64, u64) {
+    match db.get_phase_token_usage(execution_id) {
+        Ok(rows) => {
+            let mut input = 0u64;
+            let mut output = 0u64;
+            for row in &rows {
+                if row.iteration == Some(iteration) {
+                    input += row.input_tokens;
+                    output += row.output_tokens;
+                }
+            }
+            (input, output)
+        }
+        Err(e) => {
+            warn!("Failed to query phase token usage: {}", e);
+            (0, 0)
+        }
+    }
+}
+
 impl LoopController {
     /// Multi-Agent Pipeline architecture: specialized agents in a DAG-structured pipeline.
     ///
@@ -251,12 +278,13 @@ impl LoopController {
         {
             let locator_start = std::time::Instant::now();
 
-            // Get the project file tree for the locator to analyze
+            // Get the L0 directory tree (directory structure only) for the locator.
+            // The locator can use tool use to list files in specific directories.
             let project_path = config
                 .project_path
                 .clone()
                 .unwrap_or_else(|| ".".to_string());
-            let file_tree = get_file_tree(&project_path);
+            let file_tree = get_file_tree_l0(&project_path);
 
             // Build the locator prompt
             let criteria_text = criteria
@@ -271,17 +299,21 @@ impl LoopController {
                 .join("\n");
 
             let mut locator_prompt = format!(
-                r#"You are a code locator agent. Given acceptance criteria and a project file tree, identify which files are most relevant to each criterion.
+                r#"You are a code locator agent. Given acceptance criteria and a project directory structure, identify which files are most relevant to each criterion.
 
 ## Acceptance Criteria
 {criteria_text}
 
-## Project Files
+## Project Directory Structure (L0 — directories only)
 {file_tree}
 
+This shows only the directory tree, not individual files. Use tool use (e.g., `ls` or `find`) to list files within directories that look relevant to the criteria. Focus on directories whose names match the domain of each criterion.
+
 ## Instructions
-For each criterion, identify 1-5 files that are most likely to need changes or inspection.
-Rate your confidence from 0.0 to 1.0 in each mapping.
+1. Review the directory structure above and identify 2-4 directories most relevant to each criterion.
+2. Use tool use to list files within those directories.
+3. For each criterion, identify 1-5 files that are most likely to need changes or inspection.
+4. Rate your confidence from 0.0 to 1.0 in each mapping.
 
 Output JSON (and nothing else):
 
@@ -392,6 +424,31 @@ Only output the JSON array, nothing else."#,
             );
 
             let locator_duration = locator_start.elapsed().as_millis() as u64;
+
+            // Query token usage recorded during the locator's run_agentic call (iteration=0).
+            // Fall back to tokens carried on AgenticOutcome when DB has no records.
+            let (mut locator_tokens_in, mut locator_tokens_out) =
+                query_iteration_tokens(&self.checkpoint_db, &config.execution_id, 0);
+            if locator_tokens_in == 0 && locator_tokens_out == 0 {
+                let (ot_in, ot_out) = locator_outcome.token_usage();
+                locator_tokens_in = ot_in.unwrap_or(0);
+                locator_tokens_out = ot_out.unwrap_or(0);
+            }
+            let locator_model = config
+                .resolve_model_for_phase("agentic")
+                .unwrap_or_else(|| "claude-cli".to_string());
+            let locator_cost = crate::ai_pricing::calculate_cost_usd(
+                locator_tokens_in,
+                locator_tokens_out,
+                &locator_model,
+            );
+            if locator_tokens_in > 0 || locator_tokens_out > 0 {
+                info!(
+                    "MULTI-AGENT-PIPELINE: Locator tokens: in={}, out={}, cost=${:.4}",
+                    locator_tokens_in, locator_tokens_out, locator_cost
+                );
+            }
+
             agent_traces.push(PipelineAgentTrace {
                 agent_type: "locator".to_string(),
                 agent_id: "locator_0".to_string(),
@@ -399,15 +456,16 @@ Only output the JSON array, nothing else."#,
                 input_snapshot: serde_json::json!({
                     "criteria_count": criteria.len(),
                     "file_tree_lines": file_tree.lines().count(),
+                    "file_tree_tier": "l0_directories",
                 }),
                 output_snapshot: serde_json::json!({
                     "located_criteria_count": parsed.len(),
                 }),
                 config: pipeline_config.locator.clone(),
                 duration_ms: locator_duration,
-                tokens_in: 0,
-                tokens_out: 0,
-                cost_usd: 0.0,
+                tokens_in: locator_tokens_in as u32,
+                tokens_out: locator_tokens_out as u32,
+                cost_usd: locator_cost,
                 downstream_success: None,
                 output_quality_score: None,
             });
@@ -426,6 +484,12 @@ Only output the JSON array, nothing else."#,
         for subtree in &dag.subtrees {
             if self.is_task_stopped(&config.execution_id) {
                 info!("MULTI-AGENT-PIPELINE: Stopped by user");
+                // Sum tokens/cost from traces collected so far
+                let stopped_total_tokens: u64 = agent_traces
+                    .iter()
+                    .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
+                    .sum();
+                let stopped_total_cost: f64 = agent_traces.iter().map(|t| t.cost_usd).sum();
                 let result = MultiAgentPipelineResult {
                     total_iterations,
                     goal_achieved: false,
@@ -437,8 +501,8 @@ Only output the JSON array, nothing else."#,
                     dag: dag.clone(),
                     total_criteria: criteria.len() as u32,
                     passed_criteria: 0,
-                    total_tokens: 0,
-                    total_cost_usd: 0.0,
+                    total_tokens: stopped_total_tokens,
+                    total_cost_usd: stopped_total_cost,
                 };
                 return result.to_loop_result();
             }
@@ -566,6 +630,34 @@ Only output the JSON array, nothing else."#,
 
                     let implementer_duration = implementer_start.elapsed().as_millis() as u64;
 
+                    // Query token usage recorded during the implementer's run_agentic call.
+                    // Fall back to tokens carried on AgenticOutcome when DB has no records
+                    // (e.g., API providers that don't call record_phase_token_usage).
+                    let (mut impl_tokens_in, mut impl_tokens_out) = query_iteration_tokens(
+                        &self.checkpoint_db,
+                        &config.execution_id,
+                        total_iterations,
+                    );
+                    if impl_tokens_in == 0 && impl_tokens_out == 0 {
+                        let (ot_in, ot_out) = agentic_outcome.token_usage();
+                        impl_tokens_in = ot_in.unwrap_or(0);
+                        impl_tokens_out = ot_out.unwrap_or(0);
+                    }
+                    let impl_model = config
+                        .resolve_model_for_phase("agentic")
+                        .unwrap_or_else(|| "claude-cli".to_string());
+                    let impl_cost = crate::ai_pricing::calculate_cost_usd(
+                        impl_tokens_in,
+                        impl_tokens_out,
+                        &impl_model,
+                    );
+                    if impl_tokens_in > 0 || impl_tokens_out > 0 {
+                        info!(
+                            "MULTI-AGENT-PIPELINE: Implementer tokens: in={}, out={}, cost=${:.4}",
+                            impl_tokens_in, impl_tokens_out, impl_cost
+                        );
+                    }
+
                     let implementer_trace = PipelineAgentTrace {
                         agent_type: "implementer".to_string(),
                         agent_id: format!("impl_{}_{}_{}", subtree.id, level_idx, level_attempt),
@@ -582,9 +674,9 @@ Only output the JSON array, nothing else."#,
                         }),
                         config: pipeline_config.implementer.clone(),
                         duration_ms: implementer_duration,
-                        tokens_in: 0,
-                        tokens_out: 0,
-                        cost_usd: 0.0,
+                        tokens_in: impl_tokens_in as u32,
+                        tokens_out: impl_tokens_out as u32,
+                        cost_usd: impl_cost,
                         downstream_success: None,
                         output_quality_score: None,
                     };
@@ -671,20 +763,34 @@ Only output the JSON array, nothing else."#,
                             canary_id,
                             is_canary_run,
                             level_passed,
-                            0.0, // cost tracked separately via token usage
+                            impl_cost,
                             (implementer_duration + verifier_duration) as f64,
                         );
                     }
 
                     info!(
-                        "MULTI-AGENT-PIPELINE: Subtree '{}' level {} attempt {} — {} (impl={}ms, verify={}ms)",
+                        "MULTI-AGENT-PIPELINE: Subtree '{}' level {} attempt {} — {} (impl={}ms, verify={}ms, tokens={}+{})",
                         subtree.id,
                         level_idx,
                         level_attempt,
                         if level_passed { "PASSED" } else { "FAILED" },
                         implementer_duration,
                         verifier_duration,
+                        impl_tokens_in,
+                        impl_tokens_out,
                     );
+
+                    // Per-iteration token budget check
+                    let running_total_tokens: u64 = agent_traces
+                        .iter()
+                        .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
+                        .sum();
+                    if running_total_tokens > config.max_context_tokens as u64 {
+                        warn!(
+                            "MULTI-AGENT-PIPELINE: Token budget warning: {} / {} tokens used after iteration {}",
+                            running_total_tokens, config.max_context_tokens, total_iterations
+                        );
+                    }
 
                     if level_passed {
                         break; // Level succeeded, move to next level
@@ -701,16 +807,42 @@ Only output the JSON array, nothing else."#,
                         break; // No more retries, move on
                     }
 
-                    // Build feedback from failed criteria for the next attempt
-                    let failed_criteria: Vec<String> = level_criterion_results
+                    // Build tiered feedback from failed criteria for the next attempt.
+                    // First retry: L0 summary (criterion IDs + pass/fail counts).
+                    // Subsequent retries: L1 with full details to give the implementer
+                    // more context about what specifically went wrong.
+                    let failed_criteria: Vec<&PipelineCriterionResult> = level_criterion_results
                         .iter()
                         .filter(|c| !c.passed)
-                        .map(|c| format!("- {} ({}): {}", c.criterion_id, c.method_used, c.details))
                         .collect();
-                    prior_failure_feedback = Some(format!(
-                        "The following criteria failed:\n{}",
-                        failed_criteria.join("\n")
-                    ));
+                    let passed_count = level_criterion_results.iter().filter(|c| c.passed).count();
+
+                    prior_failure_feedback = if retries_used == 1 {
+                        // L0: summary only — saves tokens on first retry
+                        let failed_ids: Vec<&str> = failed_criteria
+                            .iter()
+                            .map(|c| c.criterion_id.as_str())
+                            .collect();
+                        Some(format!(
+                            "{}/{} criteria failed: {}\nFix these criteria and re-run verification.",
+                            failed_criteria.len(),
+                            failed_criteria.len() + passed_count,
+                            failed_ids.join(", ")
+                        ))
+                    } else {
+                        // L1: full details — the L0 summary wasn't enough
+                        let detailed: Vec<String> = failed_criteria
+                            .iter()
+                            .map(|c| format!("- {} ({}): {}", c.criterion_id, c.method_used, c.details))
+                            .collect();
+                        Some(format!(
+                            "{}/{} criteria still failing after {} attempts. Details:\n{}",
+                            failed_criteria.len(),
+                            failed_criteria.len() + passed_count,
+                            retries_used,
+                            detailed.join("\n")
+                        ))
+                    };
 
                     info!(
                         "MULTI-AGENT-PIPELINE: Level {} failed, retrying ({}/{} retries used)",
@@ -843,6 +975,28 @@ Only output the JSON array, nothing else."#,
             trace.downstream_success = Some(goal_achieved);
         }
 
+        // Sum total tokens and cost across all agent traces
+        let total_tokens: u64 = agent_traces
+            .iter()
+            .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
+            .sum();
+        let total_cost_usd: f64 = agent_traces.iter().map(|t| t.cost_usd).sum();
+
+        if total_tokens > 0 {
+            info!(
+                "MULTI-AGENT-PIPELINE: Total tokens={}, total cost=${:.4}",
+                total_tokens, total_cost_usd
+            );
+        }
+
+        // Check token budget
+        if total_tokens > config.max_context_tokens as u64 {
+            warn!(
+                "MULTI-AGENT-PIPELINE: Token budget exceeded: {} / {} tokens used (cost=${:.4})",
+                total_tokens, config.max_context_tokens, total_cost_usd
+            );
+        }
+
         let result = MultiAgentPipelineResult {
             total_iterations,
             goal_achieved,
@@ -854,8 +1008,8 @@ Only output the JSON array, nothing else."#,
             dag,
             total_criteria: criteria.len() as u32,
             passed_criteria,
-            total_tokens: 0,
-            total_cost_usd: 0.0,
+            total_tokens,
+            total_cost_usd,
         };
 
         info!("MULTI-AGENT-PIPELINE: {}", result.summary());
@@ -899,6 +1053,49 @@ pub(super) fn get_file_tree(project_path: &str) -> String {
             if total > 500 {
                 result.push_str(&format!("\n... and {} more files (truncated)", total - 500));
             }
+            result
+        }
+        _ => {
+            format!("(Could not list files in {})", project_path)
+        }
+    }
+}
+
+/// L0 file tree: directory structure only (unique directory paths).
+/// Much smaller than the full file listing — typically 10-50x fewer lines.
+pub(super) fn get_file_tree_l0(project_path: &str) -> String {
+    let output = std::process::Command::new("git")
+        .args(["ls-files", "--others", "--cached", "--exclude-standard"])
+        .current_dir(project_path)
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let files = String::from_utf8_lossy(&out.stdout);
+            let total_files = files.lines().count();
+
+            // Extract unique directory paths including parents
+            let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for line in files.lines() {
+                if let Some(last_slash) = line.rfind('/') {
+                    let dir = &line[..last_slash];
+                    let mut current = String::new();
+                    for part in dir.split('/') {
+                        if !current.is_empty() {
+                            current.push('/');
+                        }
+                        current.push_str(part);
+                        dirs.insert(current.clone());
+                    }
+                }
+            }
+
+            let dir_count = dirs.len();
+            let mut result = dirs.into_iter().collect::<Vec<_>>().join("\n");
+            result.push_str(&format!(
+                "\n\n({} directories, {} total files)",
+                dir_count, total_files
+            ));
             result
         }
         _ => {

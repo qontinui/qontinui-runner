@@ -319,6 +319,8 @@ impl AgenticExecutor {
                             AgenticOutcome::Success {
                                 output,
                                 parsed: None,
+                                input_tokens: resp.input_tokens,
+                                output_tokens: resp.output_tokens,
                             },
                             Vec::new(),
                         );
@@ -851,6 +853,8 @@ impl AgenticExecutor {
             AgenticOutcome::Success {
                 output: result.output,
                 parsed: parsed_output,
+                input_tokens: result.input_tokens,
+                output_tokens: result.output_tokens,
             }
         } else if result.output.is_empty() {
             let error_msg = if result.error.is_empty() {
@@ -871,6 +875,8 @@ impl AgenticExecutor {
                 output: result.output,
                 error: error_msg,
                 parsed: parsed_output,
+                input_tokens: result.input_tokens,
+                output_tokens: result.output_tokens,
             }
         };
 

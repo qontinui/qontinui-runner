@@ -25,12 +25,77 @@ pub struct WorkflowOutcome {
     pub error_type: Option<String>,
     pub error_message: Option<String>,
     pub workflow_architecture: Option<String>,
+    pub step_count: Option<i64>,
+    pub verification_step_count: Option<i64>,
+    pub agentic_step_count: Option<i64>,
+    pub has_ui_bridge: bool,
+}
+
+/// Categorize an error message into a standard error type.
+///
+/// Matches patterns from meta_optimizer_api.rs top failure patterns query.
+pub fn categorize_error(msg: &str) -> String {
+    let lower = msg.to_lowercase();
+    if lower.contains("max iterations") {
+        "max_iterations_reached"
+    } else if lower.contains("max sessions") {
+        "max_sessions_reached"
+    } else if lower.contains("generation") || lower.contains("schema") {
+        "generation_error"
+    } else if lower.contains("timeout") {
+        "timeout"
+    } else {
+        "runtime_error"
+    }
+    .to_string()
+}
+
+/// Enrich a WorkflowOutcome before recording.
+///
+/// - Auto-categorizes `error_type` from `error_message` if not already set
+/// - Ensures `workflow_architecture` is never None (defaults to "traditional")
+pub fn enrich_outcome(outcome: &mut WorkflowOutcome) {
+    // Auto-categorize error_type from error_message patterns
+    if outcome.error_type.is_none() {
+        if let Some(ref msg) = outcome.error_message {
+            if !msg.is_empty() {
+                outcome.error_type = Some(categorize_error(msg));
+            }
+        }
+    }
+
+    // Ensure workflow_architecture is always set
+    if outcome.workflow_architecture.is_none() {
+        outcome.workflow_architecture = Some("traditional".to_string());
+    }
+}
+
+/// Populate complexity indicator fields from workflow steps.
+///
+/// Sets `step_count`, `verification_step_count`, `agentic_step_count`,
+/// and `has_ui_bridge` based on the provided step type strings.
+pub fn populate_complexity_indicators(
+    outcome: &mut WorkflowOutcome,
+    step_types: &[&str],
+    verification_step_types: &[&str],
+) {
+    outcome.step_count = Some(step_types.len() as i64);
+    outcome.verification_step_count = Some(verification_step_types.len() as i64);
+    outcome.agentic_step_count = Some(
+        step_types
+            .iter()
+            .filter(|s| **s == "prompt")
+            .count() as i64,
+    );
+    outcome.has_ui_bridge = step_types.iter().any(|s| *s == "ui_bridge")
+        || verification_step_types.iter().any(|s| *s == "ui_bridge");
 }
 
 /// Record a learning outcome from a completed workflow execution.
 ///
 /// Writes to the `learning_outcomes` table with execution metrics and
 /// optionally computes a context embedding for semantic retrieval.
+/// Automatically enriches error_type from error_message if not already set.
 pub fn record_learning_outcome(
     conn: &Connection,
     outcome: &WorkflowOutcome,
@@ -62,12 +127,28 @@ pub fn record_learning_outcome(
         outcome.category,
     );
 
+    // Auto-enrich error_type from error_message if not already set
+    let error_type = outcome.error_type.clone().or_else(|| {
+        outcome
+            .error_message
+            .as_ref()
+            .filter(|msg| !msg.is_empty())
+            .map(|msg| categorize_error(msg))
+    });
+
+    // Ensure workflow_architecture is never NULL — default to "traditional"
+    let architecture = outcome
+        .workflow_architecture
+        .as_deref()
+        .unwrap_or("traditional");
+
     conn.execute(
         r#"INSERT INTO learning_outcomes
             (id, task_id, status, duration_secs, iterations, strategy,
              tools_used, files_modified, error_type, error_message, feedback,
-             workflow_architecture, created_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+             workflow_architecture, step_count, verification_step_count,
+             agentic_step_count, has_ui_bridge, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"#,
         params![
             id,
             outcome.task_run_id,
@@ -77,10 +158,14 @@ pub fn record_learning_outcome(
             strategy,
             tools_json,
             files_json,
-            outcome.error_type,
+            error_type,
             outcome.error_message,
             "[]", // feedback starts empty, populated later via feedback.rs
-            outcome.workflow_architecture.as_deref(),
+            architecture,
+            outcome.step_count,
+            outcome.verification_step_count,
+            outcome.agentic_step_count,
+            outcome.has_ui_bridge as i32,
             now,
         ],
     )

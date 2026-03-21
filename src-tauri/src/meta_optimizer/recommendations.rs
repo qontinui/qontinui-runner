@@ -354,6 +354,7 @@ fn apply_rule_create(
             condition: payload.condition.clone(),
             provenance: "meta_optimizer".to_string(),
             source_fix_id: Some(rec_id.clone()),
+            severity: None,
         };
 
         let rule = crate::workflow_generation::rules::insert_rule(conn, &input)?;
@@ -380,6 +381,7 @@ fn apply_rule_update(db: &CheckpointDb, recommended_value: &str) -> Result<(), S
             condition: payload.condition,
             status: payload.status,
             rule_number: payload.rule_number,
+            severity: None,
         };
 
         let rule = crate::workflow_generation::rules::update_rule(conn, &rule_id, &input)?;
@@ -513,6 +515,7 @@ fn rollback_rule(
             condition: None,
             status: Some("disabled".to_string()),
             rule_number: None,
+            severity: None,
         };
 
         crate::workflow_generation::rules::update_rule(conn, &target_rule_id, &input)?;

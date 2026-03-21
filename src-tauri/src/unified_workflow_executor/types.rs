@@ -471,12 +471,20 @@ pub enum AgenticOutcome {
     Success {
         output: String,
         parsed: Option<super::agentic_output::AgenticPhaseOutput>,
+        /// Input tokens consumed (available for API providers only).
+        input_tokens: Option<u64>,
+        /// Output tokens generated (available for API providers only).
+        output_tokens: Option<u64>,
     },
     /// AI ran but reported failure
     Failed {
         output: String,
         error: String,
         parsed: Option<super::agentic_output::AgenticPhaseOutput>,
+        /// Input tokens consumed (available for API providers only).
+        input_tokens: Option<u64>,
+        /// Output tokens generated (available for API providers only).
+        output_tokens: Option<u64>,
     },
     /// AI execution errored out
     Error { error: String },
@@ -495,6 +503,23 @@ impl AgenticOutcome {
             AgenticOutcome::Failed { output, .. } => Some(output),
             AgenticOutcome::Error { error } => Some(error),
             AgenticOutcome::Skipped => None,
+        }
+    }
+
+    /// Get the token usage from the AI session, if available.
+    pub fn token_usage(&self) -> (Option<u64>, Option<u64>) {
+        match self {
+            AgenticOutcome::Success {
+                input_tokens,
+                output_tokens,
+                ..
+            }
+            | AgenticOutcome::Failed {
+                input_tokens,
+                output_tokens,
+                ..
+            } => (*input_tokens, *output_tokens),
+            AgenticOutcome::Error { .. } | AgenticOutcome::Skipped => (None, None),
         }
     }
 

@@ -115,6 +115,62 @@ impl std::fmt::Display for OptimizerType {
     }
 }
 
+/// Tiered context loading level.
+///
+/// L0 = one-line summaries (index), L1 = core fields for planning,
+/// L2 = full records with all fields (existing behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextTier {
+    #[default]
+    L0,
+    L1,
+    L2,
+}
+
+/// L0 summary of agent trace aggregates: agent_type + count + success percentage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TraceSummaryL0 {
+    pub agent_type: String,
+    pub run_count: i64,
+    pub success_pct: f64,
+}
+
+/// L1 detail of a single agent trace: core fields without snapshots/config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TraceDetailL1 {
+    pub id: String,
+    pub agent_type: String,
+    pub duration_ms: i64,
+    pub downstream_success: Option<bool>,
+    pub created_at: String,
+}
+
+/// L0 summary of reflection fixes: counts grouped by fix_type and effectiveness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ReflectionFixSummaryL0 {
+    pub fix_type: String,
+    pub total_count: i64,
+    pub effective_count: i64,
+}
+
+/// L1 detail of a reflection fix: core fields without old_value, new_value,
+/// file_changed, reasoning, embeddings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ReflectionFixDetailL1 {
+    pub id: String,
+    pub fix_type: String,
+    pub fix_description: String,
+    pub confidence: String,
+    pub effectiveness: Option<String>,
+    pub source_agent: Option<String>,
+    pub created_at: String,
+}
+
 /// A recommendation produced by a meta-optimizer run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recommendation {

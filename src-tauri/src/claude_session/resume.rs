@@ -144,30 +144,78 @@ pub fn build_replay_prompt(turns: &[ConversationTurn], max_chars: Option<usize>)
         return format_replay_prompt(&full_history, turns);
     }
 
-    // Truncate: always keep the first turn, then as many recent turns as fit
-    let first_turn = &formatted_turns[0];
-    let mut budget = limit.saturating_sub(first_turn.len() + 50); // 50 chars for separator
-    let mut included_from_end = Vec::new();
+    // Importance-weighted truncation: score each turn, keep highest-value ones
+    // within budget. Always keeps first and last turns.
+    let total_turns = formatted_turns.len();
+    let scored: Vec<(usize, f64)> = turns
+        .iter()
+        .enumerate()
+        .map(|(i, turn)| {
+            let mut score: f64 = 0.0;
 
-    for turn in formatted_turns[1..].iter().rev() {
-        if turn.len() + 1 > budget {
-            break;
+            // First and last turns always kept
+            if i == 0 || i == total_turns - 1 {
+                score += 100.0;
+            }
+
+            // Messages with errors/failures are important context
+            let content_lower = turn.content.to_lowercase();
+            if content_lower.contains("error") || content_lower.contains("failed") || content_lower.contains("panic") {
+                score += 5.0;
+            }
+
+            // Messages with file modifications are important
+            if content_lower.contains("edit") || content_lower.contains("write") || content_lower.contains("modified") {
+                score += 3.0;
+            }
+
+            // Messages with verification results carry high signal
+            if content_lower.contains("verification") || content_lower.contains("verdict") || content_lower.contains("confidence") {
+                score += 4.0;
+            }
+
+            // Recent messages are more important (exponential recency weight)
+            let recency = (i as f64) / (total_turns as f64);
+            score += recency * 10.0;
+
+            (i, score)
+        })
+        .collect();
+
+    // Sort by score descending, greedily select turns within budget
+    let mut scored_sorted = scored.clone();
+    scored_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let separator = "\n\n[... earlier conversation truncated ...]\n\n";
+    let mut budget = limit.saturating_sub(separator.len());
+    let mut selected_indices: Vec<usize> = Vec::new();
+
+    for (idx, _score) in &scored_sorted {
+        let turn_len = formatted_turns[*idx].len() + 1; // +1 for newline
+        if turn_len <= budget {
+            budget -= turn_len;
+            selected_indices.push(*idx);
         }
-        budget -= turn.len() + 1; // +1 for newline
-        included_from_end.push(turn.as_str());
     }
-    included_from_end.reverse();
 
-    let truncated_history = if included_from_end.is_empty() {
-        first_turn.clone()
-    } else {
-        format!(
-            "{}\n\n[... earlier conversation truncated ...]\n\n{}",
-            first_turn,
-            included_from_end.join("\n")
-        )
-    };
+    // Sort selected indices to preserve conversation order
+    selected_indices.sort();
 
+    // Build truncated history, inserting gap markers where turns were skipped
+    let mut parts: Vec<String> = Vec::new();
+    let mut last_included = None;
+    for &idx in &selected_indices {
+        if let Some(last) = last_included {
+            if idx > last + 1 {
+                // Gap — insert truncation marker
+                parts.push("[... conversation truncated ...]".to_string());
+            }
+        }
+        parts.push(formatted_turns[idx].clone());
+        last_included = Some(idx);
+    }
+
+    let truncated_history = parts.join("\n");
     format_replay_prompt(&truncated_history, turns)
 }
 

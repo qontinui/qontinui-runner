@@ -780,6 +780,10 @@ fn record_learning(
                     .unwrap_or_else(|| format!("{:?}", a).to_lowercase())
             })
             .or_else(|| Some("traditional".to_string())),
+        step_count: None,
+        verification_step_count: None,
+        agentic_step_count: None,
+        has_ui_bridge: false,
     };
 
     if let Err(e) =

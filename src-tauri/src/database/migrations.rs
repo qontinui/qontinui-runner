@@ -4936,6 +4936,148 @@ impl CheckpointDb {
             info!("Successfully migrated to version 125 (spec_versions)");
         }
 
+        // --- Migration 126: Backfill workflow_architecture + complexity indicator columns ---
+        if current_version < 126 {
+            info!("Migrating to version 126 (backfill workflow_architecture, complexity columns)...");
+
+            // Check which columns already exist (schema.sql may have added them for fresh DBs)
+            let existing_columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(learning_outcomes)")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(1))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default();
+
+            // Backfill NULL workflow_architecture to 'traditional'.
+            // task_runs does not have config_json, so we cannot infer architecture from stored config.
+            // All historical NULL records are from the traditional execution path.
+            conn.execute_batch(
+                r#"
+                UPDATE learning_outcomes
+                SET workflow_architecture = 'traditional'
+                WHERE workflow_architecture IS NULL;
+                "#,
+            )
+            .map_err(|e| format!("Failed to backfill workflow_architecture: {}", e))?;
+
+            // Backfill error_type from error_message patterns for existing records
+            conn.execute_batch(
+                r#"
+                UPDATE learning_outcomes
+                SET error_type = CASE
+                    WHEN error_message LIKE '%max iterations%' OR error_message LIKE '%Max iterations%'
+                        THEN 'max_iterations_reached'
+                    WHEN error_message LIKE '%Max sessions%' OR error_message LIKE '%max sessions%'
+                        THEN 'max_sessions_reached'
+                    WHEN error_message LIKE '%generation%' OR error_message LIKE '%schema%'
+                        THEN 'generation_error'
+                    WHEN error_message LIKE '%timeout%' OR error_message LIKE '%Timeout%'
+                        THEN 'timeout'
+                    ELSE 'runtime_error'
+                END
+                WHERE error_type IS NULL AND error_message IS NOT NULL AND error_message != '';
+                "#,
+            )
+            .map_err(|e| format!("Failed to backfill error_type: {}", e))?;
+
+            // Add complexity indicator columns
+            if !existing_columns.contains(&"step_count".to_string()) {
+                conn.execute_batch(
+                    "ALTER TABLE learning_outcomes ADD COLUMN step_count INTEGER;",
+                )
+                .map_err(|e| format!("Failed to add step_count column: {}", e))?;
+            }
+
+            if !existing_columns.contains(&"verification_step_count".to_string()) {
+                conn.execute_batch(
+                    "ALTER TABLE learning_outcomes ADD COLUMN verification_step_count INTEGER;",
+                )
+                .map_err(|e| format!("Failed to add verification_step_count column: {}", e))?;
+            }
+
+            if !existing_columns.contains(&"agentic_step_count".to_string()) {
+                conn.execute_batch(
+                    "ALTER TABLE learning_outcomes ADD COLUMN agentic_step_count INTEGER;",
+                )
+                .map_err(|e| format!("Failed to add agentic_step_count column: {}", e))?;
+            }
+
+            if !existing_columns.contains(&"has_ui_bridge".to_string()) {
+                conn.execute_batch(
+                    "ALTER TABLE learning_outcomes ADD COLUMN has_ui_bridge INTEGER DEFAULT 0;",
+                )
+                .map_err(|e| format!("Failed to add has_ui_bridge column: {}", e))?;
+            }
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (126, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 126: {}", e))?;
+
+            info!("Successfully migrated to version 126 (backfill workflow_architecture, complexity columns)");
+        }
+
+        // --- Migration 127: Progressive rule loading columns ---
+        if current_version < 127 {
+            info!("Migrating to version 127 (generation_rules severity + failure_count)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE generation_rules ADD COLUMN severity TEXT NOT NULL DEFAULT 'normal';
+                ALTER TABLE generation_rules ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;
+                CREATE INDEX IF NOT EXISTS idx_generation_rules_severity ON generation_rules(severity);
+
+                -- Set severity='critical' for rules about: valid step types, JSON output, valid UUID, deterministic verification
+                UPDATE generation_rules SET severity = 'critical'
+                    WHERE status = 'active' AND (
+                        title LIKE '%Only 3 step types%'
+                        OR title LIKE '%step types exist%'
+                        OR title LIKE '%JSON only%'
+                        OR title LIKE '%valid UUID%'
+                        OR title LIKE '%Generate valid UUID%'
+                        OR title LIKE '%Deterministic verification%'
+                        OR title LIKE '%deterministic%automated step%'
+                        OR title LIKE '%command step MUST include a mode%'
+                    );
+
+                -- Set severity='important' for rules about: typecheck, SDK content, test_type usage
+                UPDATE generation_rules SET severity = 'important'
+                    WHERE status = 'active' AND severity = 'normal' AND (
+                        title LIKE '%typecheck%'
+                        OR title LIKE '%Code modification requires%'
+                        OR title LIKE '%SDK%'
+                        OR title LIKE '%Web app verification%'
+                        OR title LIKE '%test_type%'
+                        OR title LIKE '%Test steps with inline%'
+                        OR title LIKE '%Retry format%'
+                        OR title LIKE '%Data flow references%'
+                    );
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (127, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 127: {}", e))?;
+
+            info!("Successfully migrated to version 127 (generation_rules severity + failure_count)");
+        }
+
+        // --- Migration 128: Cross-iteration context compression column ---
+        if current_version < 128 {
+            info!("Migrating to version 128 (iteration_history column on task_runs)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE task_runs ADD COLUMN iteration_history TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (128, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 128: {}", e))?;
+
+            info!("Successfully migrated to version 128 (iteration_history)");
+        }
+
         // Repair migration: is_favorite column may be missing on databases created from
         // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
         // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,

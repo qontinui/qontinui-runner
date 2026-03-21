@@ -1034,6 +1034,20 @@ pub fn generate_workflow(
                 generation_provider,
             ) {
                 Ok(fixed) => {
+                    // Track which rules were violated by these issues.
+                    // increment_rule_failure_count auto-promotes to 'critical'
+                    // once failure_count reaches 5.
+                    if let Some(c) = conn {
+                        let issues_text = issues.join(" ");
+                        let violated_ids =
+                            rules::identify_violated_rules(c, &issues_text, "schema_context");
+                        for rule_id in &violated_ids {
+                            if let Err(e) = rules::increment_rule_failure_count(c, rule_id) {
+                                warn!("Failed to increment failure_count: {}", e);
+                            }
+                        }
+                    }
+
                     iterations.push(VerificationIteration {
                         iteration: iter_num,
                         issues,
@@ -1064,6 +1078,13 @@ pub fn generate_workflow(
     artifact_builder.verification_duration_ms =
         Some(verification_start.elapsed().as_millis() as u64);
     artifact_builder.verification_iterations = serde_json::to_value(&iterations).ok();
+
+    // ── Sync known issues → generation rules (idempotent) ─────────────
+    if let Some(c) = conn {
+        if let Err(e) = rules::sync_rules_from_known_issues(c) {
+            warn!("Failed to sync rules from known issues: {}", e);
+        }
+    }
 
     // ── Hardener Agent ───────────────────────────────────────────────────
     let hardener_start = Instant::now();
@@ -1446,6 +1467,7 @@ pub fn generate_workflow(
                 section: None,
                 status: Some("active".to_string()),
                 provenance: None,
+                severity: None,
             },
         );
         if let Ok(active) = active_rules {

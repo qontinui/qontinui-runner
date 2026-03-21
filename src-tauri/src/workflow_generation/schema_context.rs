@@ -206,6 +206,9 @@ fn assemble_prompt(
         format!("## Examples\n\n{}", examples)
     };
 
+    // Build gotchas section (compact, high-signal warnings injected before rules)
+    let gotchas_section = build_gotchas_section(conn);
+
     // Build rules from DB if available, otherwise use hardcoded fallback
     let rules_section = build_rules_section(conn);
 
@@ -327,6 +330,7 @@ Steps can pass data to each other using `inputs` and `extract`:
 
 {examples_section}
 
+{gotchas_section}
 {rules_section}
 {confidence_section}
 ## Environment Aliases
@@ -679,10 +683,71 @@ fn build_generation_confidence(conn: &Connection) -> String {
     String::new()
 }
 
-fn build_rules_section(conn: Option<&Connection>) -> String {
+/// Build a compact CRITICAL GOTCHAS section that highlights the most common
+/// failure-causing constraints. This section is always injected before
+/// regular rules and kept under ~500 tokens for maximum signal density.
+///
+/// Includes:
+/// - 3 static gotchas (step types, test_type, SDK grep)
+/// - Dynamic gotchas from rules with severity='critical' and failure_count > 0
+pub fn build_gotchas_section(conn: Option<&Connection>) -> String {
+    let mut gotchas = String::from(
+        "## CRITICAL GOTCHAS (violating these causes immediate failure)\n\n",
+    );
+
+    // Static gotchas — the top 3 failure causes from analysis
+    gotchas.push_str("1. ONLY valid step types: `command`, `ui_bridge`, `prompt`. NO `check`, `test`, `api_request`, `shell_command`, `gate`, `spec`.\n");
+    gotchas.push_str("2. `test_type: \"playwright\"` is ONLY for Playwright code assertions, NOT shell commands. Use `test_type: \"repository\"` for shell-based tests.\n");
+    gotchas.push_str("3. SDK verification MUST include `grep` or `python -c` assertion on response body — a 200 status alone is insufficient.\n");
+
+    // Dynamic gotchas from DB (rules with high failure_count)
+    let mut next_num = 4;
     if let Some(conn) = conn {
-        let important = rules::load_rules(conn, "schema_context", "important_rules");
-        let quality = rules::load_rules(conn, "schema_context", "verification_quality");
+        let critical_rules =
+            rules::load_rules_progressive(conn, "schema_context", "important_rules", rules::RuleTier::Critical);
+        let quality_rules =
+            rules::load_rules_progressive(conn, "schema_context", "verification_quality", rules::RuleTier::Critical);
+
+        for rule in critical_rules.iter().chain(quality_rules.iter()) {
+            if rule.failure_count > 0 && next_num <= 6 {
+                // Keep it compact — title only, no full content
+                gotchas.push_str(&format!(
+                    "{}. {} (failed {} times)\n",
+                    next_num, rule.title, rule.failure_count
+                ));
+                next_num += 1;
+            }
+        }
+    }
+
+    gotchas.push('\n');
+    gotchas
+}
+
+fn build_rules_section(conn: Option<&Connection>) -> String {
+    build_rules_section_for_tier(conn, rules::RuleTier::Full)
+}
+
+/// Build rules section with progressive loading support.
+/// For initial generation, use `RuleTier::Important` (critical + important only).
+/// For fixer iterations, use `RuleTier::Full` (all rules).
+pub fn build_rules_section_for_tier(
+    conn: Option<&Connection>,
+    tier: rules::RuleTier,
+) -> String {
+    if let Some(conn) = conn {
+        let important = rules::load_rules_progressive(
+            conn,
+            "schema_context",
+            "important_rules",
+            tier,
+        );
+        let quality = rules::load_rules_progressive(
+            conn,
+            "schema_context",
+            "verification_quality",
+            tier,
+        );
 
         // Only use DB rules if we actually got results (table might not be seeded yet)
         if !important.is_empty() || !quality.is_empty() {

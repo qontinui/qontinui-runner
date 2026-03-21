@@ -12,6 +12,207 @@ use super::health_monitor::fetch_verifier_ui_context;
 use super::loop_controller::LoopController;
 use super::types::{AgenticOutcome, LoopConfig, LoopResult};
 
+// =============================================================================
+// Iteration History — compressed cross-iteration context for agentic loops
+// =============================================================================
+
+/// Summary of a single iteration's approach and outcome.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct IterationSummary {
+    /// Iteration number (or range label for merged entries).
+    iteration: String,
+    /// What was tried (truncated to ~100 chars).
+    approach: String,
+    /// What happened (truncated to ~100 chars).
+    result: String,
+    /// Files that were touched during this iteration.
+    files_touched: Vec<String>,
+    /// Change in confidence from previous iteration.
+    confidence_delta: f64,
+}
+
+/// Accumulates compressed history across iterations.
+///
+/// Inspired by bytedance/deer-flow: summarize completed sub-tasks into compressed
+/// context so the worker agent knows what was already tried without token bloat.
+/// Grows logarithmically by merging oldest entries when over budget.
+struct IterationHistory {
+    entries: Vec<IterationSummary>,
+    max_total_chars: usize,
+}
+
+impl IterationHistory {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            max_total_chars: 4000,
+        }
+    }
+
+    fn add(&mut self, summary: IterationSummary) {
+        self.entries.push(summary);
+        self.compress_if_needed();
+    }
+
+    /// Total estimated character count across all entries.
+    fn total_chars(&self) -> usize {
+        self.entries.iter().map(|e| {
+            e.approach.len() + e.result.len() + e.iteration.len()
+                + e.files_touched.iter().map(|f| f.len() + 2).sum::<usize>()
+                + 40 // formatting overhead per entry
+        }).sum()
+    }
+
+    /// Merge oldest two entries into one when over budget, preserving at least 3 entries.
+    fn compress_if_needed(&mut self) {
+        while self.total_chars() > self.max_total_chars && self.entries.len() > 3 {
+            let second = self.entries.remove(1);
+            let first = &mut self.entries[0];
+
+            // Merge iteration labels
+            let merged_label = if first.iteration.contains('-') {
+                // Already a range like "1-2", extend it
+                let prefix = first.iteration.split('-').next().unwrap_or("?");
+                format!("{}-{}", prefix, second.iteration)
+            } else {
+                format!("{}-{}", first.iteration, second.iteration)
+            };
+
+            // Merge approaches (truncate combined to ~100 chars)
+            let merged_approach = format!("{} | {}", first.approach, second.approach);
+            let merged_approach = if merged_approach.len() > 100 {
+                format!("{}...", &merged_approach[..97])
+            } else {
+                merged_approach
+            };
+
+            // Merge results
+            let merged_result = format!("{} | {}", first.result, second.result);
+            let merged_result = if merged_result.len() > 100 {
+                format!("{}...", &merged_result[..97])
+            } else {
+                merged_result
+            };
+
+            // Merge files (deduplicated)
+            let mut merged_files = first.files_touched.clone();
+            for f in &second.files_touched {
+                if !merged_files.contains(f) {
+                    merged_files.push(f.clone());
+                }
+            }
+
+            first.iteration = merged_label;
+            first.approach = merged_approach;
+            first.result = merged_result;
+            first.files_touched = merged_files;
+            first.confidence_delta += second.confidence_delta;
+        }
+    }
+
+    /// Format as compact history for injection into the worker agent prompt.
+    fn to_context_string(&self) -> String {
+        if self.entries.is_empty() {
+            return String::new();
+        }
+
+        let mut ctx = String::from("## Previous Attempts\n");
+        for entry in &self.entries {
+            ctx.push_str(&format!(
+                "- Iter {}: {} → {} (confidence: {:+.1})\n",
+                entry.iteration, entry.approach, entry.result, entry.confidence_delta
+            ));
+            if !entry.files_touched.is_empty() {
+                ctx.push_str(&format!("  Files: {}\n", entry.files_touched.join(", ")));
+            }
+        }
+        ctx
+    }
+
+    /// Serialize entries to JSON for database persistence.
+    fn to_json(&self) -> String {
+        serde_json::to_string(&self.entries).unwrap_or_else(|_| "[]".to_string())
+    }
+}
+
+/// Extract an IterationSummary from a worker's output and the verification verdict.
+fn extract_iteration_summary(
+    iteration: u32,
+    worker_summary: Option<&str>,
+    verdict: &crate::autoresearch::agentic_verification::VerificationVerdict,
+    prev_confidence: f64,
+) -> IterationSummary {
+    // Extract approach: first two lines of worker summary, truncated to 100 chars
+    let approach = match worker_summary {
+        Some(s) => {
+            let condensed: String = s.lines().take(2).collect::<Vec<_>>().join(" ");
+            if condensed.len() > 100 {
+                format!("{}...", &condensed[..97])
+            } else {
+                condensed
+            }
+        }
+        None => "(no worker ran)".to_string(),
+    };
+
+    // Extract result from verdict
+    let obs_truncated: String = verdict.observations.chars().take(80).collect();
+    let result = format!("{}: {}", verdict.status, obs_truncated);
+
+    // Extract file paths from worker output
+    let files_touched = worker_summary
+        .map(extract_file_paths)
+        .unwrap_or_default();
+
+    IterationSummary {
+        iteration: iteration.to_string(),
+        approach,
+        result,
+        files_touched,
+        confidence_delta: verdict.confidence - prev_confidence,
+    }
+}
+
+/// Extract file paths from text by looking for common path patterns.
+fn extract_file_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for word in text.split_whitespace() {
+        let cleaned = word.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == ',');
+        // Match patterns like src/foo/bar.rs, ./components/App.tsx, etc.
+        if (cleaned.contains('/') || cleaned.contains('\\'))
+            && cleaned.contains('.')
+            && cleaned.len() > 4
+            && cleaned.len() < 200
+            && !cleaned.starts_with("http")
+            && !cleaned.starts_with("//")
+        {
+            // Normalize to forward slashes and take just the filename portion if too long
+            let normalized = cleaned.replace('\\', "/");
+            let path = if normalized.len() > 60 {
+                // Keep just the last path segments
+                normalized
+                    .rsplit('/')
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("/")
+            } else {
+                normalized
+            };
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        // Cap at 10 files to prevent bloat
+        if paths.len() >= 10 {
+            break;
+        }
+    }
+    paths
+}
+
 impl LoopController {
     // =========================================================================
     // Agentic Verification Loop — alternative architecture
@@ -60,6 +261,8 @@ impl LoopController {
         let mut iteration_results: Vec<AgenticVerificationIterationResult> = Vec::new();
         let mut consecutive_passes: u32 = 0;
         let mut iteration: u32 = 0;
+        let mut iteration_history = IterationHistory::new();
+        let mut prev_confidence: f64 = 0.0;
 
         // Save original model/provider overrides so we can restore after each iteration
         let original_model_override = config.model_override.clone();
@@ -88,6 +291,7 @@ impl LoopController {
                     .await
                     .on_agentic_verification_exit(&av_result)
                     .await;
+                self.persist_iteration_history(&config.execution_id, &iteration_history);
                 return av_result.to_loop_result();
             }
 
@@ -111,6 +315,7 @@ impl LoopController {
                     .await
                     .on_agentic_verification_exit(&av_result)
                     .await;
+                self.persist_iteration_history(&config.execution_id, &iteration_history);
                 return av_result.to_loop_result();
             }
 
@@ -151,6 +356,12 @@ impl LoopController {
                         last_result.iteration,
                         last_result.worker_summary.as_deref().unwrap_or("(none)"),
                     ));
+                }
+
+                // Include compressed iteration history for verifier awareness
+                let history_ctx = iteration_history.to_context_string();
+                if !history_ctx.is_empty() {
+                    verifier_context.push_str(&format!("\n\n{}", history_ctx));
                 }
 
                 // Fetch live UI Bridge data for the verifier
@@ -314,6 +525,7 @@ impl LoopController {
                             .await
                             .on_agentic_verification_exit(&av_result)
                             .await;
+                        self.persist_iteration_history(&config.execution_id, &iteration_history);
                         return av_result.to_loop_result();
                     }
                 } else {
@@ -359,6 +571,7 @@ impl LoopController {
                         .await
                         .on_agentic_verification_exit(&av_result)
                         .await;
+                    self.persist_iteration_history(&config.execution_id, &iteration_history);
                     return av_result.to_loop_result();
                 }
             }
@@ -386,7 +599,7 @@ impl LoopController {
                 .or_else(|| original_provider_override.clone());
 
             // Build worker context from the verification verdict
-            let worker_failure_context = if let Some((ref v, _)) = verdict {
+            let mut worker_failure_context = if let Some((ref v, _)) = verdict {
                 AgenticVerificationPrompts::worker_context_from_verdict(
                     &goal,
                     v,
@@ -400,6 +613,15 @@ impl LoopController {
                     goal
                 )
             };
+
+            // Inject compressed iteration history so the worker knows what was already tried
+            let history_context = iteration_history.to_context_string();
+            if !history_context.is_empty() {
+                worker_failure_context.push_str(&format!(
+                    "\n\n{}\nIMPORTANT: Do NOT repeat approaches that already failed (see Previous Attempts above).\n",
+                    history_context
+                ));
+            }
 
             let (worker_outcome, _injected_steps) = self
                 .agentic_executor
@@ -459,6 +681,17 @@ impl LoopController {
                 verifier_duration_ms: verdict.as_ref().map(|(_, d)| *d).unwrap_or(0),
                 worker_duration_ms: worker_duration,
             };
+            // Build compressed iteration summary for cross-iteration context
+            {
+                let summary = extract_iteration_summary(
+                    iteration,
+                    iter_result.worker_summary.as_deref(),
+                    &iter_result.verdict,
+                    prev_confidence,
+                );
+                prev_confidence = iter_result.verdict.confidence;
+                iteration_history.add(summary);
+            }
             iteration_results.push(iter_result);
 
             // Canvas: emit iteration panel and update tracker
@@ -489,6 +722,23 @@ impl LoopController {
             ) {
                 warn!("Failed to increment session count: {}", e);
             }
+        }
+    }
+
+    /// Persist iteration history to the database for post-analysis by the meta-optimizer.
+    fn persist_iteration_history(&self, execution_id: &str, history: &IterationHistory) {
+        if history.entries.is_empty() {
+            return;
+        }
+        let history_json = history.to_json();
+        if let Err(e) = self
+            .checkpoint_db
+            .update_task_run_iteration_history(execution_id, &history_json)
+        {
+            warn!(
+                "Failed to persist iteration history for {}: {}",
+                execution_id, e
+            );
         }
     }
 }
