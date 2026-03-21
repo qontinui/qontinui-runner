@@ -8,7 +8,6 @@
 
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::display::RawEvent;
@@ -57,7 +56,7 @@ impl StepExecutor {
             test_name = %script_id
         )
     )]
-    async fn run_playwright_script(
+    pub(crate) async fn run_playwright_script(
         &self,
         script_id: &str,
     ) -> (bool, Option<String>, Option<String>) {
@@ -115,7 +114,7 @@ impl StepExecutor {
             target_url = ?target_url
         )
     )]
-    async fn run_playwright_inline(
+    pub(crate) async fn run_playwright_inline(
         &self,
         content: &str,
         target_url: Option<&str>,
@@ -144,7 +143,7 @@ impl StepExecutor {
     /// Execute a verification test by ID and return simplified (success, error) tuple
     ///
     /// This is the legacy interface used by execute_single_step.
-    async fn execute_verification_test(
+    pub(crate) async fn execute_verification_test(
         &self,
         test_id: &str,
         is_critical: bool,
@@ -193,7 +192,7 @@ impl StepExecutor {
     /// Execute a verification test by ID and return the full TestExecutionResult
     ///
     /// This provides rich details for verification phase context building.
-    async fn execute_verification_test_with_details(
+    pub(crate) async fn execute_verification_test_with_details(
         &self,
         test_id: &str,
     ) -> Result<crate::test_executor::TestExecutionResult, String> {
@@ -260,7 +259,7 @@ impl StepExecutor {
     /// error patterns (ERROR, Exception, Traceback, etc.). Returns success
     /// with any detected errors in the output string. The log_watch step is
     /// typically non-critical (required=false), so errors are informational.
-    async fn execute_log_watch_step(
+    pub(crate) async fn execute_log_watch_step(
         &self,
         _step: &ExecutionStepConfig,
     ) -> (bool, Option<String>, Option<String>) {
@@ -401,14 +400,14 @@ impl StepExecutor {
     ///
     /// Check if a command uses bash/Unix syntax that cmd.exe cannot handle.
     /// Delegates to `ShellCommandHandler::is_bash_command()`.
-    fn is_bash_command(command: &str) -> bool {
+    pub(crate) fn is_bash_command(command: &str) -> bool {
         super::handlers::shell_command::ShellCommandHandler::is_bash_command(command)
     }
 
     /// Supports variable expansion using `{{variable_name}}` syntax in the command.
     /// Variables are resolved from the runtime context.
     /// timeout_secs: None = no timeout (disabled by default), Some(n) = timeout after n seconds
-    async fn execute_shell_command_step(
+    pub(crate) async fn execute_shell_command_step(
         &self,
         step: &ExecutionStepConfig,
         timeout_secs: Option<u64>,
@@ -861,7 +860,7 @@ impl StepExecutor {
 
     /// Execute a code quality check step
     /// timeout_secs: None = no timeout (disabled by default), Some(n) = timeout after n seconds
-    async fn execute_check_step(
+    pub(crate) async fn execute_check_step(
         &self,
         step: &ExecutionStepConfig,
         timeout_secs: Option<u64>,
@@ -1462,7 +1461,7 @@ impl StepExecutor {
     /// Makes an HTTP GET request to the specified URL and verifies the status code
     /// matches the expected value. Useful for health checks before running tests.
     /// timeout_secs: None = no timeout (disabled by default), Some(n) = timeout after n seconds
-    async fn execute_http_status_check(
+    pub(crate) async fn execute_http_status_check(
         &self,
         step: &ExecutionStepConfig,
         step_name: &str,
@@ -1681,7 +1680,7 @@ impl StepExecutor {
     /// Execute all checks in a check group
     /// Returns: (success, error_message, summary_text, individual_check_results)
     /// timeout_secs: None = no timeout (disabled by default), Some(n) = timeout after n seconds
-    async fn execute_check_group_step(
+    pub(crate) async fn execute_check_group_step(
         &self,
         step: &ExecutionStepConfig,
         _timeout_secs: Option<u64>,

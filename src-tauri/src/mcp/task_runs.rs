@@ -3549,7 +3549,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/task-runs/{id}/output", get(get_task_output))
         .route("/task-runs/{id}/workflow-state", get(get_workflow_state))
         .route("/task-runs/{id}/result-data", get(get_task_run_result_data))
-        .route("/task-runs/{id}/orchestrator-state", get(get_workflow_state)) // Alias for backward compatibility
+        .route(
+            "/task-runs/{id}/orchestrator-state",
+            get(get_workflow_state),
+        ) // Alias for backward compatibility
         .route("/task-runs/{id}/full-state", get(get_full_workflow_state)) // Full state for restart recovery
         .route("/task-runs/{id}/stop", post(stop_task_run))
         .route("/task-runs/{id}/pause", post(pause_task_run))

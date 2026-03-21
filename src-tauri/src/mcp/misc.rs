@@ -2864,7 +2864,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
     axum::Router::new()
         .route("/bridges", get(list_bridges).post(create_bridge))
-        .route("/bridges/{bridge_id}", get(get_bridge).delete(remove_bridge))
+        .route(
+            "/bridges/{bridge_id}",
+            get(get_bridge).delete(remove_bridge),
+        )
         .route("/bridges/{bridge_id}/workflow", post(run_bridge_workflow))
         .route("/gui-lock", get(get_gui_lock))
         .route(

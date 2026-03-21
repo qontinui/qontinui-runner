@@ -41,16 +41,14 @@ use crate::executor::file_logger::FileLogger;
 use crate::iteration_bundle::{
     parse_action_events, parse_image_recognition_events, RelevantLogSources,
 };
-use crate::orchestrator::context_propagation::{
-    ExpressionEvaluator, RuntimeContext, SharedVariableStore,
-};
+use crate::orchestrator::context_propagation::{RuntimeContext, SharedVariableStore};
 use crate::str_utils::truncate_str;
 use crate::unified_workflow_executor::get_parent_task_id;
 
 // Handler system imports
-use super::handlers::{HandlerContext, HandlerRegistry, StepHandler};
+use super::handlers::{HandlerContext, HandlerRegistry};
 use serde_json::json;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
@@ -60,31 +58,27 @@ use tracing::{info, warn};
 use super::executor_types::*;
 
 // Imports from extracted modules
-use super::log_watch::{
-    get_default_log_source_names, LogError, CONTEXT_LINES, DEFAULT_ERROR_PATTERNS,
-};
-use super::verification_context::{categorize_failure, extract_text_from_output_data};
 
 // Legacy step handlers extracted to legacy_steps.rs
 // Verification execution extracted to verification_execution.rs
 
 pub struct StepExecutor {
-    action_service: UnifiedActionService,
-    app_state: Arc<AppState>,
+    pub(crate) action_service: UnifiedActionService,
+    pub(crate) app_state: Arc<AppState>,
     /// Configuration storage for loading saved configs
-    config_storage: Arc<TokioMutex<ConfigStorage>>,
+    pub(crate) config_storage: Arc<TokioMutex<ConfigStorage>>,
     /// Optional app handle for emitting events to the Tauri frontend
-    app_handle: Option<tauri::AppHandle>,
+    pub(crate) app_handle: Option<tauri::AppHandle>,
     /// Optional task run ID for database logging (AWAS steps, etc.)
-    task_run_id: Option<String>,
+    pub(crate) task_run_id: Option<String>,
     /// Runtime context for variable expansion in commands
-    runtime_context: RuntimeContext,
+    pub(crate) runtime_context: RuntimeContext,
     /// Shared variable store for API request chaining (thread-safe, clone-friendly)
-    shared_variables: SharedVariableStore,
+    pub(crate) shared_variables: SharedVariableStore,
     /// Registry of step handlers for polymorphic dispatch
-    handler_registry: HandlerRegistry,
+    pub(crate) handler_registry: HandlerRegistry,
     /// PID tracker for AI process management (passed to WorkflowStepHandler)
-    pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
+    pub(crate) pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
 }
 
 impl StepExecutor {
@@ -165,7 +159,7 @@ impl StepExecutor {
     ///
     /// This shares the executor's state (runtime_context, shared_variables)
     /// with the handlers to maintain consistency during step execution.
-    fn create_handler_context(&self) -> HandlerContext {
+    pub(crate) fn create_handler_context(&self) -> HandlerContext {
         HandlerContext::with_shared_state(
             self.app_state.clone(),
             self.config_storage.clone(),
@@ -242,7 +236,7 @@ impl StepExecutor {
     /// Note: For composed run children (e.g., composed-run-X-workflow-N),
     /// the task_run_id is automatically remapped to the parent task ID because
     /// only parent IDs exist in task_runs (required by foreign key constraint).
-    fn log_step_event(
+    pub(crate) fn log_step_event(
         &self,
         task_run_id: &str,
         step: &ExecutionStepConfig,
@@ -305,7 +299,7 @@ impl StepExecutor {
     }
 
     /// Emit a tree event to the Tauri frontend (if app_handle is available)
-    fn emit_tree_event(
+    pub(crate) fn emit_tree_event(
         &self,
         event_type: &str,
         node: &serde_json::Value,
@@ -332,7 +326,7 @@ impl StepExecutor {
     ///
     /// This ensures screenshots captured directly by the step executor
     /// (not through Python) are still recorded in the automation logs.
-    async fn record_screenshot_event(
+    pub(crate) async fn record_screenshot_event(
         &self,
         screenshot_type: &str,
         file_path: &str,
@@ -921,7 +915,7 @@ impl StepExecutor {
     }
 
     /// Get the .dev-logs directory path
-    fn get_dev_logs_dir() -> PathBuf {
+    pub(crate) fn get_dev_logs_dir() -> PathBuf {
         crate::paths::get_dev_logs_dir()
     }
 
@@ -1000,7 +994,7 @@ impl StepExecutor {
     }
 
     /// Execute a single step and return (success, error, screenshot_path, output_data)
-    async fn execute_single_step(
+    pub(crate) async fn execute_single_step(
         &self,
         step: &ExecutionStepConfig,
     ) -> (

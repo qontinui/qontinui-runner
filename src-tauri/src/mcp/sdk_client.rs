@@ -3247,7 +3247,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         // Workflows
         .route("/ui-bridge/sdk/workflows", get(handle_workflows))
-        .route("/ui-bridge/sdk/workflow/{id}/run", post(handle_workflow_run))
+        .route(
+            "/ui-bridge/sdk/workflow/{id}/run",
+            post(handle_workflow_run),
+        )
         .route(
             "/ui-bridge/sdk/workflow/{runId}/status",
             get(handle_workflow_status),

@@ -14,6 +14,7 @@ use crate::workflow_state::{CheckpointManager, StepCheckpoint};
 
 use super::executor::StepExecutor;
 use super::executor_types::*;
+use super::handlers::StepHandler;
 use super::verification_context::{categorize_failure, extract_text_from_output_data};
 
 impl StepExecutor {
