@@ -68,7 +68,7 @@ export function useKnownIssues() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     }
   }, []);
 
@@ -83,7 +83,7 @@ export function useKnownIssues() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     }
   }, []);
 
@@ -94,7 +94,7 @@ export function useKnownIssues() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     }
   }, []);
 
@@ -110,7 +110,7 @@ export function useKnownIssues() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     }
   }, []);
 

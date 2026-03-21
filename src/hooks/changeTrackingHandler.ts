@@ -109,12 +109,9 @@ export async function handleChangeTrackingCommand(
         includeCategory?: boolean;
         fromBookmark?: string;
       };
-      let diff: unknown = null;
-      if (sumBody.fromBookmark) {
-        diff = ct.diffFromBookmark(sumBody.fromBookmark);
-      } else {
-        diff = ct.categorizeLastDiff()?.diff ?? null;
-      }
+      const diff = sumBody.fromBookmark
+        ? ct.diffFromBookmark(sumBody.fromBookmark)
+        : (ct.categorizeLastDiff()?.diff ?? null);
       if (!diff) {
         return { summary: "No changes detected" };
       }

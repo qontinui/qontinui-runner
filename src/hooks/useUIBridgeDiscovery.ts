@@ -207,7 +207,7 @@ export function useUIBridgeDiscovery(
       }
 
       setIsSaving(true);
-      let savedConfigId: string | null = null;
+      let savedConfigId: string;
 
       try {
         // Step 1: Create config + states (critical — must succeed)

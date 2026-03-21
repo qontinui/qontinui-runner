@@ -130,7 +130,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setError(msg);
-        throw new Error(msg);
+        throw new Error(msg, { cause: err });
       }
     },
     [setActiveConfig],
@@ -145,7 +145,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     }
   }, []);
 
@@ -167,7 +167,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     }
   }, []);
 
@@ -186,7 +186,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setError(msg);
-        throw new Error(msg);
+        throw new Error(msg, { cause: err });
       }
     },
     [activeConfig],
@@ -202,7 +202,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     }
   }, []);
 
@@ -215,7 +215,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     }
   }, []);
 
@@ -236,7 +236,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setError(msg);
-        throw new Error(msg);
+        throw new Error(msg, { cause: err });
       }
     },
     [activeConfig],
@@ -260,7 +260,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     }
   }, []);
 
@@ -273,7 +273,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     }
   }, []);
 
@@ -292,7 +292,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setError(msg);
-        throw new Error(msg);
+        throw new Error(msg, { cause: err });
       }
     },
     [loadConfigs, loadConfig],

@@ -315,7 +315,7 @@ export function useFixWorkflow(): UseFixWorkflowReturn {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to check fixable errors";
       setError(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     } finally {
       setLoading(false);
     }
@@ -331,7 +331,7 @@ export function useFixWorkflow(): UseFixWorkflowReturn {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to generate workflow";
       setError(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     } finally {
       setLoading(false);
     }
@@ -346,7 +346,7 @@ export function useFixWorkflow(): UseFixWorkflowReturn {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to generate workflow";
       setError(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: err });
     } finally {
       setLoading(false);
     }

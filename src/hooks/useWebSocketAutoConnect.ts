@@ -125,7 +125,7 @@ export function useWebSocketAutoConnect({
         accessToken = await invoke<string>("get_access_token_for_websocket");
       } catch (tokenErr) {
         console.error("[WS_AUTO_CONNECT] Failed to get access token:", tokenErr);
-        throw new Error("Failed to retrieve authentication token. Please try logging in again.");
+        throw new Error("Failed to retrieve authentication token. Please try logging in again.", { cause: tokenErr });
       }
 
       console.log("[WS_AUTO_CONNECT] Configuring WebSocket with auth token...");

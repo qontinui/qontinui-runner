@@ -112,7 +112,7 @@ interface PageSummary {
 function generateHeuristicDescription(element: ExternalElement): ElementDescription {
   const parts: string[] = [];
   const aliases: string[] = [];
-  let purpose = "";
+  let purpose: string;
 
   // Add the ID as an alias
   aliases.push(element.id);
