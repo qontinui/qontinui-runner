@@ -802,7 +802,7 @@ fn query_execution_spans(
         .query_map(rusqlite::params![task_run_id], |row| {
             Ok(ExecutionSpan {
                 name: row.get(0)?,
-                duration_ms: row.get(1)?,
+                duration_ms: row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
                 success: row.get(2)?,
                 error: row.get(3)?,
             })

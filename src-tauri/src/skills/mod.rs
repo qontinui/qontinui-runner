@@ -257,7 +257,7 @@ pub fn load_user_skills_from_conn(conn: &Connection) -> Vec<SkillDefinition> {
             depends_on: row
                 .get::<_, Option<String>>(15)?
                 .and_then(|s| serde_json::from_str(&s).ok()),
-            usage_count: row.get::<_, Option<u64>>(16)?,
+            usage_count: row.get::<_, Option<i64>>(16)?.map(|v| v as u64),
             approval_status: row.get::<_, Option<String>>(17)?,
             forked_from: row.get::<_, Option<String>>(18)?,
         })

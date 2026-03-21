@@ -102,7 +102,7 @@ pub fn row_to_run_details_from_automation(row: &rusqlite::Row) -> rusqlite::Resu
         workflow_name: row.get(2)?,
         started_at: row.get(3)?,
         ended_at: row.get(4)?,
-        duration_ms: row.get(5)?,
+        duration_ms: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
         status: tiered_info::RunStatus::from_str(&status_str)
             .unwrap_or(tiered_info::RunStatus::Running),
         success: row.get(7)?,

@@ -74,7 +74,7 @@ impl CheckpointDb {
                     depends_on: row
                         .get::<_, Option<String>>(15)?
                         .and_then(|s| serde_json::from_str(&s).ok()),
-                    usage_count: row.get::<_, Option<u64>>(16)?,
+                    usage_count: row.get::<_, Option<i64>>(16)?.map(|v| v as u64),
                     approval_status: row.get::<_, Option<String>>(17)?,
                     forked_from: row.get::<_, Option<String>>(18)?,
                 })
@@ -147,7 +147,7 @@ impl CheckpointDb {
                     depends_on: row
                         .get::<_, Option<String>>(15)?
                         .and_then(|s| serde_json::from_str(&s).ok()),
-                    usage_count: row.get::<_, Option<u64>>(16)?,
+                    usage_count: row.get::<_, Option<i64>>(16)?.map(|v| v as u64),
                     approval_status: row.get::<_, Option<String>>(17)?,
                     forked_from: row.get::<_, Option<String>>(18)?,
                 })
@@ -362,7 +362,7 @@ impl CheckpointDb {
                     depends_on: row
                         .get::<_, Option<String>>(15)?
                         .and_then(|s| serde_json::from_str(&s).ok()),
-                    usage_count: row.get::<_, Option<u64>>(16)?,
+                    usage_count: row.get::<_, Option<i64>>(16)?.map(|v| v as u64),
                     approval_status: row.get::<_, Option<String>>(17)?,
                     forked_from: row.get::<_, Option<String>>(18)?,
                 })
@@ -659,7 +659,7 @@ impl CheckpointDb {
             .query_row(
                 "SELECT COALESCE(usage_count, 0) FROM user_skills WHERE id = ?1",
                 params![skill_id],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0).map(|v| v as u64),
             )
             .map_err(|e| format!("Failed to read usage count: {}", e))?;
 

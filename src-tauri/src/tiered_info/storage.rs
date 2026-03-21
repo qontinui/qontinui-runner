@@ -671,7 +671,7 @@ pub fn get_run_details(conn: &Connection, run_id: &str) -> Result<Option<RunDeta
                     workflow_name: row.get(2)?,
                     started_at: row.get(3)?,
                     ended_at: row.get(4)?,
-                    duration_ms: row.get(5)?,
+                    duration_ms: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                     status: RunStatus::from_str(&status_str).unwrap_or(RunStatus::Running),
                     success: row.get(7)?,
                     error_type: row.get(8)?,
@@ -719,7 +719,7 @@ fn row_to_run_details_from_automation(row: &rusqlite::Row) -> rusqlite::Result<R
         workflow_name: row.get(2)?,
         started_at: row.get(3)?,
         ended_at: row.get(4)?,
-        duration_ms: row.get(5)?,
+        duration_ms: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
         // automation_status maps to status (same values)
         status: RunStatus::from_str(&status_str).unwrap_or(RunStatus::Running),
         success: row.get(7)?,
@@ -759,9 +759,9 @@ fn row_to_config_statistics(row: &rusqlite::Row) -> rusqlite::Result<ConfigStati
         successful_runs: row.get(4)?,
         failed_runs: row.get(5)?,
         timeout_runs: row.get(6)?,
-        avg_duration_ms: row.get(7)?,
+        avg_duration_ms: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
         recent_success_rate: row.get(8)?,
-        recent_avg_duration_ms: row.get(9)?,
+        recent_avg_duration_ms: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
         transition_stats: transition_json
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default(),
