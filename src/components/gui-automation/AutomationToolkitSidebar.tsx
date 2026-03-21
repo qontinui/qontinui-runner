@@ -356,7 +356,7 @@ export function AutomationToolkitSidebar({
                   <select
                     value={selectedImageId}
                     onChange={(e) => setSelectedImageId(e.target.value)}
-                    className="w-full px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-primary [&>option]:text-black [&>option]:bg-white"
+                    className="w-full px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-hidden focus:ring-1 focus:ring-primary [&>option]:text-black [&>option]:bg-white"
                     style={{ colorScheme: "dark" }}
                   >
                     <option value="">Select image...</option>
@@ -399,7 +399,7 @@ export function AutomationToolkitSidebar({
                       value={typeText}
                       onChange={(e) => setTypeText(e.target.value)}
                       placeholder="Enter text to type..."
-                      className="flex-1 px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-primary"
+                      className="flex-1 px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-hidden focus:ring-1 focus:ring-primary"
                       onKeyDown={(e) => {
                         if (e.key === "Enter" && typeText.trim()) {
                           executeType();
@@ -437,7 +437,7 @@ export function AutomationToolkitSidebar({
                       value={hotkeyText}
                       onChange={(e) => setHotkeyText(e.target.value)}
                       placeholder="e.g., ctrl+c, alt+tab"
-                      className="flex-1 px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-primary"
+                      className="flex-1 px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-hidden focus:ring-1 focus:ring-primary"
                       onKeyDown={(e) => {
                         if (e.key === "Enter" && hotkeyText.trim()) {
                           executeHotkey();
@@ -473,7 +473,7 @@ export function AutomationToolkitSidebar({
                     <select
                       value={selectedStateId}
                       onChange={(e) => setSelectedStateId(e.target.value)}
-                      className="flex-1 px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-primary [&>option]:text-black [&>option]:bg-white"
+                      className="flex-1 px-3 py-2 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-hidden focus:ring-1 focus:ring-primary [&>option]:text-black [&>option]:bg-white"
                       style={{ colorScheme: "dark" }}
                     >
                       <option value="">Select state...</option>
@@ -514,7 +514,7 @@ export function AutomationToolkitSidebar({
                   value={selectedMacroId || ""}
                   onChange={(e) => setSelectedMacroId(e.target.value || null)}
                   disabled={macros.length === 0}
-                  className="w-full px-3 py-2.5 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50 [&>option]:text-black [&>option]:bg-white"
+                  className="w-full px-3 py-2.5 text-sm bg-secondary/50 border border-border rounded-lg focus:outline-hidden focus:ring-1 focus:ring-primary disabled:opacity-50 [&>option]:text-black [&>option]:bg-white"
                   style={{ colorScheme: "dark" }}
                 >
                   <option value="">
@@ -576,13 +576,13 @@ export function AutomationToolkitSidebar({
                     >
                       <div className="flex items-center gap-3 min-w-0">
                         <MousePointer2
-                          className={`w-4 h-4 flex-shrink-0 ${getAccentColors("orange").text}`}
+                          className={`w-4 h-4 shrink-0 ${getAccentColors("orange").text}`}
                         />
                         <div className="min-w-0">
                           <div className="flex items-center gap-2">
                             <span className="text-sm font-medium truncate">{macro.name}</span>
                             <span
-                              className={`text-[10px] ${getAccentColors("orange").bg} ${getAccentColors("orange").text} px-1.5 py-0.5 rounded flex-shrink-0`}
+                              className={`text-[10px] ${getAccentColors("orange").bg} ${getAccentColors("orange").text} px-1.5 py-0.5 rounded shrink-0`}
                             >
                               {macro.steps.length} steps
                             </span>

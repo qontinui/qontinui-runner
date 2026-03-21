@@ -111,7 +111,7 @@ export function GuiWorkflowPicker({
       <button
         type="button"
         onClick={() => setIsOpen(!isOpen)}
-        className="w-full flex items-center justify-between px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 hover:border-zinc-600 focus:outline-none focus:ring-2 focus:ring-purple-500/50 transition-colors"
+        className="w-full flex items-center justify-between px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 hover:border-zinc-600 focus:outline-hidden focus:ring-2 focus:ring-purple-500/50 transition-colors"
       >
         <span className={selectedWorkflow ? "text-zinc-200" : "text-zinc-500"}>
           {selectedWorkflow ? selectedWorkflow.name : placeholder}
@@ -144,7 +144,7 @@ export function GuiWorkflowPicker({
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="Search workflows..."
-                  className="w-full pl-8 pr-3 py-1.5 bg-zinc-700 border border-zinc-600 rounded text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-purple-500/50"
+                  className="w-full pl-8 pr-3 py-1.5 bg-zinc-700 border border-zinc-600 rounded text-sm text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-1 focus:ring-purple-500/50"
                   autoFocus
                 />
               </div>

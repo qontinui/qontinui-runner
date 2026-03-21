@@ -318,7 +318,7 @@ export function PromptSnippetBuilderTab({
               placeholder="Search prompt snippets..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-2 bg-muted border border-border rounded-lg text-sm focus:outline-none focus:border-primary"
+              className="w-full pl-9 pr-3 py-2 bg-muted border border-border rounded-lg text-sm focus:outline-hidden focus:border-primary"
             />
           </div>
         </div>
@@ -385,7 +385,7 @@ export function PromptSnippetBuilderTab({
                   <div className="flex items-center gap-2">
                     {isSelectionMode && (
                       <div
-                        className={`w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${
+                        className={`w-4 h-4 rounded border shrink-0 flex items-center justify-center ${
                           selectedIds.has(snippet.id)
                             ? "bg-red-500 border-red-500"
                             : "border-muted-foreground hover:border-red-400"
@@ -486,7 +486,7 @@ export function PromptSnippetBuilderTab({
                     value={formName}
                     onChange={(e) => setFormName(e.target.value)}
                     placeholder="Prompt snippet name"
-                    className="w-full px-3 py-2 bg-muted border border-border rounded-lg focus:outline-none focus:border-primary"
+                    className="w-full px-3 py-2 bg-muted border border-border rounded-lg focus:outline-hidden focus:border-primary"
                   />
                 </div>
 
@@ -501,7 +501,7 @@ export function PromptSnippetBuilderTab({
                     onChange={(e) => setFormContent(e.target.value)}
                     placeholder="Enter the reusable text snippet content..."
                     rows={15}
-                    className="w-full px-3 py-2 bg-muted border border-border rounded-lg focus:outline-none focus:border-primary font-mono text-sm resize-y"
+                    className="w-full px-3 py-2 bg-muted border border-border rounded-lg focus:outline-hidden focus:border-primary font-mono text-sm resize-y"
                   />
                   <p className="text-xs text-muted-foreground mt-1">
                     This content can be inserted into Playwright test descriptions using @mention
@@ -520,7 +520,7 @@ export function PromptSnippetBuilderTab({
                       value={formCategory}
                       onChange={(e) => setFormCategory(e.target.value)}
                       placeholder="e.g., Login, Navigation, Forms"
-                      className="w-full px-3 py-2 bg-muted border border-border rounded-lg focus:outline-none focus:border-primary"
+                      className="w-full px-3 py-2 bg-muted border border-border rounded-lg focus:outline-hidden focus:border-primary"
                     />
                   </div>
                   <div>
@@ -533,7 +533,7 @@ export function PromptSnippetBuilderTab({
                       value={formTags}
                       onChange={(e) => setFormTags(e.target.value)}
                       placeholder="comma, separated, tags"
-                      className="w-full px-3 py-2 bg-muted border border-border rounded-lg focus:outline-none focus:border-primary"
+                      className="w-full px-3 py-2 bg-muted border border-border rounded-lg focus:outline-hidden focus:border-primary"
                     />
                   </div>
                 </div>

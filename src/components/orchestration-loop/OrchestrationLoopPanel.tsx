@@ -139,7 +139,7 @@ function PhaseBadge({ phase }: { phase: string }) {
 // --- Shared input styles ---
 
 const inputCls =
-  "px-2 py-1 text-xs bg-muted border border-border rounded text-foreground focus:outline-none focus:ring-1 focus:ring-primary";
+  "px-2 py-1 text-xs bg-muted border border-border rounded text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary";
 const labelCls = "text-[0.78rem] text-muted-foreground";
 const textareaCls = cn(inputCls, "w-full resize-y font-sans");
 

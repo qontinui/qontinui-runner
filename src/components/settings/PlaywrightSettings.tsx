@@ -117,7 +117,7 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
               value={settings.test_username || ""}
               onChange={(e) => updateSetting("test_username", e.target.value || null)}
               placeholder="user@example.com"
-              className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
+              className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
             />
           </div>
 
@@ -133,7 +133,7 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
                 value={settings.test_password || ""}
                 onChange={(e) => updateSetting("test_password", e.target.value || null)}
                 placeholder="Enter password"
-                className="w-full px-2.5 py-1.5 pr-10 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
+                className="w-full px-2.5 py-1.5 pr-10 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
               />
               <button
                 type="button"
@@ -166,7 +166,7 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
             value={settings.base_url || ""}
             onChange={(e) => updateSetting("base_url", e.target.value || null)}
             placeholder="http://localhost:3001"
-            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
+            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
           />
           <p className="text-[10px] text-muted-foreground">
             Passed as PLAYWRIGHT_BASE_URL. Leave empty to use the default from playwright.config.ts

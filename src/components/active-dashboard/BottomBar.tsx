@@ -154,7 +154,7 @@ export function BottomBar({
               agentColors.text,
               "border",
               agentColors.border,
-              "flex-shrink-0",
+              "shrink-0",
             )}
           >
             <AgentIcon className="mr-1 h-3 w-3" />
@@ -165,7 +165,7 @@ export function BottomBar({
         {/* Activity + Action */}
         <div className="flex items-center gap-2 min-w-0">
           {activeActivity && ActivityIcon && isRunning && (
-            <div className="flex items-center gap-1.5 flex-shrink-0">
+            <div className="flex items-center gap-1.5 shrink-0">
               <ActivityIcon className="w-4 h-4 text-muted-foreground" />
               <span
                 data-content-role="label"

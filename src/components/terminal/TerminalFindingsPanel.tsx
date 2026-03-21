@@ -266,7 +266,7 @@ export function TerminalFindingsPanel({
                           if (e.key === "Enter") handleSubmitResponse();
                         }}
                         placeholder="Type a response..."
-                        className="flex-1 px-2 py-1 text-xs bg-[#1a1b26] border border-[#2a2d3d] rounded text-[#c0caf5] placeholder-[#414868] focus:outline-none focus:border-[#bb9af7]/50"
+                        className="flex-1 px-2 py-1 text-xs bg-[#1a1b26] border border-[#2a2d3d] rounded text-[#c0caf5] placeholder-[#414868] focus:outline-hidden focus:border-[#bb9af7]/50"
                       />
                       <button
                         onClick={handleSubmitResponse}

@@ -74,7 +74,7 @@ export function PhaseDistributionPanel({ data, size }: CanvasPanelComponentProps
   return (
     <div className="flex items-start gap-4">
       {/* Donut chart */}
-      <div className="flex-shrink-0" style={{ width: ringSize, height: ringSize }}>
+      <div className="shrink-0" style={{ width: ringSize, height: ringSize }}>
         <svg viewBox={`0 0 ${ringSize} ${ringSize}`} width={ringSize} height={ringSize}>
           {/* Background ring */}
           <circle
@@ -122,7 +122,7 @@ export function PhaseDistributionPanel({ data, size }: CanvasPanelComponentProps
         {segments.map((seg, segIdx) => (
           <div key={seg.phase} className="flex items-center gap-1.5">
             <span
-              className="inline-block h-2.5 w-2.5 rounded-sm flex-shrink-0"
+              className="inline-block h-2.5 w-2.5 rounded-xs shrink-0"
               style={{ backgroundColor: getColor(seg, segIdx) }}
             />
             <span className="font-medium text-foreground truncate">{seg.phase}</span>

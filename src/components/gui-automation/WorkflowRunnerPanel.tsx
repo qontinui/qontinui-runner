@@ -201,7 +201,7 @@ export function WorkflowRunnerPanel({
             </span>
             <ChevronDown
               className={cn(
-                "w-5 h-5 flex-shrink-0 transition-transform",
+                "w-5 h-5 shrink-0 transition-transform",
                 showWorkflowDropdown && "rotate-180",
               )}
             />
@@ -219,7 +219,7 @@ export function WorkflowRunnerPanel({
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                     placeholder="Search workflows..."
-                    className="w-full pl-9 pr-3 py-2 text-sm bg-secondary/50 border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary"
+                    className="w-full pl-9 pr-3 py-2 text-sm bg-secondary/50 border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary"
                     autoFocus
                   />
                 </div>

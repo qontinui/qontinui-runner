@@ -55,7 +55,7 @@ function StateListItem({
       className="w-full flex items-center gap-2 p-2 rounded hover:bg-muted/50 transition-colors text-left group"
     >
       <Circle
-        className="w-2 h-2 flex-shrink-0"
+        className="w-2 h-2 shrink-0"
         style={{
           fill: stateType === "global" ? "#3b82f6" : stateType === "modal" ? "#f97316" : "#22c55e",
           color: stateType === "global" ? "#3b82f6" : stateType === "modal" ? "#f97316" : "#22c55e",
@@ -114,7 +114,7 @@ function FingerprintStatesPanelComponent({
       {/* Header */}
       <div className="flex items-center justify-between p-3 border-b border-border/50">
         <div className="flex items-center gap-2 min-w-0">
-          <Fingerprint className="w-4 h-4 text-primary flex-shrink-0" />
+          <Fingerprint className="w-4 h-4 text-primary shrink-0" />
           <div className="min-w-0">
             <div className="text-xs font-mono text-muted-foreground truncate">
               {fingerprintHash.slice(0, 16)}...

@@ -152,7 +152,7 @@ function ErrorItem({
         }}
       >
         {/* Severity icon */}
-        <div className="flex-shrink-0 mt-0.5">
+        <div className="shrink-0 mt-0.5">
           <SeverityIcon severity={error.severity} />
         </div>
 
@@ -481,7 +481,7 @@ export function ErrorMonitorTab({
               value={searchText}
               onChange={(e) => setSearchText(e.target.value)}
               placeholder="Search errors..."
-              className="flex-1 bg-transparent text-sm focus:outline-none"
+              className="flex-1 bg-transparent text-sm focus:outline-hidden"
             />
             {searchText && (
               <button

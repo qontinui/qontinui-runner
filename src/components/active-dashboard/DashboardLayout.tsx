@@ -243,7 +243,7 @@ function CopyConversationButton({ entries }: { entries: { line: string }[] }) {
   return (
     <button
       onClick={handleCopy}
-      className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1"
+      className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors rounded focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1"
       aria-label="Copy conversation to clipboard"
       title="Copy conversation"
     >
@@ -912,7 +912,7 @@ function SummaryContainer({
       className={cn(
         "relative group rounded-lg border overflow-hidden bg-background cursor-pointer",
         "hover:border-foreground/30 transition-colors duration-200",
-        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 focus-visible:ring-offset-background",
+        "focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 focus-visible:ring-offset-background",
         borderClasses,
       )}
       onClick={onClick}
@@ -936,7 +936,7 @@ function SummaryContainer({
                 onPin();
               }}
               className={cn(
-                "p-0.5 rounded hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50",
+                "p-0.5 rounded hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50",
                 isPinned && "text-cyan-500",
               )}
               aria-label={isPinned ? "Unpin widget" : "Pin widget"}
@@ -953,7 +953,7 @@ function SummaryContainer({
                 e.stopPropagation();
                 onHide();
               }}
-              className="p-0.5 rounded hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+              className="p-0.5 rounded hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50"
               aria-label="Hide widget"
               title="Hide widget"
             >
@@ -1369,7 +1369,7 @@ export function DashboardLayout({
               >
                 <button
                   className={cn(
-                    "px-3 py-1.5 text-xs font-medium border-b-2 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50",
+                    "px-3 py-1.5 text-xs font-medium border-b-2 transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50",
                     activeWidget === "execution_timeline"
                       ? "border-cyan-500 text-foreground"
                       : "border-transparent text-muted-foreground hover:text-foreground",
@@ -1382,7 +1382,7 @@ export function DashboardLayout({
                 </button>
                 <button
                   className={cn(
-                    "px-3 py-1.5 text-xs font-medium border-b-2 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50",
+                    "px-3 py-1.5 text-xs font-medium border-b-2 transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50",
                     activeWidget === "flow_execution"
                       ? "border-rose-500 text-foreground"
                       : "border-transparent text-muted-foreground hover:text-foreground",
@@ -1422,7 +1422,7 @@ export function DashboardLayout({
         role="separator"
         aria-label="Resize panel. Double-click or press Enter to reset."
         tabIndex={0}
-        className="flex-shrink-0 flex items-center justify-center cursor-col-resize group hover:bg-muted/50 transition-colors rounded"
+        className="shrink-0 flex items-center justify-center cursor-col-resize group hover:bg-muted/50 transition-colors rounded"
         style={{ width: HANDLE_WIDTH }}
         title="Drag to resize. Double-click to reset."
       >
@@ -1439,7 +1439,7 @@ export function DashboardLayout({
         {showRestoreButton && (
           <button
             onClick={handleRestoreToRunning}
-            className="flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium text-primary bg-primary/10 hover:bg-primary/20 border border-primary/30 rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+            className="flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium text-primary bg-primary/10 hover:bg-primary/20 border border-primary/30 rounded-lg transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 focus-visible:ring-offset-background"
           >
             <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
             Restore to Active Process

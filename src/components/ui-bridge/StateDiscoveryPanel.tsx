@@ -166,9 +166,9 @@ function StateCandidateCard({
         onClick={onToggle}
       >
         {expanded ? (
-          <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+          <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
         ) : (
-          <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+          <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
         )}
 
         <div className="flex items-center gap-2 flex-1 min-w-0">
@@ -181,7 +181,7 @@ function StateCandidateCard({
           </span>
         </div>
 
-        <div className="flex items-center gap-2 flex-shrink-0">
+        <div className="flex items-center gap-2 shrink-0">
           {analysis.repeatingCount > 0 && (
             <Badge variant="info" size="sm" title={`${analysis.repeatingCount} repeating elements`}>
               <Repeat className="w-3 h-3 mr-1" />
@@ -248,7 +248,7 @@ function StateCandidateCard({
                     className="w-full flex items-center gap-2 p-2 text-xs bg-muted/30 rounded hover:bg-muted/50 transition-colors text-left"
                     onClick={() => onSelectFingerprint?.(hash)}
                   >
-                    <Hash className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+                    <Hash className="w-3 h-3 text-muted-foreground shrink-0" />
                     <span className="font-mono text-[10px] text-muted-foreground">{hash}</span>
                     <Badge variant="muted" size="sm">
                       {fp.role || fp.tagName}
@@ -256,7 +256,7 @@ function StateCandidateCard({
                     {fp.accessibleName && (
                       <span className="truncate text-muted-foreground">"{fp.accessibleName}"</span>
                     )}
-                    {fp.isRepeating && <Repeat className="w-3 h-3 text-blue-400 flex-shrink-0" />}
+                    {fp.isRepeating && <Repeat className="w-3 h-3 text-blue-400 shrink-0" />}
                   </button>
                 );
               })}
@@ -298,9 +298,9 @@ function TransitionCard({
         onClick={() => setExpanded(!expanded)}
       >
         {expanded ? (
-          <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+          <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
         ) : (
-          <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+          <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
         )}
 
         <Badge variant="info">{transition.actionType}</Badge>
@@ -312,7 +312,7 @@ function TransitionCard({
           </span>
         )}
 
-        <div className="flex items-center gap-2 ml-auto flex-shrink-0">
+        <div className="flex items-center gap-2 ml-auto shrink-0">
           {transition.appearedFingerprints.length > 0 && (
             <Badge variant="success" size="sm">
               +{transition.appearedFingerprints.length}
@@ -524,7 +524,7 @@ function DiscoveredStateCard({
         {/* Compare mode checkbox or expand chevron */}
         {compareMode ? (
           <div
-            className="flex-shrink-0"
+            className="shrink-0"
             onClick={(e) => {
               e.stopPropagation();
               onToggleSelect?.();
@@ -546,9 +546,9 @@ function DiscoveredStateCard({
             )}
           </div>
         ) : expanded ? (
-          <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+          <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
         ) : (
-          <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+          <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
         )}
 
         <div className="flex items-center gap-2 flex-1 min-w-0">
@@ -560,7 +560,7 @@ function DiscoveredStateCard({
           </Badge>
         </div>
 
-        <div className="flex items-center gap-2 flex-shrink-0">
+        <div className="flex items-center gap-2 shrink-0">
           <span className={`text-xs font-mono ${confidenceColor}`}>
             {(state.confidence * 100).toFixed(0)}%
           </span>
@@ -630,7 +630,7 @@ function DiscoveredStateCard({
                       onSelectFingerprint?.(hash);
                     }}
                   >
-                    <Fingerprint className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+                    <Fingerprint className="w-3 h-3 text-muted-foreground shrink-0" />
                     <span className="font-mono text-[10px] text-muted-foreground">
                       {hash.slice(0, 12)}...
                     </span>
@@ -690,16 +690,16 @@ function DiscoveredTransitionCard({
         onClick={() => setExpanded(!expanded)}
       >
         {expanded ? (
-          <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+          <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
         ) : (
-          <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+          <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
         )}
 
         <Badge variant="info">{transition.actionType}</Badge>
 
         <div className="flex items-center gap-1 text-xs text-muted-foreground flex-1 min-w-0">
           <span className="truncate">{fromState?.name || transition.fromStateId}</span>
-          <ArrowRight className="w-3 h-3 flex-shrink-0" />
+          <ArrowRight className="w-3 h-3 shrink-0" />
           <span className="truncate">{toState?.name || transition.toStateId}</span>
         </div>
 

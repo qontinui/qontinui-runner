@@ -122,9 +122,9 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
       <div className="bg-background border border-border rounded-lg shadow-xl w-[90vw] h-[90vh] flex flex-col overflow-hidden">
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-border flex-shrink-0">
+        <div className="flex items-center justify-between p-4 border-b border-border shrink-0">
           <div className="flex items-center gap-3 min-w-0">
-            <FileCode className="w-5 h-5 text-primary flex-shrink-0" />
+            <FileCode className="w-5 h-5 text-primary shrink-0" />
             <div className="min-w-0">
               <h2 className="font-medium truncate">{capture.pageTitle}</h2>
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -149,7 +149,7 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
                 placeholder="Search (Ctrl+F)"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="pl-9 pr-3 py-1.5 text-sm bg-muted border border-border rounded-md w-48 focus:outline-none focus:ring-2 focus:ring-primary/50"
+                className="pl-9 pr-3 py-1.5 text-sm bg-muted border border-border rounded-md w-48 focus:outline-hidden focus:ring-2 focus:ring-primary/50"
               />
             </div>
 
@@ -195,7 +195,7 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
             <div className="flex">
               {/* Line numbers */}
               {showLineNumbers && (
-                <div className="flex-shrink-0 select-none text-right pr-4 py-4 text-xs text-muted-foreground bg-[#1a1a1a] border-r border-border">
+                <div className="shrink-0 select-none text-right pr-4 py-4 text-xs text-muted-foreground bg-[#1a1a1a] border-r border-border">
                   {filteredLines.map((_, i) => (
                     <div key={`ln-${i}`} className="px-2 leading-5">
                       {searchQuery ? i + 1 : i + 1}
@@ -226,7 +226,7 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-4 py-2 border-t border-border text-xs text-muted-foreground flex-shrink-0">
+        <div className="flex items-center justify-between px-4 py-2 border-t border-border text-xs text-muted-foreground shrink-0">
           <div className="flex items-center gap-4">
             <label className="flex items-center gap-1.5 cursor-pointer">
               <input

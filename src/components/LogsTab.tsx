@@ -105,8 +105,8 @@ export function LogsTab({
       onValueChange={(value) => onSubTabChange(value as LogSubTab)}
       className="h-full flex flex-col overflow-hidden"
     >
-      {/* Sub-tab Navigation - Fixed Header (flex-shrink-0 keeps it from scrolling) */}
-      <div className="flex-shrink-0 bg-background flex items-center justify-between border-b border-border z-10 relative">
+      {/* Sub-tab Navigation - Fixed Header (shrink-0 keeps it from scrolling) */}
+      <div className="shrink-0 bg-background flex items-center justify-between border-b border-border z-10 relative">
         <Tabs.List className="flex">
           {subTabs.map((tab) => {
             const Icon = tab.icon;
@@ -154,21 +154,21 @@ export function LogsTab({
       <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
         <Tabs.Content
           value="general"
-          className="flex-1 flex flex-col p-4 outline-none min-h-0 data-[state=inactive]:hidden"
+          className="flex-1 flex flex-col p-4 outline-hidden min-h-0 data-[state=inactive]:hidden"
         >
           <GeneralLogTab logs={filteredLogs} containerRef={logViewerRef} />
         </Tabs.Content>
 
         <Tabs.Content
           value="image"
-          className="flex-1 p-4 outline-none overflow-auto data-[state=inactive]:hidden"
+          className="flex-1 p-4 outline-hidden overflow-auto data-[state=inactive]:hidden"
         >
           <ImageLogTable imageLogs={imageLogs} onRowClick={onImageRowClick} />
         </Tabs.Content>
 
         <Tabs.Content
           value="actions"
-          className="flex-1 p-4 outline-none overflow-auto data-[state=inactive]:hidden"
+          className="flex-1 p-4 outline-hidden overflow-auto data-[state=inactive]:hidden"
         >
           {actionLogLoading && (
             <div className="text-center text-muted-foreground py-8">Loading action log...</div>

@@ -305,7 +305,7 @@ export function TerminalTabBar({
                       e.stopPropagation();
                     }}
                     onClick={(e) => e.stopPropagation()}
-                    className="bg-transparent border-b border-[#565f89] text-[#c0caf5] text-xs w-20 outline-none"
+                    className="bg-transparent border-b border-[#565f89] text-[#c0caf5] text-xs w-20 outline-hidden"
                   />
                 ) : (
                   <span className="truncate">{tab.title}</span>
@@ -410,7 +410,7 @@ export function TerminalTabBar({
                   onChange={(e) => setQuickLaunchCmd(e.target.value)}
                   onKeyDown={(e) => e.stopPropagation()}
                   placeholder="Auto-run command (e.g. claude)"
-                  className="w-full bg-[#13141f] border border-[#2a2d3d] rounded px-2 py-1 text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-none focus:border-[#7aa2f7] transition-colors"
+                  className="w-full bg-[#13141f] border border-[#2a2d3d] rounded px-2 py-1 text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-hidden focus:border-[#7aa2f7] transition-colors"
                 />
               </div>
               {[2, 4, 6, 9].map((count) => (

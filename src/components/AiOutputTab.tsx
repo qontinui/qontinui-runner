@@ -407,7 +407,7 @@ export function AiOutputTab({
             onKeyDown={handleKeyDown}
             placeholder="Start a conversation with AI... (Enter to send, Shift+Enter for newline)"
             disabled={isSending}
-            className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm resize-none min-h-[40px] max-h-[120px] focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm resize-none min-h-[40px] max-h-[120px] focus:outline-hidden focus:ring-2 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed"
             rows={1}
           />
           <button
@@ -430,7 +430,7 @@ export function AiOutputTab({
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
       {/* Fixed Header - doesn't scroll */}
-      <div className="flex-shrink-0 space-y-2 pb-2 mb-2 bg-background">
+      <div className="shrink-0 space-y-2 pb-2 mb-2 bg-background">
         {/* Session horizontal list and status row */}
         <div className="flex items-center gap-3">
           {/* Horizontal Session List - draggable */}
@@ -455,7 +455,7 @@ export function AiOutputTab({
                 <button
                   key={`${loop.id}-${reversedIndex}`}
                   onClick={() => !isDragging && handleSelectLoop(loop.id)}
-                  className={`flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                  className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
                     isSelected
                       ? `${getAccentColors("purple").bg} ${getAccentColors("purple").text}`
                       : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
@@ -476,7 +476,7 @@ export function AiOutputTab({
           </div>
 
           {/* Status and actions */}
-          <div className="flex-shrink-0 flex items-center gap-2">
+          <div className="shrink-0 flex items-center gap-2">
             {isAiWorking && (
               <>
                 <div
@@ -527,7 +527,7 @@ export function AiOutputTab({
       </div>
 
       {/* Prompt/Hint input */}
-      <div className="flex-shrink-0 mt-3 flex gap-2">
+      <div className="shrink-0 mt-3 flex gap-2">
         <textarea
           ref={textareaRef}
           value={promptInput}
@@ -542,7 +542,7 @@ export function AiOutputTab({
               : "Continue the conversation... (Enter to send, Shift+Enter for newline)"
           }
           disabled={isSending}
-          className={`flex-1 px-3 py-2 bg-background border rounded-lg text-sm resize-none min-h-[40px] max-h-[120px] focus:outline-none focus:ring-2 disabled:opacity-50 disabled:cursor-not-allowed ${
+          className={`flex-1 px-3 py-2 bg-background border rounded-lg text-sm resize-none min-h-[40px] max-h-[120px] focus:outline-hidden focus:ring-2 disabled:opacity-50 disabled:cursor-not-allowed ${
             isAiWorking
               ? `${getAccentColors("purple").border} focus:ring-purple-500`
               : "border-border focus:ring-primary"

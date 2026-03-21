@@ -329,7 +329,7 @@ function TagInput({ tags, onChange }: TagInputProps) {
           onKeyDown={handleKeyDown}
           placeholder="Add a tag..."
           className="flex-1 px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-            placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+            placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
             text-foreground"
         />
         <button
@@ -530,7 +530,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
               onChange={(e) => updateField("name", e.target.value)}
               placeholder="Check name..."
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground"
             />
           </div>
@@ -543,7 +543,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
               onChange={(e) => updateField("description", e.target.value)}
               placeholder="Brief description (optional)..."
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground"
             />
           </div>
@@ -555,7 +555,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
                 value={formState.check_type ?? "linter"}
                 onChange={(e) => handleCheckTypeChange(e.target.value)}
                 className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                  text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                  text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
               >
                 {CHECK_TYPES.map((ct) => (
                   <option key={ct.value} value={ct.value}>
@@ -574,7 +574,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
                 value={formState.tool ?? "custom"}
                 onChange={(e) => handleToolChange(e.target.value)}
                 className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                  text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                  text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
               >
                 {availableTools.map((tool) => (
                   <option key={tool} value={tool}>
@@ -603,7 +603,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
               placeholder="Shell command to execute..."
               rows={4}
               className="w-full px-3 py-2 text-sm font-mono bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground resize-y"
             />
           </div>
@@ -619,7 +619,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
               onChange={(e) => updateField("working_directory", e.target.value)}
               placeholder="/path/to/project (optional)"
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground"
             />
           </div>
@@ -633,7 +633,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
                 onChange={(e) => updateField("config_path", e.target.value)}
                 placeholder=".eslintrc.json (optional)"
                 className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                  placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                  placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                   text-foreground"
               />
             </div>
@@ -652,7 +652,7 @@ function CheckEditor({ builder }: CheckEditorProps) {
                 min={1}
                 max={7200}
                 className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                  text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                  text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
               />
             </div>
           </div>

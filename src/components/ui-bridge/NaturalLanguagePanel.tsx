@@ -1003,7 +1003,7 @@ export function NaturalLanguagePanel({
               }}
               placeholder='Try: Click the "Submit" button'
               rows={2}
-              className="w-full pl-9 pr-3 py-2 text-sm bg-muted/30 border border-border/50 rounded-md focus:outline-none focus:ring-1 focus:ring-primary resize-none"
+              className="w-full pl-9 pr-3 py-2 text-sm bg-muted/30 border border-border/50 rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary resize-none"
             />
           </div>
           <Button
@@ -1329,9 +1329,9 @@ export function NaturalLanguagePanel({
                   onClick={() => handleLoadHistoryCommand(entry)}
                 >
                   {entry.success ? (
-                    <CheckCircle className="w-3 h-3 text-green-500 flex-shrink-0" />
+                    <CheckCircle className="w-3 h-3 text-green-500 shrink-0" />
                   ) : (
-                    <XCircle className="w-3 h-3 text-destructive flex-shrink-0" />
+                    <XCircle className="w-3 h-3 text-destructive shrink-0" />
                   )}
                   <span className="truncate flex-1">{entry.command}</span>
                   <span className="text-[10px] text-muted-foreground">

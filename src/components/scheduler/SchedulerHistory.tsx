@@ -51,7 +51,7 @@ export function SchedulerHistory({
   return (
     <div className="flex gap-4 h-full">
       {/* Task selector */}
-      <div className="w-64 flex-shrink-0 border-r border-border pr-4">
+      <div className="w-64 shrink-0 border-r border-border pr-4">
         <h4 className="text-sm font-medium mb-3">Select Task</h4>
         <div className="space-y-1">
           {tasks.map((task) => (

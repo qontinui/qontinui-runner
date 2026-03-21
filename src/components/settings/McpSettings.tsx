@@ -477,7 +477,7 @@ export function McpSettings({ onLog }: McpSettingsProps) {
           value={formData.name}
           onChange={(e) => setFormData((f) => ({ ...f, name: e.target.value }))}
           placeholder="My MCP Server"
-          className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
+          className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
         />
       </div>
 
@@ -489,7 +489,7 @@ export function McpSettings({ onLog }: McpSettingsProps) {
           value={formData.description}
           onChange={(e) => setFormData((f) => ({ ...f, description: e.target.value }))}
           placeholder="What this server provides"
-          className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
+          className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
         />
       </div>
 
@@ -552,7 +552,7 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               value={formData.command}
               onChange={(e) => setFormData((f) => ({ ...f, command: e.target.value }))}
               placeholder="npx @modelcontextprotocol/server-filesystem"
-              className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+              className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
             />
           </div>
           <div className="space-y-1.5">
@@ -562,7 +562,7 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               onChange={(e) => setFormData((f) => ({ ...f, args: e.target.value }))}
               placeholder="--path&#10;/home/user"
               rows={3}
-              className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50 font-mono resize-none"
+              className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50 font-mono resize-none"
             />
           </div>
           <div className="space-y-1.5">
@@ -572,7 +572,7 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               value={formData.cwd}
               onChange={(e) => setFormData((f) => ({ ...f, cwd: e.target.value }))}
               placeholder="/home/user/project"
-              className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+              className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
             />
           </div>
           <div className="p-2 bg-amber-500/10 rounded text-xs text-amber-600 dark:text-amber-400">
@@ -591,7 +591,7 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               value={formData.url}
               onChange={(e) => setFormData((f) => ({ ...f, url: e.target.value }))}
               placeholder="http://localhost:3000"
-              className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+              className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
             />
           </div>
           <div className="space-y-1.5">
@@ -601,7 +601,7 @@ export function McpSettings({ onLog }: McpSettingsProps) {
               onChange={(e) => setFormData((f) => ({ ...f, headers: e.target.value }))}
               placeholder='Authorization: Bearer token&#10;Or: {"Authorization": "Bearer token"}'
               rows={3}
-              className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50 font-mono resize-none"
+              className="w-full px-2.5 py-1.5 text-sm bg-background/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50 font-mono resize-none"
             />
           </div>
         </div>
@@ -619,7 +619,7 @@ export function McpSettings({ onLog }: McpSettingsProps) {
             }
             min={1}
             max={300}
-            className="w-24 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+            className="w-24 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
           />
         </div>
 

@@ -290,7 +290,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
                     }))
                   }
                   disabled={!settings.action_caching_enabled}
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   How long cached action results remain valid (30-3600 seconds)
@@ -394,7 +394,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
                       llm_mode: e.target.value as SelfHealingLlmMode,
                     }))
                   }
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
                 >
                   {LLM_MODE_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -430,7 +430,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
                         }))
                       }
                       placeholder="llava"
-                      className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                      className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
                     />
                     <p className="text-[10px] text-muted-foreground">
                       Model to use for visual understanding (e.g., llava, bakllava, llava-phi3)
@@ -461,7 +461,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
                           api_provider: e.target.value as SelfHealingApiProvider,
                         }))
                       }
-                      className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                      className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
                     >
                       {API_PROVIDER_OPTIONS.map((option) => (
                         <option key={option.value} value={option.value}>
@@ -500,7 +500,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
                             value={apiKey}
                             onChange={(e) => setApiKey(e.target.value)}
                             placeholder={`Enter ${settings.api_provider === "open_ai" ? "OpenAI" : "Anthropic"} API key`}
-                            className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                            className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
                           />
                           <button
                             onClick={() => setApiKeyVisible(!apiKeyVisible)}

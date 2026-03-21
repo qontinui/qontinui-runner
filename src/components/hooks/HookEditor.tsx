@@ -183,7 +183,7 @@ export function HookEditor({ hook, onSave, onCancel, loading }: HookEditorProps)
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="My Hook"
-                className={`w-full px-3 py-2 bg-background border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 ${
+                className={`w-full px-3 py-2 bg-background border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50 ${
                   errors.name ? "border-destructive" : "border-border"
                 }`}
               />
@@ -199,7 +199,7 @@ export function HookEditor({ hook, onSave, onCancel, loading }: HookEditorProps)
                 onChange={(e) => setDescription(e.target.value)}
                 placeholder="What this hook does..."
                 rows={2}
-                className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm resize-none focus:outline-none focus:ring-2 focus:ring-primary/50"
+                className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm resize-none focus:outline-hidden focus:ring-2 focus:ring-primary/50"
               />
             </div>
           </div>
@@ -259,7 +259,7 @@ export function HookEditor({ hook, onSave, onCancel, loading }: HookEditorProps)
                   type="number"
                   value={executionOrder}
                   onChange={(e) => setExecutionOrder(parseInt(e.target.value) || 0)}
-                  className="w-24 px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                  className="w-24 px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
                 />
                 <p className="text-xs text-muted-foreground mt-1">Lower values execute first</p>
               </div>

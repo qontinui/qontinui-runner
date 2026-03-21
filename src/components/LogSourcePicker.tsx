@@ -253,7 +253,7 @@ export function LogSourcePicker({
                           <div className="flex items-center gap-2">
                             {source.color && (
                               <span
-                                className="w-2 h-2 rounded-full flex-shrink-0"
+                                className="w-2 h-2 rounded-full shrink-0"
                                 style={{ backgroundColor: source.color }}
                               />
                             )}
@@ -263,7 +263,7 @@ export function LogSourcePicker({
                             {source.path}
                           </div>
                         </div>
-                        {isSelected && <Check className="w-4 h-4 text-primary flex-shrink-0" />}
+                        {isSelected && <Check className="w-4 h-4 text-primary shrink-0" />}
                       </label>
                     );
                   })}

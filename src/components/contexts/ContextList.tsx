@@ -285,7 +285,7 @@ export function ContextList({ onLog }: ContextListProps) {
         <div
           className={`flex items-center gap-2 p-3 ${getStatusColors("error").bg} ${getStatusColors("error").text} rounded-lg`}
         >
-          <AlertCircle className="w-5 h-5 flex-shrink-0" />
+          <AlertCircle className="w-5 h-5 shrink-0" />
           <span className="text-sm">{error}</span>
         </div>
       )}

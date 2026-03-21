@@ -133,7 +133,7 @@ export function AcceptanceCriteriaPanel({ data, size }: CanvasPanelComponentProp
                   criterion.status === "failed" && "border-red-500/30",
                 )}
               >
-                <div className="flex-shrink-0 mt-0.5">
+                <div className="shrink-0 mt-0.5">
                   <Icon className={cn("h-4 w-4", statusCfg.classes)} />
                 </div>
                 <div className="flex-1 min-w-0">

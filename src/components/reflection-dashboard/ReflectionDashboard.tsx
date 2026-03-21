@@ -614,9 +614,9 @@ export function ReflectionDashboard() {
                         className="w-full px-4 py-2 flex items-center gap-3 text-left hover:bg-muted/50 transition-colors"
                       >
                         {isExpanded ? (
-                          <ChevronDown className="w-3.5 h-3.5 flex-shrink-0" />
+                          <ChevronDown className="w-3.5 h-3.5 shrink-0" />
                         ) : (
-                          <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" />
+                          <ChevronRight className="w-3.5 h-3.5 shrink-0" />
                         )}
                         <span className="px-1.5 py-0.5 text-xs bg-purple-500/20 text-purple-300 rounded">
                           {FIX_TYPE_LABELS[fix.fix_type] || fix.fix_type}

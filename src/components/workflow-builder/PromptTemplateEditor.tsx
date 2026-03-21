@@ -258,7 +258,7 @@ export function PromptTemplateEditor({
             <textarea
               value={editorContent}
               onChange={(e) => handleContentChange(e.target.value)}
-              className="w-full h-64 px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-md text-sm text-zinc-200 font-mono resize-y focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              className="w-full h-64 px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-md text-sm text-zinc-200 font-mono resize-y focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
               placeholder="Enter your prompt template..."
             />
             <div className="mt-1 flex items-center justify-between text-xs text-zinc-500">

@@ -177,7 +177,7 @@ export function AuthConnectionSettings({
               value={runnerName}
               onChange={(e) => handleRunnerNameChange(e.target.value)}
               placeholder="My Runner"
-              className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+              className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
             />
           </label>
         </div>
@@ -213,7 +213,7 @@ export function AuthConnectionSettings({
                 </span>
                 {!connected && (
                   <ChevronDown
-                    className={`w-3.5 h-3.5 flex-shrink-0 transition-transform ${showProjectDropdown ? "rotate-180" : ""}`}
+                    className={`w-3.5 h-3.5 shrink-0 transition-transform ${showProjectDropdown ? "rotate-180" : ""}`}
                   />
                 )}
               </button>

@@ -70,7 +70,7 @@ export function SummaryStatsPanel({ data, size }: CanvasPanelComponentProps) {
         {/* Percentage */}
         <span
           className={cn(
-            "font-mono flex-shrink-0",
+            "font-mono shrink-0",
             isCompact ? "text-[10px]" : "text-xs",
             allPassed ? "text-green-500" : "text-muted-foreground",
           )}
@@ -82,20 +82,20 @@ export function SummaryStatsPanel({ data, size }: CanvasPanelComponentProps) {
       {/* Counts with colored dots */}
       <div className={cn("flex flex-wrap gap-x-4 gap-y-1", isCompact ? "text-[10px]" : "text-xs")}>
         <span className="flex items-center gap-1.5">
-          <span className="inline-block h-2 w-2 rounded-full bg-green-500 flex-shrink-0" />
+          <span className="inline-block h-2 w-2 rounded-full bg-green-500 shrink-0" />
           <span className="text-muted-foreground">
             <span className="font-mono text-foreground">{passed}</span> passed
           </span>
         </span>
         <span className="flex items-center gap-1.5">
-          <span className="inline-block h-2 w-2 rounded-full bg-red-500 flex-shrink-0" />
+          <span className="inline-block h-2 w-2 rounded-full bg-red-500 shrink-0" />
           <span className="text-muted-foreground">
             <span className="font-mono text-foreground">{failed}</span> failed
           </span>
         </span>
         {skipped > 0 && (
           <span className="flex items-center gap-1.5">
-            <span className="inline-block h-2 w-2 rounded-full bg-gray-400 flex-shrink-0" />
+            <span className="inline-block h-2 w-2 rounded-full bg-gray-400 shrink-0" />
             <span className="text-muted-foreground">
               <span className="font-mono text-foreground">{skipped}</span> skipped
             </span>

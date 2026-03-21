@@ -32,7 +32,7 @@ export const TraceToolbar: React.FC<TraceToolbarProps> = ({
         placeholder="Search spans..."
         value={filter.nameSearch}
         onChange={(e) => onFilterChange({ ...filter, nameSearch: e.target.value })}
-        className="w-40 px-2 py-1 bg-zinc-800 border border-zinc-700 rounded text-zinc-300 placeholder:text-zinc-600 focus:outline-none focus:border-zinc-500"
+        className="w-40 px-2 py-1 bg-zinc-800 border border-zinc-700 rounded text-zinc-300 placeholder:text-zinc-600 focus:outline-hidden focus:border-zinc-500"
       />
 
       {/* Min duration */}
@@ -46,7 +46,7 @@ export const TraceToolbar: React.FC<TraceToolbarProps> = ({
             minDurationMs: e.target.value ? Number(e.target.value) : null,
           })
         }
-        className="w-20 px-2 py-1 bg-zinc-800 border border-zinc-700 rounded text-zinc-300 placeholder:text-zinc-600 focus:outline-none focus:border-zinc-500"
+        className="w-20 px-2 py-1 bg-zinc-800 border border-zinc-700 rounded text-zinc-300 placeholder:text-zinc-600 focus:outline-hidden focus:border-zinc-500"
       />
 
       {/* Phase */}
@@ -55,7 +55,7 @@ export const TraceToolbar: React.FC<TraceToolbarProps> = ({
         onChange={(e) =>
           onFilterChange({ ...filter, phase: e.target.value as WorkflowPhase | "all" })
         }
-        className="px-2 py-1 bg-zinc-800 border border-zinc-700 rounded text-zinc-300 focus:outline-none focus:border-zinc-500"
+        className="px-2 py-1 bg-zinc-800 border border-zinc-700 rounded text-zinc-300 focus:outline-hidden focus:border-zinc-500"
       >
         {PHASE_OPTIONS.map((opt) => (
           <option key={opt.value} value={opt.value}>
@@ -73,7 +73,7 @@ export const TraceToolbar: React.FC<TraceToolbarProps> = ({
             status: e.target.value as "all" | "success" | "error",
           })
         }
-        className="px-2 py-1 bg-zinc-800 border border-zinc-700 rounded text-zinc-300 focus:outline-none focus:border-zinc-500"
+        className="px-2 py-1 bg-zinc-800 border border-zinc-700 rounded text-zinc-300 focus:outline-hidden focus:border-zinc-500"
       >
         <option value="all">All Status</option>
         <option value="success">Success</option>

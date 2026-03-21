@@ -197,7 +197,7 @@ function EditableWorkflowTitle({
           onBlur={commitEdit}
           onKeyDown={handleKeyDown}
           placeholder="Workflow name..."
-          className="text-lg font-semibold text-zinc-100 bg-transparent border-b border-zinc-500 focus:border-blue-500 outline-none px-0 py-0 min-w-[120px]"
+          className="text-lg font-semibold text-zinc-100 bg-transparent border-b border-zinc-500 focus:border-blue-500 outline-hidden px-0 py-0 min-w-[120px]"
         />
         {hasUnsavedChanges && <span className="text-zinc-500 ml-1">*</span>}
       </div>
@@ -244,8 +244,8 @@ function ToggleSwitch({
       aria-checked={checked}
       onClick={() => onChange(!checked)}
       className={`
-        relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent
-        transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
+        relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent
+        transition-colors duration-200 ease-in-out focus:outline-hidden focus:ring-2 focus:ring-blue-500/50
         ${checked ? "bg-blue-600" : "bg-zinc-600"}
       `}
     >
@@ -268,9 +268,9 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
   const visibleSections = getVisibleSections(WORKFLOW_SETTINGS_CONFIG, features);
 
   const inputClass =
-    "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50";
+    "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50";
   const selectClass =
-    "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50";
+    "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50";
 
   // ─── Setting Renderers ──────────────────────────────────────────────
 
@@ -365,7 +365,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
                   }
                   min={def.min}
                   max={def.max}
-                  className="w-24 px-2 py-1 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
+                  className="w-24 px-2 py-1 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50 text-sm"
                 />
                 <span className="text-sm text-zinc-500">seconds</span>
               </>
@@ -391,7 +391,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
           }
           min={def.min}
           max={def.max}
-          className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
         />
         {def.description && <p className="text-xs text-zinc-500 mt-1">{def.description}</p>}
       </div>
@@ -682,7 +682,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
                   onChange={(e) =>
                     updateWorkflow({ provider: e.target.value || undefined, model: undefined })
                   }
-                  className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                  className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-hidden focus:ring-2 focus:ring-purple-500/50"
                 >
                   {PROVIDER_OPTIONS.map((opt) => (
                     <option key={opt.value} value={opt.value}>
@@ -694,7 +694,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
                   <select
                     value={workflow.model ?? ""}
                     onChange={(e) => updateWorkflow({ model: e.target.value || undefined })}
-                    className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                    className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-hidden focus:ring-2 focus:ring-purple-500/50"
                   >
                     {MODELS_BY_PROVIDER[workflow.provider]!.map((opt) => (
                       <option key={opt.value} value={opt.value}>
@@ -755,7 +755,7 @@ function ResolvedModelPreview() {
       <div className="space-y-1">
         {rows.map((row) => (
           <div key={row.key} className="flex items-center gap-2 text-xs">
-            <span className="text-zinc-400 w-28 flex-shrink-0 truncate">{row.label}</span>
+            <span className="text-zinc-400 w-28 shrink-0 truncate">{row.label}</span>
             <span className="text-zinc-200 flex-1 truncate">{row.resolved.model}</span>
             <span
               className={`px-1.5 py-0.5 text-[10px] font-medium rounded ${badgeClass(row.resolved.source)}`}
@@ -838,7 +838,7 @@ function PerPhaseModelSelect() {
   })();
 
   const selectClass =
-    "flex-1 px-2 py-1.5 bg-zinc-700 border border-zinc-600 rounded text-zinc-200 text-xs focus:outline-none focus:ring-2 focus:ring-purple-500/50";
+    "flex-1 px-2 py-1.5 bg-zinc-700 border border-zinc-600 rounded text-zinc-200 text-xs focus:outline-hidden focus:ring-2 focus:ring-purple-500/50";
 
   return (
     <div className="bg-zinc-800/50 rounded-md overflow-hidden">
@@ -868,7 +868,7 @@ function PerPhaseModelSelect() {
             <select
               value={currentPreset}
               onChange={(e) => applyPreset(e.target.value)}
-              className="flex-1 px-2 py-1.5 bg-zinc-700 border border-zinc-600 rounded text-zinc-200 text-xs focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+              className="flex-1 px-2 py-1.5 bg-zinc-700 border border-zinc-600 rounded text-zinc-200 text-xs focus:outline-hidden focus:ring-2 focus:ring-purple-500/50"
             >
               <option value="custom">Custom</option>
               {MODEL_PRESETS.map((preset) => (
@@ -909,7 +909,7 @@ function PerPhaseModelSelect() {
             return (
               <div key={phase.key} className="flex items-center gap-2">
                 <span
-                  className="text-xs text-zinc-400 w-28 flex-shrink-0 truncate"
+                  className="text-xs text-zinc-400 w-28 shrink-0 truncate"
                   title={phase.label}
                 >
                   {phase.label}
@@ -1039,7 +1039,7 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
               value={healthCheck.name}
               onChange={(e) => updateField("name", e.target.value)}
               className="w-full px-2 py-1.5 text-sm bg-zinc-900 border border-zinc-600 rounded
-                         text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-blue-500"
+                         text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:border-blue-500"
               placeholder="e.g., Backend Server"
             />
           </div>
@@ -1052,7 +1052,7 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
               value={healthCheck.url}
               onChange={(e) => updateField("url", e.target.value)}
               className="w-full px-2 py-1.5 text-sm bg-zinc-900 border border-zinc-600 rounded
-                         text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-blue-500 font-mono"
+                         text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:border-blue-500 font-mono"
               placeholder="http://localhost:8000/health"
             />
           </div>
@@ -1068,7 +1068,7 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
                 value={healthCheck.expected_status ?? 200}
                 onChange={(e) => updateField("expected_status", parseInt(e.target.value) || 200)}
                 className="w-full px-2 py-1.5 text-sm bg-zinc-900 border border-zinc-600 rounded
-                           text-zinc-200 focus:outline-none focus:border-blue-500"
+                           text-zinc-200 focus:outline-hidden focus:border-blue-500"
                 min={100}
                 max={599}
               />
@@ -1082,7 +1082,7 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
                 value={healthCheck.timeout_seconds ?? 5}
                 onChange={(e) => updateField("timeout_seconds", parseInt(e.target.value) || 5)}
                 className="w-full px-2 py-1.5 text-sm bg-zinc-900 border border-zinc-600 rounded
-                           text-zinc-200 focus:outline-none focus:border-blue-500"
+                           text-zinc-200 focus:outline-hidden focus:border-blue-500"
                 min={1}
                 max={300}
               />
@@ -1101,8 +1101,8 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
               aria-checked={healthCheck.is_critical ?? true}
               onClick={() => updateField("is_critical", !(healthCheck.is_critical ?? true))}
               className={`
-                relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent
-                transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
+                relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent
+                transition-colors duration-200 ease-in-out focus:outline-hidden focus:ring-2 focus:ring-blue-500/50
                 ${(healthCheck.is_critical ?? true) ? "bg-red-600" : "bg-zinc-600"}
               `}
             >
@@ -2277,14 +2277,14 @@ function WorkflowBuilderContent({
                       align="end"
                     >
                       <DropdownMenu.Item
-                        className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
+                        className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-hidden hover:bg-muted/50 transition-colors"
                         onSelect={handleNewWorkflow}
                       >
                         <Plus className="w-3.5 h-3.5 text-muted-foreground" />
                         <span className="flex-1">New Workflow</span>
                       </DropdownMenu.Item>
                       <DropdownMenu.Item
-                        className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors disabled:opacity-50"
+                        className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-hidden hover:bg-muted/50 transition-colors disabled:opacity-50"
                         disabled={workflowsLoading}
                         onSelect={() => workflowFileInputRef.current?.click()}
                       >
@@ -2293,7 +2293,7 @@ function WorkflowBuilderContent({
                       </DropdownMenu.Item>
                       <DropdownMenu.Separator className="h-px bg-border/50 my-1" />
                       <DropdownMenu.Item
-                        className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
+                        className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-hidden hover:bg-muted/50 transition-colors"
                         asChild
                       >
                         <a
@@ -2355,7 +2355,7 @@ function WorkflowBuilderContent({
                 placeholder="Search workflows..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-9 pr-3 py-2 bg-muted border border-border rounded-lg text-sm focus:outline-none focus:border-border"
+                className="w-full pl-9 pr-3 py-2 bg-muted border border-border rounded-lg text-sm focus:outline-hidden focus:border-border"
               />
             </div>
             {/* Favorites filter */}
@@ -2437,7 +2437,7 @@ function WorkflowBuilderContent({
                     {/* Checkbox in selection mode */}
                     {isWorkflowSelectionMode && (
                       <div
-                        className={`flex-shrink-0 w-5 h-5 mt-0.5 rounded border-2 flex items-center justify-center transition-colors ${
+                        className={`shrink-0 w-5 h-5 mt-0.5 rounded border-2 flex items-center justify-center transition-colors ${
                           selectedWorkflowIds.has(workflow.id)
                             ? "bg-red-500 border-red-500"
                             : "border-muted-foreground"
@@ -2456,7 +2456,7 @@ function WorkflowBuilderContent({
                               e.stopPropagation();
                               toggleFavorite(workflow.id);
                             }}
-                            className="flex-shrink-0 p-0.5 rounded transition-colors hover:bg-white/10"
+                            className="shrink-0 p-0.5 rounded transition-colors hover:bg-white/10"
                             title={
                               workflow.is_favorite ? "Remove from favorites" : "Add to favorites"
                             }
@@ -2577,7 +2577,7 @@ function WorkflowBuilderContent({
                   align="end"
                 >
                   <DropdownMenu.Item
-                    className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors disabled:opacity-50"
+                    className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-hidden hover:bg-muted/50 transition-colors disabled:opacity-50"
                     disabled={!state.workflow.id || isExportingWorkflow}
                     onSelect={handleExportWorkflow}
                   >
@@ -2586,7 +2586,7 @@ function WorkflowBuilderContent({
                   </DropdownMenu.Item>
                   <DropdownMenu.Separator className="h-px bg-border/50 my-1" />
                   <DropdownMenu.Item
-                    className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors disabled:opacity-50"
+                    className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-hidden hover:bg-muted/50 transition-colors disabled:opacity-50"
                     disabled={isExportingSkills}
                     onSelect={handleOpenExportDialog}
                   >
@@ -2594,7 +2594,7 @@ function WorkflowBuilderContent({
                     <span className="flex-1">Export Skills</span>
                   </DropdownMenu.Item>
                   <DropdownMenu.Item
-                    className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors disabled:opacity-50"
+                    className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-hidden hover:bg-muted/50 transition-colors disabled:opacity-50"
                     disabled={isImportingSkills}
                     onSelect={() => skillFileInputRef.current?.click()}
                   >
@@ -2603,7 +2603,7 @@ function WorkflowBuilderContent({
                   </DropdownMenu.Item>
                   <DropdownMenu.Separator className="h-px bg-border/50 my-1" />
                   <DropdownMenu.Item
-                    className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
+                    className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-hidden hover:bg-muted/50 transition-colors"
                     onSelect={() => setShowCompositionBuilder(true)}
                   >
                     <Layers className="w-3.5 h-3.5 text-muted-foreground" />
@@ -2935,7 +2935,7 @@ function WorkflowBuilderContent({
 
           {/* Right: Step Configuration Panel */}
           {selectedStep && (
-            <div className="w-96 flex-shrink-0">
+            <div className="w-96 shrink-0">
               <StepConfigPanel
                 onClose={() => selectStep(null)}
                 onOpenWorkflowPicker={() => {

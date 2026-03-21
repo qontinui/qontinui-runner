@@ -88,7 +88,7 @@ function StepRow<T extends StepExecution>({
       <StepStatusBadge status={step.status} iconOnly size="md" />
 
       {/* Relative time */}
-      <span className="w-16 font-mono text-xs text-muted-foreground flex-shrink-0">
+      <span className="w-16 font-mono text-xs text-muted-foreground shrink-0">
         {formatRelativeTime(step.startTime)}
       </span>
 
@@ -96,7 +96,7 @@ function StepRow<T extends StepExecution>({
       {renderStepBadge ? (
         renderStepBadge(step)
       ) : (
-        <Badge variant="muted" className="text-xs flex-shrink-0">
+        <Badge variant="muted" className="text-xs shrink-0">
           {step.name}
         </Badge>
       )}
@@ -120,7 +120,7 @@ function StepRow<T extends StepExecution>({
 
       {/* Duration */}
       {step.durationMs !== undefined && (
-        <span className="font-mono text-xs text-muted-foreground flex-shrink-0">
+        <span className="font-mono text-xs text-muted-foreground shrink-0">
           {formatDuration(step.durationMs)}
         </span>
       )}
@@ -174,7 +174,7 @@ export function StepExecutionList<T extends StepExecution>({
   return (
     <div className={cn("flex flex-col", height, className)}>
       {/* Header */}
-      <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 flex-shrink-0">
+      <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 shrink-0">
         <h3 className="text-sm font-semibold text-foreground">{title}</h3>
         <Badge variant="muted" className="text-xs">
           {steps.length} step{steps.length !== 1 ? "s" : ""}

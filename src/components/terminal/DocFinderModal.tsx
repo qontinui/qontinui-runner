@@ -589,7 +589,7 @@ function SearchTab({
             value={searchQuery}
             onChange={(e) => onSearchQueryChange(e.target.value)}
             placeholder="Search by filename..."
-            className="flex-1 bg-transparent text-sm text-[#c0caf5] placeholder-[#565f89] outline-none"
+            className="flex-1 bg-transparent text-sm text-[#c0caf5] placeholder-[#565f89] outline-hidden"
           />
         </div>
       </div>
@@ -782,7 +782,7 @@ function ContentTab({
           onChange={(e) => onContentQueryChange(e.target.value)}
           placeholder="Describe the document you're looking for..."
           rows={2}
-          className="flex-1 bg-[#13141f] border border-[#2a2d3d] rounded px-3 py-2 text-sm text-[#c0caf5] placeholder-[#565f89] outline-none focus:border-[#7aa2f7] resize-none transition-colors"
+          className="flex-1 bg-[#13141f] border border-[#2a2d3d] rounded px-3 py-2 text-sm text-[#c0caf5] placeholder-[#565f89] outline-hidden focus:border-[#7aa2f7] resize-none transition-colors"
         />
         <button
           onClick={onSearch}

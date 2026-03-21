@@ -366,7 +366,7 @@ function NavItem({
       tabIndex={tabIndex}
       className={`
         w-full flex items-center gap-3 py-2 rounded-md text-sm font-medium
-        transition-all duration-200 outline-none
+        transition-all duration-200 outline-hidden
         focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2
         focus-visible:ring-offset-background
         px-3
@@ -380,7 +380,7 @@ function NavItem({
       aria-current={isActive ? "page" : undefined}
       aria-label={item.label}
     >
-      <Icon className={`w-4 h-4 flex-shrink-0 ${showActiveState ? "text-primary" : ""}`} />
+      <Icon className={`w-4 h-4 shrink-0 ${showActiveState ? "text-primary" : ""}`} />
       {!collapsed && (
         <>
           <span className="truncate flex-1 text-left">{item.label}</span>
@@ -434,7 +434,7 @@ function FlyoutItem({ item, isActive, onClick, index }: FlyoutItemProps) {
       {/* Icon */}
       <div
         className={`
-          flex-shrink-0 p-2 rounded-lg transition-all duration-200
+          shrink-0 p-2 rounded-lg transition-all duration-200
           ${isActive ? "bg-primary/15" : "bg-muted/30 group-hover:bg-muted/50"}
         `}
       >
@@ -466,7 +466,7 @@ function FlyoutItem({ item, isActive, onClick, index }: FlyoutItemProps) {
       </div>
 
       {/* Active indicator */}
-      {isActive && <div className="flex-shrink-0 w-1.5 h-1.5 rounded-full bg-primary mt-2" />}
+      {isActive && <div className="shrink-0 w-1.5 h-1.5 rounded-full bg-primary mt-2" />}
     </button>
   );
 }
@@ -558,7 +558,7 @@ function NavGroup({
         onClick={onToggle}
         className="w-full flex items-center justify-between px-2 py-1.5 text-xs
                    font-semibold text-muted-foreground/70 hover:text-muted-foreground
-                   transition-colors uppercase tracking-wider outline-none
+                   transition-colors uppercase tracking-wider outline-hidden
                    focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset"
         aria-expanded={isExpanded}
       >
@@ -741,7 +741,7 @@ function ProductModeSwitcher({ mode, onModeChange, collapsed }: ProductModeSwitc
           transition-all duration-150
           ${
             mode === "ai"
-              ? "bg-card text-foreground shadow-sm"
+              ? "bg-card text-foreground shadow-xs"
               : "text-muted-foreground hover:text-foreground"
           }
         `}
@@ -757,7 +757,7 @@ function ProductModeSwitcher({ mode, onModeChange, collapsed }: ProductModeSwitc
           transition-all duration-150
           ${
             mode === "visual"
-              ? "bg-card text-foreground shadow-sm"
+              ? "bg-card text-foreground shadow-xs"
               : "text-muted-foreground hover:text-foreground"
           }
         `}
@@ -1004,7 +1004,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         data-tutorial-id="sidebar"
         className={`
           h-full flex flex-col bg-card border-r border-border/50
-          transition-all duration-300 ease-in-out flex-shrink-0
+          transition-all duration-300 ease-in-out shrink-0
         `}
         style={{ width: collapsed ? SIDEBAR_WIDTH_COLLAPSED : SIDEBAR_WIDTH_EXPANDED }}
         aria-label="Main navigation"
@@ -1047,7 +1047,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
               className={`
                 w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm
                 text-muted-foreground hover:text-foreground hover:bg-muted/30
-                transition-colors outline-none
+                transition-colors outline-hidden
                 focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2
                 focus-visible:ring-offset-background
                 ${collapsed ? "justify-center px-0" : ""}

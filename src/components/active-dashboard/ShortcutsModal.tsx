@@ -37,7 +37,7 @@ interface ShortcutsModalProps {
  */
 function KeyBadge({ label }: { label: string }) {
   return (
-    <kbd className="inline-flex items-center justify-center min-w-[28px] h-7 px-2 text-xs font-mono font-semibold text-foreground bg-muted border border-border rounded-md shadow-sm">
+    <kbd className="inline-flex items-center justify-center min-w-[28px] h-7 px-2 text-xs font-mono font-semibold text-foreground bg-muted border border-border rounded-md shadow-xs">
       {label}
     </kbd>
   );
@@ -84,7 +84,7 @@ export function ShortcutsModal({ isOpen, onClose }: ShortcutsModalProps) {
           <h2 className="text-base font-semibold text-foreground">Keyboard Shortcuts</h2>
           <button
             onClick={onClose}
-            className="flex items-center justify-center w-7 h-7 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+            className="flex items-center justify-center w-7 h-7 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50"
             aria-label="Close shortcuts modal"
           >
             <svg
@@ -107,7 +107,7 @@ export function ShortcutsModal({ isOpen, onClose }: ShortcutsModalProps) {
           {SHORTCUTS.map((shortcut) => (
             <div key={shortcut.description} className="flex items-center justify-between gap-4">
               <span className="text-sm text-muted-foreground">{shortcut.description}</span>
-              <div className="flex items-center gap-1 flex-shrink-0">
+              <div className="flex items-center gap-1 shrink-0">
                 {shortcut.keys.map((key, i) => (
                   <span key={key} className="flex items-center gap-1">
                     {i > 0 && <span className="text-xs text-muted-foreground">+</span>}

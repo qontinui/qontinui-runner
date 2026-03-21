@@ -261,12 +261,12 @@ export function ArchitectureGraphPanel({ data }: CanvasPanelComponentProps) {
           .filter(([k]) => k !== "default")
           .map(([layer, colors]) => (
             <div key={layer} className="flex items-center gap-1.5 text-[10px]">
-              <div className="w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: colors.border }} />
+              <div className="w-2.5 h-2.5 rounded-xs" style={{ backgroundColor: colors.border }} />
               <span className="text-zinc-400 capitalize">{layer}</span>
             </div>
           ))}
         <div className="flex items-center gap-1.5 text-[10px] mt-1 pt-1 border-t border-border/30">
-          <div className="w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: CHANGED_BORDER }} />
+          <div className="w-2.5 h-2.5 rounded-xs" style={{ backgroundColor: CHANGED_BORDER }} />
           <span className="text-zinc-400">Changed</span>
         </div>
       </div>

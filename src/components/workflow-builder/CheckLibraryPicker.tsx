@@ -169,7 +169,7 @@ export function CheckLibraryPicker({ isOpen, onClose, onSelect, phase }: CheckLi
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-9 pr-3 py-2 text-sm bg-muted border border-border rounded-md
-                       focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
+                       focus:outline-hidden focus:ring-2 focus:ring-cyan-500/50"
               autoFocus
             />
           </div>
@@ -177,7 +177,7 @@ export function CheckLibraryPicker({ isOpen, onClose, onSelect, phase }: CheckLi
             value={filterType || ""}
             onChange={(e) => setFilterType(e.target.value || null)}
             className="px-3 py-2 text-sm bg-muted border border-border rounded-md
-                     focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
+                     focus:outline-hidden focus:ring-2 focus:ring-cyan-500/50"
           >
             <option value="">All Types</option>
             {checkTypes.map((type) => (

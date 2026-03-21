@@ -83,7 +83,7 @@ export function SpecSelector({
             >
               {/* Checkbox */}
               <div
-                className={`flex-shrink-0 w-5 h-5 rounded border flex items-center justify-center ${
+                className={`shrink-0 w-5 h-5 rounded border flex items-center justify-center ${
                   isSelected
                     ? "border-emerald-500 bg-emerald-500/20 text-emerald-400"
                     : "border-border bg-muted"

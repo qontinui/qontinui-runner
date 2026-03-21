@@ -27,9 +27,9 @@ export interface GeneralLogTabProps {
 function LogRow({ log }: { log: LogEntry }) {
   return (
     <div className="flex gap-2 py-0.5 hover:bg-muted/30 px-1 rounded">
-      <span className="text-muted-foreground/70 flex-shrink-0">[{log.timestamp}]</span>
+      <span className="text-muted-foreground/70 shrink-0">[{log.timestamp}]</span>
       <span
-        className={`flex-shrink-0 font-medium ${
+        className={`shrink-0 font-medium ${
           log.level === "error"
             ? getStatusColors("error").text
             : log.level === "warning"

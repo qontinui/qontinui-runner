@@ -75,7 +75,7 @@ export function RunHistoryPanel({ runs, onRunClick }: RunHistoryPanelProps) {
         {[...recentRuns].reverse().map((run) => (
           <div
             key={run.id}
-            className={`flex-1 rounded-sm transition-colors ${
+            className={`flex-1 rounded-xs transition-colors ${
               run.success
                 ? `${getAccentColors("green").bgSolid} hover:bg-green-400`
                 : run.status === "timeout"

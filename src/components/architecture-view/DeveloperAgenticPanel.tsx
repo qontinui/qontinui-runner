@@ -149,7 +149,7 @@ const AgentNode = memo(({ data }: { data: AgentNodeData }) => {
         <div className="flex items-center gap-1.5 mb-1">
           <span className="text-xs font-semibold text-white truncate flex-1">{agent.name}</span>
           <span
-            className="text-[9px] px-1.5 py-0.5 rounded-full capitalize font-medium flex-shrink-0"
+            className="text-[9px] px-1.5 py-0.5 rounded-full capitalize font-medium shrink-0"
             style={{
               background: colors.bg,
               color: colors.text,
@@ -160,7 +160,7 @@ const AgentNode = memo(({ data }: { data: AgentNodeData }) => {
           </span>
         </div>
         <div className="flex items-center gap-1 text-[10px] text-zinc-400">
-          <Zap className="w-2.5 h-2.5 flex-shrink-0" />
+          <Zap className="w-2.5 h-2.5 shrink-0" />
           <span>{agent.capabilities.length} capabilities</span>
         </div>
       </div>
@@ -330,7 +330,7 @@ function AgentDetailSidebar({ agent, agents, feedbackLoops, onClose }: AgentDeta
   );
 
   return (
-    <div className="w-80 bg-card border-l border-border/50 overflow-y-auto flex-shrink-0">
+    <div className="w-80 bg-card border-l border-border/50 overflow-y-auto shrink-0">
       {/* Header */}
       <div className="flex items-start justify-between p-4 border-b border-border/30">
         <div className="flex-1 min-w-0">
@@ -350,7 +350,7 @@ function AgentDetailSidebar({ agent, agents, feedbackLoops, onClose }: AgentDeta
         </div>
         <button
           onClick={onClose}
-          className="p-1 rounded hover:bg-muted/50 text-zinc-400 hover:text-white transition-colors flex-shrink-0"
+          className="p-1 rounded hover:bg-muted/50 text-zinc-400 hover:text-white transition-colors shrink-0"
           aria-label="Close detail sidebar"
         >
           <X className="w-3.5 h-3.5" />
@@ -446,7 +446,7 @@ function AgentDetailSidebar({ agent, agents, feedbackLoops, onClose }: AgentDeta
                 return (
                   <div key={targetId} className="flex items-center gap-1.5 text-xs">
                     <span
-                      className="w-1.5 h-1.5 rounded-full flex-shrink-0"
+                      className="w-1.5 h-1.5 rounded-full shrink-0"
                       style={{ backgroundColor: targetColors.accent }}
                     />
                     <span className="text-zinc-300">{target?.name ?? targetId}</span>
@@ -576,7 +576,7 @@ function FeedbackLoopsSection({ feedbackLoops, agents }: FeedbackLoopsSectionPro
 
             {/* Exit condition */}
             <div className="flex items-start gap-1.5 text-[10px] text-zinc-400">
-              <CircleStop className="w-3 h-3 flex-shrink-0 mt-0.5 text-red-400/70" />
+              <CircleStop className="w-3 h-3 shrink-0 mt-0.5 text-red-400/70" />
               <span>
                 <span className="font-medium text-zinc-500">Exit:</span> {loop.exitCondition}
               </span>

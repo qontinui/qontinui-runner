@@ -178,7 +178,7 @@ export function AiExplorationAdvisor({
                   value={goal}
                   onChange={(e) => setGoal(e.target.value)}
                   placeholder="Example: Test all login-related paths thoroughly, including error states and edge cases"
-                  className="w-full px-3 py-2 bg-muted border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-none focus:border-emerald-500 min-h-[100px]"
+                  className="w-full px-3 py-2 bg-muted border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-hidden focus:border-emerald-500 min-h-[100px]"
                 />
               </div>
 

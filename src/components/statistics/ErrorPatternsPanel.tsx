@@ -58,7 +58,7 @@ export function ErrorPatternsPanel({ patterns }: ErrorPatternsPanelProps) {
                   Last seen: {formatDate(pattern.last_seen)}
                 </p>
               </div>
-              <div className="text-right flex-shrink-0">
+              <div className="text-right shrink-0">
                 <div className={`text-lg font-bold ${getAccentColors("red").text}`}>
                   {pattern.count}
                 </div>

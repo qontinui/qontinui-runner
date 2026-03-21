@@ -317,7 +317,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                     }))
                   }
                   disabled={!settings.compression.enabled}
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Compress when context exceeds this token count
@@ -342,7 +342,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                     }))
                   }
                   disabled={!settings.compression.enabled}
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Target token count after compression
@@ -366,7 +366,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                     }))
                   }
                   disabled={!settings.compression.enabled}
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Recent items preserved (never compressed)
@@ -393,7 +393,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                     }))
                   }
                   disabled={!settings.compression.enabled}
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Items summarized together per batch
@@ -466,7 +466,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                     }))
                   }
                   disabled={!settings.retry.enabled}
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                 />
                 <p className="text-[10px] text-muted-foreground">Maximum retry attempts</p>
               </div>
@@ -489,7 +489,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                     }))
                   }
                   disabled={!settings.retry.enabled}
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Initial delay before first retry
@@ -514,7 +514,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                     }))
                   }
                   disabled={!settings.retry.enabled}
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Maximum delay cap for exponential backoff
@@ -542,7 +542,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                     }))
                   }
                   disabled={!settings.retry.enabled}
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   Delay multiplier: base_delay * base^attempt
@@ -652,7 +652,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                     }))
                   }
                   disabled={!settings.routing.enabled}
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                 >
                   {MODEL_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -679,7 +679,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                     }))
                   }
                   disabled={!settings.routing.enabled}
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                 >
                   {MODEL_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -706,7 +706,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                     }))
                   }
                   disabled={!settings.routing.enabled}
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                 >
                   {MODEL_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -740,7 +740,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                       }))
                     }
                     disabled={!settings.routing.enabled}
-                    className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                    className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                   />
                   <p className="text-[10px] text-muted-foreground">Max files for simple tasks</p>
                 </div>
@@ -765,7 +765,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                       }))
                     }
                     disabled={!settings.routing.enabled}
-                    className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                    className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
                   />
                   <p className="text-[10px] text-muted-foreground">
                     Max files for medium (above = complex)

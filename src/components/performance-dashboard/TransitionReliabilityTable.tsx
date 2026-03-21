@@ -103,7 +103,7 @@ export function TransitionReliabilityTable({
                     <span className="font-medium truncate max-w-24" title={metrics.from_state}>
                       {metrics.from_state}
                     </span>
-                    <ArrowRightLeft className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+                    <ArrowRightLeft className="w-3 h-3 text-muted-foreground shrink-0" />
                     <span className="font-medium truncate max-w-24" title={metrics.to_state}>
                       {metrics.to_state}
                     </span>

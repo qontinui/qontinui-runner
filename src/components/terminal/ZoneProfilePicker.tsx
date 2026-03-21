@@ -133,7 +133,7 @@ export function ZoneProfilePicker({
                     }
                   }}
                   placeholder="Profile name..."
-                  className="flex-1 bg-[#13141f] border border-[#2a2d3d] rounded px-1.5 py-0.5 text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-none focus:border-[#7aa2f7]"
+                  className="flex-1 bg-[#13141f] border border-[#2a2d3d] rounded px-1.5 py-0.5 text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-hidden focus:border-[#7aa2f7]"
                   maxLength={30}
                 />
                 <button

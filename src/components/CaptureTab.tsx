@@ -257,7 +257,7 @@ export function CaptureTab({ onLog }: CaptureTabProps) {
   return (
     <div className="h-full flex flex-col p-4 gap-4 overflow-hidden">
       {/* Header */}
-      <div className="flex-shrink-0 px-4 py-3 rounded-lg bg-muted/30">
+      <div className="shrink-0 px-4 py-3 rounded-lg bg-muted/30">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div
@@ -291,7 +291,7 @@ export function CaptureTab({ onLog }: CaptureTabProps) {
 
       {/* Settings Panel (collapsible) */}
       {showSettings && (
-        <div className="flex-shrink-0 px-4 py-3 rounded-lg bg-card/50 border border-border/50">
+        <div className="shrink-0 px-4 py-3 rounded-lg bg-card/50 border border-border/50">
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium text-muted-foreground">Video FPS</span>
@@ -319,7 +319,7 @@ export function CaptureTab({ onLog }: CaptureTabProps) {
       {/* Main Content */}
       <div className="flex-1 flex flex-col min-h-0 rounded-lg bg-card/50 overflow-hidden">
         {/* Recording Status */}
-        <div className="flex-shrink-0 p-4">
+        <div className="shrink-0 p-4">
           {error && (
             <div
               className={`mb-3 px-3 py-2 ${getStatusColors("error").bg} rounded-lg flex items-start gap-2`}
@@ -463,7 +463,7 @@ export function CaptureTab({ onLog }: CaptureTabProps) {
         </div>
 
         {/* Info Section */}
-        <div className="flex-shrink-0 mt-auto p-4 border-t border-border/30">
+        <div className="shrink-0 mt-auto p-4 border-t border-border/30">
           <div className="flex items-start gap-2 text-muted-foreground">
             <Info className="w-4 h-4 shrink-0 mt-0.5" />
             <div className="text-xs space-y-1">

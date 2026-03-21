@@ -397,7 +397,7 @@ export function SearchComparisonPanel({
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleSearch()}
               placeholder="Search by ID, label, text, or type..."
-              className="w-full pl-9 pr-3 py-2 text-sm bg-muted/30 border border-border/50 rounded-md focus:outline-none focus:ring-1 focus:ring-primary"
+              className="w-full pl-9 pr-3 py-2 text-sm bg-muted/30 border border-border/50 rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary"
             />
           </div>
           <Button onClick={handleSearch} disabled={!query.trim() || isSearching}>

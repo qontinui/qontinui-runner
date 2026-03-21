@@ -79,7 +79,7 @@ export function LibraryBuilderLayout<T extends { id: string; name: string }>({
                 value={builder.searchQuery}
                 onChange={(e) => builder.setSearchQuery(e.target.value)}
                 className="w-full pl-9 pr-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                  placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                  placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                   text-foreground"
               />
             </div>

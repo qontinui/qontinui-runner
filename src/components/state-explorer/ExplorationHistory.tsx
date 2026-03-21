@@ -98,7 +98,7 @@ export function ExplorationHistory({ onSelectRun }: ExplorationHistoryProps) {
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
-      <div className="flex-shrink-0 p-4 border-b border-border">
+      <div className="shrink-0 p-4 border-b border-border">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <History className="w-5 h-5 text-primary" />
@@ -131,7 +131,7 @@ export function ExplorationHistory({ onSelectRun }: ExplorationHistoryProps) {
       {/* Error Display */}
       {error && (
         <div className="mx-4 mt-4 p-3 bg-destructive/10 text-destructive rounded-lg text-sm flex items-center gap-2">
-          <AlertCircle className="w-4 h-4 flex-shrink-0" />
+          <AlertCircle className="w-4 h-4 shrink-0" />
           <span>{error}</span>
         </div>
       )}
@@ -159,7 +159,7 @@ export function ExplorationHistory({ onSelectRun }: ExplorationHistoryProps) {
               >
                 <div className="flex items-start gap-3">
                   {/* Status Icon */}
-                  <div className="flex-shrink-0 mt-0.5">{getStatusIcon(item)}</div>
+                  <div className="shrink-0 mt-0.5">{getStatusIcon(item)}</div>
 
                   {/* Content */}
                   <div className="flex-1 min-w-0">
@@ -171,7 +171,7 @@ export function ExplorationHistory({ onSelectRun }: ExplorationHistoryProps) {
                         </span>
                         {getStatusBadge(item)}
                       </div>
-                      <span className="text-xs text-muted-foreground flex items-center gap-1 flex-shrink-0">
+                      <span className="text-xs text-muted-foreground flex items-center gap-1 shrink-0">
                         <Clock className="w-3 h-3" />
                         {formatDate(item.started_at)}
                       </span>

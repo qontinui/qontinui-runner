@@ -283,11 +283,11 @@ function ActionRow({ action, isActive }: { action: ActionItem; isActive: boolean
     >
       <StatusIcon status={action.status} />
 
-      <span className="w-14 font-mono text-xs text-muted-foreground flex-shrink-0">
+      <span className="w-14 font-mono text-xs text-muted-foreground shrink-0">
         {relativeTime}
       </span>
 
-      <Badge className={cn(colorClass, "text-xs flex-shrink-0")}>{action.action_type}</Badge>
+      <Badge className={cn(colorClass, "text-xs shrink-0")}>{action.action_type}</Badge>
 
       <div className="flex-1 min-w-0">
         <span className="font-mono text-sm text-foreground truncate block">{action.target}</span>
@@ -300,7 +300,7 @@ function ActionRow({ action, isActive }: { action: ActionItem; isActive: boolean
       </div>
 
       {action.duration && (
-        <span className="font-mono text-xs text-muted-foreground flex-shrink-0">
+        <span className="font-mono text-xs text-muted-foreground shrink-0">
           {action.duration}ms
         </span>
       )}
@@ -352,7 +352,7 @@ function RecognitionRow({ result }: { result: ImageRecognitionResult }) {
 
   return (
     <div className="flex items-center gap-3 rounded-lg bg-muted/30 p-2.5">
-      <div className="h-8 w-8 rounded bg-muted/50 flex items-center justify-center flex-shrink-0">
+      <div className="h-8 w-8 rounded bg-muted/50 flex items-center justify-center shrink-0">
         <ImageIcon className="h-4 w-4 text-muted-foreground" />
       </div>
       <div className="flex-1 min-w-0">
@@ -360,7 +360,7 @@ function RecognitionRow({ result }: { result: ImageRecognitionResult }) {
           <p className="font-mono text-xs text-foreground truncate">{result.template}</p>
           <Badge
             className={cn(
-              "text-[10px] flex-shrink-0 border",
+              "text-[10px] shrink-0 border",
               result.found
                 ? cn(successColors.bg, successColors.text, successColors.border)
                 : cn(errorColors.bg, errorColors.text, errorColors.border),
@@ -371,7 +371,7 @@ function RecognitionRow({ result }: { result: ImageRecognitionResult }) {
         </div>
         <div className="mt-1 flex items-center gap-2">
           <Progress value={result.confidence} className="h-1 flex-1" />
-          <span className="font-mono text-[10px] text-muted-foreground flex-shrink-0">
+          <span className="font-mono text-[10px] text-muted-foreground shrink-0">
             {result.confidence.toFixed(1)}%
           </span>
         </div>

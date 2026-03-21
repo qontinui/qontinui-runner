@@ -141,7 +141,7 @@ function TagInput({ tags, onChange }: TagInputProps) {
           onKeyDown={handleKeyDown}
           placeholder="Add a tag..."
           className="flex-1 px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-            placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+            placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
             text-foreground"
         />
         <button
@@ -383,7 +383,7 @@ function CheckGroupEditor({ builder }: CheckGroupEditorProps) {
               onChange={(e) => updateField("name", e.target.value)}
               placeholder="Group name..."
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground"
             />
           </div>
@@ -396,7 +396,7 @@ function CheckGroupEditor({ builder }: CheckGroupEditorProps) {
               placeholder="What does this group of checks verify?"
               rows={3}
               className="w-full px-3 py-2 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground resize-y"
             />
           </div>
@@ -417,7 +417,7 @@ function CheckGroupEditor({ builder }: CheckGroupEditorProps) {
               value={formState.run_in_parallel ? "parallel" : "sequential"}
               onChange={(e) => updateField("run_in_parallel", e.target.value === "parallel")}
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
             >
               {RUN_MODE_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value}>

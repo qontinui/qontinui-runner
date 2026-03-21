@@ -161,7 +161,7 @@ export function AiContextGenerator({ onContextGenerated, onCancel }: AiContextGe
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder="Example: Best practices for handling network timeouts in Playwright tests, including retry strategies and timeout configuration"
-                className="flex-1 px-3 py-2 bg-muted border border-border rounded text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-none focus:border-blue-500 min-h-[100px]"
+                className="flex-1 px-3 py-2 bg-muted border border-border rounded text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-hidden focus:border-blue-500 min-h-[100px]"
               />
             </div>
 

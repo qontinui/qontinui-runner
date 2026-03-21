@@ -107,7 +107,7 @@ function TestRow({ test }: { test: TestSpec }) {
         )}
       </div>
 
-      <div className="flex items-center gap-2 flex-shrink-0">
+      <div className="flex items-center gap-2 shrink-0">
         <Badge variant={getStatusBadgeVariant(test.status)} size="sm">
           {test.status}
         </Badge>

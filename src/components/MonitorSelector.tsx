@@ -128,7 +128,7 @@ export function MonitorSelector({
         <div
           className={`flex items-start gap-2 p-2 ${getAccentColors("blue").bg} border ${getAccentColors("blue").border} rounded-lg text-xs`}
         >
-          <Info className={`w-4 h-4 flex-shrink-0 ${getAccentColors("blue").text} mt-0.5`} />
+          <Info className={`w-4 h-4 shrink-0 ${getAccentColors("blue").text} mt-0.5`} />
           <div className={getAccentColors("blue").text}>
             Monitors are configured per element in qontinui-web. To change monitors, update your
             workflow configuration.

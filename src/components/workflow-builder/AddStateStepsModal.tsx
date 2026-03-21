@@ -318,7 +318,7 @@ export function AddStateStepsModal({
       {/* Modal */}
       <div className="relative w-full max-w-2xl max-h-[85vh] bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl flex flex-col">
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-700 flex-shrink-0">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-700 shrink-0">
           <div className="flex items-center gap-3">
             <div className="p-2 rounded-lg bg-purple-500/20">
               <Plus className="w-5 h-5 text-purple-400" />
@@ -348,7 +348,7 @@ export function AddStateStepsModal({
             </div>
           ) : !hasConfig ? (
             <div className="flex items-start gap-3 p-4 bg-amber-500/10 border border-amber-500/30 rounded-lg">
-              <AlertCircle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+              <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
               <div>
                 <p className="text-amber-400 font-medium">No Configuration Loaded</p>
                 <p className="text-sm text-zinc-400 mt-1">
@@ -359,7 +359,7 @@ export function AddStateStepsModal({
             </div>
           ) : states.length === 0 ? (
             <div className="flex items-start gap-3 p-4 bg-amber-500/10 border border-amber-500/30 rounded-lg">
-              <AlertCircle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+              <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
               <div>
                 <p className="text-amber-400 font-medium">No States Found</p>
                 <p className="text-sm text-zinc-400 mt-1">
@@ -374,7 +374,7 @@ export function AddStateStepsModal({
                 className={`flex items-start gap-3 p-3 ${configTypeInfo.bgColor} border ${configTypeInfo.borderColor} rounded-lg`}
               >
                 <configTypeInfo.icon
-                  className={`w-5 h-5 ${configTypeInfo.iconColor} flex-shrink-0 mt-0.5`}
+                  className={`w-5 h-5 ${configTypeInfo.iconColor} shrink-0 mt-0.5`}
                 />
                 <div className="flex-1">
                   <div className="flex items-center gap-2">
@@ -716,7 +716,7 @@ export function AddStateStepsModal({
               {/* Error display */}
               {error && (
                 <div className="flex items-start gap-3 p-4 bg-red-500/10 border border-red-500/30 rounded-lg">
-                  <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+                  <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
                   <p className="text-red-400 text-sm">{error}</p>
                 </div>
               )}
@@ -725,7 +725,7 @@ export function AddStateStepsModal({
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-zinc-700 flex-shrink-0">
+        <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-zinc-700 shrink-0">
           <button
             onClick={onClose}
             className="px-4 py-2 text-sm font-medium text-zinc-400 hover:text-zinc-200 transition-colors"

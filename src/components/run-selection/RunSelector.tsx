@@ -210,7 +210,7 @@ function RunItem({
       )}
 
       {/* Selection Indicator */}
-      {isSelected && <CheckCircle className="w-4 h-4 text-primary flex-shrink-0" />}
+      {isSelected && <CheckCircle className="w-4 h-4 text-primary shrink-0" />}
     </button>
   );
 }

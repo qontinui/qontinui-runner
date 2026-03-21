@@ -141,7 +141,7 @@ export function StateExplorationResultsViewer() {
         <button aria-label="screenshot thumbnail filmstrip capture navigator" tabIndex={-1} />
       </div>
       {/* Header */}
-      <div className="flex-shrink-0 px-6 py-4 border-b border-border-primary bg-surface-primary">
+      <div className="shrink-0 px-6 py-4 border-b border-border-primary bg-surface-primary">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             {viewMode === "detail" && (
@@ -161,7 +161,7 @@ export function StateExplorationResultsViewer() {
               onClick={() => setViewMode("dashboard")}
               className={`px-3 py-1.5 text-sm rounded-md transition-colors ${
                 viewMode === "dashboard"
-                  ? "bg-background shadow-sm text-foreground"
+                  ? "bg-background shadow-xs text-foreground"
                   : "text-muted-foreground hover:text-foreground"
               }`}
             >
@@ -171,7 +171,7 @@ export function StateExplorationResultsViewer() {
               onClick={() => setViewMode("history")}
               className={`px-3 py-1.5 text-sm rounded-md transition-colors ${
                 viewMode === "history"
-                  ? "bg-background shadow-sm text-foreground"
+                  ? "bg-background shadow-xs text-foreground"
                   : "text-muted-foreground hover:text-foreground"
               }`}
             >
@@ -460,7 +460,7 @@ function HistoryRow({
           {item.config_name || "Unknown Config"}
         </span>
         {item.strategy && <StrategyBadge strategy={item.strategy} />}
-        <span className="text-xs text-muted-foreground flex-shrink-0">
+        <span className="text-xs text-muted-foreground shrink-0">
           {item.started_at ? new Date(item.started_at).toLocaleString() : "—"}
         </span>
       </div>
@@ -747,7 +747,7 @@ function ScreenshotFilmstrip({
           onClick={() => onSelect(idx)}
           role="option"
           aria-selected={idx === selectedIndex}
-          className={`flex-shrink-0 rounded border-2 transition-colors overflow-hidden ${
+          className={`shrink-0 rounded border-2 transition-colors overflow-hidden ${
             idx === selectedIndex
               ? "border-blue-500"
               : "border-transparent hover:border-border-secondary"

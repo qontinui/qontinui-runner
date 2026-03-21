@@ -40,7 +40,7 @@ export function ConfigurationLoadMenu({ onLoadFromFile, onLoadRAG }: Configurati
         >
           {/* Load from File */}
           <DropdownMenu.Item
-            className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
+            className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-hidden hover:bg-muted/50 transition-colors"
             onSelect={() => {
               setOpen(false);
               onLoadFromFile();
@@ -55,7 +55,7 @@ export function ConfigurationLoadMenu({ onLoadFromFile, onLoadRAG }: Configurati
 
           {/* Load RAG */}
           <DropdownMenu.Item
-            className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
+            className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-hidden hover:bg-muted/50 transition-colors"
             onSelect={() => {
               setOpen(false);
               onLoadRAG();

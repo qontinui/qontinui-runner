@@ -148,7 +148,7 @@ export function SchedulerSettings({
               onChange={(e) => setMaxConcurrent(Math.max(1, parseInt(e.target.value, 10) || 1))}
               min={1}
               max={10}
-              className="w-20 px-3 py-2 text-center bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
+              className="w-20 px-3 py-2 text-center bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50"
             />
           </div>
         </div>
@@ -189,7 +189,7 @@ export function SchedulerSettings({
               value={timezone}
               onChange={(e) => setTimezone(e.target.value)}
               placeholder="e.g., America/New_York"
-              className="w-48 px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
+              className="w-48 px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50"
             />
           </div>
         </div>

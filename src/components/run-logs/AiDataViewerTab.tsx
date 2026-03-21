@@ -267,7 +267,7 @@ function SidebarNav({
   ];
 
   return (
-    <div className="w-56 flex-shrink-0 border-r border-border bg-muted/30 overflow-y-auto">
+    <div className="w-56 shrink-0 border-r border-border bg-muted/30 overflow-y-auto">
       <div className="p-2 space-y-1">
         {navGroups.map((group) => {
           const isExpanded = expandedGroups.has(group.id);
@@ -283,9 +283,9 @@ function SidebarNav({
                 }`}
               >
                 {isExpanded ? (
-                  <ChevronDown className="w-4 h-4 flex-shrink-0" />
+                  <ChevronDown className="w-4 h-4 shrink-0" />
                 ) : (
-                  <ChevronRight className="w-4 h-4 flex-shrink-0" />
+                  <ChevronRight className="w-4 h-4 shrink-0" />
                 )}
                 {group.icon}
                 <span className="flex-1 text-left">{group.label}</span>
@@ -347,9 +347,9 @@ function AiOutputChunkItem({
         className="w-full flex items-center gap-2 px-3 py-2 bg-muted/50 border-b border-border hover:bg-muted/80 transition-colors text-left"
       >
         {isExpanded ? (
-          <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+          <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
         ) : (
-          <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+          <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
         )}
         <span
           className={`px-2 py-0.5 text-xs font-medium rounded ${
@@ -456,9 +456,9 @@ function EventsDisplay({ events }: { events: TaskRunEvent[] }) {
             className="w-full flex items-center gap-2 px-3 py-2 bg-card hover:bg-muted/50 transition-colors text-left"
           >
             {expandedIds.has(event.id) ? (
-              <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+              <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
             ) : (
-              <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+              <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
             )}
             <span
               className={`px-2 py-0.5 text-xs font-medium rounded ${
@@ -669,12 +669,12 @@ function PlaywrightResultsDisplay({ taskRunId }: { taskRunId: string }) {
               >
                 {hasExpandableContent ? (
                   isExpanded ? (
-                    <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                    <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
                   ) : (
-                    <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                    <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
                   )
                 ) : (
-                  <div className="w-4 h-4 flex-shrink-0" />
+                  <div className="w-4 h-4 shrink-0" />
                 )}
                 {statusStyle.icon}
                 <span className="font-medium flex-1 truncate">{result.test_name}</span>
@@ -990,12 +990,12 @@ function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
               >
                 {hasExpandableContent ? (
                   isExpanded ? (
-                    <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                    <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
                   ) : (
-                    <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                    <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
                   )
                 ) : (
-                  <div className="w-4 h-4 flex-shrink-0" />
+                  <div className="w-4 h-4 shrink-0" />
                 )}
                 <span
                   className={`px-2 py-0.5 text-xs font-medium rounded ${methodStyle.bg} ${methodStyle.text}`}
@@ -1305,7 +1305,7 @@ function LoadedConfigSection() {
   return (
     <div className="flex flex-col h-full space-y-4">
       {config.meta && (
-        <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md space-y-1 flex-shrink-0">
+        <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md space-y-1 shrink-0">
           {config.meta.source_path && (
             <div>
               <span className="font-medium">Source:</span> {config.meta.source_path}
@@ -1382,7 +1382,7 @@ function AiPromptSection() {
     <div className="flex flex-col h-full space-y-4">
       {/* Show task run info */}
       {selectedRun && (
-        <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md space-y-1 flex-shrink-0">
+        <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md space-y-1 shrink-0">
           <div>
             <span className="font-medium">Task:</span> {selectedRun.task_name}
           </div>
@@ -2354,12 +2354,12 @@ function AwasStepsSection() {
               >
                 {hasExpandableContent ? (
                   isExpanded ? (
-                    <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                    <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
                   ) : (
-                    <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                    <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
                   )
                 ) : (
-                  <div className="w-4 h-4 flex-shrink-0" />
+                  <div className="w-4 h-4 shrink-0" />
                 )}
                 {step.success ? (
                   <CheckCircle className={`w-4 h-4 ${getStatusColors("success").icon}`} />
@@ -2543,7 +2543,7 @@ function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
               >
                 {/* Status indicator */}
                 <div
-                  className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                  className={`w-2 h-2 rounded-full shrink-0 ${
                     call.success ? "bg-green-500" : "bg-red-500"
                   }`}
                 />
@@ -2566,15 +2566,15 @@ function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
                 </div>
 
                 {/* Duration */}
-                <span className="text-xs text-muted-foreground flex-shrink-0">
+                <span className="text-xs text-muted-foreground shrink-0">
                   {call.duration_ms}ms
                 </span>
 
                 {/* Expand chevron */}
                 {isExpanded ? (
-                  <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                  <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
                 ) : (
-                  <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                  <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
                 )}
               </button>
 
@@ -2874,7 +2874,7 @@ function ExecutionSpansSection() {
                         {formatDurationMs(duration)}
                       </span>
                       {!span.success && (
-                        <XCircle className="w-3.5 h-3.5 text-destructive flex-shrink-0" />
+                        <XCircle className="w-3.5 h-3.5 text-destructive shrink-0" />
                       )}
                     </div>
                   );
@@ -2903,14 +2903,14 @@ function ExecutionSpansSection() {
                       className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted/50 transition-colors"
                     >
                       {isExpanded ? (
-                        <ChevronDown className="w-3.5 h-3.5 flex-shrink-0 text-muted-foreground" />
+                        <ChevronDown className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
                       ) : (
-                        <ChevronRight className="w-3.5 h-3.5 flex-shrink-0 text-muted-foreground" />
+                        <ChevronRight className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
                       )}
                       {span.success ? (
-                        <CheckCircle className="w-3.5 h-3.5 flex-shrink-0 text-green-500" />
+                        <CheckCircle className="w-3.5 h-3.5 shrink-0 text-green-500" />
                       ) : (
-                        <XCircle className="w-3.5 h-3.5 flex-shrink-0 text-destructive" />
+                        <XCircle className="w-3.5 h-3.5 shrink-0 text-destructive" />
                       )}
                       <span className={`font-mono text-xs ${getSpanColor(span.name)}`}>
                         {span.name}
@@ -3087,9 +3087,9 @@ function MobileStateSection() {
                 className="w-full flex items-center gap-3 p-3 hover:bg-muted/50 transition-colors"
               >
                 {expandedIds.has(state.id) ? (
-                  <ChevronDown className="w-4 h-4 flex-shrink-0" />
+                  <ChevronDown className="w-4 h-4 shrink-0" />
                 ) : (
-                  <ChevronRight className="w-4 h-4 flex-shrink-0" />
+                  <ChevronRight className="w-4 h-4 shrink-0" />
                 )}
                 <div className="flex-1 flex items-center gap-3">
                   <span
@@ -3311,13 +3311,13 @@ function MobileLogsSection() {
               key={log.id}
               className={`flex gap-2 p-1 hover:bg-muted/50 rounded ${getLogLevelStyle(log.log_level)}`}
             >
-              <span className="text-muted-foreground flex-shrink-0 w-20">
+              <span className="text-muted-foreground shrink-0 w-20">
                 {new Date(log.timestamp).toLocaleTimeString()}
               </span>
-              <span className="flex-shrink-0 w-6 text-center font-bold">
+              <span className="shrink-0 w-6 text-center font-bold">
                 {log.log_level?.charAt(0).toUpperCase() || "-"}
               </span>
-              <span className="flex-shrink-0 w-24 truncate text-muted-foreground">
+              <span className="shrink-0 w-24 truncate text-muted-foreground">
                 {log.log_tag || log.log_source}
               </span>
               <span className="flex-1 break-all">{log.message}</span>
@@ -3399,18 +3399,18 @@ function MobileErrorsSection() {
               className="w-full flex items-center gap-3 p-3 hover:bg-destructive/10 transition-colors text-left"
             >
               {expandedIds.has(err.id) ? (
-                <ChevronDown className="w-4 h-4 flex-shrink-0" />
+                <ChevronDown className="w-4 h-4 shrink-0" />
               ) : (
-                <ChevronRight className="w-4 h-4 flex-shrink-0" />
+                <ChevronRight className="w-4 h-4 shrink-0" />
               )}
-              <AlertCircle className="w-4 h-4 flex-shrink-0 text-destructive" />
+              <AlertCircle className="w-4 h-4 shrink-0 text-destructive" />
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium truncate text-destructive">
                   {err.error_type || err.log_tag || "Error"}
                 </div>
                 <div className="text-xs text-muted-foreground truncate">{err.message}</div>
               </div>
-              <span className="text-xs text-muted-foreground flex-shrink-0">
+              <span className="text-xs text-muted-foreground shrink-0">
                 {new Date(err.timestamp).toLocaleTimeString()}
               </span>
             </button>
@@ -3802,7 +3802,7 @@ function ProcessSessionOutputSection({
               placeholder="Filter lines by text..."
               value={searchText}
               onChange={(e) => setSearchText(e.target.value)}
-              className="w-full pl-8 pr-3 py-1.5 text-xs rounded-md border border-border bg-muted/50 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+              className="w-full pl-8 pr-3 py-1.5 text-xs rounded-md border border-border bg-muted/50 text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-ring"
             />
             {searchText && (
               <button

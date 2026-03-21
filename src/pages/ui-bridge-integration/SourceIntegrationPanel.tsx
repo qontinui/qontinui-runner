@@ -165,7 +165,7 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
               onChange={(e) => setProjectPath(e.target.value)}
               placeholder="C:\Users\you\projects\my-app"
               className="w-full pl-9 pr-3 py-1.5 text-sm rounded border border-border bg-background
-                         placeholder:text-muted-foreground focus:outline-none focus:border-cyan-500/50"
+                         placeholder:text-muted-foreground focus:outline-hidden focus:border-cyan-500/50"
             />
           </div>
           <button

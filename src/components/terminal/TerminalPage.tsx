@@ -1371,7 +1371,7 @@ export function TerminalPage({
               e.stopPropagation();
             }}
             placeholder="Search across all session output..."
-            className="flex-1 bg-[#1a1b26] border border-[#2a2d3d] rounded px-2 py-0.5 text-xs text-[#c0caf5] placeholder-[#565f89] outline-none focus:border-[#7aa2f7] transition-colors"
+            className="flex-1 bg-[#1a1b26] border border-[#2a2d3d] rounded px-2 py-0.5 text-xs text-[#c0caf5] placeholder-[#565f89] outline-hidden focus:border-[#7aa2f7] transition-colors"
           />
           {outputSearch &&
             (() => {

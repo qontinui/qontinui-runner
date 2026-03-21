@@ -110,7 +110,7 @@ export function ExplorationPanel({ onViewReport }: ExplorationPanelProps) {
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
-      <div className="flex-shrink-0 p-4 border-b border-border">
+      <div className="shrink-0 p-4 border-b border-border">
         <div className="flex items-center gap-3">
           <FileSearch className="w-5 h-5 text-primary" />
           <h2 className="text-lg font-semibold">State Explorer</h2>
@@ -123,7 +123,7 @@ export function ExplorationPanel({ onViewReport }: ExplorationPanelProps) {
       {/* Error Display */}
       {error && (
         <div className="mx-4 mt-4 p-3 bg-destructive/10 text-destructive rounded-lg text-sm flex items-center gap-2">
-          <AlertCircle className="w-4 h-4 flex-shrink-0" />
+          <AlertCircle className="w-4 h-4 shrink-0" />
           <span className="flex-1">{error}</span>
           <button onClick={clearError} className="text-destructive/70 hover:text-destructive">
             Dismiss
@@ -154,7 +154,7 @@ export function ExplorationPanel({ onViewReport }: ExplorationPanelProps) {
             value={strategy}
             onChange={(e) => setStrategy(e.target.value)}
             disabled={strategiesLoading || explorationRunning}
-            className="w-full px-3 py-2 bg-input border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+            className="w-full px-3 py-2 bg-input border border-border rounded-lg text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
           >
             {strategies.map((s) => (
               <option key={s.id} value={s.id}>
@@ -180,7 +180,7 @@ export function ExplorationPanel({ onViewReport }: ExplorationPanelProps) {
               onChange={(e) => setMaxStates(parseInt(e.target.value) || 0)}
               min={0}
               disabled={explorationRunning}
-              className="w-full px-3 py-2 bg-input border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+              className="w-full px-3 py-2 bg-input border border-border rounded-lg text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
               placeholder="0 = unlimited"
             />
             <p className="text-xs text-muted-foreground">0 = visit all states</p>
@@ -254,7 +254,7 @@ export function ExplorationPanel({ onViewReport }: ExplorationPanelProps) {
                   max={5000}
                   step={100}
                   disabled={explorationRunning}
-                  className="w-full px-3 py-2 bg-input border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                  className="w-full px-3 py-2 bg-input border border-border rounded-lg text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
                 />
                 <p className="text-xs text-muted-foreground">
                   Delay between visiting states (default: 500ms)
@@ -270,7 +270,7 @@ export function ExplorationPanel({ onViewReport }: ExplorationPanelProps) {
                   onChange={(e) => setMaxDurationSeconds(parseInt(e.target.value) || 0)}
                   min={0}
                   disabled={explorationRunning}
-                  className="w-full px-3 py-2 bg-input border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                  className="w-full px-3 py-2 bg-input border border-border rounded-lg text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
                   placeholder="0 = unlimited"
                 />
                 <p className="text-xs text-muted-foreground">0 = no time limit</p>
@@ -284,7 +284,7 @@ export function ExplorationPanel({ onViewReport }: ExplorationPanelProps) {
       </div>
 
       {/* Action Buttons */}
-      <div className="flex-shrink-0 p-4 border-t border-border flex gap-3">
+      <div className="shrink-0 p-4 border-t border-border flex gap-3">
         <button
           onClick={handlePreview}
           disabled={!canRunExploration || previewLoading}

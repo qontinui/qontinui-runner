@@ -195,7 +195,7 @@ function WorkflowStageIndicator({
             // Current stage: fully colored with smooth glow animation
             stageClasses += ` ${colors.bg} ${colors.text} ${colors.border} border-2`;
             if (isRunning) {
-              stageClasses += " animate-phase-glow shadow-sm";
+              stageClasses += " animate-phase-glow shadow-xs";
             }
           } else if (isPast || isPhaseComplete) {
             // Past stage or completed: success indicator
@@ -363,7 +363,7 @@ export function ControlBar({
       </div>
 
       {/* Center: Workflow Stage Indicator (for orchestrated) or Phase Badge + Status */}
-      <div className="flex items-center gap-3 flex-shrink-0">
+      <div className="flex items-center gap-3 shrink-0">
         {/* Show plan phase indicator for plan workflows */}
         {isOrchestrated && isPlan && (
           <PlanPhaseIndicator
@@ -432,7 +432,7 @@ export function ControlBar({
       </div>
 
       {/* Right: Controls and Task List */}
-      <div className="flex items-center gap-4 flex-shrink-0 flex-1 justify-end">
+      <div className="flex items-center gap-4 shrink-0 flex-1 justify-end">
         {/* Playback Controls */}
         <div className="flex items-center gap-2">
           <Button

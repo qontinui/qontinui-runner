@@ -55,7 +55,7 @@ export function PlaywrightSummary({ isActive, onRequestFocus, className }: BaseW
       )}
     >
       {/* Icon */}
-      <div className="flex-shrink-0">
+      <div className="shrink-0">
         {data.isRunning ? (
           <Loader2 className={cn("h-5 w-5 animate-spin", purpleColors.text)} />
         ) : (
@@ -99,7 +99,7 @@ export function PlaywrightSummary({ isActive, onRequestFocus, className }: BaseW
 
       {/* Duration */}
       {data.durationMs > 0 && (
-        <span className="text-xs text-muted-foreground font-mono flex-shrink-0">
+        <span className="text-xs text-muted-foreground font-mono shrink-0">
           {formatDuration(data.durationMs)}
         </span>
       )}

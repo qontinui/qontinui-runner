@@ -169,7 +169,7 @@ export function StepOutputPanel({
               {showLineNumbers ? (
                 <div className="flex">
                   {/* Line numbers */}
-                  <div className="pr-3 mr-3 border-r border-border/50 text-muted-foreground select-none flex-shrink-0">
+                  <div className="pr-3 mr-3 border-r border-border/50 text-muted-foreground select-none shrink-0">
                     {lines.map((_, i) => (
                       <div key={`ln-${i}`}>{i + 1}</div>
                     ))}

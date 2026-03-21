@@ -545,7 +545,7 @@ function SourceRow({
         {source.enabled && <Check className="w-3 h-3 text-primary-foreground" />}
       </button>
       <div
-        className="w-2 h-2 rounded-full flex-shrink-0"
+        className="w-2 h-2 rounded-full shrink-0"
         style={{ backgroundColor: source.color || getCategoryColor(source.category) }}
       />
       <div className="flex-1 min-w-0">
@@ -761,7 +761,7 @@ function SourceEditor({
               value={form.name}
               onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
               placeholder="Backend Logs"
-              className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+              className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
             />
           </div>
 
@@ -772,7 +772,7 @@ function SourceEditor({
               value={form.description}
               onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
               placeholder="FastAPI backend server logs"
-              className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+              className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
             />
           </div>
 
@@ -782,7 +782,7 @@ function SourceEditor({
               <select
                 value={form.category}
                 onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))}
-                className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               >
                 {CATEGORIES.map((cat) => (
                   <option key={cat.value} value={cat.value}>
@@ -796,7 +796,7 @@ function SourceEditor({
               <select
                 value={form.type}
                 onChange={(e) => setForm((f) => ({ ...f, type: e.target.value }))}
-                className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               >
                 <option value="file">File</option>
                 <option value="directory">Directory</option>
@@ -812,7 +812,7 @@ function SourceEditor({
                 value={form.path}
                 onChange={(e) => setForm((f) => ({ ...f, path: e.target.value }))}
                 placeholder="/path/to/logs/app.log"
-                className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               />
               <button className="p-2 bg-muted/50 hover:bg-muted rounded-md">
                 <FolderOpen className="w-4 h-4" />
@@ -828,7 +828,7 @@ function SourceEditor({
                 value={form.pattern}
                 onChange={(e) => setForm((f) => ({ ...f, pattern: e.target.value }))}
                 placeholder="*.log"
-                className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               />
             </div>
           )}
@@ -844,7 +844,7 @@ function SourceEditor({
                 }
                 min={10}
                 max={10000}
-                className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               />
             </div>
             <div>
@@ -854,7 +854,7 @@ function SourceEditor({
                 value={form.color}
                 onChange={(e) => setForm((f) => ({ ...f, color: e.target.value }))}
                 placeholder="#22c55e"
-                className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               />
             </div>
           </div>
@@ -866,7 +866,7 @@ function SourceEditor({
               value={form.keywords}
               onChange={(e) => setForm((f) => ({ ...f, keywords: e.target.value }))}
               placeholder="python, fastapi, http, api"
-              className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+              className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
             />
             <p className="text-[10px] text-muted-foreground mt-1">
               Keywords help AI identify when this source is relevant
@@ -896,7 +896,7 @@ function SourceEditor({
                     <select
                       value={form.format}
                       onChange={(e) => setForm((f) => ({ ...f, format: e.target.value }))}
-                      className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                      className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
                     >
                       <option value="plaintext">Plaintext</option>
                       <option value="json">JSON</option>
@@ -908,7 +908,7 @@ function SourceEditor({
                     <select
                       value={form.parser}
                       onChange={(e) => setForm((f) => ({ ...f, parser: e.target.value }))}
-                      className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                      className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
                     >
                       <option value="generic">Generic</option>
                       <option value="python">Python</option>
@@ -925,7 +925,7 @@ function SourceEditor({
                     value={form.timestamp_pattern}
                     onChange={(e) => setForm((f) => ({ ...f, timestamp_pattern: e.target.value }))}
                     placeholder="e.g. ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
-                    className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                    className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
                   />
                 </div>
 
@@ -937,7 +937,7 @@ function SourceEditor({
                       value={form.timezone}
                       onChange={(e) => setForm((f) => ({ ...f, timezone: e.target.value }))}
                       placeholder="local"
-                      className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                      className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
                     />
                   </div>
                   <div>
@@ -953,7 +953,7 @@ function SourceEditor({
                       }
                       min={500}
                       max={60000}
-                      className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                      className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
                     />
                   </div>
                 </div>
@@ -965,7 +965,7 @@ function SourceEditor({
                     onChange={(e) => setForm((f) => ({ ...f, error_patterns: e.target.value }))}
                     placeholder="Custom regex patterns to identify errors"
                     rows={3}
-                    className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+                    className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
                   />
                 </div>
 
@@ -976,7 +976,7 @@ function SourceEditor({
                     onChange={(e) => setForm((f) => ({ ...f, warning_patterns: e.target.value }))}
                     placeholder="Custom regex patterns to identify warnings"
                     rows={2}
-                    className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+                    className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
                   />
                 </div>
 
@@ -987,7 +987,7 @@ function SourceEditor({
                     onChange={(e) => setForm((f) => ({ ...f, ignore_patterns: e.target.value }))}
                     placeholder="Patterns to suppress false positives"
                     rows={2}
-                    className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+                    className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
                   />
                 </div>
               </div>
@@ -1082,7 +1082,7 @@ function ProfileEditor({
               value={form.name}
               onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
               placeholder="Web Development"
-              className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+              className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
             />
           </div>
 
@@ -1093,7 +1093,7 @@ function ProfileEditor({
               value={form.description}
               onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
               placeholder="Sources for web frontend and backend development"
-              className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+              className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
             />
           </div>
 

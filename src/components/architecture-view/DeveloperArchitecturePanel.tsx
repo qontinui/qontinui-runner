@@ -66,7 +66,7 @@ export function DeveloperArchitecturePanel({
     <div className="flex-1 min-h-0 flex flex-col gap-3">
       {/* Project selector (only when multiple projects) */}
       {specs.length > 1 && (
-        <div className="flex-shrink-0">
+        <div className="shrink-0">
           <select
             value={clampedIndex}
             onChange={(e) => setSelectedProjectIndex(Number(e.target.value))}
@@ -83,20 +83,20 @@ export function DeveloperArchitecturePanel({
 
       {/* Error banner */}
       {error && (
-        <div className="px-3 py-2 bg-red-500/10 border border-red-500/20 rounded text-sm text-red-400 flex-shrink-0">
+        <div className="px-3 py-2 bg-red-500/10 border border-red-500/20 rounded text-sm text-red-400 shrink-0">
           {error}
         </div>
       )}
 
       {/* View navigation pills */}
-      <div className="flex items-center gap-1 bg-muted/50 rounded-lg p-1 flex-shrink-0 self-start">
+      <div className="flex items-center gap-1 bg-muted/50 rounded-lg p-1 shrink-0 self-start">
         {views.map(({ id, label, icon: Icon }) => (
           <button
             key={id}
             onClick={() => setActiveView(id)}
             className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors ${
               activeView === id
-                ? "bg-background text-foreground shadow-sm"
+                ? "bg-background text-foreground shadow-xs"
                 : "text-muted-foreground hover:text-foreground hover:bg-muted"
             }`}
           >

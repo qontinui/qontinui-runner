@@ -167,7 +167,7 @@ export function BatchOperationsBar({
               e.stopPropagation();
             }}
             placeholder={`Send to ${needsInputTabs.length} waiting session${needsInputTabs.length !== 1 ? "s" : ""}...`}
-            className="bg-[#13141f] border border-[#2a2d3d] rounded px-2 py-1 text-xs text-[#c0caf5] placeholder-[#565f89] outline-none focus:border-[#7aa2f7] w-64"
+            className="bg-[#13141f] border border-[#2a2d3d] rounded px-2 py-1 text-xs text-[#c0caf5] placeholder-[#565f89] outline-hidden focus:border-[#7aa2f7] w-64"
           />
           <button
             onClick={handleBroadcast}

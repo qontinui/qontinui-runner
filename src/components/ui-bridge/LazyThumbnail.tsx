@@ -160,7 +160,7 @@ export function LazyThumbnail({
     return (
       <div
         className={cn(
-          "flex items-center justify-center border border-amber-500/30 rounded bg-amber-500/10 flex-shrink-0",
+          "flex items-center justify-center border border-amber-500/30 rounded bg-amber-500/10 shrink-0",
           className,
         )}
         title="Thumbnail not available - cross-origin iframe content"
@@ -177,7 +177,7 @@ export function LazyThumbnail({
         src={`data:image/png;base64,${thumbnail}`}
         alt=""
         className={cn(
-          "object-contain border border-border/50 rounded bg-white/50 flex-shrink-0",
+          "object-contain border border-border/50 rounded bg-white/50 shrink-0",
           className,
         )}
       />
@@ -189,7 +189,7 @@ export function LazyThumbnail({
     <div
       ref={containerRef}
       className={cn(
-        "flex items-center justify-center border border-border/30 rounded bg-muted/20 flex-shrink-0",
+        "flex items-center justify-center border border-border/30 rounded bg-muted/20 shrink-0",
         className,
       )}
     >

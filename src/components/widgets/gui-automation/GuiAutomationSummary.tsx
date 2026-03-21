@@ -76,7 +76,7 @@ function ScreenshotThumbnail({ screenshot }: { screenshot: ScreenshotInfo | unde
 
   if (!screenshot || !imageSrc || imageError) {
     return (
-      <div className="w-12 h-12 rounded bg-muted/50 flex items-center justify-center flex-shrink-0">
+      <div className="w-12 h-12 rounded bg-muted/50 flex items-center justify-center shrink-0">
         <ImageIcon className="h-5 w-5 text-muted-foreground/50" />
       </div>
     );
@@ -90,7 +90,7 @@ function ScreenshotThumbnail({ screenshot }: { screenshot: ScreenshotInfo | unde
           e.stopPropagation();
           setShowPopup(true);
         }}
-        className="w-12 h-12 rounded bg-black/90 flex items-center justify-center flex-shrink-0 overflow-hidden border border-border hover:ring-2 hover:ring-blue-500/50 transition-all cursor-pointer"
+        className="w-12 h-12 rounded bg-black/90 flex items-center justify-center shrink-0 overflow-hidden border border-border hover:ring-2 hover:ring-blue-500/50 transition-all cursor-pointer"
         title="Click to expand screenshot"
       >
         <img

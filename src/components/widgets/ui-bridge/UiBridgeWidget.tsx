@@ -42,7 +42,7 @@ function InlineDetail({ execution }: { execution: UiBridgeExecution }) {
       {execution.command && (
         <div className="px-4 py-2 border-b border-border/50 bg-muted/20">
           <div className="flex items-start gap-2">
-            <Monitor className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0 mt-0.5" />
+            <Monitor className="h-3.5 w-3.5 text-muted-foreground shrink-0 mt-0.5" />
             <code className="font-mono text-xs text-foreground break-all whitespace-pre-wrap">
               {execution.command}
             </code>
@@ -103,7 +103,7 @@ function ActionRow({
       <div
         className={cn(
           "flex items-start gap-3 border-l-2 px-4 py-2.5 transition-colors cursor-pointer",
-          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 focus-visible:ring-offset-background",
+          "focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 focus-visible:ring-offset-background",
           isActive
             ? cn(pendingColors.border, pendingColors.bg)
             : isExpanded
@@ -122,7 +122,7 @@ function ActionRow({
           }
         }}
       >
-        <div className="flex-shrink-0 mt-0.5 text-muted-foreground">
+        <div className="shrink-0 mt-0.5 text-muted-foreground">
           {isExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
         </div>
 
@@ -130,7 +130,7 @@ function ActionRow({
 
         <Badge
           className={cn(
-            "text-xs flex-shrink-0 border",
+            "text-xs shrink-0 border",
             actionColors.bg,
             actionColors.text,
             actionColors.border,
@@ -153,7 +153,7 @@ function ActionRow({
         </div>
 
         {execution.durationMs !== undefined && (
-          <span className="font-mono text-xs text-muted-foreground flex-shrink-0">
+          <span className="font-mono text-xs text-muted-foreground shrink-0">
             {execution.durationMs < 1000
               ? `${execution.durationMs}ms`
               : `${(execution.durationMs / 1000).toFixed(1)}s`}
@@ -185,7 +185,7 @@ export function UiBridgeWidget({ isSummary, data, className }: UiBridgeWidgetPro
 
       {/* Assertion stats bar if there are assertions */}
       {data.assertionStats.total > 0 && (
-        <div className="flex items-center gap-3 border-b border-border px-4 py-1.5 bg-muted/10 flex-shrink-0">
+        <div className="flex items-center gap-3 border-b border-border px-4 py-1.5 bg-muted/10 shrink-0">
           <span className="text-xs text-muted-foreground">Assertions:</span>
           <Badge variant="success" className="text-[10px]">
             {data.assertionStats.passed} passed
@@ -198,7 +198,7 @@ export function UiBridgeWidget({ isSummary, data, className }: UiBridgeWidgetPro
         </div>
       )}
 
-      <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 flex-shrink-0">
+      <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 shrink-0">
         <div className="flex items-center gap-3">
           <h3 className="text-sm font-semibold text-foreground">UI Bridge Actions</h3>
           <span className="text-xs text-muted-foreground">Click to view details</span>

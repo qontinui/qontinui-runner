@@ -32,7 +32,7 @@ export function KeyValuePanel({ data, size }: CanvasPanelComponentProps) {
     <div className={cn("space-y-1", isCompact ? "text-xs" : "text-sm")}>
       {pairs.map((pair) => (
         <div key={pair.key} className="flex items-center gap-3">
-          <span className="text-muted-foreground font-medium min-w-[100px] flex-shrink-0">
+          <span className="text-muted-foreground font-medium min-w-[100px] shrink-0">
             {pair.key}
           </span>
           <span className={cn("font-mono", STYLE_CLASSES[pair.style ?? "default"])}>

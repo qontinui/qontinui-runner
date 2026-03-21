@@ -66,7 +66,7 @@ export function WorkflowLibraryCard({
                   e.stopPropagation();
                   onToggleFavorite(workflow.id);
                 }}
-                className="flex-shrink-0 p-0.5 rounded transition-colors hover:bg-white/10"
+                className="shrink-0 p-0.5 rounded transition-colors hover:bg-white/10"
                 title={workflow.is_favorite ? "Remove from favorites" : "Add to favorites"}
               >
                 <Star
@@ -74,10 +74,10 @@ export function WorkflowLibraryCard({
                 />
               </button>
             )}
-            {isSlashCommand && <Terminal className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />}
+            {isSlashCommand && <Terminal className="w-3.5 h-3.5 text-cyan-400 shrink-0" />}
             <h3 className="text-body font-medium text-white truncate">{workflow.name}</h3>
             {requiresArgs && (
-              <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30">
+              <span className="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30">
                 Args
               </span>
             )}
@@ -99,7 +99,7 @@ export function WorkflowLibraryCard({
         <button
           onClick={onAdd}
           disabled={isQueued}
-          className={`p-2 rounded-lg transition-colors flex-shrink-0 ${
+          className={`p-2 rounded-lg transition-colors shrink-0 ${
             isQueued
               ? "bg-green-500/20 text-green-400 cursor-default"
               : "bg-white/5 text-muted-foreground hover:bg-cyan-500/20 hover:text-cyan-400"

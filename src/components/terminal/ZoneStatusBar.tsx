@@ -1076,7 +1076,7 @@ function AutoApprovePopover({
               onKeyDown={(e) => e.stopPropagation()}
               placeholder={"Do you want to proceed\\?\nApply changes\\?\nContinue\\?"}
               rows={5}
-              className="w-full bg-[#13141f] border border-[#2a2d3d] rounded px-2 py-1.5 text-[11px] font-mono text-[#c0caf5] placeholder-[#565f89]/50 outline-none focus:border-[#7aa2f7] transition-colors resize-none"
+              className="w-full bg-[#13141f] border border-[#2a2d3d] rounded px-2 py-1.5 text-[11px] font-mono text-[#c0caf5] placeholder-[#565f89]/50 outline-hidden focus:border-[#7aa2f7] transition-colors resize-none"
             />
             <div className="flex items-center justify-between text-[10px]">
               <span className="text-[#565f89]">

@@ -183,7 +183,7 @@ export function ZoneTimeline({
                   Z{row.zoneIndex + 1} {row.title}
                 </div>
                 {/* Timeline bar */}
-                <div className="flex-1 h-3 rounded-sm overflow-hidden flex bg-[#1a1b26]">
+                <div className="flex-1 h-3 rounded-xs overflow-hidden flex bg-[#1a1b26]">
                   {row.segments.map((seg, i) => {
                     const widthPct = (seg.endFrac - seg.startFrac) * 100;
                     if (widthPct <= 0) return null;

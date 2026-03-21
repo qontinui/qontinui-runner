@@ -93,7 +93,7 @@ export const SpanDetailPanel: React.FC<SpanDetailPanelProps> = ({ span, onClose 
             <div className="mt-1 space-y-1">
               {Object.entries(span.attributes).map(([key, value]) => (
                 <div key={key} className="flex gap-1">
-                  <span className="text-zinc-500 flex-shrink-0">{key}:</span>
+                  <span className="text-zinc-500 shrink-0">{key}:</span>
                   <span className="text-zinc-400 break-all">
                     {typeof value === "string" ? value : JSON.stringify(value)}
                   </span>

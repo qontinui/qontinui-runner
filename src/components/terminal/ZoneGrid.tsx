@@ -242,7 +242,7 @@ function ZoneLabel({
             }}
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
-            className="bg-transparent border-b border-[#565f89] text-[9px] text-[#bb9af7] outline-none w-16 shrink-0"
+            className="bg-transparent border-b border-[#565f89] text-[9px] text-[#bb9af7] outline-hidden w-16 shrink-0"
             placeholder="Label..."
           />
         ) : zoneLabel ? (
@@ -482,7 +482,7 @@ function HighlightedText({ text, query }: { text: string; query?: string }) {
   return (
     <>
       {text.slice(0, idx)}
-      <span className="bg-[#e0af68]/30 text-[#e0af68] rounded-sm px-0.5">
+      <span className="bg-[#e0af68]/30 text-[#e0af68] rounded-xs px-0.5">
         {text.slice(idx, idx + query.length)}
       </span>
       {text.slice(idx + query.length)}
@@ -837,7 +837,7 @@ function CompactZoneCard({
               }}
               onMouseDown={(e) => e.stopPropagation()}
               onClick={(e) => e.stopPropagation()}
-              className="bg-transparent border-b border-[#565f89] text-[9px] text-[#bb9af7] outline-none w-20"
+              className="bg-transparent border-b border-[#565f89] text-[9px] text-[#bb9af7] outline-hidden w-20"
               placeholder="Group label..."
             />
           ) : zoneLabel ? (
@@ -897,7 +897,7 @@ function CompactZoneCard({
               }}
               onMouseDown={(e) => e.stopPropagation()}
               onClick={(e) => e.stopPropagation()}
-              className="bg-transparent border-b border-[#565f89] text-[9px] text-[#a9b1d6] outline-none w-full"
+              className="bg-transparent border-b border-[#565f89] text-[9px] text-[#a9b1d6] outline-hidden w-full"
               placeholder="Add a note..."
               maxLength={100}
             />
@@ -992,7 +992,7 @@ function CompactZoneCard({
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
             placeholder="Filter regex..."
-            className="flex-1 bg-[#13141f] border border-[#2a2d3d] rounded px-1.5 py-0.5 text-[9px] font-mono text-[#c0caf5] placeholder-[#565f89] outline-none focus:border-[#7aa2f7] transition-colors"
+            className="flex-1 bg-[#13141f] border border-[#2a2d3d] rounded px-1.5 py-0.5 text-[9px] font-mono text-[#c0caf5] placeholder-[#565f89] outline-hidden focus:border-[#7aa2f7] transition-colors"
           />
           {outputFilter &&
             (() => {
@@ -1120,7 +1120,7 @@ function CompactZoneCard({
                 }}
                 placeholder={yesNo ? "or type..." : "Type response..."}
                 className={`flex-1 min-w-0 bg-[#2a2d3d]/50 border border-[#3b3d57] rounded px-1.5 py-0.5
-                  text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-none
+                  text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-hidden
                   focus:border-[#7aa2f7] transition-colors ${!yesNo ? "border-[#e0af68]/50" : ""}`}
               />
               <button
@@ -2053,7 +2053,7 @@ export function ZoneGrid({
                       onMouseDown={(e) => e.stopPropagation()}
                       onClick={(e) => e.stopPropagation()}
                       placeholder="Filter output..."
-                      className="flex-1 bg-transparent text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-none font-mono"
+                      className="flex-1 bg-transparent text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-hidden font-mono"
                     />
                     {zoneFilters[zoneIdx] && (
                       <>

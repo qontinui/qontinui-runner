@@ -142,7 +142,7 @@ export function ProcessConfigEditor({
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="e.g., FastAPI Backend"
-            className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-cyan-500/50"
+            className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 placeholder:text-zinc-600 focus:outline-hidden focus:border-cyan-500/50"
           />
         </div>
 
@@ -155,7 +155,7 @@ export function ProcessConfigEditor({
               value={command}
               onChange={(e) => setCommand(e.target.value)}
               placeholder="e.g., python, npm, cargo"
-              className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-cyan-500/50"
+              className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 placeholder:text-zinc-600 focus:outline-hidden focus:border-cyan-500/50"
             />
           </div>
           <div>
@@ -165,7 +165,7 @@ export function ProcessConfigEditor({
               value={argsStr}
               onChange={(e) => setArgsStr(e.target.value)}
               placeholder="e.g., run dev"
-              className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-cyan-500/50"
+              className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 placeholder:text-zinc-600 focus:outline-hidden focus:border-cyan-500/50"
             />
           </div>
         </div>
@@ -179,7 +179,7 @@ export function ProcessConfigEditor({
               value={cwd}
               onChange={(e) => setCwd(e.target.value)}
               placeholder="/path/to/project"
-              className="flex-1 px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-cyan-500/50"
+              className="flex-1 px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 placeholder:text-zinc-600 focus:outline-hidden focus:border-cyan-500/50"
             />
             <button
               onClick={browseCwd}
@@ -199,7 +199,7 @@ export function ProcessConfigEditor({
               value={healthPort}
               onChange={(e) => setHealthPort(e.target.value)}
               placeholder="e.g., 8000"
-              className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-cyan-500/50"
+              className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 placeholder:text-zinc-600 focus:outline-hidden focus:border-cyan-500/50"
             />
           </div>
           <div>
@@ -207,7 +207,7 @@ export function ProcessConfigEditor({
             <select
               value={parser}
               onChange={(e) => setParser(e.target.value)}
-              className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 focus:outline-none focus:border-cyan-500/50"
+              className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 focus:outline-hidden focus:border-cyan-500/50"
             >
               {PARSER_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value}>
@@ -221,7 +221,7 @@ export function ProcessConfigEditor({
             <select
               value={category}
               onChange={(e) => setCategory(e.target.value)}
-              className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 focus:outline-none focus:border-cyan-500/50"
+              className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 focus:outline-hidden focus:border-cyan-500/50"
             >
               {CATEGORY_OPTIONS.map((cat) => (
                 <option key={cat} value={cat}>
@@ -241,7 +241,7 @@ export function ProcessConfigEditor({
               min="0"
               value={startGroup}
               onChange={(e) => setStartGroup(e.target.value)}
-              className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 focus:outline-none focus:border-cyan-500/50"
+              className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 focus:outline-hidden focus:border-cyan-500/50"
             />
           </div>
           <div className="flex items-center gap-2 pb-1">

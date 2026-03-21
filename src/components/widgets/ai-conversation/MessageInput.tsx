@@ -148,7 +148,7 @@ export function MessageInput() {
           rows={1}
           className={cn(
             "flex-1 resize-none rounded-md border border-border bg-muted/30 px-3 py-2 text-sm",
-            "placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-ring",
+            "placeholder:text-muted-foreground/50 focus:outline-hidden focus:ring-1 focus:ring-ring",
             "disabled:opacity-50 disabled:cursor-not-allowed",
             "min-h-[36px] max-h-[120px]",
           )}
@@ -158,7 +158,7 @@ export function MessageInput() {
             onClick={handleInterrupt}
             title="Interrupt AI"
             className={cn(
-              "flex-shrink-0 p-2 rounded-md border border-border",
+              "shrink-0 p-2 rounded-md border border-border",
               "text-destructive hover:bg-destructive/10",
               "transition-colors",
             )}
@@ -171,7 +171,7 @@ export function MessageInput() {
           disabled={!message.trim() || !canSendMessage || isSending}
           title={isProcessing ? "Send (will be queued)" : "Send message"}
           className={cn(
-            "flex-shrink-0 p-2 rounded-md",
+            "shrink-0 p-2 rounded-md",
             "bg-primary text-primary-foreground",
             "hover:bg-primary/90",
             "disabled:opacity-50 disabled:cursor-not-allowed",

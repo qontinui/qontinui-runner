@@ -153,7 +153,7 @@ export function AiFixPanel({
           onKeyDown={handleKeyDown}
           placeholder={isProcessing ? "AI is analyzing..." : "Ask a follow-up question..."}
           disabled={!isReady}
-          className="flex-1 px-2 py-1 text-xs bg-zinc-900 border border-white/10 rounded text-zinc-300 placeholder:text-zinc-600 focus:outline-none focus:border-amber-500/50 disabled:opacity-50"
+          className="flex-1 px-2 py-1 text-xs bg-zinc-900 border border-white/10 rounded text-zinc-300 placeholder:text-zinc-600 focus:outline-hidden focus:border-amber-500/50 disabled:opacity-50"
         />
         {isProcessing ? (
           <button

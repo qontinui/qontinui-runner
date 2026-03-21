@@ -327,7 +327,7 @@ function SectionHeader({
 }) {
   return (
     <button
-      className="w-full flex items-center gap-2 py-2 text-left hover:bg-muted/30 rounded-sm transition-colors"
+      className="w-full flex items-center gap-2 py-2 text-left hover:bg-muted/30 rounded-xs transition-colors"
       onClick={onToggle}
     >
       {expanded ? (

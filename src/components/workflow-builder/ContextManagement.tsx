@@ -276,7 +276,7 @@ export function ContextManagement() {
                   <div className="absolute left-0 top-full mt-2 w-72 p-3 bg-zinc-800 border border-zinc-700 rounded-lg shadow-xl z-50 text-sm">
                     <div className="flex items-start gap-2">
                       <Lightbulb
-                        className={`w-4 h-4 ${getAccentColors("yellow").text} mt-0.5 flex-shrink-0`}
+                        className={`w-4 h-4 ${getAccentColors("yellow").text} mt-0.5 shrink-0`}
                       />
                       <div>
                         <p className="font-medium text-zinc-200 mb-1">Auto-Include Contexts</p>
@@ -368,7 +368,7 @@ export function ContextManagement() {
                         setContextPicker({ ...contextPicker, searchQuery: e.target.value })
                       }
                       placeholder="Search contexts..."
-                      className="w-full bg-zinc-700 border-none rounded pl-8 pr-2 py-1 text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      className="w-full bg-zinc-700 border-none rounded pl-8 pr-2 py-1 text-sm text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                       autoFocus
                     />
                   </div>

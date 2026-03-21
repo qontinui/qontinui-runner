@@ -409,7 +409,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search runs..."
-              className="w-full pl-9 pr-4 py-1.5 text-sm border border-border rounded-lg bg-background focus:outline-none focus:ring-2 focus:ring-primary"
+              className="w-full pl-9 pr-4 py-1.5 text-sm border border-border rounded-lg bg-background focus:outline-hidden focus:ring-2 focus:ring-primary"
             />
           </div>
         </div>
@@ -500,17 +500,17 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
                   {/* Status icon */}
                   {run.success === true ? (
                     <CheckCircle
-                      className={`w-4 h-4 ${getStatusColors("success").text} flex-shrink-0`}
+                      className={`w-4 h-4 ${getStatusColors("success").text} shrink-0`}
                     />
                   ) : run.success === false ? (
-                    <XCircle className={`w-4 h-4 ${getStatusColors("error").text} flex-shrink-0`} />
+                    <XCircle className={`w-4 h-4 ${getStatusColors("error").text} shrink-0`} />
                   ) : run.status === "running" ? (
                     <Clock
-                      className={`w-4 h-4 ${getAccentColors("blue").text} animate-pulse flex-shrink-0`}
+                      className={`w-4 h-4 ${getAccentColors("blue").text} animate-pulse shrink-0`}
                     />
                   ) : (
                     <AlertTriangle
-                      className={`w-4 h-4 ${getAccentColors("yellow").text} flex-shrink-0`}
+                      className={`w-4 h-4 ${getAccentColors("yellow").text} shrink-0`}
                     />
                   )}
 
@@ -597,17 +597,17 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
                 {/* Status icon */}
                 {run.success === true ? (
                   <CheckCircle
-                    className={`w-4 h-4 ${getStatusColors("success").text} flex-shrink-0`}
+                    className={`w-4 h-4 ${getStatusColors("success").text} shrink-0`}
                   />
                 ) : run.success === false ? (
-                  <XCircle className={`w-4 h-4 ${getStatusColors("error").text} flex-shrink-0`} />
+                  <XCircle className={`w-4 h-4 ${getStatusColors("error").text} shrink-0`} />
                 ) : run.status === "running" ? (
                   <Clock
-                    className={`w-4 h-4 ${getAccentColors("blue").text} animate-pulse flex-shrink-0`}
+                    className={`w-4 h-4 ${getAccentColors("blue").text} animate-pulse shrink-0`}
                   />
                 ) : (
                   <AlertTriangle
-                    className={`w-4 h-4 ${getAccentColors("yellow").text} flex-shrink-0`}
+                    className={`w-4 h-4 ${getAccentColors("yellow").text} shrink-0`}
                   />
                 )}
 

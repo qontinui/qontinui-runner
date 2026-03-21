@@ -88,7 +88,7 @@ export function GuiAutomationHeader({
                 align="end"
               >
                 <DropdownMenu.Item
-                  className="flex items-center gap-2 px-3 py-2 text-sm rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
+                  className="flex items-center gap-2 px-3 py-2 text-sm rounded-md cursor-pointer outline-hidden hover:bg-muted/50 transition-colors"
                   onSelect={() => {
                     setLoadMenuOpen(false);
                     onLoadConfiguration();
@@ -98,7 +98,7 @@ export function GuiAutomationHeader({
                   <span className="flex-1">Load from File</span>
                 </DropdownMenu.Item>
                 <DropdownMenu.Item
-                  className="flex items-center gap-2 px-3 py-2 text-sm rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
+                  className="flex items-center gap-2 px-3 py-2 text-sm rounded-md cursor-pointer outline-hidden hover:bg-muted/50 transition-colors"
                   onSelect={() => {
                     setLoadMenuOpen(false);
                     handleLoadLastConfig();
@@ -111,7 +111,7 @@ export function GuiAutomationHeader({
                 </DropdownMenu.Item>
                 <DropdownMenu.Separator className="h-px bg-border/50 my-1" />
                 <DropdownMenu.Item
-                  className="flex items-center gap-2 px-3 py-2 text-sm rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
+                  className="flex items-center gap-2 px-3 py-2 text-sm rounded-md cursor-pointer outline-hidden hover:bg-muted/50 transition-colors"
                   onSelect={() => {
                     setLoadMenuOpen(false);
                     setShowRAGModal(true);

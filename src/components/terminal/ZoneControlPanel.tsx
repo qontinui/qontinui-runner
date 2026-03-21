@@ -203,7 +203,7 @@ function EditableLabel({
           if (e.key === "Enter") commit();
           if (e.key === "Escape") setEditing(false);
         }}
-        className={`bg-[#1a1b26] border border-[#7aa2f7]/50 rounded px-1 py-0 text-[11px] text-[#c0caf5] outline-none w-full ${className ?? ""}`}
+        className={`bg-[#1a1b26] border border-[#7aa2f7]/50 rounded px-1 py-0 text-[11px] text-[#c0caf5] outline-hidden w-full ${className ?? ""}`}
         autoFocus
       />
     );
@@ -261,7 +261,7 @@ function InlineNotesEditor({ notes, onSave }: { notes: string; onSave: (notes: s
       }}
       rows={3}
       placeholder="Add a note..."
-      className="w-full bg-[#1a1b26] border border-[#2a2d3d] rounded px-2 py-1.5 text-[10px] text-[#c0caf5] outline-none resize-none placeholder-[#414868] focus:border-[#7aa2f7]/40 transition-colors"
+      className="w-full bg-[#1a1b26] border border-[#2a2d3d] rounded px-2 py-1.5 text-[10px] text-[#c0caf5] outline-hidden resize-none placeholder-[#414868] focus:border-[#7aa2f7]/40 transition-colors"
       onClick={(e) => e.stopPropagation()}
     />
   );
@@ -438,7 +438,7 @@ function WorkspacesSection({
                   }
                 }}
                 placeholder="Workspace name..."
-                className="flex-1 bg-[#1a1b26] border border-[#7aa2f7]/50 rounded px-1.5 py-0.5 text-[10px] text-[#c0caf5] outline-none placeholder-[#414868]"
+                className="flex-1 bg-[#1a1b26] border border-[#7aa2f7]/50 rounded px-1.5 py-0.5 text-[10px] text-[#c0caf5] outline-hidden placeholder-[#414868]"
               />
               <button
                 onClick={handleSave}
@@ -601,7 +601,7 @@ function ZoneRow({
           {/* Label color swatch */}
           {label && labelColor && (
             <span
-              className="w-2.5 h-2.5 rounded-sm shrink-0"
+              className="w-2.5 h-2.5 rounded-xs shrink-0"
               style={{ backgroundColor: labelColor }}
             />
           )}

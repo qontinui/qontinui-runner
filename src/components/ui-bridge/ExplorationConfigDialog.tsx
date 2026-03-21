@@ -318,7 +318,7 @@ export function ExplorationConfigDialog({
                       variant="danger"
                       size="sm"
                       onClick={onStopExploration}
-                      className="flex-shrink-0 ml-4"
+                      className="shrink-0 ml-4"
                     >
                       <Square className="w-3.5 h-3.5 mr-1.5 fill-current" />
                       Stop

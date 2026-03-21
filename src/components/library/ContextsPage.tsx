@@ -205,7 +205,7 @@ function ContextEditor({
             onChange={(e) => updateField("name", e.target.value)}
             placeholder="Context name..."
             className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-              placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+              placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
               text-foreground"
           />
         </div>
@@ -220,7 +220,7 @@ function ContextEditor({
             value={formState.scope ?? "global"}
             onChange={(e) => updateField("scope", e.target.value as ContextItem["scope"])}
             className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-              focus:outline-none focus:ring-1 focus:ring-primary text-foreground"
+              focus:outline-hidden focus:ring-1 focus:ring-primary text-foreground"
           >
             <option value="global">Global</option>
             <option value="workflow">Workflow</option>
@@ -246,7 +246,7 @@ function ContextEditor({
             placeholder="Enter the context content that will be provided to AI sessions..."
             rows={12}
             className="w-full px-3 py-2 text-sm bg-muted/50 border border-border rounded-md
-              placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+              placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
               text-foreground resize-y font-mono leading-relaxed"
           />
         </div>
@@ -290,7 +290,7 @@ function ContextEditor({
                 }
               }}
               className="w-32 px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                focus:outline-none focus:ring-1 focus:ring-primary text-foreground"
+                focus:outline-hidden focus:ring-1 focus:ring-primary text-foreground"
             />
             <p className="text-[10px] text-muted-foreground">
               Higher priority contexts are included first when there are token limits.
@@ -311,7 +311,7 @@ function ContextEditor({
               onKeyDown={handleTagKeyDown}
               placeholder="Add a tag..."
               className="flex-1 px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground"
             />
             <button

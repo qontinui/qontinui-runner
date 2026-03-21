@@ -123,7 +123,7 @@ function StageFlow({
         return (
           <div key={stage.index} className="flex items-center gap-1">
             {i > 0 && (
-              <svg width="12" height="8" className="text-zinc-600 flex-shrink-0">
+              <svg width="12" height="8" className="text-zinc-600 shrink-0">
                 <path
                   d="M0 4 L8 4 M6 1 L9 4 L6 7"
                   stroke="currentColor"
@@ -222,7 +222,7 @@ function ActivityLine({ activity, phase }: { activity: string; phase: string | n
   return (
     <div className={cn("flex items-start gap-2 rounded-md px-2.5 py-1.5 text-xs", colors.bg)}>
       <span
-        className={cn("mt-0.5 h-1.5 w-1.5 rounded-full flex-shrink-0 animate-pulse", colors.dot)}
+        className={cn("mt-0.5 h-1.5 w-1.5 rounded-full shrink-0 animate-pulse", colors.dot)}
       />
       <span className={cn("leading-relaxed", colors.text)}>{activity}</span>
     </div>

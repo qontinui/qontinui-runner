@@ -77,16 +77,16 @@ export function FlakyItemsList({ items }: FlakyItemsListProps) {
             <div className="flex items-start justify-between gap-2">
               <div className="flex items-center gap-2 min-w-0">
                 {item.item_type === "transition" ? (
-                  <ArrowRightLeft className="w-4 h-4 flex-shrink-0 text-muted-foreground" />
+                  <ArrowRightLeft className="w-4 h-4 shrink-0 text-muted-foreground" />
                 ) : (
-                  <Image className="w-4 h-4 flex-shrink-0 text-muted-foreground" />
+                  <Image className="w-4 h-4 shrink-0 text-muted-foreground" />
                 )}
                 <div className="min-w-0">
                   <p className="text-sm font-medium truncate">{item.name}</p>
                   <p className="text-xs text-muted-foreground">{item.total_attempts} attempts</p>
                 </div>
               </div>
-              <div className="text-right flex-shrink-0">
+              <div className="text-right shrink-0">
                 <div className={`text-sm font-medium ${getSeverityTextColor(item.success_rate)}`}>
                   {(item.success_rate * 100).toFixed(0)}%
                 </div>

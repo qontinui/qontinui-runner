@@ -219,7 +219,7 @@ export function AiTaskGenerator({
                     ? "Example: Create a task that analyzes error logs and suggests fixes based on common patterns"
                     : "Paste your existing prompt here to improve its structure and clarity..."
                 }
-                className="flex-1 px-3 py-2 bg-muted border border-border rounded text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-none focus:border-amber-500 min-h-[120px] font-mono"
+                className="flex-1 px-3 py-2 bg-muted border border-border rounded text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-hidden focus:border-amber-500 min-h-[120px] font-mono"
               />
             </div>
 

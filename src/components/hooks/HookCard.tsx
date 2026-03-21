@@ -110,7 +110,7 @@ export function HookCard({
           {/* Drag handle */}
           <div
             {...dragHandleProps}
-            className="flex-shrink-0 cursor-grab active:cursor-grabbing text-muted-foreground hover:text-foreground mt-1"
+            className="shrink-0 cursor-grab active:cursor-grabbing text-muted-foreground hover:text-foreground mt-1"
           >
             <GripVertical className="w-4 h-4" />
           </div>
@@ -168,7 +168,7 @@ export function HookCard({
           </div>
 
           {/* Actions */}
-          <div className="flex items-center gap-1 flex-shrink-0">
+          <div className="flex items-center gap-1 shrink-0">
             <button
               onClick={() => onToggleEnabled(hook)}
               disabled={loading}

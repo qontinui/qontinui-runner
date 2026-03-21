@@ -47,7 +47,7 @@ export function SparklinePanel({ data, size }: CanvasPanelComponentProps) {
           <div key={s.name} className="flex items-center gap-2">
             {/* Series name */}
             <div
-              className={cn("truncate text-muted-foreground flex-shrink-0", fontSize)}
+              className={cn("truncate text-muted-foreground shrink-0", fontSize)}
               style={{ width: isCompact ? 80 : 100 }}
               title={s.name}
             >

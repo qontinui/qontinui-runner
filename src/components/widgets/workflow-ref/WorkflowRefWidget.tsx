@@ -59,7 +59,7 @@ function WorkflowRow({
       {/* Workflow badge */}
       <Badge
         className={cn(
-          "text-xs flex-shrink-0 font-mono border",
+          "text-xs shrink-0 font-mono border",
           pinkColors.bg,
           pinkColors.text,
           pinkColors.border,
@@ -87,7 +87,7 @@ function WorkflowRow({
 
       {/* Duration */}
       {workflow.durationMs !== undefined && (
-        <span className="font-mono text-xs text-muted-foreground flex-shrink-0">
+        <span className="font-mono text-xs text-muted-foreground shrink-0">
           {workflow.durationMs < 1000
             ? `${workflow.durationMs}ms`
             : `${(workflow.durationMs / 1000).toFixed(1)}s`}
@@ -105,14 +105,14 @@ function SubStepRow({ step }: { step: StepExecution }) {
 
   return (
     <div className="flex items-center gap-3 px-4 py-2 hover:bg-muted/30 transition-colors">
-      <ChevronRight className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+      <ChevronRight className="h-3 w-3 text-muted-foreground shrink-0" />
       <StepStatusBadge status={step.status} iconOnly size="sm" />
       <span className="text-sm text-foreground truncate flex-1">{step.name}</span>
       {step.error && (
         <span className={cn("text-xs truncate max-w-[200px]", errorColors.text)}>{step.error}</span>
       )}
       {step.durationMs !== undefined && (
-        <span className="font-mono text-xs text-muted-foreground flex-shrink-0">
+        <span className="font-mono text-xs text-muted-foreground shrink-0">
           {step.durationMs < 1000
             ? `${step.durationMs}ms`
             : `${(step.durationMs / 1000).toFixed(1)}s`}
@@ -140,7 +140,7 @@ function WorkflowDetail({ workflow }: { workflow: WorkflowRefExecution | null })
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Workflow header */}
-      <div className="px-4 py-3 border-b border-border bg-muted/10 flex-shrink-0">
+      <div className="px-4 py-3 border-b border-border bg-muted/10 shrink-0">
         <div className="flex items-center gap-2">
           <GitBranch className="h-4 w-4 text-muted-foreground" />
           <span className="font-medium text-sm text-foreground">{workflow.workflowName}</span>
@@ -198,7 +198,7 @@ export function WorkflowRefWidget({ isSummary, data, className }: WorkflowRefWid
       <div className="flex-1 flex overflow-hidden">
         {/* Workflow list */}
         <div className="w-1/2 border-r border-border flex flex-col">
-          <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 flex-shrink-0">
+          <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 shrink-0">
             <h3 className="text-sm font-semibold text-foreground">Sub-Workflows</h3>
             <Badge variant="muted" className="text-xs">
               {data.workflows.length}

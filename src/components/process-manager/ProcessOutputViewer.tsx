@@ -113,7 +113,7 @@ export function ProcessOutputViewer({
             value={searchText}
             onChange={(e) => setSearchText(e.target.value)}
             placeholder="Search output..."
-            className="w-full pl-7 pr-3 py-1 text-xs bg-zinc-900 border border-white/10 rounded text-zinc-300 placeholder:text-zinc-600 focus:outline-none focus:border-cyan-500/50"
+            className="w-full pl-7 pr-3 py-1 text-xs bg-zinc-900 border border-white/10 rounded text-zinc-300 placeholder:text-zinc-600 focus:outline-hidden focus:border-cyan-500/50"
           />
         </div>
         <button

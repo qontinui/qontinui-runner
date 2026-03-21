@@ -136,7 +136,7 @@ export function CanvasWidget({
     <div className={cn("flex flex-col h-full overflow-hidden", className)}>
       {/* Header */}
       {!hideHeader && (
-        <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 flex-shrink-0">
+        <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 shrink-0">
           <div className="flex items-center gap-3">
             <LayoutDashboard className="h-4 w-4 text-rose-500" />
             <h3 className="text-sm font-semibold text-foreground">Canvas</h3>

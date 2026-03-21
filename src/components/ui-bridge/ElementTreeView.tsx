@@ -268,7 +268,7 @@ export function ElementTreeView({
           {/* Cross-origin elements show a placeholder instead of attempting to load */}
           {element.isCrossOrigin ? (
             <div
-              className="w-8 h-6 flex items-center justify-center border border-amber-500/30 rounded bg-amber-500/10 flex-shrink-0"
+              className="w-8 h-6 flex items-center justify-center border border-amber-500/30 rounded bg-amber-500/10 shrink-0"
               title="Thumbnail not available - cross-origin iframe content"
             >
               <Globe className="w-3 h-3 text-amber-600" />
@@ -293,11 +293,11 @@ export function ElementTreeView({
             <img
               src={`data:image/png;base64,${thumbnails?.get(element.id) || lazyThumbnails.get(element.id)}`}
               alt=""
-              className="w-8 h-6 object-contain border border-border/50 rounded bg-white/50 flex-shrink-0"
+              className="w-8 h-6 object-contain border border-border/50 rounded bg-white/50 shrink-0"
             />
           ) : (
             /* Element type icon as fallback */
-            <span className="text-muted-foreground w-8 flex justify-center flex-shrink-0">
+            <span className="text-muted-foreground w-8 flex justify-center shrink-0">
               {ELEMENT_TYPE_ICONS[element.type] || ELEMENT_TYPE_ICONS.custom}
             </span>
           )}
@@ -395,7 +395,7 @@ export function ElementTreeView({
             placeholder="Filter elements..."
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            className="w-full pl-7 pr-2 py-1.5 text-xs bg-muted/30 border border-border/50 rounded-md focus:outline-none focus:ring-1 focus:ring-primary"
+            className="w-full pl-7 pr-2 py-1.5 text-xs bg-muted/30 border border-border/50 rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary"
           />
         </div>
         <button

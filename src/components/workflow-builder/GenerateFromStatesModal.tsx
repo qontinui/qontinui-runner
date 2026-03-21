@@ -133,7 +133,7 @@ export function GenerateFromStatesModal({
             </div>
           ) : !hasConfig ? (
             <div className="flex items-start gap-3 p-4 bg-amber-500/10 border border-amber-500/30 rounded-lg">
-              <AlertCircle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+              <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
               <div>
                 <p className="text-amber-400 font-medium">No Configuration Loaded</p>
                 <p className="text-sm text-zinc-400 mt-1">
@@ -144,7 +144,7 @@ export function GenerateFromStatesModal({
             </div>
           ) : (
             <div className="flex items-start gap-3 p-4 bg-emerald-500/10 border border-emerald-500/30 rounded-lg">
-              <CheckCircle className="w-5 h-5 text-emerald-400 flex-shrink-0 mt-0.5" />
+              <CheckCircle className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
               <div>
                 <p className="text-emerald-400 font-medium">Configuration Ready</p>
                 <p className="text-sm text-zinc-400 mt-1">
@@ -169,7 +169,7 @@ export function GenerateFromStatesModal({
                   value={workflowName}
                   onChange={(e) => setWorkflowName(e.target.value)}
                   placeholder="Enter workflow name..."
-                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50"
                 />
               </div>
 
@@ -184,7 +184,7 @@ export function GenerateFromStatesModal({
                   onChange={(e) => setWorkflowDescription(e.target.value)}
                   placeholder="What does this workflow verify?"
                   rows={2}
-                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 resize-none"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50 resize-none"
                 />
               </div>
 
@@ -202,7 +202,7 @@ export function GenerateFromStatesModal({
                     onChange={(e) => setMaxIterations(parseInt(e.target.value) || 10)}
                     min={1}
                     max={100}
-                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50"
                   />
                   <p className="text-xs text-zinc-500 mt-1">Verification/Agentic loop limit</p>
                 </div>
@@ -219,7 +219,7 @@ export function GenerateFromStatesModal({
                     onChange={(e) => setStateTimeout(parseInt(e.target.value) || 30)}
                     min={5}
                     max={300}
-                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50"
                   />
                   <p className="text-xs text-zinc-500 mt-1">Per-state verification timeout</p>
                 </div>
@@ -284,7 +284,7 @@ export function GenerateFromStatesModal({
               {/* Error display */}
               {error && (
                 <div className="flex items-start gap-3 p-4 bg-red-500/10 border border-red-500/30 rounded-lg">
-                  <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+                  <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
                   <p className="text-red-400 text-sm">{error}</p>
                 </div>
               )}

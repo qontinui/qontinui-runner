@@ -183,7 +183,7 @@ export function RunOptionsDialog({
                       <p className="text-xs text-zinc-400 mt-0.5">{option.description}</p>
                     </div>
                     <div
-                      className={`w-5 h-5 rounded flex-shrink-0 flex items-center justify-center border ${
+                      className={`w-5 h-5 rounded shrink-0 flex items-center justify-center border ${
                         isSelected ? "bg-blue-500 border-blue-500" : "border-zinc-600 bg-zinc-800"
                       }`}
                     >
@@ -204,7 +204,7 @@ export function RunOptionsDialog({
               disabled={isLoading || isLaunching || isMultiple}
               className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-blue-500 focus:ring-blue-500/50"
             />
-            <GitBranch className="w-4 h-4 text-zinc-400 flex-shrink-0" />
+            <GitBranch className="w-4 h-4 text-zinc-400 shrink-0" />
             <div className="flex-1 min-w-0">
               <span className="text-sm font-medium text-zinc-300">Worktree isolation</span>
               <p className="text-xs text-zinc-400 mt-0.5">

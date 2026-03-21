@@ -175,7 +175,7 @@ interface ParameterFieldProps {
 function ParameterField({ param, value, onChange }: ParameterFieldProps) {
   const inputClasses =
     "w-full bg-zinc-800 border border-zinc-700 rounded-md px-3 py-2 text-sm text-zinc-200 " +
-    "placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-500 focus:border-zinc-500";
+    "placeholder:text-zinc-500 focus:outline-hidden focus:ring-1 focus:ring-zinc-500 focus:border-zinc-500";
 
   return (
     <div>
@@ -215,7 +215,7 @@ function ParameterField({ param, value, onChange }: ParameterFieldProps) {
           aria-checked={!!value}
           className={`
             relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full
-            transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-500 focus:ring-offset-2 focus:ring-offset-zinc-900
+            transition-colors focus:outline-hidden focus:ring-2 focus:ring-zinc-500 focus:ring-offset-2 focus:ring-offset-zinc-900
             ${value ? "bg-blue-500" : "bg-zinc-700"}
           `}
           onClick={() => onChange(!value)}

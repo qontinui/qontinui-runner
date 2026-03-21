@@ -371,7 +371,7 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
       <div className="flex-1 flex overflow-hidden">
         {/* Left: Library (collapsible) */}
         {isLibraryOpen ? (
-          <div className="flex-shrink-0 flex" style={{ width: 280 }}>
+          <div className="shrink-0 flex" style={{ width: 280 }}>
             <WorkflowLibraryPanel
               workflows={filteredWorkflows}
               loading={loading}
@@ -395,7 +395,7 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
           /* Collapsed library strip */
           <button
             onClick={toggleLibrary}
-            className="flex-shrink-0 flex flex-col items-center justify-center gap-2 w-8 border-r border-white/10
+            className="shrink-0 flex flex-col items-center justify-center gap-2 w-8 border-r border-white/10
                        text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors"
             title="Expand workflow library"
           >

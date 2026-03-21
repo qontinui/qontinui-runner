@@ -145,7 +145,7 @@ export function ConstraintOverridesEditor() {
               <button
                 type="button"
                 onClick={() => handleToggle(constraint.id)}
-                className={`flex-shrink-0 px-2 py-0.5 text-[10px] font-medium rounded border transition-colors cursor-pointer ${STATE_COLORS[currentState]}`}
+                className={`shrink-0 px-2 py-0.5 text-[10px] font-medium rounded border transition-colors cursor-pointer ${STATE_COLORS[currentState]}`}
                 title={`Click to cycle: Default -> Force On -> Force Off`}
               >
                 {STATE_LABELS[currentState]}
@@ -154,7 +154,7 @@ export function ConstraintOverridesEditor() {
                 <span className="text-[11px] text-zinc-300 truncate block">{constraint.name}</span>
               </div>
               <span
-                className={`flex-shrink-0 text-[10px] ${
+                className={`shrink-0 text-[10px] ${
                   constraint.enabled ? "text-emerald-500/60" : "text-zinc-600"
                 }`}
                 title={

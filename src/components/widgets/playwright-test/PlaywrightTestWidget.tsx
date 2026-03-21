@@ -74,7 +74,7 @@ function ScriptRow({
 
       {/* Language badge */}
       <Badge
-        className={cn("text-xs flex-shrink-0 font-mono border", getLanguageColor(script.language))}
+        className={cn("text-xs shrink-0 font-mono border", getLanguageColor(script.language))}
       >
         <FileCode className="h-3 w-3 mr-1" />
         {script.language.toUpperCase()}
@@ -95,7 +95,7 @@ function ScriptRow({
       </div>
 
       {/* Exit code and duration */}
-      <div className="flex items-center gap-2 flex-shrink-0">
+      <div className="flex items-center gap-2 shrink-0">
         {script.exitCode !== undefined && (
           <Badge variant={script.exitCode === 0 ? "success" : "danger"} className="text-[10px]">
             <Hash className="h-2.5 w-2.5 mr-0.5" />
@@ -129,7 +129,7 @@ function ScriptDetail({ script }: { script: ScriptExecution | null }) {
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Script header */}
-      <div className="px-4 py-3 border-b border-border bg-muted/10 flex-shrink-0">
+      <div className="px-4 py-3 border-b border-border bg-muted/10 shrink-0">
         <div className="flex items-center gap-2">
           <Badge className={cn("font-mono border", getLanguageColor(script.language))}>
             <FileCode className="h-3 w-3 mr-1" />
@@ -218,7 +218,7 @@ export function PlaywrightTestWidget({ isSummary, data, className }: PlaywrightT
       <div className="flex-1 flex overflow-hidden">
         {/* Script list */}
         <div className="w-1/2 border-r border-border flex flex-col">
-          <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 flex-shrink-0">
+          <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 shrink-0">
             <h3 className="text-sm font-semibold text-foreground">Scripts</h3>
             <Badge variant="muted" className="text-xs">
               {data.scripts.length}

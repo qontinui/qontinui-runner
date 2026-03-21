@@ -194,9 +194,9 @@ export function HooksManagerPanel() {
       >
         <div className="flex items-start gap-3">
           {result.success ? (
-            <CheckCircle className={`w-5 h-5 flex-shrink-0 ${getStatusColors("success").icon}`} />
+            <CheckCircle className={`w-5 h-5 shrink-0 ${getStatusColors("success").icon}`} />
           ) : (
-            <XCircle className={`w-5 h-5 flex-shrink-0 ${getStatusColors("error").icon}`} />
+            <XCircle className={`w-5 h-5 shrink-0 ${getStatusColors("error").icon}`} />
           )}
           <div className="flex-1 min-w-0">
             <h4 className="font-medium">Test {result.success ? "Passed" : "Failed"}</h4>
@@ -286,7 +286,7 @@ export function HooksManagerPanel() {
       {/* Error banner */}
       {error && (
         <div className="mx-4 mt-4 p-3 bg-destructive/10 border border-destructive/50 rounded-lg flex items-center gap-2">
-          <AlertCircle className="w-4 h-4 text-destructive flex-shrink-0" />
+          <AlertCircle className="w-4 h-4 text-destructive shrink-0" />
           <p className="text-sm text-destructive">{error}</p>
           <button
             onClick={() => setError(null)}

@@ -114,7 +114,7 @@ export function ExternalLogsTab({
         {error && (
           <div className="flex flex-col gap-2 px-3 py-2 bg-destructive/10 text-destructive text-sm rounded-md mt-4 max-w-2xl">
             <div className="flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 flex-shrink-0" />
+              <AlertCircle className="w-4 h-4 shrink-0" />
               <span className="font-medium">Error loading project logs</span>
             </div>
             <div className="text-xs text-left ml-6 font-mono bg-destructive/5 p-2 rounded">
@@ -247,7 +247,7 @@ export function ExternalLogsTab({
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs">
             {/* Logs directory */}
             <div className="flex items-center gap-2 p-2 bg-background rounded border border-border">
-              <FileText className={`w-4 h-4 ${getAccentColors("blue").text} flex-shrink-0`} />
+              <FileText className={`w-4 h-4 ${getAccentColors("blue").text} shrink-0`} />
               <div className="flex-1 min-w-0">
                 <div className="text-muted-foreground mb-0.5">Runner Logs</div>
                 <div className="truncate font-mono" title={config.logDirectory}>
@@ -269,7 +269,7 @@ export function ExternalLogsTab({
 
             {/* Screenshots directory */}
             <div className="flex items-center gap-2 p-2 bg-background rounded border border-border">
-              <Camera className={`w-4 h-4 ${getAccentColors("purple").text} flex-shrink-0`} />
+              <Camera className={`w-4 h-4 ${getAccentColors("purple").text} shrink-0`} />
               <div className="flex-1 min-w-0">
                 <div className="text-muted-foreground mb-0.5">Screenshots</div>
                 <div className="truncate font-mono" title={config.screenshotDirectory}>
@@ -291,7 +291,7 @@ export function ExternalLogsTab({
 
             {/* AI Output directory */}
             <div className="flex items-center gap-2 p-2 bg-background rounded border border-border">
-              <Sparkles className={`w-4 h-4 ${getAccentColors("amber").text} flex-shrink-0`} />
+              <Sparkles className={`w-4 h-4 ${getAccentColors("amber").text} shrink-0`} />
               <div className="flex-1 min-w-0">
                 <div className="text-muted-foreground mb-0.5">AI Output</div>
                 <div className="truncate font-mono" title={config.aiOutputDirectory}>

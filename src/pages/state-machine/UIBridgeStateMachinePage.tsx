@@ -258,7 +258,7 @@ export function UIBridgeStateMachinePage() {
                 sm.setActiveConfig(null);
               }
             }}
-            className="w-[220px] h-9 rounded-md border border-border-primary bg-surface-primary px-3 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-primary [&>option]:text-black [&>option]:bg-white"
+            className="w-[220px] h-9 rounded-md border border-border-primary bg-surface-primary px-3 text-sm text-text-primary focus:outline-hidden focus:ring-2 focus:ring-brand-primary [&>option]:text-black [&>option]:bg-white"
             style={{ colorScheme: "dark" }}
           >
             <option value="">Select configuration...</option>
@@ -296,7 +296,7 @@ export function UIBridgeStateMachinePage() {
               }
               className={`inline-flex items-center justify-center gap-1.5 rounded-md px-2 py-1 text-sm font-medium whitespace-nowrap transition-[color,box-shadow] ${
                 activeTab === value
-                  ? "bg-background shadow-sm text-foreground"
+                  ? "bg-background shadow-xs text-foreground"
                   : "text-muted-foreground hover:text-foreground"
               }`}
             >

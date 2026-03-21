@@ -59,9 +59,9 @@ export function FileTreePanel({ data, size }: CanvasPanelComponentProps) {
               style={{ paddingLeft: `${depth * 12}px` }}
             >
               {entry.status && (
-                <span className="w-3 text-center flex-shrink-0 opacity-70">{prefix}</span>
+                <span className="w-3 text-center shrink-0 opacity-70">{prefix}</span>
               )}
-              <Icon className="h-3 w-3 flex-shrink-0 opacity-60" />
+              <Icon className="h-3 w-3 shrink-0 opacity-60" />
               <span className="truncate">{entry.path.split("/").pop()}</span>
             </div>
           );

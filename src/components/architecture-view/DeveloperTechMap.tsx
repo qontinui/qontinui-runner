@@ -146,7 +146,7 @@ export function DeveloperTechMap({ project }: Props) {
       </div>
 
       {/* Right column: Feature sidebar */}
-      <div className="w-72 flex-shrink-0 border border-border/50 rounded-lg bg-card overflow-hidden flex flex-col">
+      <div className="w-72 shrink-0 border border-border/50 rounded-lg bg-card overflow-hidden flex flex-col">
         <div className="px-3 py-2 border-b border-border/50 bg-muted/30">
           <div className="flex items-center gap-1.5">
             <Layers className="w-3.5 h-3.5 text-muted-foreground" />

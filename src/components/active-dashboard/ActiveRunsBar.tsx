@@ -174,7 +174,7 @@ export function ActiveRunsBar({ onNewRun, onRunCreated }: ActiveRunsBarProps) {
           setFocusedIndex(-1);
         }
       }}
-      className="flex h-16 items-center gap-3 border-t border-border bg-card/50 px-4 focus:outline-none"
+      className="flex h-16 items-center gap-3 border-t border-border bg-card/50 px-4 focus:outline-hidden"
     >
       {/* Icon and label */}
       <div className="flex items-center gap-2 text-muted-foreground">
@@ -295,7 +295,7 @@ export function ActiveRunsBar({ onNewRun, onRunCreated }: ActiveRunsBarProps) {
         size="sm"
         variant="outline"
         onClick={() => setIsNewRunDialogOpen(true)}
-        className="flex-shrink-0 border-border bg-muted hover:bg-muted/80"
+        className="shrink-0 border-border bg-muted hover:bg-muted/80"
       >
         <Plus className="h-4 w-4 mr-1" />
         <span className="text-xs">New Run</span>

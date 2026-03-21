@@ -72,7 +72,7 @@ export function ProgressChartPanel({ data, size }: CanvasPanelComponentProps) {
           return (
             <div key={`legend-${segment.label}`} className="flex items-center gap-1.5">
               <div
-                className={cn("h-2.5 w-2.5 rounded-sm flex-shrink-0", !isCustomColor && bgClass)}
+                className={cn("h-2.5 w-2.5 rounded-xs shrink-0", !isCustomColor && bgClass)}
                 style={isCustomColor ? { backgroundColor: segment.color } : undefined}
               />
               <span className="text-muted-foreground">{segment.label}</span>

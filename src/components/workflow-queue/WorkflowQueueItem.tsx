@@ -78,12 +78,12 @@ export function WorkflowQueueItem({
       `}
     >
       {/* Drag handle */}
-      <div className="text-muted-foreground hover:text-foreground flex-shrink-0">
+      <div className="text-muted-foreground hover:text-foreground shrink-0">
         <GripVertical className="w-4 h-4" />
       </div>
 
       {/* Position number */}
-      <div className="w-6 h-6 rounded-full bg-cyan-500/20 text-cyan-400 flex items-center justify-center text-label-sm font-medium flex-shrink-0">
+      <div className="w-6 h-6 rounded-full bg-cyan-500/20 text-cyan-400 flex items-center justify-center text-label-sm font-medium shrink-0">
         {index + 1}
       </div>
 
@@ -109,7 +109,7 @@ export function WorkflowQueueItem({
           e.stopPropagation();
           onRemove();
         }}
-        className="p-1.5 rounded-lg text-muted-foreground hover:text-red-400 hover:bg-red-500/10 transition-colors flex-shrink-0"
+        className="p-1.5 rounded-lg text-muted-foreground hover:text-red-400 hover:bg-red-500/10 transition-colors shrink-0"
         title="Remove from queue"
       >
         <X className="w-4 h-4" />

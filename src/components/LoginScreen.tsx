@@ -71,7 +71,7 @@ export function LoginScreen({ onLogin }: LoginScreenProps) {
                   onChange={(e) => setEmail(e.target.value)}
                   className="w-full pl-11 pr-4 py-3 bg-input border border-border/50 rounded-lg
                            text-foreground placeholder:text-muted-foreground
-                           focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent
+                           focus:outline-hidden focus:ring-2 focus:ring-primary focus:border-transparent
                            transition-all duration-200"
                   placeholder="you@example.com"
                   required
@@ -94,7 +94,7 @@ export function LoginScreen({ onLogin }: LoginScreenProps) {
                   onChange={(e) => setPassword(e.target.value)}
                   className="w-full pl-11 pr-4 py-3 bg-input border border-border/50 rounded-lg
                            text-foreground placeholder:text-muted-foreground
-                           focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent
+                           focus:outline-hidden focus:ring-2 focus:ring-primary focus:border-transparent
                            transition-all duration-200"
                   placeholder="Enter your password"
                   required

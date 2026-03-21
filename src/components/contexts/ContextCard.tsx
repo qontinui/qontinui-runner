@@ -181,7 +181,7 @@ export function ContextCard({
         <div className="flex items-start gap-3">
           {/* Context Icon */}
           <div
-            className={`flex-shrink-0 p-2 rounded-lg ${
+            className={`shrink-0 p-2 rounded-lg ${
               context.enabled ? "bg-primary/10" : "bg-muted"
             }`}
           >
@@ -293,7 +293,7 @@ export function ContextCard({
           </div>
 
           {/* Actions */}
-          <div className="flex items-center gap-1 flex-shrink-0">
+          <div className="flex items-center gap-1 shrink-0">
             {/* Expand/Collapse */}
             <button
               onClick={() => setIsExpanded(!isExpanded)}

@@ -68,7 +68,7 @@ export function HookConditionBuilder({ conditions, onChange }: HookConditionBuil
               <select
                 value={condition.variable}
                 onChange={(e) => updateCondition(index, { variable: e.target.value })}
-                className="px-2 py-1.5 bg-background border border-border rounded text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                className="px-2 py-1.5 bg-background border border-border rounded text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
               >
                 {CONDITION_VARIABLES.map((v) => (
                   <option key={v.name} value={v.name} title={v.description}>
@@ -85,7 +85,7 @@ export function HookConditionBuilder({ conditions, onChange }: HookConditionBuil
                     operator: e.target.value as ConditionOperator,
                   })
                 }
-                className="px-2 py-1.5 bg-background border border-border rounded text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                className="px-2 py-1.5 bg-background border border-border rounded text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
               >
                 {(Object.keys(CONDITION_OPERATOR_DISPLAY_NAMES) as ConditionOperator[]).map(
                   (op) => (
@@ -113,7 +113,7 @@ export function HookConditionBuilder({ conditions, onChange }: HookConditionBuil
                   updateCondition(index, { value });
                 }}
                 placeholder="value"
-                className="flex-1 px-2 py-1.5 bg-background border border-border rounded text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                className="flex-1 px-2 py-1.5 bg-background border border-border rounded text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
               />
 
               {/* Remove button */}

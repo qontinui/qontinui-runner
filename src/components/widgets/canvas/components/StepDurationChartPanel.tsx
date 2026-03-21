@@ -55,7 +55,7 @@ export function StepDurationChartPanel({ data, size }: CanvasPanelComponentProps
           <div key={`${step.name}-${idx}`} className="flex items-center gap-2">
             {/* Step name */}
             <div
-              className={cn("truncate text-muted-foreground flex-shrink-0", fontSize)}
+              className={cn("truncate text-muted-foreground shrink-0", fontSize)}
               style={{ width: `${nameWidth}px` }}
               title={step.name}
             >
@@ -65,14 +65,14 @@ export function StepDurationChartPanel({ data, size }: CanvasPanelComponentProps
             {/* Bar */}
             <div className="flex-1 flex items-center gap-1.5">
               <div
-                className={cn("rounded-sm transition-all", barHeight, isRunning && "animate-pulse")}
+                className={cn("rounded-xs transition-all", barHeight, isRunning && "animate-pulse")}
                 style={{
                   width: `${widthPct}%`,
                   backgroundColor: barColor,
                 }}
                 title={`${step.name}: ${formatDuration(step.duration_ms)} (${step.status})${step.phase ? ` [${step.phase}]` : ""}`}
               />
-              <span className={cn("flex-shrink-0 font-mono text-muted-foreground", fontSize)}>
+              <span className={cn("shrink-0 font-mono text-muted-foreground", fontSize)}>
                 {formatDuration(step.duration_ms)}
               </span>
             </div>

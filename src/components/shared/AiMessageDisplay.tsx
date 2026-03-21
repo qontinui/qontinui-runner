@@ -710,7 +710,7 @@ function StatusBanner({ group }: { group: MessageGroup }) {
         colors.text,
       )}
     >
-      <Icon className="w-4 h-4 flex-shrink-0" />
+      <Icon className="w-4 h-4 shrink-0" />
       <span className="flex-1">{cleanText}</span>
       <span className="text-muted-foreground/60 text-[10px] font-normal">
         {formatTimestamp(group.timestamp)}
@@ -740,7 +740,7 @@ function FindingBanner({ group }: { group: MessageGroup }) {
         amberColors.border,
       )}
     >
-      <FileText className={cn("w-3.5 h-3.5 flex-shrink-0", amberColors.text)} />
+      <FileText className={cn("w-3.5 h-3.5 shrink-0", amberColors.text)} />
       <span className={cn("font-medium", amberColors.text)}>{category}</span>
       <span className="text-muted-foreground/60 text-[10px] uppercase">{severity}</span>
       {title && <span className="text-muted-foreground truncate flex-1">{title}</span>}
@@ -784,7 +784,7 @@ function ChatBubble({ group, isAnimated }: { group: MessageGroup; isAnimated?: b
       {/* Avatar */}
       <div
         className={cn(
-          "flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center",
+          "shrink-0 w-8 h-8 rounded-full flex items-center justify-center",
           avatarColors.bg,
           avatarColors.text,
         )}

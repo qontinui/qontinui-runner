@@ -88,7 +88,7 @@ export function AgenticPromptEditor({
           value={prompt || DEFAULT_PROMPT}
           onChange={(e) => onPromptChange(e.target.value)}
           rows={8}
-          className="w-full px-3 py-2 text-sm bg-card border border-border rounded-md text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-purple-500 font-mono resize-y"
+          className="w-full px-3 py-2 text-sm bg-card border border-border rounded-md text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:border-purple-500 font-mono resize-y"
         />
       </div>
 
@@ -100,7 +100,7 @@ export function AgenticPromptEditor({
           onChange={(e) => onMaxIterationsChange(Number(e.target.value))}
           min={1}
           max={20}
-          className="w-20 px-2 py-1 text-sm bg-card border border-border rounded text-foreground focus:outline-none focus:border-purple-500"
+          className="w-20 px-2 py-1 text-sm bg-card border border-border rounded text-foreground focus:outline-hidden focus:border-purple-500"
         />
         <span className="text-xs text-muted-foreground">
           verification-agentic loops before stopping

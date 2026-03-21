@@ -364,7 +364,7 @@ export function CodeDiffPanel({ data }: CanvasPanelComponentProps) {
                 isMeta && "text-muted-foreground font-bold",
               )}
             >
-              <span className="w-8 flex-shrink-0 text-right pr-2 text-muted-foreground/40 select-none">
+              <span className="w-8 shrink-0 text-right pr-2 text-muted-foreground/40 select-none">
                 {idx + 1}
               </span>
               <span className="px-1">

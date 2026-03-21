@@ -147,7 +147,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
                 value={settings.adb_path || ""}
                 onChange={(e) => updateSetting("adb_path", e.target.value || null)}
                 placeholder="Auto-detect (e.g., C:\Android\sdk\platform-tools\adb.exe)"
-                className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
+                className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
               />
               <button
                 type="button"
@@ -186,7 +186,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
             id="default-device"
             value={settings.default_device_id || ""}
             onChange={(e) => updateSetting("default_device_id", e.target.value || null)}
-            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
           >
             <option value="">Auto (first connected device)</option>
             {devices.map((device) => (
@@ -218,7 +218,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
             value={settings.app_package || ""}
             onChange={(e) => updateSetting("app_package", e.target.value || null)}
             placeholder="com.myapp or com.myapp.debug"
-            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
+            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
           />
           <p className="text-[10px] text-muted-foreground">
             Used for filtering logcat output to your app&apos;s logs
@@ -243,7 +243,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
               max={10000}
               value={settings.logcat_lines}
               onChange={(e) => updateSetting("logcat_lines", parseInt(e.target.value) || 500)}
-              className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+              className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
             />
           </div>
         </div>
@@ -286,7 +286,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
               value={settings.output_dir || ""}
               onChange={(e) => updateSetting("output_dir", e.target.value || null)}
               placeholder="Default: .dev-logs/mobile/"
-              className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
+              className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
             />
             <button
               type="button"

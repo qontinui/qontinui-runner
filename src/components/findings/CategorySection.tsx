@@ -107,12 +107,12 @@ export function CategorySection({
         className={`w-full flex items-center gap-3 p-3 ${categoryColors.bg} hover:bg-muted/50 transition-colors`}
       >
         {/* Expand/Collapse Icon */}
-        <div className="flex-shrink-0 text-muted-foreground">
+        <div className="shrink-0 text-muted-foreground">
           {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
         </div>
 
         {/* Category Icon */}
-        <div className={`flex-shrink-0 p-2 rounded-lg ${categoryColors.bg}`}>
+        <div className={`shrink-0 p-2 rounded-lg ${categoryColors.bg}`}>
           <IconComponent className={`w-5 h-5 ${categoryColors.text}`} />
         </div>
 
@@ -133,7 +133,7 @@ export function CategorySection({
         </div>
 
         {/* Stats */}
-        <div className="flex-shrink-0 flex items-center gap-3 text-xs">
+        <div className="shrink-0 flex items-center gap-3 text-xs">
           {actionableCount > 0 && (
             <span className={getAccentColors("amber").text}>{actionableCount} actionable</span>
           )}

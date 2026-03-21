@@ -477,7 +477,7 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
                         : "bg-red-500/10 text-red-400"
                     }`}
                   >
-                    <span className="flex-shrink-0 mt-0.5">
+                    <span className="shrink-0 mt-0.5">
                       {assertion.passed ? (
                         <CheckCircle2 className="w-3.5 h-3.5" />
                       ) : (
@@ -630,11 +630,11 @@ function CheckResultCard({ check }: CheckResultCardProps) {
         <div className="flex items-center gap-2">
           {/* Status Icon */}
           {isPassed ? (
-            <CheckCircle2 className="w-4 h-4 text-green-500 flex-shrink-0" />
+            <CheckCircle2 className="w-4 h-4 text-green-500 shrink-0" />
           ) : isSkipped ? (
-            <SkipForward className="w-4 h-4 text-yellow-500 flex-shrink-0" />
+            <SkipForward className="w-4 h-4 text-yellow-500 shrink-0" />
           ) : (
-            <XCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
+            <XCircle className="w-4 h-4 text-red-500 shrink-0" />
           )}
 
           {/* Check Name */}
@@ -759,7 +759,7 @@ function IssueRow({ issue }: IssueRowProps) {
         </div>
 
         {/* Rule code and fixable indicator */}
-        <div className="flex items-center gap-1 flex-shrink-0">
+        <div className="flex items-center gap-1 shrink-0">
           {issue.code && (
             <span className="font-mono px-1 py-0.5 rounded bg-muted/50 text-muted-foreground">
               {issue.code}

@@ -97,7 +97,7 @@ export function ConnectionBar({
             className="flex-1 min-w-[140px] max-w-[260px] px-2.5 py-1 text-xs rounded
             bg-white/5 border border-white/10 text-foreground
             placeholder:text-muted-foreground/50
-            focus:outline-none focus:border-cyan-500/50"
+            focus:outline-hidden focus:border-cyan-500/50"
             onKeyDown={(e) => {
               if (e.key === "Enter" && url.trim()) onDiscover(url.trim());
             }}
@@ -185,7 +185,7 @@ export function ConnectionBar({
             onClick={onBuildWorkflow}
             disabled={isLoading}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md
-            bg-orange-500 text-white shadow-sm shadow-orange-500/25
+            bg-orange-500 text-white shadow-xs shadow-orange-500/25
             hover:bg-orange-600 disabled:opacity-50 transition-colors shrink-0"
           >
             <Hammer className="w-3.5 h-3.5" />

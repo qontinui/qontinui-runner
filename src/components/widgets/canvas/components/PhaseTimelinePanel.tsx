@@ -93,7 +93,7 @@ export function PhaseTimelinePanel({ data, size }: CanvasPanelComponentProps) {
           <div key={`detail-${phase.name}`} className="flex items-center gap-1.5">
             <span
               className={cn(
-                "inline-block h-2 w-2 rounded-full flex-shrink-0",
+                "inline-block h-2 w-2 rounded-full shrink-0",
                 STATUS_COLORS[phase.status]?.split(" ")[0] ?? "bg-muted",
               )}
             />

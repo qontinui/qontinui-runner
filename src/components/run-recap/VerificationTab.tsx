@@ -92,7 +92,7 @@ function SnapshotAssertResults({
               assertion.passed ? "bg-green-500/10 text-green-400" : "bg-red-500/10 text-red-400"
             }`}
           >
-            <span className="flex-shrink-0 mt-0.5">
+            <span className="shrink-0 mt-0.5">
               {assertion.passed ? (
                 <CheckCircle2 className="w-3.5 h-3.5" />
               ) : (

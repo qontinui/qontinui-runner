@@ -107,7 +107,7 @@ export function TaskListWidget({
   }
 
   return (
-    <div className="bg-card border border-border rounded-lg shadow-sm min-w-[180px] max-w-[240px]">
+    <div className="bg-card border border-border rounded-lg shadow-xs min-w-[180px] max-w-[240px]">
       {/* Header */}
       <div className="px-3 py-1.5 border-b border-border/50 bg-muted/30">
         <div className="flex items-center justify-between">

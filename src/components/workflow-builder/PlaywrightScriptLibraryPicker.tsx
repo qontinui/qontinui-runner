@@ -165,7 +165,7 @@ export function PlaywrightScriptLibraryPicker({
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-9 pr-3 py-2 text-sm bg-muted border border-border rounded-md
-                       focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
+                       focus:outline-hidden focus:ring-2 focus:ring-cyan-500/50"
               autoFocus
             />
           </div>
@@ -174,7 +174,7 @@ export function PlaywrightScriptLibraryPicker({
               value={filterCategory || ""}
               onChange={(e) => setFilterCategory(e.target.value || null)}
               className="px-3 py-2 text-sm bg-muted border border-border rounded-md
-                       focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
+                       focus:outline-hidden focus:ring-2 focus:ring-cyan-500/50"
             >
               <option value="">All Categories</option>
               {categories.map((cat) => (
@@ -240,7 +240,7 @@ export function PlaywrightScriptLibraryPicker({
                       <div className="flex items-center gap-3 mt-1.5 text-xs text-muted-foreground">
                         {script.target_url && (
                           <span className="flex items-center gap-1 truncate max-w-[200px]">
-                            <Globe className="w-3 h-3 flex-shrink-0" />
+                            <Globe className="w-3 h-3 shrink-0" />
                             {script.target_url}
                           </span>
                         )}

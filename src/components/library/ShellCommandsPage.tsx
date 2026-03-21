@@ -130,7 +130,7 @@ function TagInput({ tags, onChange }: TagInputProps) {
           onKeyDown={handleKeyDown}
           placeholder="Add a tag..."
           className="flex-1 px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-            placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+            placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
             text-foreground"
         />
         <button
@@ -247,7 +247,7 @@ function ShellCommandEditor({ builder }: ShellCommandEditorProps) {
               onChange={(e) => updateField("name", e.target.value)}
               placeholder="Command name..."
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground"
             />
           </div>
@@ -260,7 +260,7 @@ function ShellCommandEditor({ builder }: ShellCommandEditorProps) {
               onChange={(e) => updateField("category", e.target.value)}
               placeholder="e.g., build, deploy, test..."
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground"
             />
           </div>
@@ -283,7 +283,7 @@ function ShellCommandEditor({ builder }: ShellCommandEditorProps) {
               placeholder="Enter shell command..."
               rows={6}
               className="w-full px-3 py-2 text-sm font-mono bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground resize-y"
             />
           </div>
@@ -299,7 +299,7 @@ function ShellCommandEditor({ builder }: ShellCommandEditorProps) {
               onChange={(e) => updateField("working_directory", e.target.value)}
               placeholder="/path/to/directory (optional)"
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground"
             />
           </div>
@@ -322,7 +322,7 @@ function ShellCommandEditor({ builder }: ShellCommandEditorProps) {
                 updateField("platform", e.target.value as ShellCommandItem["platform"])
               }
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
             >
               {PLATFORM_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value}>
@@ -344,7 +344,7 @@ function ShellCommandEditor({ builder }: ShellCommandEditorProps) {
               min={1}
               max={3600}
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
             />
           </div>
         </div>

@@ -801,7 +801,7 @@
     box-shadow: none;
   }
   .elevation-raised {
-    @apply shadow-sm;
+    @apply shadow-xs;
   }
   .elevation-floating {
     @apply shadow-md;

@@ -158,7 +158,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
         {/* Right: Toolkit sidebar (collapsible) */}
         {isToolkitOpen ? (
           <div
-            className="flex-shrink-0 border-l border-border overflow-auto scrollbar-dark"
+            className="shrink-0 border-l border-border overflow-auto scrollbar-dark"
             style={{ width: 320 }}
           >
             <AutomationToolkitSidebar
@@ -177,7 +177,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
         ) : (
           <button
             onClick={toggleToolkit}
-            className="flex-shrink-0 flex flex-col items-center justify-center gap-2 w-8 border-l border-white/10
+            className="shrink-0 flex flex-col items-center justify-center gap-2 w-8 border-l border-white/10
                        text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors"
             title="Expand toolkit"
           >

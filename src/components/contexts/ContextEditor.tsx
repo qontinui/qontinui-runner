@@ -290,7 +290,7 @@ export function ContextEditor({
               onChange={(e) => setName(e.target.value)}
               disabled={isReadOnly}
               placeholder="Context name"
-              className={`w-full px-3 py-2 bg-background border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary ${
+              className={`w-full px-3 py-2 bg-background border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary ${
                 errors.name ? getStatusColors("error").border : "border-border"
               }`}
             />
@@ -313,7 +313,7 @@ export function ContextEditor({
                   if (e.target.value) setNewCategory("");
                 }}
                 disabled={isReadOnly}
-                className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
               >
                 <option value="">Select or create new</option>
                 {categories.map((cat) => (
@@ -334,7 +334,7 @@ export function ContextEditor({
                 }}
                 disabled={isReadOnly}
                 placeholder="New category name"
-                className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
               />
             </div>
           </div>
@@ -377,7 +377,7 @@ export function ContextEditor({
                   }}
                   placeholder="Add tag and press Enter"
                   list="tag-suggestions"
-                  className="flex-1 px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                  className="flex-1 px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
                 />
                 <datalist id="tag-suggestions">
                   {tagSuggestions.map((tag) => (
@@ -421,7 +421,7 @@ export function ContextEditor({
                 disabled={isReadOnly}
                 placeholder="Enter markdown content that will be injected into AI prompts..."
                 rows={10}
-                className={`w-full px-3 py-2 bg-background border rounded-md text-sm font-mono resize-y focus:outline-none focus:ring-2 focus:ring-primary ${
+                className={`w-full px-3 py-2 bg-background border rounded-md text-sm font-mono resize-y focus:outline-hidden focus:ring-2 focus:ring-primary ${
                   errors.content ? getStatusColors("error").border : "border-border"
                 }`}
               />
@@ -488,7 +488,7 @@ export function ContextEditor({
                       }
                     }}
                     placeholder="e.g., debug, typescript, api"
-                    className="flex-1 px-2 py-1 bg-background border border-border rounded text-xs focus:outline-none focus:ring-2 focus:ring-primary"
+                    className="flex-1 px-2 py-1 bg-background border border-border rounded text-xs focus:outline-hidden focus:ring-2 focus:ring-primary"
                   />
                   <button
                     onClick={addTaskMention}
@@ -566,7 +566,7 @@ export function ContextEditor({
                       }
                     }}
                     placeholder="e.g., TypeError|ReferenceError"
-                    className={`flex-1 px-2 py-1 bg-background border rounded text-xs font-mono focus:outline-none focus:ring-2 focus:ring-primary ${
+                    className={`flex-1 px-2 py-1 bg-background border rounded text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-primary ${
                       errors.errorPatterns ? getStatusColors("error").border : "border-border"
                     }`}
                   />
@@ -622,7 +622,7 @@ export function ContextEditor({
                       }
                     }}
                     placeholder="e.g., *.rs, src/api/**, **/*.test.ts"
-                    className="flex-1 px-2 py-1 bg-background border border-border rounded text-xs font-mono focus:outline-none focus:ring-2 focus:ring-primary"
+                    className="flex-1 px-2 py-1 bg-background border border-border rounded text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-primary"
                   />
                   <button
                     onClick={addFilePattern}
@@ -641,7 +641,7 @@ export function ContextEditor({
             <div
               className={`flex items-center gap-2 text-sm ${getAccentColors("amber").text} ${getAccentColors("amber").bg} p-3 rounded-lg`}
             >
-              <AlertTriangle className="w-5 h-5 flex-shrink-0" />
+              <AlertTriangle className="w-5 h-5 shrink-0" />
               <span>
                 Built-in contexts are read-only. Use the duplicate feature to create an editable
                 copy.

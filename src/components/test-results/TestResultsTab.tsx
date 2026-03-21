@@ -238,7 +238,7 @@ export function TestResultsTab() {
   return (
     <div className="h-full flex flex-col overflow-hidden">
       {/* Summary header */}
-      <div className="flex-shrink-0 p-4 border-b border-border bg-muted/30">
+      <div className="shrink-0 p-4 border-b border-border bg-muted/30">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2">
@@ -289,9 +289,9 @@ export function TestResultsTab() {
                 className="w-full flex items-center gap-3 p-3 text-left hover:bg-muted/30 transition-colors"
               >
                 {isExpanded ? (
-                  <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                  <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
                 ) : (
-                  <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                  <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
                 )}
                 <div className={`p-1.5 rounded ${statusInfo.bgColor}`}>
                   <StatusIcon

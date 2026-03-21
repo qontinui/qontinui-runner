@@ -202,7 +202,7 @@ function TaskEditor({
               onChange={(e) => updateField("name", e.target.value)}
               placeholder="Task name..."
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground"
             />
           </div>
@@ -215,7 +215,7 @@ function TaskEditor({
               onChange={(e) => updateField("category", e.target.value)}
               placeholder="e.g., code-review, bug-fix, feature"
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground"
             />
           </div>
@@ -237,7 +237,7 @@ function TaskEditor({
             placeholder="Enter the task/prompt content..."
             rows={10}
             className="w-full px-3 py-2 text-sm font-mono bg-muted/50 border border-border rounded-md
-              placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+              placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
               text-foreground resize-y min-h-[200px]"
           />
           <p className="text-[11px] text-muted-foreground">
@@ -262,7 +262,7 @@ function TaskEditor({
               onKeyDown={handleTagKeyDown}
               placeholder="Add a tag..."
               className="flex-1 px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground"
             />
             <button

@@ -127,7 +127,7 @@ export function StepItem({
       role="checkbox"
       aria-checked={isSelectedForDelete}
       tabIndex={0}
-      className={`flex-shrink-0 w-5 h-5 rounded border-2 flex items-center justify-center transition-colors ${
+      className={`shrink-0 w-5 h-5 rounded border-2 flex items-center justify-center transition-colors ${
         isSelectedForDelete ? "bg-red-500 border-red-500" : "border-zinc-500"
       }`}
       onClick={(e) => {

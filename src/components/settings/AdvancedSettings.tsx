@@ -226,7 +226,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
                 max="10"
                 value={settings.top_matches_count}
                 onChange={(e) => handleTopMatchesChange(parseInt(e.target.value))}
-                className="w-14 px-2 py-1.5 bg-muted/50 rounded-md text-center text-sm outline-none focus:ring-1 focus:ring-primary/50"
+                className="w-14 px-2 py-1.5 bg-muted/50 rounded-md text-center text-sm outline-hidden focus:ring-1 focus:ring-primary/50"
               />
             </div>
           </label>

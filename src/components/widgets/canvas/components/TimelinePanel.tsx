@@ -44,7 +44,7 @@ export function TimelinePanel({ data, size }: CanvasPanelComponentProps) {
           <div key={`${event.title}-${idx}`} className="flex gap-3">
             {/* Line + icon column */}
             <div className="flex flex-col items-center">
-              <div className="relative flex-shrink-0">
+              <div className="relative shrink-0">
                 <Icon className={cn("h-4 w-4", config.classes)} />
                 {config.shape === "diamond" && (
                   <div className="absolute -bottom-0.5 -right-0.5 w-1.5 h-1.5 bg-red-500 rotate-45" />
@@ -60,7 +60,7 @@ export function TimelinePanel({ data, size }: CanvasPanelComponentProps) {
                   {event.title}
                 </span>
                 {event.timestamp && (
-                  <span className="text-[10px] text-muted-foreground font-mono flex-shrink-0">
+                  <span className="text-[10px] text-muted-foreground font-mono shrink-0">
                     {event.timestamp}
                   </span>
                 )}

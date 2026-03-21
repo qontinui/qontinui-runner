@@ -14,9 +14,9 @@ import { AutoresearchDashboard } from "./AutoresearchDashboard";
 import type { SearchDimension } from "@/types";
 
 const inputClass =
-  "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50";
+  "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50";
 const selectClass =
-  "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 [&>option]:text-black [&>option]:bg-white";
+  "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50 [&>option]:text-black [&>option]:bg-white";
 const chipActiveClass =
   "px-2 py-0.5 text-[11px] rounded border transition-colors border-blue-500 bg-blue-900/30 text-blue-300";
 const chipInactiveClass =

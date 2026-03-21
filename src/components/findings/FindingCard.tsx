@@ -203,7 +203,7 @@ export function FindingCard({
       <div className="p-3">
         <div className="flex items-start gap-3">
           {/* Category Icon */}
-          <div className={`flex-shrink-0 p-2 rounded-lg ${categoryColors.bg}`}>
+          <div className={`shrink-0 p-2 rounded-lg ${categoryColors.bg}`}>
             <IconComponent className={`w-4 h-4 ${categoryColors.text}`} />
           </div>
 
@@ -244,7 +244,7 @@ export function FindingCard({
           </div>
 
           {/* Actions */}
-          <div className="flex items-center gap-1 flex-shrink-0">
+          <div className="flex items-center gap-1 shrink-0">
             {/* Expand/Collapse */}
             <button
               onClick={() => setIsExpanded(!isExpanded)}
@@ -441,7 +441,7 @@ export function FindingCard({
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
                 placeholder="Enter your response..."
-                className="flex-1 px-3 py-2 text-sm bg-background border border-border rounded focus:outline-none focus:ring-2 focus:ring-primary"
+                className="flex-1 px-3 py-2 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-2 focus:ring-primary"
               />
               <button
                 onClick={handleProvideInput}

@@ -71,7 +71,7 @@ export function TablePanel({ data, size }: CanvasPanelComponentProps) {
             placeholder="Filter rows..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            className="w-full pl-7 pr-2 py-1.5 text-xs bg-muted/30 border border-border/50 rounded-md text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary/50"
+            className="w-full pl-7 pr-2 py-1.5 text-xs bg-muted/30 border border-border/50 rounded-md text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:border-primary/50"
           />
         </div>
       )}

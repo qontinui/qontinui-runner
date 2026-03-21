@@ -453,7 +453,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                       onClick={() => toggleFix(fix.id)}
                       className="w-full px-3 py-2 flex items-center gap-2 text-left hover:bg-muted/40 transition-colors rounded-lg"
                     >
-                      <Wrench className={`w-4 h-4 flex-shrink-0 ${typeColors.text}`} />
+                      <Wrench className={`w-4 h-4 shrink-0 ${typeColors.text}`} />
                       <span
                         className={`text-xs px-1.5 py-0.5 rounded ${typeColors.bg} ${typeColors.text}`}
                       >
@@ -471,9 +471,9 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                       )}
                       <span className="flex-1 text-sm truncate">{fix.fix_description}</span>
                       {isExpanded ? (
-                        <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                        <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
                       ) : (
-                        <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                        <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
                       )}
                     </button>
 
@@ -625,7 +625,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                             onClick={() => toggleKnowledge(entry.id)}
                             className="w-full px-3 py-2 flex items-center gap-2 text-left hover:bg-muted/40 transition-colors rounded-lg"
                           >
-                            <Icon className={`w-4 h-4 flex-shrink-0 ${config.color}`} />
+                            <Icon className={`w-4 h-4 shrink-0 ${config.color}`} />
                             <span
                               className={`text-xs px-1.5 py-0.5 rounded ${CONFIDENCE_COLORS[entry.confidence] || "bg-gray-500/10 text-gray-400"}`}
                             >
@@ -636,12 +636,12 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                             </span>
                             <span className="flex-1 text-sm truncate">{entry.content}</span>
                             {entry.is_resolved && (
-                              <CheckCircle className="w-3.5 h-3.5 text-green-400 flex-shrink-0" />
+                              <CheckCircle className="w-3.5 h-3.5 text-green-400 shrink-0" />
                             )}
                             {isExpanded ? (
-                              <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                              <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
                             ) : (
-                              <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                              <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
                             )}
                           </button>
 

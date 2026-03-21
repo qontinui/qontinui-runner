@@ -79,7 +79,7 @@ export function StepItem({ step, depth = 0, onAiStepClick }: StepItemProps) {
         disabled={!isClickable}
       >
         {/* Expand/collapse indicator */}
-        <div className="w-4 h-4 flex-shrink-0">
+        <div className="w-4 h-4 shrink-0">
           {hasChildren ? (
             expanded ? (
               <ChevronDown className="w-4 h-4 text-muted-foreground" />
@@ -133,7 +133,7 @@ export function StepItem({ step, depth = 0, onAiStepClick }: StepItemProps) {
         </div>
 
         {/* Navigate hint for AI steps */}
-        {onAiStepClick && <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />}
+        {onAiStepClick && <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />}
       </button>
 
       {/* Children */}

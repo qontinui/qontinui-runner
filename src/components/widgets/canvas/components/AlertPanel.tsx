@@ -43,7 +43,7 @@ export function AlertPanel({ data }: CanvasPanelComponentProps) {
 
   return (
     <div className={cn("flex items-start gap-3 rounded-md border p-3", config.classes)}>
-      <div className="relative flex-shrink-0 mt-0.5">
+      <div className="relative shrink-0 mt-0.5">
         <Icon className="h-5 w-5" />
         {config.shape === "diamond" && (
           <div className="absolute -bottom-0.5 -right-0.5 w-2 h-2 bg-current rotate-45 opacity-40" />

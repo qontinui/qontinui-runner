@@ -157,7 +157,7 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
         placeholder="Issue title"
         value={title}
         onChange={(e) => setTitle(e.target.value)}
-        className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-purple-500/50"
+        className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-purple-500/50"
         autoFocus
       />
 
@@ -166,7 +166,7 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
         placeholder="Describe the issue — what you observed, what's wrong"
         value={description}
         onChange={(e) => setDescription(e.target.value)}
-        className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-purple-500/50 min-h-[60px] resize-y"
+        className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-purple-500/50 min-h-[60px] resize-y"
         rows={3}
       />
 
@@ -179,7 +179,7 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
           <select
             value={category}
             onChange={(e) => setCategory(e.target.value as IssueCategory)}
-            className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-purple-500/50"
+            className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-purple-500/50"
           >
             {ISSUE_CATEGORIES.map((c) => (
               <option key={c.value} value={c.value}>
@@ -195,7 +195,7 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
           <select
             value={severity}
             onChange={(e) => setSeverity(e.target.value as KnownIssueSeverity)}
-            className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-purple-500/50"
+            className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-purple-500/50"
           >
             {ISSUE_SEVERITIES.map((s) => (
               <option key={s.value} value={s.value}>
@@ -216,7 +216,7 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
           placeholder="How to check for this issue"
           value={verificationHint}
           onChange={(e) => setVerificationHint(e.target.value)}
-          className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-purple-500/50"
+          className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-purple-500/50"
         />
       </div>
 
@@ -230,7 +230,7 @@ function CreateIssueForm({ specId, onSubmit, onCancel }: CreateIssueFormProps) {
           placeholder="When does this happen?"
           value={reproductionContext}
           onChange={(e) => setReproductionContext(e.target.value)}
-          className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-purple-500/50"
+          className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded focus:outline-hidden focus:ring-1 focus:ring-purple-500/50"
         />
       </div>
 

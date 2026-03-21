@@ -20,7 +20,7 @@ function StatusBanner({ status, icon, className, children, ...props }: StatusBan
       )}
       {...props}
     >
-      {icon && <span className={cn("flex-shrink-0", colors.icon, colors.pulse)}>{icon}</span>}
+      {icon && <span className={cn("shrink-0", colors.icon, colors.pulse)}>{icon}</span>}
       <div className="flex-1 min-w-0">{children}</div>
     </div>
   );

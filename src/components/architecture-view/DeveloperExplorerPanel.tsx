@@ -236,19 +236,19 @@ export function DeveloperExplorerPanel({ project }: Props) {
   return (
     <div className="flex flex-col h-full gap-3">
       {/* Search bar */}
-      <div className="flex-shrink-0 relative">
+      <div className="shrink-0 relative">
         <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
         <input
           type="text"
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
           placeholder="Search features, patterns, tech, directories, constraints..."
-          className="w-full pl-8 pr-3 py-2 text-sm bg-muted border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500/50 focus:border-blue-500/50"
+          className="w-full pl-8 pr-3 py-2 text-sm bg-muted border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-blue-500/50 focus:border-blue-500/50"
         />
       </div>
 
       {/* Filter pills */}
-      <div className="flex-shrink-0 flex flex-wrap gap-1.5">
+      <div className="shrink-0 flex flex-wrap gap-1.5">
         {ALL_FILTERS.map((filter) => {
           const active = enabledFilters.has(filter);
           return (

@@ -257,7 +257,7 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
           className={`fixed top-20 right-4 max-w-md z-40 p-4 rounded-lg shadow-lg border ${getErrorSeverityClasses(error.severity)}`}
         >
           <div className="flex items-start gap-3">
-            <div className="flex-shrink-0 mt-0.5">{getSeverityIcon(error.severity)}</div>
+            <div className="shrink-0 mt-0.5">{getSeverityIcon(error.severity)}</div>
             <div className="flex-1">
               <div className="flex justify-between items-start">
                 <h3 className="font-semibold">{error.title}</h3>

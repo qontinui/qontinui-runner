@@ -180,7 +180,7 @@ export function DomSnapshotsPanel({ taskRunId }: Props) {
   return (
     <div className="h-full flex flex-col overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between p-4 border-b border-border flex-shrink-0">
+      <div className="flex items-center justify-between p-4 border-b border-border shrink-0">
         <div className="flex items-center gap-3">
           <Code className="w-5 h-5 text-primary" />
           <div>
@@ -294,7 +294,7 @@ export function DomSnapshotsPanel({ taskRunId }: Props) {
                   <SourceIcon source={capture.source} />
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
-                      <Globe className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
+                      <Globe className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
                       <span className="text-sm font-medium truncate" title={capture.url}>
                         {new URL(capture.url).hostname}
                         {new URL(capture.url).pathname}

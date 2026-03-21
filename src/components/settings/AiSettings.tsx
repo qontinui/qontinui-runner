@@ -800,7 +800,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 text-sm"
               >
                 {EXECUTION_MODE_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -831,7 +831,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   }))
                 }
                 placeholder="Leave empty to use default (claude or claude.exe)"
-                className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               />
               <p className="text-[10px] text-muted-foreground">
                 Specify a custom path to the Claude Code executable if it's not in your PATH.
@@ -1086,7 +1086,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                       }))
                     }
                     placeholder="Leave empty to use selection above"
-                    className="w-full px-2.5 py-1.5 text-xs bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                    className="w-full px-2.5 py-1.5 text-xs bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
                   />
                 </div>
               )}
@@ -1111,7 +1111,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               />
               <p className="text-[10px] text-muted-foreground">
                 Maximum time to wait for Claude Code to respond (60-3600 seconds).
@@ -1137,7 +1137,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   <div
                     data-content-role="status"
                     data-content-label="claude api key configured"
-                    className="flex-1 px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-muted-foreground text-sm"
+                    className="flex-1 px-2.5 py-1.5 bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 text-muted-foreground text-sm"
                   >
                     API key configured securely
                   </div>
@@ -1156,7 +1156,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                       value={apiKey}
                       onChange={(e) => setApiKey(e.target.value)}
                       placeholder="sk-ant-..."
-                      className="w-full px-2.5 py-1.5 pr-10 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                      className="w-full px-2.5 py-1.5 pr-10 bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 text-sm"
                     />
                     <button
                       type="button"
@@ -1205,7 +1205,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 text-sm"
               >
                 {MODEL_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -1231,7 +1231,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               />
               <p className="text-[10px] text-muted-foreground">
                 Maximum tokens in the response (256-32768).
@@ -1307,7 +1307,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 text-sm"
               >
                 {GEMINI_MODEL_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -1330,7 +1330,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 text-sm"
               >
                 {EXECUTION_MODE_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -1359,7 +1359,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-32 px-3 py-2 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                className="w-32 px-3 py-2 bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               />
             </div>
 
@@ -1391,7 +1391,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   <div
                     data-content-role="status"
                     data-content-label="gemini api key configured"
-                    className="flex-1 px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-muted-foreground text-sm"
+                    className="flex-1 px-2.5 py-1.5 bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 text-muted-foreground text-sm"
                   >
                     Gemini API key configured securely
                   </div>
@@ -1410,7 +1410,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                       value={geminiApiKey}
                       onChange={(e) => setGeminiApiKey(e.target.value)}
                       placeholder="AIza..."
-                      className="w-full px-2.5 py-1.5 pr-10 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                      className="w-full px-2.5 py-1.5 pr-10 bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 text-sm"
                     />
                     <button
                       type="button"
@@ -1459,7 +1459,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 text-sm"
               >
                 {GEMINI_MODEL_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -1488,7 +1488,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               />
             </div>
 
@@ -1509,7 +1509,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               />
               <p className="text-[10px] text-muted-foreground">
                 Controls randomness (0 = deterministic, 2 = very creative).
@@ -1550,7 +1550,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   ),
                 }))
               }
-              className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+              className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
             />
             <p className="text-[10px] text-muted-foreground">
               Default number of failed iterations before including video frames in AI analysis. Set

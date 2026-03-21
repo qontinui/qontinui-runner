@@ -362,7 +362,7 @@ export function InlineProgressBar({
 
   return (
     <div
-      className={cn("flex items-center gap-1.5 flex-shrink-0", className)}
+      className={cn("flex items-center gap-1.5 shrink-0", className)}
       role="progressbar"
       aria-valuenow={total === null ? undefined : current}
       aria-valuemin={0}

@@ -190,7 +190,7 @@ function CheckStepRow({
         tabIndex={0}
       >
         {/* Expand/collapse indicator */}
-        <div className="flex-shrink-0 text-muted-foreground">
+        <div className="shrink-0 text-muted-foreground">
           {isExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
         </div>
 
@@ -200,7 +200,7 @@ function CheckStepRow({
         {/* Check type badge */}
         <Badge
           className={cn(
-            "text-xs flex-shrink-0 font-mono border",
+            "text-xs shrink-0 font-mono border",
             tealColors.bg,
             tealColors.text,
             tealColors.border,
@@ -410,7 +410,7 @@ export function VerificationWidget({ isActive, className }: BaseWidgetProps) {
           {data.checkSteps.length > 0 && <StepStatsBar stats={data.stats} />}
 
           {/* Overall Status and Check Steps Header */}
-          <div className="flex items-center justify-between border-b border-border px-4 py-3 bg-muted/10 flex-shrink-0">
+          <div className="flex items-center justify-between border-b border-border px-4 py-3 bg-muted/10 shrink-0">
             <div className="flex items-center gap-3">
               <StatusIndicatorCompact status={data.status} />
               {data.testName && (
@@ -475,7 +475,7 @@ export function VerificationWidget({ isActive, className }: BaseWidgetProps) {
                 <div className={cn("px-4 py-3 border-b", getStatusColors("error").bg)}>
                   <div className="flex items-start gap-2">
                     <AlertCircle
-                      className={cn("h-4 w-4 flex-shrink-0 mt-0.5", getStatusColors("error").text)}
+                      className={cn("h-4 w-4 shrink-0 mt-0.5", getStatusColors("error").text)}
                     />
                     <div className="flex-1 min-w-0">
                       <span className={cn("text-sm font-medium", getStatusColors("error").text)}>

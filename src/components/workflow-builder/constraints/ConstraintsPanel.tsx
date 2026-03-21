@@ -124,7 +124,7 @@ export function ConstraintsPanel({ onClose }: ConstraintsPanelProps) {
       {/* Error banner */}
       {error && (
         <div className="flex items-start gap-2 px-3 py-2 rounded-md bg-red-500/10 border border-red-500/20">
-          <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+          <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
           <span className="text-xs text-red-400">{error}</span>
         </div>
       )}
@@ -132,7 +132,7 @@ export function ConstraintsPanel({ onClose }: ConstraintsPanelProps) {
       {/* Success banner */}
       {saveResult?.success && (
         <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-green-500/10 border border-green-500/20">
-          <CheckCircle2 className="w-4 h-4 text-green-400 flex-shrink-0" />
+          <CheckCircle2 className="w-4 h-4 text-green-400 shrink-0" />
           <span className="text-xs text-green-400">{saveResult.message}</span>
         </div>
       )}

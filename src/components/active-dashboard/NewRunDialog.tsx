@@ -304,7 +304,7 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
           {guiLockConflict && (
             <div className={`p-4 rounded-lg ${amberColors.bg} border ${amberColors.border}`}>
               <div className="flex items-start gap-3">
-                <AlertTriangle className={`w-5 h-5 ${amberColors.text} flex-shrink-0 mt-0.5`} />
+                <AlertTriangle className={`w-5 h-5 ${amberColors.text} shrink-0 mt-0.5`} />
                 <div className="flex-1">
                   <p className={`text-sm font-medium ${amberColors.text}`}>GUI Lock Conflict</p>
                   <p className="text-sm text-zinc-400 mt-1">

@@ -135,7 +135,7 @@ export function ProjectSelector({ onProjectLoad, onLog }: ProjectSelectorProps) 
         <div
           className={`flex items-center gap-2 p-2 text-sm ${getStatusColors("error").text} ${getStatusColors("error").bg} rounded border ${getStatusColors("error").border}`}
         >
-          <AlertCircle className="w-4 h-4 flex-shrink-0" />
+          <AlertCircle className="w-4 h-4 shrink-0" />
           <span className="truncate">{error}</span>
         </div>
       )}
@@ -183,9 +183,9 @@ export function ProjectSelector({ onProjectLoad, onLog }: ProjectSelectorProps) 
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
                       <span className="font-medium text-sm truncate">{project.project_name}</span>
-                      {isSelected && <Check className="w-4 h-4 text-primary flex-shrink-0" />}
+                      {isSelected && <Check className="w-4 h-4 text-primary shrink-0" />}
                       {isLoading && (
-                        <Loader2 className="w-4 h-4 animate-spin text-primary flex-shrink-0" />
+                        <Loader2 className="w-4 h-4 animate-spin text-primary shrink-0" />
                       )}
                     </div>
                     <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">

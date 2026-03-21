@@ -566,14 +566,14 @@ function DataFlowSection({
                   value={key}
                   onChange={(e) => handleUpdateInputKey(key, e.target.value)}
                   placeholder="Variable name"
-                  className="flex-1 px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 placeholder-zinc-500 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                  className="flex-1 px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 placeholder-zinc-500 text-sm focus:outline-hidden focus:ring-1 focus:ring-blue-500/50"
                 />
                 <input
                   type="text"
                   value={value}
                   onChange={(e) => handleUpdateInputValue(key, e.target.value)}
                   placeholder="step_id.output_key"
-                  className="flex-1 px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 placeholder-zinc-500 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                  className="flex-1 px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 placeholder-zinc-500 text-sm font-mono focus:outline-hidden focus:ring-1 focus:ring-blue-500/50"
                 />
                 <button
                   onClick={() => handleRemoveInput(key)}
@@ -604,14 +604,14 @@ function DataFlowSection({
                   value={key}
                   onChange={(e) => handleUpdateExtractKey(key, e.target.value)}
                   placeholder="Output name"
-                  className="flex-1 px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 placeholder-zinc-500 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                  className="flex-1 px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 placeholder-zinc-500 text-sm focus:outline-hidden focus:ring-1 focus:ring-blue-500/50"
                 />
                 <input
                   type="text"
                   value={value}
                   onChange={(e) => handleUpdateExtractValue(key, e.target.value)}
                   placeholder="$.data.result"
-                  className="flex-1 px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 placeholder-zinc-500 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                  className="flex-1 px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 placeholder-zinc-500 text-sm font-mono focus:outline-hidden focus:ring-1 focus:ring-blue-500/50"
                 />
                 <button
                   onClick={() => handleRemoveExtract(key)}
@@ -692,7 +692,7 @@ function TestFieldsConfig({
         <select
           value={step.test_type}
           onChange={(e) => onUpdate({ test_type: e.target.value as TestType })}
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
         >
           <option value="playwright">Playwright (Browser)</option>
           <option value="qontinui_vision">Qontinui Vision</option>
@@ -719,7 +719,7 @@ function TestFieldsConfig({
                   ? "npm test"
                   : "command to run"
             }
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
           />
         </div>
       )}
@@ -734,7 +734,7 @@ function TestFieldsConfig({
               onChange={(e) =>
                 onUpdate({ execution_mode: e.target.value as PlaywrightExecutionMode })
               }
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
             >
               <option value="independent">Independent (fresh session)</option>
               <option value="chained">Chained (continue after previous)</option>
@@ -753,7 +753,7 @@ function TestFieldsConfig({
               value={step.fused_script_id || ""}
               onChange={(e) => onUpdate({ fused_script_id: e.target.value || undefined })}
               placeholder="script-uuid"
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
             />
             <p className="text-xs text-zinc-500 mt-1">
               If set, this test will run after the specified setup script
@@ -794,7 +794,7 @@ function CheckFieldsConfig({
             const newType = e.target.value as CheckType;
             onUpdate({ check_type: newType, tool: undefined, command: undefined });
           }}
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
         >
           <option value="lint">Lint (code quality)</option>
           <option value="format">Format (code style)</option>
@@ -816,7 +816,7 @@ function CheckFieldsConfig({
               value={step.repository || ""}
               onChange={(e) => onUpdate({ repository: e.target.value || undefined })}
               placeholder="owner/repo"
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
             />
             <p className="text-xs text-zinc-500 mt-1">
               GitHub repository (e.g., jspindev/qontinui-runner). Leave blank to auto-detect from
@@ -835,7 +835,7 @@ function CheckFieldsConfig({
                 value={step.working_directory || ""}
                 onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
                 placeholder="Path to git repo root"
-                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
               />
               <p className="text-xs text-zinc-500 mt-1">
                 Git repo directory to auto-detect the GitHub repository from.
@@ -853,7 +853,7 @@ function CheckFieldsConfig({
               value={step.workflow_name || ""}
               onChange={(e) => onUpdate({ workflow_name: e.target.value || undefined })}
               placeholder="CI"
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
             />
             <p className="text-xs text-zinc-500 mt-1">GitHub Actions workflow name to filter by.</p>
           </div>
@@ -868,7 +868,7 @@ function CheckFieldsConfig({
               value={step.branch || ""}
               onChange={(e) => onUpdate({ branch: e.target.value || undefined })}
               placeholder="main"
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
             />
           </div>
 
@@ -900,7 +900,7 @@ function CheckFieldsConfig({
               onChange={(e) => onUpdate({ timeout_seconds: parseInt(e.target.value) || 300 })}
               min={15}
               max={600}
-              className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
             />
           </div>
         </>
@@ -919,7 +919,7 @@ function CheckFieldsConfig({
                     command: tool?.default_command || undefined,
                   });
                 }}
-                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
               >
                 <option value="">Select a tool...</option>
                 {availableTools.map((tool) => (
@@ -947,7 +947,7 @@ function CheckFieldsConfig({
               value={step.command || ""}
               onChange={(e) => onUpdate({ command: e.target.value || undefined })}
               placeholder={selectedTool?.default_command || "Enter command..."}
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
             />
             {selectedTool?.default_command && !step.command && (
               <p className="text-xs text-zinc-500 mt-1">
@@ -967,7 +967,7 @@ function CheckFieldsConfig({
               value={step.working_directory || ""}
               onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
               placeholder="Leave empty for project root"
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
             />
           </div>
 
@@ -998,7 +998,7 @@ function CheckFieldsConfig({
               onChange={(e) => onUpdate({ timeout_seconds: parseInt(e.target.value) || 60 })}
               min={5}
               max={600}
-              className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
             />
           </div>
         </>
@@ -1046,7 +1046,7 @@ function CommandConfig({
       <select
         value={effectiveMode}
         onChange={(e) => handleModeChange(e.target.value)}
-        className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+        className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
       >
         <option value="shell">Shell Command</option>
         <option value="check">Check (lint, typecheck, etc.)</option>
@@ -1068,7 +1068,7 @@ function CommandConfig({
             value={step.check_group_id || ""}
             onChange={(e) => onUpdate({ check_group_id: e.target.value })}
             placeholder="check-group-uuid"
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
           />
           <p className="text-xs text-zinc-500 mt-1">
             The ID of a saved check group from the Check Builder
@@ -1116,7 +1116,7 @@ function CommandConfig({
           onChange={(e) => onUpdate({ command: e.target.value })}
           placeholder="git branch backup-$(date +%Y%m%d)"
           rows={3}
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
+          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
         />
         <p className="text-xs text-zinc-500 mt-1">
           Shell command to execute (bash on Unix, PowerShell on Windows)
@@ -1133,7 +1133,7 @@ function CommandConfig({
           value={step.working_directory || ""}
           onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
           placeholder="Leave empty for project root"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
         />
       </div>
 
@@ -1146,7 +1146,7 @@ function CommandConfig({
           onChange={(e) => onUpdate({ timeout_seconds: parseInt(e.target.value) || 60 })}
           min={5}
           max={600}
-          className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
         />
       </div>
 
@@ -1211,7 +1211,7 @@ function PromptConfig({
           onChange={(e) => onUpdate({ content: e.target.value })}
           placeholder="Enter the prompt for the AI agent..."
           rows={24}
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 resize-y font-mono text-sm"
+          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50 resize-y font-mono text-sm"
         />
         <p className="text-xs text-zinc-500 mt-1">
           This prompt will be sent to the AI agent during the agentic phase
@@ -1226,7 +1226,7 @@ function PromptConfig({
           <select
             value={step.provider ?? ""}
             onChange={(e) => onUpdate({ provider: e.target.value || undefined })}
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
           >
             <option value="">Default</option>
             <option value="claude_cli">Claude CLI</option>
@@ -1238,7 +1238,7 @@ function PromptConfig({
           <select
             value={step.model ?? ""}
             onChange={(e) => onUpdate({ model: e.target.value || undefined })}
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
           >
             <option value="">Default</option>
             <option value="claude-sonnet-4">Claude Sonnet 4</option>
@@ -1278,7 +1278,7 @@ function UiBridgeConfig({
                 | "snapshot_assert",
             })
           }
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50"
         >
           <option value="navigate">Navigate</option>
           <option value="execute">Execute Instruction</option>
@@ -1297,7 +1297,7 @@ function UiBridgeConfig({
             value={step.url || ""}
             onChange={(e) => onUpdate({ url: e.target.value })}
             placeholder="https://example.com"
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50"
           />
           <p className="text-xs text-zinc-500 mt-1">The URL to navigate to</p>
         </div>
@@ -1312,7 +1312,7 @@ function UiBridgeConfig({
             onChange={(e) => onUpdate({ instruction: e.target.value })}
             placeholder="Click the submit button, fill in the form..."
             rows={4}
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 resize-y"
+            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50 resize-y"
           />
           <p className="text-xs text-zinc-500 mt-1">
             Natural language instruction for the UI Bridge to execute
@@ -1330,7 +1330,7 @@ function UiBridgeConfig({
               value={step.target || ""}
               onChange={(e) => onUpdate({ target: e.target.value })}
               placeholder='[data-testid="submit-btn"], .header-title, etc.'
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 font-mono text-sm"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50 font-mono text-sm"
             />
             <p className="text-xs text-zinc-500 mt-1">CSS selector of the target element</p>
           </div>
@@ -1349,7 +1349,7 @@ function UiBridgeConfig({
                     | "enabled",
                 })
               }
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50"
             >
               <option value="exists">Exists</option>
               <option value="text_equals">Text Equals</option>
@@ -1366,7 +1366,7 @@ function UiBridgeConfig({
               value={step.expected || ""}
               onChange={(e) => onUpdate({ expected: e.target.value })}
               placeholder="Expected text or value"
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50"
             />
             <p className="text-xs text-zinc-500 mt-1">
               Expected value for text_equals and contains assertions
@@ -1387,7 +1387,7 @@ function UiBridgeConfig({
               onChange={(e) => onUpdate({ target: e.target.value })}
               placeholder={`[\n  {\n    "id": "check-1",\n    "description": "Header exists",\n    "severity": "critical",\n    "assertionType": "exists",\n    "criteria": { "textContent": "Header" }\n  }\n]`}
               rows={8}
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 resize-y font-mono text-xs"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50 resize-y font-mono text-xs"
             />
             <p className="text-xs text-zinc-500 mt-1">
               JSON array of assertions. Each needs: id, description, severity, assertionType
@@ -1401,7 +1401,7 @@ function UiBridgeConfig({
             <select
               value={step.ui_bridge_snapshot_target || "control"}
               onChange={(e) => onUpdate({ ui_bridge_snapshot_target: e.target.value })}
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50"
             >
               <option value="control">Control (Runner UI)</option>
               <option value="sdk">SDK (Connected App)</option>
@@ -1420,7 +1420,7 @@ function UiBridgeConfig({
           min={1000}
           max={60000}
           step={1000}
-          className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+          className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/50"
         />
       </div>
     </div>
@@ -1590,7 +1590,7 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
             value={selectedStep.name}
             onChange={(e) => handleUpdate({ name: e.target.value })}
             placeholder="Step name"
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50"
           />
         </div>
 

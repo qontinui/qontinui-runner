@@ -755,7 +755,7 @@ export function AiTab({
     <div className="h-full flex flex-col overflow-hidden">
       {/* Status Banner */}
       <div
-        className={`flex-shrink-0 px-4 py-3 border-b ${
+        className={`shrink-0 px-4 py-3 border-b ${
           statusInfo.status === "running"
             ? `${getStatusColors("running").bg} ${getStatusColors("running").border}`
             : statusInfo.status === "resumable"
@@ -954,7 +954,7 @@ export function AiTab({
       </div>
 
       {/* Session Dropdown + Stats Row */}
-      <div className="flex-shrink-0 px-4 py-2 border-b border-border bg-muted/20">
+      <div className="shrink-0 px-4 py-2 border-b border-border bg-muted/20">
         <div className="flex items-center gap-4">
           {/* Session Dropdown */}
           <div className="relative" ref={dropdownRef}>
@@ -1015,7 +1015,7 @@ export function AiTab({
                 {isManagingRuns && (
                   <div className="px-3 py-2 border-b border-border bg-muted/20 space-y-2">
                     <div className="flex items-center gap-2">
-                      <Calendar className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                      <Calendar className="w-4 h-4 text-muted-foreground shrink-0" />
                       <input
                         type="date"
                         value={deleteBeforeDate}
@@ -1118,17 +1118,17 @@ export function AiTab({
                             checked={selectedForDeletion.has(loop.id)}
                             onChange={() => handleToggleSessionSelection(loop.id)}
                             onClick={(e) => e.stopPropagation()}
-                            className="flex-shrink-0 accent-red-500"
+                            className="shrink-0 accent-red-500"
                           />
                         ) : (
-                          <Brain className="w-3.5 h-3.5 text-primary flex-shrink-0" />
+                          <Brain className="w-3.5 h-3.5 text-primary shrink-0" />
                         )}
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-1.5">
                             <span className="font-medium truncate">{loop.label}</span>
                             {loop.phase && (
                               <span
-                                className={`text-[10px] px-1.5 py-0.5 rounded flex-shrink-0 capitalize ${
+                                className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 capitalize ${
                                   loop.phase === "setup"
                                     ? "bg-blue-500/20 text-blue-400"
                                     : loop.phase === "verification"
@@ -1145,7 +1145,7 @@ export function AiTab({
                             )}
                             {loop.isActive && (
                               <span
-                                className={`text-[10px] px-1 py-0.5 ${getStatusColors("running").bg} ${getStatusColors("running").text} rounded flex-shrink-0`}
+                                className={`text-[10px] px-1 py-0.5 ${getStatusColors("running").bg} ${getStatusColors("running").text} rounded shrink-0`}
                               >
                                 Active
                               </span>

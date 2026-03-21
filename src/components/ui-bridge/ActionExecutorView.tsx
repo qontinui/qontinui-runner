@@ -318,7 +318,7 @@ export function ActionExecutorView({
                   value={textParam}
                   onChange={(e) => setTextParam(e.target.value)}
                   placeholder="Enter text..."
-                  className="flex-1 px-2 py-1.5 text-sm bg-muted/30 border border-border/50 rounded-md focus:outline-none focus:ring-1 focus:ring-primary"
+                  className="flex-1 px-2 py-1.5 text-sm bg-muted/30 border border-border/50 rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary"
                   disabled={disabled || executing}
                 />
                 {paramActions
@@ -338,7 +338,7 @@ export function ActionExecutorView({
                   value={valueParam}
                   onChange={(e) => setValueParam(e.target.value)}
                   placeholder="Enter option value..."
-                  className="flex-1 px-2 py-1.5 text-sm bg-muted/30 border border-border/50 rounded-md focus:outline-none focus:ring-1 focus:ring-primary"
+                  className="flex-1 px-2 py-1.5 text-sm bg-muted/30 border border-border/50 rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary"
                   disabled={disabled || executing}
                 />
                 {paramActions

@@ -147,7 +147,7 @@ export function PromptLibraryPicker({
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search by name or content..."
-              className="w-full pl-10 pr-4 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              className="w-full pl-10 pr-4 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
               autoFocus
             />
           </div>
@@ -155,7 +155,7 @@ export function PromptLibraryPicker({
             <select
               value={categoryFilter}
               onChange={(e) => setCategoryFilter(e.target.value)}
-              className="px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              className="px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
             >
               <option value="">All Categories</option>
               {categories.map((cat) => (
@@ -203,7 +203,7 @@ export function PromptLibraryPicker({
                 >
                   <div className="flex items-start gap-3">
                     <MessageSquare
-                      className={`w-4 h-4 mt-0.5 flex-shrink-0 ${getAccentColors("amber").text}`}
+                      className={`w-4 h-4 mt-0.5 shrink-0 ${getAccentColors("amber").text}`}
                     />
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
@@ -214,7 +214,7 @@ export function PromptLibraryPicker({
                           </span>
                         )}
                         {selectedId === prompt.id && (
-                          <Check className="w-4 h-4 text-primary flex-shrink-0" />
+                          <Check className="w-4 h-4 text-primary shrink-0" />
                         )}
                       </div>
                       {prompt.description && (

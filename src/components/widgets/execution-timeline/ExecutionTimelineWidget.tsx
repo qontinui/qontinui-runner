@@ -321,7 +321,7 @@ function StepRow({
         {/* Step type badge */}
         <Badge
           className={cn(
-            "text-[10px] flex-shrink-0 font-mono border",
+            "text-[10px] shrink-0 font-mono border",
             colors.bg,
             colors.text,
             colors.border,
@@ -369,9 +369,9 @@ function StepRow({
         {/* Expand/collapse chevron for clickable steps */}
         {isClickable &&
           (isExpanded ? (
-            <ChevronDown className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+            <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
           ) : (
-            <ChevronRight className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+            <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
           ))}
       </div>
 
@@ -871,7 +871,7 @@ export function ExecutionTimelineWidget({
 
       {/* Workflow name header */}
       {workflowName && (
-        <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 flex-shrink-0">
+        <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 shrink-0">
           <div className="flex items-center gap-2">
             <Clock className="h-4 w-4 text-muted-foreground" />
             <h3 className="text-sm font-semibold text-foreground">{workflowName}</h3>

@@ -165,7 +165,7 @@ export function InitialStatesSelector({
         <div
           className={`flex items-start gap-2 p-2 ${getAccentColors("amber").bg} border ${getAccentColors("amber").border} rounded-lg text-xs`}
         >
-          <Info className={`w-4 h-4 flex-shrink-0 ${getAccentColors("amber").text} mt-0.5`} />
+          <Info className={`w-4 h-4 shrink-0 ${getAccentColors("amber").text} mt-0.5`} />
           <div className={getAccentColors("amber").text}>
             Session override active. Changes reset when config reloads or workflow changes.
           </div>
@@ -190,7 +190,7 @@ export function InitialStatesSelector({
               } ${disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
             >
               <div
-                className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 transition-colors ${
+                className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 transition-colors ${
                   isSelected
                     ? "bg-primary border-primary"
                     : "border-muted-foreground/50 bg-transparent"

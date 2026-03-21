@@ -296,7 +296,7 @@ function DependencyGraphFlow({ rawNodes, rawEdges }: { rawNodes: DepNode[]; rawE
           .filter(([k]) => k !== "default")
           .map(([phase, colors]) => (
             <div key={phase} className="flex items-center gap-1.5 text-[10px]">
-              <div className="w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: colors.border }} />
+              <div className="w-2.5 h-2.5 rounded-xs" style={{ backgroundColor: colors.border }} />
               <span className="text-zinc-400 capitalize">{phase}</span>
             </div>
           ))}

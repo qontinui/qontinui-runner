@@ -200,7 +200,7 @@ function BrowserErrorItem({
         }}
       >
         {/* Severity icon */}
-        <div className="flex-shrink-0 mt-0.5">
+        <div className="shrink-0 mt-0.5">
           <BrowserSeverityIcon type={event.type} level={event.level} />
         </div>
 
@@ -225,7 +225,7 @@ function BrowserErrorItem({
                 {source}
               </span>
             )}
-            <span className="flex items-center gap-1 flex-shrink-0">
+            <span className="flex items-center gap-1 shrink-0">
               <Clock className="w-3 h-3" />
               {formatBrowserTime(group.lastSeen)}
             </span>
@@ -235,7 +235,7 @@ function BrowserErrorItem({
         {/* Expand indicator */}
         <ChevronDown
           className={cn(
-            "w-4 h-4 text-muted-foreground transition-transform flex-shrink-0",
+            "w-4 h-4 text-muted-foreground transition-transform shrink-0",
             isExpanded && "rotate-180",
           )}
         />
@@ -307,7 +307,7 @@ function NoConnectionState() {
 function HealthyEmptyState() {
   return (
     <div className="flex items-center gap-3 px-4 py-4">
-      <div className="w-8 h-8 rounded-full bg-green-500/20 flex items-center justify-center flex-shrink-0">
+      <div className="w-8 h-8 rounded-full bg-green-500/20 flex items-center justify-center shrink-0">
         <CheckCircle className="w-4 h-4 text-green-500" />
       </div>
       <div>
@@ -397,7 +397,7 @@ export function BrowserErrorsPanel({ defaultCollapsed = false }: BrowserErrorsPa
           {/* Error state */}
           {error && (
             <div className="px-4 py-3 text-sm text-red-500 flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 flex-shrink-0" />
+              <AlertCircle className="w-4 h-4 shrink-0" />
               <span>{error}</span>
             </div>
           )}
@@ -450,7 +450,7 @@ export function BrowserErrorsPanel({ defaultCollapsed = false }: BrowserErrorsPa
               {/* Top issue highlight */}
               {health.topIssue && (
                 <div className="px-4 py-2 bg-red-500/5 border-b border-border/50 flex items-start gap-2">
-                  <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+                  <AlertCircle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
                   <div className="min-w-0">
                     <span className="text-xs font-medium text-red-500">Top Issue</span>
                     <p className="text-sm text-foreground line-clamp-2">

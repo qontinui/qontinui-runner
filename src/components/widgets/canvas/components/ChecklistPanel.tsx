@@ -131,7 +131,7 @@ export function ChecklistPanel({ data, size, panelId, readOnly }: CanvasPanelCom
           >
             <Icon
               className={cn(
-                "h-4 w-4 flex-shrink-0 mt-0.5",
+                "h-4 w-4 shrink-0 mt-0.5",
                 item.checked ? "text-green-500" : "text-muted-foreground",
               )}
             />

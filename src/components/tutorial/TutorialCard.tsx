@@ -45,7 +45,7 @@ export function TutorialCard({
         {/* Icon */}
         <div
           className={cn(
-            "p-3 rounded-lg flex-shrink-0",
+            "p-3 rounded-lg shrink-0",
             isCompleted ? getStatusColors("success").bg : getAccentColors("cyan").bg,
           )}
         >
@@ -70,7 +70,7 @@ export function TutorialCard({
             {isCompleted && (
               <span
                 className={cn(
-                  "flex-shrink-0 px-2 py-1 rounded text-xs font-medium",
+                  "shrink-0 px-2 py-1 rounded text-xs font-medium",
                   getStatusColors("success").bg,
                   getStatusColors("success").text,
                 )}
@@ -81,7 +81,7 @@ export function TutorialCard({
             {isInProgress && !isCompleted && (
               <span
                 className={cn(
-                  "flex-shrink-0 px-2 py-1 rounded text-xs font-medium",
+                  "shrink-0 px-2 py-1 rounded text-xs font-medium",
                   getAccentColors("amber").bg,
                   getAccentColors("amber").text,
                 )}

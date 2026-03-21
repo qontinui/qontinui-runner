@@ -123,7 +123,7 @@ function FindingItem({ finding }: { finding: Finding }) {
       {/* Severity indicator */}
       <div
         className={cn(
-          "flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center",
+          "shrink-0 w-8 h-8 rounded-full flex items-center justify-center",
           severityConfig.bgColor,
         )}
       >

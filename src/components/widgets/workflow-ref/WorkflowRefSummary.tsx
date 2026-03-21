@@ -37,7 +37,7 @@ function CompactWorkflowRow({ workflow }: { workflow: WorkflowRefExecution }) {
       </Badge>
       <span className="text-xs text-muted-foreground truncate flex-1">{workflow.workflowName}</span>
       {workflow.totalSteps > 0 && (
-        <div className="flex items-center gap-1.5 flex-shrink-0">
+        <div className="flex items-center gap-1.5 shrink-0">
           <Progress value={progressPercent} className="h-1 w-12" />
           <span className="text-[10px] text-muted-foreground font-mono">
             {workflow.completedSteps}/{workflow.totalSteps}

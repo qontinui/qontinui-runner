@@ -154,7 +154,7 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
   -H 'Content-Type: application/json' \\
   -H 'Authorization: Bearer token' \\
   --data-raw '{"key": "value"}'`}
-              className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm font-mono resize-none h-40 focus:outline-none focus:ring-2 focus:ring-primary"
+              className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm font-mono resize-none h-40 focus:outline-hidden focus:ring-2 focus:ring-primary"
               autoFocus
             />
             <p className="text-xs text-muted-foreground mt-1">
@@ -167,7 +167,7 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
             <div
               className={`flex items-start gap-2 p-3 rounded-md ${getStatusColors("error").bg} ${getStatusColors("error").text}`}
             >
-              <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
               <span className="text-sm">{error}</span>
             </div>
           )}

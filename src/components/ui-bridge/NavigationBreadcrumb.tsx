@@ -94,7 +94,7 @@ function BreadcrumbItem({
       `}
       title={`${typeLabel}: ${item.label}`}
     >
-      <NavigationIcon type={item.type} className="w-3 h-3 flex-shrink-0" />
+      <NavigationIcon type={item.type} className="w-3 h-3 shrink-0" />
       {item.type !== "graph" && <span className="text-muted-foreground">{typeLabel}:</span>}
       <span className="truncate max-w-[120px]">{displayLabel}</span>
     </button>

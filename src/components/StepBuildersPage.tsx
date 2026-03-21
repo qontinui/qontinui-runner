@@ -123,7 +123,7 @@ export function StepBuildersPage({ onNavigate }: StepBuildersPageProps) {
               className="group flex items-start gap-4 p-4 rounded-lg border border-border bg-card hover:bg-accent/50 transition-colors text-left"
             >
               <div
-                className={`w-10 h-10 rounded-lg flex-shrink-0 flex items-center justify-center ${card.colorClasses.bg}`}
+                className={`w-10 h-10 rounded-lg shrink-0 flex items-center justify-center ${card.colorClasses.bg}`}
               >
                 <Icon className={`w-5 h-5 ${card.colorClasses.text}`} />
               </div>

@@ -131,7 +131,7 @@ export function ExecutionStatusPanel({
   return (
     <Card className={`flex flex-col h-full ${className}`}>
       {/* Header */}
-      <CardHeader className="border-b border-border/50 flex-shrink-0">
+      <CardHeader className="border-b border-border/50 shrink-0">
         <div className="flex items-center justify-between w-full">
           <CardTitle className="flex items-center gap-2">
             <Activity className="w-4 h-4 text-primary" />
@@ -163,7 +163,7 @@ export function ExecutionStatusPanel({
       </CardHeader>
 
       {/* Status Summary */}
-      <div className="px-4 py-3 border-b border-border/50 bg-muted/20 flex-shrink-0">
+      <div className="px-4 py-3 border-b border-border/50 bg-muted/20 shrink-0">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             {/* Status Badge */}
@@ -297,7 +297,7 @@ export function ExecutionStatusPanel({
 
       {/* Footer */}
       {status.lastUpdated > 0 && (
-        <div className="px-4 py-2 border-t border-border/50 bg-muted/10 flex-shrink-0">
+        <div className="px-4 py-2 border-t border-border/50 bg-muted/10 shrink-0">
           <span className="text-[10px] text-muted-foreground">
             Last updated: {new Date(status.lastUpdated).toLocaleTimeString()}
           </span>

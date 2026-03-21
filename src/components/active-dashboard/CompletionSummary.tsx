@@ -212,7 +212,7 @@ export function CompletionSummary({
         <div className="px-5 py-4 border-t border-border flex justify-end">
           <button
             onClick={onDismiss}
-            className="px-4 py-2 text-sm font-medium text-foreground bg-muted hover:bg-muted/80 border border-border rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+            className="px-4 py-2 text-sm font-medium text-foreground bg-muted hover:bg-muted/80 border border-border rounded-lg transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50"
           >
             Dismiss
           </button>

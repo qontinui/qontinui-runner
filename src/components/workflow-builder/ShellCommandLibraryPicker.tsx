@@ -136,7 +136,7 @@ export function ShellCommandLibraryPicker({
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search by name or command..."
-              className="w-full pl-10 pr-4 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              className="w-full pl-10 pr-4 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
               autoFocus
             />
           </div>
@@ -144,7 +144,7 @@ export function ShellCommandLibraryPicker({
             <select
               value={categoryFilter}
               onChange={(e) => setCategoryFilter(e.target.value)}
-              className="px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              className="px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
             >
               <option value="">All Categories</option>
               {categories.map((cat) => (
@@ -192,7 +192,7 @@ export function ShellCommandLibraryPicker({
                 >
                   <div className="flex items-start gap-3">
                     <Terminal
-                      className={`w-4 h-4 mt-0.5 flex-shrink-0 ${getAccentColors("violet").text}`}
+                      className={`w-4 h-4 mt-0.5 shrink-0 ${getAccentColors("violet").text}`}
                     />
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
@@ -208,7 +208,7 @@ export function ShellCommandLibraryPicker({
                           </span>
                         )}
                         {selectedId === cmd.id && (
-                          <Check className="w-4 h-4 text-primary flex-shrink-0" />
+                          <Check className="w-4 h-4 text-primary shrink-0" />
                         )}
                       </div>
                       {cmd.description && (

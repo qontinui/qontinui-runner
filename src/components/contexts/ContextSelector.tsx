@@ -142,7 +142,7 @@ function ContextItem({
       {/* Checkbox */}
       <div
         className={`
-          w-4 h-4 mt-0.5 rounded flex items-center justify-center flex-shrink-0
+          w-4 h-4 mt-0.5 rounded flex items-center justify-center shrink-0
           ${isSelected ? "bg-primary text-primary-foreground" : "border border-border"}
         `}
       >
@@ -457,7 +457,7 @@ export function ContextSelector({
         <div
           className={`flex items-center gap-2 p-2 text-sm ${getStatusColors("error").text} ${getStatusColors("error").bg} rounded-lg`}
         >
-          <AlertCircle className="w-4 h-4 flex-shrink-0" />
+          <AlertCircle className="w-4 h-4 shrink-0" />
           <span>{error}</span>
         </div>
       )}
@@ -474,7 +474,7 @@ export function ContextSelector({
         <div
           className={`flex items-start gap-2 p-2 text-xs ${getAccentColors("amber").text} ${getAccentColors("amber").bg} rounded-lg`}
         >
-          <Info className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+          <Info className="w-3.5 h-3.5 mt-0.5 shrink-0" />
           <span>
             {autoDetectState.results.length} context(s) auto-detected based on your task. You can
             add or remove contexts manually.

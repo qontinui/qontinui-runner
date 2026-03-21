@@ -141,7 +141,7 @@ export const CompactRunCard = forwardRef<HTMLButtonElement, CompactRunCardProps>
           flex items-center gap-2 px-3 py-2 rounded-lg
           border transition-all duration-200
           min-w-[180px] max-w-[240px]
-          focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-1
+          focus:outline-hidden focus:ring-2 focus:ring-primary focus:ring-offset-1
           ${
             isSelected
               ? `${colors.border} border-2 ${colors.bg} shadow-md`
@@ -154,7 +154,7 @@ export const CompactRunCard = forwardRef<HTMLButtonElement, CompactRunCardProps>
         title={`${run.taskName || "Unnamed Run"} - ${statusDisplay.label}${run.mode ? ` (${run.mode})` : ""}`}
       >
         {/* Status Icon */}
-        <div className={`flex-shrink-0 ${colors.text}`}>
+        <div className={`shrink-0 ${colors.text}`}>
           <StatusIcon className={`h-4 w-4 ${statusDisplay.iconClass}`} />
         </div>
 
@@ -176,7 +176,7 @@ export const CompactRunCard = forwardRef<HTMLButtonElement, CompactRunCardProps>
             )}
             {/* GUI Lock indicator with pulsing glow */}
             {run.hasGuiLock && (
-              <div className="relative flex-shrink-0" title="Has exclusive GUI control">
+              <div className="relative shrink-0" title="Has exclusive GUI control">
                 <Lock className="h-3 w-3 text-amber-500 relative z-10" />
                 <div className="absolute inset-0 h-3 w-3 bg-amber-500/40 rounded-full animate-ping" />
               </div>

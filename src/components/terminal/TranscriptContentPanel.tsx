@@ -267,7 +267,7 @@ export function TranscriptContentPanel({
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             placeholder="Describe the workflow to generate..."
-            className="w-full px-2.5 py-1.5 bg-[#13141f] border border-[#2a2d3d] rounded text-xs text-[#c0caf5] placeholder-[#414868] focus:border-[#7aa2f7] focus:outline-none transition-colors"
+            className="w-full px-2.5 py-1.5 bg-[#13141f] border border-[#2a2d3d] rounded text-xs text-[#c0caf5] placeholder-[#414868] focus:border-[#7aa2f7] focus:outline-hidden transition-colors"
           />
         </div>
 

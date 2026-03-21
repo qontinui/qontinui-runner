@@ -313,7 +313,7 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                     setSettings((prev) => ({ ...prev, authHeaderName: e.target.value }))
                   }
                   placeholder="Authorization"
-                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                  className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   HTTP header name to use for the auth token (e.g., Authorization, X-API-Key)
@@ -334,7 +334,7 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                       setSettings((prev) => ({ ...prev, authToken: e.target.value }))
                     }
                     placeholder="Bearer eyJhbGciOiJIUzI1NiIs..."
-                    className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+                    className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
                   />
                   <p className="text-[10px] text-muted-foreground">
                     Include the full header value (e.g., "Bearer token123")
@@ -357,7 +357,7 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                         setSettings((prev) => ({ ...prev, authEnvVar: e.target.value }))
                       }
                       placeholder="API_AUTH_TOKEN"
-                      className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+                      className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
                     />
                     <button
                       onClick={() => testEnvVar(settings.authEnvVar)}
@@ -456,7 +456,7 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                             value={variable.name}
                             onChange={(e) => updateCustomVariable(index, { name: e.target.value })}
                             placeholder="variableName"
-                            className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+                            className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
                           />
                           <select
                             value={variable.source}
@@ -465,7 +465,7 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                                 source: e.target.value as VariableSource,
                               })
                             }
-                            className="px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                            className="px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
                           >
                             <option value="manual">Manual Value</option>
                             <option value="environment">Environment Variable</option>
@@ -479,7 +479,7 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                             value={variable.value || ""}
                             onChange={(e) => updateCustomVariable(index, { value: e.target.value })}
                             placeholder="Value"
-                            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
                           />
                         ) : (
                           <div className="flex gap-2">
@@ -490,7 +490,7 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                                 updateCustomVariable(index, { envVar: e.target.value })
                               }
                               placeholder="ENV_VAR_NAME"
-                              className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+                              className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 font-mono"
                             />
                             <button
                               onClick={() => variable.envVar && testEnvVar(variable.envVar)}
@@ -522,7 +522,7 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                             updateCustomVariable(index, { description: e.target.value })
                           }
                           placeholder="Description (optional)"
-                          className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-muted-foreground"
+                          className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 text-muted-foreground"
                         />
                       </div>
 

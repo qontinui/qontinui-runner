@@ -31,9 +31,9 @@ interface ConstraintCardProps {
 }
 
 const inputClass =
-  "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm";
+  "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50 text-sm";
 const selectClass =
-  "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm";
+  "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-2 focus:ring-blue-500/50 text-sm";
 
 const CHECK_TYPE_OPTIONS: { value: ConstraintCheckType; label: string }[] = [
   { value: "grep_forbidden", label: "Grep Forbidden" },
@@ -85,7 +85,7 @@ export function ConstraintCard({ constraint, onUpdate, onRemove, onPromote }: Co
         <button
           type="button"
           onClick={() => !isAi && setExpanded(!expanded)}
-          className={`flex-shrink-0 transition-colors ${
+          className={`shrink-0 transition-colors ${
             isAi ? "text-zinc-600 cursor-default" : "text-zinc-400 hover:text-zinc-200"
           }`}
         >
@@ -120,7 +120,7 @@ export function ConstraintCard({ constraint, onUpdate, onRemove, onPromote }: Co
           <button
             type="button"
             onClick={onPromote}
-            className="flex items-center gap-1 flex-shrink-0 px-2 py-0.5 text-xs text-purple-400 hover:text-purple-300 bg-purple-500/10 hover:bg-purple-500/20 rounded transition-colors"
+            className="flex items-center gap-1 shrink-0 px-2 py-0.5 text-xs text-purple-400 hover:text-purple-300 bg-purple-500/10 hover:bg-purple-500/20 rounded transition-colors"
             title="Promote to project constraint"
           >
             <ArrowUpCircle className="w-3.5 h-3.5" />
@@ -136,8 +136,8 @@ export function ConstraintCard({ constraint, onUpdate, onRemove, onPromote }: Co
             aria-checked={constraint.enabled}
             onClick={() => onUpdate({ enabled: !constraint.enabled })}
             className={`
-              relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent
-              transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
+              relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent
+              transition-colors duration-200 ease-in-out focus:outline-hidden focus:ring-2 focus:ring-blue-500/50
               ${constraint.enabled ? "bg-blue-600" : "bg-zinc-600"}
             `}
           >
@@ -156,7 +156,7 @@ export function ConstraintCard({ constraint, onUpdate, onRemove, onPromote }: Co
           <button
             type="button"
             onClick={onRemove}
-            className="flex-shrink-0 p-1 text-zinc-500 hover:text-red-400 rounded transition-colors"
+            className="shrink-0 p-1 text-zinc-500 hover:text-red-400 rounded transition-colors"
             title="Remove constraint"
           >
             <Trash2 className="w-3.5 h-3.5" />
@@ -373,7 +373,7 @@ function FileScopeEditor({
                 const updated = allowedPaths.filter((_, i) => i !== index);
                 onChange(updated.length > 0 ? updated : ["src/"]);
               }}
-              className="flex-shrink-0 p-1 text-zinc-500 hover:text-red-400 rounded transition-colors"
+              className="shrink-0 p-1 text-zinc-500 hover:text-red-400 rounded transition-colors"
               title="Remove path"
             >
               <X className="w-3.5 h-3.5" />

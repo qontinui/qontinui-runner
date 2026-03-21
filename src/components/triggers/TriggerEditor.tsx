@@ -375,9 +375,9 @@ export function TriggerEditor({ trigger, onSave, onCancel }: TriggerEditorProps)
   };
 
   const inputClass =
-    "w-full px-3 py-1.5 text-sm bg-gray-800 border border-gray-600 rounded text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none";
+    "w-full px-3 py-1.5 text-sm bg-gray-800 border border-gray-600 rounded text-white placeholder-gray-500 focus:border-blue-500 focus:outline-hidden";
   const inputErrorClass =
-    "w-full px-3 py-1.5 text-sm bg-gray-800 border border-red-500 rounded text-white placeholder-gray-500 focus:border-red-400 focus:outline-none";
+    "w-full px-3 py-1.5 text-sm bg-gray-800 border border-red-500 rounded text-white placeholder-gray-500 focus:border-red-400 focus:outline-hidden";
   const labelClass = "block text-xs font-medium text-gray-400 mb-1";
 
   const getInputClass = (field: string) => (validationErrors[field] ? inputErrorClass : inputClass);

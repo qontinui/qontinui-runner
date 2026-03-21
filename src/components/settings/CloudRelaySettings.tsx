@@ -192,7 +192,7 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
             value={settings.backend_url}
             onChange={(e) => updateSetting("backend_url", e.target.value)}
             placeholder="https://qontinui.io"
-            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
+            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
           />
           <p className="text-[10px] text-muted-foreground">
             The backend server URL for relay connections

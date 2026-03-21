@@ -281,7 +281,7 @@ function CreateIssueForm({
         placeholder="Issue title"
         value={title}
         onChange={(e) => setTitle(e.target.value)}
-        className="w-full px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
+        className="w-full px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
         autoFocus
       />
 
@@ -289,7 +289,7 @@ function CreateIssueForm({
         placeholder="Describe the issue -- what you observed, what is wrong"
         value={description}
         onChange={(e) => setDescription(e.target.value)}
-        className="w-full px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50 min-h-[80px] resize-y"
+        className="w-full px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50 min-h-[80px] resize-y"
         rows={3}
       />
 
@@ -301,7 +301,7 @@ function CreateIssueForm({
           <select
             value={category}
             onChange={(e) => setCategory(e.target.value as IssueCategory)}
-            className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
+            className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
           >
             {ISSUE_CATEGORIES.map((c) => (
               <option key={c.value} value={c.value}>
@@ -317,7 +317,7 @@ function CreateIssueForm({
           <select
             value={severity}
             onChange={(e) => setSeverity(e.target.value as KnownIssueSeverity)}
-            className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
+            className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
           >
             {ISSUE_SEVERITIES.map((s) => (
               <option key={s.value} value={s.value}>
@@ -335,7 +335,7 @@ function CreateIssueForm({
             onChange={(e) =>
               setScopeType(e.target.value as "global" | "spec" | "url" | "component" | "feature")
             }
-            className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
+            className="w-full mt-0.5 px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
           >
             <option value="global">Global</option>
             <option value="spec">Spec</option>
@@ -350,7 +350,7 @@ function CreateIssueForm({
         <select
           value={scopeValue}
           onChange={(e) => setScopeValue(e.target.value)}
-          className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
+          className="w-full px-2 py-1.5 text-sm bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
         >
           <option value="">Select a page spec...</option>
           {getAllSpecs().map((s) => {
@@ -368,7 +368,7 @@ function CreateIssueForm({
           placeholder={`${scopeType} identifier`}
           value={scopeValue}
           onChange={(e) => setScopeValue(e.target.value)}
-          className="w-full px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
+          className="w-full px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
         />
       ) : null}
 
@@ -381,7 +381,7 @@ function CreateIssueForm({
           placeholder="How to check for this issue"
           value={verificationHint}
           onChange={(e) => setVerificationHint(e.target.value)}
-          className="w-full mt-0.5 px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
+          className="w-full mt-0.5 px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
         />
       </div>
 
@@ -394,7 +394,7 @@ function CreateIssueForm({
           placeholder="When does this happen?"
           value={reproductionContext}
           onChange={(e) => setReproductionContext(e.target.value)}
-          className="w-full mt-0.5 px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
+          className="w-full mt-0.5 px-3 py-2 text-sm bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
         />
       </div>
 
@@ -726,7 +726,7 @@ export function GlobalIssuesPanel() {
           <select
             value={categoryFilter}
             onChange={(e) => setCategoryFilter(e.target.value)}
-            className="px-2 py-1 text-xs bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
+            className="px-2 py-1 text-xs bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
           >
             <option value="all">All Categories</option>
             {ISSUE_CATEGORIES.map((c) => (
@@ -739,7 +739,7 @@ export function GlobalIssuesPanel() {
           <select
             value={severityFilter}
             onChange={(e) => setSeverityFilter(e.target.value)}
-            className="px-2 py-1 text-xs bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
+            className="px-2 py-1 text-xs bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
           >
             <option value="all">All Severities</option>
             {ISSUE_SEVERITIES.map((s) => (
@@ -756,7 +756,7 @@ export function GlobalIssuesPanel() {
               placeholder="Search..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="flex-1 px-2 py-1 text-xs bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50"
+              className="flex-1 px-2 py-1 text-xs bg-background border border-border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary/50"
             />
           </div>
 

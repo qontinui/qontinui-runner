@@ -101,7 +101,7 @@ function ViolationRow({ violation }: { violation: ConstraintViolation }) {
   return (
     <div className="flex items-start gap-2 py-1 px-3 text-xs">
       {violation.file && (
-        <div className="flex items-center gap-1 flex-shrink-0 text-zinc-400">
+        <div className="flex items-center gap-1 shrink-0 text-zinc-400">
           <FileCode className="w-3 h-3" />
           <span className="font-mono">
             {violation.file}
@@ -134,7 +134,7 @@ function ConstraintRow({ result }: { result: ConstraintResult }) {
         disabled={!hasViolations}
       >
         {/* Expand indicator */}
-        <div className="flex-shrink-0 w-4">
+        <div className="shrink-0 w-4">
           {hasViolations &&
             (expanded ? (
               <ChevronDown className="w-3.5 h-3.5 text-zinc-500" />
@@ -145,7 +145,7 @@ function ConstraintRow({ result }: { result: ConstraintResult }) {
 
         {/* Pass/fail icon */}
         {result.passed ? (
-          <ShieldCheck className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+          <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
         ) : (
           <SeverityIcon severity={result.severity} className={severityColors.text} />
         )}

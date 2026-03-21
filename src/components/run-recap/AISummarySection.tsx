@@ -91,7 +91,7 @@ function UserMessageBubble({ content }: { content: string }) {
       className={`flex items-start gap-2 rounded-lg p-3 border ${blueColors.bg} ${blueColors.border}`}
     >
       <div
-        className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center ${blueColors.bg} ${blueColors.text}`}
+        className={`shrink-0 w-6 h-6 rounded-full flex items-center justify-center ${blueColors.bg} ${blueColors.text}`}
       >
         <User className="w-3.5 h-3.5" />
       </div>

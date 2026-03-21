@@ -228,10 +228,10 @@ function ShortcutsPage() {
                   key={`${shortcut.keys.join("-")}-${idx}`}
                   className="p-4 flex items-start gap-4"
                 >
-                  <div className="flex items-center gap-1.5 flex-shrink-0">
+                  <div className="flex items-center gap-1.5 shrink-0">
                     {shortcut.keys.map((key, keyIdx) => (
                       <span key={`${key}-${keyIdx}`}>
-                        <kbd className="px-2 py-1 text-sm font-mono bg-muted border border-border rounded shadow-sm">
+                        <kbd className="px-2 py-1 text-sm font-mono bg-muted border border-border rounded shadow-xs">
                           {key}
                         </kbd>
                         {keyIdx < shortcut.keys.length - 1 && (
@@ -256,7 +256,7 @@ function ShortcutsPage() {
         className={`${getAccentColors("blue").bg} border ${getAccentColors("blue").border} rounded-lg p-4`}
       >
         <div className="flex items-start gap-3">
-          <HelpCircle className={`w-5 h-5 ${getAccentColors("blue").text} flex-shrink-0 mt-0.5`} />
+          <HelpCircle className={`w-5 h-5 ${getAccentColors("blue").text} shrink-0 mt-0.5`} />
           <div>
             <h4 className={`font-medium ${getAccentColors("blue").text}`}>
               Tip: Using Prompt Snippets
@@ -411,7 +411,7 @@ function GettingStartedPage() {
         className={`${getAccentColors("blue").bg} border ${getAccentColors("blue").border} rounded-lg p-4`}
       >
         <div className="flex items-start gap-3">
-          <HelpCircle className={`w-5 h-5 ${getAccentColors("blue").text} flex-shrink-0 mt-0.5`} />
+          <HelpCircle className={`w-5 h-5 ${getAccentColors("blue").text} shrink-0 mt-0.5`} />
           <div>
             <h4 className={`font-medium ${getAccentColors("blue").text}`}>Need Help?</h4>
             <p className="text-sm text-muted-foreground mt-1">
@@ -583,7 +583,7 @@ function TroubleshootingPage() {
         className={`${getAccentColors("amber").bg} border ${getAccentColors("amber").border} rounded-lg p-4`}
       >
         <div className="flex items-start gap-3">
-          <Bug className={`w-5 h-5 ${getAccentColors("amber").text} flex-shrink-0 mt-0.5`} />
+          <Bug className={`w-5 h-5 ${getAccentColors("amber").text} shrink-0 mt-0.5`} />
           <div>
             <h4 className={`font-medium ${getAccentColors("amber").text}`}>Still Having Issues?</h4>
             <p className="text-sm text-muted-foreground mt-1">
@@ -685,7 +685,7 @@ function TutorialsPage() {
         className={`${getAccentColors("blue").bg} border ${getAccentColors("blue").border} rounded-lg p-4`}
       >
         <div className="flex items-start gap-3">
-          <HelpCircle className={`w-5 h-5 ${getAccentColors("blue").text} flex-shrink-0 mt-0.5`} />
+          <HelpCircle className={`w-5 h-5 ${getAccentColors("blue").text} shrink-0 mt-0.5`} />
           <div>
             <h4 className={`font-medium ${getAccentColors("blue").text}`}>
               Tip: Keyboard Navigation
@@ -821,7 +821,7 @@ function AboutPage() {
       {/* Open Source Notice */}
       <div className="bg-primary/5 border border-primary/20 rounded-lg p-4">
         <div className="flex items-start gap-3">
-          <HelpCircle className="w-5 h-5 text-primary flex-shrink-0 mt-0.5" />
+          <HelpCircle className="w-5 h-5 text-primary shrink-0 mt-0.5" />
           <div>
             <h4 className="font-medium text-primary">Open Source</h4>
             <p className="text-sm text-muted-foreground mt-1">
@@ -901,7 +901,7 @@ export function HelpTab() {
               value={page.id}
               className={`
                 flex items-center gap-3 px-3 py-2.5 rounded-md text-left text-sm font-medium
-                transition-colors duration-150 outline-none
+                transition-colors duration-150 outline-hidden
                 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground
                 data-[state=inactive]:text-muted-foreground data-[state=inactive]:hover:bg-muted/50
                 focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2
@@ -924,27 +924,27 @@ export function HelpTab() {
 
       {/* Content area */}
       <div className="flex-1 overflow-y-auto p-6">
-        <Tabs.Content value="tutorials" className="outline-none">
+        <Tabs.Content value="tutorials" className="outline-hidden">
           <TutorialsPage />
         </Tabs.Content>
 
-        <Tabs.Content value="shortcuts" className="outline-none">
+        <Tabs.Content value="shortcuts" className="outline-hidden">
           <ShortcutsPage />
         </Tabs.Content>
 
-        <Tabs.Content value="getting-started" className="outline-none">
+        <Tabs.Content value="getting-started" className="outline-hidden">
           <GettingStartedPage />
         </Tabs.Content>
 
-        <Tabs.Content value="documentation" className="outline-none">
+        <Tabs.Content value="documentation" className="outline-hidden">
           <DocumentationPage />
         </Tabs.Content>
 
-        <Tabs.Content value="troubleshooting" className="outline-none">
+        <Tabs.Content value="troubleshooting" className="outline-hidden">
           <TroubleshootingPage />
         </Tabs.Content>
 
-        <Tabs.Content value="about" className="outline-none">
+        <Tabs.Content value="about" className="outline-hidden">
           <AboutPage />
         </Tabs.Content>
       </div>

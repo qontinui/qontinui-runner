@@ -166,7 +166,7 @@ export function TestLibraryPicker({ isOpen, onClose, onSelect, phase }: TestLibr
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-9 pr-3 py-2 text-sm bg-muted border border-border rounded-md
-                       focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                       focus:outline-hidden focus:ring-2 focus:ring-green-500/50"
               autoFocus
             />
           </div>
@@ -174,7 +174,7 @@ export function TestLibraryPicker({ isOpen, onClose, onSelect, phase }: TestLibr
             value={filterType || ""}
             onChange={(e) => setFilterType(e.target.value || null)}
             className="px-3 py-2 text-sm bg-muted border border-border rounded-md
-                     focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                     focus:outline-hidden focus:ring-2 focus:ring-green-500/50"
           >
             <option value="">All Types</option>
             {testTypes.map((type) => (

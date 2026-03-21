@@ -166,7 +166,7 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
           >
             {/* Status indicator */}
             <div
-              className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${
+              className={`w-2.5 h-2.5 rounded-full shrink-0 ${
                 instance.running && instance.api_ready
                   ? "bg-green-500"
                   : instance.running
@@ -194,7 +194,7 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
             </div>
 
             {/* Actions */}
-            <div className="flex items-center gap-1 flex-shrink-0">
+            <div className="flex items-center gap-1 shrink-0">
               {instance.running ? (
                 <button
                   onClick={() => handleStop(instance)}

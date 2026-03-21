@@ -80,7 +80,7 @@ function RequestRow({
 
       {/* Method badge */}
       <Badge
-        className={cn("text-xs flex-shrink-0 font-mono border", getMethodColor(request.method))}
+        className={cn("text-xs shrink-0 font-mono border", getMethodColor(request.method))}
       >
         {request.method}
       </Badge>
@@ -94,7 +94,7 @@ function RequestRow({
       </div>
 
       {/* Status code and duration */}
-      <div className="flex items-center gap-2 flex-shrink-0">
+      <div className="flex items-center gap-2 shrink-0">
         {request.statusCode !== undefined && (
           <Badge variant={getStatusCodeVariant(request.statusCode)} className="text-[10px]">
             {request.statusCode}
@@ -134,7 +134,7 @@ function RequestDetail({ request }: { request: ApiRequestExecution | null }) {
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Request header */}
-      <div className="px-4 py-3 border-b border-border bg-muted/10 flex-shrink-0">
+      <div className="px-4 py-3 border-b border-border bg-muted/10 shrink-0">
         <div className="flex items-center gap-2">
           <Badge className={cn("font-mono border", getMethodColor(request.method))}>
             {request.method}
@@ -148,7 +148,7 @@ function RequestDetail({ request }: { request: ApiRequestExecution | null }) {
 
       {/* Tabs for request/response */}
       <Tabs defaultValue="response" className="flex-1 flex flex-col overflow-hidden">
-        <TabsList className="px-4 pt-2 justify-start border-b border-border bg-transparent flex-shrink-0">
+        <TabsList className="px-4 pt-2 justify-start border-b border-border bg-transparent shrink-0">
           <TabsTrigger value="request" className="gap-1.5">
             <ArrowRight className="h-3.5 w-3.5" />
             Request
@@ -245,7 +245,7 @@ export function ApiRequestWidget({ isSummary, data, className }: ApiRequestWidge
       <div className="flex-1 flex overflow-hidden">
         {/* Request list */}
         <div className="w-1/2 border-r border-border flex flex-col">
-          <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 flex-shrink-0">
+          <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 shrink-0">
             <h3 className="text-sm font-semibold text-foreground">Requests</h3>
             <Badge variant="muted" className="text-xs">
               {data.requests.length}

@@ -397,7 +397,7 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
                     </div>
 
                     {/* Icon */}
-                    <div className={`flex-shrink-0 p-2 rounded-lg ${colorClasses.bg}`}>
+                    <div className={`shrink-0 p-2 rounded-lg ${colorClasses.bg}`}>
                       <Icon className={`w-4 h-4 ${colorClasses.text}`} />
                     </div>
 
@@ -429,7 +429,7 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
                     </div>
 
                     {/* Actions */}
-                    <div className="flex items-center gap-1 flex-shrink-0">
+                    <div className="flex items-center gap-1 shrink-0">
                       {/* Visibility Toggle */}
                       <button
                         onClick={() => handleToggleVisibility(category.id, isHidden)}
@@ -579,7 +579,7 @@ function CategoryForm({
     <div className="space-y-4">
       {/* Preview */}
       <div className="flex items-center gap-3 p-3 rounded-lg border border-dashed border-border bg-muted/30">
-        <div className={`flex-shrink-0 p-2 rounded-lg ${colorClasses.bg}`}>
+        <div className={`shrink-0 p-2 rounded-lg ${colorClasses.bg}`}>
           <Icon className={`w-4 h-4 ${colorClasses.text}`} />
         </div>
         <div>
@@ -602,7 +602,7 @@ function CategoryForm({
             onChange={(e) => setFormId(e.target.value)}
             disabled={!isNew}
             placeholder="category_id"
-            className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 disabled:opacity-50 disabled:cursor-not-allowed font-mono text-sm"
+            className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50 disabled:opacity-50 disabled:cursor-not-allowed font-mono text-sm"
           />
         </div>
         <div>
@@ -612,7 +612,7 @@ function CategoryForm({
             value={formName}
             onChange={(e) => handleNameChange(e.target.value)}
             placeholder="Category Name"
-            className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
+            className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50"
           />
         </div>
       </div>
@@ -625,7 +625,7 @@ function CategoryForm({
           value={formDescription}
           onChange={(e) => setFormDescription(e.target.value)}
           placeholder="Brief description of what this category is for"
-          className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
+          className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50"
         />
       </div>
 

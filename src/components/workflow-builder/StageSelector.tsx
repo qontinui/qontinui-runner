@@ -254,7 +254,7 @@ function StageTabMenu({
             onRename(editName.trim());
           }
         }}
-        className="w-full h-7 px-2 text-xs bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+        className="w-full h-7 px-2 text-xs bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-hidden focus:ring-1 focus:ring-zinc-600"
         placeholder="Phase name"
       />
       <div className="flex gap-1">
@@ -314,7 +314,7 @@ function StageSettings({
   const [overridesExpanded, setOverridesExpanded] = useState(false);
 
   const selectClass =
-    "w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-1 focus:ring-zinc-600";
+    "w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 focus:outline-hidden focus:ring-1 focus:ring-zinc-600";
 
   const stageOverrides: ModelOverrides = (stage.model_overrides as ModelOverrides) ?? {};
   const hasPhaseOverrides = MODEL_OVERRIDE_PHASES.some((phase) => {
@@ -366,7 +366,7 @@ function StageSettings({
                 value={stage.description ?? ""}
                 onChange={(e) => onUpdate({ description: e.target.value })}
                 placeholder="Phase description"
-                className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+                className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-hidden focus:ring-1 focus:ring-zinc-600"
               />
             </div>
             <div>
@@ -375,7 +375,7 @@ function StageSettings({
                 type="number"
                 value={stage.max_iterations ?? 10}
                 onChange={(e) => onUpdate({ max_iterations: parseInt(e.target.value) || 10 })}
-                className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+                className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-hidden focus:ring-1 focus:ring-zinc-600"
                 min={1}
                 max={100}
               />
@@ -415,7 +415,7 @@ function StageSettings({
                   value={stage.model ?? ""}
                   onChange={(e) => onUpdate({ model: e.target.value || undefined })}
                   placeholder="(inherit)"
-                  className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+                  className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-hidden focus:ring-1 focus:ring-zinc-600"
                 />
               )}
             </div>
@@ -454,7 +454,7 @@ function StageSettings({
                             Object.keys(preset.overrides).length > 0 ? preset.overrides : undefined,
                         });
                     }}
-                    className="flex-1 h-6 px-1.5 text-[10px] bg-zinc-800 border border-zinc-700 rounded text-zinc-200 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+                    className="flex-1 h-6 px-1.5 text-[10px] bg-zinc-800 border border-zinc-700 rounded text-zinc-200 focus:outline-hidden focus:ring-1 focus:ring-zinc-600"
                   >
                     <option value="custom">Custom</option>
                     {MODEL_PRESETS.map((preset) => (
@@ -482,7 +482,7 @@ function StageSettings({
                   return (
                     <div key={phase.key} className="flex items-center gap-1.5">
                       <span
-                        className="text-[10px] text-zinc-500 w-20 flex-shrink-0 truncate"
+                        className="text-[10px] text-zinc-500 w-20 shrink-0 truncate"
                         title={phase.label}
                       >
                         {phase.label}
@@ -495,7 +495,7 @@ function StageSettings({
                             updateStagePhaseOverride(phase.key, "model", "");
                           }
                         }}
-                        className="flex-1 h-6 px-1.5 text-[10px] bg-zinc-800 border border-zinc-700 rounded text-zinc-200 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+                        className="flex-1 h-6 px-1.5 text-[10px] bg-zinc-800 border border-zinc-700 rounded text-zinc-200 focus:outline-hidden focus:ring-1 focus:ring-zinc-600"
                       >
                         <option value="">Inherit</option>
                         {PROVIDER_OPTIONS.filter((p) => p.value !== "").map((opt) => (
@@ -510,7 +510,7 @@ function StageSettings({
                           onChange={(e) =>
                             updateStagePhaseOverride(phase.key, "model", e.target.value)
                           }
-                          className="flex-1 h-6 px-1.5 text-[10px] bg-zinc-800 border border-zinc-700 rounded text-zinc-200 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+                          className="flex-1 h-6 px-1.5 text-[10px] bg-zinc-800 border border-zinc-700 rounded text-zinc-200 focus:outline-hidden focus:ring-1 focus:ring-zinc-600"
                         >
                           {MODELS_BY_PROVIDER[provider]!.map((opt) => (
                             <option key={opt.value} value={opt.value}>

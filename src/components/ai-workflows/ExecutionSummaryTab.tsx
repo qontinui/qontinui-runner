@@ -278,7 +278,7 @@ export function ExecutionSummaryTab() {
   return (
     <div className="h-full flex flex-col overflow-hidden">
       {/* Header */}
-      <div className="flex-shrink-0 border-b border-border p-4 space-y-3">
+      <div className="shrink-0 border-b border-border p-4 space-y-3">
         {/* Run Info Header */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -363,7 +363,7 @@ export function ExecutionSummaryTab() {
 
       {/* AI Summary Section */}
       {selectedRun?.ai_summary && (
-        <div className="flex-shrink-0 border-b border-border p-4 space-y-3 bg-muted/20">
+        <div className="shrink-0 border-b border-border p-4 space-y-3 bg-muted/20">
           <div className="flex items-center gap-2">
             <Sparkles className="w-4 h-4 text-primary" />
             <h3 className="font-medium text-foreground">AI Summary</h3>
@@ -397,7 +397,7 @@ export function ExecutionSummaryTab() {
       {/* Loop Result Section (Unified Workflow) */}
       {selectedRun?.loop_result && (
         <div
-          className={`flex-shrink-0 border-b border-border p-4 space-y-3 ${
+          className={`shrink-0 border-b border-border p-4 space-y-3 ${
             selectedRun.loop_result.verification_passed
               ? "bg-green-500/5"
               : selectedRun.loop_result.critical_failure
@@ -493,7 +493,7 @@ export function ExecutionSummaryTab() {
           if (isRecentlyCompleted || isGeneratingSummary) {
             // Show loading indicator for recently completed runs or when generating
             return (
-              <div className="flex-shrink-0 border-b border-border p-4 bg-muted/20">
+              <div className="shrink-0 border-b border-border p-4 bg-muted/20">
                 <div className="flex items-center gap-2 text-muted-foreground">
                   <Loader2 className="w-4 h-4 animate-spin" />
                   <span className="text-sm">Generating AI summary...</span>
@@ -503,7 +503,7 @@ export function ExecutionSummaryTab() {
           } else {
             // Show "not available" with option to generate
             return (
-              <div className="flex-shrink-0 border-b border-border p-4 bg-muted/20">
+              <div className="shrink-0 border-b border-border p-4 bg-muted/20">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2 text-muted-foreground">
                     <FileText className="w-4 h-4 opacity-50" />
@@ -526,7 +526,7 @@ export function ExecutionSummaryTab() {
         })()}
 
       {/* Findings Summary Stats */}
-      <div className="flex-shrink-0 border-b border-border p-4">
+      <div className="shrink-0 border-b border-border p-4">
         <div className="flex items-center gap-3 text-sm flex-wrap">
           <div className="flex items-center gap-2 px-3 py-1.5 bg-muted/30 rounded-lg">
             <span className="text-muted-foreground">Code Findings:</span>

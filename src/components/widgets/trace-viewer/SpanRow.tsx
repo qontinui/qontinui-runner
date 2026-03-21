@@ -51,11 +51,11 @@ export const SpanRow: React.FC<SpanRowProps> = React.memo(
           className="w-[240px] min-w-[240px] flex items-center gap-1.5 px-2 text-xs truncate"
           style={{ paddingLeft: `${depth * 20 + 8}px` }}
         >
-          {!span.success && <span className="w-1.5 h-1.5 rounded-full bg-red-500 flex-shrink-0" />}
+          {!span.success && <span className="w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" />}
           <span className={`truncate ${span.success ? "text-zinc-300" : "text-red-400"}`}>
             {displayName}
           </span>
-          <span className={`text-[10px] px-1 rounded ${colors.badge} ${colors.text} flex-shrink-0`}>
+          <span className={`text-[10px] px-1 rounded ${colors.badge} ${colors.text} shrink-0`}>
             {phase}
           </span>
         </div>
@@ -63,7 +63,7 @@ export const SpanRow: React.FC<SpanRowProps> = React.memo(
         {/* Timeline bar column */}
         <div className="flex-1 relative h-full">
           <div
-            className={`absolute top-1.5 h-5 rounded-sm ${colors.bar} ${
+            className={`absolute top-1.5 h-5 rounded-xs ${colors.bar} ${
               !span.success ? "ring-1 ring-red-500/50" : ""
             }`}
             style={{

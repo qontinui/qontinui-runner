@@ -96,7 +96,7 @@ function InlineCommandDetail({ command }: { command: ShellCommandExecution }) {
         {hasVars && command.templateCommand && (
           <div className="mb-2 pb-2 border-b border-border/30">
             <div className="flex items-center gap-2 mb-1">
-              <FileCode className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+              <FileCode className="h-3 w-3 text-muted-foreground shrink-0" />
               <span className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium">
                 Template
               </span>
@@ -109,7 +109,7 @@ function InlineCommandDetail({ command }: { command: ShellCommandExecution }) {
 
         {/* Resolved command (or original if no variables) */}
         <div className="flex items-start gap-2">
-          <Terminal className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0 mt-0.5" />
+          <Terminal className="h-3.5 w-3.5 text-muted-foreground shrink-0 mt-0.5" />
           <div className="flex-1">
             {hasVars && (
               <span className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium mr-2">
@@ -123,7 +123,7 @@ function InlineCommandDetail({ command }: { command: ShellCommandExecution }) {
         </div>
         {command.workingDirectory && (
           <div className="flex items-start gap-1 mt-1">
-            <FolderOpen className="h-3 w-3 text-muted-foreground flex-shrink-0 mt-0.5" />
+            <FolderOpen className="h-3 w-3 text-muted-foreground shrink-0 mt-0.5" />
             <span className="text-xs text-muted-foreground break-all">
               {command.workingDirectory}
             </span>
@@ -146,7 +146,7 @@ function InlineCommandDetail({ command }: { command: ShellCommandExecution }) {
               <div key={name} className="flex items-start gap-2">
                 <Badge
                   className={cn(
-                    "text-[10px] px-1.5 py-0 font-mono flex-shrink-0 border",
+                    "text-[10px] px-1.5 py-0 font-mono shrink-0 border",
                     purpleColors.bg,
                     purpleColors.text,
                     purpleColors.border,
@@ -243,7 +243,7 @@ function CommandRow({
         tabIndex={0}
       >
         {/* Expand/collapse indicator */}
-        <div className="flex-shrink-0 mt-0.5 text-muted-foreground">
+        <div className="shrink-0 mt-0.5 text-muted-foreground">
           {isExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
         </div>
 
@@ -253,7 +253,7 @@ function CommandRow({
         {/* Command badge showing base command */}
         <Badge
           className={cn(
-            "text-xs flex-shrink-0 font-mono border",
+            "text-xs shrink-0 font-mono border",
             slateColors.bg,
             slateColors.text,
             slateColors.border,
@@ -267,7 +267,7 @@ function CommandRow({
         {hasVars && command.resolvedVariables && (
           <Badge
             className={cn(
-              "text-[10px] flex-shrink-0 border",
+              "text-[10px] shrink-0 border",
               purpleColors.bg,
               purpleColors.text,
               purpleColors.border,
@@ -320,7 +320,7 @@ function CommandRow({
         </div>
 
         {/* Exit code and duration */}
-        <div className="flex items-center gap-2 flex-shrink-0">
+        <div className="flex items-center gap-2 shrink-0">
           {command.exitCode !== undefined && (
             <Badge variant={command.exitCode === 0 ? "success" : "danger"} className="text-[10px]">
               <Hash className="h-2.5 w-2.5 mr-0.5" />
@@ -365,7 +365,7 @@ export function ShellCommandWidget({ isSummary, data, className }: ShellCommandW
       <StepStatsBar stats={data.stats} />
 
       {/* Command list header */}
-      <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 flex-shrink-0">
+      <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 shrink-0">
         <div className="flex items-center gap-3">
           <h3 className="text-sm font-semibold text-foreground">Commands</h3>
           <span className="text-xs text-muted-foreground">Click to view full command</span>

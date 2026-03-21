@@ -168,7 +168,7 @@ export function RawApiPanel({
             value={action}
             onChange={(e) => setAction(e.target.value)}
             placeholder="e.g., getElements"
-            className="w-full px-2 py-1.5 text-sm font-mono bg-muted/30 border border-border/50 rounded-md focus:outline-none focus:ring-1 focus:ring-primary"
+            className="w-full px-2 py-1.5 text-sm font-mono bg-muted/30 border border-border/50 rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary"
             disabled={disabled || isExecuting}
           />
         </div>
@@ -189,7 +189,7 @@ export function RawApiPanel({
             onChange={(e) => setParamsJson(e.target.value)}
             placeholder="{}"
             rows={4}
-            className={`w-full px-2 py-1.5 text-sm font-mono bg-muted/30 border rounded-md focus:outline-none focus:ring-1 focus:ring-primary resize-none ${
+            className={`w-full px-2 py-1.5 text-sm font-mono bg-muted/30 border rounded-md focus:outline-hidden focus:ring-1 focus:ring-primary resize-none ${
               paramsError ? "border-destructive/50" : "border-border/50"
             }`}
             disabled={disabled || isExecuting}

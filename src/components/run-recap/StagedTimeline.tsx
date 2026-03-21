@@ -143,7 +143,7 @@ function StepItem({ step, onClick }: StepItemProps) {
       </div>
 
       {/* Navigate hint for clickable steps */}
-      {isClickable && <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />}
+      {isClickable && <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />}
     </div>
   );
 }

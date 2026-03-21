@@ -294,7 +294,7 @@ export function ExecutionStatusFullWidget({ data }: ExecutionStatusFullWidgetPro
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="px-4 py-3 border-b border-border/50 bg-muted/20 flex-shrink-0">
+      <div className="px-4 py-3 border-b border-border/50 bg-muted/20 shrink-0">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <Badge className={`${statusInfo.color.bg} ${statusInfo.color.text}`}>

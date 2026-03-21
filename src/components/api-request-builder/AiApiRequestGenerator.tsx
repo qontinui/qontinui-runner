@@ -179,7 +179,7 @@ export function AiApiRequestGenerator({
                 value={baseUrl}
                 onChange={(e) => setBaseUrl(e.target.value)}
                 placeholder="https://api.example.com"
-                className="w-full px-3 py-2 bg-muted border border-border rounded text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-indigo-500"
+                className="w-full px-3 py-2 bg-muted border border-border rounded text-sm text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:border-indigo-500"
               />
             </div>
 
@@ -192,7 +192,7 @@ export function AiApiRequestGenerator({
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder="Example: POST request to create a new user with name, email, and password fields, including proper Content-Type header"
-                className="flex-1 px-3 py-2 bg-muted border border-border rounded text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-none focus:border-indigo-500 min-h-[100px]"
+                className="flex-1 px-3 py-2 bg-muted border border-border rounded text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-hidden focus:border-indigo-500 min-h-[100px]"
               />
             </div>
 

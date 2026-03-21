@@ -84,7 +84,7 @@ export function CostBreakdownPanel({ data, size }: CanvasPanelComponentProps) {
             {/* Step name + side-effect badge */}
             <div
               className={cn(
-                "truncate text-muted-foreground flex-shrink-0 flex items-center gap-1",
+                "truncate text-muted-foreground shrink-0 flex items-center gap-1",
                 fontSize,
               )}
               style={{ width: `${nameWidth}px` }}
@@ -92,7 +92,7 @@ export function CostBreakdownPanel({ data, size }: CanvasPanelComponentProps) {
             >
               <span className="truncate">{step.name}</span>
               {step.has_side_effects && (
-                <span className="flex-shrink-0 text-amber-400 font-bold" title="Has side effects">
+                <span className="shrink-0 text-amber-400 font-bold" title="Has side effects">
                   !
                 </span>
               )}
@@ -101,14 +101,14 @@ export function CostBreakdownPanel({ data, size }: CanvasPanelComponentProps) {
             {/* Bar + duration label */}
             <div className="flex-1 flex items-center gap-1.5">
               <div
-                className={cn("rounded-sm transition-all relative", barHeight)}
+                className={cn("rounded-xs transition-all relative", barHeight)}
                 style={{
                   width: `${widthPct}%`,
                   backgroundColor: barColor,
                 }}
                 title={`${step.name}: ${formatDuration(step.estimated_ms)} (${step.category})${step.has_side_effects ? " [side effects]" : ""}`}
               />
-              <span className={cn("flex-shrink-0 font-mono text-muted-foreground", fontSize)}>
+              <span className={cn("shrink-0 font-mono text-muted-foreground", fontSize)}>
                 {formatDuration(step.estimated_ms)}
               </span>
             </div>
@@ -135,7 +135,7 @@ export function CostBreakdownPanel({ data, size }: CanvasPanelComponentProps) {
       <div className="flex flex-wrap gap-x-3 gap-y-1 pt-1.5 mt-1 border-t border-border/30">
         {Object.entries(CATEGORY_COLORS).map(([category, color]) => (
           <div key={category} className="flex items-center gap-1 text-[10px]">
-            <div className="w-2 h-2 rounded-sm" style={{ backgroundColor: color }} />
+            <div className="w-2 h-2 rounded-xs" style={{ backgroundColor: color }} />
             <span className="text-zinc-400">{category.replace(/_/g, " ")}</span>
           </div>
         ))}

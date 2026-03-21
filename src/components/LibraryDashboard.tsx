@@ -529,13 +529,13 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
             placeholder="Search across all categories..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-10 pr-4 py-2.5 bg-muted border border-border rounded-lg text-sm focus:outline-none focus:border-border"
+            className="w-full pl-10 pr-4 py-2.5 bg-muted border border-border rounded-lg text-sm focus:outline-hidden focus:border-border"
           />
         </div>
 
         {/* Type filters */}
         <div className="flex items-center gap-2 overflow-x-auto pb-1">
-          <Filter className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+          <Filter className="w-4 h-4 text-muted-foreground shrink-0" />
           {hasFavorites && (
             <button
               onClick={() => setShowFavoritesOnly((prev) => !prev)}
@@ -606,7 +606,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
                   <div className="flex items-start gap-3">
                     {/* Icon */}
                     <div
-                      className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5"
+                      className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 mt-0.5"
                       style={{ backgroundColor: `${accentColors.bgSolid}20` }}
                     >
                       <Icon className="w-4 h-4" style={{ color: accentColors.bgSolid }} />
@@ -648,7 +648,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
                           e.stopPropagation();
                           toggleFavorite(item.id);
                         }}
-                        className="flex-shrink-0 p-1 rounded transition-colors hover:bg-white/10 mt-0.5"
+                        className="shrink-0 p-1 rounded transition-colors hover:bg-white/10 mt-0.5"
                         title={item.isFavorite ? "Remove from favorites" : "Add to favorites"}
                       >
                         <Star
@@ -658,7 +658,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
                     )}
 
                     {/* Arrow */}
-                    <ChevronRight className="w-4 h-4 text-border group-hover:text-muted-foreground transition-colors flex-shrink-0 mt-1" />
+                    <ChevronRight className="w-4 h-4 text-border group-hover:text-muted-foreground transition-colors shrink-0 mt-1" />
                   </div>
                 </button>
               );

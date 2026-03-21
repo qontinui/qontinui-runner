@@ -240,7 +240,7 @@ function DetailRow({
   return (
     <div className="flex items-center justify-between gap-2">
       <dt className="flex items-center gap-1.5 text-muted-foreground min-w-0">
-        {icon && <span className="flex-shrink-0">{icon}</span>}
+        {icon && <span className="shrink-0">{icon}</span>}
         <span className="text-xs">{label}</span>
       </dt>
       <dd className="text-xs text-foreground truncate max-w-[160px] text-right" title={value}>

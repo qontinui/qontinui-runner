@@ -2090,7 +2090,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
               placeholder="Search scripts..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-2 bg-muted border border-border rounded-lg text-sm focus:outline-none focus:border-primary"
+              className="w-full pl-9 pr-3 py-2 bg-muted border border-border rounded-lg text-sm focus:outline-hidden focus:border-primary"
             />
           </div>
         </div>
@@ -2157,7 +2157,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                   <div className="flex items-center gap-2">
                     {isSelectionMode && (
                       <div
-                        className={`w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${
+                        className={`w-4 h-4 rounded border shrink-0 flex items-center justify-center ${
                           selectedIds.has(script.id)
                             ? "bg-red-500 border-red-500"
                             : "border-muted-foreground hover:border-red-400"
@@ -2289,7 +2289,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                         value={formName}
                         onChange={(e) => setFormName(e.target.value)}
                         placeholder="Login Flow Test"
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-green-500/50"
                       />
                     </div>
                     <div>
@@ -2301,7 +2301,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                           value={formTargetUrl}
                           onChange={(e) => setFormTargetUrl(e.target.value)}
                           placeholder="http://localhost:3000"
-                          className="w-full pl-10 pr-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                          className="w-full pl-10 pr-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-green-500/50"
                         />
                       </div>
                     </div>
@@ -2346,7 +2346,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                           onInput={promptSnippetMention.handleInput}
                           placeholder="Describe what this test should do in plain English... (Type @ to insert a prompt snippet)&#10;&#10;Example: There is a Capture Screen button on the Image Extraction page. Click it and select Capture Screen in the dialog box."
                           rows={6}
-                          className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                          className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-green-500/50"
                         />
                         {/* @-mention popup for prompt snippet insertion */}
                         {promptSnippetMention.isActive && (
@@ -2375,7 +2375,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                           onChange={(e) => setFormAiInstructions(e.target.value)}
                           placeholder="Additional instructions for the AI that modify how the description is interpreted...&#10;&#10;Example: The feature is currently broken. Stop after capturing the screen and take a screenshot. Expect failure but capture the state for debugging."
                           rows={3}
-                          className={`w-full px-3 py-2 ${getAccentColors("purple").bg} border ${getAccentColors("purple").border} rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 text-sm`}
+                          className={`w-full px-3 py-2 ${getAccentColors("purple").bg} border ${getAccentColors("purple").border} rounded-lg focus:outline-hidden focus:ring-2 focus:ring-purple-500 text-sm`}
                         />
                         <p className="text-xs text-muted-foreground mt-1">
                           Use this to give the AI additional context without changing the test
@@ -2417,7 +2417,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                               onChange={(e) => setFormWorkflowObjective(e.target.value)}
                               placeholder="What should this workflow achieve?&#10;&#10;Example: Create a new state called 'test-state' and verify it appears in the state list"
                               rows={2}
-                              className={`w-full px-3 py-2 bg-background border ${getAccentColors("blue").border} rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm`}
+                              className={`w-full px-3 py-2 bg-background border ${getAccentColors("blue").border} rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500 text-sm`}
                             />
                           </div>
 
@@ -2437,7 +2437,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                               }
                               placeholder="Specific things to verify after script passes:&#10;- 'test-state' appears in state list&#10;- State is visible on canvas&#10;- No error messages shown"
                               rows={3}
-                              className={`w-full px-3 py-2 bg-background border ${getAccentColors("blue").border} rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm`}
+                              className={`w-full px-3 py-2 bg-background border ${getAccentColors("blue").border} rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500 text-sm`}
                             />
                           </div>
 
@@ -2480,7 +2480,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                         value={formScriptContent}
                         onChange={(e) => setFormScriptContent(e.target.value)}
                         rows={12}
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50 font-mono text-sm"
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-green-500/50 font-mono text-sm"
                         spellCheck={false}
                       />
 
@@ -2499,7 +2499,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                         >
                           <div className="flex items-start gap-2">
                             <Info
-                              className={`w-4 h-4 ${getAccentColors("amber").text} mt-0.5 flex-shrink-0`}
+                              className={`w-4 h-4 ${getAccentColors("amber").text} mt-0.5 shrink-0`}
                             />
                             <div className="flex-1">
                               <div
@@ -2552,7 +2552,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                         value={formCategory}
                         onChange={(e) => setFormCategory(e.target.value)}
                         placeholder="E2E, Smoke, Regression"
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-green-500/50"
                         list="category-suggestions"
                       />
                       <datalist id="category-suggestions">
@@ -2570,7 +2570,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                         value={formTags}
                         onChange={(e) => setFormTags(e.target.value)}
                         placeholder="login, auth, smoke"
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-green-500/50"
                       />
                     </div>
                   </div>
@@ -2584,7 +2584,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                         onChange={(e) => setFormTimeoutSeconds(parseInt(e.target.value) || 60)}
                         min={10}
                         max={600}
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-green-500/50"
                       />
                     </div>
                     <div>
@@ -2592,7 +2592,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                       <select
                         value={formBrowser}
                         onChange={(e) => setFormBrowser(e.target.value as typeof formBrowser)}
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-green-500/50"
                       >
                         <option value="chromium">Chromium</option>
                         <option value="firefox">Firefox</option>
@@ -2604,7 +2604,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                       <select
                         value={formDisplayMode}
                         onChange={(e) => setFormDisplayMode(e.target.value as DisplayMode)}
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-green-500/50"
                       >
                         <option value="headless">Headless (No UI)</option>
                         <option value="headed">Headed (New Window)</option>

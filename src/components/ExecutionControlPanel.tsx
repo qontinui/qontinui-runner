@@ -177,7 +177,7 @@ export function ExecutionControlPanel({
                 ? workflows.find((w) => w.id === selectedWorkflow)?.name || "Select Workflow"
                 : "Select Workflow"}
             </span>
-            <ChevronDown className="w-4 h-4 flex-shrink-0" />
+            <ChevronDown className="w-4 h-4 shrink-0" />
           </button>
 
           {showWorkflowDropdown && (

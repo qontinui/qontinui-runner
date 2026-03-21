@@ -107,17 +107,17 @@ export function WidgetHeader({
     >
       {/* Left: Icon + Title + Status */}
       <div className="flex items-center gap-2 min-w-0">
-        <div className={cn("flex-shrink-0", colors.text)}>
+        <div className={cn("shrink-0", colors.text)}>
           <IconComponent className={compact ? "w-4 h-4" : "w-5 h-5"} />
         </div>
         <span className={cn("font-medium truncate", compact ? "text-sm" : "text-base")}>
           {title}
         </span>
-        {statusIcon && <span className="flex-shrink-0">{statusIcon}</span>}
+        {statusIcon && <span className="shrink-0">{statusIcon}</span>}
       </div>
 
       {/* Right: Progress/Count + View All */}
-      <div className="flex items-center gap-3 flex-shrink-0">
+      <div className="flex items-center gap-3 shrink-0">
         {/* Progress bar */}
         {progress !== undefined && !compact && (
           <div className="flex items-center gap-2">

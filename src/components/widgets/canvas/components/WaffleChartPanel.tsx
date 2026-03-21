@@ -66,7 +66,7 @@ export function WaffleChartPanel({ data, size }: CanvasPanelComponentProps) {
           return (
             <div
               key={`${cell.label}-${idx}`}
-              className={cn("rounded-sm", cellSize, isRunning && "animate-pulse")}
+              className={cn("rounded-xs", cellSize, isRunning && "animate-pulse")}
               style={{ backgroundColor: color }}
               title={cell.label}
             />
@@ -79,7 +79,7 @@ export function WaffleChartPanel({ data, size }: CanvasPanelComponentProps) {
         {Object.entries(counts).map(([status, count], idx, arr) => (
           <span key={status} className="flex items-center gap-1">
             <span
-              className="inline-block h-2 w-2 rounded-sm flex-shrink-0"
+              className="inline-block h-2 w-2 rounded-xs shrink-0"
               style={{ backgroundColor: STATUS_COLORS[status] ?? STATUS_COLORS.pending }}
             />
             <span className="font-mono text-foreground">{count}</span>

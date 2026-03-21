@@ -217,7 +217,7 @@ export function UIBridgeDiscoveryPanel({
                 onClick={() => setCollectTab("explore")}
                 className={`inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-1 text-sm font-medium whitespace-nowrap transition-[color,box-shadow] ${
                   collectTab === "explore"
-                    ? "bg-background shadow-sm text-foreground"
+                    ? "bg-background shadow-xs text-foreground"
                     : "text-muted-foreground hover:text-foreground"
                 }`}
               >
@@ -228,7 +228,7 @@ export function UIBridgeDiscoveryPanel({
                 onClick={() => setCollectTab("record")}
                 className={`inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-1 text-sm font-medium whitespace-nowrap transition-[color,box-shadow] ${
                   collectTab === "record"
-                    ? "bg-background shadow-sm text-foreground"
+                    ? "bg-background shadow-xs text-foreground"
                     : "text-muted-foreground hover:text-foreground"
                 }`}
               >
@@ -457,7 +457,7 @@ export function UIBridgeDiscoveryPanel({
                   placeholder="e.g., My App States"
                   value={discovery.configName}
                   onChange={(e) => discovery.setConfigName(e.target.value)}
-                  className="w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-brand-primary"
+                  className="w-full rounded-md border border-border-primary bg-bg-secondary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:outline-hidden focus:ring-2 focus:ring-brand-primary"
                 />
               </div>
               <button

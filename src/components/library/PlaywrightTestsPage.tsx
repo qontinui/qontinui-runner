@@ -199,7 +199,7 @@ function PlaywrightTestEditor({ builder, runResult }: PlaywrightTestEditorProps)
               onChange={(e) => updateField("name", e.target.value)}
               placeholder="Test name..."
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground"
             />
           </div>
@@ -212,7 +212,7 @@ function PlaywrightTestEditor({ builder, runResult }: PlaywrightTestEditorProps)
               onChange={(e) => updateField("category", e.target.value)}
               placeholder="e.g., smoke, regression, e2e..."
               className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-                placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+                placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
                 text-foreground"
             />
           </div>
@@ -234,7 +234,7 @@ function PlaywrightTestEditor({ builder, runResult }: PlaywrightTestEditorProps)
             onChange={(e) => updateField("target_url", e.target.value)}
             placeholder="https://localhost:3001"
             className="w-full px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
-              placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+              placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
               text-foreground"
           />
           <p className="text-[11px] text-muted-foreground">
@@ -261,7 +261,7 @@ function PlaywrightTestEditor({ builder, runResult }: PlaywrightTestEditorProps)
             rows={15}
             spellCheck={false}
             className="w-full px-3 py-2 text-sm font-mono bg-muted/50 border border-border rounded-md
-              placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary
+              placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-primary
               text-foreground resize-y min-h-[300px] leading-relaxed"
           />
           <p className="text-[11px] text-muted-foreground">
@@ -288,7 +288,7 @@ function PlaywrightTestEditor({ builder, runResult }: PlaywrightTestEditorProps)
             placeholder="Add a tag..."
             className="flex-1 px-3 py-1.5 text-sm bg-muted/50 border border-border rounded-md
               text-foreground placeholder:text-muted-foreground
-              focus:outline-none focus:ring-1 focus:ring-primary"
+              focus:outline-hidden focus:ring-1 focus:ring-primary"
           />
           <button
             type="button"

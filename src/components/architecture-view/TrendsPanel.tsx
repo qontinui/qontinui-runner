@@ -145,7 +145,7 @@ export function TrendsPanel({ workflowName, selectedComponent }: TrendsPanelProp
   const hasData = trends && trends.snapshot_count > 0;
 
   return (
-    <div className="flex-shrink-0 border border-border/50 rounded-lg bg-card/30">
+    <div className="shrink-0 border border-border/50 rounded-lg bg-card/30">
       {/* Header */}
       <button
         onClick={() => setExpanded(!expanded)}

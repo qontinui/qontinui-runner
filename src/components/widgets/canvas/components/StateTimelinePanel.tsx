@@ -87,7 +87,7 @@ export function StateTimelinePanel({ data, size }: CanvasPanelComponentProps) {
           <div key={stepIdx} className="flex items-center gap-1">
             {/* Step name */}
             <div
-              className={cn("truncate text-muted-foreground flex-shrink-0", fontSize)}
+              className={cn("truncate text-muted-foreground shrink-0", fontSize)}
               style={{ width: `${nameWidth}px` }}
               title={step.name}
             >
@@ -95,7 +95,7 @@ export function StateTimelinePanel({ data, size }: CanvasPanelComponentProps) {
             </div>
 
             {/* Iteration segments */}
-            <div className={cn("flex flex-1 rounded-sm overflow-hidden", rowHeight)}>
+            <div className={cn("flex flex-1 rounded-xs overflow-hidden", rowHeight)}>
               {iterationNumbers.map((num) => {
                 const status = iterationMap.get(num) ?? "pending";
                 const color = STATUS_COLORS[status] ?? STATUS_COLORS.pending;

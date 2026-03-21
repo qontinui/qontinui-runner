@@ -26,7 +26,7 @@ export function TimeRangeSelector({ value, onChange, className = "" }: TimeRange
       <select
         value={value}
         onChange={(e) => onChange(e.target.value as TimeRange)}
-        className="bg-muted border border-border rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+        className="bg-muted border border-border rounded-md px-3 py-1.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
       >
         {TIME_RANGE_OPTIONS.map((option) => (
           <option key={option} value={option}>

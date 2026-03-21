@@ -186,7 +186,7 @@ export function ExecutionStatsCard({
   // Full card view
   return (
     <div
-      className={cn("bg-card border border-border rounded-lg shadow-sm overflow-hidden", className)}
+      className={cn("bg-card border border-border rounded-lg shadow-xs overflow-hidden", className)}
     >
       {/* Header */}
       <div className="px-3 py-2 border-b border-border/50 bg-muted/30">

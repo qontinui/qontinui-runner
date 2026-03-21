@@ -1893,7 +1893,7 @@ function AppContent() {
                 </div>
                 <button
                   onClick={() => setRunLastWorkflowError(null)}
-                  className="text-muted-foreground hover:text-foreground flex-shrink-0"
+                  className="text-muted-foreground hover:text-foreground shrink-0"
                 >
                   &times;
                 </button>
@@ -1913,7 +1913,7 @@ function AppContent() {
                 </div>
                 <button
                   onClick={() => setStaleTaskMessage(null)}
-                  className="text-muted-foreground hover:text-foreground flex-shrink-0"
+                  className="text-muted-foreground hover:text-foreground shrink-0"
                 >
                   &times;
                 </button>

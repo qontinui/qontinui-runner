@@ -69,7 +69,7 @@ export const ELEVATION = {
   /** Flat - no shadow */
   FLAT: "",
   /** Subtle lift - cards, panels */
-  RAISED: "shadow-sm",
+  RAISED: "shadow-xs",
   /** Medium elevation - dropdowns, popovers */
   FLOATING: "shadow-md",
   /** High elevation - modals, dialogs */
@@ -104,7 +104,7 @@ export const RADIUS = {
   /** No rounding */
   NONE: "rounded-none",
   /** Subtle rounding */
-  SM: "rounded-sm",
+  SM: "rounded-xs",
   /** Default rounding */
   DEFAULT: "rounded",
   /** Medium rounding */

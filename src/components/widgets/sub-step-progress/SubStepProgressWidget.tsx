@@ -119,7 +119,7 @@ export function SubStepProgressWidget({
       {/* Current step indicator */}
       {runningStep && (
         <div className="px-3 pb-2 flex items-center gap-2 text-sm">
-          <Loader2 className="w-4 h-4 text-blue-500 animate-spin flex-shrink-0" />
+          <Loader2 className="w-4 h-4 text-blue-500 animate-spin shrink-0" />
           <span className="text-blue-400 truncate">{runningStep.name}</span>
         </div>
       )}
@@ -194,7 +194,7 @@ export function SubStepProgressSummary({ subSteps }: { subSteps: SubStepStatus_D
         <Progress value={subSteps.progressPercent} max={100} className="h-1" />
         {runningStep && (
           <div className="mt-1 flex items-center gap-1 text-xs text-blue-400 truncate">
-            <Loader2 className="w-3 h-3 animate-spin flex-shrink-0" />
+            <Loader2 className="w-3 h-3 animate-spin shrink-0" />
             <span className="truncate">{runningStep.name}</span>
           </div>
         )}

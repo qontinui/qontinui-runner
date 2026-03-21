@@ -88,7 +88,7 @@ function StatusDot({ status }: { status?: string }) {
 
   return (
     <span
-      className="inline-block w-1.5 h-1.5 rounded-full flex-shrink-0"
+      className="inline-block w-1.5 h-1.5 rounded-full shrink-0"
       style={{ backgroundColor: color }}
       title={status ?? "unknown"}
     />
@@ -123,7 +123,7 @@ const FeatureNode = memo(({ data }: { data: FeatureNodeData }) => {
       <div className="px-3 py-2.5">
         <div className="flex items-center gap-1.5 mb-1">
           <span
-            className="w-2 h-2 rounded-full flex-shrink-0"
+            className="w-2 h-2 rounded-full shrink-0"
             style={{ backgroundColor: colors.dot }}
           />
           <span className="text-xs font-semibold text-white truncate flex-1">{feature.label}</span>
@@ -254,13 +254,13 @@ function DetailSidebar({ feature, depsOut, depsIn, onClose }: DetailSidebarProps
   const colors = priorityColor(feature.priority);
 
   return (
-    <div className="w-72 bg-card border-l border-border/50 overflow-y-auto flex-shrink-0">
+    <div className="w-72 bg-card border-l border-border/50 overflow-y-auto shrink-0">
       {/* Header */}
       <div className="flex items-start justify-between p-4 border-b border-border/30">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1">
             <span
-              className="w-2.5 h-2.5 rounded-full flex-shrink-0"
+              className="w-2.5 h-2.5 rounded-full shrink-0"
               style={{ backgroundColor: colors.dot }}
             />
             <h3 className="text-sm font-semibold text-white truncate">{feature.label}</h3>
@@ -288,7 +288,7 @@ function DetailSidebar({ feature, depsOut, depsIn, onClose }: DetailSidebarProps
         </div>
         <button
           onClick={onClose}
-          className="p-1 rounded hover:bg-muted/50 text-zinc-400 hover:text-white transition-colors flex-shrink-0"
+          className="p-1 rounded hover:bg-muted/50 text-zinc-400 hover:text-white transition-colors shrink-0"
           aria-label="Close detail sidebar"
         >
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none">

@@ -252,7 +252,7 @@ export function PanelCard({ panel, isExpanded, onToggle, onMaximize, readOnly }:
         )}
         onClick={onToggle}
       >
-        <div className="flex-shrink-0 text-muted-foreground">
+        <div className="shrink-0 text-muted-foreground">
           <ChevronRight className={cn("h-4 w-4 transition-transform", isExpanded && "rotate-90")} />
         </div>
 

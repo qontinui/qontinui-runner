@@ -207,7 +207,7 @@ export function StatusPanel({ executionState }: StatusPanelProps) {
                   className="flex items-start gap-2 rounded-lg bg-muted/30 p-3"
                 >
                   <AlertTriangle
-                    className={`h-4 w-4 flex-shrink-0 ${
+                    className={`h-4 w-4 shrink-0 ${
                       warning.severity === "amber"
                         ? getAccentColors("amber").text
                         : getAccentColors("red").text

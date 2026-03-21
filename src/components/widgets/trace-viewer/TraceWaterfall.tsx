@@ -1,5 +1,5 @@
-import React, { useMemo, useCallback } from "react";
-import { FixedSizeList as List } from "react-window";
+import React, { useMemo } from "react";
+import { List, type RowComponentProps } from "react-window";
 import type { TraceSpan, TraceTreeNode } from "./types";
 import { formatDuration } from "./trace-utils";
 import { SpanRow } from "./SpanRow";
@@ -11,6 +11,29 @@ interface TraceWaterfallProps {
   selectedSpanId: string | null;
   onSelectSpan: (span: TraceSpan) => void;
   height: number;
+}
+
+interface TraceRowProps {
+  filteredNodes: TraceTreeNode[];
+  traceStartMs: number;
+  traceDurationMs: number;
+  selectedSpanId: string | null;
+  onSelectSpan: (span: TraceSpan) => void;
+}
+
+function TraceRow({ index, style, filteredNodes, traceStartMs, traceDurationMs, selectedSpanId, onSelectSpan }: RowComponentProps<TraceRowProps>) {
+  const node = filteredNodes[index];
+  return (
+    <div style={style}>
+      <SpanRow
+        node={node}
+        traceStartMs={traceStartMs}
+        traceDurationMs={traceDurationMs}
+        isSelected={selectedSpanId === node.span.span_id}
+        onClick={() => onSelectSpan(node.span)}
+      />
+    </div>
+  );
 }
 
 export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
@@ -34,24 +57,6 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
   }, [spans]);
 
   const ROW_HEIGHT = 32;
-
-  const Row = useCallback(
-    ({ index, style }: { index: number; style: React.CSSProperties }) => {
-      const node = filteredNodes[index];
-      return (
-        <div style={style}>
-          <SpanRow
-            node={node}
-            traceStartMs={traceStartMs}
-            traceDurationMs={traceDurationMs}
-            isSelected={selectedSpanId === node.span.span_id}
-            onClick={() => onSelectSpan(node.span)}
-          />
-        </div>
-      );
-    },
-    [filteredNodes, traceStartMs, traceDurationMs, selectedSpanId, onSelectSpan],
-  );
 
   if (filteredNodes.length === 0) {
     return (
@@ -84,13 +89,18 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
 
       {/* Virtualized span list */}
       <List
-        height={Math.max(height - 24, 100)}
-        itemCount={filteredNodes.length}
-        itemSize={ROW_HEIGHT}
-        width="100%"
-      >
-        {Row}
-      </List>
+        rowCount={filteredNodes.length}
+        rowHeight={ROW_HEIGHT}
+        rowComponent={TraceRow}
+        rowProps={{
+          filteredNodes,
+          traceStartMs,
+          traceDurationMs,
+          selectedSpanId,
+          onSelectSpan,
+        }}
+        style={{ width: "100%", height: Math.max(height - 24, 100) }}
+      />
     </div>
   );
 };

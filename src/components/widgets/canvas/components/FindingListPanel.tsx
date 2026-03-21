@@ -102,7 +102,7 @@ export function FindingListPanel({ data, size }: CanvasPanelComponentProps) {
               isCompact && "p-1.5",
             )}
           >
-            <div className="relative flex-shrink-0 mt-0.5">
+            <div className="relative shrink-0 mt-0.5">
               <Icon className={cn("h-4 w-4", config.classes)} />
               {config.shape === "diamond" && (
                 <div className="absolute -bottom-0.5 -right-0.5 w-1.5 h-1.5 bg-current rotate-45 opacity-60" />

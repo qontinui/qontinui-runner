@@ -85,7 +85,7 @@ export function CanvasSummary({ data }: CanvasSummaryProps) {
             return (
               <div
                 key={`${cell.status}-${i}`}
-                className={cn("w-2 h-2 rounded-sm", statusColors[cell.status] ?? "bg-gray-400")}
+                className={cn("w-2 h-2 rounded-xs", statusColors[cell.status] ?? "bg-gray-400")}
               />
             );
           })}
@@ -104,7 +104,7 @@ export function CanvasSummary({ data }: CanvasSummaryProps) {
             <div key={panel.panel_id} className="flex items-center gap-2 py-0.5">
               <Badge
                 className={cn(
-                  "text-[10px] px-1.5 py-0 font-mono border flex-shrink-0",
+                  "text-[10px] px-1.5 py-0 font-mono border shrink-0",
                   roseColors.bg,
                   roseColors.text,
                   roseColors.border,

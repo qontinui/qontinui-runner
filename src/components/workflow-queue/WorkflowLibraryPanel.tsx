@@ -77,7 +77,7 @@ export function WorkflowLibraryPanel({
             <button
               onClick={onSyncCommands}
               disabled={isSyncing}
-              className="p-2 rounded-lg bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 transition-colors flex-shrink-0"
+              className="p-2 rounded-lg bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 transition-colors shrink-0"
               title="Sync slash commands from disk"
             >
               <RefreshCw className={`w-4 h-4 ${isSyncing ? "animate-spin" : ""}`} />

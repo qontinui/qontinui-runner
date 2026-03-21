@@ -53,7 +53,7 @@ function CallRow({
       <StepStatusBadge status={call.status} iconOnly size="md" />
 
       {/* Tool name badge */}
-      <Badge className="text-xs flex-shrink-0 font-mono bg-indigo-500/10 text-indigo-500 border border-indigo-500/30">
+      <Badge className="text-xs shrink-0 font-mono bg-indigo-500/10 text-indigo-500 border border-indigo-500/30">
         {call.toolName}
       </Badge>
 
@@ -66,7 +66,7 @@ function CallRow({
       </div>
 
       {/* Duration and error indicator */}
-      <div className="flex items-center gap-2 flex-shrink-0">
+      <div className="flex items-center gap-2 shrink-0">
         {call.isError && (
           <Badge variant="danger" className="text-[10px]">
             Error
@@ -110,7 +110,7 @@ function CallDetail({ call }: { call: McpCallExecution | null }) {
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Call header */}
-      <div className="px-4 py-3 border-b border-border bg-muted/10 flex-shrink-0">
+      <div className="px-4 py-3 border-b border-border bg-muted/10 shrink-0">
         <div className="flex items-center gap-2">
           <Badge className="font-mono bg-indigo-500/10 text-indigo-500 border border-indigo-500/30">
             {call.toolName}
@@ -125,7 +125,7 @@ function CallDetail({ call }: { call: McpCallExecution | null }) {
 
       {/* Tabs for arguments/result */}
       <Tabs defaultValue="result" className="flex-1 flex flex-col overflow-hidden">
-        <TabsList className="px-4 pt-2 justify-start border-b border-border bg-transparent flex-shrink-0">
+        <TabsList className="px-4 pt-2 justify-start border-b border-border bg-transparent shrink-0">
           <TabsTrigger value="arguments" className="gap-1.5">
             <ArrowRight className="h-3.5 w-3.5" />
             Arguments
@@ -203,7 +203,7 @@ export function McpCallWidget({ isSummary, data, className }: McpCallWidgetProps
       <div className="flex-1 flex overflow-hidden">
         {/* Call list */}
         <div className="w-1/2 border-r border-border flex flex-col">
-          <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 flex-shrink-0">
+          <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 shrink-0">
             <h3 className="text-sm font-semibold text-foreground">MCP Calls</h3>
             <Badge variant="muted" className="text-xs">
               {data.calls.length}

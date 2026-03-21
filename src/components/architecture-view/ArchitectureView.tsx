@@ -77,7 +77,7 @@ export function ArchitectureView() {
   return (
     <div className="h-full flex flex-col overflow-hidden p-4 space-y-3">
       {/* Header */}
-      <div className="flex items-center justify-between flex-shrink-0">
+      <div className="flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2">
           <GitBranch className="w-5 h-5 text-blue-400" />
           <h2 className="text-lg font-semibold">Architecture Model</h2>
@@ -87,7 +87,7 @@ export function ArchitectureView() {
             onClick={() => setViewMode("reflection")}
             className={`px-2.5 py-1 text-xs rounded transition-colors ${
               viewMode === "reflection"
-                ? "bg-background text-foreground shadow-sm"
+                ? "bg-background text-foreground shadow-xs"
                 : "text-muted-foreground hover:text-foreground"
             }`}
           >
@@ -97,7 +97,7 @@ export function ArchitectureView() {
             onClick={() => setViewMode("sdk")}
             className={`px-2.5 py-1 text-xs rounded transition-colors ${
               viewMode === "sdk"
-                ? "bg-background text-foreground shadow-sm"
+                ? "bg-background text-foreground shadow-xs"
                 : "text-muted-foreground hover:text-foreground"
             }`}
           >
@@ -107,7 +107,7 @@ export function ArchitectureView() {
             onClick={() => setViewMode("developer")}
             className={`px-2.5 py-1 text-xs rounded transition-colors ${
               viewMode === "developer"
-                ? "bg-background text-foreground shadow-sm"
+                ? "bg-background text-foreground shadow-xs"
                 : "text-muted-foreground hover:text-foreground"
             }`}
           >
@@ -172,7 +172,7 @@ export function ArchitectureView() {
         <>
           {/* Stats bar */}
           {stats && hasData && (
-            <div className="flex gap-3 flex-shrink-0">
+            <div className="flex gap-3 shrink-0">
               <StatCard
                 icon={<Boxes className="w-4 h-4 text-blue-400" />}
                 label="Components"
@@ -224,7 +224,7 @@ export function ArchitectureView() {
 
                 {/* Detail panel */}
                 {selectedComponent && details && (
-                  <div className="w-72 flex-shrink-0 border border-border/50 rounded-lg overflow-hidden bg-card">
+                  <div className="w-72 shrink-0 border border-border/50 rounded-lg overflow-hidden bg-card">
                     <ComponentDetailPanel details={details} loading={detailsLoading} />
                   </div>
                 )}
@@ -430,7 +430,7 @@ function SdkArchitecturePanel({
     <div className="flex-1 min-h-0 flex flex-col gap-3">
       {/* Project selector */}
       {specs.length > 1 && (
-        <div className="flex-shrink-0">
+        <div className="shrink-0">
           <select
             value={clampedIndex}
             onChange={(e) => setSelectedProject(Number(e.target.value))}
@@ -446,7 +446,7 @@ function SdkArchitecturePanel({
       )}
 
       {/* Project info */}
-      <div className="flex gap-3 flex-shrink-0 flex-wrap">
+      <div className="flex gap-3 shrink-0 flex-wrap">
         <StatCard
           icon={<Boxes className="w-4 h-4 text-blue-400" />}
           label="Features"
@@ -568,7 +568,7 @@ function SdkArchitecturePanel({
 
         {/* Detail panel */}
         {selectedNode && (
-          <div className="w-72 flex-shrink-0 border border-border/50 rounded-lg overflow-auto bg-card">
+          <div className="w-72 shrink-0 border border-border/50 rounded-lg overflow-auto bg-card">
             <div className="flex items-center justify-between px-3 py-2 border-b border-border/50">
               <div className="flex items-center gap-1.5 min-w-0">
                 <span
@@ -723,7 +723,7 @@ function SdkArchitecturePanel({
         )}
 
         {/* Tech stack & directories */}
-        <div className="w-64 flex-shrink-0 border border-border/50 rounded-lg overflow-auto p-3">
+        <div className="w-64 shrink-0 border border-border/50 rounded-lg overflow-auto p-3">
           <h3 className="text-xs font-medium text-muted-foreground mb-2 uppercase tracking-wider">
             Tech Stack
           </h3>

@@ -49,7 +49,7 @@ function CommandConfig({ config, actionType, onChange }: CommandConfigProps) {
           onChange={(e) => onChange(actionType, { ...config, command: e.target.value })}
           placeholder="echo 'Hello World'"
           rows={3}
-          className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm font-mono resize-none focus:outline-none focus:ring-2 focus:ring-primary/50"
+          className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm font-mono resize-none focus:outline-hidden focus:ring-2 focus:ring-primary/50"
         />
         <p className="mt-1 text-xs text-muted-foreground">
           Supports variable substitution: {"{{task_name}}"}, {"{{iteration}}"}, {"{{status}}"}, etc.
@@ -70,7 +70,7 @@ function CommandConfig({ config, actionType, onChange }: CommandConfigProps) {
             })
           }
           placeholder="C:\path\to\directory"
-          className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+          className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
         />
       </div>
 
@@ -89,7 +89,7 @@ function CommandConfig({ config, actionType, onChange }: CommandConfigProps) {
           }
           min={1}
           max={600}
-          className="w-32 px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+          className="w-32 px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
         />
       </div>
 
@@ -114,7 +114,7 @@ function CommandConfig({ config, actionType, onChange }: CommandConfigProps) {
                   newEnv[key] = e.target.value;
                   onChange(actionType, { ...config, env: newEnv });
                 }}
-                className="flex-1 px-2 py-1 bg-background border border-border rounded text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/50"
+                className="flex-1 px-2 py-1 bg-background border border-border rounded text-sm font-mono focus:outline-hidden focus:ring-2 focus:ring-primary/50"
               />
               <button
                 onClick={() => {
@@ -134,14 +134,14 @@ function CommandConfig({ config, actionType, onChange }: CommandConfigProps) {
               value={newEnvKey}
               onChange={(e) => setNewEnvKey(e.target.value)}
               placeholder="KEY"
-              className="w-1/3 px-2 py-1 bg-background border border-border rounded text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/50"
+              className="w-1/3 px-2 py-1 bg-background border border-border rounded text-sm font-mono focus:outline-hidden focus:ring-2 focus:ring-primary/50"
             />
             <input
               type="text"
               value={newEnvValue}
               onChange={(e) => setNewEnvValue(e.target.value)}
               placeholder="value"
-              className="flex-1 px-2 py-1 bg-background border border-border rounded text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/50"
+              className="flex-1 px-2 py-1 bg-background border border-border rounded text-sm font-mono focus:outline-hidden focus:ring-2 focus:ring-primary/50"
             />
             <button
               onClick={() => {
@@ -184,7 +184,7 @@ function WebhookConfig({ config, actionType, onChange }: WebhookConfigProps) {
           <select
             value={config.method}
             onChange={(e) => onChange(actionType, { ...config, method: e.target.value })}
-            className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+            className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
           >
             {HTTP_METHODS.map((method) => (
               <option key={method} value={method}>
@@ -200,7 +200,7 @@ function WebhookConfig({ config, actionType, onChange }: WebhookConfigProps) {
             value={config.url}
             onChange={(e) => onChange(actionType, { ...config, url: e.target.value })}
             placeholder="https://api.example.com/webhook"
-            className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+            className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
           />
         </div>
       </div>
@@ -224,7 +224,7 @@ function WebhookConfig({ config, actionType, onChange }: WebhookConfigProps) {
                   newHeaders[key] = e.target.value;
                   onChange(actionType, { ...config, headers: newHeaders });
                 }}
-                className="flex-1 px-2 py-1 bg-background border border-border rounded text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                className="flex-1 px-2 py-1 bg-background border border-border rounded text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
               />
               <button
                 onClick={() => {
@@ -244,14 +244,14 @@ function WebhookConfig({ config, actionType, onChange }: WebhookConfigProps) {
               value={newHeaderKey}
               onChange={(e) => setNewHeaderKey(e.target.value)}
               placeholder="Header-Name"
-              className="w-1/3 px-2 py-1 bg-background border border-border rounded text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+              className="w-1/3 px-2 py-1 bg-background border border-border rounded text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
             />
             <input
               type="text"
               value={newHeaderValue}
               onChange={(e) => setNewHeaderValue(e.target.value)}
               placeholder="value"
-              className="flex-1 px-2 py-1 bg-background border border-border rounded text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+              className="flex-1 px-2 py-1 bg-background border border-border rounded text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
             />
             <button
               onClick={() => {
@@ -284,7 +284,7 @@ function WebhookConfig({ config, actionType, onChange }: WebhookConfigProps) {
           }
           placeholder='{"key": "{{task_name}}"}'
           rows={4}
-          className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm font-mono resize-none focus:outline-none focus:ring-2 focus:ring-primary/50"
+          className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm font-mono resize-none focus:outline-hidden focus:ring-2 focus:ring-primary/50"
         />
         <p className="mt-1 text-xs text-muted-foreground">
           Supports variable substitution in the body.
@@ -306,7 +306,7 @@ function WebhookConfig({ config, actionType, onChange }: WebhookConfigProps) {
           }
           min={1}
           max={300}
-          className="w-32 px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+          className="w-32 px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
         />
       </div>
     </div>
@@ -330,7 +330,7 @@ function LogConfig({
         <select
           value={config.level}
           onChange={(e) => onChange(actionType, { ...config, level: e.target.value })}
-          className="w-40 px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+          className="w-40 px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
         >
           {LOG_LEVELS.map((level) => (
             <option key={level} value={level}>
@@ -347,7 +347,7 @@ function LogConfig({
           onChange={(e) => onChange(actionType, { ...config, message: e.target.value })}
           placeholder="Task {{task_name}} completed with status: {{status}}"
           rows={3}
-          className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm resize-none focus:outline-none focus:ring-2 focus:ring-primary/50"
+          className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm resize-none focus:outline-hidden focus:ring-2 focus:ring-primary/50"
         />
         <p className="mt-1 text-xs text-muted-foreground">
           Available variables: {"{{task_run_id}}"}, {"{{task_name}}"}, {"{{iteration}}"},{" "}
@@ -377,7 +377,7 @@ function NotificationConfig({
           value={config.title}
           onChange={(e) => onChange(actionType, { ...config, title: e.target.value })}
           placeholder="Task {{task_name}} Complete"
-          className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+          className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
         />
       </div>
 
@@ -388,7 +388,7 @@ function NotificationConfig({
           onChange={(e) => onChange(actionType, { ...config, body: e.target.value })}
           placeholder="Completed after {{iteration}} iterations with status: {{status}}"
           rows={3}
-          className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm resize-none focus:outline-none focus:ring-2 focus:ring-primary/50"
+          className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm resize-none focus:outline-hidden focus:ring-2 focus:ring-primary/50"
         />
         <p className="mt-1 text-xs text-muted-foreground">Supports variable substitution.</p>
       </div>

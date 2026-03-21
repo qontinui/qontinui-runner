@@ -138,7 +138,7 @@ export function WaterfallPanel({ data, size }: CanvasPanelComponentProps) {
           <div key={`${entry.name}-${idx}`} className="flex items-center gap-2">
             {/* Step name */}
             <div
-              className={cn("truncate text-muted-foreground flex-shrink-0", fontSize)}
+              className={cn("truncate text-muted-foreground shrink-0", fontSize)}
               style={{ width: `${nameWidth}px` }}
               title={entry.name}
             >
@@ -148,7 +148,7 @@ export function WaterfallPanel({ data, size }: CanvasPanelComponentProps) {
             {/* Bar area */}
             <div className="flex-1 relative">
               <div
-                className={cn("rounded-sm relative", barHeight, isRunning && "animate-pulse")}
+                className={cn("rounded-xs relative", barHeight, isRunning && "animate-pulse")}
                 style={{
                   marginLeft: `${leftPct}%`,
                   width: `${Math.min(widthPct, 100 - leftPct)}%`,

@@ -75,9 +75,9 @@ function StepHistoryItem({
       )}
     >
       {entry.success ? (
-        <CheckCircle className="w-4 h-4 text-green-400 flex-shrink-0" />
+        <CheckCircle className="w-4 h-4 text-green-400 shrink-0" />
       ) : (
-        <XCircle className="w-4 h-4 text-red-400 flex-shrink-0" />
+        <XCircle className="w-4 h-4 text-red-400 shrink-0" />
       )}
       <div className="flex-1 min-w-0">
         <div className="text-foreground truncate">{entry.stepName}</div>

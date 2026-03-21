@@ -285,7 +285,7 @@ export function AiGenerateWorkflowModal({
               onChange={(e) => setDescription(e.target.value)}
               placeholder="Describe what you want the workflow to accomplish. For example: 'Run TypeScript type checking and fix any errors automatically' or 'Build a React app and run Playwright tests, fixing failures'"
               rows={4}
-              className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary resize-none"
+              className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary resize-none"
               disabled={isGenerating}
               autoFocus
             />
@@ -302,7 +302,7 @@ export function AiGenerateWorkflowModal({
                 value={category}
                 onChange={(e) => setCategory(e.target.value)}
                 placeholder="e.g., testing, deployment"
-                className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
                 disabled={isGenerating}
               />
             </div>
@@ -315,7 +315,7 @@ export function AiGenerateWorkflowModal({
                 value={tags}
                 onChange={(e) => setTags(e.target.value)}
                 placeholder="e.g., typescript, react"
-                className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
                 disabled={isGenerating}
               />
               <p className="text-xs text-muted-foreground mt-1">Comma-separated</p>
@@ -352,7 +352,7 @@ export function AiGenerateWorkflowModal({
                     <select
                       value={provider}
                       onChange={(e) => setProvider(e.target.value)}
-                      className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                      className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
                       disabled={isGenerating}
                     >
                       {AI_PROVIDERS.map((p) => (
@@ -371,7 +371,7 @@ export function AiGenerateWorkflowModal({
                       value={model}
                       onChange={(e) => setModel(e.target.value)}
                       placeholder="e.g., claude-3-opus, gpt-4"
-                      className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                      className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
                       disabled={isGenerating}
                     />
                   </div>
@@ -391,7 +391,7 @@ export function AiGenerateWorkflowModal({
                       onChange={(e) =>
                         setMaxIterations(e.target.value ? parseInt(e.target.value, 10) : "")
                       }
-                      className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                      className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
                       disabled={isGenerating}
                     />
                     <p className="text-xs text-muted-foreground mt-1">Agentic phase limit</p>
@@ -403,7 +403,7 @@ export function AiGenerateWorkflowModal({
                     <select
                       value={logSourceSelection}
                       onChange={(e) => setLogSourceSelection(e.target.value)}
-                      className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                      className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
                       disabled={isGenerating}
                     >
                       {LOG_SOURCE_OPTIONS.map((opt) => (
@@ -424,7 +424,7 @@ export function AiGenerateWorkflowModal({
                       onChange={(e) =>
                         setDiscoveryMode(e.target.value as "auto" | "enabled" | "disabled")
                       }
-                      className="px-2 py-1 bg-background border border-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-primary"
+                      className="px-2 py-1 bg-background border border-border rounded-md text-xs focus:outline-hidden focus:ring-2 focus:ring-primary"
                       disabled={isGenerating}
                     >
                       <option value="auto">Auto</option>
@@ -473,7 +473,7 @@ export function AiGenerateWorkflowModal({
           {/* Error Display */}
           {error && (
             <div className="flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/30 rounded-md">
-              <AlertCircle className="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" />
+              <AlertCircle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
               <div className="text-sm text-red-400">{error}</div>
             </div>
           )}
@@ -550,9 +550,9 @@ export function AiGenerateWorkflowModal({
                     {discoveryCalls.map((call) => (
                       <div key={call.tool_name} className="flex items-center gap-2">
                         {call.success ? (
-                          <Check className="w-3 h-3 text-green-500 flex-shrink-0" />
+                          <Check className="w-3 h-3 text-green-500 shrink-0" />
                         ) : (
-                          <X className="w-3 h-3 text-red-500 flex-shrink-0" />
+                          <X className="w-3 h-3 text-red-500 shrink-0" />
                         )}
                         <span>{call.tool_name}</span>
                         <span className="text-muted-foreground/60">{call.input_summary}</span>

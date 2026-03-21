@@ -168,7 +168,7 @@ export function StatisticsTab({ configId, configName }: StatisticsTabProps) {
 
       {/* Run Details Slide-out */}
       {selectedRun && (
-        <div className="w-96 border-l border-border bg-background shadow-lg flex-shrink-0">
+        <div className="w-96 border-l border-border bg-background shadow-lg shrink-0">
           <RunDetailsPanel run={selectedRun} onClose={() => setSelectedRun(null)} />
         </div>
       )}
@@ -192,7 +192,7 @@ function ViewModeToggle({ mode, onChange }: ViewModeToggleProps) {
         onClick={() => onChange("overview")}
         className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm transition-colors ${
           mode === "overview"
-            ? "bg-background shadow-sm text-foreground"
+            ? "bg-background shadow-xs text-foreground"
             : "text-muted-foreground hover:text-foreground"
         }`}
       >
@@ -203,7 +203,7 @@ function ViewModeToggle({ mode, onChange }: ViewModeToggleProps) {
         onClick={() => onChange("performance")}
         className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm transition-colors ${
           mode === "performance"
-            ? "bg-background shadow-sm text-foreground"
+            ? "bg-background shadow-xs text-foreground"
             : "text-muted-foreground hover:text-foreground"
         }`}
       >

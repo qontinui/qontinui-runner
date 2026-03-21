@@ -42,7 +42,7 @@ export function IterationComparisonPanel({ data, size }: CanvasPanelComponentPro
           <div key={iter.iteration} className="flex items-center gap-2">
             {/* Iteration label */}
             <div
-              className={cn("flex-shrink-0 text-muted-foreground font-mono", fontSize)}
+              className={cn("shrink-0 text-muted-foreground font-mono", fontSize)}
               style={{ width: `${labelWidth}px` }}
             >
               Iter {iter.iteration}
@@ -52,7 +52,7 @@ export function IterationComparisonPanel({ data, size }: CanvasPanelComponentPro
             <div className="flex-1 flex items-center gap-0">
               <div
                 className={cn(
-                  "flex rounded-sm overflow-hidden bg-muted",
+                  "flex rounded-xs overflow-hidden bg-muted",
                   barHeight,
                   allPassed && "ring-1 ring-green-500/30",
                 )}
@@ -82,7 +82,7 @@ export function IterationComparisonPanel({ data, size }: CanvasPanelComponentPro
             </div>
 
             {/* Count */}
-            <div className={cn("flex-shrink-0 font-mono text-muted-foreground", fontSize)}>
+            <div className={cn("shrink-0 font-mono text-muted-foreground", fontSize)}>
               <span className="text-green-500">{iter.passed}</span>
               <span className="mx-0.5">/</span>
               <span className={iter.failed > 0 ? "text-red-500" : "text-muted-foreground"}>
