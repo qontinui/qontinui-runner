@@ -292,8 +292,10 @@ pub fn resolve_working_directory(wd: &str) -> PathBuf {
 /// Controls whether `resolve_working_directory_scoped` allows paths outside
 /// a defined boundary. Inspired by open-swe's sandbox isolation pattern.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum PathScopePolicy {
     /// Current behavior: permissive fallback chain, warnings only.
+    #[default]
     Permissive,
     /// Must resolve within the workspace root directory.
     WorkspaceScoped,
@@ -301,11 +303,6 @@ pub enum PathScopePolicy {
     Strict(PathBuf),
 }
 
-impl Default for PathScopePolicy {
-    fn default() -> Self {
-        Self::Permissive
-    }
-}
 
 /// Resolve a working directory with scope policy enforcement.
 ///
@@ -346,10 +343,10 @@ fn check_path_containment(
     // Canonicalize both paths for reliable comparison.
     // If canonicalization fails (path doesn't exist yet), use the raw paths.
     let canonical_resolved = std::fs::canonicalize(resolved)
-        .map(|p| normalize_path_separators(p))
+        .map(normalize_path_separators)
         .unwrap_or_else(|_| resolved.to_path_buf());
     let canonical_boundary = std::fs::canonicalize(boundary)
-        .map(|p| normalize_path_separators(p))
+        .map(normalize_path_separators)
         .unwrap_or_else(|_| boundary.to_path_buf());
 
     let resolved_str = canonical_resolved.to_string_lossy().to_lowercase();

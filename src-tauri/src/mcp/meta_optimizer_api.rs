@@ -1224,8 +1224,10 @@ pub async fn get_iteration_history_handler(
                            WHERE iteration_history IS NOT NULL
                              AND iteration_history != '[]'"#,
                     );
+                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
                     if let Some(ref s) = status_filter {
-                        let _ = write!(sql, " AND status = '{}'", s.replace('\'', "''"));
+                        sql.push_str(" AND status = ?1");
+                        param_values.push(Box::new(s.clone()));
                     }
                     sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
 
@@ -1234,7 +1236,7 @@ pub async fn get_iteration_history_handler(
                         .map_err(|e| format!("Query error: {}", e))?;
 
                     let rows: Vec<(String, String)> = stmt
-                        .query_map([], |row| {
+                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
                             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                         })
                         .map_err(|e| format!("Query error: {}", e))?
@@ -1320,8 +1322,10 @@ pub async fn get_iteration_history_handler(
                            WHERE iteration_history IS NOT NULL
                              AND iteration_history != '[]'"#,
                     );
+                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
                     if let Some(ref s) = status_filter {
-                        let _ = write!(sql, " AND status = '{}'", s.replace('\'', "''"));
+                        sql.push_str(" AND status = ?1");
+                        param_values.push(Box::new(s.clone()));
                     }
                     sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
 
@@ -1330,7 +1334,7 @@ pub async fn get_iteration_history_handler(
                         .map_err(|e| format!("Query error: {}", e))?;
 
                     let rows: Vec<crate::meta_optimizer::types::IterationHistoryDetailL1> = stmt
-                        .query_map([], |row| {
+                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
                             let id: String = row.get(0)?;
                             let task_name: String = row.get(1)?;
                             let status: String = row.get(2)?;
@@ -1388,8 +1392,10 @@ pub async fn get_iteration_history_handler(
                            WHERE iteration_history IS NOT NULL
                              AND iteration_history != '[]'"#,
                     );
+                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
                     if let Some(ref s) = status_filter {
-                        let _ = write!(sql, " AND status = '{}'", s.replace('\'', "''"));
+                        sql.push_str(" AND status = ?1");
+                        param_values.push(Box::new(s.clone()));
                     }
                     sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
 
@@ -1398,7 +1404,7 @@ pub async fn get_iteration_history_handler(
                         .map_err(|e| format!("Query error: {}", e))?;
 
                     let rows: Vec<serde_json::Value> = stmt
-                        .query_map([], |row| {
+                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
                             let id: String = row.get(0)?;
                             let task_name: String = row.get(1)?;
                             let status: String = row.get(2)?;

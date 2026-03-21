@@ -469,7 +469,13 @@ class ExtractionExecutor:
             # Import using importlib to bypass qontinui root __init__ (which pulls in cv2, PIL, etc.)
             import importlib.util
 
-            _sm_pkg_path = Path(__file__).parent.parent.parent / "qontinui" / "src" / "qontinui" / "state_machine"
+            _sm_pkg_path = (
+                Path(__file__).parent.parent.parent
+                / "qontinui"
+                / "src"
+                / "qontinui"
+                / "state_machine"
+            )
 
             def _load_mod(name: str, file: str):
                 spec = importlib.util.spec_from_file_location(name, str(_sm_pkg_path / file))
@@ -480,7 +486,10 @@ class ExtractionExecutor:
 
             # Load fingerprint_types first (dependency), then the main module
             _ft_mod = _load_mod("qontinui.state_machine.fingerprint_types", "fingerprint_types.py")
-            _fd_mod = _load_mod("qontinui.state_machine.fingerprint_state_discovery", "fingerprint_state_discovery.py")
+            _fd_mod = _load_mod(
+                "qontinui.state_machine.fingerprint_state_discovery",
+                "fingerprint_state_discovery.py",
+            )
 
             FingerprintStateDiscovery = _fd_mod.FingerprintStateDiscovery
             FingerprintStateDiscoveryConfig = _fd_mod.FingerprintStateDiscoveryConfig
@@ -491,9 +500,7 @@ class ExtractionExecutor:
 
             user_config = params.get("config") or {}
             min_cooccurrence_rate = (
-                user_config.get("minCooccurrenceRate", 0.95)
-                if user_config
-                else 0.95
+                user_config.get("minCooccurrenceRate", 0.95) if user_config else 0.95
             )
 
             presence_matrix = cooccurrence_export.get("presenceMatrix", [])
@@ -567,7 +574,6 @@ class ExtractionExecutor:
         seen: set[str] = set()
 
         for t in raw_transitions:
-            target_fp = getattr(t, "target_fingerprint", "")
             action_type = getattr(t, "action_type", "click")
             before_fps = set(getattr(t, "before_fingerprints", []))
             after_fps = set(getattr(t, "after_fingerprints", []))
@@ -582,12 +588,14 @@ class ExtractionExecutor:
                     key = f"{from_state}->{to_state}"
                     if key not in seen:
                         seen.add(key)
-                        state_transitions.append({
-                            "fromStateId": from_state,
-                            "toStateId": to_state,
-                            "actionType": action_type,
-                            "count": 1,
-                        })
+                        state_transitions.append(
+                            {
+                                "fromStateId": from_state,
+                                "toStateId": to_state,
+                                "actionType": action_type,
+                                "count": 1,
+                            }
+                        )
 
         return state_transitions
 

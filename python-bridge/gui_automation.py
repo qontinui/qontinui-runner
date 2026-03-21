@@ -164,7 +164,7 @@ class GUIAutomation:
                 target_ref = elements[0].get("ref")
                 self.emit_log("info", f"Found element: {target_ref}")
 
-            # Perform the action
+            # Perform the action via UIA/CDP ref (fastest path)
             if action_type == "CLICK":
                 result = await service.click_ref(target_ref)
             elif action_type == "TYPE":
@@ -178,6 +178,24 @@ class GUIAutomation:
                 return False
 
             success = bool(result.get("success", False))
+
+            # Fallback: if ref-based action failed, try coordinate-based click
+            # using the element's bounds from the accessibility tree
+            if not success and action_type == "CLICK":
+                self.emit_log("info", "Ref-based click failed, falling back to coordinate click")
+                bounds = await service.get_element_bounds(target_ref)
+                if bounds and QONTINUI_AVAILABLE:
+                    cx = bounds["x"] + bounds["width"] // 2
+                    cy = bounds["y"] + bounds["height"] // 2
+                    self.emit_log("info", f"Coordinate fallback: clicking at ({cx}, {cy})")
+                    try:
+                        from qontinui import Location
+
+                        await self.action_executor.click_at(Location(cx, cy))
+                        success = True
+                    except Exception as coord_err:
+                        self.emit_log("debug", f"Coordinate fallback failed: {coord_err}")
+
             if success:
                 self.emit_log(
                     "info", f"Accessibility action {action_type} on {target_ref} succeeded"

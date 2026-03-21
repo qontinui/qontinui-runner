@@ -5,8 +5,9 @@ this resolver matches current elements to stored element properties using
 multi-strategy matching:
 
 1. Exact ID match (no remap needed)
-2. Semantic match: same role + accessible_name + tag_name
-3. Structural match: same role + position_zone + tag_name
+2. Automation ID match (UIA automation_id — most stable native identifier)
+3. Semantic match: same role + accessible_name + tag_name
+4. Structural match: same role + position_zone + tag_name
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ class ElementResolver:
         """Capture current element properties and store for future matching."""
         snapshots: dict[str, dict] = {}
         for elem in elements:
-            snapshots[elem.id] = {
+            snapshot: dict = {
                 "tag_name": elem.tag_name,
                 "role": elem.role,
                 "accessible_name": elem.accessible_name,
@@ -41,6 +42,11 @@ class ElementResolver:
                 "position_zone": self._compute_position_zone(elem.bounds),
                 "classes": elem.classes,
             }
+            # Include automation_id if available (UIA elements)
+            automation_id = getattr(elem, "automation_id", None)
+            if automation_id:
+                snapshot["automation_id"] = automation_id
+            snapshots[elem.id] = snapshot
         self._persistence.save_element_snapshots(snapshots)
 
     def build_remap(self, current_elements: list[ElementProxy]) -> dict[str, str]:
@@ -71,14 +77,21 @@ class ElementResolver:
                 claimed.add(old_id)
                 continue  # No remap needed
 
-            # Strategy 2: semantic match (role + accessible_name + tag_name)
+            # Strategy 2: automation_id match (most stable UIA identifier)
+            best = self._find_automation_id_match(props, current_elements, claimed)
+            if best:
+                remap[old_id] = best
+                claimed.add(best)
+                continue
+
+            # Strategy 3: semantic match (role + accessible_name + tag_name)
             best = self._find_semantic_match(props, current_elements, claimed)
             if best:
                 remap[old_id] = best
                 claimed.add(best)
                 continue
 
-            # Strategy 3: structural match (role + position_zone + tag_name)
+            # Strategy 4: structural match (role + position_zone + tag_name)
             best = self._find_structural_match(props, current_elements, claimed)
             if best:
                 remap[old_id] = best
@@ -112,6 +125,26 @@ class ElementResolver:
     # =========================================================================
     # Matching strategies
     # =========================================================================
+
+    def _find_automation_id_match(
+        self,
+        props: dict,
+        current_elements: list[ElementProxy],
+        claimed: set[str],
+    ) -> str | None:
+        """Find element with same automation_id (most stable UIA identifier)."""
+        auto_id = props.get("automation_id", "")
+        if not auto_id:
+            return None
+
+        for elem in current_elements:
+            if elem.id in claimed:
+                continue
+            elem_auto_id = getattr(elem, "automation_id", None) or ""
+            if elem_auto_id and elem_auto_id == auto_id:
+                return elem.id
+
+        return None
 
     def _find_semantic_match(
         self,
@@ -166,18 +199,40 @@ class ElementResolver:
         return None
 
     @staticmethod
-    def _compute_position_zone(bounds: dict) -> str:
-        """Derive a coarse position zone from element bounds."""
+    def _compute_position_zone(
+        bounds: dict,
+        screen_width: int = 1920,
+        screen_height: int = 1080,
+    ) -> str:
+        """Derive a coarse position zone from element bounds.
+
+        Pixel thresholds are approximate defaults calibrated for 1080p
+        (1920x1080) and scale proportionally to the supplied screen
+        dimensions.
+
+        Args:
+            bounds: Element bounding box with 'x' and 'y' keys.
+            screen_width: Screen width in pixels (default 1920 for 1080p).
+            screen_height: Screen height in pixels (default 1080 for 1080p).
+        """
         if not bounds:
             return "unknown"
         y = bounds.get("y", 0)
         x = bounds.get("x", 0)
-        if y < 80:
+
+        # Thresholds expressed as proportions of screen dimensions
+        # (original 1080p values: header<80, footer>800, sidebar-left<250, sidebar-right>1200)
+        header_threshold = int(80 * screen_height / 1080)
+        footer_threshold = int(800 * screen_height / 1080)
+        sidebar_left_threshold = int(250 * screen_width / 1920)
+        sidebar_right_threshold = int(1200 * screen_width / 1920)
+
+        if y < header_threshold:
             return "header"
-        elif y > 800:
+        elif y > footer_threshold:
             return "footer"
-        elif x < 250:
+        elif x < sidebar_left_threshold:
             return "sidebar-left"
-        elif x > 1200:
+        elif x > sidebar_right_threshold:
             return "sidebar-right"
         return "main"

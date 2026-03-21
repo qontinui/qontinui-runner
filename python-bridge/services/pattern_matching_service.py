@@ -8,6 +8,7 @@ Supports both find (best match) and find_all operations.
 import base64
 import io
 import logging
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -136,6 +137,8 @@ class PatternMatchingService:
         template: str,
         similarity: float = 0.8,
         search_region: dict[str, int] | None = None,
+        invariant: bool = False,
+        invariant_scales: list[float] | None = None,
     ) -> PatternMatchResponse:
         """Find the best match of template in screenshot.
 
@@ -144,6 +147,9 @@ class PatternMatchingService:
             template: Base64 encoded template image or file path
             similarity: Minimum similarity threshold (0.0 to 1.0)
             search_region: Optional region to search within {x, y, width, height}
+            invariant: If True, use scale-invariant matching (slower but
+                       handles DPI differences)
+            invariant_scales: Custom scale factors for invariant matching
 
         Returns:
             PatternMatchResponse with best match or empty matches list
@@ -154,6 +160,8 @@ class PatternMatchingService:
             similarity=similarity,
             search_region=search_region,
             find_all=False,
+            invariant=invariant,
+            invariant_scales=invariant_scales,
         )
 
     async def find_all(
@@ -163,6 +171,8 @@ class PatternMatchingService:
         similarity: float = 0.8,
         search_region: dict[str, int] | None = None,
         max_matches: int = 100,
+        invariant: bool = False,
+        invariant_scales: list[float] | None = None,
     ) -> PatternMatchResponse:
         """Find all matches of template in screenshot.
 
@@ -172,6 +182,8 @@ class PatternMatchingService:
             similarity: Minimum similarity threshold (0.0 to 1.0)
             search_region: Optional region to search within {x, y, width, height}
             max_matches: Maximum number of matches to return
+            invariant: If True, use scale-invariant matching
+            invariant_scales: Custom scale factors for invariant matching
 
         Returns:
             PatternMatchResponse with all matches
@@ -183,6 +195,8 @@ class PatternMatchingService:
             search_region=search_region,
             find_all=True,
             max_matches=max_matches,
+            invariant=invariant,
+            invariant_scales=invariant_scales,
         )
 
     async def _find_internal(
@@ -193,16 +207,20 @@ class PatternMatchingService:
         search_region: dict[str, int] | None,
         find_all: bool,
         max_matches: int = 100,
+        invariant: bool = False,
+        invariant_scales: list[float] | None = None,
     ) -> PatternMatchResponse:
         """Internal find implementation using OpenCV template matching.
 
         Uses OpenCV's matchTemplate directly for reliable results.
+        When *invariant* is True, delegates to the HAL's
+        ``find_template_invariant()`` for scale-aware matching.
         """
         start_time = time.time()
 
         try:
             # Load screenshot
-            if screenshot.startswith(("http://", "https://", "/", "C:", "D:")):
+            if screenshot.startswith(("http://", "https://")) or os.path.isabs(screenshot):
                 screenshot_img = self._load_image_from_path(screenshot)
                 if screenshot_img is None:
                     return PatternMatchResponse(
@@ -219,7 +237,7 @@ class PatternMatchingService:
                 screenshot_img = self._decode_base64_image(screenshot)
 
             # Load template
-            if template.startswith(("http://", "https://", "/", "C:", "D:")):
+            if template.startswith(("http://", "https://")) or os.path.isabs(template):
                 template_img = self._load_image_from_path(template)
                 if template_img is None:
                     return PatternMatchResponse(
@@ -262,9 +280,10 @@ class PatternMatchingService:
                         f"Search region ({w}x{h}) smaller than template ({template_width}x{template_height})"
                     )
 
-            # Check if template is larger than search area
+            # Check if template is larger than search area (skip for invariant
+            # matching which handles scale differences internally)
             search_h, search_w = search_img.shape[:2]
-            if template_width > search_w or template_height > search_h:
+            if not invariant and (template_width > search_w or template_height > search_h):
                 return PatternMatchResponse(
                     success=True,
                     matches=[],
@@ -276,49 +295,83 @@ class PatternMatchingService:
                     error=None,
                 )
 
-            # Perform template matching
-            result = cv2.matchTemplate(search_img, template_img, cv2.TM_CCOEFF_NORMED)
-
             matches: list[dict[str, Any]] = []
 
-            if find_all:
-                # Find all matches above threshold
-                locations = np.where(result >= similarity)
+            # Scale-invariant matching via HAL
+            if invariant:
+                try:
+                    from qontinui.hal.implementations.opencv_matcher import OpenCVMatcher
 
-                # Group nearby matches using non-maximum suppression
-                match_data = []
-                for pt in zip(*locations[::-1], strict=False):  # Switch to (x, y) format
-                    match_similarity = float(result[pt[1], pt[0]])
-                    match_data.append(
-                        {
-                            "x": int(pt[0] + offset_x),
-                            "y": int(pt[1] + offset_y),
-                            "width": template_width,
-                            "height": template_height,
-                            "similarity": match_similarity,
-                        }
+                    matcher = OpenCVMatcher()
+                    # Convert BGR numpy arrays to PIL for HAL interface
+                    haystack_pil = PILImage.fromarray(cv2.cvtColor(search_img, cv2.COLOR_BGR2RGB))
+                    needle_pil = PILImage.fromarray(cv2.cvtColor(template_img, cv2.COLOR_BGR2RGB))
+                    hal_match = matcher.find_template_invariant(
+                        haystack=haystack_pil,
+                        needle=needle_pil,
+                        scales=invariant_scales,
+                        confidence=similarity,
                     )
-
-                # Apply NMS to remove overlapping matches
-                matches = self._apply_nms(match_data, iou_threshold=0.5)
-
-                # Sort by similarity (descending) and limit
-                matches.sort(key=lambda m: m["similarity"], reverse=True)
-                matches = matches[:max_matches]
-            else:
-                # Find single best match
-                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-
-                if max_val >= similarity:
-                    matches.append(
-                        {
-                            "x": int(max_loc[0] + offset_x),
-                            "y": int(max_loc[1] + offset_y),
-                            "width": template_width,
-                            "height": template_height,
-                            "similarity": float(max_val),
-                        }
+                    if hal_match is not None:
+                        matches.append(
+                            {
+                                "x": int(hal_match.x + offset_x),
+                                "y": int(hal_match.y + offset_y),
+                                "width": hal_match.width,
+                                "height": hal_match.height,
+                                "similarity": hal_match.confidence,
+                            }
+                        )
+                except ImportError:
+                    logger.warning(
+                        "Invariant matching requested but qontinui HAL unavailable, "
+                        "falling back to standard matching"
                     )
+                    invariant = False
+
+            # Standard template matching
+            if not invariant:
+                result = cv2.matchTemplate(search_img, template_img, cv2.TM_CCOEFF_NORMED)
+
+            if not invariant:
+                if find_all:
+                    # Find all matches above threshold
+                    locations = np.where(result >= similarity)
+
+                    # Group nearby matches using non-maximum suppression
+                    match_data = []
+                    for pt in zip(*locations[::-1], strict=False):  # Switch to (x, y) format
+                        match_similarity = float(result[pt[1], pt[0]])
+                        match_data.append(
+                            {
+                                "x": int(pt[0] + offset_x),
+                                "y": int(pt[1] + offset_y),
+                                "width": template_width,
+                                "height": template_height,
+                                "similarity": match_similarity,
+                            }
+                        )
+
+                    # Apply NMS to remove overlapping matches
+                    matches = self._apply_nms(match_data, iou_threshold=0.5)
+
+                    # Sort by similarity (descending) and limit
+                    matches.sort(key=lambda m: m["similarity"], reverse=True)
+                    matches = matches[:max_matches]
+                else:
+                    # Find single best match
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+
+                    if max_val >= similarity:
+                        matches.append(
+                            {
+                                "x": int(max_loc[0] + offset_x),
+                                "y": int(max_loc[1] + offset_y),
+                                "width": template_width,
+                                "height": template_height,
+                                "similarity": float(max_val),
+                            }
+                        )
 
             # Add center coordinates
             for match in matches:

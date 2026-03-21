@@ -47,8 +47,10 @@ pub struct IterationCommit {
 /// Policy for automatic git rollback on workflow failure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RollbackPolicy {
     /// Do nothing on failure (current behavior, default).
+    #[default]
     None,
     /// Revert to the commit of the last iteration where verification improved.
     LastGood,
@@ -56,11 +58,6 @@ pub enum RollbackPolicy {
     Clean,
 }
 
-impl Default for RollbackPolicy {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 impl RollbackPolicy {
     pub fn from_str(s: &str) -> Self {
@@ -460,7 +457,7 @@ impl LoopConfig {
                 // Use step name prefix (before first ':' or '_') as a concern proxy
                 if let Some(ref name) = step.name {
                     let concern = name
-                        .split(|c: char| c == ':' || c == '_' || c == ' ')
+                        .split([':', '_', ' '])
                         .next()
                         .unwrap_or(name)
                         .to_lowercase();

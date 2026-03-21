@@ -115,8 +115,27 @@ impl StepHandler for ShellCommandHandler {
         };
 
         let step_name = step.name.as_deref().unwrap_or("Shell Command");
-        let working_directory = step.shell_command_working_directory.clone();
         let fail_on_error = step.shell_command_fail_on_error.unwrap_or(true);
+
+        // Resolve working directory using scoped policy from context.
+        // This is done here (in execute) where HandlerContext is available,
+        // before passing to run_command which is a static helper without context.
+        let working_directory = match step.shell_command_working_directory.as_deref() {
+            Some(wd) => {
+                match crate::paths::resolve_working_directory_scoped(wd, &context.path_scope_policy)
+                {
+                    Ok(resolved) => Some(resolved.to_string_lossy().to_string()),
+                    Err(e) => {
+                        warn!("Shell command '{}': {}", step_name, e);
+                        return StepHandlerResult::failure(format!(
+                            "Working directory scope violation: {}",
+                            e
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
         let timeout_secs = step.timeout_seconds;
 
         // Detect shell type: PowerShell > bash > cmd (on Windows)
@@ -501,8 +520,9 @@ impl ShellCommandHandler {
 
     /// Truncate a string for display purposes.
     fn truncate_for_display(s: &str, max_len: usize) -> String {
-        if s.len() > max_len {
-            format!("{}...", &s[..max_len])
+        if s.chars().count() > max_len {
+            let truncated: String = s.chars().take(max_len).collect();
+            format!("{}...", truncated)
         } else {
             s.to_string()
         }
@@ -568,7 +588,9 @@ impl ShellCommandHandler {
             c
         };
 
-        // Set working directory if specified (resolve relative paths against workspace root)
+        // Set working directory if specified.
+        // Note: scoped path resolution is done in execute() before calling run_command(),
+        // so the working_directory passed here is already resolved and validated.
         if let Some(wd) = working_directory {
             let resolved = crate::paths::resolve_working_directory(wd);
             if !resolved.exists() {

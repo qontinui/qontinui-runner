@@ -190,17 +190,27 @@ impl StepHandler for CheckHandler {
         };
 
         // Set working directory if specified (resolve relative paths against workspace root)
+        // Uses the path scope policy from the handler context for boundary enforcement.
         if let Some(ref wd) = working_directory {
-            let resolved = crate::paths::resolve_working_directory(wd);
-            if !resolved.exists() {
-                warn!(
-                    "Check '{}': working directory does not exist: {} (resolved from '{}')",
-                    step_name,
-                    resolved.display(),
-                    wd
-                );
+            match crate::paths::resolve_working_directory_scoped(wd, &context.path_scope_policy) {
+                Ok(resolved) => {
+                    if !resolved.exists() {
+                        warn!(
+                            "Check '{}': working directory does not exist: {} (resolved from '{}')",
+                            step_name,
+                            resolved.display(),
+                            wd
+                        );
+                    }
+                    cmd.current_dir(&resolved);
+                }
+                Err(e) => {
+                    warn!("Check '{}': {}", step_name, e);
+                    return StepHandlerResult::failure(
+                        format!("Working directory scope violation: {}", e),
+                    );
+                }
             }
-            cmd.current_dir(&resolved);
         }
 
         // Capture stdout and stderr

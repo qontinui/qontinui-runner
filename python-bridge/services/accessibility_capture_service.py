@@ -322,6 +322,46 @@ class AccessibilityCaptureService:
             "element": node.model_dump(),
         }
 
+    async def get_element_bounds(self, ref: str) -> dict[str, int] | None:
+        """Get the bounding rectangle of an element by its ref.
+
+        Used as a fallback for coordinate-based interaction when ref-based
+        actions (click_by_ref) fail.
+
+        Args:
+            ref: Reference ID (e.g., "@e3")
+
+        Returns:
+            Dict with x, y, width, height keys, or None if not found.
+        """
+        if not self._capture or not self._is_connected:
+            return None
+
+        try:
+            node = await self._capture.get_node_by_ref(ref)
+            if not node or not node.bounds:
+                return None
+
+            bounds = node.bounds
+            if hasattr(bounds, "x"):
+                return {
+                    "x": bounds.x,
+                    "y": bounds.y,
+                    "width": bounds.width,
+                    "height": bounds.height,
+                }
+            elif isinstance(bounds, (list, tuple)) and len(bounds) >= 4:
+                return {
+                    "x": int(bounds[0]),
+                    "y": int(bounds[1]),
+                    "width": int(bounds[2]),
+                    "height": int(bounds[3]),
+                }
+        except Exception as e:
+            logger.debug(f"Failed to get bounds for ref {ref}: {e}")
+
+        return None
+
     def get_current_snapshot(self) -> dict[str, Any]:
         """Get the current cached snapshot.
 

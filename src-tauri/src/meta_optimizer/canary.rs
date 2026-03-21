@@ -49,6 +49,21 @@ pub struct CanaryEvaluation {
     pub canary_success_rate: f64,
     pub delta: f64,
     pub min_runs_met: bool,
+    /// One-sided p-value (H₁: canary > baseline). None if insufficient data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p_value: Option<f64>,
+    /// 95% confidence interval for the success rate difference (canary - baseline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_interval: Option<(f64, f64)>,
+    /// Cohen's h effect size for the success rate difference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_size: Option<f64>,
+    /// Percentage change in average cost (canary vs baseline). Positive = more expensive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_delta_pct: Option<f64>,
+    /// Percentage change in average duration (canary vs baseline). Positive = slower.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_delta_pct: Option<f64>,
 }
 
 /// Start a canary rollout for a recommendation.
@@ -257,6 +272,9 @@ pub fn record_canary_run(
 }
 
 /// Evaluate a canary: should it be promoted, rolled back, or continue?
+///
+/// Uses statistical tests (proportion z-test, confidence intervals, effect size)
+/// instead of simple threshold-based verdicts.
 pub fn evaluate_canary(db: &CheckpointDb, canary_id: &str) -> Result<CanaryEvaluation, String> {
     let canary_id = canary_id.to_string();
 
@@ -275,8 +293,8 @@ pub fn evaluate_canary(db: &CheckpointDb, canary_id: &str) -> Result<CanaryEvalu
         let min_runs = 20;
         let min_runs_met = canary_count >= min_runs;
 
-        let baseline_total = baseline.success_count + baseline.failure_count;
-        let canary_total = canary.success_count + canary.failure_count;
+        let baseline_total = (baseline.success_count + baseline.failure_count) as u64;
+        let canary_total = (canary.success_count + canary.failure_count) as u64;
 
         let baseline_sr = if baseline_total > 0 {
             baseline.success_count as f64 / baseline_total as f64 * 100.0
@@ -291,14 +309,98 @@ pub fn evaluate_canary(db: &CheckpointDb, canary_id: &str) -> Result<CanaryEvalu
 
         let delta = canary_sr - baseline_sr;
 
+        // Statistical analysis (requires at least 2 runs per group)
+        let (p_value, confidence_interval, effect_size) =
+            if baseline_total >= 2 && canary_total >= 2 {
+                let b_succ = baseline.success_count as u64;
+                let c_succ = canary.success_count as u64;
+
+                // One-sided p-value: is canary better than baseline?
+                let p = crate::stats::proportion_z_test_onesided(
+                    c_succ,
+                    canary_total,
+                    b_succ,
+                    baseline_total,
+                );
+
+                // 95% CI for the difference (canary - baseline) in proportions
+                let ci = crate::stats::proportion_diff_ci(
+                    c_succ,
+                    canary_total,
+                    b_succ,
+                    baseline_total,
+                    0.95,
+                );
+                // Convert to percentage points
+                let ci_pp = (ci.0 * 100.0, ci.1 * 100.0);
+
+                // Effect size (Cohen's h)
+                let b_prop = b_succ as f64 / baseline_total as f64;
+                let c_prop = c_succ as f64 / canary_total as f64;
+                let h = crate::stats::cohens_h(c_prop, b_prop);
+
+                (Some(p), Some(ci_pp), Some(h))
+            } else {
+                (None, None, None)
+            };
+
+        // Cost and duration deltas
+        let cost_delta_pct = if baseline_total > 0 && canary_total > 0 {
+            let baseline_avg_cost = baseline.total_cost_usd / baseline_total as f64;
+            let canary_avg_cost = canary.total_cost_usd / canary_total as f64;
+            if baseline_avg_cost > 0.0 {
+                Some((canary_avg_cost - baseline_avg_cost) / baseline_avg_cost * 100.0)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let duration_delta_pct = if baseline_total > 0 && canary_total > 0 {
+            let baseline_avg_dur = baseline.total_duration_ms / baseline_total as f64;
+            let canary_avg_dur = canary.total_duration_ms / canary_total as f64;
+            if baseline_avg_dur > 0.0 {
+                Some((canary_avg_dur - baseline_avg_dur) / baseline_avg_dur * 100.0)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Verdict using statistical significance
         let verdict = if !min_runs_met {
             "continue"
-        } else if delta < -5.0 {
-            "rollback"
-        } else if delta > -2.0 {
-            "promote"
+        } else if let Some(p) = p_value {
+            // Check for regression: is baseline significantly better than canary?
+            let p_regression = crate::stats::proportion_z_test_onesided(
+                baseline.success_count as u64,
+                baseline_total,
+                canary.success_count as u64,
+                canary_total,
+            );
+
+            if p_regression < 0.05 && delta < -3.0 {
+                // Statistically significant regression with meaningful delta
+                "rollback"
+            } else if p < 0.05 || (delta > -2.0 && confidence_interval.is_some_and(|ci| ci.0 > -5.0))
+            {
+                // Either canary is significantly better, or at worst not meaningfully worse
+                // (CI lower bound above -5pp)
+                "promote"
+            } else {
+                "continue"
+            }
         } else {
-            "continue"
+            // Fallback to simple thresholds when stats unavailable
+            if delta < -5.0 {
+                "rollback"
+            } else if delta > -2.0 {
+                "promote"
+            } else {
+                "continue"
+            }
         };
 
         Ok(CanaryEvaluation {
@@ -307,6 +409,11 @@ pub fn evaluate_canary(db: &CheckpointDb, canary_id: &str) -> Result<CanaryEvalu
             canary_success_rate: canary_sr,
             delta,
             min_runs_met,
+            p_value,
+            confidence_interval,
+            effect_size,
+            cost_delta_pct,
+            duration_delta_pct,
         })
     })
 }

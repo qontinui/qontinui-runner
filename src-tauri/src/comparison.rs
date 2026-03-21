@@ -126,6 +126,160 @@ pub struct ComparisonRecommendation {
 }
 
 // =============================================================================
+// Structured comparison report (machine-readable metrics alongside prose)
+// =============================================================================
+
+/// Structured comparison output with statistical analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuredComparisonReport {
+    /// Per-metric deltas across all entries.
+    pub metric_deltas: Vec<MetricDelta>,
+    /// Cost per entry (label, cost_usd).
+    pub cost_breakdown: Vec<(String, f64)>,
+    /// Winning variant (if any).
+    pub winner: Option<String>,
+    /// Confidence in the winner (0.0–1.0).
+    pub confidence: f64,
+    /// P-value for success rate difference (if ≥2 entries with ≥2 runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p_value: Option<f64>,
+}
+
+/// A single metric compared across variants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricDelta {
+    /// Metric name (e.g., "success_rate", "iterations", "duration_ms").
+    pub name: String,
+    /// (variant_label, value) pairs.
+    pub values: Vec<(String, f64)>,
+    /// Best variant for this metric.
+    pub best: String,
+    /// Delta between best and worst as a percentage.
+    pub delta_pct: f64,
+}
+
+/// Build a structured comparison report from completed entries.
+pub fn build_structured_report(entries: &[ComparisonEntry]) -> Option<StructuredComparisonReport> {
+    let completed: Vec<&ComparisonEntry> = entries
+        .iter()
+        .filter(|e| e.result.is_some())
+        .collect();
+
+    if completed.len() < 2 {
+        return None;
+    }
+
+    let labels: Vec<String> = completed.iter().map(|e| e.branch_name.clone()).collect();
+    let results: Vec<&ComparisonEntryResult> = completed.iter().map(|e| e.result.as_ref().unwrap()).collect();
+
+    // Success rate metric
+    let success_values: Vec<(String, f64)> = labels
+        .iter()
+        .zip(results.iter())
+        .map(|(l, r)| (l.clone(), if r.success { 1.0 } else { 0.0 }))
+        .collect();
+    let best_success = success_values
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(l, _)| l.clone())
+        .unwrap_or_default();
+
+    // Iterations metric (lower is better)
+    let iter_values: Vec<(String, f64)> = labels
+        .iter()
+        .zip(results.iter())
+        .map(|(l, r)| (l.clone(), r.iterations as f64))
+        .collect();
+    let best_iter = iter_values
+        .iter()
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(l, _)| l.clone())
+        .unwrap_or_default();
+
+    // Duration metric (lower is better)
+    let dur_values: Vec<(String, f64)> = labels
+        .iter()
+        .zip(results.iter())
+        .map(|(l, r)| (l.clone(), r.duration_ms as f64))
+        .collect();
+    let best_dur = dur_values
+        .iter()
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(l, _)| l.clone())
+        .unwrap_or_default();
+
+    // Files changed metric
+    let files_values: Vec<(String, f64)> = labels
+        .iter()
+        .zip(results.iter())
+        .map(|(l, r)| (l.clone(), r.files_changed as f64))
+        .collect();
+    let best_files = files_values
+        .iter()
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(l, _)| l.clone())
+        .unwrap_or_default();
+
+    let metric_deltas = vec![
+        build_metric_delta("success_rate", success_values, &best_success),
+        build_metric_delta("iterations", iter_values, &best_iter),
+        build_metric_delta("duration_ms", dur_values, &best_dur),
+        build_metric_delta("files_changed", files_values, &best_files),
+    ];
+
+    // Winner: variant with most "best" wins, tie-broken by success
+    let mut win_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for md in &metric_deltas {
+        *win_counts.entry(&md.best).or_default() += 1;
+    }
+    let winner = win_counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(label, _)| label.to_string());
+
+    // Confidence: proportion of metrics won by the winner
+    let winner_wins = metric_deltas
+        .iter()
+        .filter(|md| winner.as_deref() == Some(&md.best))
+        .count();
+    let confidence = winner_wins as f64 / metric_deltas.len() as f64;
+
+    // Cost breakdown (use duration as proxy since we don't have direct cost per entry)
+    let cost_breakdown: Vec<(String, f64)> = labels
+        .iter()
+        .zip(results.iter())
+        .map(|(l, r)| (l.clone(), r.duration_ms as f64 / 1000.0)) // duration as cost proxy
+        .collect();
+
+    Some(StructuredComparisonReport {
+        metric_deltas,
+        cost_breakdown,
+        winner,
+        confidence,
+        p_value: None, // Requires multiple trials per variant (future: aggregate from autoresearch)
+    })
+}
+
+fn build_metric_delta(name: &str, values: Vec<(String, f64)>, best: &str) -> MetricDelta {
+    let max_val = values.iter().map(|(_, v)| *v).fold(f64::NEG_INFINITY, f64::max);
+    let min_val = values.iter().map(|(_, v)| *v).fold(f64::INFINITY, f64::min);
+    let delta_pct = if min_val.abs() > f64::EPSILON {
+        ((max_val - min_val) / min_val.abs()) * 100.0
+    } else if max_val.abs() > f64::EPSILON {
+        100.0
+    } else {
+        0.0
+    };
+
+    MetricDelta {
+        name: name.to_string(),
+        values,
+        best: best.to_string(),
+        delta_pct,
+    }
+}
+
+// =============================================================================
 // Coordinator
 // =============================================================================
 

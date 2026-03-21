@@ -547,6 +547,11 @@ fn run_claude_session_inline(
         None
     };
 
+    // Shared token usage buffer — survives stdout thread join timeout
+    let shared_usage: Arc<std::sync::Mutex<Option<(u64, u64)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let shared_usage_for_thread = shared_usage.clone();
+
     let stdout_handle = thread::spawn(move || {
         let mut all_text = String::new();
         // Create finding parser if we have a finding context
@@ -594,6 +599,10 @@ fn run_claude_session_inline(
                 if session_usage.is_none() {
                     if let Some(usage) = extract_usage_from_stream_json(&line) {
                         session_usage = Some(usage);
+                        // Sync to shared buffer so usage survives thread join timeout
+                        if let Ok(mut shared) = shared_usage_for_thread.lock() {
+                            *shared = Some(usage);
+                        }
                     }
                 }
 
@@ -1593,7 +1602,9 @@ fn run_claude_session_inline(
     let (all_output, cli_token_usage) = {
         let (join_tx, join_rx) = mpsc::channel::<(String, Option<(u64, u64)>)>();
         let _ = thread::spawn(move || {
-            let result = stdout_handle.join().unwrap_or_default();
+            let result = stdout_handle
+                .join()
+                .unwrap_or_else(|_| (String::new(), None));
             let _ = join_tx.send(result);
         });
         match join_rx.recv_timeout(Duration::from_secs(10)) {
@@ -1604,12 +1615,13 @@ fn run_claude_session_inline(
                      Child process likely holding pipe handle. Using buffered output.",
                     session_id
                 );
-                // Fall back to the shared buffer which was synced periodically
+                // Fall back to the shared buffers which were synced periodically
                 let text = shared_output_buf
                     .lock()
                     .map(|s| s.clone())
                     .unwrap_or_default();
-                (text, None)
+                let usage = shared_usage.lock().ok().and_then(|u| *u);
+                (text, usage)
             }
         }
     };

@@ -5,7 +5,7 @@
 //! verification results, knowledge, screenshots, and more.
 
 use axum::{extract::State, http::StatusCode, response::sse::Sse, response::Json};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 

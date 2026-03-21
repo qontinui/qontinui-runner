@@ -6,8 +6,46 @@
 use rusqlite::{params, Connection};
 use tracing::debug;
 
-use crate::autoresearch::agentic_verification::PipelineAgentTrace;
+use crate::autoresearch::agentic_verification::{GuardrailResult, HandoffContext, PipelineAgentTrace};
 use crate::database::CheckpointDb;
+
+/// Parse a PipelineAgentTrace from a database row.
+/// Expected column order: agent_type(0), agent_id(1), run_id(2),
+/// input_snapshot(3), output_snapshot(4), config_json(5),
+/// duration_ms(6), tokens_in(7), tokens_out(8), cost_usd(9),
+/// downstream_success(10), output_quality_score(11),
+/// parent_span_id(12), span_type(13),
+/// guardrail_results_json(14), handoff_context_json(15).
+fn trace_from_row(row: &rusqlite::Row) -> rusqlite::Result<PipelineAgentTrace> {
+    let config_json: String = row.get(5)?;
+    let input_json: String = row.get(3)?;
+    let output_json: String = row.get(4)?;
+    let downstream_success: Option<i32> = row.get(10)?;
+    let guardrail_json: Option<String> = row.get(14)?;
+    let handoff_json: Option<String> = row.get(15)?;
+
+    Ok(PipelineAgentTrace {
+        agent_type: row.get(0)?,
+        agent_id: row.get(1)?,
+        run_id: row.get(2)?,
+        input_snapshot: serde_json::from_str(&input_json).unwrap_or_default(),
+        output_snapshot: serde_json::from_str(&output_json).unwrap_or_default(),
+        config: serde_json::from_str(&config_json).unwrap_or_default(),
+        duration_ms: row.get::<_, i64>(6)? as u64,
+        tokens_in: row.get::<_, i64>(7)? as u32,
+        tokens_out: row.get::<_, i64>(8)? as u32,
+        cost_usd: row.get(9)?,
+        downstream_success: downstream_success.map(|v| v != 0),
+        output_quality_score: row.get(11)?,
+        parent_span_id: row.get(12)?,
+        span_type: row.get::<_, Option<String>>(13)?.unwrap_or_else(|| "agent".to_string()),
+        guardrail_results: guardrail_json
+            .and_then(|j| serde_json::from_str::<Vec<GuardrailResult>>(&j).ok())
+            .unwrap_or_default(),
+        handoff_received: handoff_json
+            .and_then(|j| serde_json::from_str::<HandoffContext>(&j).ok()),
+    })
+}
 
 /// Save a batch of pipeline agent traces from a completed pipeline run.
 pub fn save_pipeline_agent_traces(
@@ -319,34 +357,14 @@ pub fn get_trace_full_l2(
             r#"SELECT agent_type, agent_id, run_id,
                       input_snapshot, output_snapshot, config_json,
                       duration_ms, tokens_in, tokens_out, cost_usd,
-                      downstream_success, output_quality_score
+                      downstream_success, output_quality_score,
+                      parent_span_id, span_type,
+                      guardrail_results_json, handoff_context_json
                FROM pipeline_agent_traces
                WHERE id = ?1"#,
             params![trace_id],
             |row| {
-                let config_json: String = row.get(5)?;
-                let input_json: String = row.get(3)?;
-                let output_json: String = row.get(4)?;
-                let downstream_success: Option<i32> = row.get(10)?;
-
-                Ok(PipelineAgentTrace {
-                    agent_type: row.get(0)?,
-                    agent_id: row.get(1)?,
-                    run_id: row.get(2)?,
-                    input_snapshot: serde_json::from_str(&input_json).unwrap_or_default(),
-                    output_snapshot: serde_json::from_str(&output_json).unwrap_or_default(),
-                    config: serde_json::from_str(&config_json).unwrap_or_default(),
-                    duration_ms: row.get::<_, i64>(6)? as u64,
-                    tokens_in: row.get::<_, i64>(7)? as u32,
-                    tokens_out: row.get::<_, i64>(8)? as u32,
-                    cost_usd: row.get(9)?,
-                    downstream_success: downstream_success.map(|v| v != 0),
-                    output_quality_score: row.get(11)?,
-                    parent_span_id: None,
-                    span_type: "agent".to_string(),
-                    guardrail_results: vec![],
-                    handoff_received: None,
-                })
+                Ok(trace_from_row(row)?)
             },
         );
 
@@ -372,7 +390,9 @@ pub fn get_traces_for_task_run(
                 r#"SELECT agent_type, agent_id, run_id,
                           input_snapshot, output_snapshot, config_json,
                           duration_ms, tokens_in, tokens_out, cost_usd,
-                          downstream_success, output_quality_score
+                          downstream_success, output_quality_score,
+                          parent_span_id, span_type,
+                          guardrail_results_json, handoff_context_json
                    FROM pipeline_agent_traces
                    WHERE task_run_id = ?1
                    ORDER BY created_at ASC"#,
@@ -381,29 +401,7 @@ pub fn get_traces_for_task_run(
 
         let results = stmt
             .query_map(params![task_run_id], |row| {
-                let config_json: String = row.get(5)?;
-                let input_json: String = row.get(3)?;
-                let output_json: String = row.get(4)?;
-                let downstream_success: Option<i32> = row.get(10)?;
-
-                Ok(PipelineAgentTrace {
-                    agent_type: row.get(0)?,
-                    agent_id: row.get(1)?,
-                    run_id: row.get(2)?,
-                    input_snapshot: serde_json::from_str(&input_json).unwrap_or_default(),
-                    output_snapshot: serde_json::from_str(&output_json).unwrap_or_default(),
-                    config: serde_json::from_str(&config_json).unwrap_or_default(),
-                    duration_ms: row.get::<_, i64>(6)? as u64,
-                    tokens_in: row.get::<_, i64>(7)? as u32,
-                    tokens_out: row.get::<_, i64>(8)? as u32,
-                    cost_usd: row.get(9)?,
-                    downstream_success: downstream_success.map(|v| v != 0),
-                    output_quality_score: row.get(11)?,
-                    parent_span_id: None,
-                    span_type: "agent".to_string(),
-                    guardrail_results: vec![],
-                    handoff_received: None,
-                })
+                Ok(trace_from_row(row)?)
             })
             .map_err(|e| format!("Failed to query traces: {}", e))?
             .filter_map(|r| r.ok())

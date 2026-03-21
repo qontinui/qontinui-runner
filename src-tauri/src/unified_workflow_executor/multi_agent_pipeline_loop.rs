@@ -763,7 +763,7 @@ Only output the JSON array, nothing else."#,
                     }
 
                     // Build structured handoff context: locator → implementer
-                    let implementer_handoff = crate::autoresearch::agentic_verification::HandoffContext {
+                    let mut implementer_handoff = crate::autoresearch::agentic_verification::HandoffContext {
                         from_agent: "locator".to_string(),
                         to_agent: "implementer".to_string(),
                         payload: serde_json::json!({
@@ -776,8 +776,18 @@ Only output the JSON array, nothing else."#,
                                 .collect::<Vec<_>>(),
                         }),
                         forwarded_items: vec![],
-                        validated: true,
+                        validated: false,
                     };
+
+                    // Guardrail: validate handoff payload before passing to implementer
+                    let handoff_check = crate::autoresearch::agentic_verification::guardrail_handoff_payload_present(&implementer_handoff);
+                    implementer_handoff.validated = !handoff_check.tripwire_triggered;
+                    if handoff_check.tripwire_triggered {
+                        warn!(
+                            "MULTI-AGENT-PIPELINE: Guardrail tripped — {}",
+                            handoff_check.check_description
+                        );
+                    }
 
                     // ── Implementer phase ────────────────────────────────────
                     let implementer_start = std::time::Instant::now();

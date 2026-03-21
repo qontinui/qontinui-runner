@@ -72,7 +72,7 @@ pub fn generate_cost_recommendations(
 
     let median_tokens = if avg_tokens.is_empty() {
         0.0
-    } else if avg_tokens.len() % 2 == 0 {
+    } else if avg_tokens.len().is_multiple_of(2) {
         let mid = avg_tokens.len() / 2;
         (avg_tokens[mid - 1] + avg_tokens[mid]) / 2.0
     } else {
