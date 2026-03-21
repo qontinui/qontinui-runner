@@ -92,7 +92,7 @@ pub fn create_backup() -> Result<(Vec<u8>, BackupResult), String> {
 
     let mut buffer = Vec::new();
     let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buffer));
-    let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let options: FileOptions<'_, ()> = FileOptions::<'_, ()>::default().compression_method(zip::CompressionMethod::Deflated);
 
     let mut files_backed_up = Vec::new();
     let mut errors = Vec::new();
@@ -164,8 +164,6 @@ pub fn create_backup() -> Result<(Vec<u8>, BackupResult), String> {
     // Finish the ZIP
     zip.finish()
         .map_err(|e| format!("Failed to finish ZIP: {}", e))?;
-
-    drop(zip);
 
     let result = BackupResult {
         success: !files_backed_up.is_empty(),

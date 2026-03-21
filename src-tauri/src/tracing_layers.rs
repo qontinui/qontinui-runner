@@ -403,7 +403,7 @@ impl SqliteSpanLayer {
                 entry.name,
                 entry.start_ts,
                 entry.end_ts,
-                entry.duration_ms,
+                entry.duration_ms.map(|v| v as i64),
                 attributes_json,
                 entry.success,
                 entry.error,

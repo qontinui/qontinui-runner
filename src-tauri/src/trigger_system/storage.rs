@@ -114,15 +114,15 @@ pub fn create_trigger(db: &Arc<CheckpointDb>, trigger: &WorkflowTrigger) -> Resu
             trigger.workflow_id,
             overrides_json,
             conditions_json,
-            trigger.debounce_ms,
-            trigger.cooldown_seconds,
+            trigger.debounce_ms as i64,
+            trigger.cooldown_seconds as i64,
             trigger.max_concurrent,
             trigger.retry_count,
-            trigger.retry_delay_seconds,
+            trigger.retry_delay_seconds as i64,
             trigger.enabled,
             trigger.last_triggered_at,
             trigger.last_execution_id,
-            trigger.trigger_count,
+            trigger.trigger_count as i64,
             trigger.created_at,
             trigger.updated_at,
         ],
@@ -160,11 +160,11 @@ pub fn update_trigger(db: &Arc<CheckpointDb>, trigger: &WorkflowTrigger) -> Resu
             trigger.workflow_id,
             overrides_json,
             conditions_json,
-            trigger.debounce_ms,
-            trigger.cooldown_seconds,
+            trigger.debounce_ms as i64,
+            trigger.cooldown_seconds as i64,
             trigger.max_concurrent,
             trigger.retry_count,
-            trigger.retry_delay_seconds,
+            trigger.retry_delay_seconds as i64,
             trigger.enabled,
             trigger.updated_at,
             trigger.id,
@@ -345,13 +345,13 @@ pub fn get_trigger_history_filtered(
 pub fn get_trigger_stats(db: &Arc<CheckpointDb>) -> Result<(u64, u64), String> {
     let conn = db.get_conn()?;
 
-    let total: u64 = conn
+    let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM workflow_triggers", [], |row| {
             row.get(0)
         })
         .map_err(|e| format!("Failed to count triggers: {}", e))?;
 
-    let enabled: u64 = conn
+    let enabled: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM workflow_triggers WHERE enabled = 1",
             [],
@@ -359,7 +359,7 @@ pub fn get_trigger_stats(db: &Arc<CheckpointDb>) -> Result<(u64, u64), String> {
         )
         .map_err(|e| format!("Failed to count enabled triggers: {}", e))?;
 
-    Ok((total, enabled))
+    Ok((total as u64, enabled as u64))
 }
 
 // ============================================================================

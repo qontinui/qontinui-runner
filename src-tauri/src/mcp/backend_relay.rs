@@ -164,7 +164,7 @@ async fn relay_loop(
                     });
                     let info_text = serde_json::to_string(&runner_info).unwrap_or_default();
                     let mut w = write.lock().await;
-                    if let Err(e) = w.send(Message::Text(info_text)).await {
+                    if let Err(e) = w.send(Message::Text(info_text.into())).await {
                         warn!("Failed to send runner_info to backend relay: {}", e);
                     } else {
                         info!("Sent runner_info to backend relay (port={})", port);
@@ -195,7 +195,7 @@ async fn relay_loop(
                         loop {
                             interval.tick().await;
                             let mut w = write_ping.lock().await;
-                            if let Err(e) = w.send(Message::Ping(vec![])).await {
+                            if let Err(e) = w.send(Message::Ping(vec![].into())).await {
                                 warn!("Relay keepalive ping failed: {}", e);
                                 return;
                             }
@@ -260,7 +260,7 @@ async fn handle_inbound<S>(
                     if let Some(response) = response {
                         let response_text = serde_json::to_string(&response).unwrap_or_default();
                         let mut w = write.lock().await;
-                        if let Err(e) = w.send(Message::Text(response_text)).await {
+                        if let Err(e) = w.send(Message::Text(response_text.into())).await {
                             warn!("Failed to send relay response: {}", e);
                             return;
                         }
@@ -328,7 +328,7 @@ async fn handle_outbound<S>(
 
                 let text = serde_json::to_string(&relay_msg).unwrap_or_default();
                 let mut w = write.lock().await;
-                if let Err(e) = w.send(Message::Text(text)).await {
+                if let Err(e) = w.send(Message::Text(text.into())).await {
                     warn!("Failed to forward event to backend: {}", e);
                     return;
                 }
