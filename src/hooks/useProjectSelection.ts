@@ -10,6 +10,9 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Project } from "../types/auth";
 import { instanceStorage } from "@/lib/instance-storage";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("useProjectSelection");
 
 const SELECTED_PROJECT_STORAGE_KEY = "qontinui-selected-project";
 
@@ -67,7 +70,7 @@ export function useProjectSelection(): UseProjectSelectionReturn {
         const errorMsg = err instanceof Error ? err.message : String(err);
         // Retry once on auth failure (handles keychain race condition)
         if (retryCount === 0 && errorMsg.includes("Not authenticated")) {
-          console.log("[PROJECT_SELECTION] Auth race condition, retrying in 500ms...");
+          log.debug("Auth race condition, retrying in 500ms...");
           await new Promise((resolve) => setTimeout(resolve, 500));
           return attemptLoad(1);
         }
@@ -78,7 +81,7 @@ export function useProjectSelection(): UseProjectSelectionReturn {
     try {
       const projectList = await attemptLoad();
       setProjects(projectList);
-      console.log("[PROJECT_SELECTION] Loaded", projectList.length, "projects");
+      log.debug("Loaded", projectList.length, "projects");
 
       // If we have a stored selection, validate it still exists
       if (selectedProjectId) {
@@ -132,7 +135,7 @@ export function useProjectSelection(): UseProjectSelectionReturn {
         }),
       );
 
-      console.log("[PROJECT_SELECTION] Selected project:", projectId, projectName);
+      log.debug("Selected project:", projectId, projectName);
     },
     [projects],
   );

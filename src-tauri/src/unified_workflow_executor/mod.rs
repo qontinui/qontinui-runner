@@ -57,6 +57,7 @@
 //! ```
 
 pub mod agentic_output;
+mod agentic_verification_loop;
 pub mod approval;
 pub(crate) mod auto_run;
 mod canvas_panels;
@@ -65,13 +66,17 @@ pub mod convergence;
 mod health_monitor;
 mod loop_controller;
 pub mod multi_agent_fixer;
+mod multi_agent_pipeline_loop;
 pub mod output_parser;
 mod phase_configs;
 mod phase_helpers;
 mod phases;
 mod resume;
+mod startup_resume;
 pub mod states;
 mod step_conversion;
+mod task_lifecycle;
+mod task_state;
 mod types;
 
 // Panic handling imports
@@ -88,17 +93,17 @@ pub use loop_controller::{
     convert_all_json_steps_with_phase,
     convert_json_steps_with_phase,
     extract_prompt_steps_with_phase,
-    extract_workflow_id_from_task_id,
-    resume_interrupted_workflows,
     LoopController,
-    ResumeConfig,
+};
+pub use startup_resume::{
+    extract_workflow_id_from_task_id, resume_interrupted_workflows, ResumeConfig,
 };
 pub use types::{get_parent_task_id, LoopConfig, LoopResult, StageConfig, WorkflowPhase};
 
 // Types exposed for API consumers and advanced usage
 // These may not be directly used in this crate but are part of the public API
 #[allow(unused_imports)]
-pub use loop_controller::WorkflowResult;
+pub use startup_resume::WorkflowResult;
 #[allow(unused_imports)]
 pub use types::{AgenticOutcome, IterationResult};
 

@@ -29,6 +29,9 @@ import { useEffect, useCallback, useRef } from "react";
 import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import { useUIBridge } from "ui-bridge";
 import type { StyleGuideConfig } from "ui-bridge";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("UIBridgeEventHandler");
 
 import {
   useControlEvents,
@@ -80,18 +83,12 @@ export function useUIBridgeEventHandler(): void {
     // so the HTTP fallback ensures the response always reaches the Rust backend.
     const httpPromise = httpSendResponse(response).then((ok) => {
       if (ok) {
-        console.log(
-          `[UIBridgeEventHandler] HTTP sent response for ${response.type}:`,
-          response.requestId,
-        );
+        log.debug(`HTTP sent response for ${response.type}:`, response.requestId);
       }
     });
     const emitPromise = emit("ui-bridge-response", response)
       .then(() => {
-        console.log(
-          `[UIBridgeEventHandler] Tauri emit sent response for ${response.type}:`,
-          response.requestId,
-        );
+        log.debug(`Tauri emit sent response for ${response.type}:`, response.requestId);
       })
       .catch(() => {
         // Tauri emit failed — HTTP fallback already running
@@ -129,7 +126,7 @@ export function useUIBridgeEventHandler(): void {
       const { requestId, type } = payload;
       const currentBridge = bridgeRef.current;
 
-      console.log(`[UIBridgeEventHandler] Received request: ${type}`, requestId);
+      log.debug(`Received request: ${type}`, requestId);
 
       // Check if UI Bridge is available
       if (!currentBridge.available) {
@@ -204,16 +201,16 @@ export function useUIBridgeEventHandler(): void {
 
     const setupListener = async () => {
       try {
-        console.log("[UIBridgeEventHandler] Setting up ui-bridge-request listener");
+        log.debug("Setting up ui-bridge-request listener");
 
         unlisten = await listen<UIBridgeRequestPayload>("ui-bridge-request", (event) => {
           if (!isMounted) {
-            console.log("[UIBridgeEventHandler] Component unmounted, ignoring event");
+            log.debug("Component unmounted, ignoring event");
             return;
           }
 
           const payload = event.payload;
-          console.log("[UIBridgeEventHandler] Received event:", payload.type, payload.requestId);
+          log.debug("Received event:", payload.type, payload.requestId);
 
           // Handle the request asynchronously
           handleRequest(payload).catch((error) => {
@@ -237,7 +234,7 @@ export function useUIBridgeEventHandler(): void {
           httpSendPong().catch(() => {});
         }, 3000);
 
-        console.log("[UIBridgeEventHandler] Listener set up successfully");
+        log.debug("Listener set up successfully");
 
         // Store ping unlisten for cleanup
         const originalUnlisten = unlisten;
@@ -253,14 +250,14 @@ export function useUIBridgeEventHandler(): void {
 
     // Log page unload for diagnostics (no pending-request tracking to clean up)
     const handleBeforeUnload = () => {
-      console.log("[UIBridgeEventHandler] Page unloading, cleaning up");
+      log.debug("Page unloading, cleaning up");
     };
     window.addEventListener("beforeunload", handleBeforeUnload);
 
     setupListener();
 
     return () => {
-      console.log("[UIBridgeEventHandler] Cleaning up listener");
+      log.debug("Cleaning up listener");
       isMounted = false;
       window.removeEventListener("beforeunload", handleBeforeUnload);
       if (unlisten) {

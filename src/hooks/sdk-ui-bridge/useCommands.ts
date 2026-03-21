@@ -14,6 +14,9 @@ import type {
 } from "./types";
 import { extractFingerprintHashes } from "../../lib/ui-bridge/fingerprintGenerator";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("useCommands");
 
 const MAX_COMMAND_HISTORY = 50;
 
@@ -122,8 +125,8 @@ export function useCommands(
 
             // Log transition for debugging
             if (appeared.length > 0 || disappeared.length > 0) {
-              console.log(
-                `[useCommands] Transition: ${action} on ${elementId} — +${appeared.length} -${disappeared.length} fingerprints`,
+              log.debug(
+                `Transition: ${action} on ${elementId} — +${appeared.length} -${disappeared.length} fingerprints`,
               );
             }
           }

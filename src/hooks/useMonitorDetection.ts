@@ -8,6 +8,9 @@
 import { useState, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { CommandResponse } from "../types/displayProfile";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("useMonitorDetection");
 
 interface UseMonitorDetectionOptions {
   onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
@@ -57,12 +60,12 @@ export function useMonitorDetection(
     // Save the monitor indices as the last used monitors
     try {
       await invoke("save_last_monitor_indices", { monitorIndices: validIndices });
-      console.log("[MONITOR_DETECTION] Saved last monitor indices:", validIndices);
+      log.debug("Saved last monitor indices:", validIndices);
     } catch (saveError) {
       // Fallback to old single-monitor API for backward compatibility
       try {
         await invoke("save_last_monitor_index", { monitorIndex: validIndices[0] });
-        console.log("[MONITOR_DETECTION] Saved last monitor index (legacy):", validIndices[0]);
+        log.debug("Saved last monitor index (legacy):", validIndices[0]);
       } catch (_legacyError) {
         console.error("[MONITOR_DETECTION] Failed to save last monitor indices:", saveError);
       }
@@ -100,7 +103,7 @@ export function useMonitorDetection(
    */
   useEffect(() => {
     if (detectOnMount) {
-      console.log("[MONITOR_DETECTION] Detecting monitors on mount");
+      log.debug("Detecting monitors on mount");
       detectSystemMonitors();
     }
   }, [detectOnMount, detectSystemMonitors]);

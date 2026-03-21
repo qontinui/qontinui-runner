@@ -86,11 +86,7 @@ function buildUpdateWorkflow(input: SpecDrivenWorkflowInput): UnifiedWorkflow {
     return buildVerifyWorkflow(input);
   }
 
-  const phases = buildSpecDiffPlan(
-    diff,
-    input.specConfig,
-    input.elementSource,
-  );
+  const phases = buildSpecDiffPlan(diff, input.specConfig, input.elementSource);
 
   if (phases.length === 0) {
     return buildVerifyWorkflow(input);
@@ -99,8 +95,7 @@ function buildUpdateWorkflow(input: SpecDrivenWorkflowInput): UnifiedWorkflow {
   const workflow = buildPlanWorkflow({
     phases,
     maxIterations: input.maxIterations ?? 3,
-    workflowName:
-      input.workflowName ?? `Spec Update — ${diff.summary}`,
+    workflowName: input.workflowName ?? `Spec Update — ${diff.summary}`,
     snapshotTarget: input.elementSource === "external" ? "sdk" : "control",
   });
 

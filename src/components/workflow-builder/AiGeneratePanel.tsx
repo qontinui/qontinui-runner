@@ -60,6 +60,9 @@ import {
   type SpecConfig as BuildSpecConfig,
 } from "@/lib/workflow-builder/buildSpecWorkflow";
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("AiGeneratePanel");
 
 // Icon lookup map for template icons
 const TEMPLATE_ICONS: Record<string, LucideIcon> = {
@@ -438,13 +441,7 @@ export function AiGeneratePanel({
         );
         const succeeded = results.filter((r) => r.status === "fulfilled");
         const failed = results.filter((r) => r.status === "rejected");
-        console.log(
-          "[AiGeneratePanel] Batch generation:",
-          succeeded.length,
-          "started,",
-          failed.length,
-          "failed",
-        );
+        log.debug("Batch generation:", succeeded.length, "started,", failed.length, "failed");
         if (failed.length > 0 && succeeded.length === 0) {
           const reason =
             failed[0].status === "rejected"
@@ -476,8 +473,8 @@ export function AiGeneratePanel({
             maxIterations: maxIterations ? parseInt(maxIterations, 10) : 3,
             elementSource: "control",
           });
-          console.log(
-            "[AiGeneratePanel] Spec workflow built deterministically:",
+          log.debug(
+            "Spec workflow built deterministically:",
             workflow.name,
             "—",
             workflow.verification_steps.length,
@@ -489,7 +486,7 @@ export function AiGeneratePanel({
       }
       // No specs selected → AI generation
       const taskRunId = await fireGenerateRequest(buildGenerateRequest());
-      console.log("[AiGeneratePanel] Generation started:", taskRunId);
+      log.debug("Generation started:", taskRunId);
       if (description.trim()) {
         autoSaveGenerationPrompt(description); // fire-and-forget
       }
@@ -522,13 +519,7 @@ export function AiGeneratePanel({
         );
         const succeeded = results.filter((r) => r.status === "fulfilled");
         const failed = results.filter((r) => r.status === "rejected");
-        console.log(
-          "[AiGeneratePanel] Batch Generate & Run:",
-          succeeded.length,
-          "started,",
-          failed.length,
-          "failed",
-        );
+        log.debug("Batch Generate & Run:", succeeded.length, "started,", failed.length, "failed");
         if (failed.length > 0 && succeeded.length === 0) {
           const reason =
             failed[0].status === "rejected"
@@ -560,8 +551,8 @@ export function AiGeneratePanel({
             maxIterations: maxIterations ? parseInt(maxIterations, 10) : 3,
             elementSource: "control",
           });
-          console.log(
-            "[AiGeneratePanel] Spec workflow built + run:",
+          log.debug(
+            "Spec workflow built + run:",
             workflow.name,
             "—",
             workflow.verification_steps.length,
@@ -574,7 +565,7 @@ export function AiGeneratePanel({
       // No specs selected → AI generation + auto_run
       const request = { ...buildGenerateRequest(), auto_run: true };
       const taskRunId = await fireGenerateRequest(request);
-      console.log("[AiGeneratePanel] Generate & Run started:", taskRunId);
+      log.debug("Generate & Run started:", taskRunId);
       if (description.trim()) {
         autoSaveGenerationPrompt(description); // fire-and-forget
       }

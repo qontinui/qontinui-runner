@@ -110,6 +110,9 @@ import { CompositionBuilderDialog } from "./CompositionBuilderDialog";
 import { SkillExportDialog } from "./SkillExportDialog";
 import { SkillImportDialog } from "./SkillImportDialog";
 import { RunOptionsDialog } from "./RunOptionsDialog";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("WorkflowBuilder");
 
 // Minimal icon resolver for composition builder (maps icon IDs to lucide components)
 const SKILL_ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -1468,7 +1471,7 @@ function WorkflowBuilderContent({
           source: s.source,
         }));
       if (nonBuiltin.length === 0) {
-        console.log("No user or community skills to export.");
+        log.debug("No user or community skills to export.");
         return;
       }
       setAvailableSkillsForExport(nonBuiltin);
@@ -1558,7 +1561,7 @@ function WorkflowBuilderContent({
       const result = await response.json();
       if (result.success && result.data) {
         const { imported, skipped, overwritten, errors } = result.data;
-        console.log(
+        log.debug(
           `Skills imported: ${imported}, skipped: ${skipped}, overwritten: ${overwritten}`,
           errors.length > 0 ? `Errors: ${errors.join(", ")}` : "",
         );
@@ -1663,7 +1666,7 @@ function WorkflowBuilderContent({
   const handleSave = useCallback(async () => {
     const success = await saveWorkflow();
     if (success) {
-      console.log("Workflow saved successfully");
+      log.debug("Workflow saved successfully");
     }
   }, [saveWorkflow]);
 
@@ -1684,7 +1687,7 @@ function WorkflowBuilderContent({
       setExecutionSuccess(null);
 
       try {
-        console.log("[WorkflowBuilder] Running workflow:", workflowId, state.workflow.name);
+        log.debug("Running workflow:", workflowId, state.workflow.name);
 
         const runUrl = `${getApiBase()}/unified-workflows/${workflowId}/run`;
 
@@ -1692,7 +1695,7 @@ function WorkflowBuilderContent({
         const compareArchitectures = overrides?._compareArchitectures as string[] | undefined;
         if (compareArchitectures && compareArchitectures.length > 1) {
           // Launch one run per architecture
-          console.log("[WorkflowBuilder] Comparing architectures:", compareArchitectures);
+          log.debug("Comparing architectures:", compareArchitectures);
           for (const arch of compareArchitectures) {
             const archOverrides: Record<string, unknown> = {
               use_worktree: overrides?.use_worktree ?? true,
@@ -1706,7 +1709,7 @@ function WorkflowBuilderContent({
               body: JSON.stringify({ overrides: archOverrides, force_fresh_start: true }),
             })
               .then((response) => {
-                console.log(`[WorkflowBuilder] ${arch} run response:`, response.status);
+                log.debug(`${arch} run response:`, response.status);
               })
               .catch((error) => {
                 console.error(`[WorkflowBuilder] ${arch} run error:`, error);
@@ -1742,7 +1745,7 @@ function WorkflowBuilderContent({
             body: JSON.stringify(body),
           })
             .then((response) => {
-              console.log("[WorkflowBuilder] Workflow run response:", response.status);
+              log.debug("Workflow run response:", response.status);
             })
             .catch((error) => {
               console.error("[WorkflowBuilder] Workflow run error:", error);
@@ -1788,7 +1791,7 @@ function WorkflowBuilderContent({
     async (overrides?: Record<string, unknown>) => {
       if (isExecuting) return;
 
-      const isComparison = !!(overrides?._compareArchitectures);
+      const isComparison = !!overrides?._compareArchitectures;
 
       // Check if workflow has steps
       if (isEmpty) {
@@ -1819,7 +1822,7 @@ function WorkflowBuilderContent({
   const handleLoadSpecWorkflow = useCallback(
     (workflow: UnifiedWorkflow) => {
       setWorkflow(workflow);
-      console.log("[WorkflowBuilder] Loaded spec workflow into builder:", workflow.name);
+      log.debug("Loaded spec workflow into builder:", workflow.name);
     },
     [setWorkflow],
   );
@@ -1884,7 +1887,7 @@ function WorkflowBuilderContent({
       const result = await response.json();
       if (result.success) {
         setIsExecuting(false);
-        console.log("[WorkflowBuilder] Execution stopped");
+        log.debug("Execution stopped");
       }
     } catch (error) {
       console.error("[WorkflowBuilder] Failed to stop execution:", error);
@@ -2209,7 +2212,7 @@ function WorkflowBuilderContent({
       });
       setShowSettings(true);
       setShowConstraints(false);
-      console.log("[WorkflowBuilder] Loaded AI-generated workflow:", workflow.name);
+      log.debug("Loaded AI-generated workflow:", workflow.name);
     },
     [resetToNew, updateWorkflow],
   );

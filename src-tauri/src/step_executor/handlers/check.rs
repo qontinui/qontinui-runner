@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 
 use super::{HandlerContext, StepHandler, StepHandlerResult};
-use crate::step_executor::executor::ExecutionStepConfig;
+use crate::step_executor::ExecutionStepConfig;
 use crate::str_utils::truncate_str;
 
 /// Handler for check steps.

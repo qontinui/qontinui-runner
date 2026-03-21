@@ -8,6 +8,9 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { CommandResponse } from "../types/displayProfile";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("usePythonExecutor");
 
 export type PythonStatus = "stopped" | "running";
 
@@ -36,12 +39,12 @@ export function usePythonExecutor(): UsePythonExecutorReturn {
         return true;
       }
 
-      console.log("[PYTHON_EXECUTOR] Starting Python executor...");
+      log.debug("Starting Python executor...");
       onLog?.("info", "Starting Python executor...");
 
       try {
         const startResult = await invoke<CommandResponse>("start_python_executor");
-        console.log("[PYTHON_EXECUTOR] Python start result:", startResult);
+        log.debug("Python start result:", startResult);
 
         if (startResult.success) {
           setPythonStatus("running");
@@ -54,7 +57,7 @@ export function usePythonExecutor(): UsePythonExecutorReturn {
           if (errorMsg.toLowerCase().includes("already running")) {
             setPythonStatus("running");
             onLog?.("info", "Python executor is already running");
-            console.log("[PYTHON_EXECUTOR] Python executor already running");
+            log.debug("Python executor already running");
             return true;
           }
 
@@ -84,7 +87,7 @@ export function usePythonExecutor(): UsePythonExecutorReturn {
         // python_running is inside the data field of CommandResponse
         if (result?.data?.python_running) {
           setPythonStatus("running");
-          console.log("[PYTHON_EXECUTOR] Python executor already running");
+          log.debug("Python executor already running");
         }
       } catch (error) {
         console.error("[PYTHON_EXECUTOR] Failed to check Python status:", error);

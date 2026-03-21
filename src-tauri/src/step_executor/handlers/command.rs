@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 
 use super::{HandlerContext, StepHandler, StepHandlerResult};
-use crate::step_executor::executor::ExecutionStepConfig;
+use crate::step_executor::ExecutionStepConfig;
 use crate::step_types::CommandMode;
 
 // Re-use the existing handler implementations directly

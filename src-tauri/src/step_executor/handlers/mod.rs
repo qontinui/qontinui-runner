@@ -69,7 +69,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
 use super::events::TreeEventEmitter;
-use super::executor::ExecutionStepConfig;
+use super::ExecutionStepConfig;
 
 // Step handler implementations
 // Internal modules used by CommandHandler (not registered directly)

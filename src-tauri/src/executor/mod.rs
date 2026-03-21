@@ -27,7 +27,6 @@ pub use bridge_helpers::{
     stop_default_bridge, with_default_bridge,
 };
 pub use bridge_manager::{BridgeInfo, BridgeManager, BridgeMode, CreateBridgeResult};
-pub use context::ExecutorContext;
 pub use execution_helpers::{prompt_builder, timeout_helper};
 pub use extraction_executor::ExtractionExecutor;
 pub use file_logger::FileLogger;
@@ -35,7 +34,7 @@ pub use gui_lock::GuiLockInfo;
 pub use python_bridge::PythonBridge;
 pub use results::{ExecutionOutcome, IntoOutcome};
 pub use state::ExecutorState;
-pub use traits::{Executor, ExecutorError, FromContext};
+
 #[allow(unused_imports)]
 pub use url_lock::UrlLockInfo;
 pub use url_lock::UrlLockManager;

@@ -66,9 +66,7 @@ export function buildSpecImplementationPlan(input: SpecImplementationPlanInput):
         id: "task-scaffold-component",
         name: "Create page component and route",
         description: `Create the page component for "${specConfig.description ?? "this page"}". Set up routing so the page is accessible${pageUrl ? ` at ${pageUrl}` : ""}.`,
-        verifications: [
-          { type: "compile", description: "Project compiles after scaffold" },
-        ],
+        verifications: [{ type: "compile", description: "Project compiles after scaffold" }],
       },
     ],
     max_iterations: 3,
@@ -92,9 +90,7 @@ export function buildSpecImplementationPlan(input: SpecImplementationPlanInput):
   }
 
   // Final integration phase: compile + all assertions
-  const allAssertions = selectedGroups.flatMap((g) =>
-    g.assertions.filter((a) => a.enabled),
-  );
+  const allAssertions = selectedGroups.flatMap((g) => g.assertions.filter((a) => a.enabled));
   const allUiChecks = allAssertions
     .filter((a) => DETERMINISTIC_TYPES.has(a.assertionType ?? "exists") && a.target?.criteria)
     .map((a) => assertionToUiCheck(a));
@@ -110,9 +106,7 @@ export function buildSpecImplementationPlan(input: SpecImplementationPlanInput):
           id: "task-integration-compile",
           name: "Full compilation check",
           description: "Verify the entire project compiles without errors",
-          verifications: [
-            { type: "compile", description: "Full project compiles" },
-          ],
+          verifications: [{ type: "compile", description: "Full project compiles" }],
         },
         {
           id: "task-integration-ui",
@@ -178,9 +172,7 @@ export function buildSpecDiffPlan(
       ...modified.modifiedAssertions.map((m) => m.id),
     ]);
 
-    const changedAssertions = group.assertions.filter(
-      (a) => a.enabled && changedIds.has(a.id),
-    );
+    const changedAssertions = group.assertions.filter((a) => a.enabled && changedIds.has(a.id));
 
     if (changedAssertions.length === 0) continue;
 
@@ -217,9 +209,7 @@ export function buildSpecDiffPlan(
           id: "task-cleanup",
           name: "Remove deprecated features",
           description: `Clean up code for removed spec groups: ${removedWithAssertions.map((g) => g.name).join(", ")}`,
-          verifications: [
-            { type: "compile", description: "Project compiles after cleanup" },
-          ],
+          verifications: [{ type: "compile", description: "Project compiles after cleanup" }],
         },
       ],
       max_iterations: 2,
@@ -282,7 +272,8 @@ function assertionToUiCheck(a: SpecAssertion): UiCheckAssertion {
   return {
     id: a.id,
     description: a.description,
-    assertionType: (a.assertionType as "exists" | "contains" | "visible" | "not_exists") ?? "exists",
+    assertionType:
+      (a.assertionType as "exists" | "contains" | "visible" | "not_exists") ?? "exists",
     criteria: (a.target?.criteria as Record<string, unknown>) ?? {},
     expected: a.expected,
     severity: a.severity,
@@ -300,12 +291,13 @@ function buildImplementationPrompt(
   projectContext?: string,
 ): string {
   const assertionList = assertions
-    .map((a, i) => `${i + 1}. **${a.description}** [${a.severity}]${a.assertionType ? ` (${a.assertionType})` : ""}`)
+    .map(
+      (a, i) =>
+        `${i + 1}. **${a.description}** [${a.severity}]${a.assertionType ? ` (${a.assertionType})` : ""}`,
+    )
     .join("\n");
 
-  const contextSection = projectContext
-    ? `\n\n## Project Context\n\n${projectContext}`
-    : "";
+  const contextSection = projectContext ? `\n\n## Project Context\n\n${projectContext}` : "";
 
   return `## Implement: ${group.name}
 

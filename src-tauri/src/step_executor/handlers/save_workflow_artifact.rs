@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use std::path::Path;
 
 use super::{HandlerContext, StepHandler, StepHandlerResult};
-use crate::step_executor::executor::ExecutionStepConfig;
+use crate::step_executor::ExecutionStepConfig;
 use crate::unified_workflows::CreateUnifiedWorkflowRequest;
 use crate::workflow_generation::pipeline_artifacts::PipelineArtifactBuilder;
 

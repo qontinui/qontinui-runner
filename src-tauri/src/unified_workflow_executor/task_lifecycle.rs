@@ -1,0 +1,404 @@
+//! Task lifecycle operations for the loop controller.
+//!
+//! Handles task completion, failure, error resolution, chain triggers, and worktree creation.
+
+use std::sync::Arc;
+use tracing::{error, info, warn};
+
+use crate::event_system::EventBroadcaster;
+use crate::step_executor::ExecutionStepConfig;
+
+use super::loop_controller::LoopController;
+use super::types::LoopConfig;
+
+impl LoopController {
+    /// Mark a task as completed, sync to backend, promote workflow, store convergence snapshot,
+    /// parse meta-optimizer recommendations, and check chain triggers.
+    pub(crate) async fn mark_task_completed(&self, execution_id: &str, workflow_id: Option<&str>) {
+        if let Err(e) = self.checkpoint_db.complete_task_run(execution_id) {
+            error!("Failed to mark task {} as completed: {}", execution_id, e);
+        } else {
+            info!("Marked task {} as COMPLETED", execution_id);
+            // Broadcast task-run-update to both Tauri + WebSocket
+            let broadcaster = EventBroadcaster::new(self.app_handle.clone());
+            broadcaster.task_run_update(execution_id, "completed", None, None);
+
+            // Sync completion to web backend (best-effort, non-blocking)
+            let db = self.checkpoint_db.clone();
+            let eid = execution_id.to_string();
+            tokio::spawn(async move {
+                let sync_service = crate::commands::task_sync::AITaskSyncService::new();
+                if let Ok(Some(task)) = db.get_task_run(&eid) {
+                    if let Err(e) = sync_service.sync_task_completed(&task).await {
+                        warn!("Failed to sync task completion to backend: {}", e);
+                    }
+                }
+            });
+
+            // Fire-and-forget: try to promote workflow to example library
+            if let Some(wf_id) = workflow_id {
+                let db = self.checkpoint_db.clone();
+                let wf_id = wf_id.to_string();
+                let _ = db.with_conn(|conn| {
+                    crate::workflow_generation::example_workflows::try_promote_on_success(
+                        conn, &wf_id,
+                    );
+                    Ok(())
+                });
+            }
+
+            // Auto-store convergence snapshot on completion
+            let db2 = self.checkpoint_db.clone();
+            let exec_id2 = execution_id.to_string();
+            tokio::spawn(async move {
+                let _ = db2.with_conn(|conn| {
+                    let wf_name: Option<String> = conn
+                        .query_row(
+                            "SELECT workflow_name FROM task_runs WHERE id = ?1",
+                            rusqlite::params![exec_id2],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if let Some(wf_name) = wf_name {
+                        if let Ok(metrics) =
+                            crate::reflection::prediction::compute_convergence_score(
+                                conn, &wf_name, "workflow",
+                            )
+                        {
+                            let _ = crate::reflection::prediction::store_convergence_snapshot(
+                                conn, &wf_name, None, "workflow", &metrics,
+                            );
+                        }
+                    }
+                    Ok(())
+                });
+            });
+
+            // Parse meta-optimizer recommendations from completed output
+            {
+                let db = self.checkpoint_db.clone();
+                let eid = execution_id.to_string();
+                tokio::spawn(async move {
+                    // Check if this task run is a meta-optimizer run
+                    let task_run = match db.get_task_run(&eid) {
+                        Ok(Some(tr)) => tr,
+                        _ => return,
+                    };
+                    if !task_run.is_meta_optimizer {
+                        return;
+                    }
+
+                    // Look up the optimizer_run record by task_run_id
+                    let (optimizer_run_id, optimizer_type) = match db.with_conn({
+                        let eid = eid.clone();
+                        move |conn| {
+                            conn.query_row(
+                                "SELECT id, optimizer_type FROM meta_optimizer_runs WHERE task_run_id = ?1",
+                                rusqlite::params![eid],
+                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                            )
+                            .map_err(|e| format!("Failed to find optimizer run for task {}: {}", eid, e))
+                        }
+                    }) {
+                        Ok((id, ot)) => (id, ot),
+                        Err(e) => {
+                            warn!("Could not find optimizer run for meta-optimizer task {}: {}", eid, e);
+                            return;
+                        }
+                    };
+
+                    // Parse recommendations from the output
+                    let output = &task_run.output_log;
+                    match crate::meta_optimizer::parser::save_parsed_recommendations(
+                        &db,
+                        &optimizer_type,
+                        Some(&optimizer_run_id),
+                        output,
+                    ) {
+                        Ok(count) => {
+                            info!(
+                                "Meta-optimizer {}: parsed {} recommendation(s) from task {}",
+                                optimizer_type, count, eid
+                            );
+                            // Complete the optimizer run record
+                            if let Err(e) =
+                                crate::meta_optimizer::recommendations::complete_optimizer_run(
+                                    &db,
+                                    &optimizer_run_id,
+                                    0, // runs_analyzed is not tracked here
+                                    count as i64,
+                                )
+                            {
+                                warn!(
+                                    "Failed to complete optimizer run {}: {}",
+                                    optimizer_run_id, e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to parse meta-optimizer recommendations for task {}: {}",
+                                eid, e
+                            );
+                        }
+                    }
+                });
+            }
+
+            // Check workflow chain triggers
+            if let Some(wf_id) = workflow_id {
+                self.check_chain_triggers(execution_id, wf_id, "completed")
+                    .await;
+            }
+        }
+    }
+
+    /// Mark a task as failed, sync to backend, and check chain triggers.
+    pub(crate) async fn mark_task_failed(
+        &self,
+        execution_id: &str,
+        reason: &str,
+        workflow_id: Option<&str>,
+    ) {
+        if let Err(e) = self.checkpoint_db.fail_task_run(execution_id, reason) {
+            error!("Failed to mark task {} as failed: {}", execution_id, e);
+        } else {
+            info!("Marked task {} as FAILED: {}", execution_id, reason);
+            // Broadcast task-run-update to both Tauri + WebSocket
+            let broadcaster = EventBroadcaster::new(self.app_handle.clone());
+            broadcaster.task_run_update(
+                execution_id,
+                "failed",
+                None,
+                Some(serde_json::json!({ "reason": reason })),
+            );
+
+            // Sync failure to web backend (best-effort, non-blocking)
+            let db = self.checkpoint_db.clone();
+            let eid = execution_id.to_string();
+            tokio::spawn(async move {
+                let sync_service = crate::commands::task_sync::AITaskSyncService::new();
+                if let Ok(Some(task)) = db.get_task_run(&eid) {
+                    if let Err(e) = sync_service.sync_task_completed(&task).await {
+                        warn!("Failed to sync task failure to backend: {}", e);
+                    }
+                }
+            });
+
+            // Check workflow chain triggers
+            if let Some(wf_id) = workflow_id {
+                self.check_chain_triggers(execution_id, wf_id, "failed")
+                    .await;
+            }
+        }
+    }
+
+    /// Fire-and-forget: check if any workflow chain triggers match this completion.
+    pub(crate) async fn check_chain_triggers(
+        &self,
+        execution_id: &str,
+        workflow_id: &str,
+        status: &str,
+    ) {
+        let service = crate::trigger_system::get_trigger_service().await;
+        if let Some(service) = service {
+            let tx = service.event_sender();
+            let db = self.checkpoint_db.clone();
+            let wf_id = workflow_id.to_string();
+            let exec_id = execution_id.to_string();
+            let status = status.to_string();
+            tokio::spawn(async move {
+                crate::trigger_system::watchers::workflow_chain::check_workflow_chains(
+                    &db, &tx, &wf_id, &exec_id, &status, None,
+                )
+                .await;
+            });
+        }
+    }
+
+    /// Resolve targeted errors after successful workflow completion.
+    ///
+    /// This marks all errors that were targeted by the workflow as resolved,
+    /// recording the task_run_id (execution_id) that fixed them for traceability.
+    pub(crate) async fn resolve_targeted_errors(&self, execution_id: &str, error_ids: &[i64]) {
+        info!(
+            "Resolving {} targeted errors for successful workflow {}",
+            error_ids.len(),
+            execution_id
+        );
+
+        match self.checkpoint_db.connection() {
+            Ok(conn) => {
+                let mut resolved_count = 0;
+                let mut failed_count = 0;
+
+                for error_id in error_ids {
+                    let resolution_note = format!(
+                        "Auto-resolved by successful completion of workflow task {}",
+                        execution_id
+                    );
+
+                    match crate::error_monitor::ErrorEventStorage::mark_resolved_by_task(
+                        &conn,
+                        *error_id,
+                        execution_id,
+                        Some(&resolution_note),
+                    ) {
+                        Ok(_) => {
+                            resolved_count += 1;
+                        }
+                        Err(e) => {
+                            failed_count += 1;
+                            warn!("Failed to resolve error {}: {}", error_id, e);
+                        }
+                    }
+                }
+
+                if resolved_count > 0 {
+                    info!(
+                        "Successfully resolved {} errors (failed: {}) for workflow {}",
+                        resolved_count, failed_count, execution_id
+                    );
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Failed to get database connection for error resolution: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    /// Resolve all errors captured during this workflow run on successful completion.
+    ///
+    /// This bulk-resolves errors scoped to the execution_id, reducing noise from
+    /// errors that the workflow already handled. Placed after targeted resolution
+    /// so those get their specific notes first; already-resolved errors won't be
+    /// double-processed by the WHERE clause.
+    pub(crate) async fn resolve_workflow_scoped_errors(&self, execution_id: &str) {
+        match self.checkpoint_db.connection() {
+            Ok(conn) => {
+                match crate::error_monitor::ErrorEventStorage::resolve_errors_by_task_run(
+                    &conn,
+                    execution_id,
+                    execution_id,
+                ) {
+                    Ok(count) if count > 0 => {
+                        info!(
+                            "Auto-resolved {} workflow-scoped errors for task {}",
+                            count, execution_id
+                        );
+                    }
+                    Ok(_) => {} // No errors to resolve
+                    Err(e) => {
+                        warn!(
+                            "Failed to auto-resolve workflow-scoped errors for {}: {}",
+                            execution_id, e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Failed to get database connection for workflow-scoped error resolution: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    /// Fallback: create a single-repo worktree (original behavior).
+    /// Used when the monorepo root cannot be determined or multi-repo creation fails.
+    pub(crate) fn create_single_repo_worktree(
+        config: &mut LoopConfig,
+        setup_automation_steps: &mut Vec<ExecutionStepConfig>,
+        setup_prompt_steps: &mut Vec<ExecutionStepConfig>,
+        verification_steps: &mut Vec<ExecutionStepConfig>,
+        agentic_steps: &mut Vec<ExecutionStepConfig>,
+        completion_automation_steps: &mut Vec<ExecutionStepConfig>,
+        completion_prompt_steps: &mut Vec<ExecutionStepConfig>,
+        checkpoint_db: &Arc<crate::database::CheckpointDb>,
+    ) {
+        if let Some(project_path) = config.project_path.clone() {
+            let repo_path = std::path::Path::new(&project_path);
+            match crate::worktree::create_worktree(
+                repo_path,
+                &config.execution_id,
+                &config.workflow_name,
+            ) {
+                Ok(result) => {
+                    info!(
+                        "WORKTREE: Created single-repo worktree at {} (branch: {})",
+                        result.worktree_path.display(),
+                        result.branch_name
+                    );
+                    let wt_path = result.worktree_path.to_string_lossy().to_string();
+                    config.project_path = Some(wt_path.clone());
+                    config.worktree_path = Some(wt_path.clone());
+                    config.worktree_branch = Some(result.branch_name.clone());
+
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let record = crate::worktree::WorktreeRecord {
+                        id: config.execution_id.clone(),
+                        worktree_path: wt_path.clone(),
+                        branch_name: result.branch_name.clone(),
+                        source_branch: result.source_branch.clone(),
+                        source_commit: result.source_commit.clone(),
+                        repo_path: project_path.clone(),
+                        task_run_id: Some(config.execution_id.clone()),
+                        workflow_name: Some(config.workflow_name.clone()),
+                        status: crate::worktree::WorktreeStatus::Active,
+                        created_at: now.clone(),
+                        updated_at: now,
+                    };
+                    if let Err(e) = checkpoint_db.insert_worktree(&record) {
+                        warn!("WORKTREE: Failed to track worktree in database: {}", e);
+                    }
+
+                    let original_path = project_path;
+                    let update_steps = |steps: &mut Vec<ExecutionStepConfig>| {
+                        for step in steps.iter_mut() {
+                            if let Some(ref wd) = step.shell_command_working_directory {
+                                if wd.contains(&original_path) {
+                                    step.shell_command_working_directory =
+                                        Some(wd.replace(&original_path, &wt_path));
+                                }
+                            }
+                            if let Some(ref wd) = step.check_working_directory {
+                                if wd.contains(&original_path) {
+                                    step.check_working_directory =
+                                        Some(wd.replace(&original_path, &wt_path));
+                                }
+                            }
+                        }
+                    };
+                    update_steps(setup_automation_steps);
+                    update_steps(setup_prompt_steps);
+                    update_steps(verification_steps);
+                    update_steps(agentic_steps);
+                    update_steps(completion_automation_steps);
+                    update_steps(completion_prompt_steps);
+                    for stage in &mut config.stages {
+                        update_steps(&mut stage.setup_automation_steps);
+                        update_steps(&mut stage.setup_prompt_steps);
+                        update_steps(&mut stage.verification_steps);
+                        update_steps(&mut stage.agentic_steps);
+                        update_steps(&mut stage.completion_automation_steps);
+                        update_steps(&mut stage.completion_prompt_steps);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "WORKTREE: Failed to create worktree ({}). Running in main directory.",
+                        e
+                    );
+                    config.use_worktree = false;
+                }
+            }
+        } else {
+            warn!("WORKTREE: No project_path set, cannot create worktree.");
+            config.use_worktree = false;
+        }
+    }
+}

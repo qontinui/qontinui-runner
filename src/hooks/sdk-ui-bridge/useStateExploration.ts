@@ -15,6 +15,9 @@ import type {
   SdkAppInfo,
   CaptureSessionRef,
 } from "./types";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("useStateExploration");
 import { mapSdkElement } from "./utils";
 import {
   generateFingerprints,
@@ -59,7 +62,7 @@ export function useStateExploration(
 
   const cancelExploration = useCallback(() => {
     explorationCancelledRef.current = true;
-    console.log("[useStateExploration] Exploration cancellation requested");
+    log.debug("Exploration cancellation requested");
   }, []);
 
   /**
@@ -78,7 +81,7 @@ export function useStateExploration(
       return null;
     }
 
-    console.log("[useStateExploration] Starting automated state exploration");
+    log.debug("Starting automated state exploration");
     setIsExploring(true);
     explorationCancelledRef.current = false;
     setExplorationProgress({ current: 0, total: 0 });
@@ -102,7 +105,7 @@ export function useStateExploration(
         uniqueFingerprints: 0,
       });
       setCooccurrenceData(null);
-      console.log(`[useStateExploration] Exploration capture session started: ${sessionId}`);
+      log.debug(`Exploration capture session started: ${sessionId}`);
     }
 
     try {
@@ -112,7 +115,7 @@ export function useStateExploration(
       await new Promise((r) => setTimeout(r, EXPLORATION_SETTLE_DELAY));
 
       if (explorationCancelledRef.current) {
-        console.log("[useStateExploration] Exploration cancelled before starting interactions");
+        log.debug("Exploration cancelled before starting interactions");
         return null;
       }
 
@@ -379,8 +382,8 @@ export function useStateExploration(
         total: queue.length,
       });
 
-      console.log(
-        `[useStateExploration] Initial exploration queue: ${queue.length} interactive elements (filtered from ${currentElements.length} total)`,
+      log.debug(
+        `Initial exploration queue: ${queue.length} interactive elements (filtered from ${currentElements.length} total)`,
       );
 
       // Snapshot the initial fingerprint set to detect "page changes"
@@ -389,9 +392,7 @@ export function useStateExploration(
       // Breadth-first exploration loop
       while (queue.length > 0 && interactionCount < MAX_EXPLORATION_INTERACTIONS) {
         if (explorationCancelledRef.current) {
-          console.log(
-            `[useStateExploration] Exploration cancelled after ${interactionCount} interactions`,
-          );
+          log.debug(`Exploration cancelled after ${interactionCount} interactions`);
           break;
         }
 
@@ -411,8 +412,8 @@ export function useStateExploration(
           currentElement: elementLabel,
         });
 
-        console.log(
-          `[useStateExploration] Exploring [${interactionCount}/${interactionCount + queue.length}]: click "${elementLabel}" (${element.id})`,
+        log.debug(
+          `Exploring [${interactionCount}/${interactionCount + queue.length}]: click "${elementLabel}" (${element.id})`,
         );
 
         // Capture the fingerprint set before the action
@@ -431,16 +432,14 @@ export function useStateExploration(
           totalBefore > 0 ? (appeared.length + disappeared.length) / totalBefore : 0;
 
         if (appeared.length > 0 || disappeared.length > 0) {
-          console.log(
-            `[useStateExploration] State change: +${appeared.length} -${disappeared.length} fingerprints (${(changeRatio * 100).toFixed(1)}% change)`,
+          log.debug(
+            `State change: +${appeared.length} -${disappeared.length} fingerprints (${(changeRatio * 100).toFixed(1)}% change)`,
           );
         }
 
         // If significant change (likely navigated to a new "page"), discover new elements
         if (changeRatio > 0.3) {
-          console.log(
-            "[useStateExploration] Significant state change detected — exploring new elements",
-          );
+          log.debug("Significant state change detected — exploring new elements");
 
           // Add newly visible interactive elements to the queue
           const newExplorable = filterExplorable(currentElements);
@@ -474,8 +473,8 @@ export function useStateExploration(
           });
 
           if (backElement) {
-            console.log(
-              `[useStateExploration] Attempting to navigate back via "${backElement.accessibleName || backElement.label || backElement.text || backElement.id}"`,
+            log.debug(
+              `Attempting to navigate back via "${backElement.accessibleName || backElement.label || backElement.text || backElement.id}"`,
             );
             currentElements = await executeExplorationAction(backElement.id, "click");
 
@@ -488,21 +487,19 @@ export function useStateExploration(
               baselineFingerprints.size > 0 ? returnOverlap / baselineFingerprints.size : 0;
 
             if (returnRatio > 0.7) {
-              console.log(
-                `[useStateExploration] Successfully returned to baseline (${(returnRatio * 100).toFixed(1)}% match)`,
+              log.debug(
+                `Successfully returned to baseline (${(returnRatio * 100).toFixed(1)}% match)`,
               );
             } else {
-              console.log(
-                `[useStateExploration] Navigation back resulted in different state (${(returnRatio * 100).toFixed(1)}% baseline match)`,
+              log.debug(
+                `Navigation back resulted in different state (${(returnRatio * 100).toFixed(1)}% baseline match)`,
               );
               // Update baseline since we're in a new state
               baselineFingerprints = new Set(extractFingerprintHashes(currentElements));
             }
           } else {
             // No obvious back button — update baseline to current state
-            console.log(
-              "[useStateExploration] No back navigation found — updating baseline to current state",
-            );
+            log.debug("No back navigation found — updating baseline to current state");
             baselineFingerprints = new Set(extractFingerprintHashes(currentElements));
           }
 
@@ -512,22 +509,20 @@ export function useStateExploration(
       }
 
       if (interactionCount >= MAX_EXPLORATION_INTERACTIONS) {
-        console.log(
-          `[useStateExploration] Exploration reached maximum interaction limit (${MAX_EXPLORATION_INTERACTIONS})`,
+        log.debug(
+          `Exploration reached maximum interaction limit (${MAX_EXPLORATION_INTERACTIONS})`,
         );
       }
 
-      console.log(
-        `[useStateExploration] Exploration complete: ${interactionCount} interactions, ${captureSessionRef.current?.captures.length ?? 0} captures`,
+      log.debug(
+        `Exploration complete: ${interactionCount} interactions, ${captureSessionRef.current?.captures.length ?? 0} captures`,
       );
 
       // Step 5: Persist thumbnails to dedicated localStorage key
       const thumbs = captureSessionRef.current?.elementThumbnails;
       const thumbCount = Object.keys(thumbs || {}).length;
       if (thumbCount > 0) {
-        console.log(
-          `[useStateExploration] Captured ${thumbCount} element thumbnails during exploration`,
-        );
+        log.debug(`Captured ${thumbCount} element thumbnails during exploration`);
         try {
           localStorage.setItem("qontinui-runner-sm-thumbnails", JSON.stringify(thumbs));
         } catch {
@@ -540,9 +535,7 @@ export function useStateExploration(
       const captureScreenshotsData = captureSessionRef.current?.captureScreenshots;
       if (captureScreenshotsData && captureScreenshotsData.length > 0) {
         setPendingCaptureScreenshots(captureScreenshotsData);
-        console.log(
-          `[useStateExploration] Stored ${captureScreenshotsData.length} capture screenshots for later save`,
-        );
+        log.debug(`Stored ${captureScreenshotsData.length} capture screenshots for later save`);
       }
 
       // Step 6: Generate co-occurrence export
@@ -568,7 +561,7 @@ export function useStateExploration(
             configName: "",
             pendingScreenshotSessionId: captureSessionRef.current?.sessionId,
           });
-          console.log("[useStateExploration] Persisted exploration result to localStorage");
+          log.debug("Persisted exploration result to localStorage");
         } catch {
           console.warn("[useStateExploration] Failed to persist exploration result");
         }
@@ -578,7 +571,7 @@ export function useStateExploration(
       if (!sessionWasActive) {
         captureSessionRef.current = null;
         setCaptureSession({ active: false });
-        console.log("[useStateExploration] Exploration capture session stopped");
+        log.debug("Exploration capture session stopped");
       }
 
       return result;

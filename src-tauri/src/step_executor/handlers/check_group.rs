@@ -9,9 +9,7 @@ use tracing::info;
 
 use super::{HandlerContext, StepHandler, StepHandlerResult};
 use crate::check_executor::{execute_check, CheckDefinition, CheckTool, CheckType};
-use crate::step_executor::executor::{
-    CheckIssueDetail, ExecutionStepConfig, IndividualCheckResult,
-};
+use crate::step_executor::{CheckIssueDetail, ExecutionStepConfig, IndividualCheckResult};
 
 /// Handler for check_group steps.
 pub struct CheckGroupHandler;

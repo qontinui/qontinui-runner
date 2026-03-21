@@ -182,18 +182,10 @@ pub fn diff_spec_versions(
     from_version: i64,
     to_version: i64,
 ) -> Result<versioning::SpecDiff, String> {
-    versioning::diff_spec_versions(
-        &app_state.checkpoint_db,
-        &spec_id,
-        from_version,
-        to_version,
-    )
+    versioning::diff_spec_versions(&app_state.checkpoint_db, &spec_id, from_version, to_version)
 }
 
 #[tauri::command]
-pub fn diff_spec_json(
-    old_json: String,
-    new_json: String,
-) -> Result<versioning::SpecDiff, String> {
+pub fn diff_spec_json(old_json: String, new_json: String) -> Result<versioning::SpecDiff, String> {
     versioning::diff_specs(&old_json, &new_json)
 }

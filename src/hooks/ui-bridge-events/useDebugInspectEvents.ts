@@ -2,6 +2,7 @@ import { useCallback } from "react";
 import { getGlobalSpecStore } from "ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal } from "./utils";
+import { getAllSpecs } from "../../lib/spec-registry";
 
 /**
  * Handles: get_console_errors, clear_console_errors, get_specs, get_spec,
@@ -72,11 +73,33 @@ export function useDebugInspectEvents(
         }
 
         case "get_specs": {
+          // Read from the SpecStore first (populated by BundledSpecsLoader).
+          // Fall back to the spec-registry module directly — this handles the
+          // case where HMR reloads invalidate the useEffect that populates the
+          // store, or where dual module resolution creates separate singletons.
           const store = getGlobalSpecStore();
           const allConfigs = store.getAll();
-          const specs: Array<{ specId: string; config: unknown }> = [];
+          let specs: Array<{ specId: string; config: unknown }> = [];
           for (const [id, config] of allConfigs) {
             specs.push({ specId: id, config });
+          }
+          // Also check the UIBridgeProvider's store instance
+          const uiBridgeGlobal = getUIBridgeGlobal();
+          const providerStore = (uiBridgeGlobal as Record<string, unknown> | undefined)?.specs as
+            | { getGlobalSpecStore?: () => { getAll: () => Map<string, unknown> } }
+            | undefined;
+          const pStore = providerStore?.getGlobalSpecStore?.();
+          if (pStore && pStore !== store) {
+            for (const [id, config] of pStore.getAll()) {
+              if (!specs.some((s) => s.specId === id)) {
+                specs.push({ specId: id, config });
+              }
+            }
+          }
+          // If stores are empty, fall back to spec-registry module directly
+          if (specs.length === 0) {
+            const bundled = getAllSpecs();
+            specs = bundled.map((s) => ({ specId: s.specId, config: s.config }));
           }
 
           await sendResponse({

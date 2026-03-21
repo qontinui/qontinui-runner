@@ -12,7 +12,7 @@ use tauri::Manager;
 use tracing::{info, warn};
 
 use super::{HandlerContext, StepHandler, StepHandlerResult};
-use crate::step_executor::executor::ExecutionStepConfig;
+use crate::step_executor::ExecutionStepConfig;
 use crate::unified_workflow_executor::{LoopConfig, LoopController};
 
 /// Handler for workflow steps — runs a saved workflow inline.

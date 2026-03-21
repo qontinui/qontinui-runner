@@ -15,6 +15,9 @@
 
 import { useState, useCallback, useEffect } from "react";
 import type { InitialStatesSource } from "../types/state-machine";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("useInitialStatesOverride");
 
 export interface UseInitialStatesOverrideReturn {
   /**
@@ -58,7 +61,7 @@ export function useInitialStatesOverride(
   // Clear override when workflow changes
   useEffect(() => {
     if (overrideStateIds !== null) {
-      console.log("[INITIAL_STATES_OVERRIDE] Clearing override due to workflow change");
+      log.debug("Clearing override due to workflow change");
       setOverrideStateIdsInternal(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- Only trigger on workflow change, not on overrideStateIds
@@ -67,7 +70,7 @@ export function useInitialStatesOverride(
   // Clear override when config is reloaded
   useEffect(() => {
     if (configVersion > 0 && overrideStateIds !== null) {
-      console.log("[INITIAL_STATES_OVERRIDE] Clearing override due to config reload");
+      log.debug("Clearing override due to config reload");
       setOverrideStateIdsInternal(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- Only trigger on config version change
@@ -77,7 +80,7 @@ export function useInitialStatesOverride(
    * Set the override state IDs
    */
   const setOverrideStateIds = useCallback((ids: string[] | null) => {
-    console.log("[INITIAL_STATES_OVERRIDE] Setting override:", ids);
+    log.debug("Setting override:", ids);
     setOverrideStateIdsInternal(ids);
   }, []);
 
@@ -85,7 +88,7 @@ export function useInitialStatesOverride(
    * Clear the override
    */
   const clearOverride = useCallback(() => {
-    console.log("[INITIAL_STATES_OVERRIDE] Clearing override");
+    log.debug("Clearing override");
     setOverrideStateIdsInternal(null);
   }, []);
 

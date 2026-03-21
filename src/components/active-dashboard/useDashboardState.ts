@@ -15,6 +15,9 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import { useExecution } from "../../contexts";
 import type { ExecutionStatus, ExecutionState, ActionItem, ScreenshotsResult } from "./types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("useDashboardState");
 
 interface RunningTask {
   id: string;
@@ -282,7 +285,7 @@ export function useDashboardState(): DashboardState {
           headers: { "Content-Type": "application/json" },
         });
         if (response.ok) {
-          console.log("[DashboardState] Task resumed:", taskId);
+          log.debug("Task resumed:", taskId);
           setTimeout(refresh, 300);
         }
       } else {
@@ -292,7 +295,7 @@ export function useDashboardState(): DashboardState {
           headers: { "Content-Type": "application/json" },
         });
         if (response.ok) {
-          console.log("[DashboardState] Task paused:", taskId);
+          log.debug("Task paused:", taskId);
           setTimeout(refresh, 300);
         }
       }

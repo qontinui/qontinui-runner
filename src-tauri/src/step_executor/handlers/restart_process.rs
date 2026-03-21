@@ -8,7 +8,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use super::{HandlerContext, StepHandler, StepHandlerResult};
-use crate::step_executor::executor::ExecutionStepConfig;
+use crate::step_executor::ExecutionStepConfig;
 
 pub struct RestartProcessHandler;
 

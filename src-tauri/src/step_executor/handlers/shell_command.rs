@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use super::{HandlerContext, StepHandler, StepHandlerResult};
 use crate::orchestrator::context_propagation::ExpressionEvaluator;
 use crate::step_executor::events::TreeEventEmitter;
-use crate::step_executor::executor::ExecutionStepConfig;
+use crate::step_executor::ExecutionStepConfig;
 use crate::str_utils::truncate_str;
 
 /// Handler for shell command execution steps.

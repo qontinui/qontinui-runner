@@ -31,9 +31,13 @@
 //!
 //! See `handlers/mod.rs` for details on adding new step types.
 
-// The original step_executor.rs implementation (moved here)
+// Core executor and extracted submodules
+pub mod dag;
 #[allow(clippy::module_inception)]
 mod executor;
+pub mod executor_types;
+pub mod log_watch;
+pub mod verification_context;
 
 // New modular components (Phase 1-3 of refactoring)
 pub mod dry_run;
@@ -41,6 +45,13 @@ pub mod events;
 pub mod handlers;
 pub mod step_cache;
 
-// Re-export everything from the original executor module for backward compatibility
-// This ensures existing code continues to work without changes
+// Re-export everything for backward compatibility.
+// External code uses `crate::step_executor::SomeType` — these ensure it still works.
+#[allow(unused_imports)]
+pub use dag::*;
 pub use executor::*;
+pub use executor_types::*;
+#[allow(unused_imports)]
+pub use log_watch::*;
+#[allow(unused_imports)]
+pub use verification_context::*;

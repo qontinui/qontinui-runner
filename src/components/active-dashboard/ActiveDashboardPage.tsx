@@ -38,6 +38,9 @@ import { ActiveRunsProvider, WorkflowExecutionProvider } from "../../contexts";
 import { DashboardPage, type DashboardPageProps } from "./DashboardPage";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import type { CommandResponse } from "../../types/displayProfile";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("ActiveDashboard");
 
 export type ActiveDashboardPageProps = DashboardPageProps;
 
@@ -60,10 +63,10 @@ export function ActiveDashboardPage(props: ActiveDashboardPageProps) {
     try {
       const result = await invoke<CommandResponse>("stop_execution");
       if (result.success) {
-        console.log("[ActiveDashboard] Execution stopped via UI Bridge action");
+        log.debug("Execution stopped via UI Bridge action");
       }
     } catch {
-      console.log("[ActiveDashboard] No active execution to stop");
+      log.debug("No active execution to stop");
     }
   }, []);
 
@@ -71,7 +74,7 @@ export function ActiveDashboardPage(props: ActiveDashboardPageProps) {
     // Force a refresh by re-fetching dashboard data via the API
     try {
       await tracedFetch(`${getApiBase()}/status`);
-      console.log("[ActiveDashboard] Dashboard data refreshed via UI Bridge action");
+      log.debug("Dashboard data refreshed via UI Bridge action");
     } catch (err) {
       console.error("[ActiveDashboard] Failed to refresh dashboard data:", err);
     }

@@ -16,6 +16,9 @@ import { windowManager } from "../managers";
 import { Workflow } from "./useConfiguration";
 import type { CommandResponse } from "../types/displayProfile";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("useExecutionControl");
 
 interface UseExecutionControlOptions {
   onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
@@ -105,30 +108,30 @@ export function useExecutionControl(
       availableMonitors: number[];
       initialStateIds?: string[] | null;
     }) => {
-      console.log("[EXECUTION_CONTROL] startExecution called (unified path)");
+      log.debug("startExecution called (unified path)");
       const { selectedWorkflow, selectedMonitors, workflows, initialStateIds } = params;
 
       try {
         if (!selectedWorkflow) {
           onLog?.("warning", "Please select a workflow before starting execution");
-          console.log("[EXECUTION_CONTROL] No workflow selected. Available workflows:", workflows);
+          log.debug("No workflow selected. Available workflows:", workflows);
           return;
         }
 
         const workflowName =
           workflows.find((w) => w.id === selectedWorkflow)?.name || selectedWorkflow;
-        console.log("[EXECUTION_CONTROL] Selected workflow:", selectedWorkflow, workflowName);
-        console.log("[EXECUTION_CONTROL] Selected monitors:", selectedMonitors);
+        log.debug("Selected workflow:", selectedWorkflow, workflowName);
+        log.debug("Selected monitors:", selectedMonitors);
 
         // Minimize window if auto-minimize is enabled
-        console.log("[EXECUTION_CONTROL] Auto-minimize check: autoMinimize=", autoMinimize);
+        log.debug("Auto-minimize check: autoMinimize=", autoMinimize);
         if (autoMinimize) {
-          console.log("[EXECUTION_CONTROL] Minimizing window...");
+          log.debug("Minimizing window...");
           await windowManager.minimize();
           onLog?.("info", "Window minimized - waiting 1 second before starting automation");
           await new Promise((resolve) => setTimeout(resolve, 1000));
         } else {
-          console.log("[EXECUTION_CONTROL] Skipping auto-minimize (disabled)");
+          log.debug("Skipping auto-minimize (disabled)");
         }
 
         // Build a single workflow step for the unified /execute-steps endpoint
@@ -142,10 +145,10 @@ export function useExecutionControl(
         };
 
         if (initialStateIds && initialStateIds.length > 0) {
-          console.log("[EXECUTION_CONTROL] Using initial state override:", initialStateIds);
+          log.debug("Using initial state override:", initialStateIds);
         }
 
-        console.log("[EXECUTION_CONTROL] Executing via unified /execute-steps:", step);
+        log.debug("Executing via unified /execute-steps:", step);
         setExecutionActive(true);
 
         const response = await tracedFetch(`${getApiBase()}/execute-steps`, {
@@ -158,7 +161,7 @@ export function useExecutionControl(
         });
 
         const result: ExecuteStepsResponse = await response.json();
-        console.log("[EXECUTION_CONTROL] Execute-steps response:", result);
+        log.debug("Execute-steps response:", result);
 
         if (result.success && result.data?.success) {
           const stepResult = result.data.steps[0];
@@ -177,7 +180,7 @@ export function useExecutionControl(
           // Save the workflow ID as the last used workflow
           try {
             await invoke("save_last_workflow_id", { workflowId: selectedWorkflow });
-            console.log("[EXECUTION_CONTROL] Saved last workflow ID:", selectedWorkflow);
+            log.debug("Saved last workflow ID:", selectedWorkflow);
           } catch (saveError) {
             console.error("[EXECUTION_CONTROL] Failed to save last workflow ID:", saveError);
           }
@@ -212,12 +215,12 @@ export function useExecutionControl(
    */
   const stopExecution = useCallback(async () => {
     try {
-      console.log("[EXECUTION_CONTROL] Stop execution called");
+      log.debug("Stop execution called");
       const result = await invoke<CommandResponse>("stop_execution");
       if (result.success) {
         setExecutionActive(false);
         onLog?.("info", "Execution stopped");
-        console.log("[EXECUTION_CONTROL] Calling restoreWindowIfMinimized");
+        log.debug("Calling restoreWindowIfMinimized");
         // Restore window if it was auto-minimized
         await windowManager.restoreIfMinimized();
       }

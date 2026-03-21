@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use super::{HandlerContext, StepHandler, StepHandlerResult};
 use crate::database::TestType as DbTestType;
-use crate::step_executor::executor::ExecutionStepConfig;
+use crate::step_executor::ExecutionStepConfig;
 use crate::test_executor::{
     execute_test, RepoTestConfig, TestCategory, TestDefinition, TestStatus,
     TestType as ExecutorTestType, VisionConfig,

@@ -7,6 +7,9 @@
 
 import { useState, useCallback, useRef } from "react";
 import type { CaptureSessionStatus, CooccurrenceExport, CaptureSessionRef } from "./types";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("useCaptureSession");
 // extractFingerprintHashes is used by useElements (auto-capture) and useStateExploration
 
 /**
@@ -73,13 +76,13 @@ export function useCaptureSession(fetchElements: () => Promise<void>): UseCaptur
     // Immediately capture current state
     fetchElements();
 
-    console.log(`[useCaptureSession] Capture session started: ${sessionId}`);
+    log.debug(`Capture session started: ${sessionId}`);
   }, [fetchElements]);
 
   const stopCaptureSession = useCallback(() => {
     captureSessionRef.current = null;
     setCaptureSession({ active: false });
-    console.log("[useCaptureSession] Capture session stopped");
+    log.debug("Capture session stopped");
   }, []);
 
   const generateCooccurrenceExport = useCallback(async (): Promise<CooccurrenceExport | null> => {
@@ -228,8 +231,8 @@ export function useCaptureSession(fetchElements: () => Promise<void>): UseCaptur
         captureScreenshots: session.captureScreenshots,
       };
 
-      console.log(
-        `[useCaptureSession] Co-occurrence export: ${allFingerprints.length} fingerprints, ${captures.length} captures, ${stateCandidates.length} state candidates`,
+      log.debug(
+        `Co-occurrence export: ${allFingerprints.length} fingerprints, ${captures.length} captures, ${stateCandidates.length} state candidates`,
       );
 
       setCooccurrenceData(result);

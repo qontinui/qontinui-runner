@@ -13,6 +13,9 @@ import type {
   TransitionAction,
 } from "@qontinui/shared-types";
 import type { ShowToastFn } from "./useToast";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("useElementDrag");
 
 interface ElementDragData {
   sourceStateId: string;
@@ -145,7 +148,7 @@ export function useElementDrag({
 
         const moveMsg = `Moved "${elementId}" from "${sourceState.name}" to "${targetState.name}"`;
         showToast?.(moveMsg, "success");
-        console.log(moveMsg);
+        log.debug(moveMsg);
       } else {
         const existing = findExistingTransition(transitions, sourceStateId, targetStateId);
         if (existing) {
@@ -172,7 +175,7 @@ export function useElementDrag({
         await onCreateTransition(transitionData);
         const createMsg = `Created transition "${transitionName}" from "${sourceState.name}" to "${targetState.name}"`;
         showToast?.(createMsg, "success");
-        console.log(createMsg);
+        log.debug(createMsg);
       }
 
       setDragData(null);

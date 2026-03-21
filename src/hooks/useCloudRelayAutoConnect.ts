@@ -12,6 +12,9 @@
 
 import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("useCloudRelayAutoConnect");
 
 interface CloudRelaySettingsData {
   enabled: boolean;
@@ -44,13 +47,13 @@ export function useCloudRelayAutoConnect() {
         const status = await invoke<CloudRelayStatus>("get_cloud_relay_status");
 
         if (status?.is_running) {
-          console.log("[CLOUD_RELAY_AUTO] Already running, skipping auto-connect");
+          log.debug("Already running, skipping auto-connect");
           return;
         }
 
-        console.log("[CLOUD_RELAY_AUTO] Auto-connecting cloud relay on startup...");
+        log.debug("Auto-connecting cloud relay on startup...");
         await invoke<string>("start_cloud_relay");
-        console.log("[CLOUD_RELAY_AUTO] Cloud relay auto-connect initiated");
+        log.debug("Cloud relay auto-connect initiated");
       } catch (err) {
         console.error("[CLOUD_RELAY_AUTO] Auto-connect failed:", err);
       }

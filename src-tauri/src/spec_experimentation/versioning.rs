@@ -192,17 +192,18 @@ pub fn snapshot_spec_version(
 
     info!(
         "Versioned spec '{}' → v{} (hash={}, {} groups, {} assertions)",
-        spec_id_owned, version_number, &content_hash_clone[..8], group_count, assertion_count
+        spec_id_owned,
+        version_number,
+        &content_hash_clone[..8],
+        group_count,
+        assertion_count
     );
 
     Ok(version)
 }
 
 /// Get the latest version of a spec.
-pub fn get_latest_version(
-    db: &CheckpointDb,
-    spec_id: &str,
-) -> Result<Option<SpecVersion>, String> {
+pub fn get_latest_version(db: &CheckpointDb, spec_id: &str) -> Result<Option<SpecVersion>, String> {
     let sid = spec_id.to_string();
     db.with_conn(move |conn| {
         let result = conn.query_row(
@@ -214,7 +215,7 @@ pub fn get_latest_version(
                ORDER BY version_number DESC
                LIMIT 1"#,
             params![sid],
-            |row| row_to_spec_version(row),
+            row_to_spec_version,
         );
         match result {
             Ok(v) => Ok(Some(v)),
@@ -246,7 +247,7 @@ pub fn get_version_history(
             .map_err(|e| format!("Failed to prepare version history query: {}", e))?;
 
         let rows = stmt
-            .query_map(params![sid, limit], |row| row_to_spec_version(row))
+            .query_map(params![sid, limit], row_to_spec_version)
             .map_err(|e| format!("Failed to query version history: {}", e))?;
 
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -255,10 +256,10 @@ pub fn get_version_history(
 
 /// Compute a structured diff between two spec JSON strings.
 pub fn diff_specs(old_json: &str, new_json: &str) -> Result<SpecDiff, String> {
-    let old: serde_json::Value = serde_json::from_str(old_json)
-        .map_err(|e| format!("Failed to parse old spec: {}", e))?;
-    let new: serde_json::Value = serde_json::from_str(new_json)
-        .map_err(|e| format!("Failed to parse new spec: {}", e))?;
+    let old: serde_json::Value =
+        serde_json::from_str(old_json).map_err(|e| format!("Failed to parse old spec: {}", e))?;
+    let new: serde_json::Value =
+        serde_json::from_str(new_json).map_err(|e| format!("Failed to parse new spec: {}", e))?;
 
     let old_groups = extract_groups(&old);
     let new_groups = extract_groups(&new);

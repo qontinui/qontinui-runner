@@ -7,6 +7,9 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("useRealtimeUpdates");
 import type {
   LearningUpdatePayload,
   CheckpointCreatedPayload,
@@ -91,7 +94,7 @@ export function useRealtimeUpdates(
   // Handle learning update event
   const handleLearningUpdate = useCallback(
     (payload: LearningUpdatePayload) => {
-      console.log("[useRealtimeUpdates] Learning update:", payload.task_id, payload.status);
+      log.debug("Learning update:", payload.task_id, payload.status);
       setLastLearningUpdate(payload);
       onLearningUpdate?.(payload);
     },
@@ -101,11 +104,7 @@ export function useRealtimeUpdates(
   // Handle checkpoint created event
   const handleCheckpointCreated = useCallback(
     (payload: CheckpointCreatedPayload) => {
-      console.log(
-        "[useRealtimeUpdates] Checkpoint created:",
-        payload.checkpoint_id,
-        payload.task_run_id,
-      );
+      log.debug("Checkpoint created:", payload.checkpoint_id, payload.task_run_id);
       setLastCheckpointCreated(payload);
       onCheckpointCreated?.(payload);
     },
@@ -115,7 +114,7 @@ export function useRealtimeUpdates(
   // Handle task status change event
   const handleTaskStatusChange = useCallback(
     (payload: TaskStatusChangePayload) => {
-      console.log("[useRealtimeUpdates] Task status change:", payload.task_run_id, payload.status);
+      log.debug("Task status change:", payload.task_run_id, payload.status);
       setLastTaskStatusChange(payload);
 
       // Update current task info
@@ -201,7 +200,7 @@ export function useRealtimeUpdates(
         if (isMounted) {
           unlistenRefs.current = unlistenFns;
           setIsConnected(true);
-          console.log("[useRealtimeUpdates] Connected to realtime events");
+          log.debug("Connected to realtime events");
         } else {
           // Cleanup if unmounted during setup
           unlistenFns.forEach((fn) => fn());
