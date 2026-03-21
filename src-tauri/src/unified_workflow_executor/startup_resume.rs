@@ -417,7 +417,7 @@ pub async fn resume_interrupted_workflows(
                                 workflow_architecture: None,
                                 agentic_verification_config: None,
                                 multi_agent_pipeline_config: None,
-                                comparison_architectures: None,
+
                                 acceptance_criteria: workflow.acceptance_criteria.clone(),
                             };
 
@@ -620,7 +620,7 @@ pub async fn resume_interrupted_workflows(
                                 workflow_architecture: None,
                                 agentic_verification_config: None,
                                 multi_agent_pipeline_config: None,
-                                comparison_architectures: None,
+
                                 project_path: crate::mcp::shared::current_project_path(),
                                 acceptance_criteria: workflow.acceptance_criteria.clone(),
                             };

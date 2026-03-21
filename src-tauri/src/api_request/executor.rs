@@ -10,7 +10,7 @@ use super::types::{
 use super::variable_resolver::VariableResolver;
 use crate::str_utils::truncate_str;
 use anyhow::{Context, Result};
-use jsonpath_rust::JsonPathFinder;
+use jsonpath_rust::JsonPath;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::fs;
@@ -338,9 +338,22 @@ impl ApiRequestExecutor {
         extractions
             .iter()
             .map(|ext| {
-                // Create finder and execute JSON path query
-                let finder = match JsonPathFinder::from_str(body, &ext.json_path) {
-                    Ok(f) => f,
+                // Parse body as JSON and execute JSON path query
+                let parsed_body: serde_json::Value = match serde_json::from_str(body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return ExtractionResult {
+                            variable_name: ext.variable_name.clone(),
+                            json_path: ext.json_path.clone(),
+                            extracted_value: ext.default_value.clone(),
+                            success: ext.default_value.is_some(),
+                            error: Some(format!("Invalid JSON body: {}", e)),
+                        };
+                    }
+                };
+
+                let results = match parsed_body.query(&ext.json_path) {
+                    Ok(r) => r,
                     Err(e) => {
                         return ExtractionResult {
                             variable_name: ext.variable_name.clone(),
@@ -351,9 +364,6 @@ impl ApiRequestExecutor {
                         };
                     }
                 };
-
-                // Execute query
-                let results = finder.find_slice();
 
                 if results.is_empty() {
                     ExtractionResult {
@@ -368,9 +378,7 @@ impl ApiRequestExecutor {
                         },
                     }
                 } else {
-                    // Get first result - JsonPathValue contains a reference to the data
-                    // Clone the result before calling to_data() since it takes ownership
-                    let value = match results[0].clone().to_data() {
+                    let value = match results[0] {
                         serde_json::Value::String(s) => s.clone(),
                         serde_json::Value::Number(n) => n.to_string(),
                         serde_json::Value::Bool(b) => b.to_string(),
@@ -577,17 +585,19 @@ fn extract_json_value(body: &Option<String>, json_path: &str) -> String {
         return String::new();
     };
 
-    let finder = match JsonPathFinder::from_str(body, json_path) {
-        Ok(f) => f,
+    let parsed_body: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
         Err(_) => return String::new(),
     };
 
-    let results = finder.find_slice();
+    let results = match parsed_body.query(json_path) {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
     if results.is_empty() {
         String::new()
     } else {
-        // Clone the result before calling to_data() since it takes ownership
-        value_to_string(&results[0].clone().to_data())
+        value_to_string(results[0])
     }
 }
 

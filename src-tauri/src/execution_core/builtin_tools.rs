@@ -573,8 +573,8 @@ fn execute_random_number(
     let max = inputs.get("max").and_then(|v| v.as_f64()).unwrap_or(1.0);
 
     use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let value = rng.gen_range(min..max);
+    let mut rng = rand::rng();
+    let value = rng.random_range(min..max);
 
     StepExecutionResult::success(step_id, None).with_output("value", json!(value))
 }

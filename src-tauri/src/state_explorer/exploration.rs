@@ -568,7 +568,7 @@ impl StateExplorer {
         };
 
         // Create RNG if not already set
-        let rng = self.rng.get_or_insert_with(StdRng::from_entropy);
+        let rng = self.rng.get_or_insert_with(StdRng::from_os_rng);
 
         let mut current_state = if !self.graph.initial_states.is_empty() {
             self.graph.initial_states[0].clone()
@@ -609,7 +609,7 @@ impl StateExplorer {
                     break;
                 }
 
-                let transition = transitions[rng.gen_range(0..transitions.len())];
+                let transition = transitions[rng.random_range(0..transitions.len())];
                 path.transitions.push(TransitionStep {
                     transition_id: transition.id.clone(),
                     from_state_id: current_state.clone(),

@@ -134,7 +134,7 @@ pub struct RandomPerturbator {
 impl RandomPerturbator {
     pub fn new() -> Self {
         Self {
-            rng: StdRng::from_entropy(),
+            rng: StdRng::from_os_rng(),
         }
     }
 
@@ -156,7 +156,7 @@ impl RandomPerturbator {
         let n_perturb = if dimensions.len() == 1 {
             1
         } else {
-            self.rng.gen_range(1..=2usize.min(dimensions.len()))
+            self.rng.random_range(1..=2usize.min(dimensions.len()))
         };
 
         // Pick which dimensions to perturb (without replacement)
@@ -176,22 +176,22 @@ impl RandomPerturbator {
         match dim {
             SearchDimension::Model { candidates } => {
                 if !candidates.is_empty() {
-                    let idx = self.rng.gen_range(0..candidates.len());
+                    let idx = self.rng.random_range(0..candidates.len());
                     config.model = Some(candidates[idx].clone());
                 }
             }
             SearchDimension::MultiAgentMode => {
-                config.multi_agent_mode = Some(self.rng.gen_bool(0.5));
+                config.multi_agent_mode = Some(self.rng.random_bool(0.5));
             }
             SearchDimension::MaxIterations { range } => {
                 let current = config.max_iterations.unwrap_or(range[0]);
-                let perturbation = self.rng.gen_range(0.7..1.3);
+                let perturbation = self.rng.random_range(0.7..1.3);
                 let new_val = ((current as f64) * perturbation).round() as u32;
                 config.max_iterations = Some(new_val.clamp(range[0], range[1]));
             }
             SearchDimension::ContextTokens { candidates } => {
                 if !candidates.is_empty() {
-                    let idx = self.rng.gen_range(0..candidates.len());
+                    let idx = self.rng.random_range(0..candidates.len());
                     config.max_context_tokens = Some(candidates[idx]);
                 }
             }
@@ -201,12 +201,12 @@ impl RandomPerturbator {
                     WorkflowArchitecture::AgenticVerification,
                     WorkflowArchitecture::MultiAgentPipeline,
                 ];
-                let idx = self.rng.gen_range(0..choices.len());
+                let idx = self.rng.random_range(0..choices.len());
                 config.workflow_architecture = Some(choices[idx].clone());
             }
             SearchDimension::Custom { name, candidates } => {
                 if !candidates.is_empty() {
-                    let idx = self.rng.gen_range(0..candidates.len());
+                    let idx = self.rng.random_range(0..candidates.len());
                     config.extra.insert(name.clone(), candidates[idx].clone());
                 }
             }

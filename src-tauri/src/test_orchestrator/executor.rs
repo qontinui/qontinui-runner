@@ -13,7 +13,7 @@ use crate::settings::{
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use jsonpath_rust::JsonPathFinder;
+use jsonpath_rust::JsonPath;
 use regex::Regex;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -433,19 +433,16 @@ impl TestOrchestrator {
             return Some(current.clone());
         }
 
-        // Use JSONPath library - serialize JSON to string for finder
-        let json_str = serde_json::to_string(json).ok()?;
-        let finder = match JsonPathFinder::from_str(&json_str, path) {
-            Ok(f) => f,
+        // Use JSONPath library
+        let results = match json.query(path) {
+            Ok(r) => r,
             Err(_) => return None,
         };
-
-        let results = finder.find_slice();
 
         match results.len() {
             0 => None,
             1 => {
-                let value = results[0].clone().to_data();
+                let value = results[0].clone();
                 // JSONPath library returns Null for non-existent paths; treat as None
                 if value.is_null() {
                     None
@@ -455,7 +452,7 @@ impl TestOrchestrator {
             }
             _ => {
                 let values: Vec<serde_json::Value> =
-                    results.into_iter().map(|r| r.to_data()).collect();
+                    results.into_iter().cloned().collect();
                 Some(serde_json::Value::Array(values))
             }
         }
