@@ -181,9 +181,7 @@ export function ContextCard({
         <div className="flex items-start gap-3">
           {/* Context Icon */}
           <div
-            className={`shrink-0 p-2 rounded-lg ${
-              context.enabled ? "bg-primary/10" : "bg-muted"
-            }`}
+            className={`shrink-0 p-2 rounded-lg ${context.enabled ? "bg-primary/10" : "bg-muted"}`}
           >
             <BookOpen
               className={`w-4 h-4 ${context.enabled ? "text-primary" : "text-muted-foreground"}`}

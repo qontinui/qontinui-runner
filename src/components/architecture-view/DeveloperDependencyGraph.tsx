@@ -122,10 +122,7 @@ const FeatureNode = memo(({ data }: { data: FeatureNodeData }) => {
       <Handle type="target" position={Position.Left} style={{ background: colors.border }} />
       <div className="px-3 py-2.5">
         <div className="flex items-center gap-1.5 mb-1">
-          <span
-            className="w-2 h-2 rounded-full shrink-0"
-            style={{ backgroundColor: colors.dot }}
-          />
+          <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: colors.dot }} />
           <span className="text-xs font-semibold text-white truncate flex-1">{feature.label}</span>
           <StatusDot status={feature.status} />
         </div>

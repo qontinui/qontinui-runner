@@ -113,9 +113,7 @@ export function SpecAttentionBanner() {
                 {reasonLabel(item.reason)}
               </span>
               <div className="flex-1 min-w-0">
-                <div className="text-sm text-zinc-200 font-medium truncate">
-                  {item.spec_id}
-                </div>
+                <div className="text-sm text-zinc-200 font-medium truncate">{item.spec_id}</div>
                 <div className="text-xs text-zinc-400 mt-0.5">{item.detail}</div>
               </div>
               <div className="text-right shrink-0">
@@ -135,14 +133,10 @@ export function SpecAttentionBanner() {
                   <span className="text-xs text-zinc-600">--</span>
                 )}
                 {item.broken_count > 0 && (
-                  <div className="text-xs text-red-400 mt-0.5">
-                    {item.broken_count} broken
-                  </div>
+                  <div className="text-xs text-red-400 mt-0.5">{item.broken_count} broken</div>
                 )}
                 {item.staleness_days > 0 && (
-                  <div className="text-xs text-yellow-400 mt-0.5">
-                    {item.staleness_days}d stale
-                  </div>
+                  <div className="text-xs text-yellow-400 mt-0.5">{item.staleness_days}d stale</div>
                 )}
               </div>
             </div>

@@ -160,7 +160,10 @@ export function GenerateFromStatesModal({
             <>
               {/* Workflow name */}
               <div>
-                <label htmlFor="generate-workflow-name" className="block text-sm font-medium text-zinc-400 mb-1.5">
+                <label
+                  htmlFor="generate-workflow-name"
+                  className="block text-sm font-medium text-zinc-400 mb-1.5"
+                >
                   Workflow Name
                 </label>
                 <input
@@ -175,7 +178,10 @@ export function GenerateFromStatesModal({
 
               {/* Description */}
               <div>
-                <label htmlFor="generate-workflow-description" className="block text-sm font-medium text-zinc-400 mb-1.5">
+                <label
+                  htmlFor="generate-workflow-description"
+                  className="block text-sm font-medium text-zinc-400 mb-1.5"
+                >
                   Description (optional)
                 </label>
                 <textarea
@@ -192,7 +198,10 @@ export function GenerateFromStatesModal({
               <div className="grid grid-cols-2 gap-4">
                 {/* Max iterations */}
                 <div>
-                  <label htmlFor="generate-max-iterations" className="block text-sm font-medium text-zinc-400 mb-1.5">
+                  <label
+                    htmlFor="generate-max-iterations"
+                    className="block text-sm font-medium text-zinc-400 mb-1.5"
+                  >
                     Max Iterations
                   </label>
                   <input
@@ -209,7 +218,10 @@ export function GenerateFromStatesModal({
 
                 {/* State timeout */}
                 <div>
-                  <label htmlFor="generate-state-timeout" className="block text-sm font-medium text-zinc-400 mb-1.5">
+                  <label
+                    htmlFor="generate-state-timeout"
+                    className="block text-sm font-medium text-zinc-400 mb-1.5"
+                  >
                     State Timeout (sec)
                   </label>
                   <input
@@ -228,7 +240,11 @@ export function GenerateFromStatesModal({
               {/* Toggle options */}
               <div className="space-y-3">
                 {/* Include setup navigation */}
-                <label htmlFor="generate-include-setup-nav" aria-label="Include Setup Navigation" className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors">
+                <label
+                  htmlFor="generate-include-setup-nav"
+                  aria-label="Include Setup Navigation"
+                  className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors"
+                >
                   <div>
                     <span className="text-sm font-medium text-zinc-300">
                       Include Setup Navigation
@@ -247,7 +263,11 @@ export function GenerateFromStatesModal({
                 </label>
 
                 {/* Include AI contexts */}
-                <label htmlFor="generate-include-contexts" aria-label="Include AI Contexts" className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors">
+                <label
+                  htmlFor="generate-include-contexts"
+                  aria-label="Include AI Contexts"
+                  className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors"
+                >
                   <div>
                     <span className="text-sm font-medium text-zinc-300">Include AI Contexts</span>
                     <p className="text-xs text-zinc-500 mt-0.5">
@@ -264,7 +284,11 @@ export function GenerateFromStatesModal({
                 </label>
 
                 {/* Include AI summary */}
-                <label htmlFor="generate-include-summary" aria-label="Include AI Summary" className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors">
+                <label
+                  htmlFor="generate-include-summary"
+                  aria-label="Include AI Summary"
+                  className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors"
+                >
                   <div>
                     <span className="text-sm font-medium text-zinc-300">Include AI Summary</span>
                     <p className="text-xs text-zinc-500 mt-0.5">

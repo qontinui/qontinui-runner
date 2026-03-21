@@ -343,7 +343,8 @@ function AddAssertionForm({
   onCancel: () => void;
 }) {
   const [formState, formDispatch] = useReducer(assertionFormReducer, ASSERTION_FORM_INIT);
-  const { description, severity, assertionType, category, targetText, relatedTargetText, minGap } = formState;
+  const { description, severity, assertionType, category, targetText, relatedTargetText, minGap } =
+    formState;
   const setF = (field: keyof AssertionFormState, value: string | number) =>
     formDispatch({ type: "SET", field, value });
 
@@ -484,8 +485,11 @@ function AddAssertionForm({
       )}
       {assertionType === "minSpacing" && (
         <div className="flex items-center gap-2">
-          <label htmlFor="assertion-min-gap" className="text-[10px] text-muted-foreground">Min gap (px):</label>
-          <input id="assertion-min-gap"
+          <label htmlFor="assertion-min-gap" className="text-[10px] text-muted-foreground">
+            Min gap (px):
+          </label>
+          <input
+            id="assertion-min-gap"
             type="number"
             value={minGap}
             onChange={(e) => setF("minGap", Number(e.target.value))}
@@ -542,7 +546,15 @@ function SetupActionsEditor({
 }) {
   const [edState, edDispatch] = useReducer(
     (s: Record<string, unknown>, a: { k: string; v: unknown }) => ({ ...s, [a.k]: a.v }),
-    { expanded: actions.length > 0, showAddForm: false, newType: "click", newTargetText: "", newValue: "", newUrl: "", newMs: 1000 },
+    {
+      expanded: actions.length > 0,
+      showAddForm: false,
+      newType: "click",
+      newTargetText: "",
+      newValue: "",
+      newUrl: "",
+      newMs: 1000,
+    },
   );
   const expanded = edState.expanded as boolean;
   const showAddForm = edState.showAddForm as boolean;
@@ -1280,7 +1292,7 @@ function ArchitectureOverview({
             Tech Stack ({config.techStack.length})
           </h3>
           <div className="space-y-1">
-            {config.techStack.map((entry, i) => (
+            {config.techStack.map((entry) => (
               <TechStackRow key={entry.name} entry={entry} />
             ))}
           </div>
@@ -1294,7 +1306,7 @@ function ArchitectureOverview({
             Directory Structure ({config.directories.length})
           </h3>
           <div className="space-y-1">
-            {config.directories.map((dir, i) => (
+            {config.directories.map((dir) => (
               <div
                 key={dir.path}
                 className="flex items-center gap-2 px-3 py-1.5 rounded bg-white/[0.02] border border-white/5"
@@ -1377,7 +1389,7 @@ function ArchitectureOverview({
             Feature Dependencies ({config.dependencies.length})
           </h3>
           <div className="space-y-1">
-            {config.dependencies.map((dep, i) => (
+            {config.dependencies.map((dep) => (
               <div
                 key={`${dep.featureId}-${dep.dependsOn}`}
                 className="flex items-center gap-2 px-3 py-1.5 rounded bg-white/[0.02] border border-white/5"
@@ -1431,12 +1443,8 @@ function SchemaFieldRow({ field, depth = 0 }: { field: SchemaField; depth?: numb
           </span>
         )}
       </div>
-      {field.fields?.map((nested, i) => (
-        <SchemaFieldRow
-          key={`${field.name}-${nested.name}`}
-          field={nested}
-          depth={depth + 1}
-        />
+      {field.fields?.map((nested) => (
+        <SchemaFieldRow key={`${field.name}-${nested.name}`} field={nested} depth={depth + 1} />
       ))}
       {field.items && (
         <SchemaFieldRow
@@ -1473,7 +1481,7 @@ function EndpointRow({ endpoint }: { endpoint: ApiEndpoint }) {
         <div>
           <span className="text-[10px] font-medium text-muted-foreground">Path params:</span>
           <div className="mt-0.5 border-l-2 border-white/5">
-            {endpoint.pathParams.map((p, i) => (
+            {endpoint.pathParams.map((p) => (
               <SchemaFieldRow key={`path-${p.name}`} field={p} />
             ))}
           </div>
@@ -1483,7 +1491,7 @@ function EndpointRow({ endpoint }: { endpoint: ApiEndpoint }) {
         <div>
           <span className="text-[10px] font-medium text-muted-foreground">Query params:</span>
           <div className="mt-0.5 border-l-2 border-white/5">
-            {endpoint.queryParams.map((p, i) => (
+            {endpoint.queryParams.map((p) => (
               <SchemaFieldRow key={`query-${p.name}`} field={p} />
             ))}
           </div>
@@ -1493,7 +1501,7 @@ function EndpointRow({ endpoint }: { endpoint: ApiEndpoint }) {
         <div>
           <span className="text-[10px] font-medium text-muted-foreground">Request body:</span>
           <div className="mt-0.5 border-l-2 border-cyan-500/20">
-            {endpoint.requestBody.map((f, i) => (
+            {endpoint.requestBody.map((f) => (
               <SchemaFieldRow key={`req-${f.name}`} field={f} />
             ))}
           </div>
@@ -1503,7 +1511,7 @@ function EndpointRow({ endpoint }: { endpoint: ApiEndpoint }) {
         <div>
           <span className="text-[10px] font-medium text-muted-foreground">Response:</span>
           <div className="mt-0.5 border-l-2 border-green-500/20">
-            {endpoint.responseBody.map((f, i) => (
+            {endpoint.responseBody.map((f) => (
               <SchemaFieldRow key={`res-${f.name}`} field={f} />
             ))}
           </div>
@@ -1540,7 +1548,7 @@ function ModelCard({ model }: { model: DataModel }) {
       <p className="text-[10px] text-muted-foreground leading-relaxed">{model.description}</p>
 
       <div className="border-l-2 border-white/5">
-        {model.fields.map((f, i) => (
+        {model.fields.map((f) => (
           <SchemaFieldRow key={`${model.id}-${f.name}`} field={f} />
         ))}
       </div>
@@ -1548,7 +1556,7 @@ function ModelCard({ model }: { model: DataModel }) {
       {model.relations && model.relations.length > 0 && (
         <div className="flex items-center gap-2 flex-wrap pt-1 border-t border-white/5">
           <span className="text-[10px] font-medium text-muted-foreground">Relations:</span>
-          {model.relations.map((rel, i) => (
+          {model.relations.map((rel) => (
             <span
               key={`${rel.modelId}-${rel.type}`}
               className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground border border-white/10"
@@ -1705,7 +1713,7 @@ function EntityCard({ entity }: { entity: DataEntity }) {
       <p className="text-[10px] text-muted-foreground leading-relaxed">{entity.description}</p>
 
       <div className="border-l-2 border-white/5">
-        {entity.columns.map((col, i) => (
+        {entity.columns.map((col) => (
           <ColumnRow key={`${entity.id}-${col.name}`} column={col} />
         ))}
       </div>
@@ -1713,7 +1721,7 @@ function EntityCard({ entity }: { entity: DataEntity }) {
       {entity.indexes && entity.indexes.length > 0 && (
         <div className="flex items-center gap-2 flex-wrap pt-1 border-t border-white/5">
           <span className="text-[10px] font-medium text-muted-foreground">Indexes:</span>
-          {entity.indexes.map((idx, i) => (
+          {entity.indexes.map((idx) => (
             <span
               key={idx.name}
               className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground border border-white/10"
@@ -1842,7 +1850,7 @@ function DataOverview({
             Seed Data ({config.seeds.length})
           </h3>
           <div className="space-y-1">
-            {config.seeds.map((seed, i) => (
+            {config.seeds.map((seed) => (
               <div
                 key={`${seed.entityId}-${seed.environment}`}
                 className="flex items-center gap-2 px-3 py-1.5 rounded bg-white/[0.02] border border-white/5"
@@ -2090,7 +2098,7 @@ function DependencyOverview({
                     {cluster.description}
                   </p>
                   <div className="flex flex-wrap gap-1 mt-1.5">
-                    {cluster.artifacts.map((ref, i) => (
+                    {cluster.artifacts.map((ref) => (
                       <span
                         key={`${ref.artifactId}-${ref.kind}`}
                         className={`text-[10px] px-1.5 py-0.5 rounded bg-white/5 border border-white/10 ${ARTIFACT_COLORS[ref.kind] || "text-muted-foreground"}`}
@@ -2593,7 +2601,23 @@ export function SpecDetailPanel({
           {activeTab === "triage" && (
             <SpecTriageView
               specId={selectedSpec.specId}
-              specConfig={selectedSpec.config as unknown as { description?: string; groups: Array<{ id: string; name: string; category?: string; assertions: Array<{ id: string; description: string; severity: string; assertionType: string; enabled?: boolean }> }> }}
+              specConfig={
+                selectedSpec.config as unknown as {
+                  description?: string;
+                  groups: Array<{
+                    id: string;
+                    name: string;
+                    category?: string;
+                    assertions: Array<{
+                      id: string;
+                      description: string;
+                      severity: string;
+                      assertionType: string;
+                      enabled?: boolean;
+                    }>;
+                  }>;
+                }
+              }
               onUpdateSpec={onUpdateSpec}
               onFixCode={onFixCode}
             />

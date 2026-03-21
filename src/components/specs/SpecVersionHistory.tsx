@@ -78,8 +78,8 @@ export function SpecVersionHistory({ specId }: SpecVersionHistoryProps) {
       <div className="p-4 space-y-2">
         <div className="text-sm text-zinc-400 font-medium">No version history yet</div>
         <div className="text-xs text-zinc-500">
-          Run a spec verification workflow to start tracking compliance over time.
-          Each run records assertion pass rates and overall scores.
+          Run a spec verification workflow to start tracking compliance over time. Each run records
+          assertion pass rates and overall scores.
         </div>
       </div>
     );
@@ -113,7 +113,8 @@ export function SpecVersionHistory({ specId }: SpecVersionHistoryProps) {
 
                 <div className="flex-1 min-w-0">
                   <div className="text-xs text-zinc-400">
-                    {date.toLocaleDateString()} {date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    {date.toLocaleDateString()}{" "}
+                    {date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                   </div>
                 </div>
 

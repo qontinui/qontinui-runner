@@ -73,9 +73,7 @@ function ScriptRow({
       <StepStatusBadge status={script.status} iconOnly size="md" />
 
       {/* Language badge */}
-      <Badge
-        className={cn("text-xs shrink-0 font-mono border", getLanguageColor(script.language))}
-      >
+      <Badge className={cn("text-xs shrink-0 font-mono border", getLanguageColor(script.language))}>
         <FileCode className="h-3 w-3 mr-1" />
         {script.language.toUpperCase()}
       </Badge>

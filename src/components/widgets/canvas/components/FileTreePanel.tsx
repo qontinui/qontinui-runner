@@ -46,7 +46,7 @@ export function FileTreePanel({ data, size }: CanvasPanelComponentProps) {
         </div>
       )}
       <div className={cn("font-mono", isCompact ? "text-[10px]" : "text-xs")}>
-        {entries.map((entry, idx) => {
+        {entries.map((entry) => {
           const Icon = entry.type === "directory" ? Folder : File;
           const statusClass = entry.status ? STATUS_CLASSES[entry.status] : "text-foreground";
           const prefix = entry.status ? STATUS_PREFIX[entry.status] : " ";

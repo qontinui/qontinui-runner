@@ -8,7 +8,6 @@
 import { useState, useEffect } from "react";
 import { X, Play, Loader2, GitBranch, BarChart3, Check } from "lucide-react";
 import { Button } from "../ui";
-import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 type WorkflowArchitecture = "traditional" | "agentic_verification" | "multi_agent_pipeline";
 
@@ -52,7 +51,7 @@ export function RunOptionsDialog({
   onRun,
   defaultArchitecture = "traditional",
   isLoading = false,
-  workflowId,
+  workflowId: _workflowId,
 }: RunOptionsDialogProps) {
   const [selected, setSelected] = useState<Set<WorkflowArchitecture>>(
     new Set([(defaultArchitecture as WorkflowArchitecture) || "traditional"]),

@@ -84,7 +84,6 @@ const SPECS_PAGE_INITIAL: SpecsPageState = {
 // SpecsPage component
 // ============================================================================
 
-
 /** Save a workflow via the API and navigate to builder */
 async function saveWorkflowAndNavigate(
   workflowPayload: Record<string, unknown>,
@@ -157,8 +156,13 @@ interface SpecsPageProps {
 export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
   const state = useSpecsState();
   const [pageState, dispatch] = useReducer(specsPageReducer, SPECS_PAGE_INITIAL);
-  const { isSavingWorkflow, forcePromptOnly, includeRegressionChecks, viewMode, generateSpecRequest } =
-    pageState;
+  const {
+    isSavingWorkflow,
+    forcePromptOnly,
+    includeRegressionChecks,
+    viewMode,
+    generateSpecRequest,
+  } = pageState;
   const { issues: knownIssues, loadIssuesForSpec } = useKnownIssues();
 
   // Triage resolution context — set when user clicks "Update Spec" in SpecTriageView
@@ -278,7 +282,8 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
   // Triage: "Fix Code" — create a scoped workflow for the broken group
   const handleTriageFixCode = useCallback(
     async (groupId: string) => {
-      if (!state.selectedSpec || state.selectedSpec.kind !== "page-spec" || isSavingWorkflow) return;
+      if (!state.selectedSpec || state.selectedSpec.kind !== "page-spec" || isSavingWorkflow)
+        return;
 
       const specConfig = state.selectedSpec.config as unknown as BuildSpecConfig;
       const groupName =

@@ -21,7 +21,15 @@ interface TraceRowProps {
   onSelectSpan: (span: TraceSpan) => void;
 }
 
-function TraceRow({ index, style, filteredNodes, traceStartMs, traceDurationMs, selectedSpanId, onSelectSpan }: RowComponentProps<TraceRowProps>) {
+function TraceRow({
+  index,
+  style,
+  filteredNodes,
+  traceStartMs,
+  traceDurationMs,
+  selectedSpanId,
+  onSelectSpan,
+}: RowComponentProps<TraceRowProps>) {
   const node = filteredNodes[index];
   return (
     <div style={style}>

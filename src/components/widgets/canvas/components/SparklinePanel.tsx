@@ -35,7 +35,7 @@ export function SparklinePanel({ data, size }: CanvasPanelComponentProps) {
 
   return (
     <div className="space-y-1">
-      {series.map((s, seriesIdx) => {
+      {series.map((s) => {
         // Transform data: pass = +1, fail = -1
         const chartData = s.values.map((v) => ({
           iteration: v.iteration,

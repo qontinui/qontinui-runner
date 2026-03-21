@@ -199,7 +199,10 @@ export function SpecCoverageDashboard() {
                   key={entry.spec_id}
                   className="border-b border-zinc-800/50 hover:bg-zinc-700/30"
                 >
-                  <td className="py-2 px-3 text-zinc-300 truncate max-w-[240px]" title={entry.file_name}>
+                  <td
+                    className="py-2 px-3 text-zinc-300 truncate max-w-[240px]"
+                    title={entry.file_name}
+                  >
                     {entry.spec_id}
                   </td>
                   <td className="py-2 px-3 text-right text-zinc-400">{entry.group_count}</td>

@@ -283,9 +283,7 @@ function ActionRow({ action, isActive }: { action: ActionItem; isActive: boolean
     >
       <StatusIcon status={action.status} />
 
-      <span className="w-14 font-mono text-xs text-muted-foreground shrink-0">
-        {relativeTime}
-      </span>
+      <span className="w-14 font-mono text-xs text-muted-foreground shrink-0">{relativeTime}</span>
 
       <Badge className={cn(colorClass, "text-xs shrink-0")}>{action.action_type}</Badge>
 

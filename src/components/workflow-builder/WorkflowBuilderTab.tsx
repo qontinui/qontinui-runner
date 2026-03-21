@@ -911,10 +911,7 @@ function PerPhaseModelSelect() {
             const model = cfg?.model ?? "";
             return (
               <div key={phase.key} className="flex items-center gap-2">
-                <span
-                  className="text-xs text-zinc-400 w-28 shrink-0 truncate"
-                  title={phase.label}
-                >
+                <span className="text-xs text-zinc-400 w-28 shrink-0 truncate" title={phase.label}>
                   {phase.label}
                 </span>
                 <select

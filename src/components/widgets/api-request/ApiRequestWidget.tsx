@@ -79,9 +79,7 @@ function RequestRow({
       <StepStatusBadge status={request.status} iconOnly size="md" />
 
       {/* Method badge */}
-      <Badge
-        className={cn("text-xs shrink-0 font-mono border", getMethodColor(request.method))}
-      >
+      <Badge className={cn("text-xs shrink-0 font-mono border", getMethodColor(request.method))}>
         {request.method}
       </Badge>
 

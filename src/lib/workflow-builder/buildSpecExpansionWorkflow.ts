@@ -34,24 +34,12 @@ export interface BuildSpecExpansionWorkflowInput {
 export function buildSpecExpansionWorkflow(
   input: BuildSpecExpansionWorkflowInput,
 ): UnifiedWorkflow {
-  const {
-    specConfig,
-    specId,
-    pageUrl,
-    elementSource = "control",
-    maxIterations = 3,
-  } = input;
+  const { specConfig, specId, pageUrl, elementSource = "control", maxIterations = 3 } = input;
 
-  const resolvedPageUrl =
-    pageUrl ??
-    (specConfig.metadata?.pageUrl as string | undefined) ??
-    "";
+  const resolvedPageUrl = pageUrl ?? (specConfig.metadata?.pageUrl as string | undefined) ?? "";
 
   const existingGroupNames = specConfig.groups.map((g) => g.name).join(", ");
-  const existingAssertionCount = specConfig.groups.reduce(
-    (sum, g) => sum + g.assertions.length,
-    0,
-  );
+  const existingAssertionCount = specConfig.groups.reduce((sum, g) => sum + g.assertions.length, 0);
 
   const specSummary = JSON.stringify(
     {
@@ -89,9 +77,7 @@ export function buildSpecExpansionWorkflow(
         name: "Snapshot current page elements",
         ui_bridge_action: "snapshot",
         ui_bridge_snapshot_target: snapshotTarget,
-        ...(resolvedPageUrl
-          ? { ui_bridge_navigate_url: resolvedPageUrl }
-          : {}),
+        ...(resolvedPageUrl ? { ui_bridge_navigate_url: resolvedPageUrl } : {}),
       } as unknown as UnifiedWorkflow["verification_steps"][number],
       {
         id: crypto.randomUUID(),

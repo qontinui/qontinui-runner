@@ -221,9 +221,7 @@ function ActivityLine({ activity, phase }: { activity: string; phase: string | n
 
   return (
     <div className={cn("flex items-start gap-2 rounded-md px-2.5 py-1.5 text-xs", colors.bg)}>
-      <span
-        className={cn("mt-0.5 h-1.5 w-1.5 rounded-full shrink-0 animate-pulse", colors.dot)}
-      />
+      <span className={cn("mt-0.5 h-1.5 w-1.5 rounded-full shrink-0 animate-pulse", colors.dot)} />
       <span className={cn("leading-relaxed", colors.text)}>{activity}</span>
     </div>
   );

@@ -130,7 +130,18 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
           ? `Implement from Spec — ${fileName.replace(".spec.uibridge.json", "")}`
           : `Update from Spec — ${fileName.replace(".spec.uibridge.json", "")}`,
     });
-  }, [loadedData, selectedSpecIds, agenticPrompt, maxIterations, elementSource, generatorType, genMeta, states, workflowMode, fileName]);
+  }, [
+    loadedData,
+    selectedSpecIds,
+    agenticPrompt,
+    maxIterations,
+    elementSource,
+    generatorType,
+    genMeta,
+    states,
+    workflowMode,
+    fileName,
+  ]);
 
   const stepDefs: { id: Step; label: string; icon: React.ReactNode }[] = [
     { id: "load", label: "Load Specs", icon: <FileJson className="w-4 h-4" /> },
@@ -141,8 +152,16 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
 
   const modeOptions: { value: WorkflowMode; label: string; desc: string }[] = [
     { value: "verify", label: "Verify Only", desc: "Run spec assertions against existing UI" },
-    { value: "implement", label: "Implement from Spec", desc: "Generate code to satisfy all assertions" },
-    { value: "update", label: "Update from Changes", desc: "Implement only changed/added assertions" },
+    {
+      value: "implement",
+      label: "Implement from Spec",
+      desc: "Generate code to satisfy all assertions",
+    },
+    {
+      value: "update",
+      label: "Update from Changes",
+      desc: "Implement only changed/added assertions",
+    },
   ];
 
   return (
@@ -152,7 +171,9 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
         {stepDefs.map((step, i) => (
           <div key={step.id} className="flex items-center">
             <button
-              onClick={() => { if (step.id === "load" || loadedData) setCurrentStep(step.id); }}
+              onClick={() => {
+                if (step.id === "load" || loadedData) setCurrentStep(step.id);
+              }}
               disabled={step.id !== "load" && !loadedData}
               className={`flex items-center gap-2 px-3 py-1.5 text-xs rounded-md transition-colors ${
                 currentStep === step.id
@@ -169,7 +190,11 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
 
         {loadedData && (
           <span className="text-xs text-muted-foreground ml-auto">
-            {generatorType === "snapshot" ? "Snapshot" : generatorType === "navigation" ? "Navigation" : "Spec"}{" "}
+            {generatorType === "snapshot"
+              ? "Snapshot"
+              : generatorType === "navigation"
+                ? "Navigation"
+                : "Spec"}{" "}
             &middot; {loadedData.groups.length} groups
           </span>
         )}
@@ -214,7 +239,9 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
             <div className="flex-1 overflow-auto">
               {/* Workflow mode selector */}
               <div className="px-4 pt-4 pb-2">
-                <div className="text-xs text-muted-foreground uppercase tracking-wide mb-2">Workflow Mode</div>
+                <div className="text-xs text-muted-foreground uppercase tracking-wide mb-2">
+                  Workflow Mode
+                </div>
                 <div className="flex gap-2">
                   {modeOptions.map((opt) => (
                     <button

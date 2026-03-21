@@ -276,7 +276,10 @@ function CoverageGapsView({ records }: { records: SpecAccuracyRecord[] }) {
                 </div>
                 <div className="flex flex-wrap gap-1">
                   {detail.uncovered_elements.slice(0, 20).map((el) => (
-                    <span key={el} className="text-xs bg-zinc-700 text-zinc-300 px-2 py-0.5 rounded">
+                    <span
+                      key={el}
+                      className="text-xs bg-zinc-700 text-zinc-300 px-2 py-0.5 rounded"
+                    >
                       {el}
                     </span>
                   ))}

@@ -88,7 +88,7 @@ export function useConnection(
         return false;
       }
     },
-    [fetchElements, clearElementState],
+    [fetchElements],
   );
 
   // =========================================================================

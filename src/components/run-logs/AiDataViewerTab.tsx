@@ -2566,9 +2566,7 @@ function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
                 </div>
 
                 {/* Duration */}
-                <span className="text-xs text-muted-foreground shrink-0">
-                  {call.duration_ms}ms
-                </span>
+                <span className="text-xs text-muted-foreground shrink-0">{call.duration_ms}ms</span>
 
                 {/* Expand chevron */}
                 {isExpanded ? (

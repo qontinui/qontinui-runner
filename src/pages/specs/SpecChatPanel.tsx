@@ -464,9 +464,8 @@ function ChatEmptyState({
   );
 }
 
-
 /** Build the first message with spec context for a new session */
-function buildFirstMessage(
+function _buildFirstMessage(
   text: string,
   pendingCreateType: CreateSpecType | null,
   selectedSpec: LoadedSpec | null,
@@ -475,7 +474,11 @@ function buildFirstMessage(
     if (selectedSpec && selectedSpec.kind === "page-spec") {
       return {
         message: buildSpecCreationWithMergeContext(
-          { specId: selectedSpec.specId, config: selectedSpec.config, appName: selectedSpec.appName },
+          {
+            specId: selectedSpec.specId,
+            config: selectedSpec.config,
+            appName: selectedSpec.appName,
+          },
           text,
         ),
         setTargetSpecId: selectedSpec.specId,
@@ -497,7 +500,11 @@ ${text}`,
     if (selectedSpec && selectedSpec.kind === "architecture") {
       return {
         message: buildSpecCreationWithMergeContext(
-          { specId: selectedSpec.specId, config: selectedSpec.config as unknown as SpecConfig, appName: selectedSpec.appName },
+          {
+            specId: selectedSpec.specId,
+            config: selectedSpec.config as unknown as SpecConfig,
+            appName: selectedSpec.appName,
+          },
           text,
         ),
         setTargetSpecId: selectedSpec.specId,
@@ -516,11 +523,13 @@ ${text}`,
     };
   }
   if (selectedSpec) {
-    return { message: `${buildSpecContext(selectedSpec)}
+    return {
+      message: `${buildSpecContext(selectedSpec)}
 
 ---
 
-${text}` };
+${text}`,
+    };
   }
   return null;
 }
@@ -916,25 +925,32 @@ Update the spec accordingly, preserving assertion IDs where possible.`,
     onBuildWorkflow(selectedSpec);
   }, [selectedSpec, onBuildWorkflow]);
 
-  const handleRegenerateSpec = useCallback((specKind: "page-spec" | "architecture") => {
-    if (!selectedSpec) return;
-    chatDispatch({ type: "SET_PENDING_CREATE_TYPE", value: specKind });
-    chatDispatch({ type: "SET_TARGET_SPEC_ID", value: selectedSpec.specId });
-    chatDispatch({ type: "SET_SHOW_CREATE_ACTIONS", value: true });
-    const val = specKind === "page-spec"
-      ? `Page: ${selectedSpec.config.description || selectedSpec.specId}
+  const handleRegenerateSpec = useCallback(
+    (specKind: "page-spec" | "architecture") => {
+      if (!selectedSpec) return;
+      chatDispatch({ type: "SET_PENDING_CREATE_TYPE", value: specKind });
+      chatDispatch({ type: "SET_TARGET_SPEC_ID", value: selectedSpec.specId });
+      chatDispatch({ type: "SET_SHOW_CREATE_ACTIONS", value: true });
+      const val =
+        specKind === "page-spec"
+          ? `Page: ${selectedSpec.config.description || selectedSpec.specId}
 Spec ID: ${selectedSpec.specId}`
-      : `Project: ${(selectedSpec.config as unknown as { projectName?: string }).projectName || selectedSpec.specId}
+          : `Project: ${(selectedSpec.config as unknown as { projectName?: string }).projectName || selectedSpec.specId}
 Description: ${selectedSpec.config.description || ""}`;
-    chatDispatch({ type: "SET_INPUT", value: val });
-    textareaRef.current?.focus();
-  }, [selectedSpec]);
+      chatDispatch({ type: "SET_INPUT", value: val });
+      textareaRef.current?.focus();
+    },
+    [selectedSpec],
+  );
 
-  const handleSelectCreateType = useCallback((specType: CreateSpecType) => {
-    chatDispatch({ type: "SET_PENDING_CREATE_TYPE", value: specType });
-    if (pendingCreateType !== specType) chatDispatch({ type: "SET_INPUT", value: "" });
-    textareaRef.current?.focus();
-  }, [pendingCreateType]);
+  const handleSelectCreateType = useCallback(
+    (specType: CreateSpecType) => {
+      chatDispatch({ type: "SET_PENDING_CREATE_TYPE", value: specType });
+      if (pendingCreateType !== specType) chatDispatch({ type: "SET_INPUT", value: "" });
+      textareaRef.current?.focus();
+    },
+    [pendingCreateType],
+  );
 
   const isProcessing = session.sessionState === "processing";
   const hasMessages = session.messages.length > 0;
