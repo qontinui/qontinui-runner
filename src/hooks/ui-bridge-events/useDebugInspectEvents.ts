@@ -73,30 +73,15 @@ export function useDebugInspectEvents(
         }
 
         case "get_specs": {
-          // Read from the SpecStore first (populated by BundledSpecsLoader).
-          // Fall back to the spec-registry module directly — this handles the
-          // case where HMR reloads invalidate the useEffect that populates the
-          // store, or where dual module resolution creates separate singletons.
+          // Read from the globalThis-backed SpecStore (populated by
+          // BundledSpecsLoader). Falls back to the spec-registry module
+          // directly if the store is empty (e.g. after HMR invalidation).
           const store = getGlobalSpecStore();
           const allConfigs = store.getAll();
           let specs: Array<{ specId: string; config: unknown }> = [];
           for (const [id, config] of allConfigs) {
             specs.push({ specId: id, config });
           }
-          // Also check the UIBridgeProvider's store instance
-          const uiBridgeGlobal = getUIBridgeGlobal();
-          const providerStore = (uiBridgeGlobal as Record<string, unknown> | undefined)?.specs as
-            | { getGlobalSpecStore?: () => { getAll: () => Map<string, unknown> } }
-            | undefined;
-          const pStore = providerStore?.getGlobalSpecStore?.();
-          if (pStore && pStore !== store) {
-            for (const [id, config] of pStore.getAll()) {
-              if (!specs.some((s) => s.specId === id)) {
-                specs.push({ specId: id, config });
-              }
-            }
-          }
-          // If stores are empty, fall back to spec-registry module directly
           if (specs.length === 0) {
             const bundled = getAllSpecs();
             specs = bundled.map((s) => ({ specId: s.specId, config: s.config }));

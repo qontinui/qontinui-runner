@@ -338,7 +338,7 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route("/constraints/active", get(get_active_constraints))
         .route("/constraints/config", get(get_config).post(write_config))
         .route(
-            "/constraints/results/:task_run_id",
+            "/constraints/results/{task_run_id}",
             get(get_constraint_results),
         )
         .route("/constraints/validate", post(validate_config))

@@ -11,7 +11,10 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { createLogger } from "@/lib/logger";
 import { LogStore, LogFilter, LogFormatter, TimestampFormatter, ImageLogHandler } from "./logging";
+
+const logger = createLogger("LogManager");
 import type {
   LogEntry,
   ImageRecognitionEntry,
@@ -75,7 +78,7 @@ class LogManager {
 
   private async doInitialize(): Promise<void> {
     try {
-      console.log("[LogManager] Initializing - loading conversation history...");
+      logger.debug("Initializing - loading conversation history...");
 
       // Rust returns snake_case field names
       interface RustAiOutputEntry {
@@ -113,9 +116,9 @@ class LogManager {
         }));
 
         this.logStore.loadAiOutputLogs(entries);
-        console.log(`[LogManager] Loaded ${entries.length} conversation entries from history`);
+        logger.debug(`Loaded ${entries.length} conversation entries from history`);
       } else {
-        console.log("[LogManager] No conversation history to load");
+        logger.debug("No conversation history to load");
       }
 
       this.initialized = true;

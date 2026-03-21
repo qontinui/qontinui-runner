@@ -19,6 +19,9 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { getWsBase } from "@/lib/runner-api";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("WebSocketEvents");
 
 // ============================================================================
 // Types
@@ -238,7 +241,7 @@ export function useWebSocketEvents(
           }
           default:
             // Unknown channel - could be other event types, ignore silently
-            console.debug("[useWebSocketEvents] Unknown channel:", message.channel);
+            logger.debug("Unknown channel:", message.channel);
         }
       } catch (err) {
         console.error("[useWebSocketEvents] Failed to parse message:", err);
@@ -268,7 +271,7 @@ export function useWebSocketEvents(
       const ws = new WebSocket(url);
 
       ws.onopen = () => {
-        console.log("[useWebSocketEvents] Connected to", url);
+        logger.info("Connected to", url);
         setIsConnected(true);
         setIsConnecting(false);
         setReconnectAttempts(0);
@@ -277,7 +280,7 @@ export function useWebSocketEvents(
       };
 
       ws.onclose = (event) => {
-        console.log("[useWebSocketEvents] Disconnected:", event.code, event.reason);
+        logger.info("Disconnected:", event.code, event.reason);
         setIsConnected(false);
         setIsConnecting(false);
         wsRef.current = null;
@@ -290,9 +293,7 @@ export function useWebSocketEvents(
           reconnectAttempts < maxReconnectAttempts
         ) {
           const delay = reconnectBaseDelay * Math.pow(2, reconnectAttempts);
-          console.log(
-            `[useWebSocketEvents] Reconnecting in ${delay}ms (attempt ${reconnectAttempts + 1})`,
-          );
+          logger.info(`Reconnecting in ${delay}ms (attempt ${reconnectAttempts + 1})`);
 
           reconnectTimeoutRef.current = setTimeout(() => {
             setReconnectAttempts((prev) => prev + 1);
@@ -355,7 +356,7 @@ export function useWebSocketEvents(
   useEffect(() => {
     // Skip WebSocket connection in Tauri environment - Tauri events are used instead
     if (isTauriRef.current) {
-      console.log("[useWebSocketEvents] Tauri environment detected, skipping WebSocket");
+      logger.debug("Tauri environment detected, skipping WebSocket");
       return;
     }
 

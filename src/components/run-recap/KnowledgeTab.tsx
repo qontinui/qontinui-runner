@@ -32,6 +32,9 @@ import {
 } from "lucide-react";
 import type { Finding, FindingSeverity } from "@/types/findings";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("KnowledgeTab");
 
 interface KnowledgeTabProps {
   taskRunId: string;
@@ -235,7 +238,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
       if (response.ok) {
         const result = await response.json();
         if (result.success) {
-          console.log("Reflection triggered successfully");
+          logger.info("Reflection triggered successfully");
         }
       }
     } catch (error) {

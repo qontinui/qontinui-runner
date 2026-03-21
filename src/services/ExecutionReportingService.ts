@@ -9,6 +9,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { createLogger } from "@/lib/logger";
 import { ActionStatus, ActionType } from "../types/execution";
 import type {
   RunType,
@@ -111,6 +112,8 @@ interface InternalExecutionStats {
 // Service Implementation
 // ============================================================================
 
+const logger = createLogger("ExecutionReporting");
+
 class ExecutionReportingServiceImpl {
   private activeRunId: string | null = null;
   private activeProjectId: string | null = null;
@@ -153,10 +156,8 @@ class ExecutionReportingServiceImpl {
     }
 
     try {
-      console.log(`[ExecutionReporting] Starting ${runType} run: ${runName}`);
-      console.log(
-        `[ExecutionReporting] workflowMetadata: ${JSON.stringify(workflowMetadata, null, 2)}`,
-      );
+      logger.info(`Starting ${runType} run: ${runName}`);
+      logger.debug(`workflowMetadata: ${JSON.stringify(workflowMetadata, null, 2)}`);
 
       const input: ExecutionRunCreate = {
         project_id: projectId,
@@ -174,7 +175,7 @@ class ExecutionReportingServiceImpl {
       this.activeRunType = runType;
       this.resetStats();
 
-      console.log(`[ExecutionReporting] Run created: ${response.run_id}`);
+      logger.info(`Run created: ${response.run_id}`);
       return response.run_id;
     } catch (error) {
       console.error("[ExecutionReporting] Failed to create run:", error);
@@ -236,9 +237,7 @@ class ExecutionReportingServiceImpl {
     }
 
     try {
-      console.log(
-        `[ExecutionReporting] Uploading screenshot ${screenshot.screenshot_id} for run ${this.activeRunId}`,
-      );
+      logger.info(`Uploading screenshot ${screenshot.screenshot_id} for run ${this.activeRunId}`);
 
       const response = await invoke<ExecutionScreenshotResponse>("upload_execution_screenshot", {
         runId: this.activeRunId,
@@ -246,7 +245,7 @@ class ExecutionReportingServiceImpl {
         imageData: Array.from(imageData),
       });
 
-      console.log(`[ExecutionReporting] Screenshot uploaded: ${response.image_url}`);
+      logger.info(`Screenshot uploaded: ${response.image_url}`);
       return response;
     } catch (error) {
       console.error("[ExecutionReporting] Failed to upload screenshot:", error);
@@ -265,16 +264,14 @@ class ExecutionReportingServiceImpl {
     }
 
     try {
-      console.log(
-        `[ExecutionReporting] Reporting ${issues.length} issues for run ${this.activeRunId}`,
-      );
+      logger.info(`Reporting ${issues.length} issues for run ${this.activeRunId}`);
 
       const response = await invoke<ExecutionIssueResponse>("report_execution_issues", {
         runId: this.activeRunId,
         issues,
       });
 
-      console.log(`[ExecutionReporting] Issues reported: ${response.recorded} recorded`);
+      logger.info(`Issues reported: ${response.recorded} recorded`);
     } catch (error) {
       console.error("[ExecutionReporting] Failed to report issues:", error);
     }
@@ -406,7 +403,7 @@ class ExecutionReportingServiceImpl {
       // Flush any remaining actions
       await this.flushActions();
 
-      console.log(`[ExecutionReporting] Completing run ${this.activeRunId} with status: ${status}`);
+      logger.info(`Completing run ${this.activeRunId} with status: ${status}`);
 
       const finalStats = stats || this.buildExecutionStats();
       const finalCoverage = coverage || this.buildCoverageData();
@@ -424,9 +421,7 @@ class ExecutionReportingServiceImpl {
         input,
       });
 
-      console.log(
-        `[ExecutionReporting] Run completed: ${response.status}, duration: ${response.duration_seconds}s`,
-      );
+      logger.info(`Run completed: ${response.status}, duration: ${response.duration_seconds}s`);
 
       // Reset state
       this.activeRunId = null;
@@ -624,16 +619,14 @@ class ExecutionReportingServiceImpl {
     }
 
     try {
-      console.log(
-        `[ExecutionReporting] Reporting ${actions.length} actions for run ${this.activeRunId}`,
-      );
+      logger.info(`Reporting ${actions.length} actions for run ${this.activeRunId}`);
 
       const response = await invoke<ActionExecutionResponse>("report_action_executions", {
         runId: this.activeRunId,
         actions,
       });
 
-      console.log(`[ExecutionReporting] Actions reported: ${response.recorded} recorded`);
+      logger.info(`Actions reported: ${response.recorded} recorded`);
     } catch (error) {
       console.error("[ExecutionReporting] Failed to report actions:", error);
       // Re-add actions to pending on failure (will be retried on next flush)

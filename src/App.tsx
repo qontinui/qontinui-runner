@@ -1949,31 +1949,14 @@ function AppWithTutorials() {
  */
 function BundledSpecsLoader() {
   useEffect(() => {
-    // Load specs into ALL reachable store instances to handle Vite's dual
-    // module resolution (built dist vs source). The UIBridgeProvider exposes
-    // its store on window.__UI_BRIDGE__, and the direct import may resolve
-    // to a separate singleton.
+    const store = getGlobalSpecStore();
     const specs = getAllSpecs();
-    const stores = new Set<ReturnType<typeof getGlobalSpecStore>>();
-    // Always include the directly-imported store
-    stores.add(getGlobalSpecStore());
-    // Also include the UIBridgeProvider's store if it's a different instance
-    const uiBridge = (window as unknown as Record<string, unknown>).__UI_BRIDGE__ as
-      | { specs?: { getGlobalSpecStore?: () => ReturnType<typeof getGlobalSpecStore> } }
-      | undefined;
-    const providerStore = uiBridge?.specs?.getGlobalSpecStore?.();
-    if (providerStore) stores.add(providerStore);
-
-    for (const store of stores) {
-      for (const spec of specs) {
-        store.load(spec.specId, spec.config as Parameters<typeof store.load>[1]);
-      }
+    for (const spec of specs) {
+      store.load(spec.specId, spec.config as Parameters<typeof store.load>[1]);
     }
     return () => {
-      for (const store of stores) {
-        for (const spec of specs) {
-          store.unload(spec.specId);
-        }
+      for (const spec of specs) {
+        store.unload(spec.specId);
       }
     };
   }, []);

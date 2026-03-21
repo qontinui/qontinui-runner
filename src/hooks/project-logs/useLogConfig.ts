@@ -16,6 +16,9 @@ import type {
   UseLogConfigReturn,
 } from "./types";
 import { convertRawConfigToTypescript } from "./types";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("LogConfig");
 
 /**
  * Hook for managing project log configuration loading and saving.
@@ -52,7 +55,7 @@ export function useLogConfig(): UseLogConfigReturn {
         const rawConfig = response.data as RawBackendConfig;
         const loadedConfig = convertRawConfigToTypescript(rawConfig);
         setConfig(loadedConfig);
-        console.log("[PROJECT_LOGS] Loaded config for", projectName);
+        logger.debug("Loaded config for", projectName);
       } else {
         // Create default config
         const baseDir = dirResponse.data
@@ -60,7 +63,7 @@ export function useLogConfig(): UseLogConfigReturn {
           : `~/.qontinui/projects/${projectId}`;
         const newConfig = createProjectLogConfig(projectId, projectName, baseDir);
         setConfig(newConfig);
-        console.log("[PROJECT_LOGS] Created new config for", projectName);
+        logger.debug("Created new config for", projectName);
 
         // Save the new default config
         const saveResponse = await invoke<CommandResponse>("save_project_log_config", {
@@ -115,7 +118,7 @@ export function useLogConfig(): UseLogConfigReturn {
       });
 
       if (response.success) {
-        console.log("[PROJECT_LOGS] Config saved successfully");
+        logger.debug("Config saved successfully");
 
         if (response.data) {
           const savedRawConfig = response.data as RawBackendConfig;

@@ -7,6 +7,9 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("SubStepProgress");
 import {
   type SubStepInfo,
   type SubStepStatus_Display,
@@ -147,7 +150,7 @@ export function useSubStepProgress(): UseSubStepProgressReturn {
           unlistenCompleteRef.current = unlistenComplete;
           unlistenStartedRef.current = unlistenStarted;
           setIsConnected(true);
-          console.log("[useSubStepProgress] Connected to sub-step events");
+          logger.info("Connected to sub-step events");
         } else {
           unlistenComplete();
           unlistenStarted();

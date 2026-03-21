@@ -14,6 +14,7 @@ import {
   useState,
   useRef,
 } from "react";
+import { createLogger } from "@/lib/logger";
 import type {
   Tutorial,
   TutorialStep,
@@ -22,6 +23,8 @@ import type {
   PersistedTutorialState,
 } from "../types/tutorial";
 import { instanceStorage } from "@/lib/instance-storage";
+
+const log = createLogger("TutorialContext");
 
 // Storage key for instanceStorage persistence
 const STORAGE_KEY = "qontinui-runner-tutorial-state";
@@ -246,7 +249,7 @@ export function TutorialProvider({ children, onNavigate }: TutorialProviderProps
   const completeTutorial = useCallback(() => {
     if (!currentTutorial) return;
 
-    console.log("[TutorialContext] Completing tutorial:", currentTutorial.id);
+    log.debug("Completing tutorial:", currentTutorial.id);
 
     // Update persisted state
     setPersistedState((prev) => {
@@ -295,16 +298,11 @@ export function TutorialProvider({ children, onNavigate }: TutorialProviderProps
    */
   const openTutorial = useCallback(
     (tutorial: Tutorial, mode?: TutorialMode) => {
-      console.log(
-        "[TutorialContext] Opening tutorial:",
-        tutorial.id,
-        "mode:",
-        mode || tutorial.mode,
-      );
+      log.debug("Opening tutorial:", tutorial.id, "mode:", mode || tutorial.mode);
 
       // Navigate to focus page if specified
       if (tutorial.focusPage && onNavigate) {
-        console.log("[TutorialContext] Navigating to focus page:", tutorial.focusPage);
+        log.debug("Navigating to focus page:", tutorial.focusPage);
         onNavigate(tutorial.focusPage);
       }
 
@@ -350,7 +348,7 @@ export function TutorialProvider({ children, onNavigate }: TutorialProviderProps
    * Close tutorial without completing
    */
   const closeTutorial = useCallback(() => {
-    console.log("[TutorialContext] Closing tutorial");
+    log.debug("Closing tutorial");
 
     // Save current progress
     if (currentTutorial) {
@@ -378,7 +376,7 @@ export function TutorialProvider({ children, onNavigate }: TutorialProviderProps
    * Skip tutorial (close without saving progress)
    */
   const skipTutorial = useCallback(() => {
-    console.log("[TutorialContext] Skipping tutorial");
+    log.debug("Skipping tutorial");
 
     clearHighlight();
     setCurrentTutorial(null);
@@ -392,14 +390,14 @@ export function TutorialProvider({ children, onNavigate }: TutorialProviderProps
    * Move to next step
    */
   const nextStep = useCallback(async () => {
-    console.log("[TutorialContext] nextStep called:", {
+    log.debug("nextStep called:", {
       hasTutorial: !!currentTutorial,
       currentStepIndex,
       totalSteps: currentTutorial?.steps?.length,
     });
 
     if (!currentTutorial) {
-      console.log("[TutorialContext] nextStep: No tutorial, returning");
+      log.debug("nextStep: No tutorial, returning");
       return;
     }
 
@@ -448,14 +446,14 @@ export function TutorialProvider({ children, onNavigate }: TutorialProviderProps
 
     // Check if this is the last step
     if (currentStepIndex >= currentTutorial.steps.length - 1) {
-      console.log("[TutorialContext] On last step, completing tutorial");
+      log.debug("On last step, completing tutorial");
       completeTutorial();
       return;
     }
 
     // Move to next step
     const nextIndex = currentStepIndex + 1;
-    console.log("[TutorialContext] Moving to next step:", {
+    log.debug("Moving to next step:", {
       from: currentStepIndex,
       to: nextIndex,
       nextStepId: currentTutorial.steps[nextIndex]?.id,
@@ -495,19 +493,19 @@ export function TutorialProvider({ children, onNavigate }: TutorialProviderProps
    * Move to previous step
    */
   const previousStep = useCallback(() => {
-    console.log("[TutorialContext] previousStep called:", {
+    log.debug("previousStep called:", {
       hasTutorial: !!currentTutorial,
       currentStepIndex,
       canGoBack: currentStepIndex > 0,
     });
 
     if (!currentTutorial || currentStepIndex <= 0) {
-      console.log("[TutorialContext] previousStep: Cannot go back");
+      log.debug("previousStep: Cannot go back");
       return;
     }
 
     const prevIndex = currentStepIndex - 1;
-    console.log("[TutorialContext] Moving to previous step:", {
+    log.debug("Moving to previous step:", {
       from: currentStepIndex,
       to: prevIndex,
       prevStepId: currentTutorial.steps[prevIndex]?.id,

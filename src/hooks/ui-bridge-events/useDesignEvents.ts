@@ -12,6 +12,9 @@ import type {
   StyleGuideConfig,
 } from "ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("UIBridgeDesignEvents");
 
 /**
  * Handles: design_get_snapshot, design_get_element_styles, design_get_state_styles,
@@ -62,9 +65,7 @@ export function useDesignEvents(
             }
           } else {
             // No registered elements available — nothing to report
-            console.log(
-              "[UIBridgeEventHandler] design_get_snapshot: no registered elements in bridge",
-            );
+            logger.debug("design_get_snapshot: no registered elements in bridge");
           }
 
           await sendResponse({
@@ -244,9 +245,7 @@ export function useDesignEvents(
             }
           } else {
             // No registered elements available — nothing to audit
-            console.log(
-              "[UIBridgeEventHandler] design_run_audit: no registered elements in bridge",
-            );
+            logger.debug("design_run_audit: no registered elements in bridge");
           }
 
           const guide =

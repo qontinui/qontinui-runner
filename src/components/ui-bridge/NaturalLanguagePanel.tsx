@@ -65,6 +65,9 @@ import {
   isLLMAvailable,
   type LLMMatchResult,
 } from "../../lib/ui-bridge/llmElementMatcher";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("NaturalLanguagePanel");
 
 interface NaturalLanguagePanelProps {
   elements: ExternalElement[];
@@ -633,7 +636,7 @@ export function NaturalLanguagePanel({
     loadedPageRef.current = pageContext.url;
     const loaded = ElementDescriptionService.loadDescriptions(pageContext.url);
     setDescriptions(loaded);
-    console.log(`[NaturalLanguagePanel] Loaded ${loaded.size} descriptions for enhanced matching`);
+    logger.debug(`Loaded ${loaded.size} descriptions for enhanced matching`);
   }, [pageContext?.url]);
 
   // Save command history to instanceStorage

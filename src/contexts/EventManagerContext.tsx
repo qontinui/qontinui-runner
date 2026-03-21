@@ -11,6 +11,9 @@ import { eventRouter, logManager } from "../managers";
 import { verificationService } from "../services";
 import { executeAiTask } from "../hooks";
 import type { EventPayload } from "../types/eventPayloads";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("EventManager");
 
 interface EventManagerContextValue {
   isConnected: boolean;
@@ -45,7 +48,7 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
       try {
         const pending = await verificationService.loadPendingVerification();
         if (pending && pending.status === "pending") {
-          console.log("[EVENT_MGR] Found pending verification, auto-triggering...");
+          log.debug("Found pending verification, auto-triggering...");
 
           // Small delay to ensure everything is ready
           await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -70,7 +73,7 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
 
           fullPrompt += verificationPrompt;
 
-          console.log("[EVENT_MGR] Sending verification prompt to AI...");
+          log.debug("Sending verification prompt to AI...");
 
           // Use async task execution with polling
           try {
@@ -81,12 +84,12 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
               display_prompt: "Verification: Checking if the fix worked...",
               timeout_seconds: 600,
             });
-            console.log("[EVENT_MGR] Verification prompt completed, task status:", task.status);
+            log.debug("Verification prompt completed, task status:", task.status);
           } catch (error) {
             console.error("[EVENT_MGR] Verification prompt failed:", error);
           }
         } else if (pending) {
-          console.log("[EVENT_MGR] Pending verification exists but status is:", pending.status);
+          log.debug("Pending verification exists but status is:", pending.status);
         }
       } catch (error) {
         console.error("[EVENT_MGR] Error checking pending verification:", error);
@@ -100,13 +103,13 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
 
         const { listen } = await import("@tauri-apps/api/event");
 
-        console.log("[EVENT_MGR] Setting up Tauri event listeners");
+        log.debug("Setting up Tauri event listeners");
 
         // Listen for executor events
         const unlistenExecutorFn = await listen("executor-event", (event: Event<unknown>) => {
           // Prevent processing events if component is unmounted
           if (!isMounted) {
-            console.log("[EVENT_MGR] Component unmounted, ignoring event");
+            log.debug("Component unmounted, ignoring event");
             return;
           }
 
@@ -136,7 +139,7 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
             }
 
             const data = event.payload;
-            console.log("[EVENT_MGR] AI output event:", data.source, data.line?.substring(0, 50));
+            log.debug("AI output event:", data.source, data.line?.substring(0, 50));
 
             // Route AI output to LogManager
             if (data.line !== undefined && data.source !== undefined) {
@@ -157,7 +160,7 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
         unlistenExecutor = unlistenExecutorFn;
         unlistenAiOutput = unlistenAiOutputFn;
         setIsConnected(true);
-        console.log("[EVENT_MGR] Event listeners set up successfully");
+        log.debug("Event listeners set up successfully");
 
         // Check for pending verification after initialization
         checkPendingVerification();
@@ -171,7 +174,7 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
 
     // Cleanup
     return () => {
-      console.log("[EVENT_MGR] Cleaning up event listeners");
+      log.debug("Cleaning up event listeners");
       isMounted = false;
       if (unlistenExecutor) {
         unlistenExecutor();

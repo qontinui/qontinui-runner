@@ -2991,9 +2991,9 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/capabilities", get(handle_capabilities))
         // Elements
         .route("/ui-bridge/sdk/elements", get(handle_elements))
-        .route("/ui-bridge/sdk/element/:id", get(handle_element))
+        .route("/ui-bridge/sdk/element/{id}", get(handle_element))
         .route(
-            "/ui-bridge/sdk/element/:id/action",
+            "/ui-bridge/sdk/element/{id}/action",
             post(handle_element_action),
         )
         // Snapshot & discovery
@@ -3010,7 +3010,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/screenshot", get(handle_screenshot))
         // Components
         .route("/ui-bridge/sdk/components", get(handle_components))
-        .route("/ui-bridge/sdk/component/:id", get(handle_component))
+        .route("/ui-bridge/sdk/component/{id}", get(handle_component))
         // AI endpoints
         .route("/ui-bridge/sdk/ai/search", post(handle_ai_search))
         .route("/ui-bridge/sdk/ai/execute", post(handle_ai_execute))
@@ -3040,7 +3040,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(handle_wait_for_network_request),
         )
         .route(
-            "/ui-bridge/sdk/network-request/:id",
+            "/ui-bridge/sdk/network-request/{id}",
             get(handle_network_request),
         )
         .route("/ui-bridge/sdk/ai/summary", get(handle_ai_summary))
@@ -3064,12 +3064,12 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // Idle detection
         .route("/ui-bridge/sdk/idle-status", get(handle_idle_status))
         .route(
-            "/ui-bridge/sdk/idle-status/:signal",
+            "/ui-bridge/sdk/idle-status/{signal}",
             get(handle_idle_status_signal),
         )
         .route("/ui-bridge/sdk/wait-for-idle", post(handle_wait_for_idle))
         .route(
-            "/ui-bridge/sdk/wait-for-idle/:signal",
+            "/ui-bridge/sdk/wait-for-idle/{signal}",
             post(handle_wait_for_signal),
         )
         .route(
@@ -3089,7 +3089,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // Debug
         .route("/ui-bridge/sdk/debug/metrics", get(handle_debug_metrics))
         .route(
-            "/ui-bridge/sdk/debug/highlight/:id",
+            "/ui-bridge/sdk/debug/highlight/{id}",
             post(handle_debug_highlight),
         )
         // Cached specs
@@ -3107,11 +3107,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         // Design review
         .route(
-            "/ui-bridge/sdk/design/element/:id/styles",
+            "/ui-bridge/sdk/design/element/{id}/styles",
             get(handle_design_element_styles),
         )
         .route(
-            "/ui-bridge/sdk/design/element/:id/state-styles",
+            "/ui-bridge/sdk/design/element/{id}/state-styles",
             post(handle_design_element_state_styles),
         )
         .route(
@@ -3171,11 +3171,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
             get(handle_ct_list_bookmarks).post(handle_ct_save_bookmark),
         )
         .route(
-            "/ui-bridge/sdk/ai/bookmark/:name",
+            "/ui-bridge/sdk/ai/bookmark/{name}",
             get(handle_ct_get_bookmark).delete(handle_ct_delete_bookmark),
         )
         .route(
-            "/ui-bridge/sdk/ai/bookmark/:name/diff",
+            "/ui-bridge/sdk/ai/bookmark/{name}/diff",
             get(handle_ct_diff_from_bookmark),
         )
         .route(
@@ -3234,22 +3234,22 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         // Element/Component state
         .route(
-            "/ui-bridge/sdk/element/:id/state",
+            "/ui-bridge/sdk/element/{id}/state",
             get(handle_element_state),
         )
         .route(
-            "/ui-bridge/sdk/component/:id/state",
+            "/ui-bridge/sdk/component/{id}/state",
             get(handle_component_state),
         )
         .route(
-            "/ui-bridge/sdk/component/:id/action/:actionId",
+            "/ui-bridge/sdk/component/{id}/action/{actionId}",
             post(handle_component_action),
         )
         // Workflows
         .route("/ui-bridge/sdk/workflows", get(handle_workflows))
-        .route("/ui-bridge/sdk/workflow/:id/run", post(handle_workflow_run))
+        .route("/ui-bridge/sdk/workflow/{id}/run", post(handle_workflow_run))
         .route(
-            "/ui-bridge/sdk/workflow/:runId/status",
+            "/ui-bridge/sdk/workflow/{runId}/status",
             get(handle_workflow_status),
         )
         // Debug (additional)
@@ -3278,31 +3278,31 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/states/snapshot", get(handle_state_snapshot))
         .route("/ui-bridge/sdk/states/find-path", post(handle_find_path))
         .route("/ui-bridge/sdk/states/navigate", post(handle_navigate_to))
-        .route("/ui-bridge/sdk/state/:id", get(handle_get_state))
+        .route("/ui-bridge/sdk/state/{id}", get(handle_get_state))
         .route(
-            "/ui-bridge/sdk/state/:id/activate",
+            "/ui-bridge/sdk/state/{id}/activate",
             post(handle_activate_state),
         )
         .route(
-            "/ui-bridge/sdk/state/:id/deactivate",
+            "/ui-bridge/sdk/state/{id}/deactivate",
             post(handle_deactivate_state),
         )
         .route("/ui-bridge/sdk/state-groups", get(handle_state_groups))
         .route(
-            "/ui-bridge/sdk/state-group/:id/activate",
+            "/ui-bridge/sdk/state-group/{id}/activate",
             post(handle_activate_state_group),
         )
         .route(
-            "/ui-bridge/sdk/state-group/:id/deactivate",
+            "/ui-bridge/sdk/state-group/{id}/deactivate",
             post(handle_deactivate_state_group),
         )
         .route("/ui-bridge/sdk/transitions", get(handle_transitions))
         .route(
-            "/ui-bridge/sdk/transition/:id/can-execute",
+            "/ui-bridge/sdk/transition/{id}/can-execute",
             get(handle_can_execute_transition),
         )
         .route(
-            "/ui-bridge/sdk/transition/:id/execute",
+            "/ui-bridge/sdk/transition/{id}/execute",
             post(handle_execute_transition),
         )
         // Intents
@@ -3340,7 +3340,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(handle_annotations_import),
         )
         .route(
-            "/ui-bridge/sdk/annotations/:id",
+            "/ui-bridge/sdk/annotations/{id}",
             get(handle_annotation_get)
                 .put(handle_annotation_set)
                 .delete(handle_annotation_delete),
@@ -3383,14 +3383,14 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // /control/-prefixed aliases (canonical SDK paths for path consistency)
         // =====================================================================
         .route("/ui-bridge/sdk/control/elements", get(handle_elements))
-        .route("/ui-bridge/sdk/control/element/:id", get(handle_element))
+        .route("/ui-bridge/sdk/control/element/{id}", get(handle_element))
         .route(
-            "/ui-bridge/sdk/control/element/:id/action",
+            "/ui-bridge/sdk/control/element/{id}/action",
             post(handle_element_action),
         )
         .route("/ui-bridge/sdk/control/components", get(handle_components))
         .route(
-            "/ui-bridge/sdk/control/component/:id",
+            "/ui-bridge/sdk/control/component/{id}",
             get(handle_component),
         )
         .route("/ui-bridge/sdk/control/find", post(handle_discover))
@@ -3428,7 +3428,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(handle_wait_for_network_request),
         )
         .route(
-            "/ui-bridge/sdk/control/network-request/:id",
+            "/ui-bridge/sdk/control/network-request/{id}",
             get(handle_network_request),
         )
         .route(
@@ -3436,7 +3436,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             get(handle_idle_status),
         )
         .route(
-            "/ui-bridge/sdk/control/idle-status/:signal",
+            "/ui-bridge/sdk/control/idle-status/{signal}",
             get(handle_idle_status_signal),
         )
         .route(
@@ -3444,7 +3444,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(handle_wait_for_idle),
         )
         .route(
-            "/ui-bridge/sdk/control/wait-for-idle/:signal",
+            "/ui-bridge/sdk/control/wait-for-idle/{signal}",
             post(handle_wait_for_signal),
         )
         .route(
@@ -3509,25 +3509,25 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         // Element/Component state aliases
         .route(
-            "/ui-bridge/sdk/control/element/:id/state",
+            "/ui-bridge/sdk/control/element/{id}/state",
             get(handle_element_state),
         )
         .route(
-            "/ui-bridge/sdk/control/component/:id/state",
+            "/ui-bridge/sdk/control/component/{id}/state",
             get(handle_component_state),
         )
         .route(
-            "/ui-bridge/sdk/control/component/:id/action/:actionId",
+            "/ui-bridge/sdk/control/component/{id}/action/{actionId}",
             post(handle_component_action),
         )
         // Workflow aliases
         .route("/ui-bridge/sdk/control/workflows", get(handle_workflows))
         .route(
-            "/ui-bridge/sdk/control/workflow/:id/run",
+            "/ui-bridge/sdk/control/workflow/{id}/run",
             post(handle_workflow_run),
         )
         .route(
-            "/ui-bridge/sdk/control/workflow/:runId/status",
+            "/ui-bridge/sdk/control/workflow/{runId}/status",
             get(handle_workflow_status),
         )
         // State management aliases
@@ -3548,13 +3548,13 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/control/states/navigate",
             post(handle_navigate_to),
         )
-        .route("/ui-bridge/sdk/control/state/:id", get(handle_get_state))
+        .route("/ui-bridge/sdk/control/state/{id}", get(handle_get_state))
         .route(
-            "/ui-bridge/sdk/control/state/:id/activate",
+            "/ui-bridge/sdk/control/state/{id}/activate",
             post(handle_activate_state),
         )
         .route(
-            "/ui-bridge/sdk/control/state/:id/deactivate",
+            "/ui-bridge/sdk/control/state/{id}/deactivate",
             post(handle_deactivate_state),
         )
         .route(
@@ -3562,11 +3562,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
             get(handle_state_groups),
         )
         .route(
-            "/ui-bridge/sdk/control/state-group/:id/activate",
+            "/ui-bridge/sdk/control/state-group/{id}/activate",
             post(handle_activate_state_group),
         )
         .route(
-            "/ui-bridge/sdk/control/state-group/:id/deactivate",
+            "/ui-bridge/sdk/control/state-group/{id}/deactivate",
             post(handle_deactivate_state_group),
         )
         .route(
@@ -3574,11 +3574,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
             get(handle_transitions),
         )
         .route(
-            "/ui-bridge/sdk/control/transition/:id/can-execute",
+            "/ui-bridge/sdk/control/transition/{id}/can-execute",
             get(handle_can_execute_transition),
         )
         .route(
-            "/ui-bridge/sdk/control/transition/:id/execute",
+            "/ui-bridge/sdk/control/transition/{id}/execute",
             post(handle_execute_transition),
         )
         // Performance & error aliases

@@ -1,4 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("VideoRecordingService");
 
 export interface VideoRecordingConfig {
   enabled: boolean;
@@ -62,7 +65,7 @@ export class VideoRecordingService {
         throw new Error(result.message || "Failed to start recording");
       }
 
-      console.log(
+      logger.info(
         `Video recording started for session: ${sessionId} with delay: ${config.startDelaySeconds}s`,
       );
     } catch (error) {
@@ -87,7 +90,7 @@ export class VideoRecordingService {
         throw new Error(result.message || "Failed to stop recording");
       }
 
-      console.log(`Video recording stopped. Saved to: ${result.data.path}`);
+      logger.info(`Video recording stopped. Saved to: ${result.data.path}`);
       this.currentSessionId = null;
       return result.data.path;
     } catch (error) {

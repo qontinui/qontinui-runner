@@ -17,6 +17,9 @@ import type {
   CreateContextRequest,
   UpdateContextRequest,
 } from "../../types/context";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ContextList");
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
@@ -75,7 +78,7 @@ export function ContextList({ onLog }: ContextListProps) {
   const log = useCallback(
     (level: LogLevel, message: string) => {
       onLog?.(level, message);
-      console.log(`[CONTEXTS] [${level.toUpperCase()}] ${message}`);
+      logger.debug(`[${level.toUpperCase()}] ${message}`);
     },
     [onLog],
   );

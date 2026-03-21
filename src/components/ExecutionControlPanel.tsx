@@ -14,6 +14,9 @@ import { MonitorSelector } from "./MonitorSelector";
 import { InitialStatesSelector } from "./InitialStatesSelector";
 import type { Workflow, ConfigState } from "../contexts/ExecutionContext";
 import type { ResolvedInitialStates } from "../types/state-machine";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ExecutionControlPanel");
 
 export interface ExecutionControlPanelProps {
   // Workflow selection
@@ -76,12 +79,12 @@ export function ExecutionControlPanel({
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
 
   // Debug logging
-  console.log("[EXEC_PANEL] automationEnabledCategories:", automationEnabledCategories);
-  console.log("[EXEC_PANEL] workflows count:", workflows.length);
+  logger.debug("automationEnabledCategories:", automationEnabledCategories);
+  logger.debug("workflows count:", workflows.length);
 
   // Determine if we need nested menus (more than one category)
   const hasMultipleCategories = automationEnabledCategories.length > 1;
-  console.log("[EXEC_PANEL] hasMultipleCategories:", hasMultipleCategories);
+  logger.debug("hasMultipleCategories:", hasMultipleCategories);
 
   // Group workflows by category for nested display
   const workflowsByCategory = hasMultipleCategories

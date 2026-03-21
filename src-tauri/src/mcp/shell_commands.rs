@@ -220,10 +220,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(list_shell_commands_handler).post(create_shell_command_handler),
         )
         .route(
-            "/shell-commands/:id",
+            "/shell-commands/{id}",
             get(get_shell_command_handler)
                 .put(update_shell_command_handler)
                 .delete(delete_shell_command_handler),
         )
-        .route("/shell-commands/:id/run", post(run_shell_command_handler))
+        .route("/shell-commands/{id}/run", post(run_shell_command_handler))
 }

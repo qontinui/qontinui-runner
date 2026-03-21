@@ -2,6 +2,9 @@ import { useCallback } from "react";
 import type { BridgeSnapshot } from "ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { getUIBridgeGlobal } from "./utils";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("UIBridgeDiscoveryEvents");
 
 /**
  * Handles: discover, find, get_snapshot
@@ -103,11 +106,9 @@ export function useDiscoveryEvents(
         }
 
         case "get_snapshot": {
-          console.log("[UIBridgeEventHandler] get_snapshot: creating snapshot...");
+          logger.debug("get_snapshot: creating snapshot...");
           const snapshot: BridgeSnapshot = await currentBridge.createSnapshotAsync();
-          console.log(
-            `[UIBridgeEventHandler] get_snapshot: snapshot created (${snapshot.elements.length} elements)`,
-          );
+          logger.debug(`get_snapshot: snapshot created (${snapshot.elements.length} elements)`);
 
           // Enrich with page context, modals, and toasts from trackers if available.
           // Each enrichment is wrapped individually so one failure doesn't break the snapshot.
@@ -157,7 +158,7 @@ export function useDiscoveryEvents(
             | { getSnapshotShortcutContext: () => unknown }
             | undefined;
 
-          console.log("[UIBridgeEventHandler] get_snapshot: enriching...");
+          logger.debug("get_snapshot: enriching...");
           const enrichedSnapshot = {
             ...snapshot,
             page: safeGet(() => navTracker?.getSnapshotPageContext()),
@@ -178,8 +179,8 @@ export function useDiscoveryEvents(
           };
 
           await sendResponse(response);
-          console.log(
-            `[UIBridgeEventHandler] get_snapshot: response sent (${enrichedSnapshot.elements.length} elements)`,
+          logger.debug(
+            `get_snapshot: response sent (${enrichedSnapshot.elements.length} elements)`,
           );
           return true;
         }

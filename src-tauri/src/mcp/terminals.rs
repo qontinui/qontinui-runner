@@ -248,8 +248,8 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/terminals",
             get(list_terminals_handler).post(create_terminal_handler),
         )
-        .route("/terminals/:id/write", post(write_terminal_handler))
-        .route("/terminals/:id/buffer", get(get_buffer_handler))
-        .route("/terminals/:id/resize", post(resize_terminal_handler))
-        .route("/terminals/:id", delete(close_terminal_handler))
+        .route("/terminals/{id}/write", post(write_terminal_handler))
+        .route("/terminals/{id}/buffer", get(get_buffer_handler))
+        .route("/terminals/{id}/resize", post(resize_terminal_handler))
+        .route("/terminals/{id}", delete(close_terminal_handler))
 }

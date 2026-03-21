@@ -19,6 +19,9 @@ import {
 import { getStatusColors } from "@/design-system";
 import { useStateExplorer } from "../../hooks/useStateExplorer";
 import type { ExplorationHistoryItem } from "../../types/state-explorer";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ExplorationHistory");
 
 interface ExplorationHistoryProps {
   /** Callback when a run is selected */
@@ -32,7 +35,7 @@ export function ExplorationHistory({ onSelectRun }: ExplorationHistoryProps) {
     if (window.confirm("Clear exploration reports older than 30 days?")) {
       const removed = await clearHistory(30);
       if (removed > 0) {
-        console.log(`Removed ${removed} old exploration reports`);
+        logger.info(`Removed ${removed} old exploration reports`);
       }
     }
   }, [clearHistory]);

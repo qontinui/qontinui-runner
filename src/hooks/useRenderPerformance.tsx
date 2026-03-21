@@ -19,6 +19,9 @@ import {
   type ProfilerOnRenderCallback,
 } from "react";
 import { getPerformanceMonitor, type RenderMetrics } from "../lib/performance";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("RenderPerformance");
 
 // ============================================================================
 // Types
@@ -123,16 +126,14 @@ export function useRenderPerformance(
       if (dataChangeTimeRef.current !== null) {
         const timeToUpdate = commitTime - dataChangeTimeRef.current;
         if (logToConsole) {
-          console.log(
-            `[RenderPerformance] ${componentName} time-to-update: ${timeToUpdate.toFixed(2)}ms`,
-          );
+          logger.debug(`${componentName} time-to-update: ${timeToUpdate.toFixed(2)}ms`);
         }
         dataChangeTimeRef.current = null;
       }
 
       if (logToConsole) {
-        console.log(
-          `[RenderPerformance] ${componentName} ${phase}: ${actualDuration.toFixed(2)}ms (base: ${baseDuration.toFixed(2)}ms)`,
+        logger.debug(
+          `${componentName} ${phase}: ${actualDuration.toFixed(2)}ms (base: ${baseDuration.toFixed(2)}ms)`,
         );
       }
     },

@@ -47,6 +47,9 @@ import { getAccentColors, getStatusColors } from "@/design-system";
 import { PageTutorialMenu } from "./tutorial";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { instanceStorage } from "@/lib/instance-storage";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("AiTab");
 
 // instanceStorage key for stats panel collapse
 const STORAGE_KEY_STATS_COLLAPSED = "aiTab.statsCollapsed";
@@ -641,7 +644,7 @@ export function AiTab({
       if (!checkpointResult.success) {
         console.warn("Failed to delete some checkpoints:", checkpointResult.message);
       } else {
-        console.log(`Deleted ${checkpointResult.data?.deleted_count ?? 0} checkpoint files`);
+        logger.debug(`Deleted ${checkpointResult.data?.deleted_count ?? 0} checkpoint files`);
       }
 
       if (selectedForDeletion.size === loops.length) {

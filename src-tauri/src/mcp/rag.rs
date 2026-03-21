@@ -608,7 +608,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/rag/list", get(list_rag_configs))
         .route("/rag/availability", get(get_rag_availability))
         .route("/rag/segment", post(segment_screenshot))
-        .route("/rag/:project_id/status", get(get_rag_status))
-        .route("/rag/:project_id/load", post(load_rag_project))
-        .route("/rag/:project_id", delete(delete_rag_config))
+        .route("/rag/{project_id}/status", get(get_rag_status))
+        .route("/rag/{project_id}/load", post(load_rag_project))
+        .route("/rag/{project_id}", delete(delete_rag_config))
 }

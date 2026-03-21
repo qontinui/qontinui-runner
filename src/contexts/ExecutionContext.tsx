@@ -14,7 +14,10 @@ import {
   useRef,
   useState,
 } from "react";
+import { createLogger } from "@/lib/logger";
 import { usePythonExecutor } from "../hooks/usePythonExecutor";
+
+const log = createLogger("ExecutionContext");
 import {
   useConfiguration,
   type Config,
@@ -123,10 +126,10 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
   useEffect(() => {
     if (!hasAutoStarted.current) {
       hasAutoStarted.current = true;
-      console.log("[EXECUTION_CONTEXT] Auto-starting Python executor on app launch");
+      log.debug("Auto-starting Python executor on app launch");
       startPython(onLog).then((success) => {
         if (success) {
-          console.log("[EXECUTION_CONTEXT] Python executor auto-started successfully");
+          log.debug("Python executor auto-started successfully");
         } else {
           console.warn("[EXECUTION_CONTEXT] Python executor auto-start failed");
         }
@@ -137,12 +140,7 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
   // Callback when last config is loaded with workflow/monitor info
   const handleLastConfigLoaded = useCallback(
     (workflowId: string | null, monitorIndices: number[] | number | null) => {
-      console.log(
-        "[EXECUTION_CONTEXT] Last config loaded with workflow:",
-        workflowId,
-        "monitors:",
-        monitorIndices,
-      );
+      log.debug("Last config loaded with workflow:", workflowId, "monitors:", monitorIndices);
       setPendingWorkflowId(workflowId);
       // Handle both array and legacy single-monitor format
       if (monitorIndices !== null) {
@@ -176,8 +174,8 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
   });
 
   // Debug: Log categories when they change
-  console.log("[EXEC_CONTEXT] automationEnabledCategories:", automationEnabledCategories);
-  console.log("[EXEC_CONTEXT] workflows:", workflows.length);
+  log.debug("automationEnabledCategories:", automationEnabledCategories);
+  log.debug("workflows:", workflows.length);
 
   // Workflow Selection Hook
   const { selectedWorkflow, setSelectedWorkflow, selectWorkflowWithPersistence } =
@@ -223,13 +221,10 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
       // Check if the pending workflow exists in loaded workflows
       const workflowExists = workflows.some((w) => w.id === pendingWorkflowId);
       if (workflowExists) {
-        console.log("[EXECUTION_CONTEXT] Auto-selecting saved workflow:", pendingWorkflowId);
+        log.debug("Auto-selecting saved workflow:", pendingWorkflowId);
         setSelectedWorkflow(pendingWorkflowId);
       } else {
-        console.log(
-          "[EXECUTION_CONTEXT] Saved workflow not found in loaded config:",
-          pendingWorkflowId,
-        );
+        log.debug("Saved workflow not found in loaded config:", pendingWorkflowId);
       }
       setPendingWorkflowId(null);
     }
@@ -241,11 +236,11 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
       // Filter to only available monitors
       const validIndices = pendingMonitorIndices.filter((idx) => availableMonitors.includes(idx));
       if (validIndices.length > 0) {
-        console.log("[EXECUTION_CONTEXT] Auto-selecting saved monitors:", validIndices);
+        log.debug("Auto-selecting saved monitors:", validIndices);
         setSelectedMonitors(validIndices);
       } else {
-        console.log(
-          "[EXECUTION_CONTEXT] Saved monitors not available:",
+        log.debug(
+          "Saved monitors not available:",
           pendingMonitorIndices,
           "available:",
           availableMonitors,
@@ -259,7 +254,7 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
   useEffect(() => {
     if (configLoaded) {
       setConfigLoadCount((prev) => prev + 1);
-      console.log("[EXECUTION_CONTEXT] Config loaded, incrementing config load count");
+      log.debug("Config loaded, incrementing config load count");
     }
   }, [configLoaded]);
 
@@ -275,7 +270,7 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
     }
 
     const fetchResolvedStates = async () => {
-      console.log("[EXECUTION_CONTEXT] Fetching resolved initial states for:", selectedWorkflow);
+      log.debug("Fetching resolved initial states for:", selectedWorkflow);
       const result = await getResolvedInitialStates(selectedWorkflow);
       if (result.success) {
         setResolvedInitialStates({
@@ -284,12 +279,7 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
           states: result.states,
           workflowId: result.workflowId,
         });
-        console.log(
-          "[EXECUTION_CONTEXT] Resolved initial states:",
-          result.stateIds,
-          "source:",
-          result.source,
-        );
+        log.debug("Resolved initial states:", result.stateIds, "source:", result.source);
       } else {
         console.warn("[EXECUTION_CONTEXT] Failed to fetch resolved initial states:", result.error);
         setResolvedInitialStates({

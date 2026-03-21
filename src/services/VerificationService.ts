@@ -6,6 +6,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { createLogger } from "@/lib/logger";
 import type {
   PendingVerification,
   VerificationPendingMarker,
@@ -38,6 +39,8 @@ interface VerificationEvent {
 
 type VerificationListener = (event: VerificationEvent) => void;
 
+const logger = createLogger("VerificationService");
+
 /**
  * Service for managing AI verification state across restarts
  */
@@ -69,7 +72,7 @@ class VerificationService {
       if (result.success) {
         this.currentVerification = verification;
         this.emit({ type: "verification_pending", data: verification });
-        console.log("[VerificationService] Saved pending verification:", verification.id);
+        logger.info("Saved pending verification:", verification.id);
         return true;
       } else {
         console.error("[VerificationService] Failed to save:", result.message);
@@ -94,8 +97,8 @@ class VerificationService {
 
       if (result.success && result.data?.verification) {
         this.currentVerification = result.data.verification;
-        console.log(
-          "[VerificationService] Loaded pending verification:",
+        logger.info(
+          "Loaded pending verification:",
           this.currentVerification.id,
           "status:",
           this.currentVerification.status,
@@ -103,7 +106,7 @@ class VerificationService {
         return this.currentVerification;
       }
 
-      console.log("[VerificationService] No pending verification found");
+      logger.debug("No pending verification found");
       return null;
     } catch (error) {
       console.error("[VerificationService] Error loading verification:", error);
@@ -119,7 +122,7 @@ class VerificationService {
       const result = await invoke<{ success: boolean }>("clear_pending_verification");
       if (result.success) {
         this.currentVerification = null;
-        console.log("[VerificationService] Cleared pending verification");
+        logger.info("Cleared pending verification");
         return true;
       }
       return false;
@@ -140,7 +143,7 @@ class VerificationService {
 
       if (result.success && this.currentVerification) {
         this.currentVerification.status = status;
-        console.log("[VerificationService] Updated status to:", status);
+        logger.info("Updated status to:", status);
         return true;
       }
       return false;
@@ -173,7 +176,7 @@ class VerificationService {
 
     // Build the verification prompt with context
     const contextPrompt = this.buildVerificationPrompt();
-    console.log("[VerificationService] Triggering verification with prompt");
+    logger.info("Triggering verification with prompt");
 
     return contextPrompt;
   }
@@ -219,7 +222,7 @@ class VerificationService {
    * Handle verification completed
    */
   async handleVerificationCompleted(marker: VerificationCompletedMarker): Promise<void> {
-    console.log("[VerificationService] Verification completed:", marker.message);
+    logger.info("Verification completed:", marker.message);
     await this.updateStatus("completed");
     this.emit({ type: "verification_completed", data: marker });
     await this.clearPendingVerification();
@@ -229,7 +232,7 @@ class VerificationService {
    * Handle verification failed
    */
   async handleVerificationFailed(marker: VerificationFailedMarker): Promise<void> {
-    console.log("[VerificationService] Verification failed:", marker.message);
+    logger.info("Verification failed:", marker.message);
     await this.updateStatus("failed");
     this.emit({ type: "verification_failed", data: marker });
     // Don't clear - keep for retry or debugging
@@ -268,7 +271,7 @@ class VerificationService {
    * Trigger a runner restart
    */
   async triggerRestart(marker: RunnerRestartMarker): Promise<boolean> {
-    console.log("[VerificationService] Triggering runner restart:", marker.reason);
+    logger.info("Triggering runner restart:", marker.reason);
     this.emit({ type: "restart_requested" });
 
     try {

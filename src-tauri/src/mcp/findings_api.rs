@@ -227,23 +227,23 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post, put};
     axum::Router::new()
         .route(
-            "/findings/task/:task_run_id",
+            "/findings/task/{task_run_id}",
             get(get_task_findings_handler),
         )
         .route(
-            "/findings/:finding_id/status",
+            "/findings/{finding_id}/status",
             put(update_finding_status_handler),
         )
         .route(
-            "/findings/:finding_id/resolve",
+            "/findings/{finding_id}/resolve",
             post(resolve_finding_handler),
         )
         .route(
-            "/findings/:finding_id/user-response",
+            "/findings/{finding_id}/user-response",
             post(user_response_handler),
         )
         .route(
-            "/findings/task/:task_run_id/clear-all",
+            "/findings/task/{task_run_id}/clear-all",
             post(clear_all_findings_handler),
         )
 }

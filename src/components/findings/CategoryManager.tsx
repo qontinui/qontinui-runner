@@ -49,6 +49,9 @@ import {
   resetCategories,
   getCategoryColorClasses,
 } from "../../services/FindingCategories";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("CategoryManager");
 
 // Map icon names to Lucide components
 const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -141,7 +144,7 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
       if (onLog) {
         onLog(level, message);
       } else {
-        console.log(`[${level}] ${message}`);
+        logger.debug(`[${level}] ${message}`);
       }
     },
     [onLog],

@@ -9,8 +9,11 @@
  * - tree_event: Tree-based execution events
  */
 
+import { createLogger } from "@/lib/logger";
 import { logManager } from "../LogManager";
 import { actionLogManager } from "../ActionLogManager";
+
+const logger = createLogger("ReportingHandler");
 import type { HandlerSetupFunction } from "./types";
 import type {
   ErrorEventPayload,
@@ -34,7 +37,7 @@ export const setupReportingHandlers: HandlerSetupFunction = (context) => {
   // Handler for "error" event
   unsubscribers.push(
     eventRouter.subscribe("error", (payload: ErrorEventPayload) => {
-      console.log("[REPORTING_HANDLER] error event received:", payload.data);
+      logger.debug("error event received:", payload.data);
       const errorMessage = payload.data?.message || "Unknown error occurred";
       logManager.addLog("error", errorMessage);
     }),
@@ -43,7 +46,7 @@ export const setupReportingHandlers: HandlerSetupFunction = (context) => {
   // Handler for "log" event
   unsubscribers.push(
     eventRouter.subscribe("log", (payload: LogEventPayload) => {
-      console.log("[REPORTING_HANDLER] log event received");
+      logger.debug("log event received");
       const levelStr = payload.data?.level || "info";
       const message = payload.data?.message || "";
 
@@ -77,7 +80,7 @@ export const setupReportingHandlers: HandlerSetupFunction = (context) => {
   // Handler for "tree_event" event
   unsubscribers.push(
     eventRouter.subscribe("tree_event", (payload) => {
-      console.log("[REPORTING_HANDLER] tree_event received, triggering action log refresh");
+      logger.debug("tree_event received, triggering action log refresh");
       actionLogManager.triggerRefresh();
 
       // Report completed actions to execution service

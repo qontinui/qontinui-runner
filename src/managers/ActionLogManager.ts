@@ -5,6 +5,10 @@
  * this manager notifies all subscribers to refresh their action log data.
  */
 
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ActionLogManager");
+
 type RefreshCallback = () => void;
 
 class ActionLogManager {
@@ -15,10 +19,10 @@ class ActionLogManager {
    * @returns Unsubscribe function
    */
   onRefreshNeeded(callback: RefreshCallback): () => void {
-    console.log("[ACTION_LOG_MGR] Refresh callback registered");
+    logger.debug("Refresh callback registered");
     this.refreshCallbacks.add(callback);
     return () => {
-      console.log("[ACTION_LOG_MGR] Refresh callback unregistered");
+      logger.debug("Refresh callback unregistered");
       this.refreshCallbacks.delete(callback);
     };
   }
@@ -28,9 +32,7 @@ class ActionLogManager {
    * Called by event router when tree events are received
    */
   triggerRefresh(): void {
-    console.log(
-      `[ACTION_LOG_MGR] triggerRefresh called, notifying ${this.refreshCallbacks.size} callbacks`,
-    );
+    logger.debug(`triggerRefresh called, notifying ${this.refreshCallbacks.size} callbacks`);
     this.refreshCallbacks.forEach((cb) => {
       try {
         cb();

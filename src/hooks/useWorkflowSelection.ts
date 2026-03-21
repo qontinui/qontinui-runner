@@ -7,6 +7,9 @@
 
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("WorkflowSelection");
 
 interface UseWorkflowSelectionReturn {
   selectedWorkflow: string;
@@ -29,7 +32,7 @@ export function useWorkflowSelection(): UseWorkflowSelectionReturn {
     // Save the workflow ID as the last used workflow
     try {
       await invoke("save_last_workflow_id", { workflowId });
-      console.log("[WORKFLOW_SELECTION] Saved last workflow ID:", workflowId);
+      logger.debug("Saved last workflow ID:", workflowId);
     } catch (saveError) {
       console.error("[WORKFLOW_SELECTION] Failed to save last workflow ID:", saveError);
       // Non-critical error, don't throw

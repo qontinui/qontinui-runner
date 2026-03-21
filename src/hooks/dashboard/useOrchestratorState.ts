@@ -23,6 +23,9 @@ import {
 } from "../useWebSocketEvents";
 import { useWorkflowExecutionOptional } from "../../contexts/WorkflowExecutionContext";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("OrchestratorState");
 
 // Polling is now fallback only - real-time events provide instant updates
 const POLL_INTERVAL_MS = 5000;
@@ -193,7 +196,7 @@ export function useOrchestratorState(
         unlistenRef.current = unlisten;
       } catch (e) {
         // Tauri events not available - rely on WebSocket/polling
-        console.debug("Tauri events not available:", e);
+        logger.debug("Tauri events not available:", e);
       }
     };
 

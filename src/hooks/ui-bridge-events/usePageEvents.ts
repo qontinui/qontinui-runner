@@ -1,6 +1,9 @@
 import { useCallback } from "react";
 import { getApiPort } from "@/lib/runner-api";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("UIBridgePageEvents");
 
 /**
  * Handles: page_refresh, page_navigate, page_go_back, page_go_forward, query_selector, page_evaluate
@@ -17,7 +20,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
           // Do NOT call window.location.reload() — the runner is a Tauri app and
           // a full page reload resets all React state (auth, execution, terminals),
           // causing the "Checking authentication..." screen to flash repeatedly.
-          console.log("[UIBridge] page_refresh: ignoring (full reload disabled in runner)");
+          logger.debug("page_refresh: ignoring (full reload disabled in runner)");
           await sendResponse({
             requestId,
             type,

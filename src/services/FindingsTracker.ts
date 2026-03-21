@@ -9,6 +9,7 @@
  * It maintains backward compatibility while delegating to focused modules.
  */
 
+import { createLogger } from "@/lib/logger";
 import type {
   Finding,
   FindingSeverity,
@@ -20,6 +21,8 @@ import type {
   CodeContext,
 } from "../types/findings";
 import { getCategoryById } from "./FindingCategories";
+
+const logger = createLogger("FindingsTracker");
 import {
   verificationService,
   VerificationPendingMarker,
@@ -286,7 +289,7 @@ export class FindingsTracker {
     if (verificationPendingMatch) {
       try {
         const payload = JSON.parse(verificationPendingMatch[1]) as VerificationPendingMarker;
-        console.log("[FindingsTracker] Verification pending detected:", payload.reason);
+        logger.info("Verification pending detected:", payload.reason);
         verificationService.savePendingVerification(payload);
       } catch (error) {
         console.error("[FindingsTracker] Failed to parse VERIFICATION:PENDING:", error);
@@ -299,7 +302,7 @@ export class FindingsTracker {
     if (verificationCompletedMatch) {
       try {
         const payload = JSON.parse(verificationCompletedMatch[1]) as VerificationCompletedMarker;
-        console.log("[FindingsTracker] Verification completed:", payload.message);
+        logger.info("Verification completed:", payload.message);
         verificationService.handleVerificationCompleted(payload);
       } catch (error) {
         console.error("[FindingsTracker] Failed to parse VERIFICATION:COMPLETED:", error);
@@ -312,7 +315,7 @@ export class FindingsTracker {
     if (verificationFailedMatch) {
       try {
         const payload = JSON.parse(verificationFailedMatch[1]) as VerificationFailedMarker;
-        console.log("[FindingsTracker] Verification failed:", payload.message);
+        logger.info("Verification failed:", payload.message);
         verificationService.handleVerificationFailed(payload);
       } catch (error) {
         console.error("[FindingsTracker] Failed to parse VERIFICATION:FAILED:", error);
@@ -325,7 +328,7 @@ export class FindingsTracker {
     if (restartMatch) {
       try {
         const payload = JSON.parse(restartMatch[1]) as RunnerRestartMarker;
-        console.log("[FindingsTracker] Runner restart requested:", payload.reason);
+        logger.info("Runner restart requested:", payload.reason);
         verificationService.triggerRestart(payload);
       } catch (error) {
         console.error("[FindingsTracker] Failed to parse RUNNER:RESTART:", error);
@@ -390,9 +393,7 @@ export class FindingsTracker {
       this.updateReport(this.currentReportId);
     }
 
-    console.log(
-      `[FindingsTracker] Finding detected: [${parsed.categoryId}] ${finding.title} (${finding.id})`,
-    );
+    logger.info(`Finding detected: [${parsed.categoryId}] ${finding.title} (${finding.id})`);
 
     return finding;
   }
@@ -456,7 +457,7 @@ export class FindingsTracker {
       this.updateReport(this.currentReportId);
     }
 
-    console.log(`[FindingsTracker] Finding ${id} status updated to: ${status}`);
+    logger.info(`Finding ${id} status updated to: ${status}`);
     return finding;
   }
 
@@ -480,7 +481,7 @@ export class FindingsTracker {
       this.updateReport(this.currentReportId);
     }
 
-    console.log(`[FindingsTracker] Finding resolved: ${finding.title} (${id})`);
+    logger.info(`Finding resolved: ${finding.title} (${id})`);
     return finding;
   }
 
@@ -519,7 +520,7 @@ export class FindingsTracker {
       finding,
     });
 
-    console.log(`[FindingsTracker] User response received for: ${finding.title}`);
+    logger.info(`User response received for: ${finding.title}`);
     return finding;
   }
 
@@ -540,7 +541,7 @@ export class FindingsTracker {
       this.updateReport(this.currentReportId);
     }
 
-    console.log(`[FindingsTracker] Finding removed: ${finding.title} (${id})`);
+    logger.info(`Finding removed: ${finding.title} (${id})`);
     return true;
   }
 
@@ -598,7 +599,7 @@ export class FindingsTracker {
     this.currentReportId = report.id;
 
     this.emit({ type: "report_created", report });
-    console.log(`[FindingsTracker] Report started: ${promptName} (${report.id})`);
+    logger.info(`Report started: ${promptName} (${report.id})`);
 
     return report;
   }
@@ -641,9 +642,7 @@ export class FindingsTracker {
     const finalReport = this.reports.get(this.currentReportId)!;
     this.currentReportId = null;
 
-    console.log(
-      `[FindingsTracker] Report completed: ${finalReport.promptName} (${finalReport.id})`,
-    );
+    logger.info(`Report completed: ${finalReport.promptName} (${finalReport.id})`);
     return finalReport;
   }
 
@@ -700,7 +699,7 @@ export class FindingsTracker {
     const findings = this.getAllFindings();
     this.findings.clear();
     this.emit({ type: "findings_cleared", findings });
-    console.log("[FindingsTracker] All findings cleared");
+    logger.info("All findings cleared");
   }
 
   /**
@@ -712,7 +711,7 @@ export class FindingsTracker {
       this.findings.delete(finding.id);
     }
     this.emit({ type: "findings_cleared", findings: sessionFindings });
-    console.log(`[FindingsTracker] Session findings cleared: ${sessionFindings.length}`);
+    logger.info(`Session findings cleared: ${sessionFindings.length}`);
   }
 
   /**
@@ -724,7 +723,7 @@ export class FindingsTracker {
     this.currentReportId = null;
     this.parsingBuffer = "";
     this.currentFindingMeta = null;
-    console.log(`[FindingsTracker] New session started: ${this.currentSessionId}`);
+    logger.info(`New session started: ${this.currentSessionId}`);
   }
 
   /**
@@ -760,7 +759,7 @@ export class FindingsTracker {
   ): Promise<void> {
     const currentReport = this.getCurrentReport();
     if (!currentReport) {
-      console.log("[FindingsTracker] No current report to archive");
+      logger.info("No current report to archive");
       return;
     }
 
@@ -784,11 +783,11 @@ export class FindingsTracker {
     // Sync to backend via ReportPersistenceService
     if (completedReport) {
       try {
-        console.log("[FindingsTracker] Syncing report to backend...");
+        logger.info("Syncing report to backend...");
         await reportPersistenceService.saveReport(completedReport);
 
         if (sessionFindings.length > 0) {
-          console.log(`[FindingsTracker] Syncing ${sessionFindings.length} findings to backend...`);
+          logger.info(`Syncing ${sessionFindings.length} findings to backend...`);
           await reportPersistenceService.saveFindings(sessionFindings);
         }
       } catch (error) {
@@ -797,9 +796,7 @@ export class FindingsTracker {
       }
     }
 
-    console.log(
-      `[FindingsTracker] Session archived: ${currentReport.promptName} (${currentReport.id}) - ${status}`,
-    );
+    logger.info(`Session archived: ${currentReport.promptName} (${currentReport.id}) - ${status}`);
   }
 
   /**
@@ -813,7 +810,7 @@ export class FindingsTracker {
         reports: this.getAllReports(),
         sessionHistory: this.sessionHistory,
       });
-      console.log("[FindingsTracker] Persisted to disk");
+      logger.debug("Persisted to disk");
     } catch (error) {
       console.error("[FindingsTracker] Failed to persist to disk:", error);
     }
@@ -827,7 +824,7 @@ export class FindingsTracker {
       const data = await loadFindingsData();
 
       if (!data) {
-        console.log("[FindingsTracker] No persisted data found");
+        logger.debug("No persisted data found");
         return;
       }
 
@@ -840,9 +837,7 @@ export class FindingsTracker {
       //   this.findings.set(finding.id, finding);
       // }
 
-      console.log(
-        `[FindingsTracker] Loaded from disk: ${this.sessionHistory.length} sessions in history`,
-      );
+      logger.info(`Loaded from disk: ${this.sessionHistory.length} sessions in history`);
     } catch (error) {
       console.error("[FindingsTracker] Failed to load from disk:", error);
     }

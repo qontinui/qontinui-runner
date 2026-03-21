@@ -7,6 +7,9 @@
 
 import { useCallback } from "react";
 import type { Workflow, Category, LogFunction } from "./types";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ConfigFiltering");
 
 interface FilteringResult {
   automationWorkflows: Workflow[];
@@ -30,11 +33,11 @@ interface UseConfigFilteringReturn {
  * Extract automation-enabled category names from categories array
  */
 function getAutomationEnabledCategories(categories: Category[] | string[] | undefined): string[] {
-  console.log("[FILTER] getAutomationEnabledCategories called with:", categories);
+  logger.debug("getAutomationEnabledCategories called with:", categories);
 
   // Default if no categories defined
   if (!Array.isArray(categories) || categories.length === 0) {
-    console.log("[FILTER] No categories array, defaulting to ['main']");
+    logger.debug("No categories array, defaulting to ['main']");
     return ["main"];
   }
 
@@ -44,12 +47,12 @@ function getAutomationEnabledCategories(categories: Category[] | string[] | unde
     const enabled = (categories as Category[])
       .filter((c) => c.automationEnabled)
       .map((c) => c.name.toLowerCase());
-    console.log("[FILTER] Object format categories, automation-enabled:", enabled);
+    logger.debug("Object format categories, automation-enabled:", enabled);
     return enabled;
   }
 
   // Legacy format: string[] - default to only "main" enabled
-  console.log("[FILTER] String format (legacy), defaulting to ['main']");
+  logger.debug("String format (legacy), defaulting to ['main']");
   return ["main"];
 }
 

@@ -168,7 +168,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(list_knowledge_handler).post(create_knowledge_handler),
         )
         .route(
-            "/step-type-knowledge/:id",
+            "/step-type-knowledge/{id}",
             get(get_knowledge_handler)
                 .put(update_knowledge_handler)
                 .delete(delete_knowledge_handler),

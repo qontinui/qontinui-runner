@@ -14,6 +14,9 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import type { TutorialStep, StepWaitCondition, TourState } from "../types/tutorial";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("TutorialEvents");
 
 interface UseTutorialEventsOptions {
   /** Current tutorial step */
@@ -135,7 +138,7 @@ export function useTutorialEvents({
 
     if (advanceDelay > 0) {
       // Show a brief "success" state before advancing
-      console.log(`[useTutorialEvents] Condition met, advancing in ${advanceDelay}ms`);
+      logger.debug(`Condition met, advancing in ${advanceDelay}ms`);
       advanceDelayRef.current = setTimeout(() => {
         cleanup();
         onAdvance();

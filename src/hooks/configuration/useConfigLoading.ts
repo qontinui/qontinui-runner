@@ -12,6 +12,9 @@ import { configManager } from "../../managers";
 import type { Config, Workflow, LogFunction, LoadConfigurationResponse, Category } from "./types";
 import { createConfigFromData } from "./utils";
 import { useConfigFiltering } from "./useConfigFiltering";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ConfigLoading");
 
 interface UseConfigLoadingOptions {
   onLog?: LogFunction;
@@ -98,9 +101,9 @@ export function useConfigLoading(options: UseConfigLoadingOptions = {}): UseConf
    * Load configuration via file dialog
    */
   const loadConfiguration = useCallback(async () => {
-    console.log("[CONFIG] loadConfiguration called");
+    logger.debug("loadConfiguration called");
     try {
-      console.log("[CONFIG] Opening file dialog...");
+      logger.debug("Opening file dialog...");
       const selected = await open({
         multiple: false,
         filters: [
@@ -111,13 +114,13 @@ export function useConfigLoading(options: UseConfigLoadingOptions = {}): UseConf
         ],
       });
 
-      console.log("[CONFIG] File dialog result:", selected);
+      logger.debug("File dialog result:", selected);
 
       if (selected) {
-        console.log("[CONFIG] File selected, calling loadConfigFromPath:", selected);
+        logger.debug("File selected, calling loadConfigFromPath:", selected);
         await loadConfigFromPath(selected);
       } else {
-        console.log("[CONFIG] No file selected (user cancelled)");
+        logger.debug("No file selected (user cancelled)");
       }
     } catch (error) {
       console.error("[CONFIG] Error in loadConfiguration:", error);

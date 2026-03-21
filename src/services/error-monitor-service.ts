@@ -9,6 +9,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { createLogger } from "@/lib/logger";
 import type {
   StoredErrorEvent,
   ErrorQuery,
@@ -24,6 +25,8 @@ import type {
 /**
  * Service for accessing error monitoring data via Tauri commands.
  */
+const logger = createLogger("ErrorMonitor");
+
 export const errorMonitorService = {
   // ===========================================================================
   // Error Event Commands
@@ -33,10 +36,10 @@ export const errorMonitorService = {
    * Query error events with filters.
    */
   async queryErrorEvents(query: ErrorQuery): Promise<StoredErrorEvent[]> {
-    console.log("[ERROR_MONITOR] Querying error events with:", query);
+    logger.debug("Querying error events with:", query);
     try {
       const result = await invoke<StoredErrorEvent[]>("query_error_events", { query });
-      console.log("[ERROR_MONITOR] Query result:", result?.length, "events");
+      logger.debug("Query result:", result?.length, "events");
       return result;
     } catch (err) {
       console.error("[ERROR_MONITOR] Query failed:", err);

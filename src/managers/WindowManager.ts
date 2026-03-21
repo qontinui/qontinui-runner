@@ -6,6 +6,9 @@
  */
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("WindowManager");
 
 class WindowManager {
   private wasAutoMinimized = false;
@@ -18,7 +21,7 @@ class WindowManager {
       const window = getCurrentWindow();
       await window.minimize();
       this.wasAutoMinimized = true;
-      console.log("[WINDOW] Window minimized");
+      logger.debug("Window minimized");
     } catch (error) {
       console.error("[WINDOW] Failed to minimize:", error);
     }
@@ -29,7 +32,7 @@ class WindowManager {
    */
   async restoreIfMinimized(): Promise<void> {
     if (!this.wasAutoMinimized) {
-      console.log("[WINDOW] Window was not auto-minimized, skipping restore");
+      logger.debug("Window was not auto-minimized, skipping restore");
       return;
     }
 
@@ -38,7 +41,7 @@ class WindowManager {
       await window.unminimize();
       await window.setFocus();
       this.wasAutoMinimized = false;
-      console.log("[WINDOW] Window restored and focused");
+      logger.debug("Window restored and focused");
     } catch (error) {
       console.error("[WINDOW] Failed to restore window:", error);
     }

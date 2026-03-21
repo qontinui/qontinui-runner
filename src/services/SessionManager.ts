@@ -6,6 +6,10 @@
  * Supports event subscription for session state changes.
  */
 
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("SessionManager");
+
 /**
  * Session status types
  */
@@ -66,8 +70,8 @@ export class SessionManager {
   startSession(actionId: string, name?: string): SessionContext {
     // Auto-end previous session if one exists
     if (this.currentSession) {
-      console.log(
-        `[SessionManager] Auto-ending previous session: ${this.currentSession.id} (was ${this.currentSession.status})`,
+      logger.info(
+        `Auto-ending previous session: ${this.currentSession.id} (was ${this.currentSession.status})`,
       );
       this.endSession("cancelled");
     }
@@ -85,9 +89,7 @@ export class SessionManager {
 
     this.notifyListeners(session, previousSession);
 
-    console.log(
-      `[SessionManager] Session started: ${session.name} (${session.id}) for action ${actionId}`,
-    );
+    logger.info(`Session started: ${session.name} (${session.id}) for action ${actionId}`);
 
     return session;
   }
@@ -114,9 +116,7 @@ export class SessionManager {
 
     this.notifyListeners(null, previousSession);
 
-    console.log(
-      `[SessionManager] Session ended: ${endedSession.name} (${endedSession.id}) with status: ${status}`,
-    );
+    logger.info(`Session ended: ${endedSession.name} (${endedSession.id}) with status: ${status}`);
 
     return endedSession;
   }

@@ -6,7 +6,10 @@
  */
 
 import { useState, useCallback } from "react";
+import { createLogger } from "@/lib/logger";
 import { Download, Loader2, FileJson, Upload } from "lucide-react";
+
+const log = createLogger("ExportPanel");
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
 import { buildExportConfig } from "@qontinui/workflow-utils";
@@ -38,7 +41,7 @@ export function ExportPanel({ config, showToast }: ExportPanelProps) {
       if (filePath) {
         await writeTextFile(filePath, json);
         showToast?.(`Exported to ${filePath}`, "success");
-        console.log(`Exported to ${filePath}`);
+        log.debug(`Exported to ${filePath}`);
       }
     } catch (err) {
       const errMsg = `Export failed: ${err instanceof Error ? err.message : "Unknown error"}`;
@@ -66,7 +69,7 @@ export function ExportPanel({ config, showToast }: ExportPanelProps) {
       }
 
       showToast?.("State machine loaded into runtime", "success");
-      console.log("State machine loaded into runtime");
+      log.debug("State machine loaded into runtime");
     } catch (err) {
       const loadErrMsg = `Load failed: ${err instanceof Error ? err.message : "Unknown error"}`;
       showToast?.(loadErrMsg, "error");

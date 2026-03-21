@@ -756,28 +756,28 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(list_checks_handler).post(create_check_handler),
         )
         .route(
-            "/checks/:id",
+            "/checks/{id}",
             get(get_check_handler)
                 .put(update_check_handler)
                 .delete(delete_check_handler),
         )
         // Check run route
-        .route("/checks/:id/run", post(run_check_handler))
+        .route("/checks/{id}/run", post(run_check_handler))
         // Check group CRUD routes
         .route(
             "/check-groups",
             get(list_check_groups_handler).post(create_check_group_handler),
         )
         .route(
-            "/check-groups/:id",
+            "/check-groups/{id}",
             get(get_check_group_handler)
                 .put(update_check_group_handler)
                 .delete(delete_check_group_handler),
         )
         // Check group member management routes
         .route(
-            "/check-groups/:id/checks",
+            "/check-groups/{id}/checks",
             get(get_checks_in_group_handler).put(set_checks_in_group_handler),
         )
-        .route("/check-groups/:id/run", post(run_check_group_handler))
+        .route("/check-groups/{id}/run", post(run_check_group_handler))
 }

@@ -9,6 +9,7 @@
  */
 
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { createLogger } from "@/lib/logger";
 import type {
   Finding,
   FindingSeverity,
@@ -116,6 +117,8 @@ function payloadToFinding(payload: FindingDetectedPayload): Finding {
  *
  * Manages Tauri event subscriptions for findings.
  */
+const logger = createLogger("TauriFindingsListener");
+
 class TauriFindingsListener {
   private static instance: TauriFindingsListener | null = null;
   private unlistenFunctions: UnlistenFn[] = [];
@@ -135,19 +138,16 @@ class TauriFindingsListener {
    */
   async start(): Promise<void> {
     if (this.isListening) {
-      console.log("[TauriFindingsListener] Already listening");
+      logger.debug("Already listening");
       return;
     }
 
-    console.log("[TauriFindingsListener] Starting event listeners");
+    logger.info("Starting event listeners");
 
     try {
       // Listen for finding_detected events
       const unlistenDetected = await listen<FindingDetectedPayload>("finding_detected", (event) => {
-        console.log(
-          "[TauriFindingsListener] Received finding_detected event:",
-          event.payload.title,
-        );
+        logger.debug("Received finding_detected event:", event.payload.title);
         const finding = payloadToFinding(event.payload);
 
         // Add to FindingsTracker (if not already present)
@@ -161,7 +161,7 @@ class TauriFindingsListener {
 
       // Listen for finding_resolved events
       const unlistenResolved = await listen<FindingResolvedPayload>("finding_resolved", (event) => {
-        console.log("[TauriFindingsListener] Received finding_resolved event:", event.payload.id);
+        logger.debug("Received finding_resolved event:", event.payload.id);
         const { id, resolution } = event.payload;
 
         // Update in FindingsTracker
@@ -174,7 +174,7 @@ class TauriFindingsListener {
       this.unlistenFunctions.push(unlistenResolved);
 
       this.isListening = true;
-      console.log("[TauriFindingsListener] Event listeners started");
+      logger.info("Event listeners started");
     } catch (error) {
       console.error("[TauriFindingsListener] Failed to start listeners:", error);
     }
@@ -184,7 +184,7 @@ class TauriFindingsListener {
    * Stop listening to Tauri events
    */
   async stop(): Promise<void> {
-    console.log("[TauriFindingsListener] Stopping event listeners");
+    logger.info("Stopping event listeners");
 
     for (const unlisten of this.unlistenFunctions) {
       unlisten();
@@ -192,7 +192,7 @@ class TauriFindingsListener {
     this.unlistenFunctions = [];
     this.isListening = false;
 
-    console.log("[TauriFindingsListener] Event listeners stopped");
+    logger.info("Event listeners stopped");
   }
 
   /**

@@ -3449,11 +3449,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(ui_bridge_get_elements_handler),
         )
         .route(
-            "/ui-bridge/control/element/:id",
+            "/ui-bridge/control/element/{id}",
             get(ui_bridge_get_element_handler),
         )
         .route(
-            "/ui-bridge/control/element/:id/action",
+            "/ui-bridge/control/element/{id}/action",
             post(ui_bridge_execute_action_handler),
         )
         .route(
@@ -3461,11 +3461,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(ui_bridge_get_components_handler),
         )
         .route(
-            "/ui-bridge/control/component/:id",
+            "/ui-bridge/control/component/{id}",
             get(ui_bridge_get_component_handler),
         )
         .route(
-            "/ui-bridge/control/component/:id/action/:action_id",
+            "/ui-bridge/control/component/{id}/action/{action_id}",
             post(ui_bridge_execute_component_action_handler),
         )
         .route(
@@ -3529,12 +3529,12 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             post(ui_bridge_wait_for_network_request_handler),
         )
         .route(
-            "/ui-bridge/control/network-request/:id",
+            "/ui-bridge/control/network-request/{id}",
             get(ui_bridge_get_network_request_handler),
         )
         .route("/ui-bridge/control/specs", get(ui_bridge_get_specs_handler))
         .route(
-            "/ui-bridge/control/spec/:id",
+            "/ui-bridge/control/spec/{id}",
             get(ui_bridge_get_spec_handler),
         )
         .route(
@@ -3567,11 +3567,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         // Design Review
         .route(
-            "/ui-bridge/control/design/element/:id/styles",
+            "/ui-bridge/control/design/element/{id}/styles",
             get(ui_bridge_design_element_styles_handler),
         )
         .route(
-            "/ui-bridge/control/design/element/:id/state-styles",
+            "/ui-bridge/control/design/element/{id}/state-styles",
             post(ui_bridge_design_state_styles_handler),
         )
         .route(
@@ -3604,11 +3604,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(ui_bridge_list_bookmarks_handler).post(ui_bridge_save_bookmark_handler),
         )
         .route(
-            "/ui-bridge/control/ai/bookmark/:name",
+            "/ui-bridge/control/ai/bookmark/{name}",
             get(ui_bridge_get_bookmark_handler).delete(ui_bridge_delete_bookmark_handler),
         )
         .route(
-            "/ui-bridge/control/ai/bookmark/:name/diff",
+            "/ui-bridge/control/ai/bookmark/{name}/diff",
             get(ui_bridge_diff_from_bookmark_handler),
         )
         .route(
@@ -3695,15 +3695,15 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(ui_bridge_get_workflows_handler),
         )
         .route(
-            "/ui-bridge/control/workflow/:id/run",
+            "/ui-bridge/control/workflow/{id}/run",
             post(ui_bridge_run_workflow_handler),
         )
         .route(
-            "/ui-bridge/control/workflow/:run_id/status",
+            "/ui-bridge/control/workflow/{run_id}/status",
             get(ui_bridge_get_workflow_status_handler),
         )
         .route(
-            "/ui-bridge/control/element/:id/state",
+            "/ui-bridge/control/element/{id}/state",
             get(ui_bridge_get_element_state_handler),
         )
         .route(

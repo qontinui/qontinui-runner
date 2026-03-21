@@ -837,8 +837,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
     axum::Router::new()
         .route("/testing/start", post(start_integration_test))
-        .route("/testing/status/:id", get(get_test_run_status))
-        .route("/testing/results/:id", get(get_integration_test_results))
+        .route("/testing/status/{id}", get(get_test_run_status))
+        .route("/testing/results/{id}", get(get_integration_test_results))
         .route("/testing/runs", get(list_integration_test_runs))
         .route("/testing/mock-action", post(mock_gui_action))
         .route("/testing/states", get(get_testing_states))
@@ -850,5 +850,5 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/testing/mocked-actions", get(get_mocked_actions))
         .route("/testing/clear-mocked-actions", post(clear_mocked_actions))
         .route("/testing/assertion", post(run_testing_assertion))
-        .route("/testing/end/:id", post(end_integration_test))
+        .route("/testing/end/{id}", post(end_integration_test))
 }

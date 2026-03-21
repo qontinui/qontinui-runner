@@ -7,6 +7,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { createLogger } from "@/lib/logger";
 import {
   configurationParser,
   ParsedConfig,
@@ -93,16 +94,18 @@ export interface ConfigLoadedEventPayload {
  * Service for loading configuration from various sources.
  * Each method has consistent logging with source prefixes for easy debugging.
  */
+const logger = createLogger("Config");
+
 export class ConfigurationLoaderService {
   /**
    * Log with source prefix for easy filtering in console.
    */
   private log(source: LoadingSource, message: string, data?: unknown): void {
-    const prefix = `[CONFIG:${source.toUpperCase()}]`;
+    const prefix = `[${source.toUpperCase()}]`;
     if (data !== undefined) {
-      console.log(prefix, message, data);
+      logger.info(`${prefix} ${message}`, data);
     } else {
-      console.log(prefix, message);
+      logger.info(`${prefix} ${message}`);
     }
   }
 

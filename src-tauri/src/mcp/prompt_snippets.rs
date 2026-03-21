@@ -150,7 +150,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/prompt-snippets/categories",
             get(get_prompt_snippet_categories),
         )
-        .route("/prompt-snippets/:id", get(get_prompt_snippet))
-        .route("/prompt-snippets/:id", put(update_prompt_snippet))
-        .route("/prompt-snippets/:id", delete(delete_prompt_snippet))
+        .route("/prompt-snippets/{id}", get(get_prompt_snippet))
+        .route("/prompt-snippets/{id}", put(update_prompt_snippet))
+        .route("/prompt-snippets/{id}", delete(delete_prompt_snippet))
 }

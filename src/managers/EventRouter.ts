@@ -5,7 +5,10 @@
  * Provides a centralized, type-safe way to handle events from the backend.
  */
 
+import { createLogger } from "@/lib/logger";
 import type { EventPayload } from "../types/eventPayloads";
+
+const logger = createLogger("EventRouter");
 
 type EventHandler = (payload: EventPayload) => void;
 
@@ -19,7 +22,7 @@ class EventRouter {
    * @returns Unsubscribe function
    */
   subscribe(eventType: string, handler: EventHandler): () => void {
-    console.log(`[EVENT_ROUTER] Subscribing to event type: ${eventType}`);
+    logger.debug(`Subscribing to event type: ${eventType}`);
 
     if (!this.handlers.has(eventType)) {
       this.handlers.set(eventType, new Set());
@@ -29,7 +32,7 @@ class EventRouter {
 
     // Return unsubscribe function
     return () => {
-      console.log(`[EVENT_ROUTER] Unsubscribing from event type: ${eventType}`);
+      logger.debug(`Unsubscribing from event type: ${eventType}`);
       const handlers = this.handlers.get(eventType);
       if (handlers) {
         handlers.delete(handler);
@@ -53,15 +56,15 @@ class EventRouter {
       return;
     }
 
-    console.log(
-      `[EVENT_ROUTER] Routing event type: ${eventType}, handler count: ${this.handlers.get(eventType)?.size || 0}`,
+    logger.debug(
+      `Routing event type: ${eventType}, handler count: ${this.handlers.get(eventType)?.size || 0}`,
     );
 
     // Get handlers for this event type
     const handlers = this.handlers.get(eventType);
 
     if (!handlers || handlers.size === 0) {
-      console.log(`[EVENT_ROUTER] No handlers registered for event type: ${eventType}`);
+      logger.debug(`No handlers registered for event type: ${eventType}`);
       return;
     }
 
@@ -93,7 +96,7 @@ class EventRouter {
    * Clear all handlers (useful for testing/cleanup)
    */
   clearAll(): void {
-    console.log("[EVENT_ROUTER] Clearing all handlers");
+    logger.debug("Clearing all handlers");
     this.handlers.clear();
   }
 }

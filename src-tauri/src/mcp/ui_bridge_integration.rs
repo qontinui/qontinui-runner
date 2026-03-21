@@ -1935,7 +1935,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(handle_cache_architecture_spec),
         )
         .route(
-            "/ui-bridge/integration/:id",
+            "/ui-bridge/integration/{id}",
             delete(handle_delete_integration),
         )
 }

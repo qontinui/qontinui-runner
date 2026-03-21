@@ -9,9 +9,12 @@
  * integration with the EventRouter system for other consumers.
  */
 
+import { createLogger } from "@/lib/logger";
 import { logManager } from "../LogManager";
 import type { HandlerSetupFunction } from "./types";
 import type { EventPayload } from "../../types/eventPayloads";
+
+const logger = createLogger("ConstraintHandler");
 
 /**
  * Setup constraint-related event handlers
@@ -36,8 +39,8 @@ export const setupConstraintHandlers: HandlerSetupFunction = (context) => {
       const hasBlocking = data?.has_blocking || false;
       const iteration = data?.iteration;
 
-      console.log(
-        `[CONSTRAINT_HANDLER] constraint-results event received: iteration=${iteration}, has_blocking=${hasBlocking}`,
+      logger.debug(
+        `constraint-results event received: iteration=${iteration}, has_blocking=${hasBlocking}`,
       );
 
       if (hasBlocking) {

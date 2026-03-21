@@ -708,22 +708,22 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/state-machine/configs", get(list_configs))
         .route("/state-machine/configs", post(create_config))
         .route("/state-machine/configs/import", post(import_config))
-        .route("/state-machine/configs/:id", get(get_config))
-        .route("/state-machine/configs/:id", delete(delete_config))
+        .route("/state-machine/configs/{id}", get(get_config))
+        .route("/state-machine/configs/{id}", delete(delete_config))
         .route(
-            "/state-machine/configs/:config_id/states",
+            "/state-machine/configs/{config_id}/states",
             post(create_state),
         )
         .route(
-            "/state-machine/configs/:config_id/states/:id",
+            "/state-machine/configs/{config_id}/states/{id}",
             delete(delete_state),
         )
         .route(
-            "/state-machine/configs/:config_id/transitions",
+            "/state-machine/configs/{config_id}/transitions",
             post(create_transition),
         )
         .route(
-            "/state-machine/configs/:config_id/transitions/:id",
+            "/state-machine/configs/{config_id}/transitions/{id}",
             delete(delete_transition),
         )
 }

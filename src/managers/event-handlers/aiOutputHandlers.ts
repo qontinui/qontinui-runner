@@ -9,9 +9,12 @@
  * The TauriFindingsListener bridges Rust events to FindingsTracker.
  */
 
+import { createLogger } from "@/lib/logger";
 import { logManager } from "../LogManager";
 import type { HandlerSetupFunction } from "./types";
 import type { AiOutputStreamEventPayload } from "../../types/eventPayloads";
+
+const logger = createLogger("AiOutputHandler");
 import { findingsTracker } from "../../services/FindingsTracker";
 import { sessionManager } from "../../services/SessionManager";
 import { tauriFindingsListener } from "../../services/TauriFindingsListener";
@@ -70,13 +73,11 @@ export const setupAiOutputHandlers: HandlerSetupFunction = (context) => {
 
       // Detect new AI session by checking if action_id changed
       if (actionId && actionId !== currentActionId) {
-        console.log(
-          `[AI_OUTPUT_HANDLER] New AI session detected: ${actionId} (previous: ${currentActionId})`,
-        );
+        logger.debug(`New AI session detected: ${actionId} (previous: ${currentActionId})`);
 
         // Archive previous session if one exists
         if (currentSession && findingsTracker.getCurrentReport()) {
-          console.log("[AI_OUTPUT_HANDLER] Archiving previous AI session");
+          logger.debug("Archiving previous AI session");
           // Note: archiveCurrentSession is now async but we fire-and-forget here
           // to not block the streaming handler
           findingsTracker.archiveCurrentSession("completed").catch((error) => {
@@ -90,7 +91,7 @@ export const setupAiOutputHandlers: HandlerSetupFunction = (context) => {
         // Start new session in FindingsTracker using the SessionManager's session ID
         findingsTracker.startNewSession(newSession.id);
         findingsTracker.startReport(sessionName || "AI Analysis", actionId);
-        console.log(`[AI_OUTPUT_HANDLER] Started findings report for session: ${newSession.id}`);
+        logger.debug(`Started findings report for session: ${newSession.id}`);
       }
 
       logManager.addAiOutputLog(line, source, actionId, sessionId, sessionName, phase);

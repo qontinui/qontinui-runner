@@ -2,6 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { Html5Qrcode } from "html5-qrcode";
 import { Camera, X, CheckCircle, AlertCircle } from "lucide-react";
 import { getStatusColors } from "@/design-system";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("QRScanner");
 
 export interface QRScannerProps {
   onScan: (data: string) => void;
@@ -108,7 +111,7 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
         const onScanFailure = (error: string) => {
           // Only log actual errors, not "No QR code found" messages
           if (!error.includes("NotFoundException")) {
-            console.debug("Scan error:", error);
+            logger.debug("Scan error:", error);
           }
         };
 

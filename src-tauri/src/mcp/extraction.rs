@@ -1284,7 +1284,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/extraction/stats", post(update_extraction_stats))
         .route("/extraction/complete", post(complete_extraction))
         .route(
-            "/extraction/:extraction_id/screenshot/:screenshot_id",
+            "/extraction/{extraction_id}/screenshot/{screenshot_id}",
             get(get_extraction_screenshot),
         )
         .route("/uitars-extraction/start", post(start_uitars_extraction))

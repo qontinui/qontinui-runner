@@ -12,6 +12,9 @@
  */
 
 import { instanceStorage } from "@/lib/instance-storage";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ElementDescriptionService");
 
 const STORAGE_KEY = "qontinui-element-descriptions";
 const MAX_ENTRIES = 1000; // Limit to prevent localStorage overflow
@@ -126,7 +129,7 @@ export const ElementDescriptionService = {
       result.set(elementId, desc);
     }
 
-    console.log(`[ElementDescriptionService] Loaded ${result.size} descriptions for ${pageKey}`);
+    logger.debug(`Loaded ${result.size} descriptions for ${pageKey}`);
     return result;
   },
 
@@ -154,9 +157,7 @@ export const ElementDescriptionService = {
     store.pages[pageKey].lastUpdated = Date.now();
 
     saveStore(store);
-    console.log(
-      `[ElementDescriptionService] Saved description for ${description.elementId} on ${pageKey}`,
-    );
+    logger.debug(`Saved description for ${description.elementId} on ${pageKey}`);
   },
 
   /**
@@ -185,9 +186,7 @@ export const ElementDescriptionService = {
     store.pages[pageKey].lastUpdated = Date.now();
 
     saveStore(store);
-    console.log(
-      `[ElementDescriptionService] Saved ${descriptions.size} descriptions for ${pageKey}`,
-    );
+    logger.debug(`Saved ${descriptions.size} descriptions for ${pageKey}`);
   },
 
   /**
@@ -214,7 +213,7 @@ export const ElementDescriptionService = {
     if (store.pages[pageKey]) {
       delete store.pages[pageKey];
       saveStore(store);
-      console.log(`[ElementDescriptionService] Cleared descriptions for ${pageKey}`);
+      logger.debug(`Cleared descriptions for ${pageKey}`);
     }
   },
 
@@ -223,7 +222,7 @@ export const ElementDescriptionService = {
    */
   clearAll(): void {
     instanceStorage.removeItem(STORAGE_KEY);
-    console.log("[ElementDescriptionService] Cleared all descriptions");
+    logger.debug("Cleared all descriptions");
   },
 
   /**

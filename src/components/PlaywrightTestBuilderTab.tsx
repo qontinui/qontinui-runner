@@ -36,6 +36,9 @@ import { executeAiTask } from "../hooks";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import { BuilderToolbar, toolbarActions } from "./ui/BuilderToolbar";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("PlaywrightTestBuilderTab");
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
@@ -1680,7 +1683,7 @@ import { test, expect } from '@playwright/test';
 
         // Extract code and changes summary from AI response
         const output = aiTask.output_log;
-        console.log("[AUTO-REFINE] AI output length:", output?.length);
+        logger.debug("AUTO-REFINE AI output length:", output?.length);
         let generatedCode: string | null = null;
 
         // Extract CHANGES summary
@@ -1738,7 +1741,7 @@ import { test, expect } from '@playwright/test';
           console.error("[AUTO-REFINE] Full output:", output?.substring(0, 500));
           break;
         }
-        console.log("[AUTO-REFINE] Extracted valid code, length:", generatedCode.length);
+        logger.debug("AUTO-REFINE Extracted valid code, length:", generatedCode.length);
 
         currentScriptContent = generatedCode;
         setFormScriptContent(generatedCode);
@@ -1759,7 +1762,7 @@ import { test, expect } from '@playwright/test';
           console.error("[AUTO-REFINE] Save failed:", saveResult);
           break;
         }
-        console.log("[AUTO-REFINE] Save successful, continuing to next iteration");
+        logger.debug("AUTO-REFINE Save successful, continuing to next iteration");
 
         log("Re-running test with fixes...");
         // Small delay before next iteration

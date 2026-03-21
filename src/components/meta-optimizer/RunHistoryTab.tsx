@@ -4,6 +4,9 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("MetaOptimizerRunHistory");
 
 interface MetaOptimizerRun {
   id: string;
@@ -54,7 +57,7 @@ export function RunHistoryTab() {
     try {
       setTriggering(optimizerType);
       const taskRunId = await invoke<string>("trigger_meta_optimizer", { optimizerType });
-      console.log("Triggered optimizer, task run:", taskRunId);
+      logger.info("Triggered optimizer, task run:", taskRunId);
       // Reload after a short delay to show the new run
       setTimeout(load, 1000);
     } catch (e) {

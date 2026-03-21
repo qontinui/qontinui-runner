@@ -894,26 +894,26 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/contexts/categories", get(list_context_categories))
         .route("/contexts/tags", get(list_context_tags))
         .route(
-            "/contexts/:scope/from-file",
+            "/contexts/{scope}/from-file",
             post(create_context_from_file_handler),
         )
-        .route("/contexts/:scope", post(create_context_handler))
+        .route("/contexts/{scope}", post(create_context_handler))
         .route(
-            "/contexts/:scope/:id",
+            "/contexts/{scope}/{id}",
             put(update_context_handler).delete(delete_context_handler),
         )
         .route(
-            "/contexts/:scope/:id/duplicate",
+            "/contexts/{scope}/{id}/duplicate",
             post(duplicate_context_handler),
         )
         .route(
-            "/contexts/metadata/:id/enable",
+            "/contexts/metadata/{id}/enable",
             post(enable_context_handler),
         )
         .route(
-            "/contexts/metadata/:id/disable",
+            "/contexts/metadata/{id}/disable",
             post(disable_context_handler),
         )
-        .route("/contexts/:id/approve-sync", post(approve_context_sync))
-        .route("/contexts/:id/dismiss-sync", post(dismiss_context_sync))
+        .route("/contexts/{id}/approve-sync", post(approve_context_sync))
+        .route("/contexts/{id}/dismiss-sync", post(dismiss_context_sync))
 }

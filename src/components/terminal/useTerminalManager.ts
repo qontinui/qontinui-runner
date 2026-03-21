@@ -1,6 +1,9 @@
 import { useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { CommandResponse } from "./types";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("TerminalManager");
 
 export interface TerminalTab {
   id: string;
@@ -63,7 +66,7 @@ export function useTerminalManager() {
 
       if (alive.length === 0) return false;
 
-      console.log(`[TerminalManager] Reconnecting to ${alive.length} existing PTY session(s)`);
+      logger.info(`Reconnecting to ${alive.length} existing PTY session(s)`);
 
       // Rebuild tabs from Rust session data (already sorted by created_at)
       const reconnectedTabs: TerminalTab[] = alive.map((info) => ({

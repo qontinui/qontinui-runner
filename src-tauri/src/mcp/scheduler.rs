@@ -255,13 +255,13 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(list_scheduled_tasks).post(create_scheduled_task),
         )
         .route(
-            "/scheduler/tasks/:id",
+            "/scheduler/tasks/{id}",
             get(get_scheduled_task)
                 .put(update_scheduled_task)
                 .delete(delete_scheduled_task),
         )
-        .route("/scheduler/tasks/:id/run", post(run_task_now))
-        .route("/scheduler/tasks/:id/history", get(get_task_history))
+        .route("/scheduler/tasks/{id}/run", post(run_task_now))
+        .route("/scheduler/tasks/{id}/history", get(get_task_history))
         .route(
             "/scheduler/settings",
             get(get_scheduler_settings).put(update_scheduler_settings),

@@ -7,6 +7,9 @@
 
 import type { Finding, ExecutionReport, PhaseInfo, UserInputRequest } from "../types/findings";
 import { calculateSummary, createEmptySummary } from "./FindingsExport";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("FindingsSync");
 
 /**
  * Create a new execution report
@@ -183,7 +186,7 @@ export async function syncFindingsToBackend(
     const data = await response.json();
     result.success = true;
     result.syncedCount = data.syncedCount || findings.length;
-    console.log(`[FindingsSync] Synced ${result.syncedCount} findings to backend`);
+    log.debug(`Synced ${result.syncedCount} findings to backend`);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     result.errors.push(`Sync failed: ${errorMessage}`);
@@ -233,7 +236,7 @@ export async function syncReportToBackend(
 
     result.success = true;
     result.syncedCount = 1;
-    console.log(`[FindingsSync] Synced report ${report.id} to backend`);
+    log.debug(`Synced report ${report.id} to backend`);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     result.errors.push(`Sync failed: ${errorMessage}`);

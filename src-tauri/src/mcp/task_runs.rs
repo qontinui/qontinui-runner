@@ -3545,74 +3545,74 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/task-runs", get(list_task_runs).post(create_task_run))
         .route("/task-runs/running", get(list_running_task_runs))
         .route("/task-runs/session", post(create_ai_session))
-        .route("/task-runs/:id", get(get_task_run).delete(delete_task_run))
-        .route("/task-runs/:id/output", get(get_task_output))
-        .route("/task-runs/:id/workflow-state", get(get_workflow_state))
-        .route("/task-runs/:id/result-data", get(get_task_run_result_data))
-        .route("/task-runs/:id/orchestrator-state", get(get_workflow_state)) // Alias for backward compatibility
-        .route("/task-runs/:id/full-state", get(get_full_workflow_state)) // Full state for restart recovery
-        .route("/task-runs/:id/stop", post(stop_task_run))
-        .route("/task-runs/:id/pause", post(pause_task_run))
-        .route("/task-runs/:id/unpause", post(unpause_task_run))
+        .route("/task-runs/{id}", get(get_task_run).delete(delete_task_run))
+        .route("/task-runs/{id}/output", get(get_task_output))
+        .route("/task-runs/{id}/workflow-state", get(get_workflow_state))
+        .route("/task-runs/{id}/result-data", get(get_task_run_result_data))
+        .route("/task-runs/{id}/orchestrator-state", get(get_workflow_state)) // Alias for backward compatibility
+        .route("/task-runs/{id}/full-state", get(get_full_workflow_state)) // Full state for restart recovery
+        .route("/task-runs/{id}/stop", post(stop_task_run))
+        .route("/task-runs/{id}/pause", post(pause_task_run))
+        .route("/task-runs/{id}/unpause", post(unpause_task_run))
         .route(
-            "/task-runs/:id/auto-continue",
+            "/task-runs/{id}/auto-continue",
             get(get_task_auto_continue).put(set_task_auto_continue),
         )
-        .route("/task-runs/:id/resume", post(resume_task_run))
+        .route("/task-runs/{id}/resume", post(resume_task_run))
         .route(
-            "/task-runs/:id/generate-summary",
+            "/task-runs/{id}/generate-summary",
             post(generate_task_summary),
         )
-        .route("/task-runs/:id/events", get(get_task_run_events))
-        .route("/task-runs/:id/screenshots", get(get_task_run_screenshots))
+        .route("/task-runs/{id}/events", get(get_task_run_events))
+        .route("/task-runs/{id}/screenshots", get(get_task_run_screenshots))
         .route(
-            "/task-runs/:id/playwright-results",
+            "/task-runs/{id}/playwright-results",
             get(get_task_run_playwright_results),
         )
         .route("/execution-spans", get(get_execution_spans))
-        .route("/task-runs/:id/migrate-logs", post(migrate_task_run_logs))
-        .route("/task-runs/:id/checkpoints", get(get_task_run_checkpoints))
+        .route("/task-runs/{id}/migrate-logs", post(migrate_task_run_logs))
+        .route("/task-runs/{id}/checkpoints", get(get_task_run_checkpoints))
         .route(
-            "/task-runs/:id/verification-results",
+            "/task-runs/{id}/verification-results",
             get(get_task_run_verification_results),
         )
         .route(
-            "/task-runs/:id/verification-phase-results",
+            "/task-runs/{id}/verification-phase-results",
             get(get_task_run_verification_phase_results),
         )
-        .route("/task-runs/:id/mcp-calls", get(get_task_run_mcp_calls))
+        .route("/task-runs/{id}/mcp-calls", get(get_task_run_mcp_calls))
         .route(
-            "/task-runs/:id/api-requests",
+            "/task-runs/{id}/api-requests",
             get(get_task_run_api_requests),
         )
-        .route("/task-runs/:id/awas-steps", get(get_task_run_awas_steps))
-        .route("/task-runs/:id/knowledge", get(get_task_run_knowledge))
+        .route("/task-runs/{id}/awas-steps", get(get_task_run_awas_steps))
+        .route("/task-runs/{id}/knowledge", get(get_task_run_knowledge))
         .route(
-            "/task-runs/:id/steps/:checkpoint_id/progress",
+            "/task-runs/{id}/steps/{checkpoint_id}/progress",
             get(get_step_progress_markers),
         )
-        .route("/task-runs/:id/message", post(send_message_to_session))
-        .route("/task-runs/:id/session-state", get(get_session_state))
+        .route("/task-runs/{id}/message", post(send_message_to_session))
+        .route("/task-runs/{id}/session-state", get(get_session_state))
         .route(
-            "/task-runs/:id/generate-workflow",
+            "/task-runs/{id}/generate-workflow",
             post(generate_workflow_from_session),
         )
-        .route("/task-runs/:id/rename", post(rename_task_run))
+        .route("/task-runs/{id}/rename", post(rename_task_run))
         .route(
-            "/task-runs/:id/stream/ai-output",
+            "/task-runs/{id}/stream/ai-output",
             get(sse_ai_output_for_task_run),
         )
-        .route("/task-runs/:id/approvals", get(list_approvals))
-        .route("/task-runs/:id/approvals/:aid", get(get_approval))
+        .route("/task-runs/{id}/approvals", get(list_approvals))
+        .route("/task-runs/{id}/approvals/{aid}", get(get_approval))
         .route(
-            "/task-runs/:id/approvals/:aid/respond",
+            "/task-runs/{id}/approvals/{aid}/respond",
             post(respond_to_approval),
         )
-        .route("/task-runs/:id/approval-gates", get(get_approval_gates))
+        .route("/task-runs/{id}/approval-gates", get(get_approval_gates))
         .route("/current-execution/steps", get(get_current_execution_steps))
         .route("/current-execution/batch", get(get_current_execution_batch))
-        .route("/task-runs/:id/usage", get(get_task_run_usage))
-        .route("/traces/:trace_id", get(get_trace_correlation))
+        .route("/task-runs/{id}/usage", get(get_task_run_usage))
+        .route("/traces/{trace_id}", get(get_trace_correlation))
 }
 
 /// Get per-phase token usage breakdown for a task run.

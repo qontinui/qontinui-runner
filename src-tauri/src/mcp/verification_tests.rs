@@ -452,10 +452,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/tests/execute-suite", post(execute_test_suite_handler))
         .route("/tests/history", get(get_test_history))
         .route(
-            "/tests/:id",
+            "/tests/{id}",
             get(get_test).put(update_test).delete(delete_test),
         )
-        .route("/tests/:id/execute", post(execute_test_by_id))
+        .route("/tests/{id}/execute", post(execute_test_by_id))
         .route("/test-results", get(list_test_results))
-        .route("/test-results/:id", get(get_test_result))
+        .route("/test-results/{id}", get(get_test_result))
 }

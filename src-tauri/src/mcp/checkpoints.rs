@@ -180,9 +180,9 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     axum::Router::new()
         .route("/checkpoints", get(list_checkpoints).post(save_checkpoint))
         .route(
-            "/checkpoints/:name",
+            "/checkpoints/{name}",
             get(get_checkpoint).delete(delete_checkpoint),
         )
-        .route("/checkpoints/:name/status", get(get_checkpoint_status))
+        .route("/checkpoints/{name}/status", get(get_checkpoint_status))
         .route("/checkpoints/history", get(get_checkpoint_history))
 }

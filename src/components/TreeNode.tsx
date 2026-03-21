@@ -18,6 +18,9 @@ import {
 } from "lucide-react";
 import { DisplayNode } from "../types/treeEvents";
 import { getAccentColors, getStatusColors } from "@/design-system";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("TreeNode");
 
 /**
  * Type for action config target with optional properties
@@ -469,14 +472,14 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
               const isInline = child.metadata.is_inline === true;
               const isUserWorkflow = child.metadata.is_expandable === true;
 
-              console.log(
-                `[TreeNode] Child workflow ${child.name}: isInline=${isInline}, isUserWorkflow=${isUserWorkflow}`,
+              logger.debug(
+                `Child workflow ${child.name}: isInline=${isInline}, isUserWorkflow=${isUserWorkflow}`,
               );
 
               // Skip inline workflows (transition workflows) and render their children instead
               if (isInline && !isUserWorkflow) {
-                console.log(
-                  `[TreeNode] Skipping inline workflow wrapper: ${child.name}, rendering its children`,
+                logger.debug(
+                  `Skipping inline workflow wrapper: ${child.name}, rendering its children`,
                 );
                 return child.children.map((grandchild) => (
                   <TreeNode

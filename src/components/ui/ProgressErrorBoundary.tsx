@@ -29,6 +29,9 @@
 
 import { Component, type ReactNode, type ErrorInfo } from "react";
 import { cn } from "../../lib/utils";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ProgressErrorBoundary");
 
 export interface ProgressErrorBoundaryProps {
   /** Child components to render */
@@ -106,7 +109,7 @@ export class ProgressErrorBoundary extends Component<
       const componentName = this.props.componentName || "Progress";
       console.warn(`[ProgressErrorBoundary] Error in ${componentName}:`, error.message);
       if (errorInfo.componentStack) {
-        console.debug("[ProgressErrorBoundary] Component stack:", errorInfo.componentStack);
+        logger.debug("Component stack:", errorInfo.componentStack);
       }
     }
 

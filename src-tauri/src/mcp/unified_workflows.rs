@@ -2595,30 +2595,30 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/slash-commands/sync", post(sync_slash_commands_handler))
         // Parameterized paths after all literal paths
         .route(
-            "/unified-workflows/:id",
+            "/unified-workflows/{id}",
             get(get_unified_workflow)
                 .put(update_unified_workflow)
                 .delete(delete_unified_workflow),
         )
         .route(
-            "/unified-workflows/:id/duplicate",
+            "/unified-workflows/{id}/duplicate",
             post(duplicate_unified_workflow),
         )
         .route(
-            "/unified-workflows/:id/export",
+            "/unified-workflows/{id}/export",
             get(export_unified_workflow),
         )
-        .route("/unified-workflows/:id/run", post(run_unified_workflow))
+        .route("/unified-workflows/{id}/run", post(run_unified_workflow))
         .route(
-            "/unified-workflows/:id/stats",
+            "/unified-workflows/{id}/stats",
             get(get_unified_workflow_stats),
         )
         .route(
-            "/unified-workflows/:id/example-status",
+            "/unified-workflows/{id}/example-status",
             axum::routing::put(update_example_status_handler),
         )
         .route(
-            "/unified-workflows/:id/favorite",
+            "/unified-workflows/{id}/favorite",
             axum::routing::post(toggle_favorite_handler),
         )
 }

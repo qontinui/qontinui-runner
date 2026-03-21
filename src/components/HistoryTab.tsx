@@ -35,6 +35,9 @@ import {
 } from "lucide-react";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import type { RunDetails, TieredInfoResponse } from "../types/statistics";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("HistoryTab");
 import { FixedVirtualList } from "./ui";
 
 /** Threshold for switching to virtual scrolling */
@@ -141,7 +144,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
       }
     } catch (err) {
       // Silently ignore - endpoint may not exist yet
-      console.debug("AI session history not available:", err);
+      logger.debug("AI session history not available:", err);
     }
   }, []);
 
@@ -596,9 +599,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
 
                 {/* Status icon */}
                 {run.success === true ? (
-                  <CheckCircle
-                    className={`w-4 h-4 ${getStatusColors("success").text} shrink-0`}
-                  />
+                  <CheckCircle className={`w-4 h-4 ${getStatusColors("success").text} shrink-0`} />
                 ) : run.success === false ? (
                   <XCircle className={`w-4 h-4 ${getStatusColors("error").text} shrink-0`} />
                 ) : run.status === "running" ? (
@@ -606,9 +607,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
                     className={`w-4 h-4 ${getAccentColors("blue").text} animate-pulse shrink-0`}
                   />
                 ) : (
-                  <AlertTriangle
-                    className={`w-4 h-4 ${getAccentColors("yellow").text} shrink-0`}
-                  />
+                  <AlertTriangle className={`w-4 h-4 ${getAccentColors("yellow").text} shrink-0`} />
                 )}
 
                 {/* Run info */}

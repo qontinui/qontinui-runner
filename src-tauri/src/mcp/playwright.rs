@@ -280,12 +280,12 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/playwright/tests/tags", get(get_playwright_tags))
         .route("/playwright/tests/import", post(import_playwright_tests))
         .route("/playwright/tests/export", get(export_playwright_tests))
-        .route("/playwright/tests/:id", get(get_playwright_test))
-        .route("/playwright/tests/:id", put(update_playwright_test))
-        .route("/playwright/tests/:id", delete(delete_playwright_test))
-        .route("/playwright/tests/:id/run", post(run_playwright_test))
+        .route("/playwright/tests/{id}", get(get_playwright_test))
+        .route("/playwright/tests/{id}", put(update_playwright_test))
+        .route("/playwright/tests/{id}", delete(delete_playwright_test))
+        .route("/playwright/tests/{id}/run", post(run_playwright_test))
         .route(
-            "/playwright/tests/:id/duplicate",
+            "/playwright/tests/{id}/duplicate",
             post(duplicate_playwright_test),
         )
 }

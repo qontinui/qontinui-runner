@@ -7,6 +7,9 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ExecutionStatus");
 import {
   type ExecutionStatus,
   type RawExecutionStatusEvent,
@@ -431,9 +434,7 @@ export function useExecutionStatus(): UseExecutionStatusReturn {
           unlistenSubStepCompleteRef.current = unlistenSubStepComplete;
           unlistenSubStepStartedRef.current = unlistenSubStepStarted;
           setIsConnected(true);
-          console.log(
-            "[useExecutionStatus] Connected to execution status events (including sub-steps)",
-          );
+          logger.info("Connected to execution status events (including sub-steps)");
         } else {
           unlisten();
           unlistenSubStepComplete();

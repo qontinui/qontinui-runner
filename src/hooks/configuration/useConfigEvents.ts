@@ -11,6 +11,9 @@ import type { Config, Workflow, ConfigLoadedEventPayload, Category, LogFunction 
 import type { EventPayload } from "../../types/eventPayloads";
 import { createConfigFromData, deriveProjectId } from "./utils";
 import { useConfigFiltering } from "./useConfigFiltering";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ConfigEvents");
 
 interface UseConfigEventsOptions {
   onLog?: LogFunction;
@@ -32,7 +35,7 @@ export function useConfigEvents(options: UseConfigEventsOptions = {}): void {
   useEffect(() => {
     const handleConfigLoaded = (payload: EventPayload) => {
       const configPayload = payload as ConfigLoadedEventPayload;
-      console.log("[CONFIG] Received config_loaded event from MCP API:", configPayload);
+      logger.debug("Received config_loaded event from MCP API:", configPayload);
 
       const configPath = configPayload.data?.path;
       const configData = configPayload.data?.config;
@@ -57,19 +60,19 @@ export function useConfigEvents(options: UseConfigEventsOptions = {}): void {
       // Update projectId in configManager
       const projectId = deriveProjectId(configData.metadata);
       if (projectId) {
-        console.log("[CONFIG] Config includes projectId:", projectId);
+        logger.debug("Config includes projectId:", projectId);
         configManager.setProjectId(projectId);
       } else {
         configManager.setProjectId(null);
       }
 
-      console.log(
-        "[CONFIG] Config loaded via MCP API with images:",
+      logger.debug(
+        "Config loaded via MCP API with images:",
         loadedConfig.images?.length || 0,
         "images",
       );
-      console.log(
-        "[CONFIG] Config loaded via MCP API with states:",
+      logger.debug(
+        "Config loaded via MCP API with states:",
         loadedConfig.states?.length || 0,
         "states",
       );
@@ -78,15 +81,15 @@ export function useConfigEvents(options: UseConfigEventsOptions = {}): void {
       const allWorkflows = configData.workflows || [];
       const categories = configData.categories as Category[] | string[] | undefined;
 
-      console.log("[CONFIG] MCP API - All workflows loaded:", allWorkflows.length);
+      logger.debug("MCP API - All workflows loaded:", allWorkflows.length);
 
       const { automationWorkflows, automationEnabledCategories } = filterWorkflows(
         allWorkflows,
         categories,
       );
 
-      console.log("[CONFIG] MCP API - Filtered automation workflows:", automationWorkflows.length);
-      console.log("[CONFIG] MCP API - Automation-enabled categories:", automationEnabledCategories);
+      logger.debug("MCP API - Filtered automation workflows:", automationWorkflows.length);
+      logger.debug("MCP API - Automation-enabled categories:", automationEnabledCategories);
 
       // Notify consumer of loaded config, workflows, and enabled categories
       onConfigLoaded?.(loadedConfig, automationWorkflows, automationEnabledCategories);

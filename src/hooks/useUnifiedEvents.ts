@@ -18,6 +18,9 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("UnifiedEvents");
 import {
   useWebSocketEvents,
   useWsOrchestratorState,
@@ -216,7 +219,7 @@ export function useUnifiedEvents(options: UseUnifiedEventsOptions = {}): UseUnif
           unlistenRefs.current = unlistenFns;
           setTauriConnected(true);
           wrappedOnConnected();
-          console.log("[useUnifiedEvents] Tauri event listeners connected");
+          logger.info("Tauri event listeners connected");
         } else {
           // Cleanup if unmounted during setup
           unlistenFns.forEach((fn) => fn());
@@ -369,7 +372,7 @@ export function useUnifiedOrchestratorState(
           unlisten();
         }
       } catch (error) {
-        console.debug("[useUnifiedOrchestratorState] Tauri events not available:", error);
+        logger.debug("Tauri events not available:", error);
         if (mounted) {
           setTauriConnected(false);
         }

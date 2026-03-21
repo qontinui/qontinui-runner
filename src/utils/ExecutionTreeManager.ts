@@ -12,7 +12,10 @@
  * @module ExecutionTreeManager
  */
 
+import { createLogger } from "@/lib/logger";
 import { TreeEventData, DisplayNode, NodeType, NodeStatus } from "../types/treeEvents";
+
+const logger = createLogger("ExecutionTreeManager");
 import type { ExtendedNodeMetadata, NodeMetadata } from "../types/treeEvents";
 
 /**
@@ -74,8 +77,8 @@ export class ExecutionTreeManager {
   handleTreeEvent(event: TreeEventData): DisplayNode {
     const { node: nodeData, event_type } = event;
 
-    console.log(
-      `[TreeManager] Handling ${event_type} for ${nodeData.node_type} "${nodeData.name}" (id: ${nodeData.id})`,
+    logger.debug(
+      `Handling ${event_type} for ${nodeData.node_type} "${nodeData.name}" (id: ${nodeData.id})`,
     );
 
     // Get or create node
@@ -83,9 +86,7 @@ export class ExecutionTreeManager {
 
     if (!displayNode) {
       // Create new node
-      console.log(
-        `[TreeManager] Creating new node: ${nodeData.id}, parent: ${nodeData.parent_id || "null"}`,
-      );
+      logger.debug(`Creating new node: ${nodeData.id}, parent: ${nodeData.parent_id || "null"}`);
       displayNode = this.createDisplayNode(nodeData);
       this.nodes.set(nodeData.id, displayNode);
 
@@ -93,11 +94,11 @@ export class ExecutionTreeManager {
       this.linkNodeToParent(displayNode, nodeData.parent_id);
     } else {
       // Update existing node status
-      console.log(`[TreeManager] Updating node ${nodeData.id} status: ${nodeData.status}`);
+      logger.debug(`Updating node ${nodeData.id} status: ${nodeData.status}`);
       this.updateNodeStatus(displayNode, nodeData);
     }
 
-    console.log(`[TreeManager] Total nodes: ${this.nodes.size}, roots: ${this.roots.length}`);
+    logger.debug(`Total nodes: ${this.nodes.size}, roots: ${this.roots.length}`);
     return displayNode;
   }
 

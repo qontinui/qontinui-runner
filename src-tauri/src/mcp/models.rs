@@ -357,5 +357,5 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/models/download", post(download_model))
         .route("/models/delete", post(delete_model))
         .route("/models/disk-usage", get(get_models_disk_usage))
-        .route("/models/:model_id", get(get_model_status))
+        .route("/models/{model_id}", get(get_model_status))
 }

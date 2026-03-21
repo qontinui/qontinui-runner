@@ -5,9 +5,12 @@
  * - image_recognition: Pattern matching and template detection results
  */
 
+import { createLogger } from "@/lib/logger";
 import { logManager } from "../LogManager";
 import type { HandlerSetupFunction } from "./types";
 import type { ImageRecognitionEventPayload } from "../../types/eventPayloads";
+
+const logger = createLogger("ImageHandler");
 import {
   executionReportingService,
   type ImageRecognitionData,
@@ -23,7 +26,7 @@ export const setupImageHandlers: HandlerSetupFunction = (context) => {
   // Handler for "image_recognition" event
   unsubscribers.push(
     eventRouter.subscribe("image_recognition", (payload: ImageRecognitionEventPayload) => {
-      console.log("[IMAGE_HANDLER] image_recognition event received");
+      logger.debug("image_recognition event received");
       const data = payload.data;
 
       if (!data) {

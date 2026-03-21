@@ -14,6 +14,9 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ConnectionInfo } from "../types/auth";
 import { instanceStorage } from "@/lib/instance-storage";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("WebSocketAutoConnect");
 
 interface TauriResult<T> {
   success: boolean;
@@ -87,7 +90,7 @@ export function useWebSocketAutoConnect({
     try {
       const info = await invoke<ConnectionInfo>("get_connection_info");
       setConnectionInfo(info);
-      console.log("[WS_AUTO_CONNECT] Connection info loaded:", info);
+      logger.debug("Connection info loaded:", info);
     } catch (err) {
       console.error("[WS_AUTO_CONNECT] Failed to load connection info:", err);
       setError(err as string);
@@ -106,7 +109,7 @@ export function useWebSocketAutoConnect({
     }
 
     if (connecting) {
-      console.log("[WS_AUTO_CONNECT] Connection already in progress, skipping");
+      logger.debug("Connection already in progress, skipping");
       return;
     }
 
@@ -118,17 +121,19 @@ export function useWebSocketAutoConnect({
     lastConnectTimeRef.current = Date.now();
 
     try {
-      console.log("[WS_AUTO_CONNECT] Getting access token from AuthManager...");
+      logger.debug("Getting access token from AuthManager...");
 
       let accessToken = "";
       try {
         accessToken = await invoke<string>("get_access_token_for_websocket");
       } catch (tokenErr) {
         console.error("[WS_AUTO_CONNECT] Failed to get access token:", tokenErr);
-        throw new Error("Failed to retrieve authentication token. Please try logging in again.", { cause: tokenErr });
+        throw new Error("Failed to retrieve authentication token. Please try logging in again.", {
+          cause: tokenErr,
+        });
       }
 
-      console.log("[WS_AUTO_CONNECT] Configuring WebSocket with auth token...");
+      logger.debug("Configuring WebSocket with auth token...");
 
       const config: WebSocketConfig = {
         enabled: true,
@@ -146,7 +151,7 @@ export function useWebSocketAutoConnect({
         throw new Error(configResult.message || "Failed to configure WebSocket");
       }
 
-      console.log("[WS_AUTO_CONNECT] Connecting...");
+      logger.debug("Connecting...");
 
       const connectResult = await invoke<TauriResult<null>>("connect_websocket");
 
@@ -157,7 +162,7 @@ export function useWebSocketAutoConnect({
       setConnected(true);
       onConnected?.();
       onLog?.("success", "Connected to qontinui.io successfully");
-      console.log("[WS_AUTO_CONNECT] Connected successfully");
+      logger.info("Connected successfully");
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       setError(errorMessage);
@@ -173,7 +178,7 @@ export function useWebSocketAutoConnect({
   const disconnect = useCallback(async () => {
     try {
       userDisconnectedRef.current = true;
-      console.log("[WS_AUTO_CONNECT] User initiated disconnect - auto-reconnect disabled");
+      logger.info("User initiated disconnect - auto-reconnect disabled");
 
       const result = await invoke<TauriResult<null>>("disconnect_websocket");
       if (result && result.success) {
@@ -208,7 +213,7 @@ export function useWebSocketAutoConnect({
       autoConnectAttemptedRef.current !== selectedProjectId &&
       !userDisconnectedRef.current
     ) {
-      console.log("[WS_AUTO_CONNECT] Auto-connecting WebSocket for project:", selectedProjectId);
+      logger.debug("Auto-connecting WebSocket for project:", selectedProjectId);
       autoConnectAttemptedRef.current = selectedProjectId;
       connect();
     }
@@ -237,11 +242,7 @@ export function useWebSocketAutoConnect({
           projectId: selectedProjectId,
         });
         if (cancelled) return;
-        console.log(
-          "[WS_AUTO_CONNECT] Heartbeat sent (has_active_connection:",
-          response.has_active_connection,
-          ")",
-        );
+        logger.debug("Heartbeat sent (has_active_connection:", response.has_active_connection, ")");
 
         // If backend says no active connection but we think we're connected,
         // the WebSocket has silently dropped — trigger reconnection.
@@ -251,8 +252,8 @@ export function useWebSocketAutoConnect({
         if (!response.has_active_connection) {
           const timeSinceConnect = Date.now() - lastConnectTimeRef.current;
           if (timeSinceConnect < 15000) {
-            console.log(
-              "[WS_AUTO_CONNECT] Backend reports no active connection, but connected recently (" +
+            logger.debug(
+              "Backend reports no active connection, but connected recently (" +
                 Math.round(timeSinceConnect / 1000) +
                 "s ago) — waiting for registration",
             );

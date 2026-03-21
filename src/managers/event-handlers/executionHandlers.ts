@@ -9,7 +9,10 @@
  * - execution_failed: Workflow execution failed
  */
 
+import { createLogger } from "@/lib/logger";
 import { logManager } from "../LogManager";
+
+const logger = createLogger("ExecutionHandler");
 import { windowManager } from "../WindowManager";
 import { configManager } from "../ConfigManager";
 import { APP_VERSION } from "../../lib/appInfo";
@@ -30,7 +33,7 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
   // Handler for "ready" event
   unsubscribers.push(
     eventRouter.subscribe("ready", () => {
-      console.log("[EXECUTION_HANDLER] ready event received");
+      logger.debug("ready event received");
       setPythonStatus("running");
       logManager.addLog("info", "Python executor ready");
     }),
@@ -39,7 +42,7 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
   // Handler for "config_loaded" event
   unsubscribers.push(
     eventRouter.subscribe("config_loaded", () => {
-      console.log("[EXECUTION_HANDLER] config_loaded event received");
+      logger.debug("config_loaded event received");
       setConfigLoaded(true);
       logManager.addLog("info", "Configuration loaded successfully");
     }),
@@ -48,7 +51,7 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
   // Handler for "execution_started" event
   unsubscribers.push(
     eventRouter.subscribe("execution_started", async (payload: EventPayload) => {
-      console.log("[EXECUTION_HANDLER] execution_started event received");
+      logger.debug("execution_started event received");
       setExecutionActive(true);
 
       // Start execution run reporting using the new unified service
@@ -100,8 +103,8 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
           initial_state_ids: initialStateIds.length > 0 ? initialStateIds : undefined,
         };
 
-        console.log(
-          `[EXECUTION_HANDLER] Starting ${runType} run for project ${projectId}, workflow ${workflowName}, initial states: ${JSON.stringify(initialStateIds)}`,
+        logger.debug(
+          `Starting ${runType} run for project ${projectId}, workflow ${workflowName}, initial states: ${JSON.stringify(initialStateIds)}`,
         );
 
         // Start execution run reporting
@@ -117,7 +120,7 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
             console.error("[EXECUTION_HANDLER] Failed to start execution run:", error);
           });
       } else {
-        console.log("[EXECUTION_HANDLER] No project selected, skipping execution run reporting");
+        logger.debug("No project selected, skipping execution run reporting");
       }
     }),
   );
@@ -125,13 +128,13 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
   // Handler for "execution_completed" event
   unsubscribers.push(
     eventRouter.subscribe("execution_completed", async () => {
-      console.log("[EXECUTION_HANDLER] execution_completed event received");
+      logger.debug("execution_completed event received");
       setExecutionActive(false);
       logManager.addLog("success", "Execution completed successfully");
 
       // Complete execution run (success)
       if (executionReportingService.isActive) {
-        console.log("[EXECUTION_HANDLER] Completing execution run (success)");
+        logger.debug("Completing execution run (success)");
         await executionReportingService.completeRun(RunStatus.COMPLETED).catch((error) => {
           console.error("[EXECUTION_HANDLER] Failed to complete execution run:", error);
         });
@@ -143,7 +146,7 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
       // Archive findings from the session to disk for persistence
       const findingsCount = findingsTracker.count;
       if (findingsCount > 0) {
-        console.log(`[EXECUTION_HANDLER] Archiving ${findingsCount} findings from session`);
+        logger.debug(`Archiving ${findingsCount} findings from session`);
         findingsTracker.archiveCurrentSession("completed").catch((error) => {
           console.error("[EXECUTION_HANDLER] Failed to archive session:", error);
         });
@@ -154,7 +157,7 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
   // Handler for "execution_failed" event (if execution fails)
   unsubscribers.push(
     eventRouter.subscribe("execution_failed", async (payload: EventPayload) => {
-      console.log("[EXECUTION_HANDLER] execution_failed event received");
+      logger.debug("execution_failed event received");
       setExecutionActive(false);
 
       const data = payload?.data as { error_message?: string } | undefined;
@@ -162,7 +165,7 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
 
       // Complete execution run (failure)
       if (executionReportingService.isActive) {
-        console.log("[EXECUTION_HANDLER] Completing execution run (failed)");
+        logger.debug("Completing execution run (failed)");
         await executionReportingService
           .completeRun(RunStatus.FAILED, undefined, undefined, errorMessage)
           .catch((error) => {
@@ -173,7 +176,7 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
       // Archive findings from the session (even on failure)
       const findingsCount = findingsTracker.count;
       if (findingsCount > 0) {
-        console.log(`[EXECUTION_HANDLER] Archiving ${findingsCount} findings from failed session`);
+        logger.debug(`Archiving ${findingsCount} findings from failed session`);
         findingsTracker.archiveCurrentSession("failed").catch((error) => {
           console.error("[EXECUTION_HANDLER] Failed to archive failed session:", error);
         });

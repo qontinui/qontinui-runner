@@ -318,8 +318,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/macros/categories", get(get_macro_categories))
         .route("/macros/tags", get(get_macro_tags))
         .route(
-            "/macros/:id",
+            "/macros/{id}",
             get(get_macro).put(update_macro).delete(delete_macro),
         )
-        .route("/macros/:id/run", post(run_macro))
+        .route("/macros/{id}/run", post(run_macro))
 }

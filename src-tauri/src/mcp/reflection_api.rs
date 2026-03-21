@@ -1099,16 +1099,16 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             post(create_fix_handler).get(list_fixes_handler),
         )
         .route(
-            "/reflection-fixes/:id",
+            "/reflection-fixes/{id}",
             get(get_fix_handler).put(update_fix_status_handler),
         )
         .route(
-            "/reflection-fixes/:id/effectiveness",
+            "/reflection-fixes/{id}/effectiveness",
             put(update_fix_effectiveness_handler),
         )
         // Task run scoped
         .route(
-            "/task-runs/:id/reflection-fixes",
+            "/task-runs/{id}/reflection-fixes",
             get(get_fixes_for_task_run_handler),
         )
         // Reflection management
@@ -1118,7 +1118,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route("/reflection/history", get(reflection_history_handler))
         .route(
-            "/reflection/trigger/:task_run_id",
+            "/reflection/trigger/{task_run_id}",
             post(trigger_reflection_handler),
         )
         .route("/reflection/evaluate", post(evaluate_fixes_handler))

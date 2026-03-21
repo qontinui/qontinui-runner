@@ -28,6 +28,9 @@ import { cn } from "../../lib/utils";
 import type { SavedMacro } from "../../types";
 import type { Config } from "../../contexts/ExecutionContext";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("AutomationToolkitSidebar");
 
 type ActionType = "click" | "double_click" | "right_click" | "type" | "hotkey" | "go_to_state";
 type LogLevel = "info" | "warning" | "error" | "success";
@@ -114,7 +117,7 @@ export function AutomationToolkitSidebar({
     if (onLog) {
       onLog(level, message);
     } else {
-      console.log(`[${level}] ${message}`);
+      logger.debug(`[${level}] ${message}`);
     }
   };
 

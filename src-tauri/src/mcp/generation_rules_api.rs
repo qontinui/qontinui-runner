@@ -162,7 +162,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(list_rules_handler).post(create_rule_handler),
         )
         .route(
-            "/generation-rules/:id",
+            "/generation-rules/{id}",
             get(get_rule_handler)
                 .put(update_rule_handler)
                 .delete(delete_rule_handler),

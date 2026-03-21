@@ -6,6 +6,7 @@
  * handles offline mode gracefully, and queues failed syncs for retry.
  */
 
+import { createLogger } from "@/lib/logger";
 import type { Finding, ExecutionReport } from "../types/findings";
 import type { SessionHistoryEntry } from "../findings/types";
 import {
@@ -61,6 +62,8 @@ type SyncStatusCallback = (pending: number) => void;
 // Constants
 // ============================================================================
 
+const logger = createLogger("ReportPersistence");
+
 const PENDING_SYNCS_STORAGE_KEY = "qontinui-pending-syncs";
 const BACKEND_CONFIG_STORAGE_KEY = "qontinui-backend-config";
 const MAX_RETRY_ATTEMPTS = 5;
@@ -108,12 +111,10 @@ export class ReportPersistenceService {
     // Persist to localStorage
     if (config) {
       instanceStorage.setJSON(BACKEND_CONFIG_STORAGE_KEY, config);
-      console.log(
-        `[ReportPersistence] Backend configured: ${config.baseUrl} (project: ${config.projectId})`,
-      );
+      logger.info(`Backend configured: ${config.baseUrl} (project: ${config.projectId})`);
     } else {
       instanceStorage.removeItem(BACKEND_CONFIG_STORAGE_KEY);
-      console.log("[ReportPersistence] Backend sync disabled (offline mode)");
+      logger.info("Backend sync disabled (offline mode)");
     }
 
     // Try pending syncs if we now have a config
@@ -173,7 +174,7 @@ export class ReportPersistenceService {
 
     // If no backend configured, return success (offline mode)
     if (!this.backendConfig) {
-      console.log("[ReportPersistence] No backend configured, skipping sync");
+      logger.info("No backend configured, skipping sync");
       result.success = true;
       return result;
     }
@@ -185,7 +186,7 @@ export class ReportPersistenceService {
       if (backendResult.success) {
         result.success = true;
         result.syncedCount = 1;
-        console.log(`[ReportPersistence] Report ${report.id} synced to backend`);
+        logger.info(`Report ${report.id} synced to backend`);
       } else {
         // Queue for retry
         this.addToPendingQueue("report", report, backendResult.errors.join("; "));
@@ -219,7 +220,7 @@ export class ReportPersistenceService {
 
     // If no backend configured, return success (offline mode)
     if (!this.backendConfig) {
-      console.log("[ReportPersistence] No backend configured, skipping sync");
+      logger.info("No backend configured, skipping sync");
       result.success = true;
       return result;
     }
@@ -231,7 +232,7 @@ export class ReportPersistenceService {
       if (backendResult.success) {
         result.success = true;
         result.syncedCount = backendResult.syncedCount;
-        console.log(`[ReportPersistence] ${result.syncedCount} findings synced to backend`);
+        logger.info(`${result.syncedCount} findings synced to backend`);
       } else {
         // Queue for retry
         this.addToPendingQueue("findings", findings, backendResult.errors.join("; "));
@@ -266,7 +267,7 @@ export class ReportPersistenceService {
         sessionHistory,
       });
 
-      console.log("[ReportPersistence] Saved to local disk");
+      logger.debug("Saved to local disk");
     } catch (error) {
       console.error("[ReportPersistence] Failed to save to local disk:", error);
       throw error;
@@ -284,8 +285,8 @@ export class ReportPersistenceService {
         return { reports: [], findings: [] };
       }
 
-      console.log(
-        `[ReportPersistence] Loaded from disk: ${data.reports?.length || 0} reports, ${data.findings?.length || 0} findings`,
+      logger.info(
+        `Loaded from disk: ${data.reports?.length || 0} reports, ${data.findings?.length || 0} findings`,
       );
 
       return {
@@ -315,12 +316,12 @@ export class ReportPersistenceService {
    */
   async retryPendingSyncs(): Promise<SyncResult[]> {
     if (!this.backendConfig) {
-      console.log("[ReportPersistence] No backend configured, cannot retry syncs");
+      logger.info("No backend configured, cannot retry syncs");
       return [];
     }
 
     if (this.isRetrying) {
-      console.log("[ReportPersistence] Retry already in progress");
+      logger.debug("Retry already in progress");
       return [];
     }
 
@@ -332,7 +333,7 @@ export class ReportPersistenceService {
     const results: SyncResult[] = [];
     const successfulIds: string[] = [];
 
-    console.log(`[ReportPersistence] Retrying ${this.pendingSyncs.length} pending syncs`);
+    logger.info(`Retrying ${this.pendingSyncs.length} pending syncs`);
 
     for (const item of this.pendingSyncs) {
       // Skip items that have exceeded max retries
@@ -360,7 +361,7 @@ export class ReportPersistenceService {
 
         if (result.success) {
           successfulIds.push(item.id);
-          console.log(`[ReportPersistence] Successfully retried ${item.type} ${item.id}`);
+          logger.info(`Successfully retried ${item.type} ${item.id}`);
         } else {
           item.error = result.errors.join("; ");
         }
@@ -410,7 +411,7 @@ export class ReportPersistenceService {
       this.retryTimer = null;
     }
 
-    console.log(`[ReportPersistence] Cleared ${count} pending syncs`);
+    logger.info(`Cleared ${count} pending syncs`);
   }
 
   // ==========================================================================
@@ -476,9 +477,7 @@ export class ReportPersistenceService {
     this.notifyStatusChange();
     this.scheduleRetry();
 
-    console.log(
-      `[ReportPersistence] Queued ${type} for retry (${this.pendingSyncs.length} pending)`,
-    );
+    logger.info(`Queued ${type} for retry (${this.pendingSyncs.length} pending)`);
   }
 
   /**
@@ -504,7 +503,7 @@ export class ReportPersistenceService {
       60000, // Max 1 minute
     );
 
-    console.log(`[ReportPersistence] Scheduling retry in ${delay}ms`);
+    logger.debug(`Scheduling retry in ${delay}ms`);
 
     this.retryTimer = setTimeout(async () => {
       this.retryTimer = null;
@@ -531,13 +530,13 @@ export class ReportPersistenceService {
     const config = instanceStorage.getJSON<BackendConfig | null>(BACKEND_CONFIG_STORAGE_KEY, null);
     if (config) {
       this.backendConfig = config;
-      console.log(`[ReportPersistence] Loaded backend config: ${this.backendConfig?.baseUrl}`);
+      logger.info(`Loaded backend config: ${this.backendConfig?.baseUrl}`);
     }
 
     // Load pending syncs
     this.pendingSyncs = instanceStorage.getJSON<PendingSyncItem[]>(PENDING_SYNCS_STORAGE_KEY, []);
     if (this.pendingSyncs.length > 0) {
-      console.log(`[ReportPersistence] Loaded ${this.pendingSyncs.length} pending syncs`);
+      logger.info(`Loaded ${this.pendingSyncs.length} pending syncs`);
     }
   }
 

@@ -222,11 +222,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/error-monitor/summary", get(get_error_monitor_summary))
         .route("/error-monitor/debug-context", get(get_error_debug_context))
         .route(
-            "/error-monitor/errors/:id/resolve",
+            "/error-monitor/errors/{id}/resolve",
             post(resolve_error_monitor_error),
         )
         .route(
-            "/error-monitor/errors/:id/acknowledge",
+            "/error-monitor/errors/{id}/acknowledge",
             post(acknowledge_error_monitor_error),
         )
         .route("/error-monitor/fix-workflow", post(generate_fix_workflow))

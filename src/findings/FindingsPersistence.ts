@@ -7,6 +7,9 @@
 
 import type { Finding, ExecutionReport } from "../types/findings";
 import type { PersistedFindingsData, SessionHistoryEntry } from "./types";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("FindingsPersistence");
 
 /**
  * Save findings data to disk via Tauri
@@ -29,7 +32,7 @@ export async function persistFindingsData(data: {
 
     const { invoke } = await import("@tauri-apps/api/core");
     await invoke("save_findings_data", { data: JSON.stringify(persistedData, null, 2) });
-    console.log("[FindingsPersistence] Persisted to disk");
+    log.debug("Persisted to disk");
   } catch (error) {
     console.error("[FindingsPersistence] Failed to persist to disk:", error);
     throw error;
@@ -45,14 +48,12 @@ export async function loadFindingsData(): Promise<PersistedFindingsData | null> 
     const jsonStr = await invoke<string>("load_findings_data");
 
     if (!jsonStr) {
-      console.log("[FindingsPersistence] No persisted data found");
+      log.debug("No persisted data found");
       return null;
     }
 
     const data: PersistedFindingsData = JSON.parse(jsonStr);
-    console.log(
-      `[FindingsPersistence] Loaded from disk: ${data.sessionHistory?.length || 0} sessions in history`,
-    );
+    log.debug(`Loaded from disk: ${data.sessionHistory?.length || 0} sessions in history`);
     return data;
   } catch (error) {
     console.error("[FindingsPersistence] Failed to load from disk:", error);

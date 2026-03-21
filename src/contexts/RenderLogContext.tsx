@@ -20,6 +20,9 @@ import {
   type ReactNode,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { createLogger } from "@/lib/logger";
+
+const log = createLogger("RenderLog");
 import {
   captureDOMSnapshot,
   captureQuickSummary,
@@ -114,7 +117,7 @@ export function RenderLogProvider({
       try {
         await invoke("append_render_log", { entry });
       } catch (error) {
-        console.debug("[RenderLog] Failed to append log:", error);
+        log.debug("Failed to append log:", error);
       }
     },
     [isDev],
@@ -191,11 +194,9 @@ export function RenderLogProvider({
         setLastCaptureTime(Date.now());
         setCaptureCount((c) => c + 1);
 
-        console.debug(
-          `[RenderLog] Captured snapshot: ${trigger} (${snapshot.stats.captureTimeMs}ms)`,
-        );
+        log.debug(`Captured snapshot: ${trigger} (${snapshot.stats.captureTimeMs}ms)`);
       } catch (error) {
-        console.debug("[RenderLog] Failed to capture snapshot:", error);
+        log.debug("Failed to capture snapshot:", error);
       } finally {
         isCapturingRef.current = false;
       }
@@ -237,7 +238,7 @@ export function RenderLogProvider({
         setLastCaptureTime(Date.now());
         setCaptureCount((c) => c + 1);
       } catch (error) {
-        console.debug("[RenderLog] Failed to capture quick summary:", error);
+        log.debug("Failed to capture quick summary:", error);
       } finally {
         isCapturingRef.current = false;
       }
@@ -255,9 +256,9 @@ export function RenderLogProvider({
       await invoke("clear_render_log");
       setCaptureCount(0);
       setLastCaptureTime(null);
-      console.debug("[RenderLog] Log cleared");
+      log.debug("Log cleared");
     } catch (error) {
-      console.debug("[RenderLog] Failed to clear log:", error);
+      log.debug("Failed to clear log:", error);
     }
   }, [isDev]);
 

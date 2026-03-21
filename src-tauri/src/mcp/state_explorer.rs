@@ -361,9 +361,9 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route("/state-explorer/preview", post(preview_exploration))
         .route("/state-explorer/history", get(get_exploration_history))
-        .route("/state-explorer/:run_id", get(get_exploration_report))
+        .route("/state-explorer/{run_id}", get(get_exploration_report))
         .route(
-            "/state-explorer/:run_id/prompt",
+            "/state-explorer/{run_id}/prompt",
             get(get_exploration_prompt),
         )
 }

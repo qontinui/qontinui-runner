@@ -273,10 +273,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/configs", get(list_configs).post(import_config))
         .route("/configs/parse", post(parse_config_file))
         .route(
-            "/configs/:id",
+            "/configs/{id}",
             get(get_stored_config)
                 .put(update_stored_config)
                 .delete(delete_stored_config),
         )
-        .route("/configs/:id/export", post(export_config))
+        .route("/configs/{id}/export", post(export_config))
 }

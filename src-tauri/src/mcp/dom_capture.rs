@@ -92,7 +92,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
     axum::Router::new()
         .route("/dom/captures", get(list_dom_captures))
-        .route("/dom/captures/:id", get(get_dom_capture))
-        .route("/dom/captures/:id/html", get(get_dom_capture_html))
+        .route("/dom/captures/{id}", get(get_dom_capture))
+        .route("/dom/captures/{id}/html", get(get_dom_capture_html))
         .route("/dom/receive", post(receive_dom_from_extension))
 }

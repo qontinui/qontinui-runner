@@ -36,8 +36,10 @@ pub mod dag;
 #[allow(clippy::module_inception)]
 mod executor;
 pub mod executor_types;
+mod legacy_steps;
 pub mod log_watch;
 pub mod verification_context;
+mod verification_execution;
 
 // New modular components (Phase 1-3 of refactoring)
 pub mod dry_run;

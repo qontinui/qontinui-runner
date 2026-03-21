@@ -50,5 +50,5 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::get;
     axum::Router::new()
         .route("/mcp-servers", get(list_mcp_servers_handler))
-        .route("/mcp-servers/:id", get(get_mcp_server_handler))
+        .route("/mcp-servers/{id}", get(get_mcp_server_handler))
 }

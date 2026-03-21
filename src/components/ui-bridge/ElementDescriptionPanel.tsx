@@ -67,6 +67,9 @@ import {
   generateSeleniumCode,
   type AutomationAction,
 } from "../../lib/ui-bridge/selectorGenerator";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ElementDescriptionPanel");
 
 interface ElementDescriptionPanelProps {
   elements: ExternalElement[];
@@ -391,7 +394,7 @@ export function ElementDescriptionPanel({
         });
       }
       setDescriptions(loaded);
-      console.log(`[ElementDescriptionPanel] Loaded ${loaded.size} persisted descriptions`);
+      logger.debug(`Loaded ${loaded.size} persisted descriptions`);
     }
   }, [pageContext?.url]);
 

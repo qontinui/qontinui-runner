@@ -252,8 +252,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/prompts/tags", get(get_prompt_tags))
         .route("/prompts/import", post(import_prompts))
         .route("/prompts/export", get(export_prompts))
-        .route("/prompts/:id", get(get_prompt))
-        .route("/prompts/:id", put(update_prompt))
-        .route("/prompts/:id", delete(delete_prompt))
-        .route("/prompts/:id/duplicate", post(duplicate_prompt))
+        .route("/prompts/{id}", get(get_prompt))
+        .route("/prompts/{id}", put(update_prompt))
+        .route("/prompts/{id}", delete(delete_prompt))
+        .route("/prompts/{id}/duplicate", post(duplicate_prompt))
 }

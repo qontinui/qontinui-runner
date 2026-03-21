@@ -4,7 +4,10 @@
  * Re-exports all event handler modules and provides the main setup function.
  */
 
+import { createLogger } from "@/lib/logger";
 import type { EventRouter } from "../EventRouter";
+
+const logger = createLogger("EventHandlers");
 import type { ExecutionContextActions, HandlerContext, HandlerSetupFunction } from "./types";
 import { setupExecutionHandlers } from "./executionHandlers";
 import { setupImageHandlers } from "./imageHandlers";
@@ -60,11 +63,11 @@ export function setupEventHandlers(
     allUnsubscribers.push(...unsubscribers);
   }
 
-  console.log("[EVENT_HANDLERS] All event handlers registered");
+  logger.debug("All event handlers registered");
 
   // Return cleanup function that unsubscribes all handlers
   return () => {
-    console.log("[EVENT_HANDLERS] Cleaning up all event handlers");
+    logger.debug("Cleaning up all event handlers");
     allUnsubscribers.forEach((unsub) => unsub());
   };
 }

@@ -10,6 +10,9 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ActivityType } from "../../types/dashboard/activity-types";
 import type { TaskActivityInfo } from "../../types/dashboard/widget-registry";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("TaskDetection");
 
 // Polling is now fallback only - real-time events provide instant updates
 const POLL_INTERVAL_MS = 5000;
@@ -407,7 +410,7 @@ export function useTaskDetection(options?: UseTaskDetectionOptions): UseTaskDete
         });
       } catch (e) {
         // Tauri events not available (e.g., running in browser) - rely on polling
-        console.debug("Tauri events not available, using polling only:", e);
+        logger.debug("Tauri events not available, using polling only:", e);
       }
     };
 

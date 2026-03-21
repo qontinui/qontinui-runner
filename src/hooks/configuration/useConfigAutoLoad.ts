@@ -9,6 +9,9 @@ import { useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { CommandResponse } from "../../types/displayProfile";
 import type { LogFunction, LastConfigPathData } from "./types";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ConfigAutoLoad");
 
 interface UseConfigAutoLoadOptions {
   onLog?: LogFunction;
@@ -51,7 +54,7 @@ export function useConfigAutoLoad(options: UseConfigAutoLoadOptions): UseConfigA
         onLastConfigLoaded?.(workflowId, monitorIndex);
       }
     } catch (error) {
-      console.log("No last config to auto-load:", error);
+      logger.debug("No last config to auto-load:", error);
     }
   }, [onLog, loadConfigFromPath, onLastConfigLoaded]);
 
@@ -65,14 +68,14 @@ export function useConfigAutoLoad(options: UseConfigAutoLoadOptions): UseConfigA
       if (result.success && result.data?.path) {
         const workflowId = result.data?.workflow_id || null;
         const monitorIndex = result.data?.monitor_index ?? null;
-        console.log("[CONFIG] Found last config:", result.data.path, "workflow:", workflowId);
+        logger.debug("Found last config:", result.data.path, "workflow:", workflowId);
         await loadConfigFromPath(result.data.path, workflowId ?? undefined);
-        console.log("[CONFIG] loadConfigFromPath completed");
+        logger.debug("loadConfigFromPath completed");
         onLastConfigLoaded?.(workflowId, monitorIndex);
         onLog?.("success", "Configuration loaded successfully");
       } else {
         const message = result.message || "No previous configuration found";
-        console.log("[CONFIG] No previous configuration found:", message);
+        logger.debug("No previous configuration found:", message);
         onLog?.("warning", message);
       }
     } catch (error) {
@@ -88,7 +91,7 @@ export function useConfigAutoLoad(options: UseConfigAutoLoadOptions): UseConfigA
   useEffect(() => {
     if (autoLoadOnMount && !hasAutoLoadedRef.current) {
       hasAutoLoadedRef.current = true;
-      console.log("[CONFIG] Auto-loading configuration on mount");
+      logger.debug("Auto-loading configuration on mount");
       autoLoadLastConfig();
     }
   }, [autoLoadOnMount, autoLoadLastConfig]);

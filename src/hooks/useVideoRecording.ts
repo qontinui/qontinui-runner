@@ -25,6 +25,9 @@
 
 import { useCallback, useRef } from "react";
 import { videoRecorder, VideoRecordingConfig } from "../services/VideoRecordingService";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("VideoRecording");
 
 export interface UseVideoRecordingOptions extends VideoRecordingConfig {
   onRecordingStart?: () => void;
@@ -49,12 +52,12 @@ export function useVideoRecording(options: UseVideoRecordingOptions): UseVideoRe
   const startRecordingForExecution = useCallback(
     async (sessionId: string) => {
       if (!options.enabled) {
-        console.log("[VideoRecording] Recording disabled, skipping");
+        logger.debug("Recording disabled, skipping");
         return;
       }
 
       try {
-        console.log(`[VideoRecording] Starting recording for session: ${sessionId}`);
+        logger.debug(`Starting recording for session: ${sessionId}`);
 
         const config: VideoRecordingConfig = {
           enabled: options.enabled,
@@ -72,9 +75,7 @@ export function useVideoRecording(options: UseVideoRecordingOptions): UseVideoRe
           options.onRecordingStart();
         }
 
-        console.log(
-          `[VideoRecording] Recording started successfully with ${options.startDelaySeconds}s delay`,
-        );
+        logger.info(`Recording started successfully with ${options.startDelaySeconds}s delay`);
       } catch (error) {
         console.error("[VideoRecording] Failed to start recording:", error);
         isRecordingRef.current = false;
@@ -93,12 +94,12 @@ export function useVideoRecording(options: UseVideoRecordingOptions): UseVideoRe
    */
   const stopRecording = useCallback(async (): Promise<string | null> => {
     if (!isRecordingRef.current) {
-      console.log("[VideoRecording] Not currently recording, skipping stop");
+      logger.debug("Not currently recording, skipping stop");
       return null;
     }
 
     try {
-      console.log("[VideoRecording] Stopping recording...");
+      logger.debug("Stopping recording...");
       const videoPath = await videoRecorder.stopRecording();
       isRecordingRef.current = false;
 
@@ -106,7 +107,7 @@ export function useVideoRecording(options: UseVideoRecordingOptions): UseVideoRe
         options.onRecordingStop(videoPath);
       }
 
-      console.log(`[VideoRecording] Recording stopped. Video saved to: ${videoPath}`);
+      logger.info(`Recording stopped. Video saved to: ${videoPath}`);
       return videoPath;
     } catch (error) {
       console.error("[VideoRecording] Failed to stop recording:", error);

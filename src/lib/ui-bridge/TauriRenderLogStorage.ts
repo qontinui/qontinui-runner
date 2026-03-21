@@ -1,3 +1,4 @@
+/* eslint-disable no-console */
 /**
  * Tauri Render Log Storage
  *

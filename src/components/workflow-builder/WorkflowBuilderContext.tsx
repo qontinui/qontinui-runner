@@ -53,6 +53,9 @@ import {
 import { registerUserSkills } from "@qontinui/workflow-utils";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { instanceStorage } from "@/lib/instance-storage";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("WorkflowBuilderContext");
 
 // Re-export shared types for consumers that may need them
 export type { SharedBuilderState, SharedBuilderAction, SharedBuilderContextValue };
@@ -237,7 +240,7 @@ function workflowBuilderReducer(
         ["setup", "verification", "agentic", "completion"] as WorkflowPhase[]
       ).flatMap((p) => getPhaseSteps(state.workflow, state.currentStageIndex, p));
       if (allSteps.some((s) => s.id === stepWithId.id)) {
-        console.log("[WorkflowBuilder] Skipping duplicate step ID:", stepWithId.id);
+        logger.debug("Skipping duplicate step ID:", stepWithId.id);
         return state;
       }
 

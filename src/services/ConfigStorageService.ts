@@ -6,6 +6,9 @@
  */
 
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ConfigStorage");
 
 /**
  * Metadata for a stored configuration (without full config data)
@@ -40,7 +43,7 @@ interface ApiResponse<T> {
  */
 async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
   const url = `${getApiBase()}${endpoint}`;
-  console.log(`[CONFIG_STORAGE] ${options.method || "GET"} ${endpoint}`);
+  logger.debug(`${options.method || "GET"} ${endpoint}`);
 
   try {
     const response = await tracedFetch(url, {

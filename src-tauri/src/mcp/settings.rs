@@ -995,8 +995,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/settings/ai", get(get_ai_settings).put(save_ai_settings))
         .route("/settings/ai/test-connection", post(test_ai_connection))
         .route("/settings/ai/api-key", post(save_ai_api_key))
-        .route("/settings/ai/api-key/:provider", delete(delete_ai_api_key))
-        .route("/settings/ai/has-key/:provider", get(has_ai_api_key))
+        .route("/settings/ai/api-key/{provider}", delete(delete_ai_api_key))
+        .route("/settings/ai/has-key/{provider}", get(has_ai_api_key))
         // Agentic settings
         .route(
             "/settings/agentic",
@@ -1030,11 +1030,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(save_self_healing_api_key),
         )
         .route(
-            "/settings/self-healing/api-key/:provider",
+            "/settings/self-healing/api-key/{provider}",
             delete(delete_self_healing_api_key),
         )
         .route(
-            "/settings/self-healing/has-key/:provider",
+            "/settings/self-healing/has-key/{provider}",
             get(has_self_healing_api_key),
         )
         // Mobile settings

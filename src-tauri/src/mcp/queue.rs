@@ -89,5 +89,5 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
     axum::Router::new()
         .route("/queue/status", get(get_queue_status))
         .route("/queue", get(list_queued_workflows))
-        .route("/queue/:id", delete(cancel_queued_workflow))
+        .route("/queue/{id}", delete(cancel_queued_workflow))
 }

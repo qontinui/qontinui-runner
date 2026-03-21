@@ -40,13 +40,13 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
     axum::Router::new()
         .route("/triggers", get(list_triggers).post(create_trigger))
         .route(
-            "/triggers/:id",
+            "/triggers/{id}",
             get(get_trigger).put(update_trigger).delete(delete_trigger),
         )
-        .route("/triggers/:id/enabled", put(set_enabled))
-        .route("/triggers/:id/test", post(test_trigger))
-        .route("/triggers/:id/history", get(get_history))
-        .route("/triggers/webhook/:id", post(webhook_ingestion))
+        .route("/triggers/{id}/enabled", put(set_enabled))
+        .route("/triggers/{id}/test", post(test_trigger))
+        .route("/triggers/{id}/history", get(get_history))
+        .route("/triggers/webhook/{id}", post(webhook_ingestion))
         .route("/triggers/status", get(get_status))
 }
 

@@ -484,7 +484,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/image-quality-tests/manifest", get(get_manifest))
         .route(
-            "/image-quality-tests/image/:category/:filename",
+            "/image-quality-tests/image/{category}/{filename}",
             get(get_image).put(update_image).delete(delete_image),
         )
         .route("/image-quality-tests/upload", post(upload_image))

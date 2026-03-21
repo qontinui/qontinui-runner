@@ -324,23 +324,23 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(list_recordings_handler).post(create_recording_handler),
         )
         .route(
-            "/recordings/:id",
+            "/recordings/{id}",
             get(get_recording_handler).delete(delete_recording_handler),
         )
         .route(
-            "/recordings/:id/actions",
+            "/recordings/{id}/actions",
             get(get_recording_actions_handler).post(add_recording_action_handler),
         )
         .route(
-            "/recordings/:id/status",
+            "/recordings/{id}/status",
             put(update_recording_status_handler),
         )
         .route(
-            "/recordings/:id/export/:format",
+            "/recordings/{id}/export/{format}",
             get(export_recording_handler),
         )
         .route(
-            "/recordings/:id/exports",
+            "/recordings/{id}/exports",
             get(get_recording_exports_handler),
         )
 }

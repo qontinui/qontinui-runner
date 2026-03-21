@@ -14,6 +14,9 @@ import { SpotlightOverlay } from "./SpotlightOverlay";
 import { TutorialTooltip } from "./TutorialTooltip";
 import { cn } from "../../lib/utils";
 import { getAccentColors } from "@/design-system";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("ContextualTutorial");
 
 /**
  * CenteredTooltip - Simple centered modal for steps without a target
@@ -286,12 +289,12 @@ export function ContextualTutorial() {
 
   // Handle hint display
   const handleShowHint = useCallback((hint: string) => {
-    console.log("[ContextualTutorial] Hint triggered:", hint);
+    logger.debug("Hint triggered:", hint);
   }, []);
 
   // Handle skip allowed
   const handleAllowSkip = useCallback(() => {
-    console.log("[ContextualTutorial] Skip now allowed");
+    logger.debug("Skip now allowed");
   }, []);
 
   // Event-driven step progression
@@ -361,7 +364,7 @@ export function ContextualTutorial() {
   }, [currentStep?.targetElement?.selector, currentStepIndex]);
 
   // Debug logging
-  console.log("[ContextualTutorial] Render state:", {
+  logger.debug("Render state:", {
     hasTutorial: !!currentTutorial,
     tutorialId: currentTutorial?.id,
     currentStepIndex,
@@ -385,18 +388,18 @@ export function ContextualTutorial() {
 
   // Only render when tutorial is open
   if (!currentTutorial || !isOpen) {
-    console.log("[ContextualTutorial] Not rendering:", {
+    logger.debug("Not rendering:", {
       reason: !currentTutorial ? "no tutorial" : "not open",
     });
     return null;
   }
 
   if (!currentStep) {
-    console.log("[ContextualTutorial] No current step found");
+    logger.debug("No current step found");
     return null;
   }
 
-  console.log("[ContextualTutorial] Rendering step:", {
+  logger.debug("Rendering step:", {
     stepId: currentStep.id,
     hasTarget: !!currentStep.targetElement,
     targetSelector: currentStep.targetElement?.selector,

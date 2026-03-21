@@ -280,13 +280,13 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route("/saved-api-requests/tags", get(get_saved_api_request_tags))
         .route(
-            "/saved-api-requests/:id",
+            "/saved-api-requests/{id}",
             get(get_saved_api_request)
                 .put(update_saved_api_request)
                 .delete(delete_saved_api_request),
         )
         .route(
-            "/saved-api-requests/:id/duplicate",
+            "/saved-api-requests/{id}/duplicate",
             post(duplicate_saved_api_request),
         )
 }

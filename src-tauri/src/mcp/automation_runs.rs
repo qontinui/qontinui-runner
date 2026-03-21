@@ -181,5 +181,5 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::get;
     axum::Router::new()
         .route("/runs", get(list_automation_runs))
-        .route("/runs/:id", get(get_automation_run))
+        .route("/runs/{id}", get(get_automation_run))
 }

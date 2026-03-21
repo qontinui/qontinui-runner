@@ -928,11 +928,11 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
 
     axum::Router::new()
         .route(
-            "/meta-optimizer/recommendations/:id/apply",
+            "/meta-optimizer/recommendations/{id}/apply",
             post(apply_recommendation_handler),
         )
         .route(
-            "/meta-optimizer/recommendations/:id/reject",
+            "/meta-optimizer/recommendations/{id}/reject",
             post(reject_recommendation_handler),
         )
         .route(

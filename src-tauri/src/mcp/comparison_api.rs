@@ -544,6 +544,6 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
 
     axum::Router::new()
         .route("/comparison/start", post(start_comparison))
-        .route("/comparison/:id", get(get_comparison))
+        .route("/comparison/{id}", get(get_comparison))
         .route("/comparisons", get(list_comparisons))
 }
