@@ -81,14 +81,9 @@ pub fn populate_complexity_indicators(
 ) {
     outcome.step_count = Some(step_types.len() as i64);
     outcome.verification_step_count = Some(verification_step_types.len() as i64);
-    outcome.agentic_step_count = Some(
-        step_types
-            .iter()
-            .filter(|s| **s == "prompt")
-            .count() as i64,
-    );
-    outcome.has_ui_bridge = step_types.iter().any(|s| *s == "ui_bridge")
-        || verification_step_types.iter().any(|s| *s == "ui_bridge");
+    outcome.agentic_step_count = Some(step_types.iter().filter(|s| **s == "prompt").count() as i64);
+    outcome.has_ui_bridge =
+        step_types.contains(&"ui_bridge") || verification_step_types.contains(&"ui_bridge");
 }
 
 /// Record a learning outcome from a completed workflow execution.

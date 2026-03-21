@@ -28,6 +28,7 @@ env/
 
 # Tauri
 src-tauri/target/
+target/
 src-tauri/WixTools/
 
 # Editor directories and files

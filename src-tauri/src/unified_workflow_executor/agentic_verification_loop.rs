@@ -56,11 +56,16 @@ impl IterationHistory {
 
     /// Total estimated character count across all entries.
     fn total_chars(&self) -> usize {
-        self.entries.iter().map(|e| {
-            e.approach.len() + e.result.len() + e.iteration.len()
-                + e.files_touched.iter().map(|f| f.len() + 2).sum::<usize>()
-                + 40 // formatting overhead per entry
-        }).sum()
+        self.entries
+            .iter()
+            .map(|e| {
+                e.approach.len()
+                    + e.result.len()
+                    + e.iteration.len()
+                    + e.files_touched.iter().map(|f| f.len() + 2).sum::<usize>()
+                    + 40 // formatting overhead per entry
+            })
+            .sum()
     }
 
     /// Merge oldest two entries into one when over budget, preserving at least 3 entries.
@@ -160,9 +165,7 @@ fn extract_iteration_summary(
     let result = format!("{}: {}", verdict.status, obs_truncated);
 
     // Extract file paths from worker output
-    let files_touched = worker_summary
-        .map(extract_file_paths)
-        .unwrap_or_default();
+    let files_touched = worker_summary.map(extract_file_paths).unwrap_or_default();
 
     IterationSummary {
         iteration: iteration.to_string(),

@@ -39,7 +39,7 @@ impl CheckpointDb {
         let enriched_error_type = error_type.map(|s| s.to_string()).or_else(|| {
             error_message
                 .filter(|msg| !msg.is_empty())
-                .map(|msg| crate::orchestrator::learning_recorder::categorize_error(msg))
+                .map(crate::orchestrator::learning_recorder::categorize_error)
         });
 
         // Ensure workflow_architecture is never NULL

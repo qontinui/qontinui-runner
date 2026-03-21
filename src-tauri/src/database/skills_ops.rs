@@ -659,7 +659,7 @@ impl CheckpointDb {
             .query_row(
                 "SELECT COALESCE(usage_count, 0) FROM user_skills WHERE id = ?1",
                 params![skill_id],
-                |row| row.get::<_, i64>(0).map(|v| v as u64),
+                |row| Ok(row.get::<_, i64>(0)? as u64),
             )
             .map_err(|e| format!("Failed to read usage count: {}", e))?;
 

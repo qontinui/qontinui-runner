@@ -691,9 +691,8 @@ fn build_generation_confidence(conn: &Connection) -> String {
 /// - 3 static gotchas (step types, test_type, SDK grep)
 /// - Dynamic gotchas from rules with severity='critical' and failure_count > 0
 pub fn build_gotchas_section(conn: Option<&Connection>) -> String {
-    let mut gotchas = String::from(
-        "## CRITICAL GOTCHAS (violating these causes immediate failure)\n\n",
-    );
+    let mut gotchas =
+        String::from("## CRITICAL GOTCHAS (violating these causes immediate failure)\n\n");
 
     // Static gotchas — the top 3 failure causes from analysis
     gotchas.push_str("1. ONLY valid step types: `command`, `ui_bridge`, `prompt`. NO `check`, `test`, `api_request`, `shell_command`, `gate`, `spec`.\n");
@@ -703,10 +702,18 @@ pub fn build_gotchas_section(conn: Option<&Connection>) -> String {
     // Dynamic gotchas from DB (rules with high failure_count)
     let mut next_num = 4;
     if let Some(conn) = conn {
-        let critical_rules =
-            rules::load_rules_progressive(conn, "schema_context", "important_rules", rules::RuleTier::Critical);
-        let quality_rules =
-            rules::load_rules_progressive(conn, "schema_context", "verification_quality", rules::RuleTier::Critical);
+        let critical_rules = rules::load_rules_progressive(
+            conn,
+            "schema_context",
+            "important_rules",
+            rules::RuleTier::Critical,
+        );
+        let quality_rules = rules::load_rules_progressive(
+            conn,
+            "schema_context",
+            "verification_quality",
+            rules::RuleTier::Critical,
+        );
 
         for rule in critical_rules.iter().chain(quality_rules.iter()) {
             if rule.failure_count > 0 && next_num <= 6 {
@@ -731,23 +738,12 @@ fn build_rules_section(conn: Option<&Connection>) -> String {
 /// Build rules section with progressive loading support.
 /// For initial generation, use `RuleTier::Important` (critical + important only).
 /// For fixer iterations, use `RuleTier::Full` (all rules).
-pub fn build_rules_section_for_tier(
-    conn: Option<&Connection>,
-    tier: rules::RuleTier,
-) -> String {
+pub fn build_rules_section_for_tier(conn: Option<&Connection>, tier: rules::RuleTier) -> String {
     if let Some(conn) = conn {
-        let important = rules::load_rules_progressive(
-            conn,
-            "schema_context",
-            "important_rules",
-            tier,
-        );
-        let quality = rules::load_rules_progressive(
-            conn,
-            "schema_context",
-            "verification_quality",
-            tier,
-        );
+        let important =
+            rules::load_rules_progressive(conn, "schema_context", "important_rules", tier);
+        let quality =
+            rules::load_rules_progressive(conn, "schema_context", "verification_quality", tier);
 
         // Only use DB rules if we actually got results (table might not be seeded yet)
         if !important.is_empty() || !quality.is_empty() {

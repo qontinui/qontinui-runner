@@ -247,8 +247,7 @@ pub fn calculate_cost_usd(input_tokens: u64, output_tokens: u64, model_id: &str)
                 // Use Sonnet pricing as a reasonable default
                 let pricing = CLAUDE_3_5_SONNET_PRICING;
                 let input_cost = (input_tokens as f64 / 1_000_000.0) * pricing.input_per_million;
-                let output_cost =
-                    (output_tokens as f64 / 1_000_000.0) * pricing.output_per_million;
+                let output_cost = (output_tokens as f64 / 1_000_000.0) * pricing.output_per_million;
                 input_cost + output_cost
             } else {
                 0.0

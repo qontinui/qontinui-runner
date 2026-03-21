@@ -15,13 +15,13 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::sync::Arc;
 
-use crate::database::pipeline_traces::{self, AgentTraceAggregate};
+use crate::database::pipeline_traces;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::meta_optimizer::prompt_registry;
 use crate::meta_optimizer::recommendations;
 use crate::meta_optimizer::types::{
-    ContextTier, MetaOptimizerRun, PromptVariant, ReflectionFixDetailL1, ReflectionFixSummaryL0,
-    Recommendation, TraceSummaryL0, TraceDetailL1,
+    ContextTier, MetaOptimizerRun, PromptVariant, Recommendation, ReflectionFixDetailL1,
+    ReflectionFixSummaryL0,
 };
 
 // ---------------------------------------------------------------------------
@@ -112,7 +112,9 @@ pub async fn get_agent_trace_aggregates_handler(
             let summaries =
                 pipeline_traces::get_trace_summaries_l0(&state.app_state.checkpoint_db, limit)
                     .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(serde_json::to_value(summaries).unwrap_or_default())))
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(summaries).unwrap_or_default(),
+            )))
         }
         ContextTier::L1 => {
             let details = pipeline_traces::get_trace_details_l1(
@@ -121,13 +123,17 @@ pub async fn get_agent_trace_aggregates_handler(
                 limit,
             )
             .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(serde_json::to_value(details).unwrap_or_default())))
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(details).unwrap_or_default(),
+            )))
         }
         ContextTier::L2 => {
             let aggregates =
                 pipeline_traces::get_agent_trace_aggregates(&state.app_state.checkpoint_db, limit)
                     .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(serde_json::to_value(aggregates).unwrap_or_default())))
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(aggregates).unwrap_or_default(),
+            )))
         }
     }
 }

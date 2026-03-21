@@ -1663,20 +1663,28 @@ impl LoopController {
                     }
                 });
             // Compute complexity indicators from stages
-            let total_step_count: usize = config.stages.iter().map(|s| {
-                s.setup_automation_steps.len()
-                    + s.setup_prompt_steps.len()
-                    + s.verification_steps.len()
-                    + s.agentic_steps.len()
-                    + s.completion_automation_steps.len()
-                    + s.completion_prompt_steps.len()
-            }).sum();
-            let total_verification_steps: usize = config.stages.iter()
-                .map(|s| s.verification_steps.len()).sum();
-            let total_agentic_steps: usize = config.stages.iter()
-                .map(|s| s.agentic_steps.len()).sum();
+            let total_step_count: usize = config
+                .stages
+                .iter()
+                .map(|s| {
+                    s.setup_automation_steps.len()
+                        + s.setup_prompt_steps.len()
+                        + s.verification_steps.len()
+                        + s.agentic_steps.len()
+                        + s.completion_automation_steps.len()
+                        + s.completion_prompt_steps.len()
+                })
+                .sum();
+            let total_verification_steps: usize = config
+                .stages
+                .iter()
+                .map(|s| s.verification_steps.len())
+                .sum();
+            let total_agentic_steps: usize =
+                config.stages.iter().map(|s| s.agentic_steps.len()).sum();
             let has_ui_bridge = config.stages.iter().any(|s| {
-                s.verification_steps.iter()
+                s.verification_steps
+                    .iter()
                     .chain(s.agentic_steps.iter())
                     .chain(s.setup_automation_steps.iter())
                     .chain(s.completion_automation_steps.iter())

@@ -451,8 +451,7 @@ impl TestOrchestrator {
                 }
             }
             _ => {
-                let values: Vec<serde_json::Value> =
-                    results.into_iter().cloned().collect();
+                let values: Vec<serde_json::Value> = results.into_iter().cloned().collect();
                 Some(serde_json::Value::Array(values))
             }
         }

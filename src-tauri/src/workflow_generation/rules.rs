@@ -855,11 +855,7 @@ pub fn increment_rule_failure_count(conn: &Connection, rule_id: &str) -> Result<
 
 /// Identify which rules were violated by a generation/verification error.
 /// Returns IDs of rules whose content keywords appear in the error message.
-pub fn identify_violated_rules(
-    conn: &Connection,
-    error_message: &str,
-    agent: &str,
-) -> Vec<String> {
+pub fn identify_violated_rules(conn: &Connection, error_message: &str, agent: &str) -> Vec<String> {
     let rules = load_rules(conn, agent, "important_rules");
     let all_rules = {
         let mut r = rules;
@@ -925,10 +921,7 @@ pub fn sync_rules_from_known_issues(conn: &Connection) -> Result<u32, String> {
         }
 
         // Build rule content from the issue
-        let scope_info = issue
-            .scope_value
-            .as_deref()
-            .unwrap_or("the affected area");
+        let scope_info = issue.scope_value.as_deref().unwrap_or("the affected area");
         let hint = issue
             .verification_hint
             .as_deref()
@@ -963,10 +956,7 @@ pub fn sync_rules_from_known_issues(conn: &Connection) -> Result<u32, String> {
                     rule.id, issue.id, issue.title
                 );
             }
-            Err(e) => warn!(
-                "Failed to create rule from known issue {}: {}",
-                issue.id, e
-            ),
+            Err(e) => warn!("Failed to create rule from known issue {}: {}", issue.id, e),
         }
     }
 

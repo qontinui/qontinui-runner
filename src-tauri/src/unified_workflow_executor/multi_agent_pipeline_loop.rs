@@ -833,7 +833,9 @@ Only output the JSON array, nothing else."#,
                         // L1: full details — the L0 summary wasn't enough
                         let detailed: Vec<String> = failed_criteria
                             .iter()
-                            .map(|c| format!("- {} ({}): {}", c.criterion_id, c.method_used, c.details))
+                            .map(|c| {
+                                format!("- {} ({}): {}", c.criterion_id, c.method_used, c.details)
+                            })
                             .collect();
                         Some(format!(
                             "{}/{} criteria still failing after {} attempts. Details:\n{}",

@@ -160,17 +160,26 @@ pub fn build_replay_prompt(turns: &[ConversationTurn], max_chars: Option<usize>)
 
             // Messages with errors/failures are important context
             let content_lower = turn.content.to_lowercase();
-            if content_lower.contains("error") || content_lower.contains("failed") || content_lower.contains("panic") {
+            if content_lower.contains("error")
+                || content_lower.contains("failed")
+                || content_lower.contains("panic")
+            {
                 score += 5.0;
             }
 
             // Messages with file modifications are important
-            if content_lower.contains("edit") || content_lower.contains("write") || content_lower.contains("modified") {
+            if content_lower.contains("edit")
+                || content_lower.contains("write")
+                || content_lower.contains("modified")
+            {
                 score += 3.0;
             }
 
             // Messages with verification results carry high signal
-            if content_lower.contains("verification") || content_lower.contains("verdict") || content_lower.contains("confidence") {
+            if content_lower.contains("verification")
+                || content_lower.contains("verdict")
+                || content_lower.contains("confidence")
+            {
                 score += 4.0;
             }
 

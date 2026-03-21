@@ -4938,7 +4938,9 @@ impl CheckpointDb {
 
         // --- Migration 126: Backfill workflow_architecture + complexity indicator columns ---
         if current_version < 126 {
-            info!("Migrating to version 126 (backfill workflow_architecture, complexity columns)...");
+            info!(
+                "Migrating to version 126 (backfill workflow_architecture, complexity columns)..."
+            );
 
             // Check which columns already exist (schema.sql may have added them for fresh DBs)
             let existing_columns: Vec<String> = conn
@@ -4983,10 +4985,8 @@ impl CheckpointDb {
 
             // Add complexity indicator columns
             if !existing_columns.contains(&"step_count".to_string()) {
-                conn.execute_batch(
-                    "ALTER TABLE learning_outcomes ADD COLUMN step_count INTEGER;",
-                )
-                .map_err(|e| format!("Failed to add step_count column: {}", e))?;
+                conn.execute_batch("ALTER TABLE learning_outcomes ADD COLUMN step_count INTEGER;")
+                    .map_err(|e| format!("Failed to add step_count column: {}", e))?;
             }
 
             if !existing_columns.contains(&"verification_step_count".to_string()) {
@@ -5059,7 +5059,9 @@ impl CheckpointDb {
             )
             .map_err(|e| format!("Failed to migrate to version 127: {}", e))?;
 
-            info!("Successfully migrated to version 127 (generation_rules severity + failure_count)");
+            info!(
+                "Successfully migrated to version 127 (generation_rules severity + failure_count)"
+            );
         }
 
         // --- Migration 128: Cross-iteration context compression column ---
