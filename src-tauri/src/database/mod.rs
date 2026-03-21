@@ -472,10 +472,19 @@ impl CheckpointDb {
 
     /// Run EXPLAIN QUERY PLAN on a query for debugging.
     /// Returns the query plan as a formatted string.
+    /// Only allows SELECT queries to prevent arbitrary SQL execution.
     pub fn explain_query_plan(&self, query: &str) -> Result<String, String> {
+        let trimmed = query.trim();
+        if !trimmed.to_uppercase().starts_with("SELECT") {
+            return Err("Only SELECT queries are allowed for EXPLAIN QUERY PLAN".to_string());
+        }
+        if trimmed.contains(';') {
+            return Err("Multiple statements are not allowed".to_string());
+        }
+
         let conn = self.get_conn()?;
 
-        let explain_query = format!("EXPLAIN QUERY PLAN {}", query);
+        let explain_query = format!("EXPLAIN QUERY PLAN {}", trimmed);
         let mut stmt = conn
             .prepare(&explain_query)
             .map_err(|e| format!("Failed to prepare EXPLAIN QUERY PLAN: {}", e))?;
