@@ -329,6 +329,10 @@ pub struct AgenticVerificationResult {
     pub iteration_results: Vec<AgenticVerificationIterationResult>,
     /// The final verification verdict (from the last iteration).
     pub final_verdict: Option<VerificationVerdict>,
+    /// Total tokens consumed across all iterations (if available).
+    pub total_tokens: Option<u64>,
+    /// Total cost in USD across all iterations (if available).
+    pub total_cost_usd: Option<f64>,
 }
 
 impl AgenticVerificationResult {
@@ -367,8 +371,8 @@ impl AgenticVerificationResult {
                     },
                 })
                 .collect(),
-            total_tokens: None,
-            total_cost_usd: None,
+            total_tokens: self.total_tokens,
+            total_cost_usd: self.total_cost_usd,
         }
     }
 

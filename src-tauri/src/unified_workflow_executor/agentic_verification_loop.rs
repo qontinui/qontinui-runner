@@ -12,6 +12,32 @@ use super::health_monitor::fetch_verifier_ui_context;
 use super::loop_controller::LoopController;
 use super::types::{AgenticOutcome, LoopConfig, LoopResult};
 
+/// Query total tokens consumed across all iterations for a given execution.
+fn query_total_tokens(
+    db: &crate::database::CheckpointDb,
+    execution_id: &str,
+) -> (Option<u64>, Option<f64>) {
+    match db.get_phase_token_usage(execution_id) {
+        Ok(rows) if !rows.is_empty() => {
+            let total_in: u64 = rows.iter().map(|r| r.input_tokens).sum();
+            let total_out: u64 = rows.iter().map(|r| r.output_tokens).sum();
+            let total_tokens = total_in + total_out;
+            let total_cost = crate::ai_pricing::calculate_cost_usd(
+                total_in,
+                total_out,
+                rows.first()
+                    .and_then(|r| r.model_used.as_deref())
+                    .unwrap_or("claude-sonnet-4-20250514"),
+            );
+            (
+                if total_tokens > 0 { Some(total_tokens) } else { None },
+                if total_cost > 0.0 { Some(total_cost) } else { None },
+            )
+        }
+        _ => (None, None),
+    }
+}
+
 // =============================================================================
 // Iteration History — compressed cross-iteration context for agentic loops
 // =============================================================================
@@ -159,7 +185,7 @@ fn extract_iteration_summary(
     };
 
     // Extract result from verdict
-    let obs_truncated: String = verdict.observations.chars().take(80).collect();
+    let obs_truncated = truncate_with_ellipsis(&verdict.observations, 80);
     let result = format!("{}: {}", verdict.status, obs_truncated);
 
     // Extract file paths from worker output
@@ -286,6 +312,8 @@ impl LoopController {
                     max_iterations_reached: false,
                     iteration_results,
                     final_verdict: None,
+                    total_tokens: query_total_tokens(&self.checkpoint_db, &config.execution_id).0,
+                    total_cost_usd: query_total_tokens(&self.checkpoint_db, &config.execution_id).1,
                 };
                 self.canvas_manager
                     .lock()
@@ -310,6 +338,8 @@ impl LoopController {
                     max_iterations_reached: true,
                     iteration_results: iteration_results.clone(),
                     final_verdict: iteration_results.last().map(|r| r.verdict.clone()),
+                    total_tokens: query_total_tokens(&self.checkpoint_db, &config.execution_id).0,
+                    total_cost_usd: query_total_tokens(&self.checkpoint_db, &config.execution_id).1,
                 };
                 self.canvas_manager
                     .lock()
@@ -520,6 +550,8 @@ impl LoopController {
                             max_iterations_reached: false,
                             iteration_results,
                             final_verdict: Some(v.clone()),
+                            total_tokens: { let (t, _) = query_total_tokens(&self.checkpoint_db, &config.execution_id); t },
+                            total_cost_usd: { let (_, c) = query_total_tokens(&self.checkpoint_db, &config.execution_id); c },
                         };
                         self.canvas_manager
                             .lock()
@@ -566,6 +598,8 @@ impl LoopController {
                         max_iterations_reached: false,
                         iteration_results,
                         final_verdict: Some(v.clone()),
+                        total_tokens: { let (t, _) = query_total_tokens(&self.checkpoint_db, &config.execution_id); t },
+                        total_cost_usd: { let (_, c) = query_total_tokens(&self.checkpoint_db, &config.execution_id); c },
                     };
                     self.canvas_manager
                         .lock()

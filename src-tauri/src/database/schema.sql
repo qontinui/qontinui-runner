@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 99
+-- Version: 133
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.

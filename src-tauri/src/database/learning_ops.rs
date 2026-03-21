@@ -101,7 +101,8 @@ impl CheckpointDb {
                 SELECT id, task_id, status, duration_secs, iterations, strategy,
                        tools_used, files_modified, error_type, error_message, feedback, created_at,
                        workflow_architecture, step_count, verification_step_count,
-                       agentic_step_count, has_ui_bridge
+                       agentic_step_count, has_ui_bridge,
+                       total_tokens, total_cost_usd, composite_agentic_score
                 FROM learning_outcomes
                 ORDER BY created_at DESC
                 LIMIT ?1
@@ -129,6 +130,9 @@ impl CheckpointDb {
                     "verification_step_count": row.get::<_, Option<i64>>(14)?,
                     "agentic_step_count": row.get::<_, Option<i64>>(15)?,
                     "has_ui_bridge": row.get::<_, Option<i32>>(16)?.map(|v| v != 0),
+                    "total_tokens": row.get::<_, Option<i64>>(17)?,
+                    "total_cost_usd": row.get::<_, Option<f64>>(18)?,
+                    "composite_agentic_score": row.get::<_, Option<f64>>(19)?,
                 }))
             })
             .map_err(|e| format!("Failed to get learning outcomes: {}", e))?
@@ -306,7 +310,8 @@ impl CheckpointDb {
                 SELECT id, task_id, status, duration_secs, iterations, strategy,
                        tools_used, files_modified, error_type, error_message, feedback, created_at,
                        workflow_architecture, step_count, verification_step_count,
-                       agentic_step_count, has_ui_bridge
+                       agentic_step_count, has_ui_bridge,
+                       total_tokens, total_cost_usd, composite_agentic_score
                 FROM learning_outcomes
                 ORDER BY created_at DESC
                 LIMIT ?1 OFFSET ?2
@@ -334,6 +339,9 @@ impl CheckpointDb {
                     "verification_step_count": row.get::<_, Option<i64>>(14)?,
                     "agentic_step_count": row.get::<_, Option<i64>>(15)?,
                     "has_ui_bridge": row.get::<_, Option<i32>>(16)?.map(|v| v != 0),
+                    "total_tokens": row.get::<_, Option<i64>>(17)?,
+                    "total_cost_usd": row.get::<_, Option<f64>>(18)?,
+                    "composite_agentic_score": row.get::<_, Option<f64>>(19)?,
                 }))
             })
             .map_err(|e| format!("Failed to get learning outcomes: {}", e))?
