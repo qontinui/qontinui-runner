@@ -97,6 +97,7 @@ mod step_metadata;
 mod step_registry;
 mod step_types;
 mod steps;
+mod stats;
 mod storage;
 pub(crate) mod str_utils;
 mod summary_generator;
@@ -470,14 +471,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Create error monitor config for later initialization
     let error_monitor_db = checkpoint_db.clone();
 
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    // Secondary instances (spawned by InstanceManager) must NOT use single-instance
+    // plugin — it would prevent them from starting since they share the same binary.
+    let is_secondary_instance = std::env::var("QONTINUI_INSTANCE_NAME").is_ok();
+
+    let mut builder = tauri::Builder::default();
+
+    if !is_secondary_instance {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // When a second instance is launched, focus the existing window
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.set_focus();
             }
-        }))
+        }));
+    }
+
+    let app = builder
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())

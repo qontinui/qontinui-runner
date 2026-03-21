@@ -737,3 +737,273 @@ impl LoopController {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── truncate_with_ellipsis ──────────────────────────────────────
+
+    #[test]
+    fn test_truncate_short_string_unchanged() {
+        assert_eq!(truncate_with_ellipsis("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_exact_length_unchanged() {
+        assert_eq!(truncate_with_ellipsis("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_adds_ellipsis() {
+        let result = truncate_with_ellipsis("hello world this is long", 10);
+        assert!(result.ends_with("..."));
+        assert!(result.chars().count() <= 10);
+    }
+
+    #[test]
+    fn test_truncate_multibyte_utf8() {
+        // Japanese text: each char is 3 bytes
+        let s = "こんにちは世界テスト文字列";
+        let result = truncate_with_ellipsis(s, 8);
+        assert!(result.ends_with("..."));
+        assert!(result.chars().count() <= 8);
+        // Should not panic — the whole point of this test
+    }
+
+    #[test]
+    fn test_truncate_empty_string() {
+        assert_eq!(truncate_with_ellipsis("", 10), "");
+    }
+
+    #[test]
+    fn test_truncate_max_zero() {
+        // max_chars=0, saturating_sub(3) = 0, so we get just "..."
+        let result = truncate_with_ellipsis("hello", 0);
+        assert_eq!(result, "...");
+    }
+
+    // ── extract_file_paths ──────────────────────────────────────────
+
+    #[test]
+    fn test_extract_paths_basic() {
+        let text = "Modified src/main.rs and src/lib.rs successfully";
+        let paths = extract_file_paths(text);
+        assert!(paths.contains(&"src/main.rs".to_string()));
+        assert!(paths.contains(&"src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn test_extract_paths_backslash() {
+        let text = "Edited src\\components\\App.tsx";
+        let paths = extract_file_paths(text);
+        assert!(paths.contains(&"src/components/App.tsx".to_string()));
+    }
+
+    #[test]
+    fn test_extract_paths_ignores_urls() {
+        let text = "See https://example.com/foo/bar.html for details";
+        let paths = extract_file_paths(text);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_extract_paths_ignores_comments() {
+        let text = "// this is a comment without any paths";
+        let paths = extract_file_paths(text);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_extract_paths_empty() {
+        assert!(extract_file_paths("").is_empty());
+    }
+
+    #[test]
+    fn test_extract_paths_deduplicates() {
+        let text = "Edit src/main.rs then src/main.rs again";
+        let paths = extract_file_paths(text);
+        assert_eq!(paths.iter().filter(|p| *p == "src/main.rs").count(), 1);
+    }
+
+    #[test]
+    fn test_extract_paths_caps_at_10() {
+        let text = (0..20)
+            .map(|i| format!("src/file{}.rs", i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let paths = extract_file_paths(&text);
+        assert!(paths.len() <= 10);
+    }
+
+    #[test]
+    fn test_extract_paths_strips_quotes() {
+        let text = r#"Changed `src/foo.rs` and "src/bar.rs""#;
+        let paths = extract_file_paths(text);
+        assert!(paths.contains(&"src/foo.rs".to_string()));
+        assert!(paths.contains(&"src/bar.rs".to_string()));
+    }
+
+    // ── IterationHistory ────────────────────────────────────────────
+
+    fn make_summary(iter: u32, approach: &str, result: &str) -> IterationSummary {
+        IterationSummary {
+            iteration: iter.to_string(),
+            approach: approach.to_string(),
+            result: result.to_string(),
+            files_touched: vec!["src/main.rs".to_string()],
+            confidence_delta: 0.1,
+        }
+    }
+
+    #[test]
+    fn test_history_empty_context_string() {
+        let history = IterationHistory::new();
+        assert!(history.to_context_string().is_empty());
+    }
+
+    #[test]
+    fn test_history_single_entry() {
+        let mut history = IterationHistory::new();
+        history.add(make_summary(1, "Try button click", "Fail: button not found"));
+        let ctx = history.to_context_string();
+        assert!(ctx.contains("## Previous Attempts"));
+        assert!(ctx.contains("Iter 1"));
+        assert!(ctx.contains("Try button click"));
+        assert!(ctx.contains("Fail: button not found"));
+        assert!(ctx.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn test_history_preserves_three_entries() {
+        let mut history = IterationHistory::new();
+        history.add(make_summary(1, "A", "R1"));
+        history.add(make_summary(2, "B", "R2"));
+        history.add(make_summary(3, "C", "R3"));
+        // Should NOT compress — exactly 3 entries, and total_chars is well under 4000
+        assert_eq!(history.entries.len(), 3);
+    }
+
+    #[test]
+    fn test_history_compression_merges_oldest() {
+        let mut history = IterationHistory::new();
+        // Use a small budget to force compression
+        history.max_total_chars = 200;
+        history.add(make_summary(1, "Approach one with some detail", "Result one"));
+        history.add(make_summary(2, "Approach two with some detail", "Result two"));
+        history.add(make_summary(3, "Approach three with detail", "Result three"));
+        history.add(make_summary(4, "Approach four with detail", "Result four"));
+        // With small budget, oldest entries should be merged
+        assert!(history.entries.len() <= 4);
+        // First entry should be a merged range
+        if history.entries.len() < 4 {
+            assert!(history.entries[0].iteration.contains('-'));
+        }
+    }
+
+    #[test]
+    fn test_history_never_fewer_than_three() {
+        let mut history = IterationHistory::new();
+        history.max_total_chars = 50; // Very small budget
+        for i in 1..=10 {
+            history.add(make_summary(i, &format!("Approach {}", i), &format!("Result {}", i)));
+        }
+        assert!(history.entries.len() >= 3);
+    }
+
+    #[test]
+    fn test_history_to_json_roundtrip() {
+        let mut history = IterationHistory::new();
+        history.add(make_summary(1, "Click button", "Pass: button visible"));
+        let json = history.to_json();
+        let parsed: Vec<IterationSummary> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].iteration, "1");
+        assert_eq!(parsed[0].approach, "Click button");
+    }
+
+    #[test]
+    fn test_history_empty_json() {
+        let history = IterationHistory::new();
+        assert_eq!(history.to_json(), "[]");
+    }
+
+    #[test]
+    fn test_history_confidence_delta_accumulates_on_merge() {
+        let mut history = IterationHistory::new();
+        history.max_total_chars = 150;
+        let mut s1 = make_summary(1, "A", "R");
+        s1.confidence_delta = 0.2;
+        let mut s2 = make_summary(2, "B", "R");
+        s2.confidence_delta = 0.3;
+        history.add(s1);
+        history.add(s2);
+        history.add(make_summary(3, "C", "R"));
+        history.add(make_summary(4, "D", "R"));
+        // If 1 and 2 were merged, their confidence deltas should be summed
+        if history.entries[0].iteration.contains('-') {
+            assert!((history.entries[0].confidence_delta - 0.5).abs() < 0.01);
+        }
+    }
+
+    // ── extract_iteration_summary ───────────────────────────────────
+
+    #[test]
+    fn test_extract_iteration_summary_basic() {
+        use crate::autoresearch::agentic_verification::*;
+        let verdict = VerificationVerdict {
+            status: VerificationStatus::Fail,
+            confidence: 0.3,
+            observations: "Button not clickable".to_string(),
+            next_priority: None,
+            issues: vec![],
+            unreachable: false,
+            unreachable_reason: None,
+        };
+        let summary = extract_iteration_summary(
+            1,
+            Some("Clicked the submit button\nWaited for response"),
+            &verdict,
+            0.0,
+        );
+        assert_eq!(summary.iteration, "1");
+        assert!(summary.approach.contains("Clicked the submit button"));
+        assert!(summary.result.contains("Fail"));
+        assert!((summary.confidence_delta - 0.3).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_extract_iteration_summary_no_worker() {
+        use crate::autoresearch::agentic_verification::*;
+        let verdict = VerificationVerdict {
+            status: VerificationStatus::Pass,
+            confidence: 0.9,
+            observations: "All checks passed".to_string(),
+            next_priority: None,
+            issues: vec![],
+            unreachable: false,
+            unreachable_reason: None,
+        };
+        let summary = extract_iteration_summary(5, None, &verdict, 0.7);
+        assert_eq!(summary.approach, "(no worker ran)");
+        assert!((summary.confidence_delta - 0.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_extract_iteration_summary_truncates_long_approach() {
+        use crate::autoresearch::agentic_verification::*;
+        let verdict = VerificationVerdict {
+            status: VerificationStatus::Partial,
+            confidence: 0.5,
+            observations: "Partial progress".to_string(),
+            next_priority: None,
+            issues: vec![],
+            unreachable: false,
+            unreachable_reason: None,
+        };
+        let long_output = "x".repeat(500);
+        let summary = extract_iteration_summary(1, Some(&long_output), &verdict, 0.0);
+        assert!(summary.approach.chars().count() <= 100);
+        assert!(summary.approach.ends_with("..."));
+    }
+}

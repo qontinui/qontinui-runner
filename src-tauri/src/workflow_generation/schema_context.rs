@@ -533,7 +533,25 @@ These are preferred over Playwright for inspection, content reading, and simple 
 /// The output is a compact catalog grouped by category (~500 tokens) that
 /// tells the AI what skills are available and their parameters.
 pub fn format_skills_for_generator(registry: &SkillRegistry) -> String {
-    let skills = registry.all();
+    format_skills_for_generator_filtered(registry, None, &[], None)
+}
+
+/// Format the skill registry as a compact catalog for the AI generator prompt,
+/// filtered by phase, tags, and/or category for per-execution tool whitelisting.
+///
+/// When `tool_tags` is non-empty, only skills matching at least one tag are included.
+/// This reduces prompt bloat by exposing only relevant tools.
+pub fn format_skills_for_generator_filtered(
+    registry: &SkillRegistry,
+    phase: Option<&str>,
+    tool_tags: &[String],
+    category: Option<&str>,
+) -> String {
+    let skills = if phase.is_some() || !tool_tags.is_empty() || category.is_some() {
+        registry.skills_for_context(phase, tool_tags, category)
+    } else {
+        registry.all()
+    };
     if skills.is_empty() {
         return String::new();
     }

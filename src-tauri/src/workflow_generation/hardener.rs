@@ -400,7 +400,13 @@ pub fn run_hardener_agent(
         insights_section,
     );
     let task_context = TaskContext::from_prompt(&prompt);
-    let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
+
+    // Use middleware chain for deterministic post-processing of AI output.
+    // This replaces the ad-hoc sanitize/fix calls that were previously applied
+    // after the AI call (the middleware handles them in a composable chain).
+    let middleware = build_hardener_middleware();
+    let mw_ctx = MiddlewareContext::new("hardener");
+    let ai_result: AiResponse = crate::ai_provider::run_prompt_with_middleware(
         &prompt,
         &task_context,
         doctor_handle,
@@ -410,6 +416,8 @@ pub fn run_hardener_agent(
         None,
         None,
         None,
+        &middleware,
+        &mw_ctx,
     );
 
     if !ai_result.success {
@@ -436,26 +444,10 @@ pub fn run_hardener_agent(
         return (workflow, None, Some(prompt));
     }
 
-    // Post-hardener sanitize: the AI may re-introduce jq commands or other
-    // platform-incompatible patterns in its output. Re-apply sanitization.
-    let mut post_sanitize = sanitize_commands_in_steps(&mut hardened.setup_steps)
-        + sanitize_commands_in_steps(&mut hardened.verification_steps)
-        + sanitize_commands_in_steps(&mut hardened.completion_steps);
-    for stage in hardened.stages.iter_mut() {
-        post_sanitize += sanitize_commands_in_steps(&mut stage.setup_steps);
-        post_sanitize += sanitize_commands_in_steps(&mut stage.verification_steps);
-        post_sanitize += sanitize_commands_in_steps(&mut stage.completion_steps);
-    }
-    if post_sanitize > 0 {
-        info!(
-            "Post-hardener sanitize: fixed {} steps with jq/escaping issues in AI output",
-            post_sanitize
-        );
-    }
-
-    // Post-hardener SDK URL fix: the AI may also re-introduce /control/ URLs
-    // or drop the SDK connect step
-    let mut hardened = fix_sdk_urls(&hardened);
+    // NOTE: Post-hardener command sanitization and SDK URL fixup are now handled
+    // by the middleware chain (CommandSanitizer + SdkUrlSanitizer) applied around
+    // the AI call above. The middleware operates on the raw AI response before
+    // parsing, so the workflow we get here is already sanitized.
 
     // Re-inject any regression steps that the AI may have dropped.
     // This is a safety net: the prompt tells the AI to preserve them, and
@@ -537,6 +529,100 @@ pub fn run_hardener_agent(
     );
 
     (hardened, Some(summary), Some(prompt))
+}
+
+// ============================================================================
+// Middleware implementations (wrapping existing sanitizer functions)
+// ============================================================================
+
+use crate::ai_provider::middleware::{AiMiddleware, AiMiddlewareChain, MiddlewareContext};
+
+/// Post-call middleware that sanitizes commands in AI-generated workflow JSON.
+///
+/// Wraps `sanitize_commands_in_steps()` to fix jq commands, Python f-string
+/// escaping, nested retry format, curl -f in pipes, etc.
+pub struct CommandSanitizer;
+
+impl AiMiddleware for CommandSanitizer {
+    fn name(&self) -> &'static str {
+        "command-sanitizer"
+    }
+
+    fn post_call(&self, response: &mut AiResponse, _ctx: &MiddlewareContext) {
+        if !response.success {
+            return;
+        }
+
+        // Try to parse the response as a workflow and sanitize commands
+        let json_text = crate::workflow_generation::generator::extract_json_from_response(
+            &response.output,
+        );
+        if let Ok(mut workflow) =
+            serde_json::from_str::<crate::unified_workflows::UnifiedWorkflow>(&json_text)
+        {
+            let mut total = 0;
+            total += sanitize_commands_in_steps(&mut workflow.setup_steps);
+            total += sanitize_commands_in_steps(&mut workflow.verification_steps);
+            total += sanitize_commands_in_steps(&mut workflow.completion_steps);
+            for stage in workflow.stages.iter_mut() {
+                total += sanitize_commands_in_steps(&mut stage.setup_steps);
+                total += sanitize_commands_in_steps(&mut stage.verification_steps);
+                total += sanitize_commands_in_steps(&mut stage.completion_steps);
+            }
+            if total > 0 {
+                info!(
+                    "CommandSanitizer middleware: fixed {} steps",
+                    total
+                );
+                if let Ok(fixed_json) = serde_json::to_string_pretty(&workflow) {
+                    response.output = fixed_json;
+                }
+            }
+        }
+    }
+}
+
+/// Post-call middleware that fixes SDK URLs in AI-generated workflow JSON.
+///
+/// Wraps `fix_sdk_urls()` to replace `/control/` with `/sdk/` URLs and
+/// inject missing SDK connect steps.
+pub struct SdkUrlSanitizer;
+
+impl AiMiddleware for SdkUrlSanitizer {
+    fn name(&self) -> &'static str {
+        "sdk-url-sanitizer"
+    }
+
+    fn post_call(&self, response: &mut AiResponse, _ctx: &MiddlewareContext) {
+        if !response.success {
+            return;
+        }
+
+        let json_text = crate::workflow_generation::generator::extract_json_from_response(
+            &response.output,
+        );
+        if let Ok(workflow) =
+            serde_json::from_str::<crate::unified_workflows::UnifiedWorkflow>(&json_text)
+        {
+            let fixed = fix_sdk_urls(&workflow);
+            if let Ok(fixed_json) = serde_json::to_string_pretty(&fixed) {
+                if fixed_json != response.output {
+                    info!("SdkUrlSanitizer middleware: fixed SDK URLs in AI output");
+                    response.output = fixed_json;
+                }
+            }
+        }
+    }
+}
+
+/// Build the standard hardener middleware chain with all sanitizers.
+///
+/// This chain is applied around the hardener AI call to catch issues
+/// both before sending to the AI and after receiving the response.
+pub fn build_hardener_middleware() -> AiMiddlewareChain {
+    AiMiddlewareChain::new()
+        .add(CommandSanitizer)
+        .add(SdkUrlSanitizer)
 }
 
 /// Deterministic fixup: replace `/ui-bridge/control/` with `/ui-bridge/sdk/` in command steps
@@ -1762,6 +1848,9 @@ mod tests {
             acceptance_criteria: None,
             multi_agent_mode: true,
             use_worktree: false,
+            workflow_architecture: None,
+            rollback_policy: None,
+            enforce_token_budget: false,
             ai_reviewed: true,
             model_overrides: std::collections::HashMap::new(),
             created_at: "2025-01-01T00:00:00Z".to_string(),

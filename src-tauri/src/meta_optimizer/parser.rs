@@ -74,6 +74,17 @@ pub struct ParsedRuleRecommendation {
     pub rationale: String,
 }
 
+/// A parsed rule example from generation_template_optimizer output.
+/// These attach positive/negative examples to existing rules (PromptWizard-inspired).
+#[derive(Debug, Clone)]
+pub struct ParsedRuleExample {
+    pub rule_id: String,
+    pub positive_example: String,
+    pub negative_example: String,
+    pub positive_explanation: String,
+    pub negative_explanation: String,
+}
+
 // ── Marker extraction ───────────────────────────────────────────────────
 
 /// Extract all blocks between `[TAG]` and `[/TAG]` from `output`.
@@ -299,6 +310,37 @@ pub fn parse_arch_findings(output: &str) -> Vec<ParsedArchFinding> {
         .collect()
 }
 
+/// Parse `[RULE_EXAMPLE]` blocks from generation_template_optimizer output.
+///
+/// These attach positive/negative synthetic examples to existing rules,
+/// inspired by PromptWizard's tandem instruction+examples optimization.
+pub fn parse_rule_examples(output: &str) -> Vec<ParsedRuleExample> {
+    extract_marker_blocks(output, "RULE_EXAMPLE")
+        .into_iter()
+        .filter_map(|block| {
+            let kv = parse_key_value_pairs(&block);
+            let rule_id = get_str(&kv, "rule_id");
+            if rule_id.is_empty() {
+                warn!("Skipping RULE_EXAMPLE with missing rule_id");
+                return None;
+            }
+            let positive = get_str(&kv, "positive_example");
+            let negative = get_str(&kv, "negative_example");
+            if positive.is_empty() && negative.is_empty() {
+                warn!("Skipping RULE_EXAMPLE with no examples for rule {}", rule_id);
+                return None;
+            }
+            Some(ParsedRuleExample {
+                rule_id,
+                positive_example: positive,
+                negative_example: negative,
+                positive_explanation: get_str(&kv, "positive_explanation"),
+                negative_explanation: get_str(&kv, "negative_explanation"),
+            })
+        })
+        .collect()
+}
+
 // ── Deduplication helper ─────────────────────────────────────────────────
 
 /// Check if a pending or rejected recommendation with the same title already exists.
@@ -351,7 +393,7 @@ pub fn save_parsed_recommendations(
                     rec.rationale.clone()
                 };
 
-                if rec.confidence < 0.5 {
+                if rec.confidence < 0.45 {
                     debug!(
                         "Skipping low-confidence recommendation ({:.0}%): {}",
                         rec.confidence * 100.0,
@@ -403,7 +445,7 @@ pub fn save_parsed_recommendations(
                     rec.recommended_architecture, rec.workflow_category
                 );
 
-                if rec.confidence < 0.5 {
+                if rec.confidence < 0.45 {
                     debug!(
                         "Skipping low-confidence recommendation ({:.0}%): {}",
                         rec.confidence * 100.0,
@@ -467,7 +509,7 @@ pub fn save_parsed_recommendations(
             for rec in &config_recs {
                 let title = format!("Tune {} for {}", rec.parameter, rec.architecture);
 
-                if rec.confidence < 0.5 {
+                if rec.confidence < 0.45 {
                     debug!(
                         "Skipping low-confidence recommendation ({:.0}%): {}",
                         rec.confidence * 100.0,
@@ -569,7 +611,7 @@ pub fn save_parsed_recommendations(
                     rec.title.clone()
                 };
 
-                if rec.confidence < 0.5 {
+                if rec.confidence < 0.45 {
                     debug!(
                         "Skipping low-confidence recommendation ({:.0}%): {}",
                         rec.confidence * 100.0,
@@ -629,6 +671,16 @@ pub fn save_parsed_recommendations(
                     optimizer_run_id,
                 )?;
                 count += 1;
+            }
+
+            // Parse and save synthetic examples for existing rules (PromptWizard-inspired)
+            let examples = parse_rule_examples(output);
+            if !examples.is_empty() {
+                info!(
+                    "Parsed {} RULE_EXAMPLE(s) from output — attaching to existing rules",
+                    examples.len()
+                );
+                save_rule_examples(db, &examples);
             }
         }
 
@@ -706,6 +758,87 @@ pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&s
             "Auto-applied {} high-confidence rule recommendation(s)",
             candidates.len()
         );
+    }
+}
+
+/// Save parsed rule examples to existing rules in the database.
+///
+/// Each `ParsedRuleExample` is converted to a JSON array entry and merged
+/// into the target rule's `examples_json` column. Examples are additive and
+/// low-risk, so they bypass the recommendation lifecycle.
+fn save_rule_examples(db: &CheckpointDb, examples: &[ParsedRuleExample]) {
+    for ex in examples {
+        let rule_id = ex.rule_id.clone();
+        let positive = ex.positive_example.clone();
+        let negative = ex.negative_example.clone();
+        let pos_explanation = ex.positive_explanation.clone();
+        let neg_explanation = ex.negative_explanation.clone();
+
+        let result = db.with_conn(move |conn| {
+            // Check rule exists
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM generation_rules WHERE id = ?1",
+                    rusqlite::params![rule_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+
+            if !exists {
+                warn!("RULE_EXAMPLE targets non-existent rule: {}", rule_id);
+                return Ok(());
+            }
+
+            // Build examples array
+            let mut new_examples = Vec::new();
+            if !positive.is_empty() {
+                new_examples.push(serde_json::json!({
+                    "type": "positive",
+                    "output": positive,
+                    "explanation": pos_explanation,
+                }));
+            }
+            if !negative.is_empty() {
+                new_examples.push(serde_json::json!({
+                    "type": "negative",
+                    "output": negative,
+                    "explanation": neg_explanation,
+                }));
+            }
+
+            // Merge with existing examples (if any), capping at 4 total
+            let existing_json: Option<String> = conn
+                .query_row(
+                    "SELECT examples_json FROM generation_rules WHERE id = ?1",
+                    rusqlite::params![rule_id],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            let mut all_examples: Vec<serde_json::Value> = existing_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+
+            all_examples.extend(new_examples);
+            // Cap at 4 examples per rule to prevent context bloat
+            all_examples.truncate(4);
+
+            let merged_json = serde_json::to_string(&all_examples)
+                .map_err(|e| format!("JSON serialization error: {}", e))?;
+
+            conn.execute(
+                "UPDATE generation_rules SET examples_json = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![merged_json, chrono::Utc::now().to_rfc3339(), rule_id],
+            )
+            .map_err(|e| format!("Failed to update rule examples: {}", e))?;
+
+            info!("Attached {} example(s) to rule {}", all_examples.len(), rule_id);
+            Ok(())
+        });
+
+        if let Err(e) = result {
+            warn!("Failed to save rule example for {}: {}", ex.rule_id, e);
+        }
     }
 }
 
@@ -936,5 +1069,40 @@ severity: informational
         assert!(parse_config_recommendations(output).is_empty());
         assert!(parse_rule_recommendations(output).is_empty());
         assert!(parse_arch_findings(output).is_empty());
+        assert!(parse_rule_examples(output).is_empty());
+    }
+
+    #[test]
+    fn test_parse_rule_examples() {
+        let output = r#"
+[RULE_EXAMPLE]
+rule_id: rule-abc123
+positive_example: |
+  curl -s $URL | jq '.status'
+negative_example: |
+  curl -f $URL | python -c 'import sys; print(sys.stdin.read())'
+positive_explanation: Uses jq for lightweight JSON parsing
+negative_explanation: Pipes to python subprocess — fragile and slow
+[/RULE_EXAMPLE]
+"#;
+        let examples = parse_rule_examples(output);
+        assert_eq!(examples.len(), 1);
+        assert_eq!(examples[0].rule_id, "rule-abc123");
+        assert!(examples[0].positive_example.contains("jq"));
+        assert!(examples[0].negative_example.contains("python"));
+        assert!(examples[0].positive_explanation.contains("jq"));
+        assert!(examples[0].negative_explanation.contains("fragile"));
+    }
+
+    #[test]
+    fn test_parse_rule_examples_missing_rule_id() {
+        let output = r#"
+[RULE_EXAMPLE]
+positive_example: some example
+negative_example: bad example
+[/RULE_EXAMPLE]
+"#;
+        let examples = parse_rule_examples(output);
+        assert_eq!(examples.len(), 0); // Missing rule_id
     }
 }

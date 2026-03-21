@@ -9,6 +9,92 @@ use std::path::PathBuf;
 use super::conditional_routing::{evaluate_routing_rules, ResolvedModelConfig, RoutingContext};
 use crate::unified_workflows::ModelOverrideConfig;
 
+/// Structured diff captured after each agentic iteration.
+///
+/// Tracks exactly what files changed and the git state before/after,
+/// enabling cross-iteration context injection and replay support.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IterationDiff {
+    /// Iteration number this diff belongs to.
+    pub iteration: u32,
+    /// List of files changed in this iteration.
+    pub files_changed: Vec<String>,
+    /// Human-readable diff stat (e.g., "2 files changed, 10 insertions(+), 3 deletions(-)").
+    pub diff_stat: String,
+    /// Truncated unified diff (max ~4000 chars per iteration).
+    pub diff_summary: String,
+    /// Number of lines inserted.
+    pub insertions: u32,
+    /// Number of lines deleted.
+    pub deletions: u32,
+    /// Commit hash before the agentic phase ran.
+    pub commit_before: Option<String>,
+    /// Commit hash after the agentic phase completed.
+    pub commit_after: Option<String>,
+}
+
+/// A recorded commit checkpoint for a single iteration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IterationCommit {
+    /// Iteration number.
+    pub iteration: u32,
+    /// Git commit hash after the agentic phase.
+    pub commit_hash: String,
+    /// ISO 8601 timestamp.
+    pub timestamp: String,
+}
+
+/// Policy for automatic git rollback on workflow failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackPolicy {
+    /// Do nothing on failure (current behavior, default).
+    None,
+    /// Revert to the commit of the last iteration where verification improved.
+    LastGood,
+    /// Revert to the source commit (pre-workflow state).
+    Clean,
+}
+
+impl Default for RollbackPolicy {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl RollbackPolicy {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "last_good" => Self::LastGood,
+            "clean" => Self::Clean,
+            _ => Self::None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::LastGood => "last_good",
+            Self::Clean => "clean",
+        }
+    }
+}
+
+/// Available replay points for a completed workflow execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayPoint {
+    /// Iteration number.
+    pub iteration: u32,
+    /// Git commit hash at this iteration (if available).
+    pub commit_hash: Option<String>,
+    /// Number of verification checks that passed.
+    pub passed_checks: usize,
+    /// Number of verification checks that failed.
+    pub failed_checks: usize,
+    /// ISO 8601 timestamp of when this iteration completed.
+    pub timestamp: String,
+}
+
 /// Result of a single iteration of the verification-agentic loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IterationResult {
@@ -48,6 +134,12 @@ pub struct LoopResult {
     pub unfixable_errors: bool,
     /// All iteration results
     pub iteration_results: Vec<IterationResult>,
+    /// Total tokens consumed (populated by multi-agent pipeline and agentic verification).
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+    /// Total cost in USD (populated by multi-agent pipeline and agentic verification).
+    #[serde(default)]
+    pub total_cost_usd: Option<f64>,
 }
 
 impl LoopResult {
@@ -212,6 +304,9 @@ pub struct LoopConfig {
     /// Context sections are added in priority order until this budget is reached.
     /// Default: 100_000 (~400K chars). Set lower to reduce prompt size.
     pub max_context_tokens: usize,
+    /// When true, the pipeline will stop execution if accumulated token usage
+    /// exceeds `max_context_tokens`. Disabled by default — only logs warnings.
+    pub enforce_token_budget: bool,
     /// Whether to include knowledge from similar workflows (cross-workflow learning).
     /// When true, the first iteration queries the knowledge base for insights
     /// from other workflows with similar names.
@@ -239,6 +334,14 @@ pub struct LoopConfig {
     ///
     /// Default: false (standard single-session agentic phase).
     pub multi_agent_mode: bool,
+    /// Policy for automatic git rollback when the workflow fails.
+    /// Only applies when the workflow ends due to critical failure, max iterations,
+    /// or unfixable errors. Default: None (no rollback).
+    pub rollback_policy: RollbackPolicy,
+    /// Accumulated iteration diffs (runtime state, not persisted in config).
+    /// Populated during loop execution for cross-iteration context injection.
+    #[allow(dead_code)]
+    pub iteration_diffs: Vec<IterationDiff>,
     /// Run the workflow in an isolated git worktree.
     pub use_worktree: bool,
     /// Worktree path (set at runtime, not user-configurable).
@@ -300,8 +403,13 @@ impl LoopConfig {
             auto_run_generated,
             approval_gate: workflow.approval_gate,
             max_context_tokens: 100_000,
+            enforce_token_budget: workflow.enforce_token_budget,
             cross_workflow_learning: true,
             multi_agent_mode: workflow.multi_agent_mode,
+            rollback_policy: RollbackPolicy::from_str(
+                workflow.rollback_policy.as_deref().unwrap_or("none"),
+            ),
+            iteration_diffs: Vec::new(),
             use_worktree: workflow.use_worktree,
             worktree_path: None,
             worktree_branch: None,
@@ -359,7 +467,7 @@ impl LoopConfig {
                     distinct_concerns.insert(concern);
                 }
                 // Working directory as a distinct concern
-                if let Some(ref wd) = step.working_directory {
+                if let Some(ref wd) = step.shell_command_working_directory {
                     distinct_concerns.insert(wd.clone());
                 }
                 // Check type as a distinct concern

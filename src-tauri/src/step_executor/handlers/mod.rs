@@ -222,6 +222,9 @@ pub struct HandlerContext {
     pub workflow_recursion_stack: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Current verification iteration (set when executing verification steps).
     pub iteration: Option<u32>,
+    /// Path scope policy for working directory resolution.
+    /// Controls whether steps can resolve paths outside the workspace boundary.
+    pub path_scope_policy: crate::paths::PathScopePolicy,
 }
 
 impl HandlerContext {
@@ -252,6 +255,7 @@ impl HandlerContext {
             pid_tracker: None,
             workflow_recursion_stack: Arc::new(std::sync::Mutex::new(HashSet::new())),
             iteration: None,
+            path_scope_policy: crate::paths::PathScopePolicy::default(),
         }
     }
 
@@ -286,7 +290,14 @@ impl HandlerContext {
             pid_tracker,
             workflow_recursion_stack: Arc::new(std::sync::Mutex::new(HashSet::new())),
             iteration: None,
+            path_scope_policy: crate::paths::PathScopePolicy::default(),
         }
+    }
+
+    /// Set the path scope policy for working directory resolution.
+    pub fn with_path_scope_policy(mut self, policy: crate::paths::PathScopePolicy) -> Self {
+        self.path_scope_policy = policy;
+        self
     }
 
     /// Set a variable in the runtime context.
@@ -566,7 +577,7 @@ impl PromptStepHandler {
         .await;
 
         let (success, output) = match ai_result {
-            Ok(Ok((success, output, _retry_state, _injected_steps))) => (success, output),
+            Ok(Ok(result)) => (result.success, result.output),
             Ok(Err(e)) => {
                 let duration = start.elapsed();
                 if duration.as_secs() < 5 {

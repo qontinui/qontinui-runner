@@ -367,6 +367,8 @@ impl AgenticVerificationResult {
                     },
                 })
                 .collect(),
+            total_tokens: None,
+            total_cost_usd: None,
         }
     }
 
@@ -656,6 +658,125 @@ pub struct PipelineAgentConfig {
     pub temperature: Option<f64>,
 }
 
+// ── Handoff & Guardrail Types (inspired by openai-agents-python) ─────────────
+
+/// Typed context passed between pipeline agents during handoffs.
+/// Formalizes inter-agent data transfer with schema validation support.
+/// Mirrors openai-agents-python's `HandoffInputData` pattern.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HandoffContext {
+    /// Source agent type (e.g., "locator").
+    #[serde(default)]
+    pub from_agent: String,
+    /// Target agent type (e.g., "implementer").
+    #[serde(default)]
+    pub to_agent: String,
+    /// Structured payload — schema depends on the handoff pair.
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    /// Items from the source agent's conversation history to forward.
+    #[serde(default)]
+    pub forwarded_items: Vec<String>,
+    /// Whether this handoff passed guardrail validation.
+    #[serde(default)]
+    pub validated: bool,
+}
+
+/// Result of a guardrail check on agent input or output.
+/// Mirrors openai-agents-python's `GuardrailFunctionOutput` with tripwire semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardrailResult {
+    /// Name of the guardrail that ran.
+    pub guardrail_name: String,
+    /// Whether this guardrail tripped (halts pipeline progression if true).
+    pub tripwire_triggered: bool,
+    /// Human-readable explanation of what was checked.
+    pub check_description: String,
+    /// Optional structured metadata about the check.
+    #[serde(default)]
+    pub output_info: Option<serde_json::Value>,
+}
+
+// ── Built-in Guardrail Functions ─────────────────────────────────────────────
+
+/// Validates locator agent output has the expected structure.
+/// Trips if the output is not valid JSON or lacks criteria_locations.
+pub fn guardrail_locator_output_schema(output: &serde_json::Value) -> GuardrailResult {
+    let has_locations = output.get("located_criteria_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) > 0;
+
+    GuardrailResult {
+        guardrail_name: "locator_output_schema".to_string(),
+        tripwire_triggered: !has_locations,
+        check_description: if has_locations {
+            "Locator produced criteria-to-code mappings".to_string()
+        } else {
+            "Locator produced no criteria-to-code mappings — implementer will receive no guidance".to_string()
+        },
+        output_info: None,
+    }
+}
+
+/// Validates verifier output contains a parseable pass/fail verdict.
+pub fn guardrail_verifier_verdict(output: &serde_json::Value) -> GuardrailResult {
+    let has_verdict = output.get("passed").is_some()
+        || output.get("all_passed").is_some();
+
+    GuardrailResult {
+        guardrail_name: "verifier_verdict_parseable".to_string(),
+        tripwire_triggered: !has_verdict,
+        check_description: if has_verdict {
+            "Verifier produced a clear pass/fail verdict".to_string()
+        } else {
+            "Verifier output lacks pass/fail verdict — cannot determine success".to_string()
+        },
+        output_info: None,
+    }
+}
+
+/// Guards against exceeding the remaining token budget before an agent call.
+pub fn guardrail_token_budget(
+    tokens_used: u64,
+    max_tokens: u64,
+    agent_min_requirement: u64,
+) -> GuardrailResult {
+    let remaining = max_tokens.saturating_sub(tokens_used);
+    let sufficient = remaining >= agent_min_requirement;
+
+    GuardrailResult {
+        guardrail_name: "token_budget_guard".to_string(),
+        tripwire_triggered: !sufficient,
+        check_description: format!(
+            "Token budget: {} remaining of {} total (need {} for next agent)",
+            remaining, max_tokens, agent_min_requirement
+        ),
+        output_info: Some(serde_json::json!({
+            "remaining": remaining,
+            "max": max_tokens,
+            "required": agent_min_requirement,
+        })),
+    }
+}
+
+/// Validates a handoff payload is not empty/null.
+pub fn guardrail_handoff_payload_present(handoff: &HandoffContext) -> GuardrailResult {
+    let has_payload = !handoff.payload.is_null()
+        && handoff.payload != serde_json::Value::Object(serde_json::Map::new());
+
+    GuardrailResult {
+        guardrail_name: "handoff_payload_present".to_string(),
+        tripwire_triggered: !has_payload,
+        check_description: format!(
+            "Handoff from {} → {}: payload {}",
+            handoff.from_agent,
+            handoff.to_agent,
+            if has_payload { "present" } else { "empty or null" }
+        ),
+        output_info: None,
+    }
+}
+
 /// Full configuration for the multi-agent pipeline architecture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultiAgentPipelineConfig {
@@ -877,6 +998,25 @@ pub struct PipelineAgentTrace {
     /// Quality score from automated or human review (filled post-hoc).
     #[serde(default)]
     pub output_quality_score: Option<f64>,
+
+    // ── Span hierarchy fields (openai-agents-python tracing pattern) ──
+
+    /// Parent span ID for hierarchical trace nesting (None = root span).
+    #[serde(default)]
+    pub parent_span_id: Option<String>,
+    /// Span type for categorization: "agent", "guardrail", "handoff", "verification".
+    #[serde(default = "default_span_type_agent")]
+    pub span_type: String,
+    /// Guardrail results collected during this agent's execution.
+    #[serde(default)]
+    pub guardrail_results: Vec<GuardrailResult>,
+    /// Handoff context received (if this agent was handed off to).
+    #[serde(default)]
+    pub handoff_received: Option<HandoffContext>,
+}
+
+fn default_span_type_agent() -> String {
+    "agent".to_string()
 }
 
 /// Result of one subtree's implementation + verification cycle.
@@ -995,6 +1135,8 @@ impl MultiAgentPipelineResult {
                     })
                 })
                 .collect(),
+            total_tokens: if self.total_tokens > 0 { Some(self.total_tokens) } else { None },
+            total_cost_usd: if self.total_cost_usd > 0.0 { Some(self.total_cost_usd) } else { None },
         }
     }
 

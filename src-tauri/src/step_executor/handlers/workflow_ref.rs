@@ -215,6 +215,7 @@ impl StepHandler for WorkflowRefHandler {
             auto_run_generated: false,
             approval_gate: false,
             max_context_tokens: 100_000,
+            enforce_token_budget: false,
             cross_workflow_learning: false, // Nested workflows don't need cross-workflow learning
             verification_history: HashMap::new(),
             routing_context: Default::default(),
@@ -227,6 +228,8 @@ impl StepHandler for WorkflowRefHandler {
             workflow_architecture: None,
             agentic_verification_config: None,
             multi_agent_pipeline_config: None,
+            rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+            iteration_diffs: Vec::new(),
         };
 
         // 9. Create LoopController with session manager

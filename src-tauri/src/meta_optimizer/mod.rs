@@ -18,9 +18,12 @@
 //! - `pipeline_prompt_optimizer` — Workflow builder for Agent 1
 //! - `architecture_optimizer` — Workflow builder for Agent 2
 //! - `generation_template_optimizer` — Workflow builder for Agent 3
+//! - `agentic_metrics` — DeepEval-inspired 0.0–1.0 metric scoring for runs
 
+pub mod agentic_metrics;
 pub mod architecture_optimizer;
 pub mod canary;
+pub mod cost_optimizer;
 pub mod failure_analysis;
 pub mod generation_template_optimizer;
 pub mod parser;

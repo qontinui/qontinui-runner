@@ -298,6 +298,8 @@ pub fn record_task_outcome(
         None, // verification_step_count
         None, // agentic_step_count
         false, // has_ui_bridge
+        None, // total_tokens
+        None, // total_cost_usd
     )?;
 
     Ok(())
@@ -389,6 +391,8 @@ pub fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), S
             None,  // verification_step_count
             None,  // agentic_step_count
             false, // has_ui_bridge
+            None,  // total_tokens
+            None,  // total_cost_usd
         )?;
     }
 
@@ -412,6 +416,8 @@ pub fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), S
             None,  // verification_step_count
             None,  // agentic_step_count
             false, // has_ui_bridge
+            None,  // total_tokens
+            None,  // total_cost_usd
         )?;
     }
 

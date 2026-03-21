@@ -10,11 +10,34 @@ use std::collections::HashMap;
 use crate::step_executor::ExecutionStepConfig;
 use crate::unified_workflow_executor::LoopConfig;
 
+/// Thinking style variations for mutation diversity (PromptWizard-inspired).
+/// Rotated across optimizer runs to explore different optimization angles.
+const PIPELINE_THINKING_STYLES: &[&str] = &[
+    // Style 0: Conservative
+    "**Conservative approach:** Make minimal, surgical changes. Preserve all working patterns. \
+     Focus exclusively on the single highest-impact failure pattern. Prefer tightening existing \
+     instructions over adding new ones.",
+    // Style 1: Structural
+    "**Structural approach:** Consider reorganizing the prompt structure. Evaluate whether \
+     reordering sections, adding explicit role definitions, or restructuring the task decomposition \
+     would help. Focus on clarity of prompt architecture over individual instructions.",
+    // Style 2: Example-driven
+    "**Example-driven approach:** Focus on adding concrete examples and counter-examples to the \
+     prompt. Show the agent exactly what good and bad outputs look like. Use before/after pairs \
+     that demonstrate the desired behavior change.",
+    // Style 3: Persona-based
+    "**Persona-based approach:** Assign a domain expert persona to the agent and frame instructions \
+     as what that expert would prioritize. Consider what mental model or checklist an expert in the \
+     relevant domain would follow.",
+];
+
 /// Build the LoopConfig for the pipeline prompt optimizer.
-pub fn build_config(execution_id: &str, workflow_name: &str) -> LoopConfig {
+pub fn build_config(execution_id: &str, workflow_name: &str, style_index: u32) -> LoopConfig {
+    let base_url = crate::mcp::types::get_self_base_url_from_env();
+    let style = PIPELINE_THINKING_STYLES[(style_index as usize) % PIPELINE_THINKING_STYLES.len()];
     LoopConfig {
-        max_iterations: 3,
-        base_prompt: build_agentic_prompt(&crate::mcp::types::get_self_base_url_from_env()),
+        max_iterations: 5,
+        base_prompt: build_agentic_prompt(&base_url, style),
         workflow_name: workflow_name.to_string(),
         workflow_id: format!("meta-opt-prompt-{}", execution_id),
         execution_id: execution_id.to_string(),
@@ -37,6 +60,7 @@ pub fn build_config(execution_id: &str, workflow_name: &str) -> LoopConfig {
         auto_run_generated: false,
         approval_gate: false,
         max_context_tokens: 200_000,
+        enforce_token_budget: false,
         cross_workflow_learning: false,
         verification_history: HashMap::new(),
         routing_context: Default::default(),
@@ -49,6 +73,8 @@ pub fn build_config(execution_id: &str, workflow_name: &str) -> LoopConfig {
         workflow_architecture: None,
         agentic_verification_config: None,
         multi_agent_pipeline_config: None,
+        rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+        iteration_diffs: Vec::new(),
     }
 }
 
@@ -106,6 +132,33 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
             None,
             Some("prompt_analysis"),
         ),
+        // Step 5: Load cost efficiency analysis
+        build_api_step(
+            "Load cost efficiency analysis",
+            "GET",
+            &format!("{}/meta-optimizer/cost-analysis", base_url),
+            None,
+            Some("cost_analysis"),
+        ),
+        // Step 6: Load recent workflow outcomes for batch scoring during critique
+        build_api_step(
+            "Load recent outcomes for batch scoring",
+            "GET",
+            &format!("{}/learning/outcomes?limit=20", base_url),
+            None,
+            Some("recent_outcomes"),
+        ),
+        // Step 7: Load iteration history patterns (L0 — approach success/failure patterns)
+        build_api_step(
+            "Load iteration history patterns (L0)",
+            "GET",
+            &format!(
+                "{}/meta-optimizer/iteration-history?limit=100&tier=l0",
+                base_url
+            ),
+            None,
+            Some("iteration_history"),
+        ),
     ]
 }
 
@@ -134,10 +187,12 @@ If the analysis concluded that all agents are performing well and no changes are
     }]
 }
 
-fn build_agentic_prompt(base_url: &str) -> String {
+fn build_agentic_prompt(base_url: &str, thinking_style: &str) -> String {
     let prompt = r#"You are the Pipeline Prompt Optimizer, part of the meta-optimizer system.
 
 Your job is to analyze historical performance data from the multi-agent pipeline's four agents (spec_analyst, locator, implementer, verifier) and recommend improved system prompts for underperforming agents.
+
+You will follow a **Generate → Critique → Refine** loop to produce high-quality recommendations.
 
 ## Data Available (Tiered Context — L0 Summaries)
 
@@ -147,6 +202,9 @@ The setup phase loaded **L0 summaries** (lightweight index data) to minimize tok
 - `{{reflection_fixes}}` — **L0 summary**: fix_type, total_count, effective_count (grouped by fix type)
 - `{{prompt_variants}}` — Current active prompt variants in the registry (may be empty if using defaults)
 - `{{prompt_analysis}}` — Historical prompt analysis insights
+- `{{cost_analysis}}` — Cost efficiency analysis: per-agent cost breakdown, total cost, cost trend, active cost recommendations
+- `{{recent_outcomes}}` — Last 20 workflow outcomes (success/failure with context) for batch scoring
+- `{{iteration_history}}` — **L0 summary**: approach patterns from agentic verification loops (avg iterations, most common approaches, confidence trends by run status)
 
 ## Drill-Down: L1/L2 Detail Endpoints
 
@@ -178,8 +236,6 @@ Returns: full records including reasoning, old_value, new_value.
 
 Only drill into L1/L2 when the L0 summaries show a problem worth investigating. Do NOT load L2 data for all agents — only for the 1-2 agents that need prompt changes.
 
-## Your Task
-
 ## Prerequisites — Check Before Proceeding
 
 Before generating any recommendations, verify using the L0 summaries:
@@ -189,14 +245,18 @@ Before generating any recommendations, verify using the L0 summaries:
 
 If these prerequisites are NOT met, produce a brief analysis explaining what data is missing and output ZERO [PROMPT_RECOMMENDATION] markers. This is the correct behavior — recommending changes without data is worse than recommending nothing.
 
-### Step 1: Triage with L0 Summaries
+## Your Task: Generate → Critique → Refine
+
+### Phase 1: GENERATE — Draft Candidate Prompts
+
+#### Step 1: Triage with L0 Summaries
 
 Review the L0 summaries to identify which agents need investigation:
 - Which agents have low success_pct (< 70%)?
 - Which fix types have the highest counts?
 - Use L1 drill-down on the 1-2 worst-performing agents to understand failure patterns.
 
-### Step 2: Identify Underperformers
+#### Step 2: Identify Underperformers
 
 Focus on agents with:
 - Low downstream success rates (< 70% in L0 success_pct)
@@ -204,24 +264,57 @@ Focus on agents with:
 - Recurring reflection fix patterns indicating prompt weakness (use L1 for fix details)
 - Patterns where the agent misunderstands its role or produces poor-quality output
 
-### Step 3: Generate Improved Prompts
+#### Step 3: Draft 2-3 Candidate Prompt Variants
 
-For each underperforming agent, write an improved prompt that:
-- Addresses the specific failure patterns observed
-- Preserves what works well in the current prompt
-- Is clear, specific, and actionable
-- Includes examples where helpful
+For each underperforming agent, draft 2-3 distinct candidate prompt variants. Each candidate should take a different approach to addressing the failure patterns. Output each as:
 
-### Step 4: Output Recommendations
+```
+[PROMPT_CANDIDATE]
+candidate_id: <A, B, or C>
+agent_type: <spec_analyst|locator|implementer|verifier>
+approach: <brief description of the approach taken>
+prompt_content: |
+  <the full new prompt text>
+[/PROMPT_CANDIDATE]
+```
 
-For each recommendation, output a structured marker:
+Ensure diversity between candidates — don't produce minor variations of the same idea. Each should take a meaningfully different approach (e.g., one structural, one example-driven, one that tightens constraints).
+
+### Phase 2: CRITIQUE — Self-Evaluate Each Candidate
+
+For each candidate, evaluate against these criteria and output your analysis:
+
+```
+[PROMPT_CRITIQUE]
+candidate_id: <matching candidate_id>
+failure_patterns_addressed: <which specific failure patterns from the data does this candidate fix?>
+failure_patterns_missed: <which failure patterns does this candidate NOT address?>
+regression_risk: <what currently-working patterns might this candidate break?>
+duplicate_check: <does this duplicate or closely resemble a previously-rejected recommendation from {{optimizer_context}}?>
+batch_score: <review the {{recent_outcomes}} — estimate how many of the recent failures this candidate would have prevented (0-20)>
+verdict: <advance|discard>
+verdict_reason: <why>
+[/PROMPT_CRITIQUE]
+```
+
+**Discard a candidate if:**
+- It duplicates a previously-rejected recommendation
+- It would prevent fewer than 3 of the 20 recent failures (batch score < 3)
+- Its regression risk outweighs its expected improvement
+- It doesn't address any specific failure pattern from the data
+
+### Phase 3: REFINE — Produce Final Recommendations
+
+From the surviving candidates (verdict=advance), produce the final refined recommendations. Incorporate critique findings — if a candidate was advanced but had weaknesses noted in the critique, address those weaknesses in the final version.
+
+For each recommendation, output:
 
 ```
 [PROMPT_RECOMMENDATION]
 agent_type: <spec_analyst|locator|implementer|verifier>
 variant_name: <descriptive name, e.g. "clarity_focused_v2">
 confidence: <0.0 to 1.0>
-rationale: <why this change should improve performance, referencing specific failure patterns>
+rationale: <why this change should improve performance, referencing specific failure patterns and batch score>
 prompt_content: |
   <the full new prompt text>
 [/PROMPT_RECOMMENDATION]
@@ -229,10 +322,27 @@ prompt_content: |
 
 ## Quality Gate
 
-- **Minimum confidence: 60%.** Do not output any recommendation below 0.6 confidence.
+- **Minimum confidence: 45%.** Recommendations between 45-60% confidence are saved for human review. Recommendations above 60% may be auto-applied if above 85%. This lower threshold allows the system to capture weak-signal improvements that still have merit.
 - **Must cite specific data.** Every recommendation must reference specific numbers from agent_trace_aggregates or reflection_fixes. "The failure rate is high" is not sufficient — "implementer has 22% downstream failure rate across 45 runs, with 8 reflection fixes citing 'incorrect file targeting'" is.
 - **No data = no recommendation.** If agent_trace_aggregates is empty or has zero entries, output zero recommendations. Write a brief explanation of what data is needed instead.
 - **Maximum 2 recommendations per run.** Focus on the highest-impact changes. More than 2 prompt changes at once makes it impossible to measure which one helped.
+- **Batch scoring required.** Every recommendation must include its estimated batch score from the critique phase. Recommendations with batch_score < 3 should not be output.
+
+## Expert Persona
+
+When analyzing failures and generating improvements, adopt the perspective matching the dominant failure category:
+- A **DevOps reliability engineer** for infrastructure/deployment-related failures
+- A **QA test architect** for verification/testing-related failures
+- An **API integration specialist** for SDK/endpoint-related failures
+- A **UX engineer** for UI Bridge-related failures
+
+Match your persona to the dominant failure category in the data. Frame recommendations as this expert would.
+
+## Optimization Approach for This Run
+
+{{thinking_style}}
+
+Use this approach to guide your candidate generation in Phase 1. This style is intentionally varied across optimizer runs to explore different optimization directions and prevent convergence to local optima.
 
 ## Important Guidelines
 
@@ -251,7 +361,9 @@ Use this to:
 - **Respect user decisions.** If a recommendation was rejected, understand why before suggesting similar changes.
 - **Track convergence.** Compare current metrics to baseline — if things are improving, make smaller adjustments. If stagnating, try bolder changes.
 - **Don't recommend what's already applied.** Check the active prompt variants before suggesting new ones."#;
-    prompt.replace("{{base_url}}", base_url)
+    prompt
+        .replace("{{base_url}}", base_url)
+        .replace("{{thinking_style}}", thinking_style)
 }
 
 /// Helper: Build a command step that makes an HTTP request via curl.

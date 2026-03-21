@@ -30,6 +30,8 @@ impl CheckpointDb {
         verification_step_count: Option<i64>,
         agentic_step_count: Option<i64>,
         has_ui_bridge: bool,
+        total_tokens: Option<u64>,
+        total_cost_usd: Option<f64>,
     ) -> Result<String, String> {
         let conn = self.get_conn()?;
         let id = format!("lo-{}", uuid::Uuid::new_v4());
@@ -55,8 +57,8 @@ impl CheckpointDb {
                 id, task_id, status, duration_secs, iterations, strategy,
                 tools_used, files_modified, error_type, error_message, feedback,
                 workflow_architecture, step_count, verification_step_count,
-                agentic_step_count, has_ui_bridge, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                agentic_step_count, has_ui_bridge, total_tokens, total_cost_usd, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
             "#,
             params![
                 id,
@@ -75,6 +77,8 @@ impl CheckpointDb {
                 verification_step_count,
                 agentic_step_count,
                 has_ui_bridge as i32,
+                total_tokens.map(|t| t as i64),
+                total_cost_usd,
                 now
             ],
         )

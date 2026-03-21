@@ -359,6 +359,44 @@ impl SkillRegistry {
             .collect()
     }
 
+    /// Get skills filtered by phase, tags, and/or category.
+    ///
+    /// This enables per-execution tool whitelisting: only expose skills
+    /// relevant to the current task to reduce prompt bloat.
+    ///
+    /// - `phase`: if Some, only include skills allowed in this phase
+    /// - `tags`: if non-empty, only include skills that have at least one matching tag
+    /// - `category`: if Some, only include skills in this category
+    pub fn skills_for_context(
+        &self,
+        phase: Option<&str>,
+        tags: &[String],
+        category: Option<&str>,
+    ) -> Vec<&SkillDefinition> {
+        self.all()
+            .into_iter()
+            .filter(|s| {
+                // Phase filter
+                if let Some(p) = phase {
+                    if !s.allowed_phases.iter().any(|ap| ap == p) {
+                        return false;
+                    }
+                }
+                // Tag filter (any match)
+                if !tags.is_empty() && !s.tags.iter().any(|t| tags.contains(t)) {
+                    return false;
+                }
+                // Category filter
+                if let Some(c) = category {
+                    if s.category != c {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect()
+    }
+
     /// Search skills by text query with relevance-ranked results.
     ///
     /// Scoring: exact name match (100), slug match (80), word in name (10 each),

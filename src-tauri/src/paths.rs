@@ -283,6 +283,90 @@ pub fn resolve_working_directory(wd: &str) -> PathBuf {
     path
 }
 
+// ============================================================================
+// Scoped CWD resolution
+// ============================================================================
+
+/// Policy for restricting working directory resolution.
+///
+/// Controls whether `resolve_working_directory_scoped` allows paths outside
+/// a defined boundary. Inspired by open-swe's sandbox isolation pattern.
+#[derive(Debug, Clone)]
+pub enum PathScopePolicy {
+    /// Current behavior: permissive fallback chain, warnings only.
+    Permissive,
+    /// Must resolve within the workspace root directory.
+    WorkspaceScoped,
+    /// Must resolve within the specified directory boundary.
+    Strict(PathBuf),
+}
+
+impl Default for PathScopePolicy {
+    fn default() -> Self {
+        Self::Permissive
+    }
+}
+
+/// Resolve a working directory with scope policy enforcement.
+///
+/// Delegates to `resolve_working_directory()` for the actual resolution, then
+/// checks that the result stays within the allowed boundary.
+///
+/// Returns `Err` if the resolved path escapes the boundary in non-Permissive mode.
+pub fn resolve_working_directory_scoped(
+    wd: &str,
+    policy: &PathScopePolicy,
+) -> Result<PathBuf, String> {
+    let resolved = resolve_working_directory(wd);
+
+    match policy {
+        PathScopePolicy::Permissive => Ok(resolved),
+
+        PathScopePolicy::WorkspaceScoped => {
+            let workspace_root = crate::mcp::shared::get_workspace_paths_internal()
+                .map(|(root, _, _)| root)
+                .map_err(|e| format!("Cannot determine workspace root for scope check: {}", e))?;
+
+            check_path_containment(&resolved, &workspace_root, wd)
+        }
+
+        PathScopePolicy::Strict(boundary) => {
+            check_path_containment(&resolved, boundary, wd)
+        }
+    }
+}
+
+/// Check that `resolved` is contained within `boundary`.
+/// Uses canonicalization when possible for robust comparison.
+fn check_path_containment(
+    resolved: &Path,
+    boundary: &Path,
+    original_wd: &str,
+) -> Result<PathBuf, String> {
+    // Canonicalize both paths for reliable comparison.
+    // If canonicalization fails (path doesn't exist yet), use the raw paths.
+    let canonical_resolved = std::fs::canonicalize(resolved)
+        .map(|p| normalize_path_separators(p))
+        .unwrap_or_else(|_| resolved.to_path_buf());
+    let canonical_boundary = std::fs::canonicalize(boundary)
+        .map(|p| normalize_path_separators(p))
+        .unwrap_or_else(|_| boundary.to_path_buf());
+
+    let resolved_str = canonical_resolved.to_string_lossy().to_lowercase();
+    let boundary_str = canonical_boundary.to_string_lossy().to_lowercase();
+
+    if resolved_str.starts_with(&boundary_str) {
+        Ok(normalize_path_separators(canonical_resolved))
+    } else {
+        Err(format!(
+            "Working directory '{}' resolves to '{}' which is outside the allowed boundary '{}'",
+            original_wd,
+            canonical_resolved.display(),
+            canonical_boundary.display(),
+        ))
+    }
+}
+
 /// Normalize path separators to the platform-native separator.
 /// On Windows, converts forward slashes to backslashes to avoid mixed-separator
 /// paths that can cause issues with CreateProcessW and cmd.exe.

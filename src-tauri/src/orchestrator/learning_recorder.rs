@@ -29,6 +29,8 @@ pub struct WorkflowOutcome {
     pub verification_step_count: Option<i64>,
     pub agentic_step_count: Option<i64>,
     pub has_ui_bridge: bool,
+    pub total_tokens: Option<u64>,
+    pub total_cost_usd: Option<f64>,
 }
 
 /// Categorize an error message into a standard error type.
@@ -106,8 +108,8 @@ pub fn record_learning_outcome(
             (id, task_id, status, duration_secs, iterations, strategy,
              tools_used, files_modified, error_type, error_message, feedback,
              workflow_architecture, step_count, verification_step_count,
-             agentic_step_count, has_ui_bridge, created_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"#,
+             agentic_step_count, has_ui_bridge, total_tokens, total_cost_usd, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"#,
         params![
             id,
             outcome.task_run_id,
@@ -125,6 +127,8 @@ pub fn record_learning_outcome(
             outcome.verification_step_count,
             outcome.agentic_step_count,
             outcome.has_ui_bridge as i32,
+            outcome.total_tokens.map(|t| t as i64),
+            outcome.total_cost_usd,
             now,
         ],
     )
@@ -290,7 +294,8 @@ pub fn extract_and_record_patterns(
 /// Record a complete learning observation from a workflow run.
 ///
 /// This is the main entry point called from `loop_controller.rs` after
-/// a workflow completes. It records both the outcome and extracted patterns.
+/// a workflow completes. It records both the outcome, extracted patterns,
+/// and deterministic agentic metric scores.
 pub fn record_workflow_learning(
     conn: &Connection,
     outcome: &WorkflowOutcome,
@@ -298,9 +303,91 @@ pub fn record_workflow_learning(
     let outcome_id = record_learning_outcome(conn, outcome)?;
     let pattern_ids = extract_and_record_patterns(conn, outcome)?;
 
+    // Compute and persist deterministic agentic metrics (zero LLM cost)
+    if let Err(e) = score_and_persist_agentic_metrics(conn, outcome) {
+        // Non-fatal: metrics are supplementary to the core learning outcome
+        tracing::warn!(
+            "Failed to compute agentic metrics for task {}: {}",
+            outcome.task_run_id,
+            e
+        );
+    }
+
     debug!(
         "Recorded learning for task {}: outcome={}, patterns={:?}",
         outcome.task_run_id, outcome_id, pattern_ids
+    );
+
+    Ok(())
+}
+
+/// Compute deterministic agentic metrics and persist them to the database.
+///
+/// Runs synchronously after recording the learning outcome. Cost: zero LLM
+/// calls, milliseconds of wall time.
+fn score_and_persist_agentic_metrics(
+    conn: &Connection,
+    outcome: &WorkflowOutcome,
+) -> Result<(), String> {
+    use crate::meta_optimizer::agentic_metrics::{self, DeterministicInput};
+
+    let input = DeterministicInput {
+        task_run_id: outcome.task_run_id.clone(),
+        status: outcome.status.clone(),
+        verification_passed: outcome.verification_passed,
+        was_stopped: outcome.was_stopped,
+        iterations: outcome.iterations,
+        step_count: outcome.step_count,
+        verification_step_count: outcome.verification_step_count,
+        agentic_step_count: outcome.agentic_step_count,
+        max_iterations_reached: outcome.max_iterations_reached,
+        duration_secs: outcome.duration_secs,
+        error_type: outcome.error_type.clone(),
+    };
+
+    let scores = agentic_metrics::compute_deterministic(&input);
+    let composite = agentic_metrics::composite_score(&scores);
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Insert each metric score
+    for score in &scores {
+        let id = format!("ams-{}", Uuid::new_v4());
+        conn.execute(
+            r#"INSERT OR REPLACE INTO agentic_metric_scores
+                (id, task_run_id, metric_type, score, confidence,
+                 rationale, is_llm_judged, model_used, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            params![
+                id,
+                outcome.task_run_id,
+                score.metric.as_str(),
+                score.score,
+                score.confidence,
+                score.rationale,
+                score.is_llm_judged as i32,
+                score.model_used,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to insert agentic metric score: {}", e))?;
+    }
+
+    // Update the cached composite score on learning_outcomes
+    conn.execute(
+        "UPDATE learning_outcomes SET composite_agentic_score = ?1 WHERE task_id = ?2",
+        params![composite, outcome.task_run_id],
+    )
+    .map_err(|e| format!("Failed to update composite agentic score: {}", e))?;
+
+    info!(
+        "Scored agentic metrics for task {}: composite={:.3}, metrics={}",
+        outcome.task_run_id,
+        composite,
+        scores
+            .iter()
+            .map(|s| format!("{}={:.2}", s.metric, s.score))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     Ok(())

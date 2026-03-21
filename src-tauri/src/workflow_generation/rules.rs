@@ -42,6 +42,7 @@ pub struct GenerationRule {
     pub source_fix_id: Option<String>,
     pub severity: String,
     pub failure_count: i32,
+    pub examples_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -58,6 +59,7 @@ pub struct InsertRuleInput {
     pub provenance: String,
     pub source_fix_id: Option<String>,
     pub severity: Option<String>,
+    pub examples_json: Option<String>,
 }
 
 /// Input for updating an existing rule.
@@ -70,6 +72,8 @@ pub struct UpdateRuleInput {
     pub rule_number: Option<i32>,
     /// Severity level: 'critical', 'important', 'normal', 'hint'
     pub severity: Option<String>,
+    /// JSON array of positive/negative examples
+    pub examples_json: Option<String>,
 }
 
 /// Query parameters for listing rules.
@@ -90,7 +94,7 @@ pub struct ListRulesQuery {
 /// Load active rules for a specific agent and section, ordered by rule_number.
 pub fn load_rules(conn: &Connection, agent: &str, section: &str) -> Vec<GenerationRule> {
     let mut stmt = match conn.prepare(
-        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, created_at, updated_at
+        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, examples_json, created_at, updated_at
          FROM generation_rules
          WHERE agent = ?1 AND section = ?2 AND status = 'active'
          ORDER BY rule_number",
@@ -116,8 +120,9 @@ pub fn load_rules(conn: &Connection, agent: &str, section: &str) -> Vec<Generati
             source_fix_id: row.get(9)?,
             severity: row.get(10)?,
             failure_count: row.get(11)?,
-            created_at: row.get(12)?,
-            updated_at: row.get(13)?,
+            examples_json: row.get(12)?,
+            created_at: row.get(13)?,
+            updated_at: row.get(14)?,
         })
     });
 
@@ -148,7 +153,7 @@ pub fn load_rules_progressive(
     };
 
     let sql = format!(
-        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, created_at, updated_at
+        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, examples_json, created_at, updated_at
          FROM generation_rules
          WHERE agent = ?1 AND section = ?2 AND status = 'active' {}
          ORDER BY rule_number",
@@ -177,8 +182,9 @@ pub fn load_rules_progressive(
             source_fix_id: row.get(9)?,
             severity: row.get(10)?,
             failure_count: row.get(11)?,
-            created_at: row.get(12)?,
-            updated_at: row.get(13)?,
+            examples_json: row.get(12)?,
+            created_at: row.get(13)?,
+            updated_at: row.get(14)?,
         })
     });
 
@@ -194,7 +200,7 @@ pub fn load_rules_progressive(
 /// Load all active rules for an agent, grouped by section.
 pub fn load_rules_by_agent(conn: &Connection, agent: &str) -> HashMap<String, Vec<GenerationRule>> {
     let mut stmt = match conn.prepare(
-        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, created_at, updated_at
+        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, examples_json, created_at, updated_at
          FROM generation_rules
          WHERE agent = ?1 AND status = 'active'
          ORDER BY section, rule_number",
@@ -220,8 +226,9 @@ pub fn load_rules_by_agent(conn: &Connection, agent: &str) -> HashMap<String, Ve
             source_fix_id: row.get(9)?,
             severity: row.get(10)?,
             failure_count: row.get(11)?,
-            created_at: row.get(12)?,
-            updated_at: row.get(13)?,
+            examples_json: row.get(12)?,
+            created_at: row.get(13)?,
+            updated_at: row.get(14)?,
         })
     });
 
@@ -240,7 +247,7 @@ pub fn list_rules(
     query: &ListRulesQuery,
 ) -> Result<Vec<GenerationRule>, String> {
     let mut sql = String::from(
-        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, created_at, updated_at
+        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, examples_json, created_at, updated_at
          FROM generation_rules WHERE 1=1",
     );
     let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -289,8 +296,9 @@ pub fn list_rules(
                 source_fix_id: row.get(9)?,
                 severity: row.get(10)?,
                 failure_count: row.get(11)?,
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
+                examples_json: row.get(12)?,
+                created_at: row.get(13)?,
+                updated_at: row.get(14)?,
             })
         })
         .map_err(|e| format!("Failed to execute list_rules query: {}", e))?;
@@ -301,7 +309,7 @@ pub fn list_rules(
 /// Get a single rule by ID.
 pub fn get_rule(conn: &Connection, id: &str) -> Result<Option<GenerationRule>, String> {
     let result = conn.query_row(
-        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, created_at, updated_at
+        "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, examples_json, created_at, updated_at
          FROM generation_rules WHERE id = ?1",
         params![id],
         |row| {
@@ -318,8 +326,9 @@ pub fn get_rule(conn: &Connection, id: &str) -> Result<Option<GenerationRule>, S
                 source_fix_id: row.get(9)?,
                 severity: row.get(10)?,
                 failure_count: row.get(11)?,
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
+                examples_json: row.get(12)?,
+                created_at: row.get(13)?,
+                updated_at: row.get(14)?,
             })
         },
     );
@@ -335,11 +344,45 @@ pub fn get_rule(conn: &Connection, id: &str) -> Result<Option<GenerationRule>, S
 // Formatting Functions
 // ============================================================================
 
+/// A deserialized rule example from `examples_json`.
+#[derive(Debug, Deserialize)]
+struct RuleExample {
+    #[serde(rename = "type")]
+    example_type: String,
+    output: String,
+    #[serde(default)]
+    explanation: String,
+}
+
 /// Format rules into numbered markdown for prompt injection.
+///
+/// When a rule has `examples_json`, up to 2 examples are appended as
+/// GOOD/BAD pairs to provide concrete demonstrations (PromptWizard-inspired).
 pub fn format_rules_as_markdown(rules: &[GenerationRule]) -> String {
     rules
         .iter()
-        .map(|r| format!("{}. **{}**: {}", r.rule_number, r.title, r.content))
+        .map(|r| {
+            let mut s = format!("{}. **{}**: {}", r.rule_number, r.title, r.content);
+
+            // Append up to 2 synthetic examples if present
+            if let Some(ref json) = r.examples_json {
+                if let Ok(examples) = serde_json::from_str::<Vec<RuleExample>>(json) {
+                    for ex in examples.iter().take(2) {
+                        let label = if ex.example_type == "positive" {
+                            "GOOD"
+                        } else {
+                            "BAD"
+                        };
+                        s.push_str(&format!("\n   - {}: `{}`", label, ex.output));
+                        if !ex.explanation.is_empty() {
+                            s.push_str(&format!(" — {}", ex.explanation));
+                        }
+                    }
+                }
+            }
+
+            s
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -366,7 +409,7 @@ pub fn insert_rule(conn: &Connection, input: &InsertRuleInput) -> Result<Generat
     if let Some(ref fix_id) = input.source_fix_id {
         let existing: Option<GenerationRule> = conn
             .query_row(
-                "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, created_at, updated_at
+                "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, failure_count, examples_json, created_at, updated_at
                  FROM generation_rules WHERE source_fix_id = ?1 LIMIT 1",
                 params![fix_id],
                 |row| {
@@ -383,8 +426,9 @@ pub fn insert_rule(conn: &Connection, input: &InsertRuleInput) -> Result<Generat
                         source_fix_id: row.get(9)?,
                         severity: row.get(10)?,
                         failure_count: row.get(11)?,
-                        created_at: row.get(12)?,
-                        updated_at: row.get(13)?,
+                        examples_json: row.get(12)?,
+                        created_at: row.get(13)?,
+                        updated_at: row.get(14)?,
                     })
                 },
             )
@@ -405,8 +449,8 @@ pub fn insert_rule(conn: &Connection, input: &InsertRuleInput) -> Result<Generat
     let severity = input.severity.as_deref().unwrap_or("normal").to_string();
 
     conn.execute(
-        "INSERT INTO generation_rules (id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO generation_rules (id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, severity, examples_json, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             id,
             input.agent,
@@ -418,6 +462,7 @@ pub fn insert_rule(conn: &Connection, input: &InsertRuleInput) -> Result<Generat
             input.provenance,
             input.source_fix_id,
             severity,
+            input.examples_json,
             now,
             now,
         ],
@@ -437,6 +482,7 @@ pub fn insert_rule(conn: &Connection, input: &InsertRuleInput) -> Result<Generat
         source_fix_id: input.source_fix_id.clone(),
         severity,
         failure_count: 0,
+        examples_json: input.examples_json.clone(),
         created_at: now.clone(),
         updated_at: now,
     })
@@ -475,6 +521,10 @@ pub fn update_rule(
     if let Some(ref severity) = input.severity {
         params_vec.push(Box::new(severity.clone()));
         sets.push(format!("severity = ?{}", params_vec.len()));
+    }
+    if let Some(ref examples_json) = input.examples_json {
+        params_vec.push(Box::new(examples_json.clone()));
+        sets.push(format!("examples_json = ?{}", params_vec.len()));
     }
 
     params_vec.push(Box::new(id.to_string()));
@@ -682,6 +732,7 @@ pub fn create_rules_from_reflection_fixes(
             provenance: "reflection".to_string(),
             source_fix_id: Some(fix.id.clone()),
             severity: None,
+            examples_json: None,
         };
 
         match insert_rule(conn, &input) {
@@ -776,6 +827,7 @@ pub fn promote_insights_to_rules(
             provenance: "auto_insight".to_string(),
             source_fix_id: None,
             severity: None,
+            examples_json: None,
         };
 
         match insert_rule(conn, &input) {
@@ -946,6 +998,7 @@ pub fn sync_rules_from_known_issues(conn: &Connection) -> Result<u32, String> {
             provenance: "known_issue".to_string(),
             source_fix_id: Some(source_id),
             severity: Some("important".to_string()),
+            examples_json: None,
         };
 
         match insert_rule(conn, &input) {
@@ -1042,6 +1095,7 @@ mod tests {
                 source_fix_id: None,
                 severity: "normal".into(),
                 failure_count: 0,
+                examples_json: None,
                 created_at: "now".into(),
                 updated_at: "now".into(),
             },
@@ -1058,6 +1112,7 @@ mod tests {
                 source_fix_id: None,
                 severity: "normal".into(),
                 failure_count: 0,
+                examples_json: None,
                 created_at: "now".into(),
                 updated_at: "now".into(),
             },
@@ -1359,6 +1414,214 @@ mod tests {
 /// Deduplicates by matching on provenance='seed' and title — safe to call repeatedly.
 pub fn ensure_seed_rules(conn: &Connection) {
     let seed_rules = [
+        // ── Critical severity: structural correctness rules ────────────
+        // These prevent immediate generation failures (invalid JSON, wrong step types, etc.)
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "important_rules".to_string(),
+            rule_number: 1,
+            title: "Generate valid UUIDs".to_string(),
+            content: "Generate valid UUIDs for all `id` fields (format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx).".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("critical".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "important_rules".to_string(),
+            rule_number: 2,
+            title: "Phase field must match array".to_string(),
+            content: "`phase` field MUST match the array the step is in (setup_steps -> \"setup\", verification_steps -> \"verification\", agentic_steps -> \"agentic\", completion_steps -> \"completion\").".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("critical".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "important_rules".to_string(),
+            rule_number: 3,
+            title: "Agentic steps are prompt only".to_string(),
+            content: "`agentic_steps` can ONLY contain `prompt` type steps.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("critical".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "important_rules".to_string(),
+            rule_number: 5,
+            title: "JSON only output".to_string(),
+            content: "Return ONLY the JSON object, no markdown formatting, no code fences, no commentary outside the JSON structure.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("critical".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 16,
+            title: "Only 3 step types exist".to_string(),
+            content: "The only valid step types are `command`, `ui_bridge`, and `prompt`. Do NOT use `shell_command`, `api_request`, `mcp_call`, `check`, `check_group`, `test`, `gate`, or `spec` — these are not valid types. Tests are run via `command` with `test_type` set. Checks are run via `command` with `check_type` set.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("critical".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 17,
+            title: "Every command step MUST include a mode field".to_string(),
+            content: "Valid modes are `shell`, `check`, `check_group`, `test`. The mode must match the fields present: `check` requires `check_type`, `check_group` requires `check_group_id`, `test` requires `test_type` or `test_id`, `shell` is for plain commands.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("critical".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 6,
+            title: "Deterministic verification step required".to_string(),
+            content: "verification_steps MUST include at least one deterministic, automated step — one of: `command` (with check_type or a command), `test`, or `ui_bridge` (assert action). Do NOT use only `prompt` type steps for verification.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("critical".to_string()),
+            examples_json: None,
+        },
+        // ── Important severity: correctness-adjacent rules ───────────
+        // These prevent common errors but aren't structurally fatal
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "important_rules".to_string(),
+            rule_number: 4,
+            title: "ISO 8601 timestamps".to_string(),
+            content: "Use ISO 8601 format for timestamps (e.g., \"2024-01-15T10:30:00Z\").".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("important".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 7,
+            title: "Code modification requires typecheck".to_string(),
+            content: "When the workflow creates or modifies source code files, verification MUST include a `command` step with `check_type` set to the appropriate type checker.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("important".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 8,
+            title: "Web app verification requires SDK or Playwright".to_string(),
+            content: "When the workflow verifies interactive UI behavior of a web application, verification MUST include `ui_bridge` steps or Playwright-based checks. For simple health checks or content verification (page loads, contains text), `command` steps with `curl` are sufficient.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("important".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 9,
+            title: "Data flow references must be valid".to_string(),
+            content: "All step IDs referenced in `inputs`, `depends_on`, and `extract` must correspond to existing step IDs within the same workflow. Circular dependencies in `depends_on` are invalid.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("important".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 10,
+            title: "Prompts are supplementary".to_string(),
+            content: "`prompt` type steps in verification must NEVER be the sole verification mechanism.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("important".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 14,
+            title: "Feature-specific verification required".to_string(),
+            content: "Must include feature-specific checks, not just compilation/lint checks.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("important".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 15,
+            title: "Agentic-verification correspondence".to_string(),
+            content: "Each agentic step must have a corresponding deterministic verification step.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("important".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 18,
+            title: "No Python f-strings or jq in shell commands".to_string(),
+            content: "When piping curl output to `python -c`, NEVER use f-strings (`f'...'`). Use string concatenation instead. Do NOT use `jq` — it is not available on Windows. For JSON assertions, pipe to `python -c \"import sys,json; d=json.load(sys.stdin); ...\"`. For checking fields exist, use `grep`.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("important".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 19,
+            title: "Retry format".to_string(),
+            content: "Use flat `retry_count` and `retry_delay_ms` fields directly on step objects. Do NOT use a nested `retry` object (e.g., `\"retry\": {\"count\": 5}` is WRONG, use `\"retry_count\": 5`).".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("important".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 20,
+            title: "No bash negation prefix in shell commands".to_string(),
+            content: "NEVER use `!` as a command prefix to invert exit codes (e.g., `! grep -qE 'pattern' file`). The `!` operator is bash-specific and may not work on Windows. Instead, use explicit exit code handling: `grep -qE 'pattern' file && exit 1 || exit 0`.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("important".to_string()),
+            examples_json: None,
+        },
         InsertRuleInput {
             agent: "schema_context".to_string(),
             section: "important_rules".to_string(),
@@ -1369,6 +1632,7 @@ pub fn ensure_seed_rules(conn: &Connection) {
             provenance: "seed".to_string(),
             source_fix_id: None,
             severity: Some("important".to_string()),
+            examples_json: None,
         },
         InsertRuleInput {
             agent: "schema_context".to_string(),
@@ -1380,6 +1644,68 @@ pub fn ensure_seed_rules(conn: &Connection) {
             provenance: "seed".to_string(),
             source_fix_id: None,
             severity: Some("important".to_string()),
+            examples_json: None,
+        },
+        // ── Normal severity: situational rules ───────────────────────
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 11,
+            title: "Test steps with inline commands use repository".to_string(),
+            content: "When a `test` step runs a shell command, set `test_type: \"repository\"`.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("normal".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 12,
+            title: "Next.js App Router path conventions".to_string(),
+            content: "Use correct paths like `src/app/(app)/`.".to_string(),
+            condition: Some("targets_nextjs".to_string()),
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("normal".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 13,
+            title: "Verification step caching".to_string(),
+            content: "Running tasks cache verification steps at startup; API updates don't affect current task.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("hint".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 21,
+            title: "Removal tasks require runtime verification".to_string(),
+            content: "When a workflow involves removing pages/routes/components from a web app, verification MUST include runtime checks (UI Bridge navigate + assertion, or HTTP request to the removed URL), not just static file-existence checks (`test ! -f`). Build caches and routing config may still serve removed content after source file deletion.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("normal".to_string()),
+            examples_json: None,
+        },
+        InsertRuleInput {
+            agent: "schema_context".to_string(),
+            section: "verification_quality".to_string(),
+            rule_number: 22,
+            title: "Per-stage UI verification in multi-stage workflows".to_string(),
+            content: "In multi-stage workflows, each stage that modifies UI must have its own UI Bridge verification steps. A UI Bridge check in one stage does NOT cover UI changes made in another stage.".to_string(),
+            condition: None,
+            provenance: "seed".to_string(),
+            source_fix_id: None,
+            severity: Some("normal".to_string()),
+            examples_json: None,
         },
         InsertRuleInput {
             agent: "schema_context".to_string(),
@@ -1391,6 +1717,7 @@ pub fn ensure_seed_rules(conn: &Connection) {
             provenance: "seed".to_string(),
             source_fix_id: None,
             severity: Some("normal".to_string()),
+            examples_json: None,
         },
     ];
 

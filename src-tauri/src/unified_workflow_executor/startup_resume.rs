@@ -406,6 +406,7 @@ pub async fn resume_interrupted_workflows(
                                 auto_run_generated: false,
                                 approval_gate: workflow.approval_gate,
                                 max_context_tokens: 100_000,
+                                enforce_token_budget: false,
                                 cross_workflow_learning: true,
                                 verification_history: std::collections::HashMap::new(),
                                 routing_context: Default::default(),
@@ -419,6 +420,8 @@ pub async fn resume_interrupted_workflows(
                                 multi_agent_pipeline_config: None,
 
                                 acceptance_criteria: workflow.acceptance_criteria.clone(),
+                                rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+                                iteration_diffs: Vec::new(),
                             };
 
                             controller
@@ -610,6 +613,7 @@ pub async fn resume_interrupted_workflows(
                                 auto_run_generated: false,
                                 approval_gate: workflow.approval_gate,
                                 max_context_tokens: 100_000,
+                                enforce_token_budget: false,
                                 cross_workflow_learning: true,
                                 verification_history: std::collections::HashMap::new(),
                                 routing_context: Default::default(),
@@ -623,6 +627,8 @@ pub async fn resume_interrupted_workflows(
 
                                 project_path: crate::mcp::shared::current_project_path(),
                                 acceptance_criteria: workflow.acceptance_criteria.clone(),
+                                rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+                                iteration_diffs: Vec::new(),
                             };
 
                             controller

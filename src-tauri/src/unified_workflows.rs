@@ -458,6 +458,16 @@ pub struct UnifiedWorkflow {
     #[serde(default = "default_multi_agent_mode")]
     pub multi_agent_mode: bool,
 
+    /// Policy for automatic git rollback when the workflow fails.
+    /// Values: "none" (default), "last_good", "clean".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_policy: Option<String>,
+
+    /// When true, the pipeline will stop execution if accumulated token usage
+    /// exceeds the token budget. Disabled by default — only logs warnings.
+    #[serde(default)]
+    pub enforce_token_budget: bool,
+
     /// Run the workflow in an isolated git worktree.
     /// When true, a new branch and worktree are created before execution.
     /// Changes stay on the worktree branch and can be merged back after review.
@@ -674,6 +684,10 @@ pub struct CreateUnifiedWorkflowRequest {
     #[serde(default)]
     pub workflow_architecture:
         Option<crate::autoresearch::agentic_verification::WorkflowArchitecture>,
+    /// When true, the pipeline will stop execution if accumulated token usage
+    /// exceeds the token budget. Disabled by default.
+    #[serde(default)]
+    pub enforce_token_budget: Option<bool>,
 }
 
 impl From<&UnifiedWorkflow> for CreateUnifiedWorkflowRequest {
@@ -718,6 +732,7 @@ impl From<&UnifiedWorkflow> for CreateUnifiedWorkflowRequest {
             acceptance_criteria: w.acceptance_criteria.clone(),
             ai_reviewed: Some(w.ai_reviewed),
             workflow_architecture: w.workflow_architecture.clone(),
+            enforce_token_budget: Some(w.enforce_token_budget),
         }
     }
 }
@@ -787,6 +802,10 @@ pub struct UpdateUnifiedWorkflowRequest {
     /// Workflow execution architecture override (e.g., "multi_agent_pipeline").
     pub workflow_architecture:
         Option<crate::autoresearch::agentic_verification::WorkflowArchitecture>,
+    /// When true, the pipeline will stop execution if accumulated token usage
+    /// exceeds the token budget. Disabled by default.
+    #[serde(default)]
+    pub enforce_token_budget: Option<bool>,
 }
 
 /// Query parameters for searching unified workflows

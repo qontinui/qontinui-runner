@@ -40,6 +40,9 @@ struct RulePayload {
     /// For disabling a rule.
     #[serde(default)]
     status: Option<String>,
+    /// JSON array of positive/negative examples (PromptWizard-inspired).
+    #[serde(default)]
+    examples_json: Option<String>,
 }
 
 /// Create a new recommendation.
@@ -355,6 +358,7 @@ fn apply_rule_create(
             provenance: "meta_optimizer".to_string(),
             source_fix_id: Some(rec_id.clone()),
             severity: None,
+            examples_json: payload.examples_json.clone(),
         };
 
         let rule = crate::workflow_generation::rules::insert_rule(conn, &input)?;
@@ -382,6 +386,7 @@ fn apply_rule_update(db: &CheckpointDb, recommended_value: &str) -> Result<(), S
             status: payload.status,
             rule_number: payload.rule_number,
             severity: None,
+            examples_json: payload.examples_json,
         };
 
         let rule = crate::workflow_generation::rules::update_rule(conn, &rule_id, &input)?;
@@ -516,6 +521,7 @@ fn rollback_rule(
             status: Some("disabled".to_string()),
             rule_number: None,
             severity: None,
+            examples_json: None,
         };
 
         crate::workflow_generation::rules::update_rule(conn, &target_rule_id, &input)?;

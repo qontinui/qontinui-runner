@@ -219,3 +219,25 @@ pub struct MetaOptimizerRun {
     pub created_at: String,
     pub completed_at: Option<String>,
 }
+
+/// L0 summary of iteration history across runs: approach patterns and confidence trends.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IterationHistorySummaryL0 {
+    pub status: String,
+    pub run_count: i64,
+    pub avg_iterations: f64,
+    pub avg_final_confidence_delta: f64,
+    pub most_common_approaches: Vec<String>,
+}
+
+/// L1 per-run iteration history: compressed iteration sequences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IterationHistoryDetailL1 {
+    pub task_run_id: String,
+    pub task_name: String,
+    pub status: String,
+    pub iteration_count: usize,
+    pub total_confidence_delta: f64,
+    pub approaches: Vec<String>,
+    pub created_at: String,
+}

@@ -96,6 +96,10 @@ pub struct ApiResponse<T: Serialize> {
     pub data: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Structured error detail with machine-readable code and recovery hint.
+    /// Added alongside `error` for backward compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<crate::mcp::ui_bridge::UiBridgeError>,
 }
 
 impl<T: Serialize> ApiResponse<T> {
@@ -104,6 +108,7 @@ impl<T: Serialize> ApiResponse<T> {
             success: true,
             data: Some(data),
             error: None,
+            error_detail: None,
         }
     }
 
@@ -112,6 +117,19 @@ impl<T: Serialize> ApiResponse<T> {
             success: false,
             data: None,
             error: Some(message.into()),
+            error_detail: None,
+        }
+    }
+
+    pub fn error_detailed(
+        message: impl Into<String>,
+        detail: crate::mcp::ui_bridge::UiBridgeError,
+    ) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message.into()),
+            error_detail: Some(detail),
         }
     }
 }
@@ -122,6 +140,20 @@ pub fn api_error(message: impl Into<String>) -> ApiResponse<()> {
         success: false,
         data: None,
         error: Some(message.into()),
+        error_detail: None,
+    }
+}
+
+/// Create an error response with structured error detail
+pub fn api_error_detailed(
+    message: impl Into<String>,
+    detail: crate::mcp::ui_bridge::UiBridgeError,
+) -> ApiResponse<()> {
+    ApiResponse {
+        success: false,
+        data: None,
+        error: Some(message.into()),
+        error_detail: Some(detail),
     }
 }
 

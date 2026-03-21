@@ -395,4 +395,101 @@ mod tests {
         assert!(prompt.contains("Do NOT produce any output"));
         assert!(prompt.contains("wait silently"));
     }
+
+    #[test]
+    fn test_truncation_keeps_first_and_last() {
+        // Create enough turns to exceed a small budget
+        let mut turns = vec![
+            ConversationTurn {
+                role: TurnRole::User,
+                content: "FIRST MESSAGE".to_string(),
+            },
+        ];
+        for i in 0..20 {
+            turns.push(ConversationTurn {
+                role: TurnRole::Assistant,
+                content: format!("Middle response {}: {}", i, "x".repeat(100)),
+            });
+        }
+        turns.push(ConversationTurn {
+            role: TurnRole::User,
+            content: "LAST MESSAGE".to_string(),
+        });
+
+        // Budget small enough to force truncation but large enough for first+last
+        let prompt = build_replay_prompt(&turns, Some(500));
+        assert!(prompt.contains("FIRST MESSAGE"), "First turn must be preserved");
+        assert!(prompt.contains("LAST MESSAGE"), "Last turn must be preserved");
+    }
+
+    #[test]
+    fn test_truncation_inserts_gap_markers() {
+        let mut turns = Vec::new();
+        for i in 0..10 {
+            turns.push(ConversationTurn {
+                role: if i % 2 == 0 { TurnRole::User } else { TurnRole::Assistant },
+                content: format!("Turn {} content: {}", i, "y".repeat(80)),
+            });
+        }
+
+        // Small budget: can't fit all 10 turns
+        let prompt = build_replay_prompt(&turns, Some(600));
+        assert!(
+            prompt.contains("[... conversation truncated ...]"),
+            "Gap marker should appear when turns are skipped"
+        );
+    }
+
+    #[test]
+    fn test_truncation_prefers_error_messages() {
+        let turns = vec![
+            ConversationTurn {
+                role: TurnRole::User,
+                content: "Start".to_string(),
+            },
+            ConversationTurn {
+                role: TurnRole::Assistant,
+                content: format!("Normal response: {}", "a".repeat(100)),
+            },
+            ConversationTurn {
+                role: TurnRole::User,
+                content: format!("Got an error: {}", "b".repeat(100)),
+            },
+            ConversationTurn {
+                role: TurnRole::Assistant,
+                content: format!("Another normal response: {}", "c".repeat(100)),
+            },
+            ConversationTurn {
+                role: TurnRole::User,
+                content: "Final question".to_string(),
+            },
+        ];
+
+        // Budget that can fit ~3 turns but not all 5
+        let prompt = build_replay_prompt(&turns, Some(450));
+        // Error message should be prioritized over normal messages
+        assert!(
+            prompt.contains("Got an error"),
+            "Error-containing turn should be preserved over normal turns"
+        );
+    }
+
+    #[test]
+    fn test_truncation_tiny_budget_still_has_first_last() {
+        let turns = vec![
+            ConversationTurn {
+                role: TurnRole::User,
+                content: "Hello".to_string(),
+            },
+            ConversationTurn {
+                role: TurnRole::Assistant,
+                content: "World".to_string(),
+            },
+        ];
+
+        // Even with absurdly small budget, first and last should be included
+        let prompt = build_replay_prompt(&turns, Some(1));
+        assert!(prompt.contains("Hello"));
+        assert!(prompt.contains("World"));
+    }
 }

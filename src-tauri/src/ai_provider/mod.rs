@@ -14,6 +14,7 @@ mod claude_cli;
 mod config;
 mod gemini_api;
 mod gemini_cli;
+pub mod middleware;
 mod process;
 mod retry;
 mod routing;
@@ -21,5 +22,8 @@ mod types;
 
 // Re-export public API
 pub use config::{get_effective_config_dir, set_resolved_config_dir};
-pub use routing::{run_prompt_sync, run_prompt_with_model_override, run_prompt_with_routing};
+pub use routing::{
+    run_prompt_sync, run_prompt_with_middleware, run_prompt_with_model_override,
+    run_prompt_with_routing,
+};
 pub use types::AiResponse;

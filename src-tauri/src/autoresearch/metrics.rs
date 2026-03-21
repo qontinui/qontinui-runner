@@ -380,209 +380,31 @@ fn compare_spec_compliance(
 }
 
 // =============================================================================
-// Statistical tests (pure Rust, no external stats crate needed)
+// Statistical tests — delegated to shared crate::stats module
 // =============================================================================
 
 /// Fisher's exact test approximation for 2x2 contingency table.
 /// Computes a one-sided p-value for whether experiment pass rate > control pass rate.
 ///
-/// Uses the normal approximation to the binomial (valid for n >= 5).
+/// Delegates to `crate::stats::proportion_z_test_onesided`.
 fn fisher_exact_p(experiment_trials: &[TrialResult], control_trials: &[TrialResult]) -> f64 {
-    let n_exp = experiment_trials.len() as f64;
-    let n_ctrl = control_trials.len() as f64;
-    let x_exp = experiment_trials.iter().filter(|t| t.passed).count() as f64;
-    let x_ctrl = control_trials.iter().filter(|t| t.passed).count() as f64;
+    let exp_passed = experiment_trials.iter().filter(|t| t.passed).count() as u64;
+    let exp_total = experiment_trials.len() as u64;
+    let ctrl_passed = control_trials.iter().filter(|t| t.passed).count() as u64;
+    let ctrl_total = control_trials.len() as u64;
 
-    let p_exp = x_exp / n_exp;
-    let p_ctrl = x_ctrl / n_ctrl;
-
-    // Pooled proportion under H0
-    let p_pool = (x_exp + x_ctrl) / (n_exp + n_ctrl);
-    if p_pool == 0.0 || p_pool == 1.0 {
-        // All passed or all failed — no variance
-        return if p_exp > p_ctrl { 0.0 } else { 1.0 };
-    }
-
-    let se = (p_pool * (1.0 - p_pool) * (1.0 / n_exp + 1.0 / n_ctrl)).sqrt();
-    if se == 0.0 {
-        return 1.0;
-    }
-
-    let z = (p_exp - p_ctrl) / se;
-    // One-sided p-value: P(Z > z)
-    1.0 - normal_cdf(z)
+    crate::stats::proportion_z_test_onesided(exp_passed, exp_total, ctrl_passed, ctrl_total)
 }
 
 /// Welch's t-test for unequal variances.
-/// Returns a two-sided p-value testing whether the means differ.
+/// Delegates to `crate::stats::welch_t_test`.
 fn welch_t_test(a: &[f64], b: &[f64]) -> f64 {
-    let n_a = a.len() as f64;
-    let n_b = b.len() as f64;
-
-    let mean_a = a.iter().sum::<f64>() / n_a;
-    let mean_b = b.iter().sum::<f64>() / n_b;
-
-    let var_a = a.iter().map(|x| (x - mean_a).powi(2)).sum::<f64>() / (n_a - 1.0);
-    let var_b = b.iter().map(|x| (x - mean_b).powi(2)).sum::<f64>() / (n_b - 1.0);
-
-    let se_sq = var_a / n_a + var_b / n_b;
-    if se_sq == 0.0 {
-        return if (mean_a - mean_b).abs() < f64::EPSILON {
-            1.0
-        } else {
-            0.0
-        };
-    }
-
-    let t = (mean_a - mean_b) / se_sq.sqrt();
-
-    // Welch-Satterthwaite degrees of freedom
-    let num = se_sq.powi(2);
-    let denom = (var_a / n_a).powi(2) / (n_a - 1.0) + (var_b / n_b).powi(2) / (n_b - 1.0);
-    let df = if denom > 0.0 { num / denom } else { 1.0 };
-
-    // Two-sided p-value using t-distribution approximation
-    // For df > 30, normal approximation is adequate
-    let p = if df > 30.0 {
-        2.0 * (1.0 - normal_cdf(t.abs()))
-    } else {
-        2.0 * (1.0 - t_cdf(t.abs(), df))
-    };
-
-    p.clamp(0.0, 1.0)
+    crate::stats::welch_t_test(a, b)
 }
 
-/// Standard normal CDF approximation (Abramowitz & Stegun, eq. 26.2.17).
-/// Maximum error: 7.5e-8.
+/// Standard normal CDF. Delegates to `crate::stats::normal_cdf`.
 fn normal_cdf(x: f64) -> f64 {
-    if x < -8.0 {
-        return 0.0;
-    }
-    if x > 8.0 {
-        return 1.0;
-    }
-
-    let t = 1.0 / (1.0 + 0.2316419 * x.abs());
-    let d = 0.3989422804014327; // 1/sqrt(2*pi)
-    let p = d * (-x * x / 2.0).exp();
-    let poly = t
-        * (0.319381530
-            + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
-
-    if x >= 0.0 {
-        1.0 - p * poly
-    } else {
-        p * poly
-    }
-}
-
-/// Student's t-distribution CDF approximation.
-/// Uses the regularized incomplete beta function approximation for small df.
-fn t_cdf(t: f64, df: f64) -> f64 {
-    // Use the relationship: F_t(t|df) = 1 - 0.5 * I_x(df/2, 0.5)
-    // where x = df / (df + t^2)
-    let x = df / (df + t * t);
-    1.0 - 0.5 * regularized_incomplete_beta(x, df / 2.0, 0.5)
-}
-
-/// Regularized incomplete beta function I_x(a, b) via continued fraction (Lentz's method).
-/// Sufficient precision for p-value computation.
-fn regularized_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    if x >= 1.0 {
-        return 1.0;
-    }
-
-    // Use the symmetry relation if x > (a+1)/(a+b+2)
-    if x > (a + 1.0) / (a + b + 2.0) {
-        return 1.0 - regularized_incomplete_beta(1.0 - x, b, a);
-    }
-
-    let ln_beta = ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b);
-    let front = (a * x.ln() + b * (1.0 - x).ln() - ln_beta).exp() / a;
-
-    // Continued fraction (Lentz's method)
-    let mut c = 1.0;
-    let mut d = 1.0 - (a + b) * x / (a + 1.0);
-    if d.abs() < 1e-30 {
-        d = 1e-30;
-    }
-    d = 1.0 / d;
-    let mut f = d;
-
-    for m in 1..200u32 {
-        let m_f = m as f64;
-
-        // Even step
-        let num_even = m_f * (b - m_f) * x / ((a + 2.0 * m_f - 1.0) * (a + 2.0 * m_f));
-        d = 1.0 + num_even * d;
-        if d.abs() < 1e-30 {
-            d = 1e-30;
-        }
-        c = 1.0 + num_even / c;
-        if c.abs() < 1e-30 {
-            c = 1e-30;
-        }
-        d = 1.0 / d;
-        f *= d * c;
-
-        // Odd step
-        let num_odd = -((a + m_f) * (a + b + m_f) * x) / ((a + 2.0 * m_f) * (a + 2.0 * m_f + 1.0));
-        d = 1.0 + num_odd * d;
-        if d.abs() < 1e-30 {
-            d = 1e-30;
-        }
-        c = 1.0 + num_odd / c;
-        if c.abs() < 1e-30 {
-            c = 1e-30;
-        }
-        d = 1.0 / d;
-        let delta = d * c;
-        f *= delta;
-
-        if (delta - 1.0).abs() < 1e-10 {
-            break;
-        }
-    }
-
-    (front * f).clamp(0.0, 1.0)
-}
-
-/// Stirling's approximation of ln(Gamma(x)) for x > 0.
-fn ln_gamma(x: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    // Lanczos approximation (g=7, n=9)
-    #[allow(clippy::excessive_precision)]
-    let coeffs: [f64; 9] = [
-        0.99999999999980993,
-        676.5203681218851,
-        -1259.1392167224028,
-        771.32342877765313,
-        -176.61502916214059,
-        12.507343278686905,
-        -0.13857109526572012,
-        9.9843695780195716e-6,
-        1.5056327351493116e-7,
-    ];
-
-    if x < 0.5 {
-        // Reflection formula
-        let pi = std::f64::consts::PI;
-        return (pi / (pi * x).sin()).ln() - ln_gamma(1.0 - x);
-    }
-
-    let x = x - 1.0;
-    let mut sum = coeffs[0];
-    for (i, &c) in coeffs.iter().enumerate().skip(1) {
-        sum += c / (x + i as f64);
-    }
-
-    let t = x + 7.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + sum.ln()
+    crate::stats::normal_cdf(x)
 }
 
 /// Format experiment results as a TSV table.

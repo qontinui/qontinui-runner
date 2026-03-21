@@ -784,6 +784,8 @@ fn record_learning(
         verification_step_count: None,
         agentic_step_count: None,
         has_ui_bridge: false,
+        total_tokens: None,
+        total_cost_usd: None,
     };
 
     if let Err(e) =

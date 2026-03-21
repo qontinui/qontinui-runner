@@ -38,6 +38,7 @@ pub fn build_config(execution_id: &str, workflow_name: &str) -> LoopConfig {
         auto_run_generated: false,
         approval_gate: false,
         max_context_tokens: 200_000,
+        enforce_token_budget: false,
         cross_workflow_learning: false,
         verification_history: HashMap::new(),
         routing_context: Default::default(),
@@ -50,6 +51,8 @@ pub fn build_config(execution_id: &str, workflow_name: &str) -> LoopConfig {
         workflow_architecture: None,
         agentic_verification_config: None,
         multi_agent_pipeline_config: None,
+        rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+        iteration_diffs: Vec::new(),
     }
 }
 
@@ -103,6 +106,17 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
             &format!("{}/settings/agentic", base_url),
             None,
             Some("agentic_settings"),
+        ),
+        // Step 5: Load iteration history patterns (L0 — approach patterns from agentic loops)
+        build_api_step(
+            "Load iteration history patterns (L0)",
+            "GET",
+            &format!(
+                "{}/meta-optimizer/iteration-history?limit=100&tier=l0",
+                base_url
+            ),
+            None,
+            Some("iteration_history"),
         ),
     ]
 }
@@ -167,10 +181,23 @@ The setup phase loaded **L0 summaries** where applicable:
 - `{{agent_traces}}` — **L0 summary**: agent_type, run_count, success_pct (one row per agent type)
 - `{{autoresearch_campaigns}}` — Autoresearch experiment results (A/B testing data)
 - `{{agentic_settings}}` — Current configuration defaults for each architecture
+- `{{iteration_history}}` — **L0 summary**: approach patterns from agentic verification loops (avg iterations, confidence trends, most common approaches tried, grouped by run status)
 
 ## Drill-Down: L1/L2 Detail Endpoints
 
-If the L0 agent trace summaries reveal issues, drill into details:
+If the L0 summaries reveal issues, drill into details:
+
+**Iteration History — L1 (per-run iteration sequences):**
+```bash
+curl -s '{{base_url}}/meta-optimizer/iteration-history?tier=l1&status=failed&limit=20'
+```
+Returns: task_run_id, approaches tried, iteration count, confidence trajectory per run.
+
+**Iteration History — L2 (full iteration data including files touched):**
+```bash
+curl -s '{{base_url}}/meta-optimizer/iteration-history?tier=l2&limit=10'
+```
+Returns: complete iteration entries with approach, result, files_touched, confidence_delta.
 
 **Agent Traces — L1 (core fields per trace):**
 ```bash

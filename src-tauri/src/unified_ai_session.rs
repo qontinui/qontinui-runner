@@ -720,14 +720,21 @@ impl UnifiedAiSessionExecutor {
 
         // Handle result and log appropriate events
         match result {
-            Ok(Ok((success, output, _, injected_steps))) => {
+            Ok(Ok(cli_result)) => {
+                let success = cli_result.success;
+                let output = cli_result.output;
+                let injected_steps = cli_result.injected_steps;
+                let cli_input_tokens = cli_result.input_tokens;
+                let cli_output_tokens = cli_result.output_tokens;
                 info!(
-                    "UNIFIED-AI-SESSION: {} completed (success={}, output={} chars, duration={}ms, injected_steps={})",
+                    "UNIFIED-AI-SESSION: {} completed (success={}, output={} chars, duration={}ms, injected_steps={}, tokens={:?}/{:?})",
                     config.phase.as_str(),
                     success,
                     output.len(),
                     duration_ms,
-                    injected_steps.len()
+                    injected_steps.len(),
+                    cli_input_tokens,
+                    cli_output_tokens,
                 );
 
                 let details =
@@ -786,8 +793,8 @@ impl UnifiedAiSessionExecutor {
                     duration_ms,
                     injected_steps,
                     error: String::new(),
-                    input_tokens: None,
-                    output_tokens: None,
+                    input_tokens: cli_input_tokens,
+                    output_tokens: cli_output_tokens,
                 }
             }
             Ok(Err(e)) => {

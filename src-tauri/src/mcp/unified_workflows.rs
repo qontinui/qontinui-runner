@@ -1759,6 +1759,9 @@ pub async fn execute_inline_workflow(
         multi_agent_mode: true,
         use_worktree: false,
         model_overrides: std::collections::HashMap::new(),
+        enforce_token_budget: false,
+        rollback_policy: None,
+        workflow_architecture: None,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -1883,16 +1886,19 @@ pub async fn execute_inline_workflow(
             use_worktree: workflow.use_worktree,
             worktree_path: None,
             worktree_branch: None,
-            workflow_architecture: None,
+            workflow_architecture: workflow.workflow_architecture.clone(),
             agentic_verification_config: None,
             multi_agent_pipeline_config: None,
             approval_gate: workflow.approval_gate,
             max_context_tokens: 100_000,
+            enforce_token_budget: workflow.enforce_token_budget,
             cross_workflow_learning: true,
             verification_history: std::collections::HashMap::new(),
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
             acceptance_criteria: workflow.acceptance_criteria.clone(),
+            rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+            iteration_diffs: Vec::new(),
         };
 
         // Apply overrides if present (same logic as run_unified_workflow)
@@ -2380,11 +2386,14 @@ pub async fn run_composed_workflow(
                 auto_run_generated: false,
                 approval_gate: false,
                 max_context_tokens: 100_000,
+                enforce_token_budget: false,
                 cross_workflow_learning: true,
                 verification_history: std::collections::HashMap::new(),
                 routing_context: Default::default(),
                 project_path: crate::mcp::shared::current_project_path(),
                 acceptance_criteria: None,
+                rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+                iteration_diffs: Vec::new(),
             };
 
             // Run the LoopController once with all stages
@@ -2545,6 +2554,7 @@ async fn sync_slash_commands_handler(
                 success: true,
                 data: Some(result),
                 error: None,
+                error_detail: None,
             }))
         }
         Err(e) => {

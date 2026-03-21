@@ -8,14 +8,15 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use tauri::Emitter;
 
 use crate::executor::with_default_bridge;
-use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 use crate::timeout_config::Timeouts;
 
 // ============================================================================
@@ -133,6 +134,204 @@ pub struct DiscoverStatesRequest {
 /// This needs a reasonable timeout since it's synchronous communication with the frontend.
 fn get_ui_bridge_timeout_ms() -> u64 {
     Timeouts::ui_bridge_ipc().as_millis() as u64
+}
+
+// ============================================================================
+// Structured Error Taxonomy
+// ============================================================================
+
+/// Machine-readable error codes for UI Bridge operations.
+/// Enables AI agents to match on error type rather than parsing strings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum UiBridgeErrorCode {
+    // Transport errors
+    Timeout,
+    CircuitBreakerOpen,
+    ConcurrencyLimitReached,
+    FrontendUnresponsive,
+    WindowNotFound,
+    // Element targeting errors
+    ElementNotFound,
+    ElementNotVisible,
+    ElementNotEnabled,
+    ElementStale,
+    // Action errors
+    ActionFailed,
+    // Assertion errors
+    AssertionFailed,
+    UnknownAssertionType,
+    // System errors
+    InternalError,
+}
+
+/// Machine-readable recovery hints telling AI agents what to do next.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecoveryHint {
+    /// Re-take a DOM snapshot; element refs may have changed
+    Resnapshot,
+    /// Retry the same operation after a delay (milliseconds)
+    RetryAfterMs(u64),
+    /// Wait for the circuit breaker cooldown to expire
+    WaitForRecovery,
+    /// Scroll or navigate to make the element visible
+    ScrollIntoView,
+    /// The element exists but is disabled; wait for it to become enabled
+    WaitForEnabled,
+    /// Use a different selector or broaden the search criteria
+    BroadenSelector,
+    /// The operation cannot be recovered; skip or report failure
+    Unrecoverable,
+}
+
+/// Structured error with machine-readable code and recovery hint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiBridgeError {
+    pub code: UiBridgeErrorCode,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryHint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+}
+
+impl UiBridgeError {
+    pub fn timeout(duration_ms: u64) -> Self {
+        Self {
+            code: UiBridgeErrorCode::Timeout,
+            message: format!("UI Bridge request timed out after {}ms", duration_ms),
+            recovery: Some(RecoveryHint::RetryAfterMs(1000)),
+            context: Some(serde_json::json!({"timeout_ms": duration_ms})),
+        }
+    }
+
+    pub fn circuit_breaker_open() -> Self {
+        Self {
+            code: UiBridgeErrorCode::CircuitBreakerOpen,
+            message: "UI Bridge temporarily unavailable (circuit breaker open)".to_string(),
+            recovery: Some(RecoveryHint::WaitForRecovery),
+            context: None,
+        }
+    }
+
+    pub fn concurrency_limit() -> Self {
+        Self {
+            code: UiBridgeErrorCode::ConcurrencyLimitReached,
+            message: "UI Bridge concurrency limit reached (timeout acquiring permit)".to_string(),
+            recovery: Some(RecoveryHint::RetryAfterMs(500)),
+            context: None,
+        }
+    }
+
+    pub fn window_not_found() -> Self {
+        Self {
+            code: UiBridgeErrorCode::WindowNotFound,
+            message: "Main webview window not found".to_string(),
+            recovery: Some(RecoveryHint::Unrecoverable),
+            context: None,
+        }
+    }
+
+    pub fn element_not_found(selector: &str) -> Self {
+        Self {
+            code: UiBridgeErrorCode::ElementNotFound,
+            message: format!("No element found matching criteria {}", selector),
+            recovery: Some(RecoveryHint::Resnapshot),
+            context: Some(serde_json::json!({"selector": selector})),
+        }
+    }
+
+    pub fn element_not_visible(selector: &str, total_found: usize) -> Self {
+        Self {
+            code: UiBridgeErrorCode::ElementNotVisible,
+            message: format!(
+                "Found {} element(s) matching '{}' but none are visible",
+                total_found, selector
+            ),
+            recovery: Some(RecoveryHint::ScrollIntoView),
+            context: Some(serde_json::json!({"selector": selector, "total_found": total_found})),
+        }
+    }
+
+    pub fn action_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: UiBridgeErrorCode::ActionFailed,
+            message: message.into(),
+            recovery: Some(RecoveryHint::Resnapshot),
+            context: None,
+        }
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self {
+            code: UiBridgeErrorCode::InternalError,
+            message: message.into(),
+            recovery: Some(RecoveryHint::Unrecoverable),
+            context: None,
+        }
+    }
+}
+
+/// Classify a transport-level error string into a structured error.
+/// Used by wrap_ipc_result and batch handler to convert legacy string errors.
+/// Checks both transport-level and assertion-level patterns so that frontend
+/// error messages like "No element found" get the correct error code.
+pub fn classify_transport_error(error_msg: &str) -> UiBridgeError {
+    // Transport-level errors
+    if error_msg.contains("timed out") {
+        UiBridgeError::timeout(0)
+    } else if error_msg.contains("circuit breaker") {
+        UiBridgeError::circuit_breaker_open()
+    } else if error_msg.contains("concurrency limit") {
+        UiBridgeError::concurrency_limit()
+    } else if error_msg.contains("window not found") || error_msg.contains("Window not found") {
+        UiBridgeError::window_not_found()
+    }
+    // Assertion/element-level errors (from frontend IPC responses)
+    else if error_msg.contains("No element found") || error_msg.contains("no element found") {
+        UiBridgeError::element_not_found(error_msg)
+    } else if error_msg.contains("none are visible") {
+        UiBridgeError::element_not_visible(error_msg, 0)
+    } else if error_msg.contains("Operation failed") || error_msg.contains("action failed") {
+        UiBridgeError::action_failed(error_msg)
+    } else {
+        UiBridgeError::internal(error_msg)
+    }
+}
+
+/// Classify an assertion failure detail string into an error code.
+/// Used by the verification phase to annotate failure context for AI agents.
+pub fn classify_assertion_failure(detail: &str) -> UiBridgeErrorCode {
+    if detail.contains("No element found") {
+        UiBridgeErrorCode::ElementNotFound
+    } else if detail.contains("none are visible") {
+        UiBridgeErrorCode::ElementNotVisible
+    } else if detail.contains("Unknown assertion type") {
+        UiBridgeErrorCode::UnknownAssertionType
+    } else {
+        UiBridgeErrorCode::AssertionFailed
+    }
+}
+
+/// Get the recovery hint for an error code.
+pub fn recovery_hint_for(code: &UiBridgeErrorCode) -> RecoveryHint {
+    match code {
+        UiBridgeErrorCode::Timeout => RecoveryHint::RetryAfterMs(1000),
+        UiBridgeErrorCode::CircuitBreakerOpen => RecoveryHint::WaitForRecovery,
+        UiBridgeErrorCode::ConcurrencyLimitReached => RecoveryHint::RetryAfterMs(500),
+        UiBridgeErrorCode::FrontendUnresponsive => RecoveryHint::WaitForRecovery,
+        UiBridgeErrorCode::WindowNotFound => RecoveryHint::Unrecoverable,
+        UiBridgeErrorCode::ElementNotFound => RecoveryHint::Resnapshot,
+        UiBridgeErrorCode::ElementNotVisible => RecoveryHint::ScrollIntoView,
+        UiBridgeErrorCode::ElementNotEnabled => RecoveryHint::WaitForEnabled,
+        UiBridgeErrorCode::ElementStale => RecoveryHint::Resnapshot,
+        UiBridgeErrorCode::ActionFailed => RecoveryHint::Resnapshot,
+        UiBridgeErrorCode::AssertionFailed => RecoveryHint::BroadenSelector,
+        UiBridgeErrorCode::UnknownAssertionType => RecoveryHint::Unrecoverable,
+        UiBridgeErrorCode::InternalError => RecoveryHint::Unrecoverable,
+    }
 }
 
 // ============================================================================
@@ -566,6 +765,9 @@ pub async fn handle_ui_bridge_response(
 /// this propagates the failure to the outer API envelope instead of wrapping
 /// it in `ApiResponse::success()` (which would create a misleading double-envelope:
 /// `{success: true, data: {success: false, error: "..."}}`).
+///
+/// Also populates `error_detail` with a structured `UiBridgeError` for machine-readable
+/// error handling by AI agents.
 fn wrap_ipc_result(
     result: Result<serde_json::Value, String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -578,10 +780,12 @@ fn wrap_ipc_result(
                     .and_then(|v| v.as_str())
                     .unwrap_or("Operation failed")
                     .to_string();
+                let error_detail = classify_transport_error(&error_msg);
                 Ok(Json(ApiResponse {
                     success: false,
                     data: Some(data),
                     error: Some(error_msg),
+                    error_detail: Some(error_detail),
                 }))
             } else {
                 Ok(Json(ApiResponse::success(data)))
@@ -589,7 +793,11 @@ fn wrap_ipc_result(
         }
         Err(e) => {
             error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+            let detail = classify_transport_error(&e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error_detailed(e, detail)),
+            ))
         }
     }
 }
@@ -3440,6 +3648,163 @@ pub async fn ui_bridge_ipc_response_handler(
     ))
 }
 
+// ============================================================================
+// Batch Execution
+// ============================================================================
+
+/// Request to execute multiple UI Bridge operations in a single HTTP call.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRequest {
+    pub operations: Vec<BatchOperation>,
+    /// If true, stop executing on first error. Default: false (execute all).
+    #[serde(default)]
+    pub stop_on_error: bool,
+}
+
+/// A single operation within a batch request.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchOperation {
+    /// Unique ID for this operation within the batch (for result correlation).
+    pub id: String,
+    /// The operation type (e.g., "get_elements", "execute_action", "discover").
+    pub operation: String,
+    /// Operation-specific parameters (merged into the IPC payload).
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+/// Response from a batch execution.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchResponse {
+    /// True only if all operations succeeded.
+    pub success: bool,
+    /// Per-operation results in request order.
+    pub results: Vec<BatchOperationResult>,
+    /// Total wall-clock time for the entire batch.
+    pub total_duration_ms: u64,
+}
+
+/// Result of a single operation within a batch.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchOperationResult {
+    pub id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<UiBridgeError>,
+    pub duration_ms: u64,
+}
+
+/// Execute multiple UI Bridge operations in a single HTTP call.
+///
+/// Each operation is executed sequentially via the existing `ui_bridge_request_sync`
+/// path, reusing all existing concurrency, circuit breaker, and timeout logic.
+/// Max 20 operations per batch.
+async fn ui_bridge_batch_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(batch): Json<BatchRequest>,
+) -> Result<Json<ApiResponse<BatchResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    const MAX_BATCH_SIZE: usize = 20;
+
+    if batch.operations.len() > MAX_BATCH_SIZE {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "Batch size {} exceeds maximum of {}",
+                batch.operations.len(),
+                MAX_BATCH_SIZE
+            ))),
+        ));
+    }
+
+    if batch.operations.is_empty() {
+        return Ok(Json(ApiResponse::success(BatchResponse {
+            success: true,
+            results: vec![],
+            total_duration_ms: 0,
+        })));
+    }
+
+    info!(
+        "UI Bridge API: Batch executing {} operations (stop_on_error={})",
+        batch.operations.len(),
+        batch.stop_on_error
+    );
+
+    let start = Instant::now();
+    let mut results = Vec::with_capacity(batch.operations.len());
+
+    for op in &batch.operations {
+        let op_start = Instant::now();
+        let result = ui_bridge_request_sync(&state, &op.operation, op.params.clone()).await;
+
+        let (success, data, error, error_detail) = match result {
+            Ok(data) => {
+                // Check for nested frontend failure (same logic as wrap_ipc_result)
+                if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
+                    let error_msg = data
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Operation failed")
+                        .to_string();
+                    let detail = classify_transport_error(&error_msg);
+                    (false, Some(data), Some(error_msg), Some(detail))
+                } else {
+                    (true, Some(data), None, None)
+                }
+            }
+            Err(e) => {
+                let detail = classify_transport_error(&e);
+                (false, None, Some(e), Some(detail))
+            }
+        };
+
+        let op_duration = op_start.elapsed().as_millis() as u64;
+
+        results.push(BatchOperationResult {
+            id: op.id.clone(),
+            success,
+            data,
+            error,
+            error_detail,
+            duration_ms: op_duration,
+        });
+
+        if !success && batch.stop_on_error {
+            info!(
+                "UI Bridge batch: stopping on error at operation '{}' ({}ms)",
+                op.id, op_duration
+            );
+            break;
+        }
+    }
+
+    let total_duration = start.elapsed().as_millis() as u64;
+    let all_success = results.iter().all(|r| r.success);
+
+    info!(
+        "UI Bridge batch: {}/{} succeeded in {}ms",
+        results.iter().filter(|r| r.success).count(),
+        results.len(),
+        total_duration
+    );
+
+    let response = BatchResponse {
+        success: all_success,
+        results,
+        total_duration_ms: total_duration,
+    };
+
+    Ok(Json(ApiResponse::success(response)))
+}
+
 /// Create routes for this module.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
@@ -3715,6 +4080,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/render-log",
             get(ui_bridge_get_render_log_handler).post(ui_bridge_append_render_log_handler),
         )
+        // Batch execution
+        .route("/ui-bridge/batch", post(ui_bridge_batch_handler))
         // Diagnostics & health
         .route("/ui-bridge/diagnostics", get(ui_bridge_diagnostics_handler))
         .route(

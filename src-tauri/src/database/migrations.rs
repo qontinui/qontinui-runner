@@ -5096,6 +5096,106 @@ impl CheckpointDb {
             info!("Successfully migrated to version 129 (workflow_architecture on unified_workflows)");
         }
 
+        // --- Migration 130: Add total_tokens and total_cost_usd to learning_outcomes ---
+        if current_version < 130 {
+            info!("Migrating to version 130 (total_tokens, total_cost_usd on learning_outcomes)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE learning_outcomes ADD COLUMN total_tokens INTEGER;
+                ALTER TABLE learning_outcomes ADD COLUMN total_cost_usd REAL;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (130, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 130: {}", e))?;
+
+            info!("Successfully migrated to version 130 (total_tokens, total_cost_usd on learning_outcomes)");
+        }
+
+        // --- Migration 131: Add examples_json to generation_rules ---
+        if current_version < 131 {
+            info!("Migrating to version 131 (examples_json on generation_rules)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE generation_rules ADD COLUMN examples_json TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (131, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 131: {}", e))?;
+
+            info!("Successfully migrated to version 131 (examples_json on generation_rules)");
+        }
+
+        // --- Migration 132: Add span hierarchy and guardrail columns to pipeline_agent_traces ---
+        if current_version < 132 {
+            info!("Migrating to version 132 (span hierarchy + guardrail columns on pipeline_agent_traces)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE pipeline_agent_traces ADD COLUMN parent_span_id TEXT;
+                ALTER TABLE pipeline_agent_traces ADD COLUMN span_type TEXT DEFAULT 'agent';
+                ALTER TABLE pipeline_agent_traces ADD COLUMN guardrail_results_json TEXT;
+                ALTER TABLE pipeline_agent_traces ADD COLUMN handoff_context_json TEXT;
+
+                CREATE INDEX IF NOT EXISTS idx_pipeline_traces_parent_span
+                    ON pipeline_agent_traces(parent_span_id);
+                CREATE INDEX IF NOT EXISTS idx_pipeline_traces_span_type
+                    ON pipeline_agent_traces(span_type);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (132, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 132: {}", e))?;
+
+            info!("Successfully migrated to version 132 (span hierarchy + guardrail columns on pipeline_agent_traces)");
+        }
+
+        // --- Migration 133: Agentic metric scores and baselines tables ---
+        if current_version < 133 {
+            info!("Migrating to version 133 (agentic metric scores + baselines tables, composite_agentic_score column)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS agentic_metric_scores (
+                    id TEXT PRIMARY KEY,
+                    task_run_id TEXT NOT NULL,
+                    metric_type TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    rationale TEXT,
+                    is_llm_judged INTEGER NOT NULL DEFAULT 0,
+                    model_used TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_agentic_scores_task_run ON agentic_metric_scores(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_agentic_scores_metric ON agentic_metric_scores(metric_type);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_agentic_scores_unique ON agentic_metric_scores(task_run_id, metric_type);
+
+                CREATE TABLE IF NOT EXISTS agentic_metric_baselines (
+                    id TEXT PRIMARY KEY,
+                    workflow_id TEXT,
+                    metric_type TEXT NOT NULL,
+                    baseline_value TEXT NOT NULL,
+                    sample_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_baselines_unique ON agentic_metric_baselines(workflow_id, metric_type);
+
+                ALTER TABLE learning_outcomes ADD COLUMN composite_agentic_score REAL;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (133, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 133: {}", e))?;
+
+            info!("Successfully migrated to version 133 (agentic metric scores + baselines tables)");
+        }
+
         // Repair migration: is_favorite column may be missing on databases created from
         // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
         // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,

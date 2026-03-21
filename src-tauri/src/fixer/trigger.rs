@@ -177,6 +177,36 @@ pub fn should_launch_fixer_excluding(
             return Ok(false);
         }
 
+        // Guard 7: Skip fixer if the source run passed verification (fixer_on_failure_only)
+        let fixer_on_failure_only: bool = conn
+            .query_row(
+                "SELECT COALESCE(CAST(json_extract(value, '$.fixer_on_failure_only') AS TEXT), 'true') FROM settings WHERE key = 'dev_mode'",
+                [],
+                |row| {
+                    let val: String = row.get(0)?;
+                    Ok(val == "true" || val == "1")
+                },
+            )
+            .unwrap_or(true);
+
+        if fixer_on_failure_only {
+            let verification_passed: bool = conn
+                .query_row(
+                    "SELECT COALESCE(verification_passed, 0) FROM task_runs WHERE id = ?1",
+                    rusqlite::params![source_id],
+                    |row| row.get::<_, i32>(0).map(|v| v != 0),
+                )
+                .unwrap_or(false);
+
+            if verification_passed {
+                debug!(
+                    "Skipping fixer for {} — source run passed verification",
+                    source_id
+                );
+                return Ok(false);
+            }
+        }
+
         Ok(true)
     })
 }
@@ -423,6 +453,7 @@ mod tests {
                 fixer_source_task_run_id TEXT,
                 workflow_type TEXT,
                 parent_task_run_id TEXT,
+                verification_passed INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL,
                 completed_at TEXT,
                 updated_at TEXT NOT NULL
@@ -590,5 +621,73 @@ mod tests {
             )
             .unwrap_or(true);
         assert!(fixer_enabled);
+    }
+
+    #[test]
+    fn test_guard_skips_when_source_passed_verification() {
+        let conn = setup_test_db();
+
+        // Create a source run that passed verification
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, output_log, verification_passed, created_at, updated_at, completed_at) \
+             VALUES ('src-pass', 'Test', 'my-workflow', 'complete', '', 1, datetime('now'), datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        add_output_chunks(
+            &conn,
+            "src-pass",
+            &["some meaningful output that is long enough to pass the threshold check"],
+        );
+        // Add a reflection fix so Guard 6 passes
+        conn.execute(
+            "INSERT INTO reflection_fixes (id, source_task_run_id, reflection_task_run_id) VALUES ('fix-1', 'src-pass', 'ref-1')",
+            [],
+        )
+        .unwrap();
+
+        // Guard 7 should skip because verification_passed = 1
+        let verification_passed: bool = conn
+            .query_row(
+                "SELECT COALESCE(verification_passed, 0) FROM task_runs WHERE id = 'src-pass'",
+                [],
+                |row| row.get::<_, i32>(0).map(|v| v != 0),
+            )
+            .unwrap();
+        assert!(verification_passed, "Source run should have verification_passed = 1");
+    }
+
+    #[test]
+    fn test_guard_allows_fixer_when_source_failed_verification() {
+        let conn = setup_test_db();
+
+        // Create a source run that failed verification
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, output_log, verification_passed, created_at, updated_at, completed_at) \
+             VALUES ('src-fail', 'Test', 'my-workflow', 'complete', '', 0, datetime('now'), datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        add_output_chunks(
+            &conn,
+            "src-fail",
+            &["some meaningful output that is long enough to pass the threshold check"],
+        );
+        // Add a reflection fix so Guard 6 passes
+        conn.execute(
+            "INSERT INTO reflection_fixes (id, source_task_run_id, reflection_task_run_id) VALUES ('fix-2', 'src-fail', 'ref-2')",
+            [],
+        )
+        .unwrap();
+
+        // Guard 7 should NOT skip because verification_passed = 0
+        let verification_passed: bool = conn
+            .query_row(
+                "SELECT COALESCE(verification_passed, 0) FROM task_runs WHERE id = 'src-fail'",
+                [],
+                |row| row.get::<_, i32>(0).map(|v| v != 0),
+            )
+            .unwrap();
+        assert!(!verification_passed, "Source run should have verification_passed = 0");
     }
 }

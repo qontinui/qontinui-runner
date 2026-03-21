@@ -41,6 +41,7 @@ pub fn build_follow_up_config(
         auto_run_generated: false,
         approval_gate: false,
         max_context_tokens: 100_000,
+        enforce_token_budget: false,
         cross_workflow_learning: true,
         verification_history: std::collections::HashMap::new(),
         routing_context: Default::default(),
@@ -53,6 +54,8 @@ pub fn build_follow_up_config(
         workflow_architecture: None,
         agentic_verification_config: None,
         multi_agent_pipeline_config: None,
+        rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+        iteration_diffs: Vec::new(),
     }
 }
 

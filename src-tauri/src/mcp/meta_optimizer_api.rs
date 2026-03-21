@@ -33,6 +33,7 @@ pub struct TraceAggregateQuery {
     pub limit: Option<u32>,
     pub tier: Option<ContextTier>,
     pub agent_type: Option<String>,
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,12 +129,20 @@ pub async fn get_agent_trace_aggregates_handler(
             )))
         }
         ContextTier::L2 => {
-            let aggregates =
-                pipeline_traces::get_agent_trace_aggregates(&state.app_state.checkpoint_db, limit)
-                    .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(
-                serde_json::to_value(aggregates).unwrap_or_default(),
-            )))
+            // If trace_id is provided, return a single full trace record
+            if let Some(ref trace_id) = query.trace_id {
+                let trace = pipeline_traces::get_trace_full_l2(
+                    &state.app_state.checkpoint_db,
+                    trace_id,
+                )
+                .map_err(make_err)?;
+                Ok(Json(ApiResponse::success(serde_json::to_value(trace).unwrap_or_default())))
+            } else {
+                let aggregates =
+                    pipeline_traces::get_agent_trace_aggregates(&state.app_state.checkpoint_db, limit)
+                        .map_err(make_err)?;
+                Ok(Json(ApiResponse::success(serde_json::to_value(aggregates).unwrap_or_default())))
+            }
         }
     }
 }
@@ -653,6 +662,28 @@ pub async fn get_optimizer_context_handler(
     Ok(Json(ApiResponse::success(OptimizerContext { context })))
 }
 
+/// GET /meta-optimizer/cost-analysis
+///
+/// Returns a cost-efficiency summary: per-agent cost breakdown, total pipeline
+/// cost, cost trend (increasing/decreasing/stable), and active cost recommendations.
+pub async fn get_cost_analysis_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<
+    Json<ApiResponse<crate::meta_optimizer::cost_optimizer::CostAnalysisSummary>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let summary =
+        crate::meta_optimizer::cost_optimizer::build_cost_analysis(&state.app_state.checkpoint_db)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to build cost analysis: {}", e))),
+                )
+            })?;
+
+    Ok(Json(ApiResponse::success(summary)))
+}
+
 /// GET /learning/outcomes?limit=N&status=X&workflow_architecture=Y
 ///
 /// Returns learning outcomes from the learning_outcomes table.
@@ -1144,6 +1175,263 @@ pub async fn reject_recommendation_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Iteration history (approach pattern analysis for agentic verification loops)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct IterationHistoryQuery {
+    limit: Option<u32>,
+    status: Option<String>,
+    tier: Option<ContextTier>,
+}
+
+/// GET /meta-optimizer/iteration-history?tier=l0|l1|l2&status=X&limit=N
+///
+/// Exposes compressed iteration history from agentic verification loops
+/// for meta-optimizer analysis of approach patterns.
+///
+/// - L0 (default): aggregate stats grouped by run status
+/// - L1: per-run iteration sequences with approaches and confidence trajectory
+/// - L2: full raw iteration_history JSON from each run
+pub async fn get_iteration_history_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<IterationHistoryQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let limit = query.limit.unwrap_or(50) as i64;
+    let status_filter = query.status.clone();
+    let tier = query.tier.unwrap_or_default();
+
+    let make_err = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "Failed to get iteration history: {}",
+                e
+            ))),
+        )
+    };
+
+    match tier {
+        ContextTier::L0 => {
+            // Aggregate: group by status, compute avg iterations, confidence delta, top approaches
+            let summaries = state
+                .app_state
+                .checkpoint_db
+                .with_conn(move |conn| {
+                    let mut sql = String::from(
+                        r#"SELECT status, iteration_history
+                           FROM task_runs
+                           WHERE iteration_history IS NOT NULL
+                             AND iteration_history != '[]'"#,
+                    );
+                    if let Some(ref s) = status_filter {
+                        let _ = write!(sql, " AND status = '{}'", s.replace('\'', "''"));
+                    }
+                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
+
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("Query error: {}", e))?;
+
+                    let rows: Vec<(String, String)> = stmt
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .map_err(|e| format!("Query error: {}", e))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+
+                    // Group by status and compute aggregates
+                    let mut groups: std::collections::HashMap<
+                        String,
+                        Vec<Vec<serde_json::Value>>,
+                    > = std::collections::HashMap::new();
+                    for (status, history_json) in &rows {
+                        if let Ok(entries) =
+                            serde_json::from_str::<Vec<serde_json::Value>>(history_json)
+                        {
+                            groups.entry(status.clone()).or_default().push(entries);
+                        }
+                    }
+
+                    let mut summaries = Vec::new();
+                    for (status, runs) in &groups {
+                        let run_count = runs.len() as i64;
+                        let mut total_iterations: usize = 0;
+                        let mut total_confidence_delta: f64 = 0.0;
+                        let mut approach_counts: std::collections::HashMap<String, usize> =
+                            std::collections::HashMap::new();
+
+                        for entries in runs {
+                            total_iterations += entries.len();
+                            for entry in entries {
+                                if let Some(delta) =
+                                    entry.get("confidence_delta").and_then(|d| d.as_f64())
+                                {
+                                    total_confidence_delta += delta;
+                                }
+                                if let Some(approach) =
+                                    entry.get("approach").and_then(|a| a.as_str())
+                                {
+                                    let key: String = approach.chars().take(50).collect();
+                                    *approach_counts.entry(key).or_default() += 1;
+                                }
+                            }
+                        }
+
+                        let mut top_approaches: Vec<(String, usize)> =
+                            approach_counts.into_iter().collect();
+                        top_approaches.sort_by(|a, b| b.1.cmp(&a.1));
+                        let top_5: Vec<String> = top_approaches
+                            .into_iter()
+                            .take(5)
+                            .map(|(approach, count)| format!("{} (x{})", approach, count))
+                            .collect();
+
+                        summaries.push(
+                            crate::meta_optimizer::types::IterationHistorySummaryL0 {
+                                status: status.clone(),
+                                run_count,
+                                avg_iterations: total_iterations as f64 / run_count as f64,
+                                avg_final_confidence_delta: total_confidence_delta
+                                    / run_count as f64,
+                                most_common_approaches: top_5,
+                            },
+                        );
+                    }
+
+                    Ok(summaries)
+                })
+                .map_err(make_err)?;
+
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(summaries).unwrap_or_default(),
+            )))
+        }
+        ContextTier::L1 => {
+            // Per-run: iteration count, approaches, confidence trajectory
+            let details = state
+                .app_state
+                .checkpoint_db
+                .with_conn(move |conn| {
+                    let mut sql = String::from(
+                        r#"SELECT id, task_name, status, iteration_history, created_at
+                           FROM task_runs
+                           WHERE iteration_history IS NOT NULL
+                             AND iteration_history != '[]'"#,
+                    );
+                    if let Some(ref s) = status_filter {
+                        let _ = write!(sql, " AND status = '{}'", s.replace('\'', "''"));
+                    }
+                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
+
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("Query error: {}", e))?;
+
+                    let rows: Vec<crate::meta_optimizer::types::IterationHistoryDetailL1> = stmt
+                        .query_map([], |row| {
+                            let id: String = row.get(0)?;
+                            let task_name: String = row.get(1)?;
+                            let status: String = row.get(2)?;
+                            let history_json: String = row.get(3)?;
+                            let created_at: String = row.get(4)?;
+
+                            let entries: Vec<serde_json::Value> =
+                                serde_json::from_str(&history_json).unwrap_or_default();
+
+                            let iteration_count = entries.len();
+                            let total_confidence_delta: f64 = entries
+                                .iter()
+                                .filter_map(|e| {
+                                    e.get("confidence_delta").and_then(|d| d.as_f64())
+                                })
+                                .sum();
+                            let approaches: Vec<String> = entries
+                                .iter()
+                                .filter_map(|e| {
+                                    e.get("approach").and_then(|a| a.as_str()).map(String::from)
+                                })
+                                .collect();
+
+                            Ok(crate::meta_optimizer::types::IterationHistoryDetailL1 {
+                                task_run_id: id,
+                                task_name,
+                                status,
+                                iteration_count,
+                                total_confidence_delta,
+                                approaches,
+                                created_at,
+                            })
+                        })
+                        .map_err(|e| format!("Query error: {}", e))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+
+                    Ok(rows)
+                })
+                .map_err(make_err)?;
+
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(details).unwrap_or_default(),
+            )))
+        }
+        ContextTier::L2 => {
+            // Full raw iteration_history JSON per run
+            let full = state
+                .app_state
+                .checkpoint_db
+                .with_conn(move |conn| {
+                    let mut sql = String::from(
+                        r#"SELECT id, task_name, status, iteration_history, created_at
+                           FROM task_runs
+                           WHERE iteration_history IS NOT NULL
+                             AND iteration_history != '[]'"#,
+                    );
+                    if let Some(ref s) = status_filter {
+                        let _ = write!(sql, " AND status = '{}'", s.replace('\'', "''"));
+                    }
+                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
+
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("Query error: {}", e))?;
+
+                    let rows: Vec<serde_json::Value> = stmt
+                        .query_map([], |row| {
+                            let id: String = row.get(0)?;
+                            let task_name: String = row.get(1)?;
+                            let status: String = row.get(2)?;
+                            let history_json: String = row.get(3)?;
+                            let created_at: String = row.get(4)?;
+
+                            let entries: serde_json::Value =
+                                serde_json::from_str(&history_json).unwrap_or_default();
+
+                            Ok(serde_json::json!({
+                                "task_run_id": id,
+                                "task_name": task_name,
+                                "status": status,
+                                "iteration_history": entries,
+                                "created_at": created_at,
+                            }))
+                        })
+                        .map_err(|e| format!("Query error: {}", e))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+
+                    Ok(rows)
+                })
+                .map_err(make_err)?;
+
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(full).unwrap_or_default(),
+            )))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
 
@@ -1174,6 +1462,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         )
         .route("/meta-optimizer/runs", get(get_optimizer_runs_handler))
         .route(
+            "/meta-optimizer/cost-analysis",
+            get(get_cost_analysis_handler),
+        )
+        .route(
             "/meta-optimizer/optimizer-context",
             get(get_optimizer_context_handler),
         )
@@ -1190,5 +1482,9 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route(
             "/meta-optimizer/reflection-fixes",
             get(get_reflection_fixes_handler),
+        )
+        .route(
+            "/meta-optimizer/iteration-history",
+            get(get_iteration_history_handler),
         )
 }

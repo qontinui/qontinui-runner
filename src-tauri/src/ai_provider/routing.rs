@@ -209,6 +209,52 @@ pub fn run_prompt_with_model_override(
     retry_with_backoff("AI prompt", primary)
 }
 
+/// Run an AI prompt with model override AND a middleware chain.
+///
+/// This wraps `run_prompt_with_model_override` with pre/post middleware processing:
+/// - Pre-call: middleware transforms the prompt before it reaches the AI
+/// - Post-call: middleware transforms the response before it's returned to the caller
+///
+/// Use this when deterministic sanitization is needed around AI calls (e.g., hardener).
+pub fn run_prompt_with_middleware(
+    prompt: &str,
+    context: &TaskContext,
+    doctor_handle: Option<&DoctorHandle>,
+    model_override: Option<&str>,
+    provider_override: Option<&str>,
+    temperature_override: Option<f32>,
+    max_tokens_override: Option<u32>,
+    fallback_model: Option<&str>,
+    fallback_provider: Option<&str>,
+    middleware: &super::middleware::AiMiddlewareChain,
+    middleware_ctx: &super::middleware::MiddlewareContext,
+) -> AiResponse {
+    middleware.log_chain();
+
+    // Pre-call: transform prompt
+    let transformed_prompt = middleware.run_pre_call(prompt, middleware_ctx);
+
+    // Execute the AI call with the transformed prompt
+    let mut response = run_prompt_with_model_override(
+        &transformed_prompt,
+        context,
+        doctor_handle,
+        model_override,
+        provider_override,
+        temperature_override,
+        max_tokens_override,
+        fallback_model,
+        fallback_provider,
+    );
+
+    // Post-call: transform response
+    if response.success {
+        middleware.run_post_call(&mut response, middleware_ctx);
+    }
+
+    response
+}
+
 /// Inner implementation of model-override prompt execution.
 fn run_prompt_with_overrides_inner(
     prompt: &str,

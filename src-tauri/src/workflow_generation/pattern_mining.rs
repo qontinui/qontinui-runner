@@ -318,6 +318,7 @@ pub fn patterns_to_rules(
             provenance: "pattern_mining".to_string(),
             source_fix_id: None,
             severity: None,
+            examples_json: None,
         };
 
         match rules::insert_rule(conn, &input) {

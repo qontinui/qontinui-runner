@@ -32,6 +32,61 @@ pub fn save_pipeline_agent_traces(
     })
 }
 
+fn insert_trace_row(
+    conn: &Connection,
+    task_run_id: &str,
+    trace: &PipelineAgentTrace,
+    now: &str,
+) -> Result<(), String> {
+    let id = format!("pat-{}", uuid::Uuid::new_v4());
+    let config_json = serde_json::to_string(&trace.config).unwrap_or_default();
+    let input_json = trace.input_snapshot.to_string();
+    let output_json = trace.output_snapshot.to_string();
+    let guardrail_json = if trace.guardrail_results.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&trace.guardrail_results).unwrap_or_default())
+    };
+    let handoff_json = trace
+        .handoff_received
+        .as_ref()
+        .and_then(|h| serde_json::to_string(h).ok());
+
+    conn.execute(
+        r#"INSERT INTO pipeline_agent_traces
+           (id, task_run_id, agent_type, agent_id, run_id,
+            input_snapshot, output_snapshot, config_json,
+            duration_ms, tokens_in, tokens_out, cost_usd,
+            downstream_success, output_quality_score, created_at,
+            parent_span_id, span_type, guardrail_results_json, handoff_context_json)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"#,
+        params![
+            id,
+            task_run_id,
+            trace.agent_type,
+            trace.agent_id,
+            trace.run_id,
+            input_json,
+            output_json,
+            config_json,
+            trace.duration_ms as i64,
+            trace.tokens_in as i64,
+            trace.tokens_out as i64,
+            trace.cost_usd,
+            trace.downstream_success.map(|b| b as i32),
+            trace.output_quality_score,
+            now,
+            trace.parent_span_id,
+            trace.span_type,
+            guardrail_json,
+            handoff_json,
+        ],
+    )
+    .map_err(|e| format!("Failed to insert pipeline agent trace: {}", e))?;
+
+    Ok(())
+}
+
 fn insert_traces(
     conn: &Connection,
     task_run_id: &str,
@@ -41,42 +96,61 @@ fn insert_traces(
     let mut count = 0;
 
     for trace in traces {
-        let id = format!("pat-{}", uuid::Uuid::new_v4());
-        let config_json = serde_json::to_string(&trace.config).unwrap_or_default();
-        let input_json = trace.input_snapshot.to_string();
-        let output_json = trace.output_snapshot.to_string();
-
-        conn.execute(
-            r#"INSERT INTO pipeline_agent_traces
-               (id, task_run_id, agent_type, agent_id, run_id,
-                input_snapshot, output_snapshot, config_json,
-                duration_ms, tokens_in, tokens_out, cost_usd,
-                downstream_success, output_quality_score, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
-            params![
-                id,
-                task_run_id,
-                trace.agent_type,
-                trace.agent_id,
-                trace.run_id,
-                input_json,
-                output_json,
-                config_json,
-                trace.duration_ms as i64,
-                trace.tokens_in as i64,
-                trace.tokens_out as i64,
-                trace.cost_usd,
-                trace.downstream_success.map(|b| b as i32),
-                trace.output_quality_score,
-                now,
-            ],
-        )
-        .map_err(|e| format!("Failed to insert pipeline agent trace: {}", e))?;
-
+        insert_trace_row(conn, task_run_id, trace, &now)?;
         count += 1;
     }
 
     Ok(count)
+}
+
+/// Save a single pipeline agent trace incrementally (as each agent completes).
+/// Unlike `save_pipeline_agent_traces`, this persists immediately so traces
+/// survive pipeline crashes mid-execution.
+pub fn save_pipeline_agent_trace(
+    db: &CheckpointDb,
+    task_run_id: &str,
+    trace: &PipelineAgentTrace,
+) -> Result<(), String> {
+    let task_run_id = task_run_id.to_string();
+    let trace = trace.clone();
+
+    db.with_conn(move |conn| {
+        let now = chrono::Utc::now().to_rfc3339();
+        insert_trace_row(conn, &task_run_id, &trace, &now)?;
+        debug!(
+            "Persisted trace for {} ({}) in run {}",
+            trace.agent_type, trace.agent_id, task_run_id
+        );
+        Ok(())
+    })
+}
+
+/// Backfill `downstream_success` on all traces for a completed execution.
+/// Called after a workflow (traditional or pipeline) finishes to correlate
+/// early agent performance with final outcome.
+pub fn backfill_downstream_success(
+    db: &CheckpointDb,
+    task_run_id: &str,
+    success: bool,
+) -> Result<usize, String> {
+    let task_run_id = task_run_id.to_string();
+
+    db.with_conn(move |conn| {
+        let updated = conn
+            .execute(
+                "UPDATE pipeline_agent_traces SET downstream_success = ?1 WHERE task_run_id = ?2 AND downstream_success IS NULL",
+                params![success as i32, task_run_id],
+            )
+            .map_err(|e| format!("Failed to backfill downstream_success: {}", e))?;
+
+        if updated > 0 {
+            debug!(
+                "Backfilled downstream_success={} on {} traces for {}",
+                success, updated, task_run_id
+            );
+        }
+        Ok(updated)
+    })
 }
 
 /// L0: Get one-line summaries of agent traces grouped by agent_type.
@@ -233,6 +307,57 @@ pub fn get_agent_trace_aggregates(
     })
 }
 
+/// L2: Retrieve a single pipeline agent trace by its ID with all fields.
+pub fn get_trace_full_l2(
+    db: &CheckpointDb,
+    trace_id: &str,
+) -> Result<Option<PipelineAgentTrace>, String> {
+    let trace_id = trace_id.to_string();
+
+    db.with_conn(move |conn| {
+        let result = conn.query_row(
+            r#"SELECT agent_type, agent_id, run_id,
+                      input_snapshot, output_snapshot, config_json,
+                      duration_ms, tokens_in, tokens_out, cost_usd,
+                      downstream_success, output_quality_score
+               FROM pipeline_agent_traces
+               WHERE id = ?1"#,
+            params![trace_id],
+            |row| {
+                let config_json: String = row.get(5)?;
+                let input_json: String = row.get(3)?;
+                let output_json: String = row.get(4)?;
+                let downstream_success: Option<i32> = row.get(10)?;
+
+                Ok(PipelineAgentTrace {
+                    agent_type: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    input_snapshot: serde_json::from_str(&input_json).unwrap_or_default(),
+                    output_snapshot: serde_json::from_str(&output_json).unwrap_or_default(),
+                    config: serde_json::from_str(&config_json).unwrap_or_default(),
+                    duration_ms: row.get::<_, i64>(6)? as u64,
+                    tokens_in: row.get::<_, i64>(7)? as u32,
+                    tokens_out: row.get::<_, i64>(8)? as u32,
+                    cost_usd: row.get(9)?,
+                    downstream_success: downstream_success.map(|v| v != 0),
+                    output_quality_score: row.get(11)?,
+                    parent_span_id: None,
+                    span_type: "agent".to_string(),
+                    guardrail_results: vec![],
+                    handoff_received: None,
+                })
+            },
+        );
+
+        match result {
+            Ok(trace) => Ok(Some(trace)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to query trace by id: {}", e)),
+        }
+    })
+}
+
 /// Retrieve all pipeline agent traces for a given task run ID.
 /// Used to attach traces to ExperimentResult.extra for the autoresearch UI.
 pub fn get_traces_for_task_run(
@@ -274,6 +399,10 @@ pub fn get_traces_for_task_run(
                     cost_usd: row.get(9)?,
                     downstream_success: downstream_success.map(|v| v != 0),
                     output_quality_score: row.get(11)?,
+                    parent_span_id: None,
+                    span_type: "agent".to_string(),
+                    guardrail_results: vec![],
+                    handoff_received: None,
                 })
             })
             .map_err(|e| format!("Failed to query traces: {}", e))?

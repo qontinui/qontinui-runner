@@ -189,6 +189,10 @@ pub fn check_and_launch_optimizers(
     // Auto-evaluate canary rollouts and promote/rollback when threshold is met.
     auto_evaluate_canaries(db);
 
+    // Run data-driven cost optimization analysis (no AI session needed).
+    // Generates recommendations for high-token agents, cost concentration, etc.
+    run_cost_analysis(db);
+
     Ok(launched)
 }
 
@@ -292,6 +296,22 @@ fn auto_evaluate_canaries(db: &CheckpointDb) {
     }
 }
 
+/// Run data-driven cost analysis and generate cost recommendations.
+/// This does not require an AI session — it's purely SQL-based analysis.
+fn run_cost_analysis(db: &CheckpointDb) {
+    // Load existing recommendations to avoid duplicates
+    let existing = super::recommendations::list_recommendations(db, Some("pipeline_prompt"), None)
+        .unwrap_or_default();
+
+    let recs = super::cost_optimizer::generate_cost_recommendations(db, &existing);
+    if !recs.is_empty() {
+        info!(
+            "Cost optimizer produced {} recommendation(s)",
+            recs.len()
+        );
+    }
+}
+
 /// Launch a specific optimizer workflow.
 pub fn launch_optimizer(
     deps: &MetaOptimizerDeps,
@@ -348,10 +368,33 @@ fn launch_optimizer_internal(
         optimizer_run_id
     );
 
+    // Query completed optimizer run count for style rotation (PromptWizard-inspired diversity)
+    let opt_type_str = optimizer_type.as_str().to_string();
+    let style_index: u32 = db
+        .with_conn(move |conn| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM meta_optimizer_runs WHERE optimizer_type = ?1",
+                    rusqlite::params![opt_type_str],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            Ok(count as u32)
+        })
+        .unwrap_or(0);
+
+    info!(
+        "Style rotation: optimizer_type={}, run_count={}, style_index={}",
+        optimizer_type.as_str(),
+        style_index,
+        style_index % 4
+    );
+
     // Build workflow config based on optimizer type
     let (loop_config, setup_steps, verification_steps) = match optimizer_type {
         OptimizerType::PipelinePrompt => {
-            let config = super::pipeline_prompt_optimizer::build_config(&task_run_id, &task_name);
+            let config =
+                super::pipeline_prompt_optimizer::build_config(&task_run_id, &task_name, style_index);
             let setup = super::pipeline_prompt_optimizer::build_setup_steps();
             let verify = super::pipeline_prompt_optimizer::build_verification_steps();
             (config, setup, verify)
@@ -363,8 +406,11 @@ fn launch_optimizer_internal(
             (config, setup, verify)
         }
         OptimizerType::GenerationTemplate => {
-            let config =
-                super::generation_template_optimizer::build_config(&task_run_id, &task_name);
+            let config = super::generation_template_optimizer::build_config(
+                &task_run_id,
+                &task_name,
+                style_index,
+            );
             let setup = super::generation_template_optimizer::build_setup_steps();
             let verify = super::generation_template_optimizer::build_verification_steps();
             (config, setup, verify)

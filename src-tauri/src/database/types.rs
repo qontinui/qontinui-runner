@@ -1947,3 +1947,13 @@ impl MigrationResult {
             + self.checkpoints_migrated
     }
 }
+
+/// Summary of a single iteration's verification phase results (for replay point listing).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationPhaseSummary {
+    pub iteration: i32,
+    pub all_passed: bool,
+    pub passed_steps: i32,
+    pub failed_steps: i32,
+    pub created_at: String,
+}

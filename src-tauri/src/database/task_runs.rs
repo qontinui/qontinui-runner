@@ -1377,6 +1377,250 @@ impl CheckpointDb {
         }
     }
 
+    // --- Durable Execution: Iteration Diffs ---
+
+    /// Append a structured iteration diff to the task run's iteration_diffs JSON array.
+    pub fn append_iteration_diff(
+        &self,
+        id: &str,
+        diff: &crate::unified_workflow_executor::IterationDiff,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        // Read existing diffs
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT iteration_diffs FROM task_runs WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap_or(None);
+
+        let mut diffs: Vec<serde_json::Value> = existing
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
+        let diff_value = serde_json::to_value(diff)
+            .map_err(|e| format!("Failed to serialize iteration diff: {}", e))?;
+        diffs.push(diff_value);
+
+        let json = serde_json::to_string(&diffs)
+            .map_err(|e| format!("Failed to serialize iteration diffs: {}", e))?;
+
+        conn.execute(
+            "UPDATE task_runs SET iteration_diffs = ?1, updated_at = ?2 WHERE id = ?3",
+            params![json, now, id],
+        )
+        .map_err(|e| format!("Failed to update iteration diffs: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get all iteration diffs for a task run.
+    pub fn get_iteration_diffs(
+        &self,
+        id: &str,
+    ) -> Result<Vec<crate::unified_workflow_executor::IterationDiff>, String> {
+        let conn = self.get_conn()?;
+
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT iteration_diffs FROM task_runs WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap_or(None);
+
+        match json {
+            Some(s) => serde_json::from_str(&s)
+                .map_err(|e| format!("Failed to parse iteration diffs: {}", e)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Clear iteration diffs from a given iteration onward (for replay).
+    pub fn clear_iteration_diffs_from(
+        &self,
+        id: &str,
+        from_iteration: u32,
+    ) -> Result<(), String> {
+        let diffs = self.get_iteration_diffs(id)?;
+        let filtered: Vec<_> = diffs
+            .into_iter()
+            .filter(|d| d.iteration < from_iteration)
+            .collect();
+
+        let json = serde_json::to_string(&filtered)
+            .map_err(|e| format!("Failed to serialize filtered diffs: {}", e))?;
+
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE task_runs SET iteration_diffs = ?1, updated_at = ?2 WHERE id = ?3",
+            params![json, now, id],
+        )
+        .map_err(|e| format!("Failed to clear iteration diffs: {}", e))?;
+
+        Ok(())
+    }
+
+    // --- Durable Execution: Iteration Commits ---
+
+    /// Append a commit checkpoint for an iteration.
+    pub fn append_iteration_commit(
+        &self,
+        id: &str,
+        commit: &crate::unified_workflow_executor::IterationCommit,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT iteration_commits FROM task_runs WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap_or(None);
+
+        let mut commits: Vec<serde_json::Value> = existing
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
+        let commit_value = serde_json::to_value(commit)
+            .map_err(|e| format!("Failed to serialize iteration commit: {}", e))?;
+        commits.push(commit_value);
+
+        let json = serde_json::to_string(&commits)
+            .map_err(|e| format!("Failed to serialize iteration commits: {}", e))?;
+
+        conn.execute(
+            "UPDATE task_runs SET iteration_commits = ?1, updated_at = ?2 WHERE id = ?3",
+            params![json, now, id],
+        )
+        .map_err(|e| format!("Failed to update iteration commits: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get all iteration commits for a task run.
+    pub fn get_iteration_commits(
+        &self,
+        id: &str,
+    ) -> Result<Vec<crate::unified_workflow_executor::IterationCommit>, String> {
+        let conn = self.get_conn()?;
+
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT iteration_commits FROM task_runs WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap_or(None);
+
+        match json {
+            Some(s) => serde_json::from_str(&s)
+                .map_err(|e| format!("Failed to parse iteration commits: {}", e)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Clear iteration commits from a given iteration onward (for replay).
+    pub fn clear_iteration_commits_from(
+        &self,
+        id: &str,
+        from_iteration: u32,
+    ) -> Result<(), String> {
+        let commits = self.get_iteration_commits(id)?;
+        let filtered: Vec<_> = commits
+            .into_iter()
+            .filter(|c| c.iteration < from_iteration)
+            .collect();
+
+        let json = serde_json::to_string(&filtered)
+            .map_err(|e| format!("Failed to serialize filtered commits: {}", e))?;
+
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE task_runs SET iteration_commits = ?1, updated_at = ?2 WHERE id = ?3",
+            params![json, now, id],
+        )
+        .map_err(|e| format!("Failed to clear iteration commits: {}", e))?;
+
+        Ok(())
+    }
+
+    // --- Durable Execution: Verification Results for Replay ---
+
+    /// Get verification phase results for replay point listing.
+    pub fn get_workflow_verification_results(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<VerificationPhaseSummary>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT iteration, all_passed, passed_steps, failed_steps, created_at
+                FROM workflow_verification_phase_results
+                WHERE task_run_id = ?1
+                ORDER BY iteration ASC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let results = stmt
+            .query_map(params![execution_id], |row| {
+                Ok(VerificationPhaseSummary {
+                    iteration: row.get(0)?,
+                    all_passed: row.get(1)?,
+                    passed_steps: row.get(2)?,
+                    failed_steps: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query verification results: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Clear step checkpoints from a given iteration onward (for replay).
+    pub fn clear_checkpoints_from_iteration(
+        &self,
+        execution_id: &str,
+        from_iteration: u32,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+
+        conn.execute(
+            r#"
+            DELETE FROM workflow_step_checkpoints
+            WHERE execution_id = ?1 AND iteration >= ?2
+            "#,
+            params![execution_id, from_iteration],
+        )
+        .map_err(|e| format!("Failed to clear checkpoints: {}", e))?;
+
+        // Also clear verification phase results
+        conn.execute(
+            r#"
+            DELETE FROM workflow_verification_phase_results
+            WHERE task_run_id = ?1 AND iteration >= ?2
+            "#,
+            params![execution_id, from_iteration],
+        )
+        .map_err(|e| format!("Failed to clear verification results: {}", e))?;
+
+        Ok(())
+    }
+
     /// Get all running (incomplete) task runs.
     /// Note: output_log is empty for performance. Use get_full_task_output() to get output.
     /// Includes execution_steps_json and log_sources_json for re-execution on resume.

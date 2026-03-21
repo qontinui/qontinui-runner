@@ -934,6 +934,9 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     acceptance_criteria TEXT DEFAULT NULL,
     ai_reviewed INTEGER DEFAULT 1,
 
+    -- Execution architecture override ('traditional', 'agentic_verification', 'multi_agent_pipeline')
+    workflow_architecture TEXT DEFAULT NULL,
+
     -- Slash command import tracking
     source_file_path TEXT DEFAULT NULL,    -- Relative path to source .md file (e.g. "qontinui-claude-config/.claude/commands/fix.md")
     source_content_hash TEXT DEFAULT NULL, -- SHA-256 hex of file content for change detection
@@ -1199,6 +1202,9 @@ CREATE TABLE IF NOT EXISTS learning_outcomes (
     verification_step_count INTEGER,  -- Number of verification steps
     agentic_step_count INTEGER,  -- Number of agentic (prompt) steps
     has_ui_bridge INTEGER DEFAULT 0,  -- Whether workflow uses UI Bridge steps
+    total_tokens INTEGER,  -- Total tokens consumed (from multi-agent pipeline)
+    total_cost_usd REAL,  -- Total cost in USD (from multi-agent pipeline)
+    composite_agentic_score REAL,  -- Cached weighted composite of agentic metric scores (0.0-1.0)
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_learning_outcomes_task_id ON learning_outcomes(task_id);
@@ -2267,6 +2273,7 @@ CREATE TABLE IF NOT EXISTS generation_rules (
     evidence_count INTEGER DEFAULT 0,     -- How many examples support this rule
     severity TEXT NOT NULL DEFAULT 'normal',  -- 'critical', 'important', 'normal', 'hint'
     failure_count INTEGER NOT NULL DEFAULT 0,  -- Tracks how many generation failures this rule would have prevented
+    examples_json TEXT,                          -- JSON array of positive/negative examples: [{"type":"positive","output":"...","explanation":"..."}]
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (source_fix_id) REFERENCES reflection_fixes(id) ON DELETE SET NULL
@@ -3257,4 +3264,42 @@ CREATE INDEX IF NOT EXISTS idx_spec_versions_spec ON spec_versions(spec_id);
 CREATE INDEX IF NOT EXISTS idx_spec_versions_hash ON spec_versions(content_hash);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_spec_versions_num ON spec_versions(spec_id, version_number);
 
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (128, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (130, datetime('now'));
+
+-- =============================================================================
+-- Agentic Metrics Tables (migration 133)
+-- =============================================================================
+
+-- Individual metric scores for task runs. Each run can have multiple scores
+-- (one per metric type). Deterministic scores are written synchronously after
+-- recording the learning outcome; LLM-judged scores arrive asynchronously.
+CREATE TABLE IF NOT EXISTS agentic_metric_scores (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    metric_type TEXT NOT NULL,              -- 'task_completion', 'step_efficiency', etc.
+    score REAL NOT NULL,                    -- 0.0 to 1.0
+    confidence REAL NOT NULL DEFAULT 1.0,   -- 0.0 to 1.0, reliability of this score
+    rationale TEXT,                         -- Human-readable explanation
+    is_llm_judged INTEGER NOT NULL DEFAULT 0,
+    model_used TEXT,                        -- NULL for deterministic, model ID for LLM-judged
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agentic_scores_task_run ON agentic_metric_scores(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_agentic_scores_metric ON agentic_metric_scores(metric_type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agentic_scores_unique ON agentic_metric_scores(task_run_id, metric_type);
+
+-- Learned baselines per workflow for step efficiency and tool correctness.
+-- Bootstrapped from the first 20+ successful runs, then updated periodically.
+CREATE TABLE IF NOT EXISTS agentic_metric_baselines (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT,                        -- NULL = global baseline
+    metric_type TEXT NOT NULL,               -- 'min_steps', 'expected_tools'
+    baseline_value TEXT NOT NULL,            -- JSON: {"expected_iterations": 2, "expected_steps": 8}
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_baselines_unique ON agentic_metric_baselines(workflow_id, metric_type);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (133, datetime('now'));

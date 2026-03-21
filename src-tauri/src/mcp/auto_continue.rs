@@ -56,6 +56,7 @@ pub async fn set_auto_continue_setting(
             success: false,
             data: None,
             error: Some(format!("Failed to save setting: {}", e)),
+            error_detail: None,
         }),
     }
 }
@@ -108,6 +109,7 @@ pub async fn set_workflow_auto_continue(
             success: false,
             data: None,
             error: Some(format!("Failed to update auto-continue setting: {}", e)),
+            error_detail: None,
         }),
     }
 }

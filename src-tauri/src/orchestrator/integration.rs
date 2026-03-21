@@ -2167,6 +2167,8 @@ impl Orchestrator {
             None, // verification_step_count
             None, // agentic_step_count
             false, // has_ui_bridge
+            None, // total_tokens
+            None, // total_cost_usd
         ) {
             warn!("Failed to record learning outcome: {}", e);
         } else {

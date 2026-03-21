@@ -29,6 +29,29 @@ use crate::step_injection::parser::InjectedStepParser;
 use crate::step_injection::types::StepInjectionContext;
 use crate::workflow_state::{ParsedProgress, ProgressParser};
 
+/// Output from a CLI session including token usage data.
+pub struct CliSessionOutput {
+    pub success: bool,
+    pub output: String,
+    pub injected_steps: Vec<ExecutionStepConfig>,
+    /// Input tokens consumed (extracted from stream-json result message).
+    pub input_tokens: Option<u64>,
+    /// Output tokens generated (extracted from stream-json result message).
+    pub output_tokens: Option<u64>,
+}
+
+/// Output from a CLI session with retry, including token usage data.
+pub struct CliSessionRetryOutput {
+    pub success: bool,
+    pub output: String,
+    pub retry_state: Option<RetryState>,
+    pub injected_steps: Vec<ExecutionStepConfig>,
+    /// Input tokens consumed (extracted from stream-json result message).
+    pub input_tokens: Option<u64>,
+    /// Output tokens generated (extracted from stream-json result message).
+    pub output_tokens: Option<u64>,
+}
+
 /// Context for periodic flushing of AI output to the database during a session.
 /// When provided, the runner will flush accumulated output every ~30 seconds
 /// so that output survives runner restarts.
@@ -111,6 +134,23 @@ fn extract_tool_activity_from_stream_json(json_line: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract token usage from a Claude CLI stream-json result message.
+/// The result message contains `usage.input_tokens` and `usage.output_tokens`.
+fn extract_usage_from_stream_json(json_line: &str) -> Option<(u64, u64)> {
+    let parsed: serde_json::Value = serde_json::from_str(json_line).ok()?;
+    if parsed.get("type")?.as_str()? != "result" {
+        return None;
+    }
+    // Usage can be at result.usage (object result) or top-level usage
+    let usage = parsed
+        .get("result")
+        .and_then(|r| r.get("usage"))
+        .or_else(|| parsed.get("usage"))?;
+    let input = usage.get("input_tokens")?.as_u64()?;
+    let output = usage.get("output_tokens")?.as_u64()?;
+    Some((input, output))
 }
 
 /// Extract text from Claude CLI stream-json output line
@@ -214,7 +254,7 @@ fn run_claude_session_inline(
     task_run_id: Option<&str>,
     cli_session_ctx: Option<&CliSessionContext>,
     db_flush_ctx: Option<&DbFlushContext>,
-) -> Result<(bool, String, Vec<ExecutionStepConfig>), String> {
+) -> Result<CliSessionOutput, String> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{mpsc, Arc};
@@ -538,6 +578,9 @@ fn run_claude_session_inline(
             None
         };
 
+        // Track token usage from the CLI result message
+        let mut session_usage: Option<(u64, u64)> = None;
+
         // Buffer to accumulate text until we have complete lines for finding/progress parsing.
         // Stream-json sends partial text chunks (content_block_delta), so markers like
         // [FINDING:code_bug:high] or [PROGRESS: 50/100] can be split across multiple events.
@@ -547,6 +590,13 @@ fn run_claude_session_inline(
         if let Some(stdout) = stdout {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
+                // Extract token usage from result message (comes at end of session)
+                if session_usage.is_none() {
+                    if let Some(usage) = extract_usage_from_stream_json(&line) {
+                        session_usage = Some(usage);
+                    }
+                }
+
                 // Update activity time
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -674,7 +724,7 @@ fn run_claude_session_inline(
             *buf = all_text.clone();
         }
 
-        all_text
+        (all_text, session_usage)
     });
 
     // Finding processor thread - stores findings in DB and emits events
@@ -1540,14 +1590,14 @@ fn run_claude_session_inline(
     // Join stdout thread with a bounded wait (fallback for non-Windows or edge cases).
     // On Windows the handle close above should make this return immediately, but
     // the timeout acts as a safety net.
-    let all_output = {
-        let (join_tx, join_rx) = mpsc::channel::<String>();
+    let (all_output, cli_token_usage) = {
+        let (join_tx, join_rx) = mpsc::channel::<(String, Option<(u64, u64)>)>();
         let _ = thread::spawn(move || {
             let result = stdout_handle.join().unwrap_or_default();
             let _ = join_tx.send(result);
         });
         match join_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(text) => text,
+            Ok(result) => result,
             Err(_) => {
                 warn!(
                     "Session {}: stdout thread didn't finish within 10s after process exit. \
@@ -1555,10 +1605,11 @@ fn run_claude_session_inline(
                     session_id
                 );
                 // Fall back to the shared buffer which was synced periodically
-                shared_output_buf
+                let text = shared_output_buf
                     .lock()
                     .map(|s| s.clone())
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                (text, None)
             }
         }
     };
@@ -1703,6 +1754,17 @@ fn run_claude_session_inline(
 
     let success = status.success();
 
+    let (cli_input_tokens, cli_output_tokens) = match cli_token_usage {
+        Some((input, output)) => {
+            info!(
+                "Session {} token usage: input={}, output={}, total={}",
+                session_id, input, output, input + output
+            );
+            (Some(input), Some(output))
+        }
+        None => (None, None),
+    };
+
     info!(
         "Session {} completed: success={}, output_len={}, findings={}, progress_markers={}, reflection_fixes={}, injected_steps={}",
         session_id,
@@ -1717,7 +1779,13 @@ fn run_claude_session_inline(
     // Remove PID from tracker now that session is complete
     remove_pid(&pid_tracker);
 
-    Ok((success, all_output, injected_steps))
+    Ok(CliSessionOutput {
+        success,
+        output: all_output,
+        injected_steps,
+        input_tokens: cli_input_tokens,
+        output_tokens: cli_output_tokens,
+    })
 }
 
 /// Run Claude session with retry support.
@@ -1750,7 +1818,7 @@ pub fn run_claude_session_with_retry(
     task_run_id: Option<&str>,
     cli_session_ctx: Option<&CliSessionContext>,
     db_flush_ctx: Option<&DbFlushContext>,
-) -> Result<(bool, String, Option<RetryState>, Vec<ExecutionStepConfig>), String> {
+) -> Result<CliSessionRetryOutput, String> {
     use std::thread;
     use std::time::Duration;
 
@@ -1776,7 +1844,14 @@ pub fn run_claude_session_with_retry(
                 cli_session_ctx,
                 db_flush_ctx,
             )?;
-            return Ok((result.0, result.1, None, result.2));
+            return Ok(CliSessionRetryOutput {
+                success: result.success,
+                output: result.output,
+                retry_state: None,
+                injected_steps: result.injected_steps,
+                input_tokens: result.input_tokens,
+                output_tokens: result.output_tokens,
+            });
         }
     };
 
@@ -1824,7 +1899,7 @@ pub fn run_claude_session_with_retry(
         );
 
         match result {
-            Ok((success, output, injected_steps)) => {
+            Ok(cli_output) => {
                 // Session succeeded (or at least completed without error)
                 if retry_state.attempt > 0 {
                     info!(
@@ -1832,7 +1907,14 @@ pub fn run_claude_session_with_retry(
                         session_id, retry_state.attempt
                     );
                 }
-                return Ok((success, output, Some(retry_state), injected_steps));
+                return Ok(CliSessionRetryOutput {
+                    success: cli_output.success,
+                    output: cli_output.output,
+                    retry_state: Some(retry_state),
+                    injected_steps: cli_output.injected_steps,
+                    input_tokens: cli_output.input_tokens,
+                    output_tokens: cli_output.output_tokens,
+                });
             }
             Err(error) => {
                 // Session failed - check if we should retry
@@ -1936,7 +2018,7 @@ pub fn run_claude_session_interactive(
     _reflection_fix_ctx: Option<ReflectionFixContext>,
     _step_injection_ctx: Option<StepInjectionContext>,
     model_override: Option<&str>,
-) -> Result<(bool, String, Vec<ExecutionStepConfig>), String> {
+) -> Result<CliSessionOutput, String> {
     use crate::claude_session::ClaudeSession;
     use crate::commands::ai_session::emit_session_state;
     use std::sync::Arc;
@@ -2021,8 +2103,14 @@ pub fn run_claude_session_interactive(
         output.len()
     );
 
-    // Note: Step injection not implemented for interactive sessions yet
-    Ok((success, output, Vec::new()))
+    // Note: Step injection and token tracking not implemented for interactive sessions yet
+    Ok(CliSessionOutput {
+        success,
+        output,
+        injected_steps: Vec::new(),
+        input_tokens: None,
+        output_tokens: None,
+    })
 }
 
 /// Run an interactive Claude CLI session with retry support.
@@ -2046,7 +2134,7 @@ pub fn run_claude_session_interactive_with_retry(
     reflection_fix_ctx: Option<ReflectionFixContext>,
     step_injection_ctx: Option<StepInjectionContext>,
     model_override: Option<&str>,
-) -> Result<(bool, String, Option<RetryState>, Vec<ExecutionStepConfig>), String> {
+) -> Result<CliSessionRetryOutput, String> {
     use std::thread;
     use std::time::Duration;
 
@@ -2070,7 +2158,14 @@ pub fn run_claude_session_interactive_with_retry(
                 step_injection_ctx,
                 model_override,
             )?;
-            return Ok((result.0, result.1, None, result.2));
+            return Ok(CliSessionRetryOutput {
+                success: result.success,
+                output: result.output,
+                retry_state: None,
+                injected_steps: result.injected_steps,
+                input_tokens: result.input_tokens,
+                output_tokens: result.output_tokens,
+            });
         }
     };
 
@@ -2112,14 +2207,21 @@ pub fn run_claude_session_interactive_with_retry(
         );
 
         match result {
-            Ok((success, output, injected_steps)) => {
+            Ok(cli_output) => {
                 if retry_state.attempt > 0 {
                     info!(
                         "Interactive session {} succeeded after {} retries",
                         session_id, retry_state.attempt
                     );
                 }
-                return Ok((success, output, Some(retry_state), injected_steps));
+                return Ok(CliSessionRetryOutput {
+                    success: cli_output.success,
+                    output: cli_output.output,
+                    retry_state: Some(retry_state),
+                    injected_steps: cli_output.injected_steps,
+                    input_tokens: cli_output.input_tokens,
+                    output_tokens: cli_output.output_tokens,
+                });
             }
             Err(error) => {
                 let decision = retry_service.should_retry(&error, &retry_state);

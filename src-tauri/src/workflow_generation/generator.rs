@@ -32,8 +32,8 @@ use crate::workflow_generation::prompt_analysis;
 use crate::workflow_generation::revision;
 use crate::workflow_generation::rules;
 use crate::workflow_generation::schema_context::{
-    build_gotchas_section, build_schema_context, build_schema_context_full,
-    format_skills_for_generator,
+    build_gotchas_section, build_rules_section_for_tier, build_schema_context,
+    build_schema_context_full, format_skills_for_generator,
 };
 use crate::workflow_generation::self_improve;
 use crate::workflow_generation::spec_synthesis;
@@ -2272,6 +2272,8 @@ fn build_fix_prompt(
 
     // Include gotchas so the fixer knows the critical schema constraints
     let gotchas = build_gotchas_section(conn);
+    // Fixer gets Full tier rules (all severities) for complete guidance
+    let full_rules = build_rules_section_for_tier(conn, rules::RuleTier::Full);
 
     format!(
         r#"You are a workflow fixer agent for Qontinui Runner.
@@ -2281,6 +2283,8 @@ fn build_fix_prompt(
 A verification agent found issues in the workflow below. Fix ALL of them and return the corrected, complete UnifiedWorkflow JSON.
 
 {gotchas}
+{full_rules}
+
 ## Rules
 - Fix every listed issue. Do NOT skip any.
 - Preserve the overall structure, step ordering, IDs, and intent of the workflow.

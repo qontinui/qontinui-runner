@@ -1,14 +1,149 @@
 //! Multi-Agent Pipeline Loop — DAG-structured workflow architecture.
 //!
 //! Specialized agents in a DAG-structured pipeline instead of a monolithic verify->fix loop.
+//!
+//! ## PipelineContext
+//!
+//! Structured inter-agent data that flows through all pipeline phases.
+//! Each phase reads from previous phases' outputs and writes its own,
+//! replacing the previous pattern of passing failure context as concatenated strings.
 
 use tracing::{debug, info, warn};
 
+use crate::autoresearch::agentic_verification::*;
 use crate::step_executor::ExecutionStepConfig;
 use crate::step_registry::StepEventLogger;
 
 use super::loop_controller::LoopController;
 use super::types::{LoopConfig, LoopResult};
+
+/// Structured inter-agent context that accumulates outputs from each pipeline phase.
+///
+/// Instead of passing failure context as concatenated strings between agents,
+/// each phase reads structured data from previous phases and writes its own.
+/// This enables:
+/// - Type-safe data flow between agents
+/// - Richer context for downstream agents (e.g., locator results inform implementer)
+/// - Structured telemetry for per-agent optimization
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PipelineContext {
+    /// Structured acceptance criteria from the Spec Analyst phase.
+    pub spec_results: Vec<PipelineAcceptanceCriterion>,
+
+    /// Code location mappings from the Locator Agent phase.
+    pub locator_results: Vec<LocatedCriterion>,
+
+    /// Changes made by Implementer agents, tracked per subtree+level.
+    pub implementer_changes: Vec<ImplementerChange>,
+
+    /// Verification failures from Verifier agents.
+    pub verifier_failures: Vec<VerifierFailure>,
+}
+
+/// A record of changes made by an implementer agent.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImplementerChange {
+    /// Subtree this change belongs to.
+    pub subtree_id: String,
+    /// DAG level within the subtree.
+    pub level: usize,
+    /// Attempt number (1-indexed).
+    pub attempt: u32,
+    /// Criteria IDs addressed in this change.
+    pub criteria_ids: Vec<String>,
+    /// Whether the implementer succeeded.
+    pub success: bool,
+    /// Token usage for this implementation pass.
+    pub tokens_in: u64,
+    /// Output tokens for this implementation pass.
+    pub tokens_out: u64,
+}
+
+/// A verification failure from a verifier agent.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VerifierFailure {
+    /// Criterion that failed verification.
+    pub criterion_id: String,
+    /// Verification method used.
+    pub method: String,
+    /// Truncated failure details.
+    pub details: String,
+    /// Which attempt this failure occurred on.
+    pub attempt: u32,
+}
+
+impl PipelineContext {
+    fn new() -> Self {
+        Self {
+            spec_results: Vec::new(),
+            locator_results: Vec::new(),
+            implementer_changes: Vec::new(),
+            verifier_failures: Vec::new(),
+        }
+    }
+
+    /// Build implementer context string from structured data for a specific level.
+    fn build_implementer_context(
+        &self,
+        subtree_id: &str,
+        level_idx: usize,
+        level_criteria: &[&str],
+        prior_failure_feedback: Option<&str>,
+        attempt: u32,
+        max_retries: u32,
+    ) -> String {
+        let mut context = format!(
+            "Multi-Agent Pipeline: Implement criteria at level {} for subtree '{}'. Criteria: {}",
+            level_idx,
+            subtree_id,
+            level_criteria.join(", ")
+        );
+
+        // Add prior failure feedback
+        if let Some(feedback) = prior_failure_feedback {
+            context.push_str(&format!(
+                "\n\n## Previous Attempt Failed (attempt {}/{})\n{}",
+                attempt - 1,
+                max_retries + 1,
+                feedback
+            ));
+        }
+
+        // Add location context from the Locator agent
+        if !self.locator_results.is_empty() {
+            context.push_str("\n\n## Code Locations (from Locator Agent)\n");
+            for lc in &self.locator_results {
+                if level_criteria.contains(&lc.criterion.id.as_str()) {
+                    context.push_str(&format!(
+                        "### {} (confidence: {:.0}%)\n",
+                        lc.criterion.id,
+                        lc.confidence * 100.0
+                    ));
+                    if !lc.target_files.is_empty() {
+                        context.push_str("Target files:\n");
+                        for f in &lc.target_files {
+                            context.push_str(&format!(
+                                "- `{}` ({})\n",
+                                f.path, f.relevance
+                            ));
+                        }
+                    }
+                    if !lc.related_files.is_empty() {
+                        context.push_str("Related files:\n");
+                        for f in &lc.related_files {
+                            context.push_str(&format!(
+                                "- `{}` ({})\n",
+                                f.path, f.relevance
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        context
+    }
+}
 
 /// Query token usage from the database for a specific execution_id and iteration.
 ///
@@ -50,8 +185,6 @@ impl LoopController {
         _all_step_results: &mut Vec<crate::step_executor::StepExecutionResult>,
         logger: &StepEventLogger,
     ) -> LoopResult {
-        use crate::autoresearch::agentic_verification::*;
-
         let pipeline_config = config
             .multi_agent_pipeline_config
             .clone()
@@ -144,6 +277,7 @@ impl LoopController {
 
         let mut total_iterations: u32 = 0;
         let mut agent_traces: Vec<PipelineAgentTrace> = Vec::new();
+        let mut pipeline_ctx = PipelineContext::new();
 
         // ── Phase 1: Spec Analysis ──────────────────────────────────────
         // The Spec Analyst agent parses spec files into structured acceptance
@@ -174,7 +308,7 @@ impl LoopController {
             .collect();
         let analyst_duration = analyst_start.elapsed().as_millis() as u64;
 
-        agent_traces.push(PipelineAgentTrace {
+        let spec_trace = PipelineAgentTrace {
             agent_type: "spec_analyst".to_string(),
             agent_id: "spec_analyst_0".to_string(),
             run_id: config.execution_id.clone(),
@@ -191,7 +325,23 @@ impl LoopController {
             cost_usd: 0.0,
             downstream_success: None,
             output_quality_score: None,
-        });
+            parent_span_id: None,
+            span_type: "agent".to_string(),
+            guardrail_results: vec![],
+            handoff_received: None,
+        };
+        // Persist incrementally so trace survives pipeline crashes
+        if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
+            &self.checkpoint_db,
+            &config.execution_id,
+            &spec_trace,
+        ) {
+            warn!("Failed to persist spec_analyst trace: {}", e);
+        }
+        agent_traces.push(spec_trace);
+
+        // Store spec results in pipeline context
+        pipeline_ctx.spec_results = criteria.clone();
 
         if criteria.is_empty() {
             info!("MULTI-AGENT-PIPELINE: No criteria derived — nothing to do");
@@ -203,6 +353,8 @@ impl LoopController {
                 was_stopped: false,
                 unfixable_errors: false,
                 iteration_results: vec![],
+                total_tokens: None,
+                total_cost_usd: None,
             };
         }
 
@@ -439,7 +591,7 @@ Only output the JSON array, nothing else."#,
                 );
             }
 
-            agent_traces.push(PipelineAgentTrace {
+            let locator_trace = PipelineAgentTrace {
                 agent_type: "locator".to_string(),
                 agent_id: "locator_0".to_string(),
                 run_id: config.execution_id.clone(),
@@ -458,13 +610,64 @@ Only output the JSON array, nothing else."#,
                 cost_usd: locator_cost,
                 downstream_success: None,
                 output_quality_score: None,
-            });
+                parent_span_id: None,
+                span_type: "agent".to_string(),
+                guardrail_results: vec![],
+                handoff_received: None,
+            };
+            if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
+                &self.checkpoint_db,
+                &config.execution_id,
+                &locator_trace,
+            ) {
+                warn!("Failed to persist locator trace: {}", e);
+            }
+            agent_traces.push(locator_trace);
 
             parsed
         } else {
             info!("MULTI-AGENT-PIPELINE: Phase 4 — Code Location (skipped, locator.max_tokens=0)");
             Vec::new()
         };
+
+        // Store locator results in pipeline context
+        pipeline_ctx.locator_results = located_criteria.clone();
+
+        // Guardrail: check locator output quality before proceeding to implementer
+        {
+            use crate::autoresearch::agentic_verification::guardrail_locator_output_schema;
+            let locator_check = guardrail_locator_output_schema(&serde_json::json!({
+                "located_criteria_count": located_criteria.len(),
+            }));
+            if locator_check.tripwire_triggered {
+                warn!(
+                    "MULTI-AGENT-PIPELINE: Guardrail tripped — {}",
+                    locator_check.check_description
+                );
+                // Record guardrail result but don't halt — locator may be disabled
+            }
+        }
+
+        // Guardrail: check token budget before entering implementation loop
+        {
+            use crate::autoresearch::agentic_verification::guardrail_token_budget;
+            let tokens_so_far: u64 = agent_traces
+                .iter()
+                .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
+                .sum();
+            let budget_check = guardrail_token_budget(
+                tokens_so_far,
+                config.max_context_tokens as u64,
+                1000, // minimum tokens needed for at least one implementer call
+            );
+            if budget_check.tripwire_triggered {
+                warn!(
+                    "MULTI-AGENT-PIPELINE: Guardrail tripped — {}",
+                    budget_check.check_description
+                );
+                // Continue anyway — the implementer will fail naturally if budget is truly exhausted
+            }
+        }
 
         // ── Phase 5: Implementation + Verification per subtree ──────────
         info!("MULTI-AGENT-PIPELINE: Phase 5 — Implementation + Verification");
@@ -541,21 +744,15 @@ Only output the JSON array, nothing else."#,
                     total_iterations += 1;
                     level_attempt += 1;
 
-                    // Build failure context, including feedback from prior attempt if retrying
-                    let mut failure_context = format!(
-                        "Multi-Agent Pipeline: Implement criteria at level {} for subtree '{}'. Criteria: {}",
+                    // Build failure context from structured PipelineContext
+                    let mut failure_context = pipeline_ctx.build_implementer_context(
+                        &subtree.id,
                         level_idx,
-                        subtree.id,
-                        level_criteria.join(", ")
+                        &level_criteria,
+                        prior_failure_feedback.as_deref(),
+                        level_attempt,
+                        pipeline_config.max_retries_per_subtree,
                     );
-                    if let Some(ref feedback) = prior_failure_feedback {
-                        failure_context.push_str(&format!(
-                            "\n\n## Previous Attempt Failed (attempt {}/{})\n{}",
-                            level_attempt - 1,
-                            pipeline_config.max_retries_per_subtree + 1,
-                            feedback
-                        ));
-                    }
 
                     // Inject active prompt variant for implementer if available
                     if let Some(variant_prompt) = active_prompt_variants.get("implementer") {
@@ -565,37 +762,22 @@ Only output the JSON array, nothing else."#,
                         ));
                     }
 
-                    // Add location context from the Locator agent if available
-                    if !located_criteria.is_empty() {
-                        failure_context.push_str("\n\n## Code Locations (from Locator Agent)\n");
-                        for lc in &located_criteria {
-                            if level_criteria.contains(&lc.criterion.id.as_str()) {
-                                failure_context.push_str(&format!(
-                                    "### {} (confidence: {:.0}%)\n",
-                                    lc.criterion.id,
-                                    lc.confidence * 100.0
-                                ));
-                                if !lc.target_files.is_empty() {
-                                    failure_context.push_str("Target files:\n");
-                                    for f in &lc.target_files {
-                                        failure_context.push_str(&format!(
-                                            "- `{}` ({})\n",
-                                            f.path, f.relevance
-                                        ));
-                                    }
-                                }
-                                if !lc.related_files.is_empty() {
-                                    failure_context.push_str("Related files:\n");
-                                    for f in &lc.related_files {
-                                        failure_context.push_str(&format!(
-                                            "- `{}` ({})\n",
-                                            f.path, f.relevance
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // Build structured handoff context: locator → implementer
+                    let implementer_handoff = crate::autoresearch::agentic_verification::HandoffContext {
+                        from_agent: "locator".to_string(),
+                        to_agent: "implementer".to_string(),
+                        payload: serde_json::json!({
+                            "subtree_id": subtree.id,
+                            "level": level_idx,
+                            "criteria": &level_criteria,
+                            "located_files": located_criteria.iter()
+                                .filter(|lc| level_criteria.contains(&lc.criterion.id.as_str()))
+                                .map(|lc| &lc.target_files)
+                                .collect::<Vec<_>>(),
+                        }),
+                        forwarded_items: vec![],
+                        validated: true,
+                    };
 
                     // ── Implementer phase ────────────────────────────────────
                     let implementer_start = std::time::Instant::now();
@@ -669,9 +851,31 @@ Only output the JSON array, nothing else."#,
                         cost_usd: impl_cost,
                         downstream_success: None,
                         output_quality_score: None,
+                        parent_span_id: None,
+                        span_type: "agent".to_string(),
+                        guardrail_results: vec![],
+                        handoff_received: Some(implementer_handoff.clone()),
                     };
+                    if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
+                        &self.checkpoint_db,
+                        &config.execution_id,
+                        &implementer_trace,
+                    ) {
+                        warn!("Failed to persist implementer trace: {}", e);
+                    }
                     agent_traces.push(implementer_trace.clone());
                     last_implementer_trace = Some(implementer_trace);
+
+                    // Record implementer change in pipeline context
+                    pipeline_ctx.implementer_changes.push(ImplementerChange {
+                        subtree_id: subtree.id.clone(),
+                        level: level_idx,
+                        attempt: level_attempt,
+                        criteria_ids: level_criteria.iter().map(|s| s.to_string()).collect(),
+                        success: agentic_outcome.is_success(),
+                        tokens_in: impl_tokens_in,
+                        tokens_out: impl_tokens_out,
+                    });
 
                     // ── Verifier phase ───────────────────────────────────────
                     let verifier_start = std::time::Instant::now();
@@ -721,6 +925,35 @@ Only output the JSON array, nothing else."#,
 
                     let verifier_duration = verifier_start.elapsed().as_millis() as u64;
 
+                    // Build structured handoff context: implementer → verifier
+                    let verifier_handoff = crate::autoresearch::agentic_verification::HandoffContext {
+                        from_agent: "implementer".to_string(),
+                        to_agent: "verifier".to_string(),
+                        payload: serde_json::json!({
+                            "subtree_id": subtree.id,
+                            "level": level_idx,
+                            "attempt": level_attempt,
+                            "implementer_success": agentic_outcome.is_success(),
+                        }),
+                        forwarded_items: vec![],
+                        validated: true,
+                    };
+
+                    // Guardrail: check verifier output has a parseable verdict
+                    let verifier_output_json = serde_json::json!({
+                        "passed": level_passed,
+                        "results": level_criterion_results.len(),
+                    });
+                    let verdict_check = crate::autoresearch::agentic_verification::guardrail_verifier_verdict(&verifier_output_json);
+                    let mut verifier_guardrails = vec![];
+                    if verdict_check.tripwire_triggered {
+                        warn!(
+                            "MULTI-AGENT-PIPELINE: Guardrail tripped — {}",
+                            verdict_check.check_description
+                        );
+                    }
+                    verifier_guardrails.push(verdict_check);
+
                     let verifier_trace = PipelineAgentTrace {
                         agent_type: "verifier".to_string(),
                         agent_id: format!("verify_{}_{}_{}", subtree.id, level_idx, level_attempt),
@@ -731,10 +964,7 @@ Only output the JSON array, nothing else."#,
                             "attempt": level_attempt,
                             "criteria_count": level_criterion_results.len(),
                         }),
-                        output_snapshot: serde_json::json!({
-                            "passed": level_passed,
-                            "results": level_criterion_results.len(),
-                        }),
+                        output_snapshot: verifier_output_json,
                         config: pipeline_config.verifier.clone(),
                         duration_ms: verifier_duration,
                         tokens_in: 0,
@@ -742,9 +972,32 @@ Only output the JSON array, nothing else."#,
                         cost_usd: 0.0,
                         downstream_success: Some(level_passed),
                         output_quality_score: None,
+                        parent_span_id: None,
+                        span_type: "agent".to_string(),
+                        guardrail_results: verifier_guardrails,
+                        handoff_received: Some(verifier_handoff),
                     };
+                    if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
+                        &self.checkpoint_db,
+                        &config.execution_id,
+                        &verifier_trace,
+                    ) {
+                        warn!("Failed to persist verifier trace: {}", e);
+                    }
                     agent_traces.push(verifier_trace.clone());
                     last_verifier_trace = Some(verifier_trace);
+
+                    // Record verifier failures in pipeline context
+                    for cr in &level_criterion_results {
+                        if !cr.passed {
+                            pipeline_ctx.verifier_failures.push(VerifierFailure {
+                                criterion_id: cr.criterion_id.clone(),
+                                method: cr.method_used.clone(),
+                                details: cr.details.clone(),
+                                attempt: level_attempt,
+                            });
+                        }
+                    }
 
                     // Record canary run outcome if this is a canary run
                     if let Some((ref canary_id, _)) = active_canary {
@@ -776,10 +1029,19 @@ Only output the JSON array, nothing else."#,
                         .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
                         .sum();
                     if running_total_tokens > config.max_context_tokens as u64 {
-                        warn!(
-                            "MULTI-AGENT-PIPELINE: Token budget warning: {} / {} tokens used after iteration {}",
-                            running_total_tokens, config.max_context_tokens, total_iterations
-                        );
+                        if config.enforce_token_budget {
+                            warn!(
+                                "MULTI-AGENT-PIPELINE: Token budget ENFORCED — stopping execution: {} / {} tokens used",
+                                running_total_tokens, config.max_context_tokens
+                            );
+                            // Break out of the retry loop to stop this subtree
+                            break;
+                        } else {
+                            warn!(
+                                "MULTI-AGENT-PIPELINE: Token budget warning: {} / {} tokens used after iteration {}",
+                                running_total_tokens, config.max_context_tokens, total_iterations
+                            );
+                        }
                     }
 
                     if level_passed {
@@ -862,6 +1124,10 @@ Only output the JSON array, nothing else."#,
                             cost_usd: 0.0,
                             downstream_success: None,
                             output_quality_score: None,
+                            parent_span_id: None,
+                            span_type: "agent".to_string(),
+                            guardrail_results: vec![],
+                            handoff_received: None,
                         }
                     }),
                     verifier_trace: last_verifier_trace.unwrap_or_else(|| PipelineAgentTrace {
@@ -877,6 +1143,10 @@ Only output the JSON array, nothing else."#,
                         cost_usd: 0.0,
                         downstream_success: None,
                         output_quality_score: None,
+                        parent_span_id: None,
+                        span_type: "agent".to_string(),
+                        guardrail_results: vec![],
+                        handoff_received: None,
                     }),
                     retries: level_attempt.saturating_sub(1),
                     passed: level_passed,
@@ -945,7 +1215,7 @@ Only output the JSON array, nothing else."#,
         };
 
         // ── Build final result ──────────────────────────────────────────
-        let goal_achieved = if let Some(ref int_results) = integration_result {
+        let mut goal_achieved = if let Some(ref int_results) = integration_result {
             int_results.iter().all(|c| c.passed)
         } else {
             subtree_results.iter().all(|s| s.all_passed)
@@ -983,10 +1253,19 @@ Only output the JSON array, nothing else."#,
 
         // Check token budget
         if total_tokens > config.max_context_tokens as u64 {
-            warn!(
-                "MULTI-AGENT-PIPELINE: Token budget exceeded: {} / {} tokens used (cost=${:.4})",
-                total_tokens, config.max_context_tokens, total_cost_usd
-            );
+            if config.enforce_token_budget {
+                warn!(
+                    "MULTI-AGENT-PIPELINE: Token budget ENFORCED — exceeded: {} / {} tokens used (cost=${:.4})",
+                    total_tokens, config.max_context_tokens, total_cost_usd
+                );
+                // Mark goal as not achieved when budget is enforced and exceeded
+                goal_achieved = false;
+            } else {
+                warn!(
+                    "MULTI-AGENT-PIPELINE: Token budget exceeded: {} / {} tokens used (cost=${:.4})",
+                    total_tokens, config.max_context_tokens, total_cost_usd
+                );
+            }
         }
 
         let result = MultiAgentPipelineResult {
@@ -1006,13 +1285,14 @@ Only output the JSON array, nothing else."#,
 
         info!("MULTI-AGENT-PIPELINE: {}", result.summary());
 
-        // Persist agent traces for meta-optimizer analysis
-        if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_traces(
+        // Traces were persisted incrementally after each agent phase.
+        // Backfill downstream_success on all traces now that final outcome is known.
+        if let Err(e) = crate::database::pipeline_traces::backfill_downstream_success(
             &self.checkpoint_db,
             &config.execution_id,
-            &result.agent_traces,
+            result.goal_achieved,
         ) {
-            warn!("Failed to persist pipeline agent traces: {}", e);
+            warn!("Failed to backfill downstream_success on pipeline traces: {}", e);
         }
 
         // Store the full pipeline result in task run result_data for autoresearch retrieval
@@ -1030,6 +1310,10 @@ Only output the JSON array, nothing else."#,
 }
 
 /// Get a truncated file tree from the project directory using `git ls-files`.
+///
+/// Deprecated: use `get_file_tree_l0()` for directory-only summaries (lower token cost).
+/// Retained as the L2 equivalent for cases where full file listings are needed.
+#[allow(dead_code)]
 pub(super) fn get_file_tree(project_path: &str) -> String {
     let output = std::process::Command::new("git")
         .args(["ls-files", "--others", "--cached", "--exclude-standard"])

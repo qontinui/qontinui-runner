@@ -309,6 +309,8 @@ pub async fn sync_workflows_from_backend(
                     quality_report: workflow.quality_report.clone(),
                     acceptance_criteria: workflow.acceptance_criteria.clone(),
                     ai_reviewed: Some(workflow.ai_reviewed),
+                    workflow_architecture: workflow.workflow_architecture.clone(),
+                    enforce_token_budget: Some(workflow.enforce_token_budget),
                 };
                 if let Err(e) = db.update_unified_workflow(&workflow.id, &update_req) {
                     warn!("Failed to update cached workflow {}: {}", workflow.id, e);
@@ -355,6 +357,8 @@ pub async fn sync_workflows_from_backend(
                     quality_report: workflow.quality_report.clone(),
                     acceptance_criteria: workflow.acceptance_criteria.clone(),
                     ai_reviewed: Some(workflow.ai_reviewed),
+                    workflow_architecture: workflow.workflow_architecture.clone(),
+                    enforce_token_budget: Some(workflow.enforce_token_budget),
                 };
                 if let Err(e) = db.create_unified_workflow(&create_req) {
                     warn!("Failed to cache workflow {}: {}", workflow.id, e);

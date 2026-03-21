@@ -1138,6 +1138,7 @@ impl LoopController {
                     auto_run_generated: false,
                     approval_gate: config.approval_gate,
                     max_context_tokens: config.max_context_tokens,
+                    enforce_token_budget: config.enforce_token_budget,
                     cross_workflow_learning: config.cross_workflow_learning,
                     verification_history: std::collections::HashMap::new(),
                     routing_context: Default::default(),
@@ -1150,6 +1151,8 @@ impl LoopController {
                     workflow_architecture: config.workflow_architecture.clone(),
                     agentic_verification_config: config.agentic_verification_config.clone(),
                     multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                    rollback_policy: config.rollback_policy.clone(),
+                    iteration_diffs: Vec::new(),
                 };
 
                 // Handle agentic-first: run the agentic phase before the verification loop.
@@ -1723,6 +1726,8 @@ impl LoopController {
                 verification_step_count: Some(total_verification_steps as i64),
                 agentic_step_count: Some(total_agentic_steps as i64),
                 has_ui_bridge,
+                total_tokens: last_loop_result.as_ref().and_then(|r| r.total_tokens),
+                total_cost_usd: last_loop_result.as_ref().and_then(|r| r.total_cost_usd),
             };
             tokio::spawn(async move {
                 if let Err(e) = db.with_conn(|conn| {
@@ -1896,7 +1901,9 @@ impl LoopController {
             }
 
             // Trigger fixer workflow (30s delay, waits for all children to complete)
-            if config.is_dev_mode {
+            // Skip if verification passed — the fixer is only useful for failed runs.
+            // The fixer's own should_launch_fixer() has Guard 7 for this too (belt-and-suspenders).
+            if config.is_dev_mode && !overall_passed {
                 let fixer_deps = crate::fixer::trigger::FixerDeps {
                     app_state: self.app_state.clone(),
                     config_storage: self.config_storage.clone(),
@@ -2155,6 +2162,8 @@ impl LoopController {
                     was_stopped: true,
                     unfixable_errors: false,
                     iteration_results,
+                    total_tokens: None,
+                    total_cost_usd: None,
                 };
             }
 
@@ -2172,6 +2181,8 @@ impl LoopController {
                     was_stopped: true,
                     unfixable_errors: false,
                     iteration_results,
+                    total_tokens: None,
+                    total_cost_usd: None,
                 };
             }
 
@@ -2193,6 +2204,8 @@ impl LoopController {
                             was_stopped: false,
                             unfixable_errors: true,
                             iteration_results,
+                            total_tokens: None,
+                            total_cost_usd: None,
                         };
                     }
                 }
@@ -2230,6 +2243,8 @@ impl LoopController {
                     was_stopped: false,
                     unfixable_errors: true,
                     iteration_results,
+                    total_tokens: None,
+                    total_cost_usd: None,
                 };
             }
 
@@ -2462,6 +2477,43 @@ impl LoopController {
 
             // Add step results to overall results
             all_step_results.extend(step_results);
+
+            // Emit pipeline agent trace for the verification phase
+            {
+                let trace = crate::autoresearch::agentic_verification::PipelineAgentTrace {
+                    agent_type: "verification".to_string(),
+                    agent_id: format!("verifier_iter{}", iteration),
+                    run_id: config.execution_id.clone(),
+                    input_snapshot: serde_json::json!({
+                        "iteration": iteration,
+                        "total_steps": verification_result.total_steps,
+                    }),
+                    output_snapshot: serde_json::json!({
+                        "all_passed": verification_result.all_passed,
+                        "passed_steps": verification_result.passed_steps,
+                        "failed_steps": verification_result.failed_steps,
+                        "critical_failure": verification_result.critical_failure,
+                    }),
+                    config: Default::default(),
+                    duration_ms: 0, // verification timing not separately tracked
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cost_usd: 0.0,
+                    downstream_success: None, // backfilled after loop completes
+                    output_quality_score: None,
+                    parent_span_id: None,
+                    span_type: "verification".to_string(),
+                    guardrail_results: vec![],
+                    handoff_received: None,
+                };
+                if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
+                    &self.checkpoint_db,
+                    &config.execution_id,
+                    &trace,
+                ) {
+                    debug!("Failed to persist verification trace: {}", e);
+                }
+            }
 
             // Log verification results to output_log so the summary AI has context
             {
@@ -2721,6 +2773,8 @@ impl LoopController {
                     was_stopped: false,
                     unfixable_errors: false,
                     iteration_results,
+                    total_tokens: None,
+                    total_cost_usd: None,
                 };
             }
 
@@ -2751,6 +2805,8 @@ impl LoopController {
                     was_stopped: false,
                     unfixable_errors: false,
                     iteration_results,
+                    total_tokens: None,
+                    total_cost_usd: None,
                 };
             }
 
@@ -3161,6 +3217,44 @@ impl LoopController {
                 &UnifiedWorkflowState::agentic_complete(iteration),
             );
 
+            // Emit pipeline agent trace for the agentic phase (populates
+            // pipeline_agent_traces for meta-optimizer analysis — works for
+            // traditional architecture, not just MultiAgentPipeline).
+            {
+                let trace = crate::autoresearch::agentic_verification::PipelineAgentTrace {
+                    agent_type: "agentic_fixer".to_string(),
+                    agent_id: format!("fixer_iter{}", iteration),
+                    run_id: config.execution_id.clone(),
+                    input_snapshot: serde_json::json!({
+                        "iteration": iteration,
+                        "failure_context_len": failure_context.len(),
+                        "has_agentic_steps": has_agentic_steps,
+                    }),
+                    output_snapshot: serde_json::json!({
+                        "success": agentic_outcome.is_success(),
+                        "files_modified": &iteration_files,
+                    }),
+                    config: Default::default(),
+                    duration_ms: agentic_duration_ms,
+                    tokens_in: 0,  // not tracked at this level
+                    tokens_out: 0,
+                    cost_usd: 0.0,
+                    downstream_success: None, // backfilled after loop completes
+                    output_quality_score: None,
+                    parent_span_id: None,
+                    span_type: "agent".to_string(),
+                    guardrail_results: vec![],
+                    handoff_received: None,
+                };
+                if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
+                    &self.checkpoint_db,
+                    &config.execution_id,
+                    &trace,
+                ) {
+                    debug!("Failed to persist agentic trace: {}", e);
+                }
+            }
+
             // Log agentic output to database
             // CRITICAL: Use append_task_output_ex with check_completion_marker=false
             // The AI may output [TASK_COMPLETE] but that does NOT mean verification passed!
@@ -3439,6 +3533,8 @@ impl LoopController {
                     was_stopped: false,
                     unfixable_errors: true,
                     iteration_results,
+                    total_tokens: None,
+                    total_cost_usd: None,
                 };
             }
 
@@ -3453,6 +3549,8 @@ impl LoopController {
                     was_stopped: true,
                     unfixable_errors: false,
                     iteration_results,
+                    total_tokens: None,
+                    total_cost_usd: None,
                 };
             }
 
@@ -3470,6 +3568,8 @@ impl LoopController {
                     was_stopped: true,
                     unfixable_errors: false,
                     iteration_results,
+                    total_tokens: None,
+                    total_cost_usd: None,
                 };
             }
 
@@ -3695,6 +3795,8 @@ impl LoopController {
                         was_stopped: true,
                         unfixable_errors: false,
                         iteration_results,
+                        total_tokens: None,
+                        total_cost_usd: None,
                     };
                 }
                 if !approval_response.approved {
@@ -3818,6 +3920,16 @@ impl LoopController {
                     "issue_ids": auto_detected_ids,
                 }),
             );
+        }
+
+        // Backfill downstream_success on all traces emitted during this loop.
+        // This correlates each iteration's agent performance with the final outcome.
+        if let Err(e) = crate::database::pipeline_traces::backfill_downstream_success(
+            &self.checkpoint_db,
+            &config.execution_id,
+            loop_result.verification_passed,
+        ) {
+            debug!("Failed to backfill downstream_success on traces: {}", e);
         }
 
         loop_result

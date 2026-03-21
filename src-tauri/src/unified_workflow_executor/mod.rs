@@ -61,10 +61,12 @@ mod agentic_verification_loop;
 pub mod approval;
 pub(crate) mod auto_run;
 mod canvas_panels;
+pub mod compensation;
 pub mod conditional_routing;
 pub mod convergence;
 mod health_monitor;
 mod loop_controller;
+pub mod replay;
 pub mod multi_agent_fixer;
 mod multi_agent_pipeline_loop;
 pub mod output_parser;
@@ -105,7 +107,9 @@ pub use types::{get_parent_task_id, LoopConfig, LoopResult, StageConfig, Workflo
 #[allow(unused_imports)]
 pub use startup_resume::WorkflowResult;
 #[allow(unused_imports)]
-pub use types::{AgenticOutcome, IterationResult};
+pub use types::{
+    AgenticOutcome, IterationCommit, IterationDiff, IterationResult, ReplayPoint, RollbackPolicy,
+};
 
 // Re-export phase executors for testing or advanced usage
 // Note: These implement the Executor trait for use with FromContext pattern

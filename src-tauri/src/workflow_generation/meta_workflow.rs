@@ -373,6 +373,9 @@ pub fn build_meta_workflow_template(
         multi_agent_mode: true,
         use_worktree: false,
         model_overrides: std::collections::HashMap::new(),
+        enforce_token_budget: false,
+        rollback_policy: None,
+        workflow_architecture: None,
         created_at: now.clone(),
         updated_at: now,
     }

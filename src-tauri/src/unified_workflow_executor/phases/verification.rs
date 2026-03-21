@@ -236,10 +236,17 @@ impl VerificationExecutor {
             if step_result.success {
                 checkpoint.mark_success(serde_json::to_string(step_result).ok(), duration_ms);
             } else {
-                checkpoint.mark_failed(
-                    step_result.error.as_deref().unwrap_or("Unknown error"),
-                    duration_ms,
+                // Annotate failure with structured error code for AI consumption
+                let raw_error = step_result.error.as_deref().unwrap_or("Unknown error");
+                let error_code =
+                    crate::mcp::ui_bridge::classify_assertion_failure(raw_error);
+                let recovery =
+                    crate::mcp::ui_bridge::recovery_hint_for(&error_code);
+                let annotated_error = format!(
+                    "[{:?} → {:?}] {}",
+                    error_code, recovery, raw_error
                 );
+                checkpoint.mark_failed(&annotated_error, duration_ms);
             }
 
             if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {

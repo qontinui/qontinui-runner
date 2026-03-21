@@ -208,6 +208,8 @@ fn build_calculator_workflow(
         quality_report: None,
         acceptance_criteria: None,
         ai_reviewed: None,
+        workflow_architecture: None,
+        enforce_token_budget: None,
     }
 }
 
@@ -294,6 +296,8 @@ fn build_tdd_workflow(
         quality_report: None,
         acceptance_criteria: None,
         ai_reviewed: None,
+        workflow_architecture: None,
+        enforce_token_budget: None,
     }
 }
 
@@ -381,5 +385,7 @@ fn build_pipeline_workflow(
         quality_report: None,
         acceptance_criteria: None,
         ai_reviewed: None,
+        workflow_architecture: None,
+        enforce_token_budget: None,
     }
 }

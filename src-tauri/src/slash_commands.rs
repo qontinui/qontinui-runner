@@ -224,6 +224,8 @@ fn build_workflow_request(parsed: &SlashCommandParsed) -> CreateUnifiedWorkflowR
         quality_report: None,
         acceptance_criteria: None,
         ai_reviewed: None,
+        workflow_architecture: None,
+        enforce_token_budget: None,
     }
 }
 
@@ -340,6 +342,8 @@ pub fn sync_slash_commands(db: &CheckpointDb) -> Result<SyncResult, String> {
                     quality_report: None,
                     acceptance_criteria: None,
                     ai_reviewed: None,
+                    workflow_architecture: None,
+                    enforce_token_budget: None,
                 };
 
                 match db.update_slash_command_content(
