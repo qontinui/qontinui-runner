@@ -113,14 +113,6 @@ function AppContent() {
   const [activeLogSubTab, setActiveLogSubTab] = useState<LogSubTab>("general");
   const [showLogSourcePicker, setShowLogSourcePicker] = useState(false);
 
-  const _handleEditWorkflow = useCallback(
-    (workflowId: string) => {
-      setEditWorkflowId(workflowId);
-      setActiveTab("unified-workflow-builder");
-    },
-    [setActiveTab],
-  );
-
   useEffect(() => {
     if (activeTab !== "unified-workflow-builder") {
       setEditWorkflowId(null);

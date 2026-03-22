@@ -95,6 +95,10 @@ async function saveWorkflowAndNavigate(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(workflowPayload),
   });
+  if (!response.ok) {
+    console.error("[Specs] HTTP error saving workflow:", response.status, response.statusText);
+    return;
+  }
   const data = await response.json();
   if (data.success && data.data?.id && onNavigate) {
     onNavigate(data.data.id);

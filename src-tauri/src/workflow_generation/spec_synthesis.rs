@@ -323,10 +323,38 @@ pub fn synthesize_verification_steps(
     }
 }
 
+/// Returns `true` if the command string contains shell meta-characters that
+/// could allow injection (chaining, redirection, substitution).
+fn contains_shell_injection(cmd: &str) -> bool {
+    // Reject commands that chain or redirect via shell metacharacters.
+    // This is intentionally conservative — commands that need these operators
+    // should be wrapped in a script file instead.
+    let dangerous_patterns: &[&str] = &[
+        "&&", "||", ";", "|", ">", "<", "$(", "${", "`",
+    ];
+    dangerous_patterns.iter().any(|p| cmd.contains(p))
+}
+
+/// Shell-escape a string for safe inclusion inside single quotes.
+/// Replaces `'` with `'\''` (end quote, escaped quote, start quote).
+fn shell_escape_single_quoted(s: &str) -> String {
+    s.replace('\'', "'\\''")
+}
+
 /// Derive a shell command from a criterion's verification hint.
 ///
 /// Attempts to extract a concrete command from the hint text. Falls back to
 /// echoing the hint if no command can be extracted.
+///
+/// # Security
+///
+/// The backtick-extraction, curl-extraction, and `Run ` prefix paths return
+/// commands derived from user-authored `verification_hint` text. These commands
+/// are eventually executed in a sandboxed shell. To reduce the risk of
+/// injection via crafted hints, we reject any extracted command that contains
+/// shell meta-characters (`;`, `&&`, `||`, `|`, redirects, or substitutions).
+/// Commands that legitimately need these operators should be placed in a script
+/// file and referenced by path instead.
 fn derive_command(criterion: &AcceptanceCriterion, working_dir: &Option<String>) -> String {
     let hint = &criterion.verification_hint;
 
@@ -335,7 +363,10 @@ fn derive_command(criterion: &AcceptanceCriterion, working_dir: &Option<String>)
         if let Some(end) = hint[start + 1..].find('`') {
             let extracted = &hint[start + 1..start + 1 + end];
             if !extracted.is_empty() && (!extracted.contains(' ') || extracted.contains("--")) {
-                return extracted.to_string();
+                if !contains_shell_injection(extracted) {
+                    return extracted.to_string();
+                }
+                // Fall through to safer alternatives if injection detected
             }
         }
     }
@@ -362,7 +393,10 @@ fn derive_command(criterion: &AcceptanceCriterion, working_dir: &Option<String>)
                 .find('\n')
                 .or_else(|| rest.find('"'))
                 .unwrap_or(rest.len());
-            return rest[..end].trim().to_string();
+            let extracted = rest[..end].trim().to_string();
+            if !contains_shell_injection(&extracted) {
+                return extracted;
+            }
         }
     }
 
@@ -376,7 +410,9 @@ fn derive_command(criterion: &AcceptanceCriterion, working_dir: &Option<String>)
                 .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')')
                 .unwrap_or(rest.len());
             let url = &rest[..end];
-            return format!("curl -sf {}", url);
+            if !contains_shell_injection(url) {
+                return format!("curl -sf {}", url);
+            }
         }
     }
 
@@ -385,13 +421,14 @@ fn derive_command(criterion: &AcceptanceCriterion, working_dir: &Option<String>)
     if hint.starts_with("Run ") {
         // Strip "Run " prefix and backticks
         let cmd = hint.trim_start_matches("Run ").trim_matches('`').trim();
-        if !cmd.is_empty() {
+        if !cmd.is_empty() && !contains_shell_injection(cmd) {
             return cmd.to_string();
         }
     }
 
-    // Last resort: echo a pass/fail check
-    format!("echo 'TODO: verify {}' && exit 1", criterion.id)
+    // Last resort: echo a pass/fail check (shell-escape the id to prevent injection)
+    let safe_id = shell_escape_single_quoted(&criterion.id);
+    format!("echo 'TODO: verify {}' && exit 1", safe_id)
 }
 
 // ============================================================================
