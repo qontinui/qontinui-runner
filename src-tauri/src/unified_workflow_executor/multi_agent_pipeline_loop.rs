@@ -209,8 +209,12 @@ fn build_dependency_dag(criteria: &[PipelineAcceptanceCriterion]) -> ExecutionDA
     for c in criteria {
         for dep in &c.depends_on {
             if id_set.contains(dep.as_str()) {
-                *in_degree.get_mut(c.id.as_str()).unwrap() += 1;
-                dependents_map.get_mut(dep.as_str()).unwrap().push(&c.id);
+                if let Some(deg) = in_degree.get_mut(c.id.as_str()) {
+                    *deg += 1;
+                }
+                if let Some(deps) = dependents_map.get_mut(dep.as_str()) {
+                    deps.push(&c.id);
+                }
             }
         }
     }
@@ -233,16 +237,17 @@ fn build_dependency_dag(criteria: &[PipelineAcceptanceCriterion]) -> ExecutionDA
         let level_idx = levels.len();
 
         for _ in 0..layer_size {
-            let node = queue.pop_front().unwrap();
+            let Some(node) = queue.pop_front() else { break };
             layer.push(node.to_string());
             node_level.insert(node, level_idx);
             processed += 1;
 
-            for &dep in dependents_map.get(node).unwrap() {
-                let deg = in_degree.get_mut(dep).unwrap();
-                *deg -= 1;
-                if *deg == 0 {
-                    queue.push_back(dep);
+            for &dep in dependents_map.get(node).unwrap_or(&Vec::new()) {
+                if let Some(deg) = in_degree.get_mut(dep) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(dep);
+                    }
                 }
             }
         }
@@ -321,7 +326,9 @@ fn build_dependency_dag(criteria: &[PipelineAcceptanceCriterion]) -> ExecutionDA
                 max_level = level;
             }
 
-            let c = criteria.iter().find(|c| c.id == crit_id).unwrap();
+            let Some(c) = criteria.iter().find(|c| c.id == crit_id) else {
+                continue;
+            };
             let has_internal_dep = c.depends_on.iter().any(|d| group.contains(&d.as_str()));
             if !has_internal_dep {
                 root_criteria.push(crit_id.to_string());
@@ -692,8 +699,9 @@ impl LoopController {
             cp.last_completed_phase >= 4 && cp.located_criteria.is_some()
         });
 
+        let empty_located: Vec<LocatedCriterion> = Vec::new();
         let mut located_criteria: Vec<LocatedCriterion> = if has_checkpoint_located {
-            let saved = checkpoint.as_ref().unwrap().located_criteria.as_ref().unwrap();
+            let saved = checkpoint.as_ref().and_then(|cp| cp.located_criteria.as_ref()).unwrap_or(&empty_located);
             info!(
                 "MULTI-AGENT-PIPELINE: Phase 4 — Restoring {} located criteria from checkpoint (skipping AI locator)",
                 saved.len()
@@ -1275,13 +1283,16 @@ Only output the JSON array, nothing else."#,
 
         // Restore any canary config overrides to their original values
         for (key, original) in &canary_config_originals {
-            if let Some(val) = original {
-                if let Err(e) = self.checkpoint_db.set_setting(key, val) {
-                    warn!("MULTI-AGENT-PIPELINE: Failed to restore config {}: {}", key, e);
+            match original {
+                Some(val) => {
+                    if let Err(e) = self.checkpoint_db.set_setting(key, val) {
+                        warn!("MULTI-AGENT-PIPELINE: Failed to restore config {}: {}", key, e);
+                    }
+                }
+                None => {
+                    let _ = self.checkpoint_db.delete_setting(key);
                 }
             }
-            // If no original existed, the setting was newly created by canary.
-            // We leave it in place — it won't affect behavior unless explicitly queried.
         }
 
         result.to_loop_result()
@@ -1807,33 +1818,6 @@ Only output the JSON array, nothing else."#,
     }
 }
 
-/// Get a truncated file tree from the project directory using `git ls-files`.
-///
-/// Deprecated: use `get_file_tree_l0()` for directory-only summaries (lower token cost).
-/// Retained as the L2 equivalent for cases where full file listings are needed.
-#[allow(dead_code)]
-pub(super) fn get_file_tree(project_path: &str) -> String {
-    let output = std::process::Command::new("git")
-        .args(["ls-files", "--others", "--cached", "--exclude-standard"])
-        .current_dir(project_path)
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let files = String::from_utf8_lossy(&out.stdout);
-            let lines: Vec<&str> = files.lines().take(500).collect();
-            let total = files.lines().count();
-            let mut result = lines.join("\n");
-            if total > 500 {
-                result.push_str(&format!("\n... and {} more files (truncated)", total - 500));
-            }
-            result
-        }
-        _ => {
-            format!("(Could not list files in {})", project_path)
-        }
-    }
-}
 
 /// L0 file tree: directory structure only (unique directory paths).
 /// Much smaller than the full file listing — typically 10-50x fewer lines.

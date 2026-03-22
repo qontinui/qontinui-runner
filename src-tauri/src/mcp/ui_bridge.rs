@@ -392,7 +392,7 @@ impl UiBridgeCircuitBreaker {
                     .load(std::sync::atomic::Ordering::Relaxed);
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_millis() as u64;
                 if now - last_failure >= self.cooldown_ms {
                     *state = CircuitBreakerState::HalfOpen;
@@ -432,7 +432,7 @@ impl UiBridgeCircuitBreaker {
     pub async fn record_failure(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
         self.last_failure_time
             .store(now, std::sync::atomic::Ordering::Relaxed);
@@ -472,7 +472,7 @@ impl UiBridgeCircuitBreaker {
             + 1;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
         self.last_recovery_time
             .store(now, std::sync::atomic::Ordering::Relaxed);
@@ -523,7 +523,7 @@ impl UiBridgeCircuitBreaker {
     pub async fn get_failure_count(&self) -> u32 {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
         let timestamps = self.failure_timestamps.lock().await;
         let cutoff = now.saturating_sub(self.window_ms);
@@ -553,7 +553,7 @@ pub async fn ui_bridge_request_sync(
     if last_pong > 0 {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
         let pong_age = now - last_pong;
         if pong_age > 15000 {
@@ -4278,7 +4278,7 @@ pub async fn ui_bridge_diagnostics_handler(
             "lastPongAgeMs": if last_pong > 0 {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_millis() as u64;
                 now - last_pong
             } else { 0 }
@@ -4293,7 +4293,7 @@ pub async fn ui_bridge_pong_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64;
     state
         .ui_bridge_last_pong
@@ -4314,7 +4314,7 @@ pub async fn ui_bridge_ipc_response_handler(
     // Also update pong timestamp since this proves the frontend is alive
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64;
     state
         .ui_bridge_last_pong

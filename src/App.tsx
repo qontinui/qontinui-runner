@@ -95,7 +95,6 @@ function AppContent() {
     setActiveTab,
     sidebarCollapsed,
     handleSidebarCollapsedChange,
-    terminalSessionCount: _terminalSessionCount,
     setTerminalSessionCount,
     staleTaskMessage,
     setStaleTaskMessage,
@@ -131,7 +130,6 @@ function AppContent() {
     copyLogs,
     logCount,
     imageLogCount,
-    aiOutputLogCount: _aiOutputLogCount,
   } = useLogManager();
 
   const {
@@ -168,7 +166,7 @@ function AppContent() {
     if (auth.authStatus?.authenticated && !auth.loading) {
       projectSelection.loadProjects();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- loadProjects changes with selectedProjectId; including it would reload projects on every selection change
   }, [auth.authStatus?.authenticated, auth.loading]);
 
   useEffect(() => {
@@ -178,8 +176,11 @@ function AppContent() {
         projectSelection.selectedProjectName,
       );
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectSelection.selectedProjectId, projectSelection.selectedProjectName]);
+  }, [
+    projectSelection.selectedProjectId,
+    projectSelection.selectedProjectName,
+    projectLogs.loadConfig,
+  ]);
 
   useEffect(() => {
     const cleanup = setupEventHandlers(eventRouter, {
@@ -189,7 +190,7 @@ function AppContent() {
     });
 
     return cleanup;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-time setup; setters are stable useState dispatchers accessed via context object
   }, []);
 
   useEffect(() => {

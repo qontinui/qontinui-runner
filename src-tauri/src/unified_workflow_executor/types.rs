@@ -339,7 +339,6 @@ pub struct LoopConfig {
     pub rollback_policy: RollbackPolicy,
     /// Accumulated iteration diffs (runtime state, not persisted in config).
     /// Populated during loop execution for cross-iteration context injection.
-    #[allow(dead_code)]
     pub iteration_diffs: Vec<IterationDiff>,
     /// Restrict working directory resolution to the workspace boundary.
     /// Propagated to HandlerContext.path_scope_policy during step execution.

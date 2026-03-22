@@ -182,6 +182,10 @@ pub fn check_and_launch_optimizers(
         &source_task_run_id,
     );
 
+    // Maintenance: dedup pending recommendations and reject stale ones (>30 days)
+    super::recommendations::dedup_pending_recommendations(db);
+    super::recommendations::auto_reject_stale_recommendations(db);
+
     // Auto-evaluate applied recommendations that are due for re-evaluation.
     // Only re-evaluate recs applied >7 days ago whose verdict is still "insufficient_data".
     auto_evaluate_outcomes(db);

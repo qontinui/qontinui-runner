@@ -56,6 +56,17 @@ impl CheckpointDb {
         Ok(())
     }
 
+    /// Delete a setting by key. Returns true if a row was deleted.
+    pub fn delete_setting(&self, key: &str) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+
+        let rows = conn
+            .execute("DELETE FROM settings WHERE key = ?1", params![key])
+            .map_err(|e| format!("Failed to delete setting: {}", e))?;
+
+        Ok(rows > 0)
+    }
+
     /// Get all settings as a JSON object.
     pub fn get_all_settings(&self) -> Result<serde_json::Value, String> {
         let conn = self.get_conn()?;

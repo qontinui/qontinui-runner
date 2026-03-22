@@ -472,6 +472,98 @@ pub fn reject_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Resu
     })
 }
 
+/// Deduplicate pending recommendations by content hash.
+///
+/// For each group of pending recs with the same content hash, keeps the oldest
+/// and supersedes the rest. Also backfills content_hash for older rows that lack it.
+pub fn dedup_pending_recommendations(db: &CheckpointDb) -> usize {
+    // First, backfill content_hash for any pending recs that don't have one
+    let pending = match list_recommendations(db, None, Some("pending")) {
+        Ok(recs) => recs,
+        Err(_) => return 0,
+    };
+
+    let mut backfilled = 0;
+    for rec in &pending {
+        // Backfill hash if missing
+        let hash = compute_content_hash(
+            &rec.optimizer_type,
+            &rec.recommendation_type,
+            rec.target_agent.as_deref(),
+            rec.recommended_value.as_deref(),
+        );
+        let id = rec.id.clone();
+        let _ = db.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE meta_optimizer_recommendations SET content_hash = ?1 WHERE id = ?2 AND content_hash IS NULL",
+                params![hash, id],
+            )
+            .map_err(|e| format!("Failed to backfill hash: {}", e))
+        });
+        backfilled += 1;
+    }
+
+    // Now find and supersede duplicates (keep oldest per hash)
+    let superseded: usize = db
+        .with_conn(|conn| {
+            let affected = conn
+                .execute(
+                    r#"UPDATE meta_optimizer_recommendations SET status = 'superseded'
+                       WHERE id IN (
+                           SELECT r.id FROM meta_optimizer_recommendations r
+                           WHERE r.status = 'pending' AND r.content_hash IS NOT NULL
+                             AND r.created_at > (
+                                 SELECT MIN(r2.created_at) FROM meta_optimizer_recommendations r2
+                                 WHERE r2.content_hash = r.content_hash
+                                   AND r2.status IN ('pending', 'canary', 'applied')
+                             )
+                       )"#,
+                    [],
+                )
+                .map_err(|e| format!("Dedup query failed: {}", e))?;
+            Ok(affected)
+        })
+        .unwrap_or(0);
+
+    if superseded > 0 {
+        info!(
+            "Dedup: superseded {} duplicate pending recommendation(s) (backfilled {} hashes)",
+            superseded, backfilled
+        );
+    }
+
+    superseded
+}
+
+/// Auto-reject pending recommendations older than 30 days.
+///
+/// Stale recs block the optimizer from regenerating fresh suggestions for the
+/// same targets. Rejecting them frees those slots while preserving history.
+pub fn auto_reject_stale_recommendations(db: &CheckpointDb) -> usize {
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+
+    let rejected: usize = db
+        .with_conn(move |conn| {
+            let affected = conn
+                .execute(
+                    "UPDATE meta_optimizer_recommendations SET status = 'rejected' WHERE status = 'pending' AND created_at < ?1",
+                    params![cutoff],
+                )
+                .map_err(|e| format!("Stale rejection failed: {}", e))?;
+            Ok(affected)
+        })
+        .unwrap_or(0);
+
+    if rejected > 0 {
+        info!(
+            "Auto-rejected {} stale pending recommendation(s) (older than 30 days)",
+            rejected
+        );
+    }
+
+    rejected
+}
+
 /// Roll back an applied recommendation, undoing side-effects where possible.
 pub fn rollback_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Result<(), String> {
     let rec = get_recommendation(db, recommendation_id)?;
