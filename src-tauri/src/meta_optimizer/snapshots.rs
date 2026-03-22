@@ -82,8 +82,9 @@ pub struct RecommendationOutcome {
 /// Evaluate whether an applied recommendation improved or regressed performance.
 ///
 /// Compares 7-day windows before and after `applied_at` for the target agent.
-/// Verdict thresholds: success_rate drops >5pp → "regressed"; improves >3pp → "improved";
-/// <5 runs → "insufficient_data"; else "neutral".
+/// Uses statistical significance testing (z-test, CI, Cohen's h) via `stats::compute_verdict`
+/// with `VerdictThresholds::recommendation()`. Falls back to simple delta thresholds when
+/// sample sizes are too small for statistical analysis.
 pub fn evaluate_recommendation_outcome(
     db: &CheckpointDb,
     recommendation_id: &str,

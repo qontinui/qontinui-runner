@@ -346,14 +346,35 @@ pub fn parse_rule_examples(output: &str) -> Vec<ParsedRuleExample> {
 
 // ── Deduplication helper ─────────────────────────────────────────────────
 
-/// Check if a pending or rejected recommendation with the same title already exists.
-/// This prevents re-generating recommendations that were previously rejected.
-fn is_duplicate_recommendation(db: &CheckpointDb, title: &str) -> bool {
+/// Check if a recommendation with the same content already exists in a non-terminal state.
+///
+/// Uses content-hash based dedup (optimizer_type + recommendation_type + target_agent +
+/// recommended_value) when the content_hash column is populated, falling back to exact
+/// title match for older rows without hashes.
+fn is_duplicate_recommendation(
+    db: &CheckpointDb,
+    title: &str,
+    optimizer_type: &str,
+    recommendation_type: &str,
+    target_agent: Option<&str>,
+    recommended_value: Option<&str>,
+) -> bool {
+    let hash = super::recommendations::compute_content_hash(
+        optimizer_type,
+        recommendation_type,
+        target_agent,
+        recommended_value,
+    );
+    // Check content hash first (covers pending, canary, applied)
+    if super::recommendations::is_content_duplicate(db, &hash) {
+        return true;
+    }
+    // Fallback: title match for rejected recs (rejected can't be re-created with same title)
     let title = title.to_string();
     db.with_conn(move |conn| {
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE title = ?1 AND status IN ('pending', 'rejected')",
+                "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE title = ?1 AND status = 'rejected'",
                 rusqlite::params![title],
                 |row| row.get(0),
             )
@@ -405,11 +426,6 @@ pub fn save_parsed_recommendations(
                     continue;
                 }
 
-                if is_duplicate_recommendation(db, &title) {
-                    debug!("Skipping duplicate recommendation: {}", title);
-                    continue;
-                }
-
                 // Serialize as JSON payload matching PromptRewritePayload
                 let recommended_value = serde_json::json!({
                     "agent_type": rec.agent_type,
@@ -417,6 +433,11 @@ pub fn save_parsed_recommendations(
                     "prompt_content": rec.prompt_content,
                 })
                 .to_string();
+
+                if is_duplicate_recommendation(db, &title, optimizer_type, "prompt_rewrite", Some(&rec.agent_type), Some(&recommended_value)) {
+                    debug!("Skipping duplicate recommendation: {}", title);
+                    continue;
+                }
 
                 recommendations::create_recommendation(
                     db,
@@ -466,11 +487,6 @@ pub fn save_parsed_recommendations(
                     rec.rationale.clone()
                 };
 
-                if is_duplicate_recommendation(db, &title) {
-                    debug!("Skipping duplicate recommendation: {}", title);
-                    continue;
-                }
-
                 // Serialize as JSON payload matching ConfigChangePayload
                 let current_value = serde_json::json!({
                     "key": format!("architecture.{}", rec.workflow_category),
@@ -482,6 +498,11 @@ pub fn save_parsed_recommendations(
                     "value": rec.recommended_architecture,
                 })
                 .to_string();
+
+                if is_duplicate_recommendation(db, &title, optimizer_type, "config_change", None, Some(&recommended_value)) {
+                    debug!("Skipping duplicate recommendation: {}", title);
+                    continue;
+                }
 
                 recommendations::create_recommendation(
                     db,
@@ -530,11 +551,6 @@ pub fn save_parsed_recommendations(
                     rec.rationale.clone()
                 };
 
-                if is_duplicate_recommendation(db, &title) {
-                    debug!("Skipping duplicate recommendation: {}", title);
-                    continue;
-                }
-
                 // Serialize as JSON payload matching ConfigChangePayload
                 let config_key = format!("{}.{}", rec.architecture, rec.parameter);
                 let current_value = serde_json::json!({
@@ -547,6 +563,11 @@ pub fn save_parsed_recommendations(
                     "value": rec.recommended_value,
                 })
                 .to_string();
+
+                if is_duplicate_recommendation(db, &title, optimizer_type, "config_change", None, Some(&recommended_value)) {
+                    debug!("Skipping duplicate recommendation: {}", title);
+                    continue;
+                }
 
                 recommendations::create_recommendation(
                     db,
@@ -573,16 +594,16 @@ pub fn save_parsed_recommendations(
             info!("Parsed {} ARCH_FINDING(s) from output", findings.len());
             for finding in &findings {
                 let title = finding.title.clone();
-                if is_duplicate_recommendation(db, &title) {
-                    debug!("Skipping duplicate finding: {}", title);
-                    continue;
-                }
                 let metadata = serde_json::json!({
                     "category": finding.category,
                     "severity": finding.severity,
                     "suggested_action": finding.suggested_action,
                 })
                 .to_string();
+                if is_duplicate_recommendation(db, &title, optimizer_type, "finding", None, Some(&metadata)) {
+                    debug!("Skipping duplicate finding: {}", title);
+                    continue;
+                }
                 recommendations::create_recommendation(
                     db,
                     optimizer_type,
@@ -632,11 +653,6 @@ pub fn save_parsed_recommendations(
                     rec.rationale.clone()
                 };
 
-                if is_duplicate_recommendation(db, &title) {
-                    debug!("Skipping duplicate recommendation: {}", title);
-                    continue;
-                }
-
                 // Serialize as JSON payload matching RulePayload
                 let status_override = if rec.action == "disable" {
                     Some("disabled")
@@ -659,6 +675,11 @@ pub fn save_parsed_recommendations(
                     "disable" => "rule_update",
                     _ => "rule_create",
                 };
+
+                if is_duplicate_recommendation(db, &title, optimizer_type, rec_type, Some(&rec.agent), Some(&recommended_value)) {
+                    debug!("Skipping duplicate recommendation: {}", title);
+                    continue;
+                }
 
                 recommendations::create_recommendation(
                     db,
@@ -708,13 +729,14 @@ pub fn save_parsed_recommendations(
     Ok(count)
 }
 
-/// Auto-apply high-confidence rule recommendations and auto-canary prompt rewrites.
+/// Auto-apply high-confidence rule recommendations and auto-canary prompt/config changes.
 ///
 /// - `rule_create` and `rule_update` with confidence >= 0.85 are applied directly
 ///   (safest, most reversible).
 /// - `prompt_rewrite` with confidence >= 0.85 are started as canary rollouts at 20%
 ///   so they can be evaluated before full promotion.
-/// - `config_change` always requires human review.
+/// - `config_change` with confidence >= 0.85 are started as canary rollouts at 10%
+///   (more conservative since config changes affect global behavior).
 pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&str>) {
     let run_id = optimizer_run_id.map(|s| s.to_string());
 
@@ -771,6 +793,7 @@ pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&s
     // Auto-canary prompt rewrites with high confidence (>= 0.85)
     // These are started as canary rollouts at 20% rather than applied directly,
     // since prompt changes have broader impact and benefit from A/B evaluation.
+    let run_id_for_config = run_id.clone();
     let prompt_candidates: Vec<(String, f64)> = db
         .with_conn(move |conn| {
             let mut stmt = conn
@@ -816,6 +839,59 @@ pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&s
         info!(
             "Auto-started {} canary rollout(s) for high-confidence prompt recommendation(s)",
             prompt_candidates.len()
+        );
+    }
+
+    // Auto-canary config changes with high confidence (>= 0.85) at conservative 10% rollout.
+    // Config changes affect global behavior, so use lower rollout than prompt rewrites.
+    let config_candidates: Vec<(String, f64)> = db
+        .with_conn({
+            let run_id = run_id_for_config.clone();
+            move |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        r#"SELECT id, confidence FROM meta_optimizer_recommendations
+                           WHERE status = 'pending'
+                             AND recommendation_type = 'config_change'
+                             AND confidence >= 0.85
+                             AND (?1 IS NULL OR optimizer_run_id = ?1)"#,
+                    )
+                    .map_err(|e| format!("Query error: {}", e))?;
+
+                let rows = stmt
+                    .query_map(rusqlite::params![run_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                    })
+                    .map_err(|e| format!("Query error: {}", e))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                Ok(rows)
+            }
+        })
+        .unwrap_or_default();
+
+    for (rec_id, confidence) in &config_candidates {
+        match super::canary::start_canary(db, rec_id, 10) {
+            Ok(canary_id) => {
+                info!(
+                    "Auto-started canary {} for config recommendation {} (confidence: {:.0}%, rollout: 10%)",
+                    canary_id, rec_id, confidence * 100.0
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to auto-start canary for config recommendation {}: {}",
+                    rec_id, e
+                );
+            }
+        }
+    }
+
+    if !config_candidates.is_empty() {
+        info!(
+            "Auto-started {} canary rollout(s) for high-confidence config recommendation(s)",
+            config_candidates.len()
         );
     }
 }

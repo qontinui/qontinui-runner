@@ -997,6 +997,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::checkpoint_browser::get_checkpoints_filtered,
             commands::checkpoint_browser::get_checkpoints_paginated,
             commands::checkpoint_browser::get_checkpoints_count,
+            // Durable execution commands (Conductor-inspired replay/rollback)
+            commands::durable_execution::list_replay_points,
+            commands::durable_execution::replay_workflow,
+            commands::durable_execution::rollback_workflow_to_iteration,
+            commands::durable_execution::get_iteration_diffs,
+            commands::durable_execution::get_iteration_commits,
             // Database maintenance commands
             commands::database::optimize_database,
             commands::database::get_database_stats,

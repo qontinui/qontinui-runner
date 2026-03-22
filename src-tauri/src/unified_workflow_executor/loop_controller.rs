@@ -29,11 +29,13 @@ use crate::summary_generator::generate_task_summary_async;
 use crate::AppState;
 
 use super::canvas_panels::CanvasPanelManager;
+use super::compensation::{self, CompensationManager};
 use super::phases::{AgenticExecutor, CompletionExecutor, SetupExecutor, VerificationExecutor};
 use super::resume::{ResumeManager, ResumePoint};
 use super::states::UnifiedWorkflowState;
 use super::types::{
-    get_parent_task_id, AgenticOutcome, IterationResult, LoopConfig, LoopResult, SweepResult,
+    get_parent_task_id, AgenticOutcome, IterationResult, LoopConfig, LoopResult, RollbackPolicy,
+    SweepResult,
 };
 
 /// The main loop controller for unified workflows.
@@ -2149,6 +2151,19 @@ impl LoopController {
         // its changes degraded the app.
         let mut pending_health_regression: Option<String> = None;
 
+        // Conductor-inspired durable execution: compensation manager for commit
+        // checkpointing and rollback, plus accumulated diffs for cross-iteration context.
+        let compensation_manager = CompensationManager::new(self.checkpoint_db.clone());
+        let mut accumulated_diffs: Vec<super::types::IterationDiff> = Vec::new();
+
+        // Capture initial HEAD before the loop starts — used as source_commit for
+        // the Clean rollback policy (revert to pre-workflow state).
+        let initial_source_commit = if let Some(ref p) = config.project_path {
+            compensation::get_head_commit_async(std::path::Path::new(p)).await
+        } else {
+            None
+        };
+
         let loop_result = loop {
             iteration += 1;
 
@@ -3065,6 +3080,28 @@ impl LoopController {
                 ctx
             };
 
+            // Inject cross-iteration diff context so the AI knows what previous
+            // iterations changed. Uses the structured diffs captured by compensation module.
+            let failure_context = if !accumulated_diffs.is_empty() {
+                let diff_section =
+                    compensation::format_iteration_diffs_context(&accumulated_diffs, 8000);
+                if !diff_section.is_empty() {
+                    format!("{}\n\n{}", failure_context, diff_section)
+                } else {
+                    failure_context
+                }
+            } else {
+                failure_context
+            };
+
+            // Capture HEAD commit before agentic phase for structured diff tracking.
+            let working_dir = config.project_path.as_deref().map(std::path::Path::new);
+            let commit_before = if let Some(wd) = working_dir {
+                compensation::get_head_commit_async(wd).await
+            } else {
+                None
+            };
+
             // Capture error baseline before agentic phase for regression detection.
             // After the AI makes changes, we compare to identify newly introduced errors.
             let pre_agentic_health = fetch_pre_agentic_health_baseline().await;
@@ -3861,8 +3898,65 @@ impl LoopController {
 
             // Capture git diff after agentic phase for cross-iteration context.
             // This helps the AI understand what it changed in the previous iteration.
+            // Also captures structured IterationDiff and records commit checkpoint
+            // for the compensation module (Conductor-inspired durable execution).
             {
                 let parent_id = get_parent_task_id(&config.execution_id);
+
+                // Capture HEAD after agentic phase for commit checkpoint
+                let commit_after = if let Some(wd) = working_dir {
+                    compensation::get_head_commit_async(wd).await
+                } else {
+                    None
+                };
+
+                // Record commit checkpoint for this iteration (enables rollback)
+                if let Some(ref hash) = commit_after {
+                    if let Err(e) = compensation_manager.record_iteration_commit(
+                        &config.execution_id,
+                        iteration,
+                        hash,
+                    ) {
+                        warn!(
+                            "COMPENSATION: Failed to record iteration {} commit: {}",
+                            iteration, e
+                        );
+                    } else {
+                        debug!(
+                            "COMPENSATION: Recorded commit {} for iteration {}",
+                            &hash[..hash.len().min(8)],
+                            iteration
+                        );
+                    }
+                }
+
+                // Capture structured iteration diff (uses commit_before from pre-agentic capture)
+                if let Some(wd) = working_dir {
+                    if let Some(diff) = compensation::capture_iteration_diff(
+                        wd,
+                        iteration,
+                        commit_before.as_deref(),
+                        commit_after.as_deref(),
+                    )
+                    .await
+                    {
+                        // Persist to database
+                        if let Err(e) = self.checkpoint_db.append_iteration_diff(
+                            &config.execution_id,
+                            &diff,
+                        ) {
+                            warn!(
+                                "COMPENSATION: Failed to persist iteration diff {}: {}",
+                                iteration, e
+                            );
+                        }
+
+                        // Keep in memory for cross-iteration context injection
+                        accumulated_diffs.push(diff);
+                    }
+                }
+
+                // Legacy: also record as knowledge base observation for backward compat
                 match crate::process_helpers::tokio_no_window("git")
                     .args(["diff", "--stat"])
                     .output()
@@ -3871,7 +3965,6 @@ impl LoopController {
                     Ok(output) if output.status.success() => {
                         let diff_stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
                         if !diff_stat.is_empty() {
-                            // Also capture the actual diff (truncated)
                             let full_diff = match crate::process_helpers::tokio_no_window("git")
                                 .args(["diff"])
                                 .output()
@@ -3929,6 +4022,52 @@ impl LoopController {
             // The loop continues here naturally - no return statement
             // Control flows back to the top of the loop for the next iteration
         };
+
+        // Conductor-inspired compensation: execute rollback if the workflow failed
+        // and a rollback policy is configured. Only runs for non-success exits
+        // (critical failure, max iterations, unfixable errors).
+        if !loop_result.verification_passed
+            && !loop_result.was_stopped
+            && !matches!(config.rollback_policy, RollbackPolicy::None)
+        {
+            if let Some(wd) = config.project_path.as_deref().map(std::path::Path::new) {
+                let source_commit = initial_source_commit.as_deref();
+                match compensation_manager
+                    .execute_rollback(
+                        &config.execution_id,
+                        &config.rollback_policy,
+                        wd,
+                        source_commit,
+                        &loop_result.iteration_results,
+                    )
+                    .await
+                {
+                    Ok(Some(commit)) => {
+                        info!(
+                            "COMPENSATION: Rolled back to {} (policy: {:?})",
+                            &commit[..commit.len().min(8)],
+                            config.rollback_policy
+                        );
+                        let _ = self.checkpoint_db.append_task_output_ex(
+                            &config.execution_id,
+                            &format!(
+                                "\n=== COMPENSATION ROLLBACK ===\nRolled back to commit {} (policy: {:?})\n",
+                                &commit[..commit.len().min(8)],
+                                config.rollback_policy
+                            ),
+                            false,
+                            false,
+                        );
+                    }
+                    Ok(None) => {
+                        debug!("COMPENSATION: No rollback performed (policy returned None)");
+                    }
+                    Err(e) => {
+                        warn!("COMPENSATION: Rollback failed: {}", e);
+                    }
+                }
+            }
+        }
 
         // Auto-detect recurring findings → known issues
         let auto_detected_ids: Vec<String> = self

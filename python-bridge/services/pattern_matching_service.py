@@ -302,7 +302,9 @@ class PatternMatchingService:
                 try:
                     from qontinui.hal.implementations.opencv_matcher import OpenCVMatcher
 
-                    matcher = OpenCVMatcher()
+                    if not hasattr(self, "_invariant_matcher"):
+                        self._invariant_matcher = OpenCVMatcher()
+                    matcher = self._invariant_matcher
                     # Convert BGR numpy arrays to PIL for HAL interface
                     haystack_pil = PILImage.fromarray(cv2.cvtColor(search_img, cv2.COLOR_BGR2RGB))
                     needle_pil = PILImage.fromarray(cv2.cvtColor(template_img, cv2.COLOR_BGR2RGB))

@@ -79,7 +79,7 @@ pub mod states;
 mod step_conversion;
 mod task_lifecycle;
 mod task_state;
-mod types;
+pub(crate) mod types;
 
 // Panic handling imports
 use futures_util::FutureExt;

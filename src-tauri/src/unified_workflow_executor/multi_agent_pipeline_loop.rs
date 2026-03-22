@@ -439,6 +439,9 @@ impl LoopController {
             );
         }
 
+        // Track config overrides to restore after pipeline completes
+        let mut canary_config_originals: Vec<(String, Option<serde_json::Value>)> = Vec::new();
+
         // Check for active canary rollouts targeting pipeline agents.
         // If a canary is active, probabilistically decide whether this run uses the canary config.
         let active_canary: Option<(String, String)> = {
@@ -485,6 +488,30 @@ impl LoopController {
                         "MULTI-AGENT-PIPELINE: Failed to load canary prompt overrides: {}",
                         e
                     );
+                }
+            }
+
+            // For canary config_change recs, temporarily apply config overrides.
+            // Store original values to restore after the pipeline completes.
+            match crate::meta_optimizer::canary::get_canary_config_overrides(
+                &self.checkpoint_db,
+                rec_id,
+            ) {
+                Ok(overrides) => {
+                    for (key, value) in overrides {
+                        // Save original value for restoration
+                        let original = self.checkpoint_db.get_setting(&key).ok().flatten();
+                        canary_config_originals.push((key.clone(), original));
+                        // Apply canary config
+                        if let Err(e) = self.checkpoint_db.set_setting(&key, &value) {
+                            warn!("MULTI-AGENT-PIPELINE: Failed to set canary config {}={}: {}", key, value, e);
+                        } else {
+                            info!("MULTI-AGENT-PIPELINE: Canary injecting config override {}={}", key, value);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("MULTI-AGENT-PIPELINE: Failed to load canary config overrides: {}", e);
                 }
             }
         }
@@ -946,6 +973,12 @@ Only output the JSON array, nothing else."#,
                     total_tokens: budget_total_tokens,
                     total_cost_usd: budget_total_cost,
                 };
+                // Restore canary config before early return
+                for (key, original) in &canary_config_originals {
+                    if let Some(val) = original {
+                        let _ = self.checkpoint_db.set_setting(key, val);
+                    }
+                }
                 return result.to_loop_result();
             }
         }
@@ -1075,6 +1108,12 @@ Only output the JSON array, nothing else."#,
                         total_tokens: stopped_total_tokens,
                         total_cost_usd: stopped_total_cost,
                     };
+                    // Restore canary config before early return
+                    for (key, original) in &canary_config_originals {
+                        if let Some(val) = original {
+                            let _ = self.checkpoint_db.set_setting(key, val);
+                        }
+                    }
                     return result.to_loop_result();
                 }
             }
@@ -1232,6 +1271,17 @@ Only output the JSON array, nothing else."#,
             &config.execution_id,
         ) {
             warn!("Failed to clear pipeline checkpoint: {}", e);
+        }
+
+        // Restore any canary config overrides to their original values
+        for (key, original) in &canary_config_originals {
+            if let Some(val) = original {
+                if let Err(e) = self.checkpoint_db.set_setting(key, val) {
+                    warn!("MULTI-AGENT-PIPELINE: Failed to restore config {}: {}", key, e);
+                }
+            }
+            // If no original existed, the setting was newly created by canary.
+            // We leave it in place — it won't affect behavior unless explicitly queried.
         }
 
         result.to_loop_result()

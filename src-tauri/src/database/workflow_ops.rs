@@ -31,7 +31,7 @@ impl CheckpointDb {
                        stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                        completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
                        quality_report, acceptance_criteria, constraint_overrides,
-                       COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture
+                       COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy
                 FROM unified_workflows
                 ORDER BY is_favorite DESC, updated_at DESC
                 "#,
@@ -139,7 +139,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
                     enforce_token_budget: false,
-                    rollback_policy: None,
+                    rollback_policy: row.get::<_, Option<String>>(42)?,
                     strict_cwd: false,
                     tool_tags: Vec::new(),
                     use_worktree: false,
@@ -172,7 +172,7 @@ impl CheckpointDb {
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
                    quality_report, acceptance_criteria, constraint_overrides,
-                   COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture
+                   COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -259,7 +259,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
                     enforce_token_budget: false,
-                    rollback_policy: None,
+                    rollback_policy: row.get::<_, Option<String>>(42)?,
                     strict_cwd: false,
                     tool_tags: Vec::new(),
                     use_worktree: false,
@@ -294,7 +294,7 @@ impl CheckpointDb {
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
                    quality_report, acceptance_criteria, constraint_overrides,
-                   COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture
+                   COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -383,7 +383,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
                     enforce_token_budget: false,
-                    rollback_policy: None,
+                    rollback_policy: row.get::<_, Option<String>>(42)?,
                     strict_cwd: false,
                     tool_tags: Vec::new(),
                     use_worktree: false,
@@ -894,7 +894,7 @@ impl CheckpointDb {
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
                    quality_report, acceptance_criteria, constraint_overrides,
-                   COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture
+                   COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -1031,7 +1031,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
                     enforce_token_budget: false,
-                    rollback_policy: None,
+                    rollback_policy: row.get::<_, Option<String>>(42)?,
                     strict_cwd: false,
                     tool_tags: Vec::new(),
                     use_worktree: false,
@@ -1150,7 +1150,7 @@ impl CheckpointDb {
                        max_sweep_iterations, stages, stop_on_failure, reflection_mode, model_overrides,
                        approval_gate, completion_prompts_first, is_favorite, dependency_graph,
                        cost_annotations, quality_report, acceptance_criteria, constraint_overrides,
-                       COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture
+                       COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy
                 FROM unified_workflows
                 WHERE sync_pending = 1
                 "#,
@@ -1258,7 +1258,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
                     enforce_token_budget: false,
-                    rollback_policy: None,
+                    rollback_policy: row.get::<_, Option<String>>(42)?,
                     strict_cwd: false,
                     tool_tags: Vec::new(),
                     use_worktree: false,

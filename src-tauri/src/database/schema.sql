@@ -274,6 +274,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- Pipeline Checkpoint (v138)
     pipeline_checkpoint TEXT,                   -- JSON: PipelineCheckpoint for resuming multi-agent pipeline from last completed phase
 
+    -- Durable Execution (v139) — Conductor-inspired diff tracking and compensation
+    iteration_diffs TEXT,                      -- JSON array of IterationDiff objects (structured cross-iteration diff tracking)
+    iteration_commits TEXT,                    -- JSON array of IterationCommit objects ({iteration, commit_hash, timestamp})
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -943,6 +947,9 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     -- Slash command import tracking
     source_file_path TEXT DEFAULT NULL,    -- Relative path to source .md file (e.g. "qontinui-claude-config/.claude/commands/fix.md")
     source_content_hash TEXT DEFAULT NULL, -- SHA-256 hex of file content for change detection
+
+    -- Durable Execution (v139) — Conductor-inspired rollback policy
+    rollback_policy TEXT DEFAULT 'none',  -- 'none' | 'last_good' | 'clean' — automatic git rollback on failure
 
     -- Timestamps
     created_at TEXT NOT NULL,
@@ -3102,12 +3109,14 @@ CREATE TABLE IF NOT EXISTS meta_optimizer_recommendations (
     applied_at TEXT,
     outcome_after_apply TEXT,              -- JSON: measured impact after application
     optimizer_run_id TEXT,                 -- FK to meta_optimizer_runs
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    content_hash TEXT                      -- SHA256 of (optimizer_type, rec_type, target_agent, recommended_value) for dedup
 );
 
 CREATE INDEX IF NOT EXISTS idx_meta_optimizer_recs_type ON meta_optimizer_recommendations(optimizer_type);
 CREATE INDEX IF NOT EXISTS idx_meta_optimizer_recs_status ON meta_optimizer_recommendations(status);
 CREATE INDEX IF NOT EXISTS idx_meta_optimizer_recs_run ON meta_optimizer_recommendations(optimizer_run_id);
+CREATE INDEX IF NOT EXISTS idx_meta_optimizer_recs_content_hash ON meta_optimizer_recommendations(content_hash);
 
 -- Tracks meta-optimizer execution runs.
 CREATE TABLE IF NOT EXISTS meta_optimizer_runs (
@@ -3393,3 +3402,12 @@ INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (137, datetime
 -- Migration 138: Pipeline checkpoint column on task_runs
 -- Column already included in task_runs CREATE TABLE above.
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (138, datetime('now'));
+
+-- =============================================================================
+-- Migration 139: Durable execution — iteration_diffs, iteration_commits, rollback_policy
+-- Columns already included in task_runs and unified_workflows CREATE TABLE above.
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (139, datetime('now'));
+
+-- Migration 140: Content-hash dedup for meta_optimizer_recommendations
+-- Column and index already included in CREATE TABLE above.
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (140, datetime('now'));

@@ -45,6 +45,8 @@ import { PerformanceOverlay } from "./components/dev";
 import { useTaskRuns } from "./hooks/useAiData";
 import { getAllSpecs } from "./lib/spec-registry";
 import { getGlobalSpecStore } from "@qontinui/ui-bridge/specs";
+import { autoPopulateCtr, getGlobalCtr } from "@qontinui/ui-bridge/ctr";
+import { getGlobalRegistry } from "@qontinui/ui-bridge/core";
 
 import { instanceStorage } from "@/lib/instance-storage";
 
@@ -437,6 +439,16 @@ function BundledSpecsLoader() {
   return null;
 }
 
+function CtrAutoPopulator() {
+  useEffect(() => {
+    const registry = getGlobalRegistry();
+    const ctr = getGlobalCtr();
+    const unsubscribe = autoPopulateCtr(registry, ctr);
+    return unsubscribe;
+  }, []);
+  return null;
+}
+
 export default function App() {
   return (
     <UIBridgeProvider
@@ -446,6 +458,7 @@ export default function App() {
       <UIBridgeEventHandler />
       <SpecExecutionHandler />
       <BundledSpecsLoader />
+      <CtrAutoPopulator />
       <AutoRegisterProvider
         enabled={import.meta.env.DEV}
         idStrategy="prefer-existing"

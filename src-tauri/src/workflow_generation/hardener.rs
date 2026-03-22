@@ -1853,6 +1853,8 @@ mod tests {
             acceptance_criteria: None,
             multi_agent_mode: true,
             use_worktree: false,
+            strict_cwd: false,
+            tool_tags: vec![],
             workflow_architecture: None,
             rollback_policy: None,
             enforce_token_budget: false,

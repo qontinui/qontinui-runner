@@ -5973,6 +5973,8 @@ class QontinuiExecutor:
             template = params.get("template", "")
             similarity = params.get("similarity", 0.8)
             search_region = params.get("search_region")
+            invariant = params.get("invariant", False)
+            invariant_scales = params.get("invariant_scales")
 
             if not screenshot:
                 return {"success": False, "error": "screenshot is required"}
@@ -5989,6 +5991,8 @@ class QontinuiExecutor:
                         template=template,
                         similarity=similarity,
                         search_region=search_region,
+                        invariant=invariant,
+                        invariant_scales=invariant_scales,
                     )
                 )
             finally:
@@ -6033,6 +6037,8 @@ class QontinuiExecutor:
             similarity = params.get("similarity", 0.8)
             search_region = params.get("search_region")
             max_matches = params.get("max_matches", 100)
+            invariant = params.get("invariant", False)
+            invariant_scales = params.get("invariant_scales")
 
             if not screenshot:
                 return {"success": False, "error": "screenshot is required"}
@@ -6050,6 +6056,8 @@ class QontinuiExecutor:
                         similarity=similarity,
                         search_region=search_region,
                         max_matches=max_matches,
+                        invariant=invariant,
+                        invariant_scales=invariant_scales,
                     )
                 )
             finally:

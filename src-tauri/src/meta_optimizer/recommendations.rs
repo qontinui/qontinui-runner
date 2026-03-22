@@ -4,10 +4,48 @@
 
 use rusqlite::params;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use super::types::{MetaOptimizerRun, Recommendation};
 use crate::database::CheckpointDb;
+
+/// Compute a content hash for deduplication based on semantic identity fields.
+/// Two recommendations with the same hash are semantically identical regardless
+/// of title/description wording.
+pub fn compute_content_hash(
+    optimizer_type: &str,
+    recommendation_type: &str,
+    target_agent: Option<&str>,
+    recommended_value: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(optimizer_type.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(recommendation_type.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(target_agent.unwrap_or("").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(recommended_value.unwrap_or("").as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Check if a recommendation with the same content hash already exists
+/// in a non-terminal state (pending, canary, applied).
+pub fn is_content_duplicate(db: &CheckpointDb, content_hash: &str) -> bool {
+    let hash = content_hash.to_string();
+    db.with_conn(move |conn| {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE content_hash = ?1 AND status IN ('pending', 'canary', 'applied')",
+                params![hash],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(count > 0)
+    })
+    .unwrap_or(false)
+}
 
 // ── JSON payloads expected inside `recommended_value` ────────────────
 
@@ -61,6 +99,12 @@ pub fn create_recommendation(
 ) -> Result<Recommendation, String> {
     let id = format!("mor-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
+    let content_hash = compute_content_hash(
+        optimizer_type,
+        recommendation_type,
+        target_agent,
+        recommended_value,
+    );
 
     let rec = Recommendation {
         id: id.clone(),
@@ -88,8 +132,8 @@ pub fn create_recommendation(
             r#"INSERT INTO meta_optimizer_recommendations
                (id, optimizer_type, recommendation_type, target_agent, title, description,
                 current_value, recommended_value, evidence, confidence, status,
-                optimizer_run_id, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12)"#,
+                optimizer_run_id, created_at, content_hash)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13)"#,
             params![
                 rec_clone.id,
                 rec_clone.optimizer_type,
@@ -103,6 +147,7 @@ pub fn create_recommendation(
                 rec_clone.confidence,
                 rec_clone.optimizer_run_id,
                 rec_clone.created_at,
+                content_hash,
             ],
         )
         .map_err(|e| format!("Failed to create recommendation: {}", e))?;
@@ -191,13 +236,13 @@ pub fn apply_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Resul
     db.with_conn(move |conn| {
         let affected = conn
             .execute(
-                "UPDATE meta_optimizer_recommendations SET status = 'applied', applied_at = ?1 WHERE id = ?2 AND status = 'pending'",
+                "UPDATE meta_optimizer_recommendations SET status = 'applied', applied_at = ?1 WHERE id = ?2 AND status IN ('pending', 'canary')",
                 params![now, id],
             )
             .map_err(|e| format!("Failed to apply recommendation: {}", e))?;
 
         if affected == 0 {
-            return Err(format!("Recommendation {} not found or not pending", id));
+            return Err(format!("Recommendation {} not found or not in pending/canary status", id));
         }
 
         info!("Applied recommendation {}", id);
@@ -253,9 +298,9 @@ pub fn apply_recommendation_with_side_effects(
 ) -> Result<(), String> {
     let rec = get_recommendation(db, recommendation_id)?;
 
-    if rec.status != "pending" {
+    if rec.status != "pending" && rec.status != "canary" {
         return Err(format!(
-            "Recommendation {} is not pending (status: {})",
+            "Recommendation {} is not pending or canary (status: {})",
             rec.id, rec.status
         ));
     }

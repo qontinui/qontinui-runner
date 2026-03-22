@@ -32,6 +32,7 @@ class ElementProxy:
         self.bounds: dict = data.get("bounds", {})
         self.label: str = data.get("label", "")
         self.classes: list[str] = data.get("classes", [])
+        self.automation_id: str = data.get("automationId", "")
 
 
 class FindResponse:

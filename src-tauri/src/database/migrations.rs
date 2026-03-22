@@ -5420,6 +5420,63 @@ impl CheckpointDb {
             info!("Successfully migrated to version 138 (pipeline_checkpoint column added)");
         }
 
+        // Migration to version 139: Durable execution — iteration diffs, commits, rollback policy
+        // Conductor-inspired compensation flows: structured diff tracking, commit checkpointing,
+        // and automatic rollback on workflow failure.
+        if current_version < 139 {
+            info!("Migrating to version 139 (durable execution: iteration_diffs, iteration_commits, rollback_policy)...");
+            conn.execute_batch(
+                r#"
+                -- Structured iteration diff tracking on task_runs
+                ALTER TABLE task_runs ADD COLUMN iteration_diffs TEXT;
+                -- Commit checkpoints per iteration on task_runs
+                ALTER TABLE task_runs ADD COLUMN iteration_commits TEXT;
+                -- Rollback policy on unified_workflows
+                ALTER TABLE unified_workflows ADD COLUMN rollback_policy TEXT DEFAULT 'none';
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (139, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 139: {}", e))?;
+
+            info!("Successfully migrated to version 139 (durable execution columns added)");
+        }
+
+        // Migration to version 140: Content-hash dedup for meta_optimizer_recommendations
+        if current_version < 140 {
+            info!("Migrating to version 140 (recommendation content_hash dedup)...");
+
+            // Check if column already exists (idempotent)
+            let has_column: bool = conn
+                .prepare("PRAGMA table_info(meta_optimizer_recommendations)")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(1))
+                        .map(|rows| {
+                            rows.filter_map(|r| r.ok())
+                                .any(|name| name == "content_hash")
+                        })
+                })
+                .unwrap_or(false);
+
+            if !has_column {
+                conn.execute_batch(
+                    r#"
+                    ALTER TABLE meta_optimizer_recommendations ADD COLUMN content_hash TEXT;
+                    CREATE INDEX IF NOT EXISTS idx_meta_optimizer_recs_content_hash
+                        ON meta_optimizer_recommendations(content_hash);
+                    "#,
+                )
+                .map_err(|e| format!("Failed to migrate to version 140: {}", e))?;
+            }
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (140, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 140: {}", e))?;
+
+            info!("Successfully migrated to version 140 (recommendation content_hash)");
+        }
+
         // Repair migration: is_favorite column may be missing on databases created from
         // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
         // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,

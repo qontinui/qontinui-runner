@@ -197,6 +197,44 @@ pub fn get_canary_prompt_overrides(
     })
 }
 
+/// Get config overrides for a canary rollout of a config_change recommendation.
+/// Returns a vec of (key, serde_json::Value) pairs to apply as temporary settings during canary runs.
+pub fn get_canary_config_overrides(
+    db: &CheckpointDb,
+    recommendation_id: &str,
+) -> Result<Vec<(String, serde_json::Value)>, String> {
+    let rec_id = recommendation_id.to_string();
+    db.with_conn(move |conn| {
+        let (rec_type, recommended_value): (String, Option<String>) = conn
+            .query_row(
+                "SELECT recommendation_type, recommended_value FROM meta_optimizer_recommendations WHERE id = ?1",
+                params![rec_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| format!("Recommendation not found: {}", e))?;
+
+        if rec_type != "config_change" {
+            return Ok(Vec::new());
+        }
+
+        let Some(val) = recommended_value else {
+            return Ok(Vec::new());
+        };
+
+        // Parse ConfigChangePayload: { key, value }
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&val) {
+            if let (Some(key), Some(value)) = (
+                payload.get("key").and_then(|v| v.as_str()),
+                payload.get("value").cloned(),
+            ) {
+                return Ok(vec![(key.to_string(), value)]);
+            }
+        }
+
+        Ok(Vec::new())
+    })
+}
+
 /// Probabilistic check: should this run use the canary config?
 pub fn should_apply_canary(db: &CheckpointDb, recommendation_id: &str) -> bool {
     let rec_id = recommendation_id.to_string();

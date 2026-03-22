@@ -3472,6 +3472,460 @@ pub async fn ui_bridge_diagnose_stuck_screen_handler(
 }
 
 // ============================================================================
+// Page Health Analysis
+// ============================================================================
+
+/// Optional request body for page-health endpoint.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PageHealthRequest {
+    /// Reserved for future per-check toggles.
+    #[serde(default)]
+    pub options: Option<serde_json::Value>,
+}
+
+/// Analyse the current page by running discover internally and returning a
+/// structured `PageHealthReport` with spatial coverage, layout regions,
+/// element diversity, text signal scanning, interactive readiness, visual
+/// anomalies and an ASCII heatmap.
+pub async fn ui_bridge_page_health_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<PageHealthRequest>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Page health analysis");
+
+    // --- Step 1: run discover to get all elements -------------------------
+    let _body = body.map(|b| b.0).unwrap_or_default();
+
+    let discover_payload = serde_json::json!({
+        "options": {
+            "includeHidden": true
+        }
+    });
+
+    let discover_data = match ui_bridge_request_sync(&state, "discover", discover_payload).await {
+        Ok(d) => d,
+        Err(e) => {
+            error!("UI Bridge API: page-health discover failed: {}", e);
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
+        }
+    };
+
+    // Elements live under "elements" key returned by discover.
+    let elements = discover_data
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let element_count = elements.len();
+
+    // Visible elements: state.visible == true and state.normalizedRect present.
+    let visible: Vec<&serde_json::Value> = elements
+        .iter()
+        .filter(|el| {
+            let state = el.get("state");
+            let is_visible = state
+                .and_then(|s| s.get("visible"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let has_rect = state
+                .and_then(|s| s.get("normalizedRect"))
+                .is_some();
+            is_visible && has_rect
+        })
+        .collect();
+    let visible_count = visible.len();
+
+    let mut findings: Vec<serde_json::Value> = Vec::new();
+
+    // --- Step 2: Spatial coverage (20x20 grid) ----------------------------
+    const GRID: usize = 20;
+    let mut grid = [[false; GRID]; GRID];
+
+    for el in &visible {
+        if let Some(rect) = el.get("state").and_then(|s| s.get("normalizedRect")) {
+            let x = rect.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = rect.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let w = rect.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let h = rect.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+            let col_start = (x * GRID as f64).floor().max(0.0) as usize;
+            let col_end = ((x + w) * GRID as f64).ceil().min(GRID as f64) as usize;
+            let row_start = (y * GRID as f64).floor().max(0.0) as usize;
+            let row_end = ((y + h) * GRID as f64).ceil().min(GRID as f64) as usize;
+
+            for r in row_start..row_end.min(GRID) {
+                for c in col_start..col_end.min(GRID) {
+                    grid[r][c] = true;
+                }
+            }
+        }
+    }
+
+    let total_cells = (GRID * GRID) as f64;
+    let filled_cells = grid.iter().flatten().filter(|&&v| v).count() as f64;
+    let coverage_pct = (filled_cells / total_cells * 100.0).round();
+
+    // Left half = columns 0..10, right half = columns 10..20
+    let left_filled = grid
+        .iter()
+        .flat_map(|row| row[..GRID / 2].iter())
+        .filter(|&&v| v)
+        .count() as f64;
+    let right_filled = grid
+        .iter()
+        .flat_map(|row| row[GRID / 2..].iter())
+        .filter(|&&v| v)
+        .count() as f64;
+    let half_cells = (GRID * GRID / 2) as f64;
+    let left_half_pct = (left_filled / half_cells * 100.0).round();
+    let right_half_pct = (right_filled / half_cells * 100.0).round();
+
+    let spatial_severity = if coverage_pct < 15.0 {
+        "CRITICAL"
+    } else if coverage_pct < 30.0 {
+        "WARNING"
+    } else {
+        "OK"
+    };
+
+    // Sidebar-only: right < 5% and left > 20%
+    let spatial_severity = if right_half_pct < 5.0 && left_half_pct > 20.0 {
+        "CRITICAL"
+    } else {
+        spatial_severity
+    };
+
+    findings.push(serde_json::json!({
+        "check": "spatial_coverage",
+        "severity": spatial_severity,
+        "detail": format!(
+            "Elements cover {}% of viewport. Left={}%, Right={}%",
+            coverage_pct, left_half_pct, right_half_pct
+        ),
+        "data": {
+            "coverage_pct": coverage_pct,
+            "left_half_pct": left_half_pct,
+            "right_half_pct": right_half_pct
+        }
+    }));
+
+    // --- Step 3: Layout regions -------------------------------------------
+    let mut sidebar_count: usize = 0;
+    let mut header_count: usize = 0;
+    let mut content_count: usize = 0;
+
+    for el in &visible {
+        if let Some(rect) = el.get("state").and_then(|s| s.get("normalizedRect")) {
+            let x = rect.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let w = rect.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = rect.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let h = rect.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+            let cx = x + w / 2.0;
+            let cy = y + h / 2.0;
+
+            if cx < 0.2 {
+                sidebar_count += 1;
+            } else if cy < 0.08 {
+                header_count += 1;
+            } else {
+                content_count += 1;
+            }
+        }
+    }
+
+    let layout_severity = if content_count == 0 {
+        "CRITICAL"
+    } else if content_count < 3 {
+        "WARNING"
+    } else {
+        "OK"
+    };
+
+    findings.push(serde_json::json!({
+        "check": "layout_regions",
+        "severity": layout_severity,
+        "detail": format!(
+            "sidebar={}, header={}, content={}",
+            sidebar_count, header_count, content_count
+        ),
+        "data": {
+            "sidebar": sidebar_count,
+            "header": header_count,
+            "content": content_count
+        }
+    }));
+
+    // --- Step 4: Element diversity ----------------------------------------
+    let nav_types: &[&str] = &["button", "heading", "badge", "status-message"];
+    let mut type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for el in &elements {
+        let t = el
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        *type_counts.entry(t.to_string()).or_insert(0) += 1;
+    }
+
+    let all_nav = element_count > 5
+        && type_counts
+            .keys()
+            .all(|k| nav_types.contains(&k.as_str()));
+
+    let diversity_severity = if all_nav { "WARNING" } else { "OK" };
+
+    findings.push(serde_json::json!({
+        "check": "element_diversity",
+        "severity": diversity_severity,
+        "detail": format!(
+            "{} type(s) across {} elements{}",
+            type_counts.len(),
+            element_count,
+            if all_nav { " (navigation-only)" } else { "" }
+        ),
+        "data": {
+            "types": type_counts
+        }
+    }));
+
+    // --- Step 5: Text signal scanning -------------------------------------
+    let skip_types: &[&str] = &["button", "link", "tab", "menuitem"];
+
+    let error_phrases: &[&str] = &[
+        "error occurred",
+        "failed to",
+        "exception",
+        "crash",
+        "unavailable",
+        "something went wrong",
+        "could not",
+    ];
+    let loading_phrases: &[&str] = &[
+        "loading",
+        "starting",
+        "connecting",
+        "please wait",
+        "initializing",
+        "fetching",
+    ];
+    let empty_phrases: &[&str] = &[
+        "no data",
+        "no results",
+        "nothing here",
+        "empty",
+        "no items",
+        "get started",
+    ];
+    let css_signals: &[&str] = &["spin", "pulse", "skeleton", "loading", "shimmer"];
+
+    let mut detected_errors: Vec<String> = Vec::new();
+    let mut detected_loading: Vec<String> = Vec::new();
+    let mut detected_empty: Vec<String> = Vec::new();
+    let mut detected_css: Vec<String> = Vec::new();
+
+    for el in &elements {
+        let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let text = el
+            .get("state")
+            .and_then(|s| s.get("textContent"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // "classes" is a top-level array of strings
+        let classes_arr = el.get("classes").and_then(|v| v.as_array());
+        let classes_str: String = classes_arr
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+
+        // Check CSS class signals on all elements
+        let classes_lower = classes_str.to_lowercase();
+        for sig in css_signals {
+            if classes_lower.contains(sig) {
+                detected_css.push(format!("class contains '{}' on {}", sig, el_type));
+                break;
+            }
+        }
+
+        // Skip navigation types for text scanning
+        if skip_types.contains(&el_type) {
+            continue;
+        }
+
+        let text_lower = text.to_lowercase();
+        for phrase in error_phrases {
+            if text_lower.contains(phrase) {
+                detected_errors.push(text.chars().take(120).collect());
+                break;
+            }
+        }
+        for phrase in loading_phrases {
+            if text_lower.contains(phrase) {
+                detected_loading.push(text.chars().take(120).collect());
+                break;
+            }
+        }
+        for phrase in empty_phrases {
+            if text_lower.contains(phrase) {
+                detected_empty.push(text.chars().take(120).collect());
+                break;
+            }
+        }
+    }
+
+    let text_severity = if !detected_errors.is_empty() {
+        "CRITICAL"
+    } else if !detected_loading.is_empty() || !detected_css.is_empty() {
+        "WARNING"
+    } else if !detected_empty.is_empty() {
+        "WARNING"
+    } else {
+        "OK"
+    };
+
+    findings.push(serde_json::json!({
+        "check": "text_signals",
+        "severity": text_severity,
+        "detail": format!(
+            "errors={}, loading={}, empty={}, css_signals={}",
+            detected_errors.len(),
+            detected_loading.len(),
+            detected_empty.len(),
+            detected_css.len()
+        ),
+        "data": {
+            "errors": detected_errors,
+            "loading": detected_loading,
+            "empty": detected_empty,
+            "css_signals": detected_css
+        }
+    }));
+
+    // --- Step 6: Interactive readiness ------------------------------------
+    let mut interactive_total: usize = 0;
+    let mut interactive_disabled: usize = 0;
+
+    for el in &elements {
+        let cat = el
+            .get("category")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if cat == "interactive" {
+            interactive_total += 1;
+            let enabled = el
+                .get("state")
+                .and_then(|s| s.get("enabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if !enabled {
+                interactive_disabled += 1;
+            }
+        }
+    }
+
+    let interactive_severity = if interactive_total > 0
+        && (interactive_disabled as f64 / interactive_total as f64) > 0.5
+    {
+        "WARNING"
+    } else {
+        "OK"
+    };
+
+    findings.push(serde_json::json!({
+        "check": "interactive_readiness",
+        "severity": interactive_severity,
+        "detail": format!(
+            "{} interactive elements, {} disabled",
+            interactive_total, interactive_disabled
+        ),
+        "data": {
+            "total": interactive_total,
+            "disabled": interactive_disabled
+        }
+    }));
+
+    // --- Step 7: Visual anomalies -----------------------------------------
+    let mut zero_size: usize = 0;
+    let mut outside_viewport: usize = 0;
+
+    for el in &visible {
+        if let Some(rect) = el.get("state").and_then(|s| s.get("normalizedRect")) {
+            let x = rect.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = rect.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let w = rect.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let h = rect.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+            if w == 0.0 || h == 0.0 {
+                zero_size += 1;
+            }
+            if x + w < 0.0 || y + h < 0.0 || x > 1.0 || y > 1.0 {
+                outside_viewport += 1;
+            }
+        }
+    }
+
+    let anomaly_severity = if zero_size > 0 || outside_viewport > 0 {
+        "WARNING"
+    } else {
+        "OK"
+    };
+
+    findings.push(serde_json::json!({
+        "check": "visual_anomalies",
+        "severity": anomaly_severity,
+        "detail": format!(
+            "zero_size={}, outside_viewport={}",
+            zero_size, outside_viewport
+        ),
+        "data": {
+            "zero_size": zero_size,
+            "outside_viewport": outside_viewport
+        }
+    }));
+
+    // --- Step 8: ASCII heatmap --------------------------------------------
+    let heatmap: Vec<String> = grid
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|&filled| if filled { '#' } else { '.' })
+                .collect()
+        })
+        .collect();
+
+    // --- Step 9: Determine worst severity ---------------------------------
+    let severity_rank = |s: &str| -> u8 {
+        match s {
+            "CRITICAL" => 3,
+            "WARNING" => 2,
+            "OK" => 1,
+            _ => 0,
+        }
+    };
+
+    let worst = findings
+        .iter()
+        .filter_map(|f| f.get("severity").and_then(|s| s.as_str()))
+        .max_by_key(|s| severity_rank(s))
+        .unwrap_or("OK");
+
+    let report = serde_json::json!({
+        "summary": worst,
+        "findings": findings,
+        "heatmap": heatmap,
+        "element_count": element_count,
+        "visible_count": visible_count
+    });
+
+    Ok(Json(ApiResponse::success(report)))
+}
+
+// ============================================================================
 // AI Search & Find Handlers
 // ============================================================================
 
@@ -4303,6 +4757,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/diagnose-stuck",
             post(ui_bridge_diagnose_stuck_screen_handler),
+        )
+        .route(
+            "/ui-bridge/control/page-health",
+            post(ui_bridge_page_health_handler),
         )
         // AI search & find
         .route(

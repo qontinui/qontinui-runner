@@ -16,7 +16,7 @@
 /// # Arguments
 /// * `exp_passed` / `exp_total` — experiment successes and total trials
 /// * `ctrl_passed` / `ctrl_total` — control successes and total trials
-pub fn proportion_z_test_onesided(
+pub(crate) fn proportion_z_test_onesided(
     exp_passed: u64,
     exp_total: u64,
     ctrl_passed: u64,
@@ -105,7 +105,7 @@ pub fn welch_t_test(a: &[f64], b: &[f64]) -> f64 {
 /// h = 2 * (arcsin(√p₁) - arcsin(√p₂))
 ///
 /// Interpretation: |h| < 0.2 small, 0.2–0.8 medium, > 0.8 large.
-pub fn cohens_h(p1: f64, p2: f64) -> f64 {
+pub(crate) fn cohens_h(p1: f64, p2: f64) -> f64 {
     2.0 * (p1.sqrt().asin() - p2.sqrt().asin())
 }
 
@@ -144,7 +144,7 @@ pub fn wilson_confidence_interval(successes: u64, total: u64, confidence: f64) -
 /// Confidence interval for the difference between two proportions (Newcombe-Wilson).
 ///
 /// Returns (lower, upper) for (p₁ - p₂) at the given confidence level.
-pub fn proportion_diff_ci(
+pub(crate) fn proportion_diff_ci(
     successes_1: u64,
     total_1: u64,
     successes_2: u64,
@@ -392,7 +392,7 @@ pub fn normal_cdf(x: f64) -> f64 {
 ///
 /// Uses a rational initial approximation refined with one Newton-Raphson step
 /// for accuracy across the full range.
-pub fn normal_quantile(p: f64) -> f64 {
+pub(crate) fn normal_quantile(p: f64) -> f64 {
     if p <= 0.0 {
         return f64::NEG_INFINITY;
     }
@@ -759,10 +759,11 @@ mod tests {
 
     #[test]
     fn test_verdict_canary_promote_not_worse() {
-        // Canary is slightly worse (-1pp) but CI doesn't indicate catastrophic regression
-        let analysis = proportion_analysis((8, 10), (9, 10), 2);
-        let v = compute_verdict(-1.0, &analysis, 10, &VerdictThresholds::canary());
-        // -1.0 > -2.0 (improvement_delta), so canary should promote
+        // Canary is slightly worse (-1pp) but CI doesn't indicate catastrophic regression.
+        // Need enough samples so CI is tight enough (lower bound > -5pp).
+        let analysis = proportion_analysis((890, 1000), (900, 1000), 2);
+        let v = compute_verdict(-1.0, &analysis, 1000, &VerdictThresholds::canary());
+        // -1.0 > -2.0 (improvement_delta) and CI lower bound > -5.0, so canary should promote
         assert_eq!(v, Verdict::Positive);
         assert_eq!(v.as_canary_str(), "promote");
     }
@@ -773,6 +774,17 @@ mod tests {
         let v = compute_verdict(-80.0, &analysis, 10, &VerdictThresholds::canary());
         assert_eq!(v, Verdict::Negative);
         assert_eq!(v.as_canary_str(), "rollback");
+    }
+
+    #[test]
+    fn test_verdict_canary_ci_too_wide_stays_neutral() {
+        // Canary is slightly worse (-1pp) but with tiny samples the CI is very wide
+        // (lower bound well below -5pp), so we can't confidently say "not catastrophic".
+        let analysis = proportion_analysis((8, 10), (9, 10), 2);
+        let v = compute_verdict(-1.0, &analysis, 10, &VerdictThresholds::canary());
+        // CI lower bound is ~-41pp which is < -5pp, so canary should NOT promote
+        assert_eq!(v, Verdict::Neutral);
+        assert_eq!(v.as_canary_str(), "continue");
     }
 
     #[test]

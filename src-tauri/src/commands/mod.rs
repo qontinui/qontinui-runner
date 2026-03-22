@@ -60,6 +60,7 @@ pub mod config;
 pub mod context;
 pub mod database; // Database maintenance and optimization
 pub mod dataset;
+pub mod durable_execution; // Conductor-inspired replay, rollback, iteration diffs
 pub mod debug;
 pub mod discoveries;
 pub mod execution;
