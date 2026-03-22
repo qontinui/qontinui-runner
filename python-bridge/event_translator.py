@@ -137,8 +137,38 @@ class EventTranslator:
         register_callback(QontinuiEventType.MOUSE_CLICKED, self.on_mouse_clicked)
         print("[EventTranslator] MOUSE_CLICKED callback registered", file=sys.stderr, flush=True)
 
-        # Future: Additional callbacks can be registered here
-        # register_callback(QontinuiEventType.ACTION_STARTED, self.on_action_started)
+        # Register cascade detection event callbacks
+        print(
+            "[EventTranslator] Registering CASCADE_STARTED callback...",
+            file=sys.stderr,
+            flush=True,
+        )
+        register_callback(QontinuiEventType.CASCADE_STARTED, self.on_cascade_started)
+        print("[EventTranslator] CASCADE_STARTED callback registered", file=sys.stderr, flush=True)
+
+        print(
+            "[EventTranslator] Registering CASCADE_BACKEND_TRIED callback...",
+            file=sys.stderr,
+            flush=True,
+        )
+        register_callback(QontinuiEventType.CASCADE_BACKEND_TRIED, self.on_cascade_backend_tried)
+        print("[EventTranslator] CASCADE_BACKEND_TRIED callback registered", file=sys.stderr, flush=True)
+
+        print(
+            "[EventTranslator] Registering CASCADE_HIT callback...",
+            file=sys.stderr,
+            flush=True,
+        )
+        register_callback(QontinuiEventType.CASCADE_HIT, self.on_cascade_hit)
+        print("[EventTranslator] CASCADE_HIT callback registered", file=sys.stderr, flush=True)
+
+        print(
+            "[EventTranslator] Registering CASCADE_MISS callback...",
+            file=sys.stderr,
+            flush=True,
+        )
+        register_callback(QontinuiEventType.CASCADE_MISS, self.on_cascade_miss)
+        print("[EventTranslator] CASCADE_MISS callback registered", file=sys.stderr, flush=True)
 
     def on_match_attempted(self, event) -> None:
         """Translate MATCH_ATTEMPTED event to IMAGE_RECOGNITION format.
@@ -747,6 +777,181 @@ class EventTranslator:
 
         except Exception as e:
             print(f"[EventTranslator] ERROR in on_action_completed_library: {e}", file=sys.stderr)
+            import traceback
+
+            traceback.print_exc()
+
+        finally:
+            sys.stdout = current_stdout
+
+    def on_cascade_started(self, event) -> None:
+        """Translate CASCADE_STARTED event to cascade.started format.
+
+        Args:
+            event: qontinui Event object with type=CASCADE_STARTED
+                  Expected data fields:
+                  - needle: Label of the element being searched for
+                  - needle_type: Type of needle (e.g. "text", "image")
+                  - min_confidence: Minimum confidence threshold
+                  - timestamp: Event timestamp
+        """
+        current_stdout = sys.stdout
+        sys.stdout = self._real_stdout
+
+        try:
+            data = event.data
+            print(
+                f"[EventTranslator] CASCADE_STARTED: needle={data.get('needle')}, type={data.get('needle_type')}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+            frontend_data = {
+                "needle": data.get("needle", ""),
+                "needle_type": data.get("needle_type", ""),
+                "min_confidence": data.get("min_confidence", 0),
+                "timestamp": data.get("timestamp", 0),
+            }
+
+            self.emitter("cascade.started", frontend_data)
+
+        except Exception as e:
+            print(f"[EventTranslator] ERROR in on_cascade_started: {e}", file=sys.stderr)
+            import traceback
+
+            traceback.print_exc()
+
+        finally:
+            sys.stdout = current_stdout
+
+    def on_cascade_backend_tried(self, event) -> None:
+        """Translate CASCADE_BACKEND_TRIED event to cascade.backend_tried format.
+
+        Args:
+            event: qontinui Event object with type=CASCADE_BACKEND_TRIED
+                  Expected data fields:
+                  - backend: Name of the backend that was tried
+                  - needle: Label of the element being searched for
+                  - duration_ms: Time spent on this backend (ms)
+                  - result_count: Number of results found
+                  - success: Whether the backend found a match
+                  - reason: Failure reason if not successful
+                  - timestamp: Event timestamp
+        """
+        current_stdout = sys.stdout
+        sys.stdout = self._real_stdout
+
+        try:
+            data = event.data
+            print(
+                f"[EventTranslator] CASCADE_BACKEND_TRIED: backend={data.get('backend')}, "
+                f"needle={data.get('needle')}, success={data.get('success')}, "
+                f"duration_ms={data.get('duration_ms')}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+            frontend_data = {
+                "backend": data.get("backend", ""),
+                "needle": data.get("needle", ""),
+                "duration_ms": data.get("duration_ms", 0),
+                "result_count": data.get("result_count", 0),
+                "success": data.get("success", False),
+                "reason": data.get("reason"),
+                "timestamp": data.get("timestamp", 0),
+            }
+
+            self.emitter("cascade.backend_tried", frontend_data)
+
+        except Exception as e:
+            print(f"[EventTranslator] ERROR in on_cascade_backend_tried: {e}", file=sys.stderr)
+            import traceback
+
+            traceback.print_exc()
+
+        finally:
+            sys.stdout = current_stdout
+
+    def on_cascade_hit(self, event) -> None:
+        """Translate CASCADE_HIT event to cascade.hit format.
+
+        Args:
+            event: qontinui Event object with type=CASCADE_HIT
+                  Expected data fields:
+                  - needle: Label of the element being searched for
+                  - winning_backend: Name of the backend that succeeded
+                  - backends_tried: Number of backends attempted
+                  - confidence: Confidence of the winning match
+                  - total_duration_ms: Total cascade duration (ms)
+                  - timestamp: Event timestamp
+        """
+        current_stdout = sys.stdout
+        sys.stdout = self._real_stdout
+
+        try:
+            data = event.data
+            print(
+                f"[EventTranslator] CASCADE_HIT: needle={data.get('needle')}, "
+                f"winner={data.get('winning_backend')}, confidence={data.get('confidence')}, "
+                f"tried={data.get('backends_tried')}, duration_ms={data.get('total_duration_ms')}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+            frontend_data = {
+                "needle": data.get("needle", ""),
+                "winning_backend": data.get("winning_backend", ""),
+                "backends_tried": data.get("backends_tried", 0),
+                "confidence": data.get("confidence", 0),
+                "total_duration_ms": data.get("total_duration_ms", 0),
+                "timestamp": data.get("timestamp", 0),
+            }
+
+            self.emitter("cascade.hit", frontend_data)
+
+        except Exception as e:
+            print(f"[EventTranslator] ERROR in on_cascade_hit: {e}", file=sys.stderr)
+            import traceback
+
+            traceback.print_exc()
+
+        finally:
+            sys.stdout = current_stdout
+
+    def on_cascade_miss(self, event) -> None:
+        """Translate CASCADE_MISS event to cascade.miss format.
+
+        Args:
+            event: qontinui Event object with type=CASCADE_MISS
+                  Expected data fields:
+                  - needle: Label of the element being searched for
+                  - backends_tried: Number of backends attempted
+                  - total_duration_ms: Total cascade duration (ms)
+                  - timestamp: Event timestamp
+        """
+        current_stdout = sys.stdout
+        sys.stdout = self._real_stdout
+
+        try:
+            data = event.data
+            print(
+                f"[EventTranslator] CASCADE_MISS: needle={data.get('needle')}, "
+                f"tried={data.get('backends_tried')}, duration_ms={data.get('total_duration_ms')}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+            frontend_data = {
+                "needle": data.get("needle", ""),
+                "backends_tried": data.get("backends_tried", 0),
+                "total_duration_ms": data.get("total_duration_ms", 0),
+                "timestamp": data.get("timestamp", 0),
+            }
+
+            self.emitter("cascade.miss", frontend_data)
+
+        except Exception as e:
+            print(f"[EventTranslator] ERROR in on_cascade_miss: {e}", file=sys.stderr)
             import traceback
 
             traceback.print_exc()

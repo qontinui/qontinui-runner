@@ -390,6 +390,9 @@ pub fn create_router(
         });
     }
 
+    // Start cascade event buffer (collects cascade detection events for /cascade/events)
+    crate::mcp::cascade::start_buffer_task(&api_state);
+
     // CORS: Permissive (allow any origin) is intentional.
     // This localhost-only API (port 9876) must be accessible from:
     //   - The Tauri webview (tauri://localhost origin)
@@ -414,6 +417,7 @@ pub fn create_router(
         .route("/awas/extract-elements", post(awas_extract_elements))
         // Module routes
         .merge(crate::mcp::canvas::routes())
+        .merge(crate::mcp::cascade::routes())
         .merge(crate::mcp::ai_generation::routes())
         .merge(crate::mcp::api_requests::routes())
         .merge(crate::mcp::app_discovery::routes())

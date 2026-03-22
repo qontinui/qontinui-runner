@@ -249,7 +249,10 @@ pub fn save_model_profile(db: &CheckpointDb, profile: &ModelProfile) -> Result<(
         )
         .map_err(|e| format!("Failed to save model profile: {}", e))?;
 
-        info!("Saved model profile for {} ({} trials)", model_id, trial_count);
+        info!(
+            "Saved model profile for {} ({} trials)",
+            model_id, trial_count
+        );
         Ok(())
     })
 }

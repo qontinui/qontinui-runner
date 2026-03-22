@@ -205,13 +205,11 @@ impl LoopController {
         // workspace-scoped working directory resolution on all step handlers.
         if config.strict_cwd {
             let policy = crate::paths::PathScopePolicy::WorkspaceScoped;
-            self.setup_executor
-                .set_path_scope_policy(policy.clone());
+            self.setup_executor.set_path_scope_policy(policy.clone());
             if let Some(ve) = Arc::get_mut(&mut self.verification_executor) {
                 ve.set_path_scope_policy(policy.clone());
             }
-            self.completion_executor
-                .set_path_scope_policy(policy);
+            self.completion_executor.set_path_scope_policy(policy);
         }
 
         // =====================================================================

@@ -116,12 +116,15 @@ pub fn comparison_to_recommendation(
         &title,
         &description,
         None,
-        Some(&serde_json::json!({
-            "source": "comparison",
-            "comparison_id": comparison.id,
-            "winner_branch": rec.branch_name,
-            "confidence": rec.confidence,
-        }).to_string()),
+        Some(
+            &serde_json::json!({
+                "source": "comparison",
+                "comparison_id": comparison.id,
+                "winner_branch": rec.branch_name,
+                "confidence": rec.confidence,
+            })
+            .to_string(),
+        ),
         Some(evidence),
         rec.confidence,
         None,
@@ -141,7 +144,10 @@ pub fn comparison_to_recommendation(
 
     info!(
         "Created recommendation {} from comparison {} (winner: {}, confidence: {:.0}%)",
-        recommendation.id, comparison.id, rec.branch_name, rec.confidence * 100.0
+        recommendation.id,
+        comparison.id,
+        rec.branch_name,
+        rec.confidence * 100.0
     );
 
     Ok(Some(recommendation.id))

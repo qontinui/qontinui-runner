@@ -268,13 +268,9 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
                     // Detect server framework from dependencies
                     if framework == Framework::NextJs {
                         server_framework = ServerFramework::NextJs;
-                    } else if deps.get("express").is_some()
-                        || dev_deps.get("express").is_some()
-                    {
+                    } else if deps.get("express").is_some() || dev_deps.get("express").is_some() {
                         server_framework = ServerFramework::Express;
-                    } else if deps.get("fastify").is_some()
-                        || dev_deps.get("fastify").is_some()
-                    {
+                    } else if deps.get("fastify").is_some() || dev_deps.get("fastify").is_some() {
                         server_framework = ServerFramework::Fastify;
                     }
 
@@ -734,13 +730,7 @@ async fn integrate_source(
     // Next.js server relay is already handled in integrate_nextjs().
     match analysis.server_framework {
         ServerFramework::Express => {
-            integrate_express_server(
-                &project,
-                analysis,
-                &mut modifications,
-                &mut warnings,
-            )
-            .await;
+            integrate_express_server(&project, analysis, &mut modifications, &mut warnings).await;
             next_steps.push(
                 "Server-side: Express relay router created. Mount it in your server with: app.use('/api/ui-bridge', uiBridgeRouter)"
                     .to_string(),
@@ -1145,11 +1135,7 @@ async fn integrate_express_server(
     warnings: &mut Vec<String>,
 ) {
     // Create relay setup file (shared pattern with Next.js)
-    let relay_path = if project.join("src/lib").exists() {
-        "src/lib/ui-bridge.ts"
-    } else {
-        "src/lib/ui-bridge.ts"
-    };
+    let relay_path = "src/lib/ui-bridge.ts";
 
     if !project.join(relay_path).exists() {
         if let Some(parent) = project.join(relay_path).parent() {
