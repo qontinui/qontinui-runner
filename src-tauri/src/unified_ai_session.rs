@@ -1054,10 +1054,9 @@ impl UnifiedAiSessionExecutor {
 
         // Apply middleware pre-call transformations (if a middleware chain is configured)
         if let Some(ref chain) = self.middleware_chain {
-            let mw_ctx = crate::ai_provider::middleware::MiddlewareContext::new(
-                config.phase.as_str(),
-            )
-            .with_task_run_id(&config.task_run_id);
+            let mw_ctx =
+                crate::ai_provider::middleware::MiddlewareContext::new(config.phase.as_str())
+                    .with_task_run_id(&config.task_run_id);
             result = chain.run_pre_call(&result, &mw_ctx);
         }
 

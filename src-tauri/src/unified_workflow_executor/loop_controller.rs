@@ -51,14 +51,14 @@ pub struct LoopController {
     pub(super) agentic_executor: AgenticExecutor,
     pub(super) completion_executor: CompletionExecutor,
     pub(super) checkpoint_db: Arc<crate::database::CheckpointDb>,
-    knowledge_base: KnowledgeBase,
-    app_state: Arc<AppState>,
-    config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
+    pub(super) knowledge_base: KnowledgeBase,
+    pub(super) app_state: Arc<AppState>,
+    pub(super) config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
     pub(super) app_handle: tauri::AppHandle,
-    pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
-    doctor_handle: Option<DoctorHandle>,
-    reflection_fix_ctx: Option<crate::mcp::shared::ReflectionFixContext>,
-    step_injection_ctx: Option<crate::step_injection::types::StepInjectionContext>,
+    pub(super) pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
+    pub(super) doctor_handle: Option<DoctorHandle>,
+    pub(super) reflection_fix_ctx: Option<crate::mcp::shared::ReflectionFixContext>,
+    pub(super) step_injection_ctx: Option<crate::step_injection::types::StepInjectionContext>,
     pub(super) canvas_manager: tokio::sync::Mutex<CanvasPanelManager>,
 }
 
@@ -198,12 +198,10 @@ impl LoopController {
         // workspace-scoped working directory resolution on all step handlers.
         if config.strict_cwd {
             let policy = crate::paths::PathScopePolicy::WorkspaceScoped;
-            self.setup_executor
-                .set_path_scope_policy(policy.clone());
+            self.setup_executor.set_path_scope_policy(policy.clone());
             self.verification_executor
                 .set_path_scope_policy(policy.clone());
-            self.completion_executor
-                .set_path_scope_policy(policy);
+            self.completion_executor.set_path_scope_policy(policy);
         }
 
         // =====================================================================
@@ -1334,6 +1332,23 @@ impl LoopController {
                         &stage.agentic_steps,
                         &mut all_step_results,
                         logger,
+                    )
+                    .await
+                } else if stage_loop_config.is_dev_mode {
+                    // State machine implementation — active in dev mode for validation.
+                    // Same signature and return type as the monolith. Once validated,
+                    // this becomes the only path and the monolith is deleted.
+                    info!("Using state machine loop (dev mode)");
+                    self.run_loop_state_machine(
+                        &mut stage_loop_config,
+                        &stage.verification_steps,
+                        has_agentic,
+                        &stage.agentic_steps,
+                        &mut all_step_results,
+                        &mut transitions,
+                        &mut current_stage,
+                        logger,
+                        initial_dynamic_steps,
                     )
                     .await
                 } else {
@@ -3281,18 +3296,25 @@ impl LoopController {
             );
 
             // Compute token usage for the agentic phase trace
-            let (mut trace_tokens_in, mut trace_tokens_out) = super::multi_agent_pipeline_loop::query_iteration_tokens(
-                &self.checkpoint_db,
-                &config.execution_id,
-                iteration,
-            );
+            let (mut trace_tokens_in, mut trace_tokens_out) =
+                super::multi_agent_pipeline_loop::query_iteration_tokens(
+                    &self.checkpoint_db,
+                    &config.execution_id,
+                    iteration,
+                );
             if trace_tokens_in == 0 && trace_tokens_out == 0 {
                 let (ot_in, ot_out) = agentic_outcome.token_usage();
                 trace_tokens_in = ot_in.unwrap_or(0);
                 trace_tokens_out = ot_out.unwrap_or(0);
             }
-            let trace_model = config.resolve_model_for_phase("agentic").unwrap_or_else(|| "claude-cli".to_string());
-            let trace_cost = crate::ai_pricing::calculate_cost_usd(trace_tokens_in, trace_tokens_out, &trace_model);
+            let trace_model = config
+                .resolve_model_for_phase("agentic")
+                .unwrap_or_else(|| "claude-cli".to_string());
+            let trace_cost = crate::ai_pricing::calculate_cost_usd(
+                trace_tokens_in,
+                trace_tokens_out,
+                &trace_model,
+            );
 
             // Emit pipeline agent trace for the agentic phase (populates
             // pipeline_agent_traces for meta-optimizer analysis — works for
@@ -3941,10 +3963,10 @@ impl LoopController {
                     .await
                     {
                         // Persist to database
-                        if let Err(e) = self.checkpoint_db.append_iteration_diff(
-                            &config.execution_id,
-                            &diff,
-                        ) {
+                        if let Err(e) = self
+                            .checkpoint_db
+                            .append_iteration_diff(&config.execution_id, &diff)
+                        {
                             warn!(
                                 "COMPENSATION: Failed to persist iteration diff {}: {}",
                                 iteration, e
@@ -4143,7 +4165,7 @@ impl LoopController {
     ///
     /// Returns Some((outcome, injected_steps)) on success, None if triage fails
     /// and we should fall back to the standard monolithic session.
-    async fn run_multi_agent_fix(
+    pub(super) async fn run_multi_agent_fix(
         &self,
         config: &LoopConfig,
         iteration: u32,

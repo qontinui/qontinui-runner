@@ -511,14 +511,23 @@ impl LoopController {
                         canary_config_originals.push((key.clone(), original));
                         // Apply canary config
                         if let Err(e) = self.checkpoint_db.set_setting(&key, &value) {
-                            warn!("MULTI-AGENT-PIPELINE: Failed to set canary config {}={}: {}", key, value, e);
+                            warn!(
+                                "MULTI-AGENT-PIPELINE: Failed to set canary config {}={}: {}",
+                                key, value, e
+                            );
                         } else {
-                            info!("MULTI-AGENT-PIPELINE: Canary injecting config override {}={}", key, value);
+                            info!(
+                                "MULTI-AGENT-PIPELINE: Canary injecting config override {}={}",
+                                key, value
+                            );
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("MULTI-AGENT-PIPELINE: Failed to load canary config overrides: {}", e);
+                    warn!(
+                        "MULTI-AGENT-PIPELINE: Failed to load canary config overrides: {}",
+                        e
+                    );
                 }
             }
         }
@@ -548,7 +557,10 @@ impl LoopController {
             }
             Ok(None) => None,
             Err(e) => {
-                warn!("MULTI-AGENT-PIPELINE: Failed to load checkpoint: {}. Starting fresh.", e);
+                warn!(
+                    "MULTI-AGENT-PIPELINE: Failed to load checkpoint: {}. Starting fresh.",
+                    e
+                );
                 None
             }
         };
@@ -574,7 +586,10 @@ impl LoopController {
                         agent_traces = traces;
                     }
                     Err(e) => {
-                        warn!("MULTI-AGENT-PIPELINE: Failed to reload traces on resume: {}", e);
+                        warn!(
+                            "MULTI-AGENT-PIPELINE: Failed to reload traces on resume: {}",
+                            e
+                        );
                     }
                 }
             }
@@ -695,24 +710,22 @@ impl LoopController {
 
         // If we have a checkpoint with located_criteria from a previous run,
         // skip the expensive AI locator call and reuse the saved results.
-        let has_checkpoint_located = checkpoint.as_ref().is_some_and(|cp| {
-            cp.last_completed_phase >= 4 && cp.located_criteria.is_some()
-        });
+        let has_checkpoint_located = checkpoint
+            .as_ref()
+            .is_some_and(|cp| cp.last_completed_phase >= 4 && cp.located_criteria.is_some());
 
         let empty_located: Vec<LocatedCriterion> = Vec::new();
         let mut located_criteria: Vec<LocatedCriterion> = if has_checkpoint_located {
-            let saved = checkpoint.as_ref().and_then(|cp| cp.located_criteria.as_ref()).unwrap_or(&empty_located);
+            let saved = checkpoint
+                .as_ref()
+                .and_then(|cp| cp.located_criteria.as_ref())
+                .unwrap_or(&empty_located);
             info!(
                 "MULTI-AGENT-PIPELINE: Phase 4 — Restoring {} located criteria from checkpoint (skipping AI locator)",
                 saved.len()
             );
             saved.clone()
-        } else if pipeline_config
-            .locator
-            .max_tokens
-            .unwrap_or(0)
-            > 0
-        {
+        } else if pipeline_config.locator.max_tokens.unwrap_or(0) > 0 {
             let locator_start = std::time::Instant::now();
 
             // Get the L0 directory tree (directory structure only) for the locator.
@@ -1009,7 +1022,10 @@ Only output the JSON array, nothing else."#,
                 &config.execution_id,
                 &cp,
             ) {
-                warn!("MULTI-AGENT-PIPELINE: Failed to save Phase 4 checkpoint: {}", e);
+                warn!(
+                    "MULTI-AGENT-PIPELINE: Failed to save Phase 4 checkpoint: {}",
+                    e
+                );
             } else {
                 info!("MULTI-AGENT-PIPELINE: Saved checkpoint at Phase 4 boundary");
             }
@@ -1023,7 +1039,12 @@ Only output the JSON array, nothing else."#,
         // Collect IDs of subtrees already completed in a previous run (from checkpoint).
         let checkpoint_completed_ids: std::collections::HashSet<String> = checkpoint
             .as_ref()
-            .map(|cp| cp.completed_subtrees.iter().map(|s| s.subtree_id.clone()).collect())
+            .map(|cp| {
+                cp.completed_subtrees
+                    .iter()
+                    .map(|s| s.subtree_id.clone())
+                    .collect()
+            })
             .unwrap_or_default();
 
         // Pre-populate subtree_results with checkpoint data for already-completed subtrees.
@@ -1072,8 +1093,12 @@ Only output the JSON array, nothing else."#,
 
                 total_iterations += output.iterations_used;
                 agent_traces.extend(output.traces);
-                pipeline_ctx.implementer_changes.extend(output.implementer_changes);
-                pipeline_ctx.verifier_failures.extend(output.verifier_failures);
+                pipeline_ctx
+                    .implementer_changes
+                    .extend(output.implementer_changes);
+                pipeline_ctx
+                    .verifier_failures
+                    .extend(output.verifier_failures);
                 subtree_results.push(output.result.clone());
 
                 // Update checkpoint with this completed subtree so progress survives crashes.
@@ -1286,7 +1311,10 @@ Only output the JSON array, nothing else."#,
             match original {
                 Some(val) => {
                     if let Err(e) = self.checkpoint_db.set_setting(key, val) {
-                        warn!("MULTI-AGENT-PIPELINE: Failed to restore config {}: {}", key, e);
+                        warn!(
+                            "MULTI-AGENT-PIPELINE: Failed to restore config {}: {}",
+                            key, e
+                        );
                     }
                 }
                 None => {
@@ -1407,24 +1435,28 @@ Only output the JSON array, nothing else."#,
                 }
 
                 // Build structured handoff context: locator -> implementer
-                let mut implementer_handoff = crate::autoresearch::agentic_verification::HandoffContext {
-                    from_agent: "locator".to_string(),
-                    to_agent: "implementer".to_string(),
-                    payload: serde_json::json!({
-                        "subtree_id": subtree.id,
-                        "level": level_idx,
-                        "criteria": &level_criteria,
-                        "located_files": located_criteria.iter()
-                            .filter(|lc| level_criteria.contains(&lc.criterion.id.as_str()))
-                            .map(|lc| &lc.target_files)
-                            .collect::<Vec<_>>(),
-                    }),
-                    forwarded_items: vec![],
-                    validated: false,
-                };
+                let mut implementer_handoff =
+                    crate::autoresearch::agentic_verification::HandoffContext {
+                        from_agent: "locator".to_string(),
+                        to_agent: "implementer".to_string(),
+                        payload: serde_json::json!({
+                            "subtree_id": subtree.id,
+                            "level": level_idx,
+                            "criteria": &level_criteria,
+                            "located_files": located_criteria.iter()
+                                .filter(|lc| level_criteria.contains(&lc.criterion.id.as_str()))
+                                .map(|lc| &lc.target_files)
+                                .collect::<Vec<_>>(),
+                        }),
+                        forwarded_items: vec![],
+                        validated: false,
+                    };
 
                 // Guardrail: validate handoff payload before passing to implementer
-                let handoff_check = crate::autoresearch::agentic_verification::guardrail_handoff_payload_present(&implementer_handoff);
+                let handoff_check =
+                    crate::autoresearch::agentic_verification::guardrail_handoff_payload_present(
+                        &implementer_handoff,
+                    );
                 implementer_handoff.validated = !handoff_check.tripwire_triggered;
                 if handoff_check.tripwire_triggered {
                     info!(
@@ -1535,9 +1567,7 @@ Only output the JSON array, nothing else."#,
                 let level_verification_steps: Vec<ExecutionStepConfig> = verification_steps
                     .iter()
                     .enumerate()
-                    .filter(|(i, _)| {
-                        level_criteria.contains(&format!("criterion_{}", i).as_str())
-                    })
+                    .filter(|(i, _)| level_criteria.contains(&format!("criterion_{}", i).as_str()))
                     .map(|(_, step)| step.clone())
                     .collect();
 
@@ -1596,7 +1626,10 @@ Only output the JSON array, nothing else."#,
                     "passed": level_passed,
                     "results": level_criterion_results.len(),
                 });
-                let verdict_check = crate::autoresearch::agentic_verification::guardrail_verifier_verdict(&verifier_output_json);
+                let verdict_check =
+                    crate::autoresearch::agentic_verification::guardrail_verifier_verdict(
+                        &verifier_output_json,
+                    );
                 let mut verifier_guardrails = vec![];
                 if verdict_check.tripwire_triggered {
                     warn!(
@@ -1732,9 +1765,7 @@ Only output the JSON array, nothing else."#,
                 } else {
                     let detailed: Vec<String> = failed_criteria
                         .iter()
-                        .map(|c| {
-                            format!("- {} ({}): {}", c.criterion_id, c.method_used, c.details)
-                        })
+                        .map(|c| format!("- {} ({}): {}", c.criterion_id, c.method_used, c.details))
                         .collect();
                     Some(format!(
                         "{}/{} criteria still failing after {} attempts. Details:\n{}",
@@ -1757,25 +1788,23 @@ Only output the JSON array, nothing else."#,
 
             subtree_level_results.push(SubtreeLevelResult {
                 level: level_idx as u32,
-                implementer_trace: last_implementer_trace.unwrap_or_else(|| {
-                    PipelineAgentTrace {
-                        agent_type: "implementer".to_string(),
-                        agent_id: format!("impl_{}_{}", subtree.id, level_idx),
-                        run_id: config.execution_id.clone(),
-                        input_snapshot: serde_json::json!(null),
-                        output_snapshot: serde_json::json!(null),
-                        config: pipeline_config.implementer.clone(),
-                        duration_ms: 0,
-                        tokens_in: 0,
-                        tokens_out: 0,
-                        cost_usd: 0.0,
-                        downstream_success: None,
-                        output_quality_score: None,
-                        parent_span_id: None,
-                        span_type: "agent".to_string(),
-                        guardrail_results: vec![],
-                        handoff_received: None,
-                    }
+                implementer_trace: last_implementer_trace.unwrap_or_else(|| PipelineAgentTrace {
+                    agent_type: "implementer".to_string(),
+                    agent_id: format!("impl_{}_{}", subtree.id, level_idx),
+                    run_id: config.execution_id.clone(),
+                    input_snapshot: serde_json::json!(null),
+                    output_snapshot: serde_json::json!(null),
+                    config: pipeline_config.implementer.clone(),
+                    duration_ms: 0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cost_usd: 0.0,
+                    downstream_success: None,
+                    output_quality_score: None,
+                    parent_span_id: None,
+                    span_type: "agent".to_string(),
+                    guardrail_results: vec![],
+                    handoff_received: None,
                 }),
                 verifier_trace: last_verifier_trace.unwrap_or_else(|| PipelineAgentTrace {
                     agent_type: "verifier".to_string(),
@@ -1817,7 +1846,6 @@ Only output the JSON array, nothing else."#,
         }
     }
 }
-
 
 /// L0 file tree: directory structure only (unique directory paths).
 /// Much smaller than the full file listing — typically 10-50x fewer lines.

@@ -434,7 +434,14 @@ pub fn save_parsed_recommendations(
                 })
                 .to_string();
 
-                if is_duplicate_recommendation(db, &title, optimizer_type, "prompt_rewrite", Some(&rec.agent_type), Some(&recommended_value)) {
+                if is_duplicate_recommendation(
+                    db,
+                    &title,
+                    optimizer_type,
+                    "prompt_rewrite",
+                    Some(&rec.agent_type),
+                    Some(&recommended_value),
+                ) {
                     debug!("Skipping duplicate recommendation: {}", title);
                     continue;
                 }
@@ -499,7 +506,14 @@ pub fn save_parsed_recommendations(
                 })
                 .to_string();
 
-                if is_duplicate_recommendation(db, &title, optimizer_type, "config_change", None, Some(&recommended_value)) {
+                if is_duplicate_recommendation(
+                    db,
+                    &title,
+                    optimizer_type,
+                    "config_change",
+                    None,
+                    Some(&recommended_value),
+                ) {
                     debug!("Skipping duplicate recommendation: {}", title);
                     continue;
                 }
@@ -564,7 +578,14 @@ pub fn save_parsed_recommendations(
                 })
                 .to_string();
 
-                if is_duplicate_recommendation(db, &title, optimizer_type, "config_change", None, Some(&recommended_value)) {
+                if is_duplicate_recommendation(
+                    db,
+                    &title,
+                    optimizer_type,
+                    "config_change",
+                    None,
+                    Some(&recommended_value),
+                ) {
                     debug!("Skipping duplicate recommendation: {}", title);
                     continue;
                 }
@@ -600,7 +621,14 @@ pub fn save_parsed_recommendations(
                     "suggested_action": finding.suggested_action,
                 })
                 .to_string();
-                if is_duplicate_recommendation(db, &title, optimizer_type, "finding", None, Some(&metadata)) {
+                if is_duplicate_recommendation(
+                    db,
+                    &title,
+                    optimizer_type,
+                    "finding",
+                    None,
+                    Some(&metadata),
+                ) {
                     debug!("Skipping duplicate finding: {}", title);
                     continue;
                 }
@@ -676,7 +704,14 @@ pub fn save_parsed_recommendations(
                     _ => "rule_create",
                 };
 
-                if is_duplicate_recommendation(db, &title, optimizer_type, rec_type, Some(&rec.agent), Some(&recommended_value)) {
+                if is_duplicate_recommendation(
+                    db,
+                    &title,
+                    optimizer_type,
+                    rec_type,
+                    Some(&rec.agent),
+                    Some(&recommended_value),
+                ) {
                     debug!("Skipping duplicate recommendation: {}", title);
                     continue;
                 }

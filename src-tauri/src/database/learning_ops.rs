@@ -52,11 +52,11 @@ impl CheckpointDb {
         let architecture = workflow_architecture.unwrap_or("traditional");
 
         // Auto-enrich technology and domain tags from files_modified
-        let files_vec: Vec<String> = files_modified
-            .map(|f| f.to_vec())
-            .unwrap_or_default();
-        let technology_tags = crate::orchestrator::learning_recorder::infer_technology_tags(&files_vec);
-        let technology_tags_json = serde_json::to_string(&technology_tags).unwrap_or_else(|_| "[]".into());
+        let files_vec: Vec<String> = files_modified.map(|f| f.to_vec()).unwrap_or_default();
+        let technology_tags =
+            crate::orchestrator::learning_recorder::infer_technology_tags(&files_vec);
+        let technology_tags_json =
+            serde_json::to_string(&technology_tags).unwrap_or_else(|_| "[]".into());
 
         let domain_tags = crate::orchestrator::learning_recorder::infer_domain_tags(
             &files_vec,

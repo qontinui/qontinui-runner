@@ -107,8 +107,7 @@ pub fn list_golden_datasets(
 
         let map_row = |row: &rusqlite::Row| -> rusqlite::Result<GoldenDataset> {
             let entries_json: String = row.get(3)?;
-            let entries: Vec<GoldenEntry> =
-                serde_json::from_str(&entries_json).unwrap_or_default();
+            let entries: Vec<GoldenEntry> = serde_json::from_str(&entries_json).unwrap_or_default();
             Ok(GoldenDataset {
                 id: row.get(0)?,
                 agent_type: row.get(1)?,

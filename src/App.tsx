@@ -176,6 +176,7 @@ function AppContent() {
         projectSelection.selectedProjectName,
       );
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only reload config when project selection changes, not when projectLogs object reference changes
   }, [
     projectSelection.selectedProjectId,
     projectSelection.selectedProjectName,

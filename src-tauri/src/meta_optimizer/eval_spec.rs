@@ -63,10 +63,7 @@ pub enum EvalAssertion {
     MaxIterations { count: u32 },
     /// No regression vs baseline: metric must not drop more than `tolerance_pp`
     /// percentage points.
-    NoRegression {
-        metric: String,
-        tolerance_pp: f64,
-    },
+    NoRegression { metric: String, tolerance_pp: f64 },
 }
 
 /// Thresholds for declaring an eval as passed, failed, or inconclusive.
@@ -287,10 +284,7 @@ pub fn save_eval_result(db: &CheckpointDb, result: &EvalResult) -> Result<(), St
     let status = result.status.clone();
     let result_json = serde_json::to_string(result)
         .map_err(|e| format!("Failed to serialize eval result: {}", e))?;
-    let p_value = result
-        .comparison
-        .as_ref()
-        .and_then(|c| c.p_value);
+    let p_value = result.comparison.as_ref().and_then(|c| c.p_value);
     let trials_run = result.trials_run as i64;
     let created_at = result.created_at.clone();
 
@@ -323,9 +317,7 @@ pub fn list_eval_results(
     let rec = recommendation_id.map(|s| s.to_string());
 
     db.with_conn(move |conn| {
-        let mut sql = String::from(
-            "SELECT result_json FROM eval_results WHERE 1=1",
-        );
+        let mut sql = String::from("SELECT result_json FROM eval_results WHERE 1=1");
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut idx = 1;
 
@@ -389,10 +381,7 @@ pub fn attach_eval_result(
 ///
 /// Uses recent learning outcomes to derive sensible assertion thresholds
 /// (e.g., "success rate must be at least 80% of historical average").
-pub fn generate_default_spec(
-    db: &CheckpointDb,
-    target_agent: &str,
-) -> Result<EvalSpec, String> {
+pub fn generate_default_spec(db: &CheckpointDb, target_agent: &str) -> Result<EvalSpec, String> {
     let agent = target_agent.to_string();
 
     // Get historical performance baseline
@@ -449,10 +438,7 @@ pub fn generate_default_spec(
         target_agent: Some(target_agent.to_string()),
         test_cases: vec![EvalTestCase {
             id: format!("tc-{}", uuid::Uuid::new_v4()),
-            description: format!(
-                "Baseline validation for {} agent",
-                target_agent
-            ),
+            description: format!("Baseline validation for {} agent", target_agent),
             input: EvalInput::WorkflowIds { ids: vec![] }, // populated at eval time from recent runs
             assertions,
         }],

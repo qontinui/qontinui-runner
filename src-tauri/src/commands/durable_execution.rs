@@ -52,11 +52,7 @@ pub async fn replay_workflow(
     };
 
     let resume_point = replay_manager
-        .prepare_replay(
-            &execution_id,
-            &target,
-            std::path::Path::new(&working_dir),
-        )
+        .prepare_replay(&execution_id, &target, std::path::Path::new(&working_dir))
         .await?;
 
     Ok(format!(
@@ -114,7 +110,5 @@ pub async fn get_iteration_commits(
     app_state: State<'_, Arc<AppState>>,
     execution_id: String,
 ) -> Result<Vec<crate::unified_workflow_executor::types::IterationCommit>, String> {
-    app_state
-        .checkpoint_db
-        .get_iteration_commits(&execution_id)
+    app_state.checkpoint_db.get_iteration_commits(&execution_id)
 }

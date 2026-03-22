@@ -809,10 +809,7 @@ pub fn get_pipeline_checkpoint(
 }
 
 /// Clear the pipeline checkpoint for a task run (e.g., after successful completion).
-pub fn clear_pipeline_checkpoint(
-    db: &CheckpointDb,
-    task_run_id: &str,
-) -> Result<(), String> {
+pub fn clear_pipeline_checkpoint(db: &CheckpointDb, task_run_id: &str) -> Result<(), String> {
     let task_run_id = task_run_id.to_string();
 
     db.with_conn(move |conn| {

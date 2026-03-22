@@ -329,9 +329,7 @@ fn contains_shell_injection(cmd: &str) -> bool {
     // Reject commands that chain or redirect via shell metacharacters.
     // This is intentionally conservative — commands that need these operators
     // should be wrapped in a script file instead.
-    let dangerous_patterns: &[&str] = &[
-        "&&", "||", ";", "|", ">", "<", "$(", "${", "`",
-    ];
+    let dangerous_patterns: &[&str] = &["&&", "||", ";", "|", ">", "<", "$(", "${", "`"];
     dangerous_patterns.iter().any(|p| cmd.contains(p))
 }
 
@@ -362,12 +360,13 @@ fn derive_command(criterion: &AcceptanceCriterion, working_dir: &Option<String>)
     if let Some(start) = hint.find('`') {
         if let Some(end) = hint[start + 1..].find('`') {
             let extracted = &hint[start + 1..start + 1 + end];
-            if !extracted.is_empty() && (!extracted.contains(' ') || extracted.contains("--")) {
-                if !contains_shell_injection(extracted) {
-                    return extracted.to_string();
-                }
-                // Fall through to safer alternatives if injection detected
+            if !extracted.is_empty()
+                && (!extracted.contains(' ') || extracted.contains("--"))
+                && !contains_shell_injection(extracted)
+            {
+                return extracted.to_string();
             }
+            // Fall through to safer alternatives if injection detected
         }
     }
 

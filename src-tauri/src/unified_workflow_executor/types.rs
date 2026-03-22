@@ -414,8 +414,7 @@ impl LoopConfig {
             ),
             iteration_diffs: Vec::new(),
             // strict_cwd is true if either the workflow or global setting enables it
-            strict_cwd: workflow.strict_cwd
-                || crate::settings::get_path_settings().strict_mode,
+            strict_cwd: workflow.strict_cwd || crate::settings::get_path_settings().strict_mode,
             tool_tags: workflow.tool_tags.clone(),
             use_worktree: workflow.use_worktree,
             worktree_path: None,

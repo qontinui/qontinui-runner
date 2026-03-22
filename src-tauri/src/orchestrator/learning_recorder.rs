@@ -103,8 +103,7 @@ pub fn infer_domain_tags(
     // Infer from file paths
     for file in files {
         let lower = file.to_lowercase().replace('\\', "/");
-        if lower.contains("/database/") || lower.contains("/migrations") || lower.contains(".sql")
-        {
+        if lower.contains("/database/") || lower.contains("/migrations") || lower.contains(".sql") {
             tags.insert("database".to_string());
         }
         if lower.contains("/ui-bridge/") || lower.contains("/ui_bridge/") {
@@ -290,7 +289,8 @@ pub fn record_learning_outcome(
 
     // Auto-enrich technology and domain tags from files_modified and workflow metadata
     let technology_tags = infer_technology_tags(&outcome.files_modified);
-    let technology_tags_json = serde_json::to_string(&technology_tags).unwrap_or_else(|_| "[]".into());
+    let technology_tags_json =
+        serde_json::to_string(&technology_tags).unwrap_or_else(|_| "[]".into());
 
     let domain_tags = infer_domain_tags(
         &outcome.files_modified,

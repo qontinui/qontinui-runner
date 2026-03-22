@@ -33,8 +33,7 @@ use crate::workflow_generation::revision;
 use crate::workflow_generation::rules;
 use crate::workflow_generation::schema_context::{
     build_gotchas_section, build_rules_section_for_tier, build_schema_context,
-    build_schema_context_full, format_skills_for_generator,
-    format_skills_for_generator_filtered,
+    build_schema_context_full, format_skills_for_generator, format_skills_for_generator_filtered,
 };
 use crate::workflow_generation::self_improve;
 use crate::workflow_generation::spec_synthesis;

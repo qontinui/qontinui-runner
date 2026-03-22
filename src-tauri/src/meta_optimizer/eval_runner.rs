@@ -39,7 +39,10 @@ pub fn evaluate_spec(
         let period_end = chrono::Utc::now().to_rfc3339();
 
         crate::database::pipeline_traces::get_agent_aggregates_for_period(
-            db, agent, &period_start, &period_end,
+            db,
+            agent,
+            &period_start,
+            &period_end,
         )?
     } else {
         None
@@ -115,7 +118,10 @@ pub fn evaluate_spec(
     let status = if total_count == 0 {
         "inconclusive"
     } else if pass_rate >= spec.thresholds.required_pass_rate {
-        if comparison.as_ref().is_some_and(|c| c.verdict == "regressed") {
+        if comparison
+            .as_ref()
+            .is_some_and(|c| c.verdict == "regressed")
+        {
             "failed"
         } else {
             "passed"
@@ -124,14 +130,8 @@ pub fn evaluate_spec(
         "failed"
     };
 
-    let trials_run = baseline_agg
-        .as_ref()
-        .map(|a| a.trial_count)
-        .unwrap_or(0)
-        + candidate_agg
-            .as_ref()
-            .map(|a| a.trial_count)
-            .unwrap_or(0);
+    let trials_run = baseline_agg.as_ref().map(|a| a.trial_count).unwrap_or(0)
+        + candidate_agg.as_ref().map(|a| a.trial_count).unwrap_or(0);
 
     let result = EvalResult {
         id: result_id.clone(),
@@ -237,7 +237,10 @@ fn get_post_apply_metrics(
             .map_err(|e| format!("Invalid applied_at: {}", e))?;
 
         let agg = crate::database::pipeline_traces::get_agent_aggregates_for_period(
-            db, agent, &applied_at, &after_end,
+            db,
+            agent,
+            &applied_at,
+            &after_end,
         )?;
 
         Ok(agg.map(|a| EvalAggregateMetrics {
@@ -506,7 +509,7 @@ mod tests {
             description: "Test".to_string(),
             input: EvalInput::WorkflowIds { ids: vec![] },
             assertions: vec![
-                EvalAssertion::SuccessRate { min: 0.9 }, // will fail
+                EvalAssertion::SuccessRate { min: 0.9 },  // will fail
                 EvalAssertion::MaxDuration { ms: 10000 }, // will pass
             ],
         };

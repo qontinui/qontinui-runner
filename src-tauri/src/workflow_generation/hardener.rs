@@ -2143,7 +2143,8 @@ mod tests {
             json!({"id": "s1", "type": "prompt", "content": "Check page"}),
         ]);
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None);
+        let prompt =
+            build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None);
         assert!(prompt.contains("Rule 4"));
         assert!(prompt.contains("page navigation"));
     }
@@ -2154,7 +2155,8 @@ mod tests {
             json!({"id": "s1", "type": "command", "command": "curl -s http://localhost:9876/ui-bridge/sdk/ai/search", "mode": "shell"}),
         ]);
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None);
+        let prompt =
+            build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None);
         assert!(prompt.contains("ai/search"));
         assert!(prompt.contains("total"));
         assert!(prompt.contains("grep"));
@@ -2198,7 +2200,8 @@ mod tests {
         workflow.agentic_steps =
             vec![json!({"id": "a1", "type": "prompt", "content": "Implement thumbnails"})];
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None);
+        let prompt =
+            build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None);
         assert!(prompt.contains("Rule 5"));
         assert!(prompt.contains("agentic step"));
         assert!(prompt.contains("verification coverage"));

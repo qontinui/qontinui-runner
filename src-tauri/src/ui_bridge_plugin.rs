@@ -69,12 +69,9 @@ async fn fs_assert(
                     size: None,
                 });
             }
-            let content = std::fs::read_to_string(&path)
-                .map_err(|e| format!("Failed to read file: {e}"))?;
-            let needle = expected
-                .as_ref()
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let content =
+                std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {e}"))?;
+            let needle = expected.as_ref().and_then(|v| v.as_str()).unwrap_or("");
             let passed = content.contains(needle);
             Ok(FsAssertResult {
                 passed,
@@ -93,12 +90,9 @@ async fn fs_assert(
                     size: None,
                 });
             }
-            let content = std::fs::read_to_string(&path)
-                .map_err(|e| format!("Failed to read file: {e}"))?;
-            let expected_str = expected
-                .as_ref()
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let content =
+                std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {e}"))?;
+            let expected_str = expected.as_ref().and_then(|v| v.as_str()).unwrap_or("");
             let passed = content == expected_str;
             Ok(FsAssertResult {
                 passed,
@@ -120,10 +114,7 @@ async fn fs_assert(
             let meta = std::fs::metadata(&path)
                 .map_err(|e| format!("Failed to get file metadata: {e}"))?;
             let size = meta.len();
-            let threshold: u64 = expected
-                .as_ref()
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let threshold: u64 = expected.as_ref().and_then(|v| v.as_u64()).unwrap_or(0);
             let passed = size > threshold;
             Ok(FsAssertResult {
                 passed,
@@ -158,9 +149,7 @@ async fn db_assert(
     expected_rows: Option<i64>,
     expected_values: Option<Vec<serde_json::Value>>,
 ) -> Result<DbAssertResult, String> {
-    info!(
-        "ui-bridge plugin: db_assert query={query} connection_ref={connection_ref:?}"
-    );
+    info!("ui-bridge plugin: db_assert query={query} connection_ref={connection_ref:?}");
 
     if let Some(ref cref) = connection_ref {
         warn!("db_assert: connection_ref '{cref}' ignored – using runner's checkpoint DB");
@@ -170,8 +159,7 @@ async fn db_assert(
 
     // Run the query on a blocking thread to avoid blocking the async runtime
     tokio::task::spawn_blocking(move || {
-        let conn = db
-            .get_conn_string()?;
+        let conn = db.get_conn_string()?;
 
         let mut stmt = conn
             .prepare(&query)
@@ -295,8 +283,9 @@ async fn get_artifact(
     tokio::task::spawn_blocking(move || {
         let artifact = db.get_artifact(&artifact_id)?;
         match artifact {
-            Some(a) => serde_json::to_value(&a)
-                .map_err(|e| format!("Failed to serialize artifact: {e}")),
+            Some(a) => {
+                serde_json::to_value(&a).map_err(|e| format!("Failed to serialize artifact: {e}"))
+            }
             None => Err(format!("Artifact '{artifact_id}' not found")),
         }
     })
@@ -316,8 +305,7 @@ async fn query_artifacts(
     let db = state.checkpoint_db.clone();
     tokio::task::spawn_blocking(move || {
         let artifacts = db.query_artifacts(&query)?;
-        serde_json::to_value(&artifacts)
-            .map_err(|e| format!("Failed to serialize artifacts: {e}"))
+        serde_json::to_value(&artifacts).map_err(|e| format!("Failed to serialize artifacts: {e}"))
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))?

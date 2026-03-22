@@ -10,7 +10,7 @@
  * Generates valid ContractConfig JSON and saves/loads via Tauri file APIs.
  */
 
-import { useState, useCallback, useMemo, useReducer } from "react";
+import { useCallback, useMemo, useReducer } from "react";
 import {
   Plus,
   Trash2,

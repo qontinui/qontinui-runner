@@ -5327,10 +5327,8 @@ impl CheckpointDb {
             }
 
             if !existing_columns.contains(&"domain_tags".to_string()) {
-                conn.execute_batch(
-                    "ALTER TABLE learning_outcomes ADD COLUMN domain_tags TEXT;",
-                )
-                .map_err(|e| format!("Failed to add domain_tags column: {}", e))?;
+                conn.execute_batch("ALTER TABLE learning_outcomes ADD COLUMN domain_tags TEXT;")
+                    .map_err(|e| format!("Failed to add domain_tags column: {}", e))?;
             }
 
             if !existing_columns.contains(&"complexity_tier".to_string()) {

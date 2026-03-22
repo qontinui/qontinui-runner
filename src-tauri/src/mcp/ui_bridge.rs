@@ -3529,9 +3529,7 @@ pub async fn ui_bridge_page_health_handler(
                 .and_then(|s| s.get("visible"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let has_rect = state
-                .and_then(|s| s.get("normalizedRect"))
-                .is_some();
+            let has_rect = state.and_then(|s| s.get("normalizedRect")).is_some();
             is_visible && has_rect
         })
         .collect();
@@ -3555,9 +3553,9 @@ pub async fn ui_bridge_page_health_handler(
             let row_start = (y * GRID as f64).floor().max(0.0) as usize;
             let row_end = ((y + h) * GRID as f64).ceil().min(GRID as f64) as usize;
 
-            for r in row_start..row_end.min(GRID) {
-                for c in col_start..col_end.min(GRID) {
-                    grid[r][c] = true;
+            for row in grid.iter_mut().take(row_end.min(GRID)).skip(row_start) {
+                for cell in row.iter_mut().take(col_end.min(GRID)).skip(col_start) {
+                    *cell = true;
                 }
             }
         }
@@ -3660,19 +3658,14 @@ pub async fn ui_bridge_page_health_handler(
 
     // --- Step 4: Element diversity ----------------------------------------
     let nav_types: &[&str] = &["button", "heading", "badge", "status-message"];
-    let mut type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut type_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for el in &elements {
-        let t = el
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+        let t = el.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
         *type_counts.entry(t.to_string()).or_insert(0) += 1;
     }
 
-    let all_nav = element_count > 5
-        && type_counts
-            .keys()
-            .all(|k| nav_types.contains(&k.as_str()));
+    let all_nav = element_count > 5 && type_counts.keys().all(|k| nav_types.contains(&k.as_str()));
 
     let diversity_severity = if all_nav { "WARNING" } else { "OK" };
 
@@ -3780,9 +3773,8 @@ pub async fn ui_bridge_page_health_handler(
 
     let text_severity = if !detected_errors.is_empty() {
         "CRITICAL"
-    } else if !detected_loading.is_empty() || !detected_css.is_empty() {
-        "WARNING"
-    } else if !detected_empty.is_empty() {
+    } else if !detected_loading.is_empty() || !detected_css.is_empty() || !detected_empty.is_empty()
+    {
         "WARNING"
     } else {
         "OK"
@@ -3811,10 +3803,7 @@ pub async fn ui_bridge_page_health_handler(
     let mut interactive_disabled: usize = 0;
 
     for el in &elements {
-        let cat = el
-            .get("category")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let cat = el.get("category").and_then(|v| v.as_str()).unwrap_or("");
         if cat == "interactive" {
             interactive_total += 1;
             let enabled = el

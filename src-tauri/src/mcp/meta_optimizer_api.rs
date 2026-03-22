@@ -20,9 +20,9 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::meta_optimizer::prompt_registry;
 use crate::meta_optimizer::recommendations;
 use crate::meta_optimizer::types::{
-    ContextTier, GenerationFeedbackDetailL1, GenerationFeedbackSummaryL0,
-    LearningOutcomeDetailL1, LearningOutcomeSummaryL0, MetaOptimizerRun, PromptVariant,
-    Recommendation, ReflectionFixDetailL1, ReflectionFixSummaryL0,
+    ContextTier, GenerationFeedbackDetailL1, GenerationFeedbackSummaryL0, LearningOutcomeDetailL1,
+    LearningOutcomeSummaryL0, MetaOptimizerRun, PromptVariant, Recommendation,
+    ReflectionFixDetailL1, ReflectionFixSummaryL0,
 };
 
 // ---------------------------------------------------------------------------
@@ -709,10 +709,7 @@ pub async fn get_learning_outcomes_handler(
     let make_err = |e: String| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!(
-                "Failed to get learning outcomes: {}",
-                e
-            ))),
+            Json(api_error(format!("Failed to get learning outcomes: {}", e))),
         )
     };
 
@@ -1847,11 +1844,11 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         )
         // Eval spec routes (promptfoo-inspired declarative evaluation)
         .route("/meta-optimizer/eval-specs", get(get_eval_specs_handler))
+        .route("/meta-optimizer/eval-specs", post(create_eval_spec_handler))
         .route(
-            "/meta-optimizer/eval-specs",
-            post(create_eval_spec_handler),
+            "/meta-optimizer/eval-results",
+            get(get_eval_results_handler),
         )
-        .route("/meta-optimizer/eval-results", get(get_eval_results_handler))
         .route(
             "/meta-optimizer/recommendations/{id}/evaluate",
             post(evaluate_recommendation_handler),
