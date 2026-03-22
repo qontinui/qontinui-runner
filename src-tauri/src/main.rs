@@ -1257,6 +1257,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::meta_optimizer::get_robustness_reports,
             commands::meta_optimizer::get_golden_datasets,
             commands::meta_optimizer::build_golden_dataset,
+            // Model profiles and comparison bridge
+            commands::meta_optimizer::get_model_profiles,
+            commands::meta_optimizer::refresh_model_profiles,
+            commands::meta_optimizer::get_model_recommendations,
+            commands::meta_optimizer::convert_comparison_to_recommendation,
             // Comparison commands
             commands::comparison::start_comparison,
             commands::comparison::get_comparison_status,

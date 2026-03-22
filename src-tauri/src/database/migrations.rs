@@ -5028,7 +5028,7 @@ impl CheckpointDb {
                 ALTER TABLE generation_rules ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;
                 CREATE INDEX IF NOT EXISTS idx_generation_rules_severity ON generation_rules(severity);
 
-                -- Set severity='critical' for rules about: valid step types, JSON output, valid UUID, deterministic verification
+                -- Set severity='critical' for structural correctness rules
                 UPDATE generation_rules SET severity = 'critical'
                     WHERE status = 'active' AND (
                         title LIKE '%Only 3 step types%'
@@ -5039,9 +5039,11 @@ impl CheckpointDb {
                         OR title LIKE '%Deterministic verification%'
                         OR title LIKE '%deterministic%automated step%'
                         OR title LIKE '%command step MUST include a mode%'
+                        OR title LIKE '%Phase field must match%'
+                        OR title LIKE '%Agentic steps are prompt%'
                     );
 
-                -- Set severity='important' for rules about: typecheck, SDK content, test_type usage
+                -- Set severity='important' for correctness-adjacent rules
                 UPDATE generation_rules SET severity = 'important'
                     WHERE status = 'active' AND severity = 'normal' AND (
                         title LIKE '%typecheck%'
@@ -5052,6 +5054,15 @@ impl CheckpointDb {
                         OR title LIKE '%Test steps with inline%'
                         OR title LIKE '%Retry format%'
                         OR title LIKE '%Data flow references%'
+                        OR title LIKE '%ISO 8601%'
+                        OR title LIKE '%Prompts are supplementary%'
+                        OR title LIKE '%Feature-specific verification%'
+                        OR title LIKE '%Agentic-verification correspondence%'
+                        OR title LIKE '%f-string%'
+                        OR title LIKE '%Python f-string%'
+                        OR title LIKE '%bash negation%'
+                        OR title LIKE '%No echo EXIT%'
+                        OR title LIKE '%Safe grep pipeline%'
                     );
 
                 INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (127, datetime('now'));
@@ -5473,6 +5484,55 @@ impl CheckpointDb {
             .map_err(|e| format!("Failed to migrate to version 140: {}", e))?;
 
             info!("Successfully migrated to version 140 (recommendation content_hash)");
+        }
+
+        // --- Migration 141: Model profiles + comparison bridge columns ---
+        if current_version < 141 {
+            info!("Migrating to version 141 (model profiles + comparison bridge)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS model_profiles (
+                    id TEXT PRIMARY KEY,
+                    model_id TEXT NOT NULL UNIQUE,
+                    profile_json TEXT NOT NULL,
+                    trial_count INTEGER DEFAULT 0,
+                    last_updated TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_model_profiles_model ON model_profiles(model_id);
+                "#,
+            )
+            .map_err(|e| format!("Failed to create model_profiles table: {}", e))?;
+
+            // Add bridge columns to comparison_runs (check first for idempotency)
+            let has_rec_id: bool = conn
+                .prepare("PRAGMA table_info(comparison_runs)")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(1))
+                        .map(|rows| {
+                            rows.filter_map(|r| r.ok())
+                                .any(|name| name == "recommendation_id")
+                        })
+                })
+                .unwrap_or(false);
+
+            if !has_rec_id {
+                conn.execute_batch(
+                    r#"
+                    ALTER TABLE comparison_runs ADD COLUMN recommendation_id TEXT;
+                    ALTER TABLE comparison_runs ADD COLUMN source TEXT DEFAULT 'manual';
+                    "#,
+                )
+                .map_err(|e| format!("Failed to add comparison bridge columns: {}", e))?;
+            }
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (141, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 141: {}", e))?;
+
+            info!("Successfully migrated to version 141 (model profiles + comparison bridge)");
         }
 
         // Repair migration: is_favorite column may be missing on databases created from

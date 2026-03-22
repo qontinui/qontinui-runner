@@ -44,6 +44,16 @@ pub enum PackageManager {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+pub enum ServerFramework {
+    NextJs,
+    Express,
+    Fastify,
+    Axum,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum IntegrationStatus {
     None,
     Partial,
@@ -66,7 +76,9 @@ pub struct ProjectAnalysis {
     pub existing_sdk_version: Option<String>,
     pub has_babel_plugin: bool,
     pub has_swc_plugin: bool,
+    pub server_framework: ServerFramework,
     pub server_adapter: Option<String>,
+    pub server_entry_points: Vec<String>,
     pub dev_server_port: Option<u16>,
     pub has_generated_hooks: bool,
     pub has_architecture_spec: bool,
@@ -191,7 +203,9 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
     let mut existing_sdk_version = None;
     let mut has_babel_plugin = false;
     let mut has_swc_plugin = false;
+    let mut server_framework = ServerFramework::None;
     let mut server_adapter = None;
+    let mut server_entry_points = Vec::new();
     let mut dev_server_port = None;
     let mut issues = Vec::new();
 
@@ -251,6 +265,19 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
                         has_swc_plugin = true;
                     }
 
+                    // Detect server framework from dependencies
+                    if framework == Framework::NextJs {
+                        server_framework = ServerFramework::NextJs;
+                    } else if deps.get("express").is_some()
+                        || dev_deps.get("express").is_some()
+                    {
+                        server_framework = ServerFramework::Express;
+                    } else if deps.get("fastify").is_some()
+                        || dev_deps.get("fastify").is_some()
+                    {
+                        server_framework = ServerFramework::Fastify;
+                    }
+
                     // Check for server adapter
                     if deps.get("@qontinui/ui-bridge-server").is_some()
                         || dev_deps.get("@qontinui/ui-bridge-server").is_some()
@@ -291,6 +318,35 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
         }
     } else if project_path.join("index.html").exists() {
         framework = Framework::PlainHtml;
+    }
+
+    // Detect Rust/Axum server framework from Cargo.toml (check project dir and parent)
+    if server_framework == ServerFramework::None {
+        for cargo_dir in &[project_path.clone(), project_path.join("..").to_path_buf()] {
+            let cargo_path = cargo_dir.join("Cargo.toml");
+            if cargo_path.exists() {
+                if let Ok(cargo_content) = tokio::fs::read_to_string(&cargo_path).await {
+                    if cargo_content.contains("axum") {
+                        server_framework = ServerFramework::Axum;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Detect server entry points
+    for entry in &[
+        "server.ts",
+        "server.js",
+        "src/server.ts",
+        "src/server.js",
+        "src/index.ts",
+        "src/index.js",
+    ] {
+        if project_path.join(entry).exists() {
+            server_entry_points.push(entry.to_string());
+        }
     }
 
     // Find entry points based on framework
@@ -399,7 +455,9 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
         existing_sdk_version,
         has_babel_plugin,
         has_swc_plugin,
+        server_framework,
         server_adapter,
+        server_entry_points,
         dev_server_port,
         has_generated_hooks,
         has_architecture_spec,
@@ -669,6 +727,52 @@ async fn integrate_source(
         }
         Framework::Unknown => {
             warnings.push("Could not detect framework. Please integrate manually.".to_string());
+        }
+    }
+
+    // Server-side relay integration (separate from client-side framework setup).
+    // Next.js server relay is already handled in integrate_nextjs().
+    match analysis.server_framework {
+        ServerFramework::Express => {
+            integrate_express_server(
+                &project,
+                analysis,
+                &mut modifications,
+                &mut warnings,
+            )
+            .await;
+            next_steps.push(
+                "Server-side: Express relay router created. Mount it in your server with: app.use('/api/ui-bridge', uiBridgeRouter)"
+                    .to_string(),
+            );
+        }
+        ServerFramework::Axum => {
+            next_steps.push(
+                "Server-side: Axum detected. Add UI Bridge relay endpoints to your Axum server. See qontinui-supervisor/src/routes/supervisor_bridge.rs for a reference Rust implementation with SSE command stream, command response handler, and control endpoints."
+                    .to_string(),
+            );
+        }
+        ServerFramework::Fastify => {
+            next_steps.push(
+                "Server-side: Fastify detected. Create relay setup with CommandRelay + createRelayHandlers from @qontinui/ui-bridge/server. Register routes manually following the Express adapter pattern."
+                    .to_string(),
+            );
+        }
+        ServerFramework::None => {
+            // For React (non-Next.js) apps with no server framework detected,
+            // offer the standalone server option.
+            if analysis.framework == Framework::React
+                && analysis.server_framework == ServerFramework::None
+            {
+                integrate_standalone_server(&project, &mut modifications, &mut warnings).await;
+                next_steps.push(
+                    "Server-side: No server framework detected. Created a standalone UI Bridge server file. Run it with: npx tsx ui-bridge-server.ts"
+                        .to_string(),
+                );
+            }
+        }
+        ServerFramework::NextJs => {
+            // Already handled in integrate_nextjs()
         }
     }
 
@@ -1033,6 +1137,74 @@ async fn add_missing_command_relay_listener(
     }
 }
 
+/// Generate server-side relay files for Express apps.
+async fn integrate_express_server(
+    project: &std::path::Path,
+    _analysis: &ProjectAnalysis,
+    modifications: &mut Vec<FileModification>,
+    warnings: &mut Vec<String>,
+) {
+    // Create relay setup file (shared pattern with Next.js)
+    let relay_path = if project.join("src/lib").exists() {
+        "src/lib/ui-bridge.ts"
+    } else {
+        "src/lib/ui-bridge.ts"
+    };
+
+    if !project.join(relay_path).exists() {
+        if let Some(parent) = project.join(relay_path).parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        modifications.push(FileModification {
+            file_path: relay_path.to_string(),
+            modification_type: ModificationType::CreateNew,
+            description: "Create CommandRelay + handlers setup for UI Bridge".to_string(),
+            original_content: None,
+            new_content: RELAY_SETUP_TEMPLATE.to_string(),
+        });
+    }
+
+    // Create Express router file
+    let routes_path = "src/ui-bridge-routes.ts";
+    if !project.join(routes_path).exists() {
+        modifications.push(FileModification {
+            file_path: routes_path.to_string(),
+            modification_type: ModificationType::CreateNew,
+            description: "Create Express router for UI Bridge endpoints".to_string(),
+            original_content: None,
+            new_content: EXPRESS_ROUTES_TEMPLATE.to_string(),
+        });
+    }
+
+    warnings.push(
+        "Server-side relay files created. Add the router to your Express app: import { uiBridgeRouter } from './ui-bridge-routes'; app.use('/api/ui-bridge', uiBridgeRouter);"
+            .to_string(),
+    );
+}
+
+/// Generate a standalone server file for apps without a Node.js server framework.
+async fn integrate_standalone_server(
+    project: &std::path::Path,
+    modifications: &mut Vec<FileModification>,
+    warnings: &mut Vec<String>,
+) {
+    let server_path = "ui-bridge-server.ts";
+    if !project.join(server_path).exists() {
+        modifications.push(FileModification {
+            file_path: server_path.to_string(),
+            modification_type: ModificationType::CreateNew,
+            description: "Create standalone UI Bridge server for command relay".to_string(),
+            original_content: None,
+            new_content: STANDALONE_SERVER_TEMPLATE.to_string(),
+        });
+    }
+
+    warnings.push(
+        "Created ui-bridge-server.ts — run it alongside your app to enable UI Bridge relay: npx tsx ui-bridge-server.ts"
+            .to_string(),
+    );
+}
+
 fn find_last_import_pos(content: &str) -> usize {
     let mut last_import_end = 0;
     for (i, line) in content.lines().enumerate() {
@@ -1178,6 +1350,48 @@ export function RenderLogWrapper({
 
   return <>{children}</>;
 }
+"#;
+
+// The relay setup template is shared between Express, Standalone, and any
+// Node.js server that uses the CommandRelay pattern.
+const RELAY_SETUP_TEMPLATE: &str = r#"import { CommandRelay, createRelayHandlers } from '@qontinui/ui-bridge/server';
+
+export const relay = new CommandRelay();
+export const handlers = createRelayHandlers(relay);
+"#;
+
+const EXPRESS_ROUTES_TEMPLATE: &str = r#"import { createExpressRouter, SSEManager } from '@qontinui/ui-bridge/server';
+import { handlers, relay } from './lib/ui-bridge';
+
+const sseManager = new SSEManager();
+
+/**
+ * Express router for UI Bridge endpoints.
+ * Mount this in your Express app:
+ *
+ *   import { uiBridgeRouter } from './ui-bridge-routes';
+ *   app.use('/api/ui-bridge', uiBridgeRouter);
+ */
+export const uiBridgeRouter = createExpressRouter(handlers, {
+  relay,
+  sseManager,
+  cors: true,
+});
+"#;
+
+const STANDALONE_SERVER_TEMPLATE: &str = r#"import { StandaloneServer, CommandRelay, createRelayHandlers } from '@qontinui/ui-bridge/server';
+
+const relay = new CommandRelay();
+const handlers = createRelayHandlers(relay);
+
+const server = new StandaloneServer(handlers, {
+  port: 4200,
+  cors: true,
+});
+
+server.start().then(() => {
+  console.log('UI Bridge server running on http://localhost:4200');
+});
 "#;
 
 // ============================================================================

@@ -47,8 +47,8 @@ use super::types::{
 /// - Step events are logged through a centralized registry to prevent duplicates
 pub struct LoopController {
     pub(super) setup_executor: SetupExecutor,
-    pub(super) verification_executor: VerificationExecutor,
-    pub(super) agentic_executor: AgenticExecutor,
+    pub(super) verification_executor: Arc<VerificationExecutor>,
+    pub(super) agentic_executor: Arc<AgenticExecutor>,
     pub(super) completion_executor: CompletionExecutor,
     pub(super) checkpoint_db: Arc<crate::database::CheckpointDb>,
     pub(super) knowledge_base: KnowledgeBase,
@@ -81,16 +81,16 @@ impl LoopController {
                 app_handle.clone(),
                 pid_tracker.clone(),
             ),
-            verification_executor: VerificationExecutor::new(
+            verification_executor: Arc::new(VerificationExecutor::new(
                 app_state.clone(),
                 config_storage.clone(),
                 app_handle.clone(),
-            ),
-            agentic_executor: AgenticExecutor::new(
+            )),
+            agentic_executor: Arc::new(AgenticExecutor::new(
                 app_state.clone(),
                 app_handle.clone(),
                 pid_tracker.clone(),
-            ),
+            )),
             completion_executor: CompletionExecutor::new(
                 app_state.clone(),
                 config_storage.clone(),
@@ -117,7 +117,9 @@ impl LoopController {
     /// Enable interactive sessions on all phase executors via the session manager.
     pub fn with_session_manager(mut self, sm: Arc<crate::claude_session::SessionManager>) -> Self {
         self.setup_executor.set_session_manager(sm.clone());
-        self.agentic_executor.set_session_manager(sm.clone());
+        Arc::get_mut(&mut self.agentic_executor)
+            .expect("agentic_executor Arc has multiple owners during builder phase")
+            .set_session_manager(sm.clone());
         self.completion_executor.set_session_manager(sm);
         self
     }
@@ -127,7 +129,9 @@ impl LoopController {
         mut self,
         ctx: crate::mcp::shared::ReflectionFixContext,
     ) -> Self {
-        self.agentic_executor.set_reflection_fix_ctx(ctx.clone());
+        Arc::get_mut(&mut self.agentic_executor)
+            .expect("agentic_executor Arc has multiple owners during builder phase")
+            .set_reflection_fix_ctx(ctx.clone());
         self.reflection_fix_ctx = Some(ctx);
         self
     }
@@ -137,7 +141,9 @@ impl LoopController {
         mut self,
         ctx: crate::step_injection::types::StepInjectionContext,
     ) -> Self {
-        self.agentic_executor.set_step_injection_ctx(ctx.clone());
+        Arc::get_mut(&mut self.agentic_executor)
+            .expect("agentic_executor Arc has multiple owners during builder phase")
+            .set_step_injection_ctx(ctx.clone());
         self.step_injection_ctx = Some(ctx);
         self
     }
@@ -186,8 +192,9 @@ impl LoopController {
         // StepExecutor/HandlerContext can write result_data (e.g. generated_workflow_id).
         self.setup_executor
             .set_task_run_id(config.execution_id.clone());
-        self.verification_executor
-            .set_task_run_id(config.execution_id.clone());
+        if let Some(ve) = Arc::get_mut(&mut self.verification_executor) {
+            ve.set_task_run_id(config.execution_id.clone());
+        }
         self.completion_executor
             .set_task_run_id(config.execution_id.clone());
 
@@ -198,10 +205,13 @@ impl LoopController {
         // workspace-scoped working directory resolution on all step handlers.
         if config.strict_cwd {
             let policy = crate::paths::PathScopePolicy::WorkspaceScoped;
-            self.setup_executor.set_path_scope_policy(policy.clone());
-            self.verification_executor
+            self.setup_executor
                 .set_path_scope_policy(policy.clone());
-            self.completion_executor.set_path_scope_policy(policy);
+            if let Some(ve) = Arc::get_mut(&mut self.verification_executor) {
+                ve.set_path_scope_policy(policy.clone());
+            }
+            self.completion_executor
+                .set_path_scope_policy(policy);
         }
 
         // =====================================================================

@@ -475,7 +475,9 @@ pub fn reject_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Resu
 /// Deduplicate pending recommendations by content hash.
 ///
 /// For each group of pending recs with the same content hash, keeps the oldest
-/// and supersedes the rest. Also backfills content_hash for older rows that lack it.
+/// and supersedes newer pending duplicates. Canary and applied recs are not touched
+/// (they represent active rollouts or already-applied changes). Also backfills
+/// content_hash for older rows that lack it.
 pub fn dedup_pending_recommendations(db: &CheckpointDb) -> usize {
     // First, backfill content_hash for any pending recs that don't have one
     let pending = match list_recommendations(db, None, Some("pending")) {
@@ -483,9 +485,8 @@ pub fn dedup_pending_recommendations(db: &CheckpointDb) -> usize {
         Err(_) => return 0,
     };
 
-    let mut backfilled = 0;
+    let mut backfilled = 0usize;
     for rec in &pending {
-        // Backfill hash if missing
         let hash = compute_content_hash(
             &rec.optimizer_type,
             &rec.recommendation_type,
@@ -493,14 +494,17 @@ pub fn dedup_pending_recommendations(db: &CheckpointDb) -> usize {
             rec.recommended_value.as_deref(),
         );
         let id = rec.id.clone();
-        let _ = db.with_conn(move |conn| {
+        if let Ok(affected) = db.with_conn(move |conn| {
             conn.execute(
                 "UPDATE meta_optimizer_recommendations SET content_hash = ?1 WHERE id = ?2 AND content_hash IS NULL",
                 params![hash, id],
             )
             .map_err(|e| format!("Failed to backfill hash: {}", e))
-        });
-        backfilled += 1;
+        }) {
+            if affected > 0 {
+                backfilled += 1;
+            }
+        }
     }
 
     // Now find and supersede duplicates (keep oldest per hash)

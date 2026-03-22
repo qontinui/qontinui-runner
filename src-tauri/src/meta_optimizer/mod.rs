@@ -23,6 +23,7 @@
 pub mod agentic_metrics;
 pub mod architecture_optimizer;
 pub mod canary;
+pub mod comparison_bridge;
 pub mod cost_optimizer;
 pub mod eval_runner;
 pub mod eval_spec;

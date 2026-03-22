@@ -11,7 +11,7 @@
  */
 
 import { useState } from "react";
-import { Activity, AlertCircle, XCircle, LayoutDashboard } from "lucide-react";
+import { Activity, AlertCircle, XCircle, LayoutDashboard, GitCommitHorizontal } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { useTaskRunRecap } from "../../hooks/useTaskRunRecap";
@@ -28,6 +28,7 @@ import { KnowledgeTab } from "./KnowledgeTab";
 import { ContextTab } from "./ContextTab";
 import { ErrorMonitorTab } from "../error-monitor/ErrorMonitorTab";
 import { CanvasRecapTab } from "./CanvasRecapTab";
+import { DurableExecutionTab } from "./DurableExecutionTab";
 import { useErrorBadge } from "../../hooks/useErrorMonitor";
 
 // ============================================================================
@@ -162,6 +163,10 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
             <LayoutDashboard className="w-3.5 h-3.5" />
             Canvas
           </TabsTrigger>
+          <TabsTrigger value="durable" className="flex items-center gap-1.5">
+            <GitCommitHorizontal className="w-3.5 h-3.5" />
+            Diffs &amp; Replay
+          </TabsTrigger>
           <TabsTrigger value="errors" className="flex items-center gap-1.5">
             <AlertCircle className="w-3.5 h-3.5" />
             Errors
@@ -203,6 +208,10 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
 
         <TabsContent value="canvas">
           <CanvasRecapTab taskRunId={taskRunId} />
+        </TabsContent>
+
+        <TabsContent value="durable">
+          <DurableExecutionTab taskRunId={taskRunId} />
         </TabsContent>
 
         <TabsContent value="errors" className="h-full">

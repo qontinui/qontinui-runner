@@ -45,6 +45,7 @@ src-tauri/WixTools/
 # OS files
 Thumbs.db
 .DS_Store
+nul
 
 # Test files
 *.test.json

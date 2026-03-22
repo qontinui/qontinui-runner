@@ -3411,3 +3411,22 @@ INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (139, datetime
 -- Migration 140: Content-hash dedup for meta_optimizer_recommendations
 -- Column and index already included in CREATE TABLE above.
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (140, datetime('now'));
+
+-- =============================================================================
+-- Model Profiles Table (migration 141)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS model_profiles (
+    id TEXT PRIMARY KEY,
+    model_id TEXT NOT NULL UNIQUE,
+    profile_json TEXT NOT NULL,
+    trial_count INTEGER DEFAULT 0,
+    last_updated TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_profiles_model ON model_profiles(model_id);
+
+-- recommendation_id and source columns on comparison_runs
+-- are added via ALTER TABLE in migration 141 (not repeatable in CREATE TABLE).
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (141, datetime('now'));

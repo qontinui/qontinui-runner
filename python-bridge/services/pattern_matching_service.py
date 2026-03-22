@@ -75,6 +75,7 @@ class PatternMatchingService:
     def __init__(self) -> None:
         """Initialize the pattern matching service."""
         self._hal = None
+        self._invariant_matcher: Any | None = None
         if QONTINUI_AVAILABLE and _get_hal_func is not None:
             try:
                 self._hal = _get_hal_func()
@@ -302,28 +303,48 @@ class PatternMatchingService:
                 try:
                     from qontinui.hal.implementations.opencv_matcher import OpenCVMatcher
 
-                    if not hasattr(self, "_invariant_matcher"):
+                    if self._invariant_matcher is None:
                         self._invariant_matcher = OpenCVMatcher()
                     matcher = self._invariant_matcher
                     # Convert BGR numpy arrays to PIL for HAL interface
                     haystack_pil = PILImage.fromarray(cv2.cvtColor(search_img, cv2.COLOR_BGR2RGB))
                     needle_pil = PILImage.fromarray(cv2.cvtColor(template_img, cv2.COLOR_BGR2RGB))
-                    hal_match = matcher.find_template_invariant(
-                        haystack=haystack_pil,
-                        needle=needle_pil,
-                        scales=invariant_scales,
-                        confidence=similarity,
-                    )
-                    if hal_match is not None:
-                        matches.append(
-                            {
-                                "x": int(hal_match.x + offset_x),
-                                "y": int(hal_match.y + offset_y),
-                                "width": hal_match.width,
-                                "height": hal_match.height,
-                                "similarity": hal_match.confidence,
-                            }
+
+                    if find_all:
+                        hal_matches = matcher.find_all_template_invariant(
+                            haystack=haystack_pil,
+                            needle=needle_pil,
+                            scales=invariant_scales,
+                            confidence=similarity,
+                            limit=max_matches,
                         )
+                        for m in hal_matches:
+                            matches.append(
+                                {
+                                    "x": int(m.x + offset_x),
+                                    "y": int(m.y + offset_y),
+                                    "width": m.width,
+                                    "height": m.height,
+                                    "similarity": m.confidence,
+                                }
+                            )
+                    else:
+                        hal_match = matcher.find_template_invariant(
+                            haystack=haystack_pil,
+                            needle=needle_pil,
+                            scales=invariant_scales,
+                            confidence=similarity,
+                        )
+                        if hal_match is not None:
+                            matches.append(
+                                {
+                                    "x": int(hal_match.x + offset_x),
+                                    "y": int(hal_match.y + offset_y),
+                                    "width": hal_match.width,
+                                    "height": hal_match.height,
+                                    "similarity": hal_match.confidence,
+                                }
+                            )
                 except ImportError:
                     logger.warning(
                         "Invariant matching requested but qontinui HAL unavailable, "

@@ -440,3 +440,47 @@ pub fn build_golden_dataset(
         max_entries.unwrap_or(50),
     )
 }
+
+// ── Model Profiles ────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn get_model_profiles(
+    app_state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::autoresearch::model_profiles::ModelProfile>, String> {
+    crate::autoresearch::model_profiles::list_model_profiles(&app_state.checkpoint_db)
+}
+
+#[tauri::command]
+pub fn refresh_model_profiles(
+    app_state: State<'_, Arc<AppState>>,
+    days: Option<i64>,
+) -> Result<Vec<crate::autoresearch::model_profiles::ModelProfile>, String> {
+    crate::autoresearch::model_profiles::refresh_all_profiles(
+        &app_state.checkpoint_db,
+        days.unwrap_or(30),
+    )
+}
+
+#[tauri::command]
+pub fn get_model_recommendations(
+    app_state: State<'_, Arc<AppState>>,
+    budget_usd: Option<f64>,
+) -> Result<Vec<crate::autoresearch::model_profiles::ModelRecommendation>, String> {
+    crate::autoresearch::model_profiles::get_model_recommendation(
+        &app_state.checkpoint_db,
+        budget_usd,
+    )
+}
+
+// ── Comparison Bridge ─────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn convert_comparison_to_recommendation(
+    app_state: State<'_, Arc<AppState>>,
+    comparison_id: String,
+) -> Result<Option<String>, String> {
+    crate::meta_optimizer::comparison_bridge::comparison_to_recommendation(
+        &app_state.checkpoint_db,
+        &comparison_id,
+    )
+}

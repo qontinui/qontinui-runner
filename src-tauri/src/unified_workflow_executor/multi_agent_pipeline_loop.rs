@@ -996,8 +996,9 @@ Only output the JSON array, nothing else."#,
                 };
                 // Restore canary config before early return
                 for (key, original) in &canary_config_originals {
-                    if let Some(val) = original {
-                        let _ = self.checkpoint_db.set_setting(key, val);
+                    match original {
+                        Some(val) => { let _ = self.checkpoint_db.set_setting(key, val); }
+                        None => { let _ = self.checkpoint_db.delete_setting(key); }
                     }
                 }
                 return result.to_loop_result();
@@ -1067,14 +1068,16 @@ Only output the JSON array, nothing else."#,
             .filter(|s| !checkpoint_completed_ids.contains(&s.id))
             .collect();
 
-        // Process subtrees sequentially via the extracted process_subtree method.
-        // NOTE: Parallel subtree processing requires LoopController to be Arc-wrapped
-        // (for tokio::spawn 'static bounds), which is a larger refactor tracked separately.
-        // The process_subtree extraction already prepares for that future change.
+        // Process independent subtrees concurrently using buffer_unordered.
+        // Runs up to max_parallel_implementers subtrees at once. Results collected
+        // into a Vec first (to release the &pipeline_ctx borrow), then merged.
         {
-            for subtree in &pending_subtrees {
-                let output = self
-                    .process_subtree(
+            use futures::stream::{self, StreamExt};
+            let max_parallel = pipeline_config.max_parallel_implementers.max(1) as usize;
+
+            let all_outputs: Vec<SubtreeOutput> = stream::iter(
+                pending_subtrees.iter().map(|subtree| {
+                    self.process_subtree(
                         subtree,
                         config,
                         &pipeline_config,
@@ -1089,8 +1092,14 @@ Only output the JSON array, nothing else."#,
                         logger,
                         &pipeline_ctx,
                     )
-                    .await;
+                }),
+            )
+            .buffer_unordered(max_parallel)
+            .collect()
+            .await;
 
+            // Merge results sequentially after all parallel subtrees complete.
+            for output in all_outputs {
                 total_iterations += output.iterations_used;
                 agent_traces.extend(output.traces);
                 pipeline_ctx
@@ -1102,53 +1111,66 @@ Only output the JSON array, nothing else."#,
                 subtree_results.push(output.result.clone());
 
                 // Update checkpoint with this completed subtree so progress survives crashes.
-                {
-                    let cp = PipelineCheckpoint {
-                        last_completed_phase: 5,
-                        criteria: Some(criteria.clone()),
-                        located_criteria: Some(located_criteria.clone()),
-                        completed_subtrees: subtree_results.clone(),
-                        total_iterations,
-                        agent_trace_count: agent_traces.len(),
-                    };
-                    if let Err(e) = crate::database::pipeline_traces::save_pipeline_checkpoint(
-                        &self.checkpoint_db,
-                        &config.execution_id,
-                        &cp,
-                    ) {
-                        warn!("MULTI-AGENT-PIPELINE: Failed to update checkpoint after subtree '{}': {}", subtree.id, e);
-                    }
+                let cp = PipelineCheckpoint {
+                    last_completed_phase: 5,
+                    criteria: Some(criteria.clone()),
+                    located_criteria: Some(located_criteria.clone()),
+                    completed_subtrees: subtree_results.clone(),
+                    total_iterations,
+                    agent_trace_count: agent_traces.len(),
+                };
+                if let Err(e) = crate::database::pipeline_traces::save_pipeline_checkpoint(
+                    &self.checkpoint_db,
+                    &config.execution_id,
+                    &cp,
+                ) {
+                    warn!("MULTI-AGENT-PIPELINE: Failed to update checkpoint: {}", e);
                 }
+            }
 
-                if output.was_stopped {
-                    info!("MULTI-AGENT-PIPELINE: Stopped by user");
-                    let stopped_total_tokens: u64 = agent_traces
-                        .iter()
-                        .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
-                        .sum();
-                    let stopped_total_cost: f64 = agent_traces.iter().map(|t| t.cost_usd).sum();
-                    let result = MultiAgentPipelineResult {
-                        total_iterations,
-                        goal_achieved: false,
-                        was_stopped: true,
-                        max_iterations_reached: false,
-                        subtree_results,
-                        integration_result: None,
-                        agent_traces,
-                        dag: dag.clone(),
-                        total_criteria: criteria.len() as u32,
-                        passed_criteria: 0,
-                        total_tokens: stopped_total_tokens,
-                        total_cost_usd: stopped_total_cost,
-                    };
-                    // Restore canary config before early return
-                    for (key, original) in &canary_config_originals {
-                        if let Some(val) = original {
-                            let _ = self.checkpoint_db.set_setting(key, val);
-                        }
+        }
+
+        // Check for user stop after all parallel subtrees complete.
+        // In parallel mode, we can't break mid-stream, so check after collection.
+        // The process_subtree method checks is_task_stopped at entry and returns
+        // was_stopped=true, so subtrees started after a stop return early.
+        {
+            let any_stopped = self.is_task_stopped(&config.execution_id);
+            if any_stopped {
+                info!("MULTI-AGENT-PIPELINE: Stopped by user");
+                let stopped_total_tokens: u64 = agent_traces
+                    .iter()
+                    .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
+                    .sum();
+                let stopped_total_cost: f64 = agent_traces.iter().map(|t| t.cost_usd).sum();
+                let stopped_passed_criteria = subtree_results
+                    .iter()
+                    .flat_map(|s| s.level_results.iter())
+                    .flat_map(|l| l.criterion_results.iter())
+                    .filter(|c| c.passed)
+                    .count() as u32;
+                let result = MultiAgentPipelineResult {
+                    total_iterations,
+                    goal_achieved: false,
+                    was_stopped: true,
+                    max_iterations_reached: false,
+                    subtree_results,
+                    integration_result: None,
+                    agent_traces,
+                    dag: dag.clone(),
+                    total_criteria: criteria.len() as u32,
+                    passed_criteria: stopped_passed_criteria,
+                    total_tokens: stopped_total_tokens,
+                    total_cost_usd: stopped_total_cost,
+                };
+                // Restore canary config before early return
+                for (key, original) in &canary_config_originals {
+                    match original {
+                        Some(val) => { let _ = self.checkpoint_db.set_setting(key, val); }
+                        None => { let _ = self.checkpoint_db.delete_setting(key); }
                     }
-                    return result.to_loop_result();
                 }
+                return result.to_loop_result();
             }
         }
 
