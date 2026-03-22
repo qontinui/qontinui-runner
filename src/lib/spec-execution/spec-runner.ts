@@ -8,7 +8,7 @@
 import { SpecExecutor } from "@qontinui/ui-bridge/specs";
 import type { SpecGroup, SpecGroupResult, SpecExecutionOptions } from "@qontinui/ui-bridge/specs";
 import type { DiscoveredElement } from "@qontinui/ui-bridge/control";
-import type { ArtifactStore, ResultArtifact } from "@qontinui/ui-bridge/artifacts";
+import type { ArtifactStore } from "@qontinui/ui-bridge/artifacts";
 import { createArtifact, captureEnvironment } from "@qontinui/ui-bridge/artifacts";
 
 export interface SpecRunnerOptions extends SpecExecutionOptions {
@@ -40,7 +40,7 @@ export async function executeSpecGroup(
         result,
         {
           specId: options.specId,
-          triggeredBy: 'workflow-step',
+          triggeredBy: "workflow-step",
         },
         captureEnvironment(),
       );

@@ -206,9 +206,10 @@ impl StepHandler for CheckHandler {
                 }
                 Err(e) => {
                     warn!("Check '{}': {}", step_name, e);
-                    return StepHandlerResult::failure(
-                        format!("Working directory scope violation: {}", e),
-                    );
+                    return StepHandlerResult::failure(format!(
+                        "Working directory scope violation: {}",
+                        e
+                    ));
                 }
             }
         }

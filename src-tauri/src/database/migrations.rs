@@ -5093,12 +5093,16 @@ impl CheckpointDb {
             )
             .map_err(|e| format!("Failed to migrate to version 129: {}", e))?;
 
-            info!("Successfully migrated to version 129 (workflow_architecture on unified_workflows)");
+            info!(
+                "Successfully migrated to version 129 (workflow_architecture on unified_workflows)"
+            );
         }
 
         // --- Migration 130: Add total_tokens and total_cost_usd to learning_outcomes ---
         if current_version < 130 {
-            info!("Migrating to version 130 (total_tokens, total_cost_usd on learning_outcomes)...");
+            info!(
+                "Migrating to version 130 (total_tokens, total_cost_usd on learning_outcomes)..."
+            );
 
             conn.execute_batch(
                 r#"
@@ -5193,7 +5197,9 @@ impl CheckpointDb {
             )
             .map_err(|e| format!("Failed to migrate to version 133: {}", e))?;
 
-            info!("Successfully migrated to version 133 (agentic metric scores + baselines tables)");
+            info!(
+                "Successfully migrated to version 133 (agentic metric scores + baselines tables)"
+            );
         }
 
         // Repair migration: is_favorite column may be missing on databases created from

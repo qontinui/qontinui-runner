@@ -122,19 +122,13 @@ impl PipelineContext {
                     if !lc.target_files.is_empty() {
                         context.push_str("Target files:\n");
                         for f in &lc.target_files {
-                            context.push_str(&format!(
-                                "- `{}` ({})\n",
-                                f.path, f.relevance
-                            ));
+                            context.push_str(&format!("- `{}` ({})\n", f.path, f.relevance));
                         }
                     }
                     if !lc.related_files.is_empty() {
                         context.push_str("Related files:\n");
                         for f in &lc.related_files {
-                            context.push_str(&format!(
-                                "- `{}` ({})\n",
-                                f.path, f.relevance
-                            ));
+                            context.push_str(&format!("- `{}` ({})\n", f.path, f.relevance));
                         }
                     }
                 }
@@ -763,21 +757,22 @@ Only output the JSON array, nothing else."#,
                     }
 
                     // Build structured handoff context: locator → implementer
-                    let mut implementer_handoff = crate::autoresearch::agentic_verification::HandoffContext {
-                        from_agent: "locator".to_string(),
-                        to_agent: "implementer".to_string(),
-                        payload: serde_json::json!({
-                            "subtree_id": subtree.id,
-                            "level": level_idx,
-                            "criteria": &level_criteria,
-                            "located_files": located_criteria.iter()
-                                .filter(|lc| level_criteria.contains(&lc.criterion.id.as_str()))
-                                .map(|lc| &lc.target_files)
-                                .collect::<Vec<_>>(),
-                        }),
-                        forwarded_items: vec![],
-                        validated: false,
-                    };
+                    let mut implementer_handoff =
+                        crate::autoresearch::agentic_verification::HandoffContext {
+                            from_agent: "locator".to_string(),
+                            to_agent: "implementer".to_string(),
+                            payload: serde_json::json!({
+                                "subtree_id": subtree.id,
+                                "level": level_idx,
+                                "criteria": &level_criteria,
+                                "located_files": located_criteria.iter()
+                                    .filter(|lc| level_criteria.contains(&lc.criterion.id.as_str()))
+                                    .map(|lc| &lc.target_files)
+                                    .collect::<Vec<_>>(),
+                            }),
+                            forwarded_items: vec![],
+                            validated: false,
+                        };
 
                     // Guardrail: validate handoff payload before passing to implementer
                     let handoff_check = crate::autoresearch::agentic_verification::guardrail_handoff_payload_present(&implementer_handoff);
@@ -936,25 +931,29 @@ Only output the JSON array, nothing else."#,
                     let verifier_duration = verifier_start.elapsed().as_millis() as u64;
 
                     // Build structured handoff context: implementer → verifier
-                    let verifier_handoff = crate::autoresearch::agentic_verification::HandoffContext {
-                        from_agent: "implementer".to_string(),
-                        to_agent: "verifier".to_string(),
-                        payload: serde_json::json!({
-                            "subtree_id": subtree.id,
-                            "level": level_idx,
-                            "attempt": level_attempt,
-                            "implementer_success": agentic_outcome.is_success(),
-                        }),
-                        forwarded_items: vec![],
-                        validated: true,
-                    };
+                    let verifier_handoff =
+                        crate::autoresearch::agentic_verification::HandoffContext {
+                            from_agent: "implementer".to_string(),
+                            to_agent: "verifier".to_string(),
+                            payload: serde_json::json!({
+                                "subtree_id": subtree.id,
+                                "level": level_idx,
+                                "attempt": level_attempt,
+                                "implementer_success": agentic_outcome.is_success(),
+                            }),
+                            forwarded_items: vec![],
+                            validated: true,
+                        };
 
                     // Guardrail: check verifier output has a parseable verdict
                     let verifier_output_json = serde_json::json!({
                         "passed": level_passed,
                         "results": level_criterion_results.len(),
                     });
-                    let verdict_check = crate::autoresearch::agentic_verification::guardrail_verifier_verdict(&verifier_output_json);
+                    let verdict_check =
+                        crate::autoresearch::agentic_verification::guardrail_verifier_verdict(
+                            &verifier_output_json,
+                        );
                     let mut verifier_guardrails = vec![];
                     if verdict_check.tripwire_triggered {
                         warn!(
@@ -1302,7 +1301,10 @@ Only output the JSON array, nothing else."#,
             &config.execution_id,
             result.goal_achieved,
         ) {
-            warn!("Failed to backfill downstream_success on pipeline traces: {}", e);
+            warn!(
+                "Failed to backfill downstream_success on pipeline traces: {}",
+                e
+            );
         }
 
         // Store the full pipeline result in task run result_data for autoresearch retrieval

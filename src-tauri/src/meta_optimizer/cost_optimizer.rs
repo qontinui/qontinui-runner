@@ -84,10 +84,7 @@ pub fn generate_cost_recommendations(
         for agent in &agent_stats {
             let avg_total = agent.avg_total_tokens();
             if avg_total > median_tokens * 2.0 && agent.run_count >= 5 {
-                let title = format!(
-                    "High token usage: {} agent",
-                    agent.agent_type
-                );
+                let title = format!("High token usage: {} agent", agent.agent_type);
                 if has_recent(&title) {
                     continue;
                 }
@@ -214,10 +211,7 @@ pub fn generate_cost_recommendations(
 
     for (agent_type, run_count) in &zero_token_agents {
         if *run_count >= 5 {
-            let title = format!(
-                "Instrumentation gap: {} agent has 0 tokens",
-                agent_type
-            );
+            let title = format!("Instrumentation gap: {} agent has 0 tokens", agent_type);
             if has_recent(&title) {
                 continue;
             }
@@ -500,9 +494,7 @@ fn query_zero_token_agents(db: &CheckpointDb) -> Result<Vec<(String, i64)>, Stri
 ///
 /// Joins pipeline_agent_traces → task_runs to check if the run used CLI
 /// provider. Returns (agent_type, cli_runs, total_runs, avg_cli_cost, avg_api_cost).
-fn query_cli_heavy_agents(
-    db: &CheckpointDb,
-) -> Result<Vec<(String, i64, i64, f64, f64)>, String> {
+fn query_cli_heavy_agents(db: &CheckpointDb) -> Result<Vec<(String, i64, i64, f64, f64)>, String> {
     db.with_conn(|conn| {
         let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
 
@@ -596,12 +588,13 @@ fn compute_cost_trend(db: &CheckpointDb) -> Result<String, String> {
 
 /// Fetch active (pending) cost_optimization recommendations.
 fn query_active_cost_recommendations(db: &CheckpointDb) -> Result<Vec<Recommendation>, String> {
-    super::recommendations::list_recommendations(db, Some("pipeline_prompt"), Some("pending"))
-        .map(|recs| {
+    super::recommendations::list_recommendations(db, Some("pipeline_prompt"), Some("pending")).map(
+        |recs| {
             recs.into_iter()
                 .filter(|r| r.recommendation_type == "cost_optimization")
                 .collect()
-        })
+        },
+    )
 }
 
 /// Compute confidence based on sample size. Linearly scales from 0.5 at

@@ -291,8 +291,7 @@ pub fn resolve_working_directory(wd: &str) -> PathBuf {
 ///
 /// Controls whether `resolve_working_directory_scoped` allows paths outside
 /// a defined boundary. Inspired by open-swe's sandbox isolation pattern.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum PathScopePolicy {
     /// Current behavior: permissive fallback chain, warnings only.
     #[default]
@@ -302,7 +301,6 @@ pub enum PathScopePolicy {
     /// Must resolve within the specified directory boundary.
     Strict(PathBuf),
 }
-
 
 /// Resolve a working directory with scope policy enforcement.
 ///
@@ -327,9 +325,7 @@ pub fn resolve_working_directory_scoped(
             check_path_containment(&resolved, &workspace_root, wd)
         }
 
-        PathScopePolicy::Strict(boundary) => {
-            check_path_containment(&resolved, boundary, wd)
-        }
+        PathScopePolicy::Strict(boundary) => check_path_containment(&resolved, boundary, wd),
     }
 }
 

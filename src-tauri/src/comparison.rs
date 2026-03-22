@@ -160,17 +160,17 @@ pub struct MetricDelta {
 
 /// Build a structured comparison report from completed entries.
 pub fn build_structured_report(entries: &[ComparisonEntry]) -> Option<StructuredComparisonReport> {
-    let completed: Vec<&ComparisonEntry> = entries
-        .iter()
-        .filter(|e| e.result.is_some())
-        .collect();
+    let completed: Vec<&ComparisonEntry> = entries.iter().filter(|e| e.result.is_some()).collect();
 
     if completed.len() < 2 {
         return None;
     }
 
     let labels: Vec<String> = completed.iter().map(|e| e.branch_name.clone()).collect();
-    let results: Vec<&ComparisonEntryResult> = completed.iter().map(|e| e.result.as_ref().unwrap()).collect();
+    let results: Vec<&ComparisonEntryResult> = completed
+        .iter()
+        .map(|e| e.result.as_ref().unwrap())
+        .collect();
 
     // Success rate metric
     let success_values: Vec<(String, f64)> = labels
@@ -261,7 +261,10 @@ pub fn build_structured_report(entries: &[ComparisonEntry]) -> Option<Structured
 }
 
 fn build_metric_delta(name: &str, values: Vec<(String, f64)>, best: &str) -> MetricDelta {
-    let max_val = values.iter().map(|(_, v)| *v).fold(f64::NEG_INFINITY, f64::max);
+    let max_val = values
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(f64::NEG_INFINITY, f64::max);
     let min_val = values.iter().map(|(_, v)| *v).fold(f64::INFINITY, f64::min);
     let delta_pct = if min_val.abs() > f64::EPSILON {
         ((max_val - min_val) / min_val.abs()) * 100.0

@@ -134,7 +134,8 @@ impl CheckpointDb {
                         .unwrap_or(Some(1))
                         .unwrap_or(1)
                         != 0,
-                    workflow_architecture: row.get::<_, Option<String>>(41)?
+                    workflow_architecture: row
+                        .get::<_, Option<String>>(41)?
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
                     enforce_token_budget: false,
@@ -839,10 +840,13 @@ impl CheckpointDb {
                 acceptance_criteria.map(|v| v.to_string()),
                 serde_json::to_string(constraint_overrides).unwrap_or_else(|_| "{}".to_string()),
                 request.ai_reviewed.unwrap_or(existing.ai_reviewed),
-                request.workflow_architecture.as_ref()
+                request
+                    .workflow_architecture
+                    .as_ref()
                     .or(existing.workflow_architecture.as_ref())
                     .map(|a| {
-                        serde_json::to_value(a).ok()
+                        serde_json::to_value(a)
+                            .ok()
                             .and_then(|v| v.as_str().map(|s| s.to_string()))
                             .unwrap_or_else(|| format!("{:?}", a).to_lowercase())
                     }),
@@ -1016,7 +1020,8 @@ impl CheckpointDb {
                         .unwrap_or(Some(1))
                         .unwrap_or(1)
                         != 0,
-                    workflow_architecture: row.get::<_, Option<String>>(41)?
+                    workflow_architecture: row
+                        .get::<_, Option<String>>(41)?
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
                     enforce_token_budget: false,
@@ -1240,7 +1245,8 @@ impl CheckpointDb {
                         .unwrap_or(Some(1))
                         .unwrap_or(1)
                         != 0,
-                    workflow_architecture: row.get::<_, Option<String>>(41)?
+                    workflow_architecture: row
+                        .get::<_, Option<String>>(41)?
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
                     enforce_token_budget: false,

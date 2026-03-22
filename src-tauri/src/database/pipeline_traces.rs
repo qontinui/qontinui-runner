@@ -6,7 +6,9 @@
 use rusqlite::{params, Connection};
 use tracing::debug;
 
-use crate::autoresearch::agentic_verification::{GuardrailResult, HandoffContext, PipelineAgentTrace};
+use crate::autoresearch::agentic_verification::{
+    GuardrailResult, HandoffContext, PipelineAgentTrace,
+};
 use crate::database::CheckpointDb;
 
 /// Parse a PipelineAgentTrace from a database row.
@@ -38,7 +40,9 @@ fn trace_from_row(row: &rusqlite::Row) -> rusqlite::Result<PipelineAgentTrace> {
         downstream_success: downstream_success.map(|v| v != 0),
         output_quality_score: row.get(11)?,
         parent_span_id: row.get(12)?,
-        span_type: row.get::<_, Option<String>>(13)?.unwrap_or_else(|| "agent".to_string()),
+        span_type: row
+            .get::<_, Option<String>>(13)?
+            .unwrap_or_else(|| "agent".to_string()),
         guardrail_results: guardrail_json
             .and_then(|j| serde_json::from_str::<Vec<GuardrailResult>>(&j).ok())
             .unwrap_or_default(),
@@ -363,9 +367,7 @@ pub fn get_trace_full_l2(
                FROM pipeline_agent_traces
                WHERE id = ?1"#,
             params![trace_id],
-            |row| {
-                Ok(trace_from_row(row)?)
-            },
+            trace_from_row,
         );
 
         match result {
@@ -400,9 +402,7 @@ pub fn get_traces_for_task_run(
             .map_err(|e| format!("Failed to prepare trace query: {}", e))?;
 
         let results = stmt
-            .query_map(params![task_run_id], |row| {
-                Ok(trace_from_row(row)?)
-            })
+            .query_map(params![task_run_id], trace_from_row)
             .map_err(|e| format!("Failed to query traces: {}", e))?
             .filter_map(|r| r.ok())
             .collect();

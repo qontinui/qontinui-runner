@@ -327,7 +327,10 @@ pub fn parse_rule_examples(output: &str) -> Vec<ParsedRuleExample> {
             let positive = get_str(&kv, "positive_example");
             let negative = get_str(&kv, "negative_example");
             if positive.is_empty() && negative.is_empty() {
-                warn!("Skipping RULE_EXAMPLE with no examples for rule {}", rule_id);
+                warn!(
+                    "Skipping RULE_EXAMPLE with no examples for rule {}",
+                    rule_id
+                );
                 return None;
             }
             Some(ParsedRuleExample {
@@ -832,7 +835,11 @@ fn save_rule_examples(db: &CheckpointDb, examples: &[ParsedRuleExample]) {
             )
             .map_err(|e| format!("Failed to update rule examples: {}", e))?;
 
-            info!("Attached {} example(s) to rule {}", all_examples.len(), rule_id);
+            info!(
+                "Attached {} example(s) to rule {}",
+                all_examples.len(),
+                rule_id
+            );
             Ok(())
         });
 

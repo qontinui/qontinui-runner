@@ -554,9 +554,8 @@ impl AiMiddleware for CommandSanitizer {
         }
 
         // Try to parse the response as a workflow and sanitize commands
-        let json_text = crate::workflow_generation::generator::extract_json_from_response(
-            &response.output,
-        );
+        let json_text =
+            crate::workflow_generation::generator::extract_json_from_response(&response.output);
         if let Ok(mut workflow) =
             serde_json::from_str::<crate::unified_workflows::UnifiedWorkflow>(&json_text)
         {
@@ -570,10 +569,7 @@ impl AiMiddleware for CommandSanitizer {
                 total += sanitize_commands_in_steps(&mut stage.completion_steps);
             }
             if total > 0 {
-                info!(
-                    "CommandSanitizer middleware: fixed {} steps",
-                    total
-                );
+                info!("CommandSanitizer middleware: fixed {} steps", total);
                 if let Ok(fixed_json) = serde_json::to_string_pretty(&workflow) {
                     response.output = fixed_json;
                 }
@@ -598,9 +594,8 @@ impl AiMiddleware for SdkUrlSanitizer {
             return;
         }
 
-        let json_text = crate::workflow_generation::generator::extract_json_from_response(
-            &response.output,
-        );
+        let json_text =
+            crate::workflow_generation::generator::extract_json_from_response(&response.output);
         if let Ok(workflow) =
             serde_json::from_str::<crate::unified_workflows::UnifiedWorkflow>(&json_text)
         {

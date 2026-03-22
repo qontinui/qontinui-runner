@@ -43,10 +43,7 @@ impl ReplayManager {
     ///
     /// Returns one entry per iteration that has recorded checkpoints, along with
     /// the commit hash (if available) and verification results.
-    pub fn list_replay_points(
-        &self,
-        execution_id: &str,
-    ) -> Result<Vec<ReplayPoint>, String> {
+    pub fn list_replay_points(&self, execution_id: &str) -> Result<Vec<ReplayPoint>, String> {
         let commits = self.compensation.get_iteration_commits(execution_id)?;
 
         // Get verification results from step checkpoints
@@ -114,9 +111,7 @@ impl ReplayManager {
 
         if target_iteration > 1 {
             // Find commit from the iteration before the target
-            let before_commit = commits
-                .iter()
-                .find(|c| c.iteration == target_iteration - 1);
+            let before_commit = commits.iter().find(|c| c.iteration == target_iteration - 1);
 
             if let Some(commit) = before_commit {
                 info!(

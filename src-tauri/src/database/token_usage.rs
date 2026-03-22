@@ -102,9 +102,7 @@ impl CheckpointDb {
                 FROM phase_token_usage
                 WHERE task_run_id = ?1 AND iteration = ?2"#,
                 params![task_run_id, iteration as i64],
-                |row| {
-                    Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
-                },
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
             )
             .map_err(|e| format!("Failed to query iteration token totals: {}", e))?;
         Ok((input, output))

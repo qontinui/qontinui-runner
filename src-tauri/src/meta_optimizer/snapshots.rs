@@ -195,26 +195,25 @@ pub fn evaluate_recommendation_outcome(
                 let sr_delta = (p.success_rate - b.success_rate) * 100.0; // convert to pp
 
                 // Statistical analysis from snapshot-level aggregate counts
-                let (p_value, confidence_interval, effect_size) =
-                    if b.total_runs >= 2 && p.total_runs >= 2 {
-                        let b_total = b.total_runs as u64;
-                        let p_total = p.total_runs as u64;
-                        let b_succ = b.successful_runs as u64;
-                        let p_succ = p.successful_runs as u64;
+                let (p_value, confidence_interval, effect_size) = if b.total_runs >= 2
+                    && p.total_runs >= 2
+                {
+                    let b_total = b.total_runs as u64;
+                    let p_total = p.total_runs as u64;
+                    let b_succ = b.successful_runs as u64;
+                    let p_succ = p.successful_runs as u64;
 
-                        let pv = crate::stats::proportion_z_test_onesided(
-                            p_succ, p_total, b_succ, b_total,
-                        );
-                        let ci = crate::stats::proportion_diff_ci(
-                            p_succ, p_total, b_succ, b_total, 0.95,
-                        );
-                        let ci_pp = (ci.0 * 100.0, ci.1 * 100.0);
-                        let h = crate::stats::cohens_h(p.success_rate, b.success_rate);
+                    let pv =
+                        crate::stats::proportion_z_test_onesided(p_succ, p_total, b_succ, b_total);
+                    let ci =
+                        crate::stats::proportion_diff_ci(p_succ, p_total, b_succ, b_total, 0.95);
+                    let ci_pp = (ci.0 * 100.0, ci.1 * 100.0);
+                    let h = crate::stats::cohens_h(p.success_rate, b.success_rate);
 
-                        (Some(pv), Some(ci_pp), Some(h))
-                    } else {
-                        (None, None, None)
-                    };
+                    (Some(pv), Some(ci_pp), Some(h))
+                } else {
+                    (None, None, None)
+                };
 
                 let verdict = if p.total_runs < 5 {
                     "insufficient_data"
@@ -301,30 +300,27 @@ fn compute_verdict(
             let cost_delta = a.avg_cost_usd - b.avg_cost_usd;
 
             // Statistical analysis when we have enough data
-            let (p_value, confidence_interval, effect_size) =
-                if b.run_count >= 2 && a.run_count >= 2 {
-                    let b_total = b.run_count as u64;
-                    let a_total = a.run_count as u64;
-                    let b_succ = b.success_count as u64;
-                    let a_succ = a.success_count as u64;
+            let (p_value, confidence_interval, effect_size) = if b.run_count >= 2
+                && a.run_count >= 2
+            {
+                let b_total = b.run_count as u64;
+                let a_total = a.run_count as u64;
+                let b_succ = b.success_count as u64;
+                let a_succ = a.success_count as u64;
 
-                    let p = crate::stats::proportion_z_test_onesided(
-                        a_succ, a_total, b_succ, b_total,
-                    );
+                let p = crate::stats::proportion_z_test_onesided(a_succ, a_total, b_succ, b_total);
 
-                    let ci = crate::stats::proportion_diff_ci(
-                        a_succ, a_total, b_succ, b_total, 0.95,
-                    );
-                    let ci_pp = (ci.0 * 100.0, ci.1 * 100.0);
+                let ci = crate::stats::proportion_diff_ci(a_succ, a_total, b_succ, b_total, 0.95);
+                let ci_pp = (ci.0 * 100.0, ci.1 * 100.0);
 
-                    let b_prop = b_succ as f64 / b_total as f64;
-                    let a_prop = a_succ as f64 / a_total as f64;
-                    let h = crate::stats::cohens_h(a_prop, b_prop);
+                let b_prop = b_succ as f64 / b_total as f64;
+                let a_prop = a_succ as f64 / a_total as f64;
+                let h = crate::stats::cohens_h(a_prop, b_prop);
 
-                    (Some(p), Some(ci_pp), Some(h))
-                } else {
-                    (None, None, None)
-                };
+                (Some(p), Some(ci_pp), Some(h))
+            } else {
+                (None, None, None)
+            };
 
             let verdict = if a.run_count < 5 {
                 "insufficient_data"

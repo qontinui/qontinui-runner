@@ -399,12 +399,10 @@ mod tests {
     #[test]
     fn test_truncation_keeps_first_and_last() {
         // Create enough turns to exceed a small budget
-        let mut turns = vec![
-            ConversationTurn {
-                role: TurnRole::User,
-                content: "FIRST MESSAGE".to_string(),
-            },
-        ];
+        let mut turns = vec![ConversationTurn {
+            role: TurnRole::User,
+            content: "FIRST MESSAGE".to_string(),
+        }];
         for i in 0..20 {
             turns.push(ConversationTurn {
                 role: TurnRole::Assistant,
@@ -418,8 +416,14 @@ mod tests {
 
         // Budget small enough to force truncation but large enough for first+last
         let prompt = build_replay_prompt(&turns, Some(500));
-        assert!(prompt.contains("FIRST MESSAGE"), "First turn must be preserved");
-        assert!(prompt.contains("LAST MESSAGE"), "Last turn must be preserved");
+        assert!(
+            prompt.contains("FIRST MESSAGE"),
+            "First turn must be preserved"
+        );
+        assert!(
+            prompt.contains("LAST MESSAGE"),
+            "Last turn must be preserved"
+        );
     }
 
     #[test]
@@ -427,7 +431,11 @@ mod tests {
         let mut turns = Vec::new();
         for i in 0..10 {
             turns.push(ConversationTurn {
-                role: if i % 2 == 0 { TurnRole::User } else { TurnRole::Assistant },
+                role: if i % 2 == 0 {
+                    TurnRole::User
+                } else {
+                    TurnRole::Assistant
+                },
                 content: format!("Turn {} content: {}", i, "y".repeat(80)),
             });
         }

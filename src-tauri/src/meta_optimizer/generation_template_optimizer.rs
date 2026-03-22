@@ -32,7 +32,8 @@ const GENERATION_THINKING_STYLES: &[&str] = &[
 
 /// Build the LoopConfig for the generation template optimizer.
 pub fn build_config(execution_id: &str, workflow_name: &str, style_index: u32) -> LoopConfig {
-    let style = GENERATION_THINKING_STYLES[(style_index as usize) % GENERATION_THINKING_STYLES.len()];
+    let style =
+        GENERATION_THINKING_STYLES[(style_index as usize) % GENERATION_THINKING_STYLES.len()];
     LoopConfig {
         max_iterations: 5,
         base_prompt: build_agentic_prompt(style),

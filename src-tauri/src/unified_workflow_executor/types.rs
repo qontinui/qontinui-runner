@@ -58,7 +58,6 @@ pub enum RollbackPolicy {
     Clean,
 }
 
-
 impl RollbackPolicy {
     pub fn from_str(s: &str) -> Self {
         match s {
@@ -438,11 +437,8 @@ impl LoopConfig {
         }
 
         // Count total verification steps across all stages
-        let total_verification_steps: usize = self
-            .stages
-            .iter()
-            .map(|s| s.verification_steps.len())
-            .sum();
+        let total_verification_steps: usize =
+            self.stages.iter().map(|s| s.verification_steps.len()).sum();
 
         // Need >3 verification steps to justify pipeline overhead
         if total_verification_steps <= 3 {

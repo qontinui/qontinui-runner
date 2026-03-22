@@ -1770,7 +1770,10 @@ fn run_claude_session_inline(
         Some((input, output)) => {
             info!(
                 "Session {} token usage: input={}, output={}, total={}",
-                session_id, input, output, input + output
+                session_id,
+                input,
+                output,
+                input + output
             );
             (Some(input), Some(output))
         }

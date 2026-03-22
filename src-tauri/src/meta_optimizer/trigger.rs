@@ -305,10 +305,7 @@ fn run_cost_analysis(db: &CheckpointDb) {
 
     let recs = super::cost_optimizer::generate_cost_recommendations(db, &existing);
     if !recs.is_empty() {
-        info!(
-            "Cost optimizer produced {} recommendation(s)",
-            recs.len()
-        );
+        info!("Cost optimizer produced {} recommendation(s)", recs.len());
     }
 }
 
@@ -393,8 +390,11 @@ fn launch_optimizer_internal(
     // Build workflow config based on optimizer type
     let (loop_config, setup_steps, verification_steps) = match optimizer_type {
         OptimizerType::PipelinePrompt => {
-            let config =
-                super::pipeline_prompt_optimizer::build_config(&task_run_id, &task_name, style_index);
+            let config = super::pipeline_prompt_optimizer::build_config(
+                &task_run_id,
+                &task_name,
+                style_index,
+            );
             let setup = super::pipeline_prompt_optimizer::build_setup_steps();
             let verify = super::pipeline_prompt_optimizer::build_verification_steps();
             (config, setup, verify)

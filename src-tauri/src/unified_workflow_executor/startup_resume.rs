@@ -420,7 +420,8 @@ pub async fn resume_interrupted_workflows(
                                 multi_agent_pipeline_config: None,
 
                                 acceptance_criteria: workflow.acceptance_criteria.clone(),
-                                rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+                                rollback_policy:
+                                    crate::unified_workflow_executor::RollbackPolicy::None,
                                 iteration_diffs: Vec::new(),
                             };
 
@@ -627,7 +628,8 @@ pub async fn resume_interrupted_workflows(
 
                                 project_path: crate::mcp::shared::current_project_path(),
                                 acceptance_criteria: workflow.acceptance_criteria.clone(),
-                                rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+                                rollback_policy:
+                                    crate::unified_workflow_executor::RollbackPolicy::None,
                                 iteration_diffs: Vec::new(),
                             };
 

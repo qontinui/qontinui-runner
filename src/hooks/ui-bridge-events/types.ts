@@ -54,6 +54,8 @@ export type UIBridgeRequestType =
   | "get_change_buffer_size"
   // Undo/Redo
   | "get_undo_state"
+  | "undo"
+  | "redo"
   // Forms
   | "get_forms"
   // Network requests
@@ -82,7 +84,22 @@ export type UIBridgeRequestType =
   // Element image capture (DOM-based, no screen capture)
   | "capture_element_images"
   // Element image metadata (reads <img> src attributes from DOM)
-  | "get_element_images";
+  | "get_element_images"
+  // Browser events & timeline
+  | "get_browser_events"
+  | "get_timeline"
+  | "get_health_report"
+  | "get_network_chains"
+  | "get_error_snapshots"
+  // Error sessions
+  | "start_error_session"
+  | "end_error_session"
+  | "get_error_sessions"
+  // Error baselines
+  | "capture_error_baseline"
+  | "compare_error_baseline"
+  // Error report
+  | "get_error_report";
 
 /**
  * Payload structure for UI Bridge requests from Rust

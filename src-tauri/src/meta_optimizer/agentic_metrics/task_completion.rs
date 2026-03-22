@@ -30,7 +30,10 @@ pub fn score(input: &DeterministicInput) -> MetricResult {
 fn compute(input: &DeterministicInput) -> (f64, String) {
     // Success — verification passed
     if input.verification_passed {
-        return (1.0, "Verification passed, task completed successfully".into());
+        return (
+            1.0,
+            "Verification passed, task completed successfully".into(),
+        );
     }
 
     // Zero-iteration crash — no work was attempted
@@ -44,11 +47,7 @@ fn compute(input: &DeterministicInput) -> (f64, String) {
     // Stopped by user (partial completion)
     if input.was_stopped {
         // Give more credit if more iterations were completed
-        let partial_score = if input.iterations >= 2 {
-            0.7
-        } else {
-            0.5
-        };
+        let partial_score = if input.iterations >= 2 { 0.7 } else { 0.5 };
         return (
             partial_score,
             format!(
@@ -184,7 +183,13 @@ mod tests {
 
     #[test]
     fn test_generation_error() {
-        let result = score(&make_input(false, 1, false, false, Some("generation_error")));
+        let result = score(&make_input(
+            false,
+            1,
+            false,
+            false,
+            Some("generation_error"),
+        ));
         assert_eq!(result.score, 0.1);
     }
 

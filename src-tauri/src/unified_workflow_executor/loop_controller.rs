@@ -3236,7 +3236,7 @@ impl LoopController {
                     }),
                     config: Default::default(),
                     duration_ms: agentic_duration_ms,
-                    tokens_in: 0,  // not tracked at this level
+                    tokens_in: 0, // not tracked at this level
                     tokens_out: 0,
                     cost_usd: 0.0,
                     downstream_success: None, // backfilled after loop completes

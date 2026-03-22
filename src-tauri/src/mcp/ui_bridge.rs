@@ -1226,6 +1226,228 @@ pub async fn ui_bridge_clear_console_errors_handler(
 }
 
 // ============================================================================
+// Browser Events & Timeline Handlers
+// ============================================================================
+
+/// Query parameters for browser events endpoint
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserEventsQuery {
+    #[serde(default, rename = "type")]
+    event_type: Option<String>,
+    #[serde(default)]
+    since: Option<f64>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// Query parameters for timeline endpoint
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineQuery {
+    #[serde(default)]
+    since: Option<f64>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// Query parameters for error snapshots endpoint
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorSnapshotsQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// Query parameters for network chains endpoint
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkChainsQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// Request body for starting an error session
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorSessionStartRequest {
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// Request body for capturing/comparing an error baseline
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorBaselineRequest {
+    label: String,
+}
+
+/// Get browser events captured by the UI Bridge BrowserCapture.
+pub async fn ui_bridge_get_browser_events_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<BrowserEventsQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting browser events");
+
+    let payload = serde_json::json!({
+        "params": {
+            "type": query.event_type,
+            "since": query.since,
+            "limit": query.limit
+        }
+    });
+
+    wrap_ipc_result(ui_bridge_request_sync(&state, "get_browser_events", payload).await)
+}
+
+/// Get timeline events captured by the UI Bridge BrowserCapture.
+pub async fn ui_bridge_get_timeline_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<TimelineQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting timeline");
+
+    let payload = serde_json::json!({
+        "params": {
+            "since": query.since,
+            "limit": query.limit
+        }
+    });
+
+    wrap_ipc_result(ui_bridge_request_sync(&state, "get_timeline", payload).await)
+}
+
+/// Get a health report from the UI Bridge BrowserCapture.
+pub async fn ui_bridge_get_health_report_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting health report");
+
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "get_health_report", serde_json::json!({})).await,
+    )
+}
+
+/// Get network request chains from the UI Bridge BrowserCapture.
+pub async fn ui_bridge_get_network_chains_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<NetworkChainsQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting network chains");
+
+    let payload = serde_json::json!({
+        "params": {
+            "limit": query.limit
+        }
+    });
+
+    wrap_ipc_result(ui_bridge_request_sync(&state, "get_network_chains", payload).await)
+}
+
+/// Get recent error snapshots from the UI Bridge BrowserCapture.
+pub async fn ui_bridge_get_error_snapshots_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ErrorSnapshotsQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting error snapshots");
+
+    let payload = serde_json::json!({
+        "params": {
+            "limit": query.limit
+        }
+    });
+
+    wrap_ipc_result(ui_bridge_request_sync(&state, "get_error_snapshots", payload).await)
+}
+
+/// Get a comprehensive error report from the UI Bridge.
+pub async fn ui_bridge_get_error_report_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting error report");
+
+    wrap_ipc_result(ui_bridge_request_sync(&state, "get_error_report", serde_json::json!({})).await)
+}
+
+// ============================================================================
+// Error Session Handlers
+// ============================================================================
+
+/// Start an error monitoring session.
+pub async fn ui_bridge_start_error_session_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<ErrorSessionStartRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Starting error session");
+
+    let payload = serde_json::json!({
+        "params": {
+            "label": body.label
+        }
+    });
+
+    wrap_ipc_result(ui_bridge_request_sync(&state, "start_error_session", payload).await)
+}
+
+/// End the active error monitoring session.
+pub async fn ui_bridge_end_error_session_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Ending error session");
+
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "end_error_session", serde_json::json!({})).await,
+    )
+}
+
+/// Get all error sessions (completed and active).
+pub async fn ui_bridge_get_error_sessions_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting error sessions");
+
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "get_error_sessions", serde_json::json!({})).await,
+    )
+}
+
+// ============================================================================
+// Error Baseline Handlers
+// ============================================================================
+
+/// Capture an error baseline with a given label.
+pub async fn ui_bridge_capture_error_baseline_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<ErrorBaselineRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Capturing error baseline '{}'", body.label);
+
+    let payload = serde_json::json!({
+        "params": {
+            "label": body.label
+        }
+    });
+
+    wrap_ipc_result(ui_bridge_request_sync(&state, "capture_error_baseline", payload).await)
+}
+
+/// Compare current errors against a previously captured baseline.
+pub async fn ui_bridge_compare_error_baseline_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<ErrorBaselineRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Comparing error baseline '{}'", body.label);
+
+    let payload = serde_json::json!({
+        "params": {
+            "label": body.label
+        }
+    });
+
+    wrap_ipc_result(ui_bridge_request_sync(&state, "compare_error_baseline", payload).await)
+}
+
+// ============================================================================
 // Network Request Monitoring Handlers
 // ============================================================================
 
@@ -3857,6 +4079,54 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/control/console-errors/clear",
             post(ui_bridge_clear_console_errors_handler),
         )
+        // Browser events & timeline
+        .route(
+            "/ui-bridge/control/browser-events",
+            get(ui_bridge_get_browser_events_handler),
+        )
+        .route(
+            "/ui-bridge/control/timeline",
+            get(ui_bridge_get_timeline_handler),
+        )
+        .route(
+            "/ui-bridge/control/network-chains",
+            get(ui_bridge_get_network_chains_handler),
+        )
+        .route(
+            "/ui-bridge/control/error-snapshots",
+            get(ui_bridge_get_error_snapshots_handler),
+        )
+        .route(
+            "/ui-bridge/control/error-report",
+            get(ui_bridge_get_error_report_handler),
+        )
+        // Error sessions
+        .route(
+            "/ui-bridge/control/error-sessions/start",
+            post(ui_bridge_start_error_session_handler),
+        )
+        .route(
+            "/ui-bridge/control/error-sessions/end",
+            post(ui_bridge_end_error_session_handler),
+        )
+        .route(
+            "/ui-bridge/control/error-sessions",
+            get(ui_bridge_get_error_sessions_handler),
+        )
+        // Error baselines
+        .route(
+            "/ui-bridge/control/error-baselines/capture",
+            post(ui_bridge_capture_error_baseline_handler),
+        )
+        .route(
+            "/ui-bridge/control/error-baselines/compare",
+            post(ui_bridge_compare_error_baseline_handler),
+        )
+        // Detailed health (separate from /health which is app-level)
+        .route(
+            "/ui-bridge/control/health",
+            get(ui_bridge_get_health_report_handler),
+        )
         // Undo/Redo awareness
         .route(
             "/ui-bridge/control/undo-state",
@@ -4108,4 +4378,59 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/discover-states",
             post(discover_states_from_renders),
         )
+        // AI route aliases (/ui-bridge/ai/* mirrors /ui-bridge/control/ai/*)
+        .route(
+            "/ui-bridge/ai/bookmarks",
+            get(ui_bridge_list_bookmarks_handler).post(ui_bridge_save_bookmark_handler),
+        )
+        .route(
+            "/ui-bridge/ai/bookmark/{name}",
+            get(ui_bridge_get_bookmark_handler).delete(ui_bridge_delete_bookmark_handler),
+        )
+        .route(
+            "/ui-bridge/ai/bookmark/{name}/diff",
+            get(ui_bridge_diff_from_bookmark_handler),
+        )
+        .route(
+            "/ui-bridge/ai/execute-with-diff",
+            post(ui_bridge_execute_with_diff_handler),
+        )
+        .route(
+            "/ui-bridge/ai/wait-for-change",
+            post(ui_bridge_wait_for_change_handler),
+        )
+        .route(
+            "/ui-bridge/ai/categorize-last-diff",
+            get(ui_bridge_categorize_last_diff_handler),
+        )
+        .route(
+            "/ui-bridge/ai/scoped-diff",
+            post(ui_bridge_scoped_diff_handler),
+        )
+        .route(
+            "/ui-bridge/ai/summarize-diff",
+            post(ui_bridge_summarize_diff_handler),
+        )
+        .route(
+            "/ui-bridge/ai/structured-changes",
+            post(ui_bridge_structured_changes_handler),
+        )
+        .route(
+            "/ui-bridge/ai/change-buffer/enable",
+            post(ui_bridge_enable_change_buffer_handler),
+        )
+        .route(
+            "/ui-bridge/ai/change-buffer/disable",
+            post(ui_bridge_disable_change_buffer_handler),
+        )
+        .route(
+            "/ui-bridge/ai/change-buffer/drain",
+            post(ui_bridge_drain_change_buffer_handler),
+        )
+        .route(
+            "/ui-bridge/ai/change-buffer/size",
+            get(ui_bridge_get_change_buffer_size_handler),
+        )
+        .route("/ui-bridge/ai/search", post(ui_bridge_ai_search_handler))
+        .route("/ui-bridge/ai/find", post(ui_bridge_ai_find_handler))
 }

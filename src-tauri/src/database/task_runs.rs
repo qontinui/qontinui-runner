@@ -1441,11 +1441,7 @@ impl CheckpointDb {
     }
 
     /// Clear iteration diffs from a given iteration onward (for replay).
-    pub fn clear_iteration_diffs_from(
-        &self,
-        id: &str,
-        from_iteration: u32,
-    ) -> Result<(), String> {
+    pub fn clear_iteration_diffs_from(&self, id: &str, from_iteration: u32) -> Result<(), String> {
         let diffs = self.get_iteration_diffs(id)?;
         let filtered: Vec<_> = diffs
             .into_iter()

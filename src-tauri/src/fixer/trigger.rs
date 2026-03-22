@@ -654,7 +654,10 @@ mod tests {
                 |row| row.get::<_, i32>(0).map(|v| v != 0),
             )
             .unwrap();
-        assert!(verification_passed, "Source run should have verification_passed = 1");
+        assert!(
+            verification_passed,
+            "Source run should have verification_passed = 1"
+        );
     }
 
     #[test]
@@ -688,6 +691,9 @@ mod tests {
                 |row| row.get::<_, i32>(0).map(|v| v != 0),
             )
             .unwrap();
-        assert!(!verification_passed, "Source run should have verification_passed = 0");
+        assert!(
+            !verification_passed,
+            "Source run should have verification_passed = 0"
+        );
     }
 }

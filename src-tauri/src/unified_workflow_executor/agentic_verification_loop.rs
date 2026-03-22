@@ -30,8 +30,16 @@ fn query_total_tokens(
                     .unwrap_or("claude-sonnet-4-20250514"),
             );
             (
-                if total_tokens > 0 { Some(total_tokens) } else { None },
-                if total_cost > 0.0 { Some(total_cost) } else { None },
+                if total_tokens > 0 {
+                    Some(total_tokens)
+                } else {
+                    None
+                },
+                if total_cost > 0.0 {
+                    Some(total_cost)
+                } else {
+                    None
+                },
             )
         }
         _ => (None, None),
@@ -550,8 +558,16 @@ impl LoopController {
                             max_iterations_reached: false,
                             iteration_results,
                             final_verdict: Some(v.clone()),
-                            total_tokens: { let (t, _) = query_total_tokens(&self.checkpoint_db, &config.execution_id); t },
-                            total_cost_usd: { let (_, c) = query_total_tokens(&self.checkpoint_db, &config.execution_id); c },
+                            total_tokens: {
+                                let (t, _) =
+                                    query_total_tokens(&self.checkpoint_db, &config.execution_id);
+                                t
+                            },
+                            total_cost_usd: {
+                                let (_, c) =
+                                    query_total_tokens(&self.checkpoint_db, &config.execution_id);
+                                c
+                            },
                         };
                         self.canvas_manager
                             .lock()
@@ -598,8 +614,16 @@ impl LoopController {
                         max_iterations_reached: false,
                         iteration_results,
                         final_verdict: Some(v.clone()),
-                        total_tokens: { let (t, _) = query_total_tokens(&self.checkpoint_db, &config.execution_id); t },
-                        total_cost_usd: { let (_, c) = query_total_tokens(&self.checkpoint_db, &config.execution_id); c },
+                        total_tokens: {
+                            let (t, _) =
+                                query_total_tokens(&self.checkpoint_db, &config.execution_id);
+                            t
+                        },
+                        total_cost_usd: {
+                            let (_, c) =
+                                query_total_tokens(&self.checkpoint_db, &config.execution_id);
+                            c
+                        },
                     };
                     self.canvas_manager
                         .lock()
@@ -899,7 +923,11 @@ mod tests {
     #[test]
     fn test_history_single_entry() {
         let mut history = IterationHistory::new();
-        history.add(make_summary(1, "Try button click", "Fail: button not found"));
+        history.add(make_summary(
+            1,
+            "Try button click",
+            "Fail: button not found",
+        ));
         let ctx = history.to_context_string();
         assert!(ctx.contains("## Previous Attempts"));
         assert!(ctx.contains("Iter 1"));
@@ -923,9 +951,21 @@ mod tests {
         let mut history = IterationHistory::new();
         // Use a small budget to force compression
         history.max_total_chars = 200;
-        history.add(make_summary(1, "Approach one with some detail", "Result one"));
-        history.add(make_summary(2, "Approach two with some detail", "Result two"));
-        history.add(make_summary(3, "Approach three with detail", "Result three"));
+        history.add(make_summary(
+            1,
+            "Approach one with some detail",
+            "Result one",
+        ));
+        history.add(make_summary(
+            2,
+            "Approach two with some detail",
+            "Result two",
+        ));
+        history.add(make_summary(
+            3,
+            "Approach three with detail",
+            "Result three",
+        ));
         history.add(make_summary(4, "Approach four with detail", "Result four"));
         // With small budget, oldest entries should be merged
         assert!(history.entries.len() <= 4);
@@ -940,7 +980,11 @@ mod tests {
         let mut history = IterationHistory::new();
         history.max_total_chars = 50; // Very small budget
         for i in 1..=10 {
-            history.add(make_summary(i, &format!("Approach {}", i), &format!("Result {}", i)));
+            history.add(make_summary(
+                i,
+                &format!("Approach {}", i),
+                &format!("Result {}", i),
+            ));
         }
         assert!(history.entries.len() >= 3);
     }

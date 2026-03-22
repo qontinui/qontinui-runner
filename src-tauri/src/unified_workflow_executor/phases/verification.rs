@@ -238,14 +238,9 @@ impl VerificationExecutor {
             } else {
                 // Annotate failure with structured error code for AI consumption
                 let raw_error = step_result.error.as_deref().unwrap_or("Unknown error");
-                let error_code =
-                    crate::mcp::ui_bridge::classify_assertion_failure(raw_error);
-                let recovery =
-                    crate::mcp::ui_bridge::recovery_hint_for(&error_code);
-                let annotated_error = format!(
-                    "[{:?} → {:?}] {}",
-                    error_code, recovery, raw_error
-                );
+                let error_code = crate::mcp::ui_bridge::classify_assertion_failure(raw_error);
+                let recovery = crate::mcp::ui_bridge::recovery_hint_for(&error_code);
+                let annotated_error = format!("[{:?} → {:?}] {}", error_code, recovery, raw_error);
                 checkpoint.mark_failed(&annotated_error, duration_ms);
             }
 

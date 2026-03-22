@@ -131,17 +131,21 @@ pub async fn get_agent_trace_aggregates_handler(
         ContextTier::L2 => {
             // If trace_id is provided, return a single full trace record
             if let Some(ref trace_id) = query.trace_id {
-                let trace = pipeline_traces::get_trace_full_l2(
+                let trace =
+                    pipeline_traces::get_trace_full_l2(&state.app_state.checkpoint_db, trace_id)
+                        .map_err(make_err)?;
+                Ok(Json(ApiResponse::success(
+                    serde_json::to_value(trace).unwrap_or_default(),
+                )))
+            } else {
+                let aggregates = pipeline_traces::get_agent_trace_aggregates(
                     &state.app_state.checkpoint_db,
-                    trace_id,
+                    limit,
                 )
                 .map_err(make_err)?;
-                Ok(Json(ApiResponse::success(serde_json::to_value(trace).unwrap_or_default())))
-            } else {
-                let aggregates =
-                    pipeline_traces::get_agent_trace_aggregates(&state.app_state.checkpoint_db, limit)
-                        .map_err(make_err)?;
-                Ok(Json(ApiResponse::success(serde_json::to_value(aggregates).unwrap_or_default())))
+                Ok(Json(ApiResponse::success(
+                    serde_json::to_value(aggregates).unwrap_or_default(),
+                )))
             }
         }
     }
@@ -1204,10 +1208,7 @@ pub async fn get_iteration_history_handler(
     let make_err = |e: String| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!(
-                "Failed to get iteration history: {}",
-                e
-            ))),
+            Json(api_error(format!("Failed to get iteration history: {}", e))),
         )
     };
 
@@ -1244,10 +1245,8 @@ pub async fn get_iteration_history_handler(
                         .collect();
 
                     // Group by status and compute aggregates
-                    let mut groups: std::collections::HashMap<
-                        String,
-                        Vec<Vec<serde_json::Value>>,
-                    > = std::collections::HashMap::new();
+                    let mut groups: std::collections::HashMap<String, Vec<Vec<serde_json::Value>>> =
+                        std::collections::HashMap::new();
                     for (status, history_json) in &rows {
                         if let Ok(entries) =
                             serde_json::from_str::<Vec<serde_json::Value>>(history_json)
@@ -1290,16 +1289,13 @@ pub async fn get_iteration_history_handler(
                             .map(|(approach, count)| format!("{} (x{})", approach, count))
                             .collect();
 
-                        summaries.push(
-                            crate::meta_optimizer::types::IterationHistorySummaryL0 {
-                                status: status.clone(),
-                                run_count,
-                                avg_iterations: total_iterations as f64 / run_count as f64,
-                                avg_final_confidence_delta: total_confidence_delta
-                                    / run_count as f64,
-                                most_common_approaches: top_5,
-                            },
-                        );
+                        summaries.push(crate::meta_optimizer::types::IterationHistorySummaryL0 {
+                            status: status.clone(),
+                            run_count,
+                            avg_iterations: total_iterations as f64 / run_count as f64,
+                            avg_final_confidence_delta: total_confidence_delta / run_count as f64,
+                            most_common_approaches: top_5,
+                        });
                     }
 
                     Ok(summaries)
@@ -1347,9 +1343,7 @@ pub async fn get_iteration_history_handler(
                             let iteration_count = entries.len();
                             let total_confidence_delta: f64 = entries
                                 .iter()
-                                .filter_map(|e| {
-                                    e.get("confidence_delta").and_then(|d| d.as_f64())
-                                })
+                                .filter_map(|e| e.get("confidence_delta").and_then(|d| d.as_f64()))
                                 .sum();
                             let approaches: Vec<String> = entries
                                 .iter()

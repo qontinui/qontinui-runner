@@ -706,9 +706,11 @@ pub struct GuardrailResult {
 /// Validates locator agent output has the expected structure.
 /// Trips if the output is not valid JSON or lacks criteria_locations.
 pub fn guardrail_locator_output_schema(output: &serde_json::Value) -> GuardrailResult {
-    let has_locations = output.get("located_criteria_count")
+    let has_locations = output
+        .get("located_criteria_count")
         .and_then(|v| v.as_u64())
-        .unwrap_or(0) > 0;
+        .unwrap_or(0)
+        > 0;
 
     GuardrailResult {
         guardrail_name: "locator_output_schema".to_string(),
@@ -716,7 +718,8 @@ pub fn guardrail_locator_output_schema(output: &serde_json::Value) -> GuardrailR
         check_description: if has_locations {
             "Locator produced criteria-to-code mappings".to_string()
         } else {
-            "Locator produced no criteria-to-code mappings — implementer will receive no guidance".to_string()
+            "Locator produced no criteria-to-code mappings — implementer will receive no guidance"
+                .to_string()
         },
         output_info: None,
     }
@@ -724,8 +727,7 @@ pub fn guardrail_locator_output_schema(output: &serde_json::Value) -> GuardrailR
 
 /// Validates verifier output contains a parseable pass/fail verdict.
 pub fn guardrail_verifier_verdict(output: &serde_json::Value) -> GuardrailResult {
-    let has_verdict = output.get("passed").is_some()
-        || output.get("all_passed").is_some();
+    let has_verdict = output.get("passed").is_some() || output.get("all_passed").is_some();
 
     GuardrailResult {
         guardrail_name: "verifier_verdict_parseable".to_string(),
@@ -775,7 +777,11 @@ pub fn guardrail_handoff_payload_present(handoff: &HandoffContext) -> GuardrailR
             "Handoff from {} → {}: payload {}",
             handoff.from_agent,
             handoff.to_agent,
-            if has_payload { "present" } else { "empty or null" }
+            if has_payload {
+                "present"
+            } else {
+                "empty or null"
+            }
         ),
         output_info: None,
     }
@@ -1004,7 +1010,6 @@ pub struct PipelineAgentTrace {
     pub output_quality_score: Option<f64>,
 
     // ── Span hierarchy fields (openai-agents-python tracing pattern) ──
-
     /// Parent span ID for hierarchical trace nesting (None = root span).
     #[serde(default)]
     pub parent_span_id: Option<String>,
@@ -1139,8 +1144,16 @@ impl MultiAgentPipelineResult {
                     })
                 })
                 .collect(),
-            total_tokens: if self.total_tokens > 0 { Some(self.total_tokens) } else { None },
-            total_cost_usd: if self.total_cost_usd > 0.0 { Some(self.total_cost_usd) } else { None },
+            total_tokens: if self.total_tokens > 0 {
+                Some(self.total_tokens)
+            } else {
+                None
+            },
+            total_cost_usd: if self.total_cost_usd > 0.0 {
+                Some(self.total_cost_usd)
+            } else {
+                None
+            },
         }
     }
 

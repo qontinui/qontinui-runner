@@ -97,7 +97,9 @@ function AssertionRow({
                 ? assertion.relatedTarget.criteria?.textContent ||
                   assertion.relatedTarget.criteria?.role ||
                   "related"
-                : assertion.relatedTarget.elementId || "related"}
+                : ("elementId" in assertion.relatedTarget
+                    ? assertion.relatedTarget.elementId
+                    : undefined) || "related"}
             </span>
           )}
 
@@ -460,7 +462,7 @@ function SetupActionsEditor({
                 : action.type === "wait"
                   ? `${action.ms}ms`
                   : action.type === "type"
-                    ? `"${action.value}" → ${action.target.type === "search" ? action.target.criteria?.textContent || "?" : action.target.elementId}`
+                    ? `"${action.value}" → ${action.target.type === "search" ? action.target.criteria?.textContent || "?" : "elementId" in action.target ? action.target.elementId : "?"}`
                     : "target" in action && action.target.type === "search"
                       ? action.target.criteria?.textContent || ""
                       : "";

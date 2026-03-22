@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::database::CheckpointDb;
+use crate::str_utils::truncate_str;
 
 use super::types::{IterationCommit, IterationDiff, RollbackPolicy};
 
@@ -71,7 +72,9 @@ impl CompensationManager {
             RollbackPolicy::LastGood => {
                 let commits = self.get_iteration_commits(execution_id)?;
                 if commits.is_empty() {
-                    warn!("COMPENSATION: No iteration commits recorded, cannot rollback to last good");
+                    warn!(
+                        "COMPENSATION: No iteration commits recorded, cannot rollback to last good"
+                    );
                     return Ok(None);
                 }
 
@@ -207,7 +210,7 @@ pub async fn capture_iteration_diff(
     let diff_summary = if diff_output.status.success() {
         let raw = String::from_utf8_lossy(&diff_output.stdout).to_string();
         if raw.len() > 4000 {
-            let truncated = &raw[..raw.floor_char_boundary(4000)];
+            let truncated = truncate_str(&raw, 4000);
             format!(
                 "{}...\n[truncated, {} more chars]",
                 truncated,
@@ -242,11 +245,7 @@ pub async fn get_head_commit_async(working_dir: &Path) -> Option<String> {
         .ok()?;
 
     if output.status.success() {
-        Some(
-            String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .to_string(),
-        )
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         None
     }
@@ -275,10 +274,7 @@ pub fn format_iteration_diffs_context(diffs: &[IterationDiff], max_chars: usize)
     // Iterate newest-first, but we build oldest-first so newest gets priority
     // Actually, show all in order but truncate oldest if over budget
     for diff in diffs {
-        let section = format!(
-            "\n### Iteration {}\n{}\n",
-            diff.iteration, diff.diff_stat
-        );
+        let section = format!("\n### Iteration {}\n{}\n", diff.iteration, diff.diff_stat);
 
         if section.len() > remaining {
             if result.len() > 50 {
@@ -295,9 +291,7 @@ pub fn format_iteration_diffs_context(diffs: &[IterationDiff], max_chars: usize)
 }
 
 /// Find the last iteration where verification was at its best (fewest failures).
-fn find_last_good_iteration(
-    iteration_results: &[super::types::IterationResult],
-) -> Option<u32> {
+fn find_last_good_iteration(iteration_results: &[super::types::IterationResult]) -> Option<u32> {
     if iteration_results.is_empty() {
         return None;
     }

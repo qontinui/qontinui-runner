@@ -322,8 +322,7 @@ pub fn regularized_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
         f *= d * c;
 
         // Odd step
-        let num_odd =
-            -((a + m_f) * (a + b + m_f) * x) / ((a + 2.0 * m_f) * (a + 2.0 * m_f + 1.0));
+        let num_odd = -((a + m_f) * (a + b + m_f) * x) / ((a + 2.0 * m_f) * (a + 2.0 * m_f + 1.0));
         d = 1.0 + num_odd * d;
         if d.abs() < 1e-30 {
             d = 1e-30;
@@ -450,11 +449,7 @@ mod tests {
     fn test_proportion_z_test_worse() {
         // 2/10 vs 8/10 — experiment is worse
         let p = proportion_z_test_onesided(2, 10, 8, 10);
-        assert!(
-            p > 0.95,
-            "Experiment worse should have p > 0.95, got {}",
-            p
-        );
+        assert!(p > 0.95, "Experiment worse should have p > 0.95, got {}", p);
     }
 
     #[test]
