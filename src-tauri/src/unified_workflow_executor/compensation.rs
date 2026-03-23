@@ -618,10 +618,8 @@ mod tests {
         assert!(commits.is_empty());
 
         // Record two iterations
-        mgr.record_iteration_commit(exec_id, 1, "abc123")
-            .unwrap();
-        mgr.record_iteration_commit(exec_id, 2, "def456")
-            .unwrap();
+        mgr.record_iteration_commit(exec_id, 1, "abc123").unwrap();
+        mgr.record_iteration_commit(exec_id, 2, "def456").unwrap();
 
         let commits = mgr.get_iteration_commits(exec_id).unwrap();
         assert_eq!(commits.len(), 2);
@@ -638,10 +636,8 @@ mod tests {
         seed_task_run(&db, "exec-B");
         let mgr = CompensationManager::new(db);
 
-        mgr.record_iteration_commit("exec-A", 1, "aaa111")
-            .unwrap();
-        mgr.record_iteration_commit("exec-B", 1, "bbb222")
-            .unwrap();
+        mgr.record_iteration_commit("exec-A", 1, "aaa111").unwrap();
+        mgr.record_iteration_commit("exec-B", 1, "bbb222").unwrap();
 
         let a_commits = mgr.get_iteration_commits("exec-A").unwrap();
         assert_eq!(a_commits.len(), 1);
@@ -654,7 +650,10 @@ mod tests {
 
     // ── helpers ───────────────────────────────────────────────────────
 
-    fn make_iter_result(iteration: u32, failed_checks: usize) -> super::super::types::IterationResult {
+    fn make_iter_result(
+        iteration: u32,
+        failed_checks: usize,
+    ) -> super::super::types::IterationResult {
         super::super::types::IterationResult {
             iteration,
             verification_passed: failed_checks == 0,

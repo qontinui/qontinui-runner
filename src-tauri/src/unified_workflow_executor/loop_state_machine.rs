@@ -18,7 +18,9 @@ use std::time::Instant;
 use crate::step_executor::{ExecutionStepConfig, VerificationPhaseResult};
 
 use super::compensation::CompensationManager;
-use super::convergence::{ConvergenceAction, ConvergenceConfig, ConvergenceDetector, ConvergenceReport};
+use super::convergence::{
+    ConvergenceConfig, ConvergenceDetector, ConvergenceReport,
+};
 use super::types::{AgenticOutcome, IterationResult, LoopConfig, LoopResult};
 
 // =============================================================================
@@ -549,16 +551,17 @@ mod tests {
         let mut ctx = make_test_context(1);
         assert!(ctx.accumulated_diffs.is_empty());
 
-        ctx.accumulated_diffs.push(super::super::types::IterationDiff {
-            iteration: 1,
-            files_changed: vec!["src/main.rs".to_string()],
-            diff_stat: "1 file changed".to_string(),
-            diff_summary: "+println!(\"hello\")".to_string(),
-            insertions: 1,
-            deletions: 0,
-            commit_before: Some("abc123".to_string()),
-            commit_after: Some("def456".to_string()),
-        });
+        ctx.accumulated_diffs
+            .push(super::super::types::IterationDiff {
+                iteration: 1,
+                files_changed: vec!["src/main.rs".to_string()],
+                diff_stat: "1 file changed".to_string(),
+                diff_summary: "+println!(\"hello\")".to_string(),
+                insertions: 1,
+                deletions: 0,
+                commit_before: Some("abc123".to_string()),
+                commit_after: Some("def456".to_string()),
+            });
         assert_eq!(ctx.accumulated_diffs.len(), 1);
         assert_eq!(ctx.accumulated_diffs[0].iteration, 1);
         assert_eq!(ctx.accumulated_diffs[0].files_changed, vec!["src/main.rs"]);
@@ -623,10 +626,7 @@ mod tests {
         assert!(ctx.pending_health_regression.is_some());
         // Simulate consumption in next iteration's failure context building
         let warning = ctx.pending_health_regression.take();
-        assert_eq!(
-            warning.unwrap(),
-            "WARNING: App crashed after agentic phase"
-        );
+        assert_eq!(warning.unwrap(), "WARNING: App crashed after agentic phase");
         assert!(ctx.pending_health_regression.is_none());
     }
 

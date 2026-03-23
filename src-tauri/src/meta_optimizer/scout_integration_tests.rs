@@ -204,12 +204,20 @@ mod tests {
             // Cost delta should be negative (canary is cheaper)
             assert!(eval.cost_delta_pct.is_some());
             let cost_pct = eval.cost_delta_pct.unwrap();
-            assert!(cost_pct < -40.0 && cost_pct > -60.0, "expected ~-50%, got {}", cost_pct);
+            assert!(
+                cost_pct < -40.0 && cost_pct > -60.0,
+                "expected ~-50%, got {}",
+                cost_pct
+            );
 
             // Duration delta should be negative (canary is faster)
             assert!(eval.duration_delta_pct.is_some());
             let dur_pct = eval.duration_delta_pct.unwrap();
-            assert!(dur_pct < -15.0 && dur_pct > -25.0, "expected ~-20%, got {}", dur_pct);
+            assert!(
+                dur_pct < -15.0 && dur_pct > -25.0,
+                "expected ~-20%, got {}",
+                dur_pct
+            );
         }
 
         #[test]
@@ -369,21 +377,42 @@ mod tests {
 
         #[test]
         fn content_hash_is_deterministic() {
-            let h1 = compute_content_hash("pipeline_prompt", "prompt_rewrite", Some("implementer"), Some("content"));
-            let h2 = compute_content_hash("pipeline_prompt", "prompt_rewrite", Some("implementer"), Some("content"));
+            let h1 = compute_content_hash(
+                "pipeline_prompt",
+                "prompt_rewrite",
+                Some("implementer"),
+                Some("content"),
+            );
+            let h2 = compute_content_hash(
+                "pipeline_prompt",
+                "prompt_rewrite",
+                Some("implementer"),
+                Some("content"),
+            );
             assert_eq!(h1, h2);
         }
 
         #[test]
         fn content_hash_differs_for_different_inputs() {
-            let h1 = compute_content_hash("pipeline_prompt", "prompt_rewrite", Some("implementer"), Some("v1"));
-            let h2 = compute_content_hash("pipeline_prompt", "prompt_rewrite", Some("implementer"), Some("v2"));
+            let h1 = compute_content_hash(
+                "pipeline_prompt",
+                "prompt_rewrite",
+                Some("implementer"),
+                Some("v1"),
+            );
+            let h2 = compute_content_hash(
+                "pipeline_prompt",
+                "prompt_rewrite",
+                Some("implementer"),
+                Some("v2"),
+            );
             assert_ne!(h1, h2);
         }
 
         #[test]
         fn content_hash_differs_by_optimizer_type() {
-            let h1 = compute_content_hash("pipeline_prompt", "prompt_rewrite", Some("a"), Some("x"));
+            let h1 =
+                compute_content_hash("pipeline_prompt", "prompt_rewrite", Some("a"), Some("x"));
             let h2 = compute_content_hash("architecture", "prompt_rewrite", Some("a"), Some("x"));
             assert_ne!(h1, h2);
         }
@@ -474,7 +503,12 @@ mod tests {
             let c_tc = composite_score(&scores_high_tc);
             let c_se = composite_score(&scores_high_se);
             // Higher weight on TaskCompletion should make it dominate
-            assert!(c_tc > c_se, "TaskCompletion should have higher weight: {} vs {}", c_tc, c_se);
+            assert!(
+                c_tc > c_se,
+                "TaskCompletion should have higher weight: {} vs {}",
+                c_tc,
+                c_se
+            );
             // Expected: c_tc = 0.25/(0.25+0.12) ≈ 0.676, c_se = 0.12/(0.25+0.12) ≈ 0.324
             assert!((c_tc - 0.6757).abs() < 0.01);
             assert!((c_se - 0.3243).abs() < 0.01);
@@ -508,7 +542,11 @@ mod tests {
                 AgenticMetric::RagAnswerRelevancy,
             ];
             let total: f64 = metrics.iter().map(|m| m.default_weight()).sum();
-            assert!((total - 1.0).abs() < 0.001, "Weights sum to {} not 1.0", total);
+            assert!(
+                (total - 1.0).abs() < 0.001,
+                "Weights sum to {} not 1.0",
+                total
+            );
         }
     }
 
@@ -516,8 +554,8 @@ mod tests {
     // Task completion scoring tests (deepeval-inspired)
     // =========================================================================
     mod task_completion {
-        use crate::meta_optimizer::agentic_metrics::{AgenticMetric, DeterministicInput};
         use crate::meta_optimizer::agentic_metrics::task_completion;
+        use crate::meta_optimizer::agentic_metrics::{AgenticMetric, DeterministicInput};
 
         fn make_input(
             verification_passed: bool,
@@ -528,7 +566,12 @@ mod tests {
         ) -> DeterministicInput {
             DeterministicInput {
                 task_run_id: "scout-test".to_string(),
-                status: if verification_passed { "success" } else { "failure" }.to_string(),
+                status: if verification_passed {
+                    "success"
+                } else {
+                    "failure"
+                }
+                .to_string(),
                 verification_passed,
                 was_stopped,
                 iterations,
@@ -576,7 +619,8 @@ mod tests {
 
         #[test]
         fn timeout_scores_point_two() {
-            let result = task_completion::score(&make_input(false, 2, false, false, Some("timeout")));
+            let result =
+                task_completion::score(&make_input(false, 2, false, false, Some("timeout")));
             assert_eq!(result.score, 0.2);
         }
 
@@ -719,9 +763,13 @@ negative_explanation: Silent failures hide bugs.
             assert_eq!(examples.len(), 2);
 
             assert_eq!(examples[0].rule_id, "rule-timeout-handling");
-            assert!(examples[0].positive_example.contains("timeout of 30 seconds"));
+            assert!(examples[0]
+                .positive_example
+                .contains("timeout of 30 seconds"));
             assert!(examples[0].negative_example.contains("without any timeout"));
-            assert!(examples[0].positive_explanation.contains("Timeouts prevent"));
+            assert!(examples[0]
+                .positive_explanation
+                .contains("Timeouts prevent"));
             assert!(examples[0].negative_explanation.contains("infinite waits"));
 
             assert_eq!(examples[1].rule_id, "rule-error-logging");
@@ -869,9 +917,7 @@ prompt_content: content here
     // Stats module: proportion analysis and verdict tests (canary verdicts)
     // =========================================================================
     mod stats_verdict {
-        use crate::stats::{
-            compute_verdict, proportion_analysis, Verdict, VerdictThresholds,
-        };
+        use crate::stats::{compute_verdict, proportion_analysis, Verdict, VerdictThresholds};
 
         #[test]
         fn proportion_analysis_insufficient_data() {
@@ -891,7 +937,11 @@ prompt_content: content here
             assert!(result.effect_size.is_some());
             // Experiment is better, so p-value should be low
             let p = result.p_value.unwrap();
-            assert!(p < 0.5, "p-value should indicate experiment is better: {}", p);
+            assert!(
+                p < 0.5,
+                "p-value should indicate experiment is better: {}",
+                p
+            );
         }
 
         #[test]
@@ -927,7 +977,10 @@ prompt_content: content here
             assert_eq!(Verdict::Positive.as_recommendation_str(), "improved");
             assert_eq!(Verdict::Negative.as_recommendation_str(), "regressed");
             assert_eq!(Verdict::Neutral.as_recommendation_str(), "neutral");
-            assert_eq!(Verdict::InsufficientData.as_recommendation_str(), "insufficient_data");
+            assert_eq!(
+                Verdict::InsufficientData.as_recommendation_str(),
+                "insufficient_data"
+            );
         }
 
         #[test]
@@ -1060,9 +1113,11 @@ prompt_content: content here
                        VALUES (?1, 'cost', 'config_change', 'test', 'test desc',
                                0.8, 'pending', ?2, datetime('now'))"#,
                     rusqlite::params![id, payload],
-                ).map_err(|e| format!("{}", e))?;
+                )
+                .map_err(|e| format!("{}", e))?;
                 Ok(())
-            }).unwrap();
+            })
+            .unwrap();
         }
 
         #[test]
@@ -1105,7 +1160,10 @@ prompt_content: content here
 
             // Should no longer be in active list
             let active = get_active_canaries(&db).unwrap();
-            assert!(active.is_empty(), "Promoted canary should not be in active list");
+            assert!(
+                active.is_empty(),
+                "Promoted canary should not be in active list"
+            );
         }
 
         #[test]
@@ -1125,7 +1183,10 @@ prompt_content: content here
 
             // Should no longer be in active list
             let active = get_active_canaries(&db).unwrap();
-            assert!(active.is_empty(), "Rolled-back canary should not be in active list");
+            assert!(
+                active.is_empty(),
+                "Rolled-back canary should not be in active list"
+            );
 
             // Verify recommendation status was set to rolled_back (not pending)
             let status: String = db

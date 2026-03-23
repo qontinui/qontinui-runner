@@ -13,28 +13,24 @@
 //! 6. The loop respects external stop requests (via stop_ai_analysis endpoint)
 
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
-use crate::database::CreateTaskRunEventInput;
 use crate::doctor::DoctorHandle;
-use crate::event_system::EventBroadcaster;
 use crate::orchestrator::integration::StageTransition;
-use crate::orchestrator::knowledge::{parse_findings_from_output, AgentType, KnowledgeBase};
+use crate::orchestrator::knowledge::KnowledgeBase;
 use crate::step_executor::ExecutionStepConfig;
 use crate::step_registry::StepEventLogger;
-use crate::str_utils::truncate_str;
 use crate::summary_generator::generate_task_summary_async;
 use crate::AppState;
 
 use super::canvas_panels::CanvasPanelManager;
-use super::compensation::{self, CompensationManager};
 use super::phases::{AgenticExecutor, CompletionExecutor, SetupExecutor, VerificationExecutor};
 use super::resume::{ResumeManager, ResumePoint};
 use super::states::UnifiedWorkflowState;
 use super::types::{
-    get_parent_task_id, AgenticOutcome, IterationResult, LoopConfig, LoopResult, RollbackPolicy,
+    AgenticOutcome, LoopConfig, LoopResult,
     SweepResult,
 };
 
@@ -2544,7 +2540,4 @@ pub use super::step_conversion::{
 };
 
 // Health monitoring utilities extracted to health_monitor module
-pub(super) use super::health_monitor::{
-    build_resume_agentic_context, detect_health_regression, detect_regression,
-    fetch_pre_agentic_health_baseline,
-};
+pub(super) use super::health_monitor::build_resume_agentic_context;
