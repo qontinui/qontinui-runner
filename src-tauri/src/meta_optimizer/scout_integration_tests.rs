@@ -1020,4 +1020,282 @@ prompt_content: content here
             assert_eq!(l2, ContextTier::L2);
         }
     }
+
+    // =========================================================================
+    // Canary DB lifecycle tests — start, promote, rollback
+    // =========================================================================
+    mod canary_lifecycle {
+        use crate::database::CheckpointDb;
+        use crate::meta_optimizer::canary::{
+            get_active_canaries, promote_canary, rollback_canary, start_canary,
+        };
+
+        fn setup_db() -> CheckpointDb {
+            CheckpointDb::new_in_memory().unwrap()
+        }
+
+        fn insert_recommendation(db: &CheckpointDb, rec_id: &str) {
+            let id = rec_id.to_string();
+            db.with_conn(move |conn| {
+                conn.execute(
+                    r#"INSERT OR IGNORE INTO meta_optimizer_recommendations
+                       (id, optimizer_type, recommendation_type, title, description, confidence, status, created_at)
+                       VALUES (?1, 'pipeline_prompt', 'config_change', 'test', 'test desc', 0.8, 'pending', datetime('now'))"#,
+                    rusqlite::params![id],
+                ).map_err(|e| format!("{}", e))?;
+                Ok(())
+            }).unwrap();
+        }
+
+        /// Seed a config_change recommendation with a valid JSON payload so
+        /// apply_recommendation_with_side_effects can succeed during promote.
+        fn insert_config_recommendation(db: &CheckpointDb, rec_id: &str) {
+            let id = rec_id.to_string();
+            let payload = serde_json::json!({"key": "test_key", "value": "test_val"}).to_string();
+            db.with_conn(move |conn| {
+                conn.execute(
+                    r#"INSERT OR IGNORE INTO meta_optimizer_recommendations
+                       (id, optimizer_type, recommendation_type, title, description,
+                        confidence, status, recommended_value, created_at)
+                       VALUES (?1, 'cost', 'config_change', 'test', 'test desc',
+                               0.8, 'pending', ?2, datetime('now'))"#,
+                    rusqlite::params![id, payload],
+                ).map_err(|e| format!("{}", e))?;
+                Ok(())
+            }).unwrap();
+        }
+
+        #[test]
+        fn test_canary_start_and_get_active() {
+            let db = setup_db();
+            let rec_id = "rec-lifecycle-start";
+            insert_recommendation(&db, rec_id);
+
+            // No active canaries initially
+            let active = get_active_canaries(&db).unwrap();
+            assert!(active.is_empty());
+
+            // Start a canary rollout
+            let canary_id = start_canary(&db, rec_id, 50).unwrap();
+            assert!(!canary_id.is_empty());
+
+            // Now it should appear in active canaries
+            let active = get_active_canaries(&db).unwrap();
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].id, canary_id);
+            assert_eq!(active[0].recommendation_id, rec_id);
+            assert_eq!(active[0].percentage, 50);
+            assert_eq!(active[0].status, "active");
+        }
+
+        #[test]
+        fn test_canary_promote_removes_from_active() {
+            let db = setup_db();
+            let rec_id = "rec-lifecycle-promote";
+            insert_config_recommendation(&db, rec_id);
+
+            let canary_id = start_canary(&db, rec_id, 30).unwrap();
+
+            // Verify it's active
+            let active = get_active_canaries(&db).unwrap();
+            assert_eq!(active.len(), 1);
+
+            // Promote the canary
+            promote_canary(&db, &canary_id).unwrap();
+
+            // Should no longer be in active list
+            let active = get_active_canaries(&db).unwrap();
+            assert!(active.is_empty(), "Promoted canary should not be in active list");
+        }
+
+        #[test]
+        fn test_canary_rollback_removes_from_active() {
+            let db = setup_db();
+            let rec_id = "rec-lifecycle-rollback";
+            insert_recommendation(&db, rec_id);
+
+            let canary_id = start_canary(&db, rec_id, 25).unwrap();
+
+            // Verify it's active
+            let active = get_active_canaries(&db).unwrap();
+            assert_eq!(active.len(), 1);
+
+            // Roll back the canary
+            rollback_canary(&db, &canary_id).unwrap();
+
+            // Should no longer be in active list
+            let active = get_active_canaries(&db).unwrap();
+            assert!(active.is_empty(), "Rolled-back canary should not be in active list");
+
+            // Verify recommendation status was set to rolled_back (not pending)
+            let status: String = db
+                .with_conn({
+                    let id = rec_id.to_string();
+                    move |conn| {
+                        conn.query_row(
+                            "SELECT status FROM meta_optimizer_recommendations WHERE id = ?1",
+                            rusqlite::params![id],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| format!("{}", e))
+                    }
+                })
+                .unwrap();
+            assert_eq!(status, "rolled_back");
+        }
+    }
+
+    // =========================================================================
+    // Eval result attachment to recommendation
+    // =========================================================================
+    mod eval_result_attachment {
+        use crate::database::CheckpointDb;
+        use crate::meta_optimizer::eval_spec::{
+            attach_eval_result, list_eval_results, save_eval_result, EvalResult,
+        };
+
+        fn setup_db() -> CheckpointDb {
+            CheckpointDb::new_in_memory().unwrap()
+        }
+
+        fn insert_recommendation(db: &CheckpointDb, rec_id: &str) {
+            let id = rec_id.to_string();
+            db.with_conn(move |conn| {
+                conn.execute(
+                    r#"INSERT OR IGNORE INTO meta_optimizer_recommendations
+                       (id, optimizer_type, recommendation_type, title, description, confidence, status, created_at)
+                       VALUES (?1, 'pipeline_prompt', 'prompt_rewrite', 'test', 'test desc', 0.8, 'pending', datetime('now'))"#,
+                    rusqlite::params![id],
+                ).map_err(|e| format!("{}", e))?;
+                Ok(())
+            }).unwrap();
+        }
+
+        #[test]
+        fn test_eval_result_attaches_to_recommendation() {
+            let db = setup_db();
+            let rec_id = "rec-eval-attach";
+            insert_recommendation(&db, rec_id);
+
+            // Create and save an eval result linked to the recommendation
+            let eval_result = EvalResult {
+                id: "er-attach-1".to_string(),
+                spec_id: "es-attach".to_string(),
+                recommendation_id: Some(rec_id.to_string()),
+                status: "passed".to_string(),
+                test_case_results: vec![],
+                baseline_metrics: None,
+                candidate_metrics: None,
+                comparison: None,
+                trials_run: 5,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            save_eval_result(&db, &eval_result).unwrap();
+
+            // Attach the eval result to the recommendation
+            attach_eval_result(&db, rec_id, "er-attach-1", "passed").unwrap();
+
+            // Verify the recommendation now has the eval result attached
+            let (result_id, eval_status): (Option<String>, Option<String>) = db
+                .with_conn({
+                    let id = rec_id.to_string();
+                    move |conn| {
+                        conn.query_row(
+                            "SELECT eval_result_id, eval_status FROM meta_optimizer_recommendations WHERE id = ?1",
+                            rusqlite::params![id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .map_err(|e| format!("{}", e))
+                    }
+                })
+                .unwrap();
+            assert_eq!(result_id.as_deref(), Some("er-attach-1"));
+            assert_eq!(eval_status.as_deref(), Some("passed"));
+
+            // Verify we can list eval results filtered by recommendation_id
+            let results = list_eval_results(&db, None, Some(rec_id)).unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id, "er-attach-1");
+            assert_eq!(results[0].recommendation_id.as_deref(), Some(rec_id));
+        }
+    }
+
+    // =========================================================================
+    // Golden dataset save and list
+    // =========================================================================
+    mod golden_dataset {
+        use crate::database::CheckpointDb;
+        use crate::meta_optimizer::golden_dataset::{
+            delete_golden_dataset, list_golden_datasets, save_golden_dataset, GoldenDataset,
+            GoldenEntry, GoldenEntryMetrics,
+        };
+
+        fn setup_db() -> CheckpointDb {
+            CheckpointDb::new_in_memory().unwrap()
+        }
+
+        #[test]
+        fn test_golden_dataset_save_and_list() {
+            let db = setup_db();
+
+            let dataset = GoldenDataset {
+                id: "gd-test-1".to_string(),
+                agent_type: "implementer".to_string(),
+                name: "Test golden dataset".to_string(),
+                entries: vec![
+                    GoldenEntry {
+                        input_hash: "abc123".to_string(),
+                        input_summary: "Build a REST API endpoint".to_string(),
+                        expected_success: true,
+                        source_task_run_id: Some("tr-001".to_string()),
+                        baseline_metrics: Some(GoldenEntryMetrics {
+                            iterations: 2,
+                            duration_ms: 45000,
+                            success: true,
+                        }),
+                    },
+                    GoldenEntry {
+                        input_hash: "def456".to_string(),
+                        input_summary: "Fix a null pointer bug".to_string(),
+                        expected_success: true,
+                        source_task_run_id: Some("tr-002".to_string()),
+                        baseline_metrics: None,
+                    },
+                ],
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+
+            // Save the dataset
+            save_golden_dataset(&db, &dataset).unwrap();
+
+            // List all datasets
+            let all = list_golden_datasets(&db, None).unwrap();
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].id, "gd-test-1");
+            assert_eq!(all[0].agent_type, "implementer");
+            assert_eq!(all[0].name, "Test golden dataset");
+            assert_eq!(all[0].entries.len(), 2);
+            assert_eq!(all[0].entries[0].input_summary, "Build a REST API endpoint");
+            assert_eq!(all[0].entries[1].input_hash, "def456");
+
+            // Verify baseline_metrics survived round-trip
+            let metrics = all[0].entries[0].baseline_metrics.as_ref().unwrap();
+            assert_eq!(metrics.iterations, 2);
+            assert_eq!(metrics.duration_ms, 45000);
+            assert!(metrics.success);
+
+            // List filtered by agent type
+            let impl_only = list_golden_datasets(&db, Some("implementer")).unwrap();
+            assert_eq!(impl_only.len(), 1);
+
+            let verifier_only = list_golden_datasets(&db, Some("verifier")).unwrap();
+            assert!(verifier_only.is_empty());
+
+            // Delete and verify
+            delete_golden_dataset(&db, "gd-test-1").unwrap();
+            let after_delete = list_golden_datasets(&db, None).unwrap();
+            assert!(after_delete.is_empty());
+        }
+    }
 }
