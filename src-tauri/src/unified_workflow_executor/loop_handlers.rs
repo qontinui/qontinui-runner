@@ -1,11 +1,13 @@
 //! Handler methods for the verification-agentic loop state machine.
 //!
 //! Each handler corresponds to one `LoopState` variant and contains the logic
-//! extracted from the monolithic `run_verification_agentic_loop` method.
+//! for one phase of the verification-agentic loop. The dispatch method
+//! `run_loop_state_machine` drives the state machine by matching on the current
+//! state and calling the appropriate handler, which returns the next state.
 //!
-//! The dispatch method `run_loop_state_machine` drives the state machine by
-//! matching on the current state and calling the appropriate handler, which
-//! returns the next state.
+//! This is the only implementation of the Traditional workflow loop — the
+//! monolithic `run_verification_agentic_loop` was deleted after parity was
+//! verified by the Group E scout integration tests.
 
 use std::time::Instant;
 
