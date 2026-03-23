@@ -2,7 +2,7 @@
 //!
 //! Runs periodically to compute embeddings for rows where the embedding
 //! column is NULL but the source text exists. Rate-limited to avoid
-//! overloading the qontinui-api embedding service.
+//! overloading the runner's embedding service.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,7 +113,7 @@ const EMBEDDING_TARGETS: &[EmbeddingTarget] = &[
 /// Start the background embedding backfill job.
 ///
 /// This spawns a task that periodically scans for rows missing
-/// embeddings and computes them via the qontinui-api.
+/// embeddings and computes them via the runner's embedding service.
 ///
 /// Uses `tauri::async_runtime::spawn()` to properly integrate with
 /// Tauri's async runtime, allowing this to be called from setup().

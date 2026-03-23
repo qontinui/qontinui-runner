@@ -1,13 +1,13 @@
-//! Async HTTP client for computing text embeddings via the qontinui-api.
+//! Async HTTP client for computing text embeddings locally via the runner's embedding service.
 //!
-//! Uses the existing `POST /api/embeddings/compute-text` endpoint which returns
+//! Uses the `POST /api/embeddings/compute-text` endpoint which returns
 //! 384-dimensional MiniLM-L6-v2 embeddings.
 
 use crate::str_utils::truncate_str;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-/// Default URL for the qontinui-api embedding service.
+/// Default URL for the runner's local embedding service.
 // Use 127.0.0.1 to avoid IPv6 resolution delays on Windows
 const DEFAULT_EMBEDDING_URL: &str = "http://127.0.0.1:8001/api/embeddings/compute-text";
 
@@ -37,7 +37,7 @@ struct BatchEmbeddingResponse {
     embeddings: Vec<Vec<f32>>,
 }
 
-/// Client for computing text embeddings via the qontinui-api.
+/// Client for computing text embeddings via the runner's local embedding service.
 #[derive(Clone)]
 pub struct EmbeddingClient {
     client: reqwest::Client,
