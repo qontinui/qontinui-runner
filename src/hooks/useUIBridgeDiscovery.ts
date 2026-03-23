@@ -405,6 +405,7 @@ async function captureFallbackScreenshot(
 ): Promise<void> {
   try {
     const { getApiBase, tracedFetch } = await import("@/lib/runner-api");
+    const { generateFingerprints } = await import("@/lib/ui-bridge/fingerprintGenerator");
 
     // Use per-page fingerprints from the last presenceMatrix entry,
     // not allFingerprints which spans all pages ever visited.
@@ -412,7 +413,11 @@ async function captureFallbackScreenshot(
     const lastEntry = matrix[matrix.length - 1];
     const visibleHashes = new Set(lastEntry?.fingerprints ?? []);
 
-    const ssResp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/screenshot?runner=true`);
+    // Fetch screenshot and live SDK snapshot in parallel so we get actual element bounds
+    const [ssResp, snapResp] = await Promise.all([
+      tracedFetch(`${getApiBase()}/ui-bridge/sdk/screenshot?runner=true`),
+      tracedFetch(`${getApiBase()}/ui-bridge/sdk/snapshot?recency=current`),
+    ]);
     const ssJson = await ssResp.json();
     if (!ssJson.success || !ssJson.data?.screenshot) return;
 
@@ -420,18 +425,51 @@ async function captureFallbackScreenshot(
     const imgW = (ssJson.data.width || 1920) * dpr;
     const imgH = (ssJson.data.height || 1080) * dpr;
 
-    // Build bounds only for elements visible on the last captured page
+    // Build a hash→rect map from live snapshot elements (actual bounding boxes)
+    const liveBounds = new Map<string, { x: number; y: number; width: number; height: number }>();
+    try {
+      const { mapSdkElement } = await import("./sdk-ui-bridge/utils");
+      const snapJson = await snapResp.json();
+      if (snapJson.success) {
+        const rawElements: Record<string, unknown>[] =
+          snapJson.data?.elements || snapJson.elements || snapJson.data || [];
+        const mapped = rawElements.map(mapSdkElement);
+        const { elementFingerprintMap } = generateFingerprints(mapped);
+        for (const el of mapped) {
+          const fp = elementFingerprintMap.get(el.id);
+          if (fp && el.bounds.width > 0 && el.bounds.height > 0) {
+            liveBounds.set(fp.hash, {
+              x: el.bounds.x * dpr,
+              y: el.bounds.y * dpr,
+              width: el.bounds.width * dpr,
+              height: el.bounds.height * dpr,
+            });
+          }
+        }
+      }
+    } catch {
+      // Live snapshot failed — fall through to relativePosition fallback
+    }
+
+    // Build bounds: prefer live snapshot bounds, fall back to relativePosition estimate
     const boundsMap: Record<string, { x: number; y: number; width: number; height: number }> = {};
     const fpDetails = cooccurrenceData.fingerprintDetails ?? {};
     for (const hash of visibleHashes) {
-      const fp = fpDetails[hash];
-      if (fp?.relativePosition) {
-        boundsMap[hash] = {
-          x: fp.relativePosition.left * imgW,
-          y: fp.relativePosition.top * imgH,
-          width: imgW * 0.05,
-          height: imgH * 0.03,
-        };
+      const live = liveBounds.get(hash);
+      if (live) {
+        boundsMap[hash] = live;
+      } else {
+        // Fallback: use relativePosition with size estimated from sizeCategory
+        const fp = fpDetails[hash];
+        if (fp?.relativePosition) {
+          const sizePx = estimateSizePx(fp.sizeCategory, imgW, imgH);
+          boundsMap[hash] = {
+            x: fp.relativePosition.left * imgW,
+            y: fp.relativePosition.top * imgH,
+            width: sizePx.width,
+            height: sizePx.height,
+          };
+        }
       }
     }
 
@@ -451,6 +489,32 @@ async function captureFallbackScreenshot(
     });
   } catch (err) {
     console.warn("[useUIBridgeDiscovery] Fallback screenshot failed:", err);
+  }
+}
+
+/** Estimate element pixel size from sizeCategory when actual bounds aren't available. */
+function estimateSizePx(
+  sizeCategory: string | undefined,
+  imgW: number,
+  imgH: number,
+): { width: number; height: number } {
+  switch (sizeCategory) {
+    case "icon":
+      return { width: 24 * (imgW / 1920), height: 24 * (imgH / 1080) };
+    case "button":
+      return { width: 80 * (imgW / 1920), height: 32 * (imgH / 1080) };
+    case "small":
+      return { width: 120 * (imgW / 1920), height: 36 * (imgH / 1080) };
+    case "medium":
+      return { width: 200 * (imgW / 1920), height: 48 * (imgH / 1080) };
+    case "large":
+      return { width: 400 * (imgW / 1920), height: 80 * (imgH / 1080) };
+    case "fullwidth":
+      return { width: imgW * 0.9, height: 48 * (imgH / 1080) };
+    case "panel":
+      return { width: imgW * 0.3, height: imgH * 0.4 };
+    default:
+      return { width: 100 * (imgW / 1920), height: 36 * (imgH / 1080) };
   }
 }
 
