@@ -413,10 +413,11 @@ async function captureFallbackScreenshot(
     const lastEntry = matrix[matrix.length - 1];
     const visibleHashes = new Set(lastEntry?.fingerprints ?? []);
 
-    // Fetch screenshot and live SDK snapshot in parallel so we get actual element bounds
+    // Fetch screenshot and live SDK snapshot in parallel so we get actual element bounds.
+    // Use individual .catch() so a snapshot failure doesn't lose the screenshot.
     const [ssResp, snapResp] = await Promise.all([
       tracedFetch(`${getApiBase()}/ui-bridge/sdk/screenshot?runner=true`),
-      tracedFetch(`${getApiBase()}/ui-bridge/sdk/snapshot?recency=current`),
+      tracedFetch(`${getApiBase()}/ui-bridge/sdk/snapshot?recency=current`).catch(() => null),
     ]);
     const ssJson = await ssResp.json();
     if (!ssJson.success || !ssJson.data?.screenshot) return;
@@ -428,11 +429,13 @@ async function captureFallbackScreenshot(
     // Build a hash→rect map from live snapshot elements (actual bounding boxes)
     const liveBounds = new Map<string, { x: number; y: number; width: number; height: number }>();
     try {
+      if (!snapResp) throw new Error("snapshot fetch failed");
       const { mapSdkElement } = await import("./sdk-ui-bridge/utils");
       const snapJson = await snapResp.json();
       if (snapJson.success) {
-        const rawElements: Record<string, unknown>[] =
+        const candidate =
           snapJson.data?.elements || snapJson.elements || snapJson.data || [];
+        const rawElements: Record<string, unknown>[] = Array.isArray(candidate) ? candidate : [];
         const mapped = rawElements.map(mapSdkElement);
         const { elementFingerprintMap } = generateFingerprints(mapped);
         for (const el of mapped) {
