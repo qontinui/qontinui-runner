@@ -19,7 +19,7 @@ use crate::step_executor::{ExecutionStepConfig, VerificationPhaseResult};
 
 use super::compensation::CompensationManager;
 use super::convergence::{
-    ConvergenceConfig, ConvergenceDetector, ConvergenceReport,
+    ConvergenceAction, ConvergenceConfig, ConvergenceDetector, ConvergenceReport,
 };
 use super::types::{AgenticOutcome, IterationResult, LoopConfig, LoopResult};
 
