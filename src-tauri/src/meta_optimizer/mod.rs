@@ -38,3 +38,6 @@ pub mod robustness;
 pub mod snapshots;
 pub mod trigger;
 pub mod types;
+
+#[cfg(test)]
+mod scout_integration_tests;

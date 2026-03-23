@@ -351,3 +351,319 @@ fn parse_diff_stat(stat: &str) -> (Vec<String>, u32, u32) {
 
     (files, total_insertions, total_deletions)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    // ── RollbackPolicy::from_str ──────────────────────────────────────
+
+    #[test]
+    fn rollback_policy_from_str_none() {
+        assert_eq!(RollbackPolicy::from_str("none"), RollbackPolicy::None);
+    }
+
+    #[test]
+    fn rollback_policy_from_str_last_good() {
+        assert_eq!(
+            RollbackPolicy::from_str("last_good"),
+            RollbackPolicy::LastGood
+        );
+    }
+
+    #[test]
+    fn rollback_policy_from_str_clean() {
+        assert_eq!(RollbackPolicy::from_str("clean"), RollbackPolicy::Clean);
+    }
+
+    #[test]
+    fn rollback_policy_from_str_invalid_defaults_to_none() {
+        assert_eq!(RollbackPolicy::from_str("bogus"), RollbackPolicy::None);
+        assert_eq!(RollbackPolicy::from_str(""), RollbackPolicy::None);
+        assert_eq!(RollbackPolicy::from_str("CLEAN"), RollbackPolicy::None);
+    }
+
+    #[test]
+    fn rollback_policy_roundtrip() {
+        for policy in &[
+            RollbackPolicy::None,
+            RollbackPolicy::LastGood,
+            RollbackPolicy::Clean,
+        ] {
+            assert_eq!(RollbackPolicy::from_str(policy.as_str()), *policy);
+        }
+    }
+
+    // ── format_iteration_diffs_context ────────────────────────────────
+
+    #[test]
+    fn format_diffs_empty_returns_empty_string() {
+        let result = format_iteration_diffs_context(&[], 8000);
+        assert!(result.is_empty(), "Expected empty string, got: {result}");
+    }
+
+    #[test]
+    fn format_diffs_single_diff_contains_header() {
+        let diff = IterationDiff {
+            iteration: 1,
+            files_changed: vec!["src/foo.rs".to_string()],
+            diff_stat: " src/foo.rs | 5 +++++\n 1 file changed, 5 insertions(+)".to_string(),
+            diff_summary: String::new(),
+            insertions: 5,
+            deletions: 0,
+            commit_before: None,
+            commit_after: None,
+        };
+        let result = format_iteration_diffs_context(&[diff], 8000);
+        assert!(
+            result.contains("## Changes from Previous Iterations"),
+            "Missing header in: {result}"
+        );
+        assert!(
+            result.contains("### Iteration 1"),
+            "Missing iteration heading in: {result}"
+        );
+        assert!(
+            result.contains("src/foo.rs"),
+            "Missing diff stat content in: {result}"
+        );
+    }
+
+    #[test]
+    fn format_diffs_multiple_iterations() {
+        let diffs: Vec<IterationDiff> = (1..=3)
+            .map(|i| IterationDiff {
+                iteration: i,
+                files_changed: vec![format!("file_{i}.rs")],
+                diff_stat: format!(" file_{i}.rs | {i} +\n 1 file changed, {i} insertions(+)"),
+                diff_summary: String::new(),
+                insertions: i,
+                deletions: 0,
+                commit_before: None,
+                commit_after: None,
+            })
+            .collect();
+
+        let result = format_iteration_diffs_context(&diffs, 8000);
+        assert!(result.contains("### Iteration 1"));
+        assert!(result.contains("### Iteration 2"));
+        assert!(result.contains("### Iteration 3"));
+    }
+
+    #[test]
+    fn format_diffs_truncates_when_over_budget() {
+        // Create diffs large enough to exceed a small budget
+        let diffs: Vec<IterationDiff> = (1..=20)
+            .map(|i| IterationDiff {
+                iteration: i,
+                files_changed: vec![format!("very_long_filename_for_iteration_{i}.rs")],
+                diff_stat: format!(
+                    " very_long_filename_for_iteration_{i}.rs | 100 {}\n 1 file changed, 100 insertions(+)",
+                    "+".repeat(80)
+                ),
+                diff_summary: String::new(),
+                insertions: 100,
+                deletions: 0,
+                commit_before: None,
+                commit_after: None,
+            })
+            .collect();
+
+        // Use a small budget that can't fit all 20 iterations
+        let result = format_iteration_diffs_context(&diffs, 400);
+        assert!(
+            result.contains("[older iteration diffs truncated]"),
+            "Expected truncation marker in: {result}"
+        );
+        // Should contain at least iteration 1
+        assert!(result.contains("### Iteration 1"));
+        // Should NOT contain all 20
+        assert!(
+            !result.contains("### Iteration 20"),
+            "Should have been truncated before iteration 20"
+        );
+    }
+
+    #[test]
+    fn format_diffs_respects_exact_budget() {
+        let diff = IterationDiff {
+            iteration: 1,
+            files_changed: vec!["a.rs".to_string()],
+            diff_stat: "a.rs | 1 +".to_string(),
+            diff_summary: String::new(),
+            insertions: 1,
+            deletions: 0,
+            commit_before: None,
+            commit_after: None,
+        };
+        let result = format_iteration_diffs_context(&[diff], 8000);
+        assert!(
+            result.len() <= 8000,
+            "Result exceeded budget: {} chars",
+            result.len()
+        );
+    }
+
+    // ── find_last_good_iteration ──────────────────────────────────────
+
+    #[test]
+    fn find_last_good_empty_results() {
+        assert_eq!(find_last_good_iteration(&[]), None);
+    }
+
+    #[test]
+    fn find_last_good_single_iteration_returns_none() {
+        // Only one iteration — no point rolling back to current
+        let results = vec![make_iter_result(1, 3)];
+        assert_eq!(find_last_good_iteration(&results), None);
+    }
+
+    #[test]
+    fn find_last_good_monotonic_improvement_returns_none() {
+        // Each iteration is better — last is best, so no rollback target
+        let results = vec![
+            make_iter_result(1, 5),
+            make_iter_result(2, 3),
+            make_iter_result(3, 1),
+        ];
+        assert_eq!(find_last_good_iteration(&results), None);
+    }
+
+    #[test]
+    fn find_last_good_regression_returns_best() {
+        // Iteration 2 was best (1 failure), iteration 3 regressed
+        let results = vec![
+            make_iter_result(1, 5),
+            make_iter_result(2, 1),
+            make_iter_result(3, 4),
+        ];
+        assert_eq!(find_last_good_iteration(&results), Some(2));
+    }
+
+    #[test]
+    fn find_last_good_early_best_with_late_regression() {
+        let results = vec![
+            make_iter_result(1, 0),
+            make_iter_result(2, 2),
+            make_iter_result(3, 5),
+        ];
+        assert_eq!(find_last_good_iteration(&results), Some(1));
+    }
+
+    #[test]
+    fn find_last_good_ties_prefer_latest() {
+        // Two iterations tied at 2 failures, then regression at 3
+        let results = vec![
+            make_iter_result(1, 2),
+            make_iter_result(2, 2),
+            make_iter_result(3, 5),
+        ];
+        // <= means ties go to the later iteration
+        assert_eq!(find_last_good_iteration(&results), Some(2));
+    }
+
+    // ── parse_diff_stat ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_diff_stat_basic() {
+        let stat = " src/foo.rs | 10 ++++------\n src/bar.rs | 3 +++\n 2 files changed, 7 insertions(+), 6 deletions(-)";
+        let (files, ins, del) = parse_diff_stat(stat);
+        assert_eq!(files, vec!["src/foo.rs", "src/bar.rs"]);
+        assert_eq!(ins, 7);
+        assert_eq!(del, 6);
+    }
+
+    #[test]
+    fn parse_diff_stat_single_insertion() {
+        let stat = " a.rs | 1 +\n 1 file changed, 1 insertion(+)";
+        let (files, ins, del) = parse_diff_stat(stat);
+        assert_eq!(files, vec!["a.rs"]);
+        assert_eq!(ins, 1);
+        assert_eq!(del, 0);
+    }
+
+    #[test]
+    fn parse_diff_stat_empty() {
+        let (files, ins, del) = parse_diff_stat("");
+        assert!(files.is_empty());
+        assert_eq!(ins, 0);
+        assert_eq!(del, 0);
+    }
+
+    // ── CompensationManager with in-memory DB ─────────────────────────
+
+    #[test]
+    fn compensation_manager_new_succeeds() {
+        let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
+        let _mgr = CompensationManager::new(db);
+    }
+
+    /// Helper to seed a task_run row so iteration commits can be stored.
+    fn seed_task_run(db: &CheckpointDb, id: &str) {
+        use crate::database::types::CreateTaskRunInput;
+        let input = CreateTaskRunInput::new(id, "test-task");
+        db.create_task_run(&input).unwrap();
+    }
+
+    #[test]
+    fn record_and_get_iteration_commits() {
+        let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
+        let exec_id = "test-exec-001";
+        seed_task_run(&db, exec_id);
+        let mgr = CompensationManager::new(db);
+
+        // Initially empty
+        let commits = mgr.get_iteration_commits(exec_id).unwrap();
+        assert!(commits.is_empty());
+
+        // Record two iterations
+        mgr.record_iteration_commit(exec_id, 1, "abc123")
+            .unwrap();
+        mgr.record_iteration_commit(exec_id, 2, "def456")
+            .unwrap();
+
+        let commits = mgr.get_iteration_commits(exec_id).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].iteration, 1);
+        assert_eq!(commits[0].commit_hash, "abc123");
+        assert_eq!(commits[1].iteration, 2);
+        assert_eq!(commits[1].commit_hash, "def456");
+    }
+
+    #[test]
+    fn get_commits_isolated_by_execution_id() {
+        let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
+        seed_task_run(&db, "exec-A");
+        seed_task_run(&db, "exec-B");
+        let mgr = CompensationManager::new(db);
+
+        mgr.record_iteration_commit("exec-A", 1, "aaa111")
+            .unwrap();
+        mgr.record_iteration_commit("exec-B", 1, "bbb222")
+            .unwrap();
+
+        let a_commits = mgr.get_iteration_commits("exec-A").unwrap();
+        assert_eq!(a_commits.len(), 1);
+        assert_eq!(a_commits[0].commit_hash, "aaa111");
+
+        let b_commits = mgr.get_iteration_commits("exec-B").unwrap();
+        assert_eq!(b_commits.len(), 1);
+        assert_eq!(b_commits[0].commit_hash, "bbb222");
+    }
+
+    // ── helpers ───────────────────────────────────────────────────────
+
+    fn make_iter_result(iteration: u32, failed_checks: usize) -> super::super::types::IterationResult {
+        super::super::types::IterationResult {
+            iteration,
+            verification_passed: failed_checks == 0,
+            critical_failure: false,
+            passed_checks: 10_usize.saturating_sub(failed_checks),
+            failed_checks,
+            failure_context: String::new(),
+            agentic_phase_ran: true,
+            agentic_phase_success: Some(true),
+        }
+    }
+}
