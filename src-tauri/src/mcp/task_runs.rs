@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 
 use crate::database::{CreateTaskRunInput, TaskRun};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext};
-use crate::mcp::types::ApiState;
+use crate::mcp::types::{ApiState, ApiResponse};
 use crate::safe_lock::safe_lock_or_recover;
 use crate::summary_generator;
 use tauri::Manager;
@@ -34,7 +34,7 @@ pub struct ListTaskRunsQuery {
 pub async fn list_task_runs(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<ListTaskRunsQuery>,
-) -> Result<Json<Vec<TaskRun>>, (StatusCode, String)> {
+) -> Result<Json<ApiResponse<Vec<TaskRun>>>, (StatusCode, String)> {
     let limit = query.limit.unwrap_or(50);
     let workflow_type = query.workflow_type;
     let db = state.app_state.checkpoint_db.clone();
@@ -43,7 +43,7 @@ pub async fn list_task_runs(
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    tokio::task::spawn_blocking(move || {
+    let runs = tokio::task::spawn_blocking(move || {
         db.get_recent_task_runs_filtered(limit, workflow_type.as_deref(), Some(port))
     })
     .await
@@ -51,8 +51,9 @@ pub async fn list_task_runs(
         error!("spawn_blocking error in list_task_runs: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?
-    .map(Json)
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(ApiResponse::success(runs)))
 }
 
 /// List only running task runs.
