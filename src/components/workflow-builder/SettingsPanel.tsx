@@ -937,7 +937,14 @@ function EditableWorkflowTitle({
 }) {
   const [isEditing, setIsEditing] = useState(false);
   const [editValue, setEditValue] = useState(name);
+  const [prevName, setPrevName] = useState(name);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Sync editValue when the name prop changes externally
+  if (name !== prevName) {
+    setPrevName(name);
+    setEditValue(name);
+  }
 
   const displayName = name || "New Workflow";
 

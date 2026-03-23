@@ -240,6 +240,11 @@ function StageTabMenu({
   onMoveDown?: () => void;
 }) {
   const [editName, setEditName] = useState(name);
+  const [prevName, setPrevName] = useState(name);
+  if (name !== prevName) {
+    setPrevName(name);
+    setEditName(name);
+  }
 
   return (
     <div className="space-y-1">

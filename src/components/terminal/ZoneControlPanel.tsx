@@ -177,14 +177,20 @@ function EditableLabel({
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value);
+  const [prevValue, setPrevValue] = useState(value);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Sync draft with value prop during render (replaces useEffect-based sync)
+  if (value !== prevValue) {
+    setPrevValue(value);
+    setDraft(value);
+  }
 
   useEffect(() => {
     if (editing) {
-      setDraft(value);
       requestAnimationFrame(() => inputRef.current?.select());
     }
-  }, [editing, value]);
+  }, [editing]);
 
   const commit = useCallback(() => {
     setEditing(false);

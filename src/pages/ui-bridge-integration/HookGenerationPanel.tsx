@@ -254,9 +254,16 @@ export function HookGenerationPanel({
 
     // Only process when transitioning from "processing" to "ready" —
     // ignore the initial "ready" from createSession (before sendMessage)
-    if (session.sessionState !== "ready" || prevState !== "processing") return;
-    const currentStep = pendingStepRef.current;
-    if (!currentStep) return;
+    const shouldProcess =
+      session.sessionState === "ready" && prevState === "processing";
+    const currentStep = shouldProcess ? pendingStepRef.current : null;
+
+    if (!shouldProcess || !currentStep) {
+      return () => {
+        controller.abort();
+        if (retryTimer) clearTimeout(retryTimer);
+      };
+    }
 
     // Gather all AI content
     const allContent = session.messages

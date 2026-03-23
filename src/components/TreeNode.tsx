@@ -256,58 +256,6 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
   const isTransition = node.node_type === "transition";
 
   /**
-   * Renders the toggle button for expandable nodes
-   */
-  const renderToggleButton = () => {
-    if (!isExpandable) {
-      return <div className="w-5 h-5" />; // Spacer for alignment
-    }
-
-    return (
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          onToggle(node.id);
-        }}
-        className="w-5 h-5 flex items-center justify-center text-muted-foreground hover:text-foreground transition-colors"
-        aria-label={isExpanded ? "Collapse" : "Expand"}
-      >
-        {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-      </button>
-    );
-  };
-
-  /**
-   * Renders the icon for the event type
-   */
-  const renderIcon = () => {
-    if (isWorkflow) {
-      return <FolderOpen className="w-4 h-4 text-primary" />;
-    }
-    if (isTransition) {
-      return <Activity className={`w-4 h-4 ${getAccentColors("purple").text}`} />;
-    }
-    return <Activity className="w-4 h-4 text-secondary" />;
-  };
-
-  /**
-   * Renders the success/failure indicator
-   */
-  const renderStatusIndicator = () => {
-    switch (node.status) {
-      case "success":
-        return <CheckCircle2 className={`w-4 h-4 ${getStatusColors("success").icon}`} />;
-      case "failed":
-        return <XCircle className={`w-4 h-4 ${getStatusColors("error").icon}`} />;
-      case "running":
-        return <Loader className={`w-4 h-4 ${getStatusColors("running").icon} animate-spin`} />;
-      case "pending":
-      default:
-        return null;
-    }
-  };
-
-  /**
    * Format the timestamp for display
    */
   const formatTimestamp = (timestamp: number) => {
@@ -409,10 +357,29 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
         tabIndex={isExpandable ? 0 : undefined}
       >
         {/* Toggle Button */}
-        {renderToggleButton()}
+        {isExpandable ? (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggle(node.id);
+            }}
+            className="w-5 h-5 flex items-center justify-center text-muted-foreground hover:text-foreground transition-colors"
+            aria-label={isExpanded ? "Collapse" : "Expand"}
+          >
+            {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+          </button>
+        ) : (
+          <div className="w-5 h-5" />
+        )}
 
         {/* Icon */}
-        {renderIcon()}
+        {isWorkflow ? (
+          <FolderOpen className="w-4 h-4 text-primary" />
+        ) : isTransition ? (
+          <Activity className={`w-4 h-4 ${getAccentColors("purple").text}`} />
+        ) : (
+          <Activity className="w-4 h-4 text-secondary" />
+        )}
 
         {/* Label */}
         <span
@@ -424,7 +391,13 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
         </span>
 
         {/* Status Indicator */}
-        {renderStatusIndicator()}
+        {node.status === "success" ? (
+          <CheckCircle2 className={`w-4 h-4 ${getStatusColors("success").icon}`} />
+        ) : node.status === "failed" ? (
+          <XCircle className={`w-4 h-4 ${getStatusColors("error").icon}`} />
+        ) : node.status === "running" ? (
+          <Loader className={`w-4 h-4 ${getStatusColors("running").icon} animate-spin`} />
+        ) : null}
 
         {/* Duration (always visible if available) */}
         {node.duration !== undefined && (

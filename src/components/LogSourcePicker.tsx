@@ -62,6 +62,22 @@ export function LogSourcePicker({
   const [localProfileId, setLocalProfileId] = useState<string | undefined>(globalProfileId);
   const [mode, setMode] = useState<"profile" | "custom">(globalProfileId ? "profile" : "custom");
 
+  // Sync local state with props during render when dialog opens or props change
+  const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+  const [prevSelectedSourceIds, setPrevSelectedSourceIds] = useState(selectedSourceIds);
+  const [prevGlobalProfileId, setPrevGlobalProfileId] = useState(globalProfileId);
+  if (isOpen && (isOpen !== prevIsOpen || selectedSourceIds !== prevSelectedSourceIds || globalProfileId !== prevGlobalProfileId)) {
+    setPrevIsOpen(isOpen);
+    setPrevSelectedSourceIds(selectedSourceIds);
+    setPrevGlobalProfileId(globalProfileId);
+    setLocalSelectedIds(selectedSourceIds);
+    setLocalProfileId(globalProfileId);
+    setMode(globalProfileId ? "profile" : "custom");
+  }
+  if (!isOpen && isOpen !== prevIsOpen) {
+    setPrevIsOpen(isOpen);
+  }
+
   // Load global log source settings
   const loadSettings = useCallback(async () => {
     setLoading(true);
@@ -80,11 +96,8 @@ export function LogSourcePicker({
   useEffect(() => {
     if (isOpen) {
       loadSettings();
-      setLocalSelectedIds(selectedSourceIds);
-      setLocalProfileId(globalProfileId);
-      setMode(globalProfileId ? "profile" : "custom");
     }
-  }, [isOpen, loadSettings, selectedSourceIds, globalProfileId]);
+  }, [isOpen, loadSettings]);
 
   if (!isOpen) return null;
 

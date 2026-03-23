@@ -76,6 +76,12 @@ export function CategorySection({
   defaultExpanded = true,
 }: CategorySectionProps) {
   const [isExpanded, setIsExpanded] = useState(defaultExpanded);
+  const [prevDefaultExpanded, setPrevDefaultExpanded] = useState(defaultExpanded);
+  // Sync expanded state when the defaultExpanded prop changes
+  if (defaultExpanded !== prevDefaultExpanded) {
+    setPrevDefaultExpanded(defaultExpanded);
+    setIsExpanded(defaultExpanded);
+  }
 
   const categoryColors = getCategoryColorClasses(category.color);
   const IconComponent = iconMap[category.icon] || Info;

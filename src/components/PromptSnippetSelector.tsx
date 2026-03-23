@@ -7,7 +7,7 @@
  * - popup: Floating popup for @-mention style insertion
  */
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { Puzzle, Search, ChevronDown, X } from "lucide-react";
 import type { PromptSnippet } from "../types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
@@ -188,7 +188,7 @@ export function PromptSnippetSelector({
   };
 
   // Group prompt snippets by category for display
-  const groupedSnippets = filteredSnippets.reduce(
+  const groupedSnippets = useMemo(() => filteredSnippets.reduce(
     (acc, snippet) => {
       const category = snippet.category || "Uncategorized";
       if (!acc[category]) {
@@ -198,51 +198,54 @@ export function PromptSnippetSelector({
       return acc;
     },
     {} as Record<string, PromptSnippet[]>,
-  );
+  ), [filteredSnippets]);
 
-  const renderSnippetList = () => (
-    <div className="max-h-64 overflow-y-auto" ref={listRef}>
-      {loading ? (
-        <div className="p-4 text-center text-muted-foreground text-sm">Loading...</div>
-      ) : filteredSnippets.length === 0 ? (
-        <div className="p-4 text-center text-muted-foreground text-sm">
-          {snippets.length === 0 ? "No prompt snippets yet" : "No matching prompt snippets"}
-        </div>
-      ) : (
-        Object.entries(groupedSnippets).map(([category, items]) => (
-          <div key={category}>
-            <div className="px-3 py-1.5 text-xs font-medium text-muted-foreground bg-muted/30 sticky top-0">
-              {category}
-            </div>
-            {items.map((snippet) => {
-              const globalIndex = filteredSnippets.indexOf(snippet);
-              return (
-                <button
-                  key={snippet.id}
-                  onClick={() => handleSelect(snippet)}
-                  onMouseEnter={() => {
-                    setSelectedIndex(globalIndex);
-                    setHoveredSnippet(snippet);
-                  }}
-                  onMouseLeave={() => setHoveredSnippet(null)}
-                  className={`w-full px-3 py-2 text-left transition-colors ${
-                    globalIndex === selectedIndex
-                      ? "bg-primary/10 text-primary"
-                      : "hover:bg-muted/50"
-                  }`}
-                >
-                  <div className="font-medium text-sm">{snippet.name}</div>
-                  <div className="text-xs text-muted-foreground truncate">{snippet.content}</div>
-                </button>
-              );
-            })}
+  const snippetListContent = useMemo(
+    () => (
+      <div className="max-h-64 overflow-y-auto" ref={listRef}>
+        {loading ? (
+          <div className="p-4 text-center text-muted-foreground text-sm">Loading...</div>
+        ) : filteredSnippets.length === 0 ? (
+          <div className="p-4 text-center text-muted-foreground text-sm">
+            {snippets.length === 0 ? "No prompt snippets yet" : "No matching prompt snippets"}
           </div>
-        ))
-      )}
-    </div>
+        ) : (
+          Object.entries(groupedSnippets).map(([category, items]) => (
+            <div key={category}>
+              <div className="px-3 py-1.5 text-xs font-medium text-muted-foreground bg-muted/30 sticky top-0">
+                {category}
+              </div>
+              {items.map((snippet) => {
+                const globalIndex = filteredSnippets.indexOf(snippet);
+                return (
+                  <button
+                    key={snippet.id}
+                    onClick={() => handleSelect(snippet)}
+                    onMouseEnter={() => {
+                      setSelectedIndex(globalIndex);
+                      setHoveredSnippet(snippet);
+                    }}
+                    onMouseLeave={() => setHoveredSnippet(null)}
+                    className={`w-full px-3 py-2 text-left transition-colors ${
+                      globalIndex === selectedIndex
+                        ? "bg-primary/10 text-primary"
+                        : "hover:bg-muted/50"
+                    }`}
+                  >
+                    <div className="font-medium text-sm">{snippet.name}</div>
+                    <div className="text-xs text-muted-foreground truncate">{snippet.content}</div>
+                  </button>
+                );
+              })}
+            </div>
+          ))
+        )}
+      </div>
+    ),
+    [loading, filteredSnippets, snippets.length, groupedSnippets, selectedIndex, handleSelect],
   );
 
-  const renderPreview = () => {
+  const previewContent = useMemo(() => {
     if (!hoveredSnippet) return null;
 
     return (
@@ -257,7 +260,7 @@ export function PromptSnippetSelector({
         </div>
       </div>
     );
-  };
+  }, [hoveredSnippet]);
 
   // Dropdown mode: button + popover
   if (mode === "dropdown") {
@@ -305,10 +308,10 @@ export function PromptSnippetSelector({
             </div>
 
             {/* Prompt snippet list */}
-            {renderSnippetList()}
+            {snippetListContent}
 
             {/* Preview on hover */}
-            {renderPreview()}
+            {previewContent}
           </div>
         )}
       </div>
@@ -349,7 +352,7 @@ export function PromptSnippetSelector({
       </div>
 
       {/* Prompt snippet list */}
-      {renderSnippetList()}
+      {snippetListContent}
     </div>
   );
 }

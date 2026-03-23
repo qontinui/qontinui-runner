@@ -155,7 +155,7 @@ export function Settings({
     ],
   });
 
-  const renderContent = () => {
+  const settingsContent = (() => {
     switch (activeTab) {
       case "account":
         return (
@@ -201,11 +201,11 @@ export function Settings({
       default:
         return null;
     }
-  };
+  })();
 
   return (
     <div className="h-full flex flex-col p-4 gap-3 overflow-hidden">
-      <div className="flex-1 overflow-y-auto scrollbar-dark">{renderContent()}</div>
+      <div className="flex-1 overflow-y-auto scrollbar-dark">{settingsContent}</div>
     </div>
   );
 }
