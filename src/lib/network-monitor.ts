@@ -11,6 +11,7 @@
  */
 
 import { getPerformanceMonitor } from "./performance";
+import { getErrorMessage } from "./utils";
 
 // ============================================================================
 // Types
@@ -114,7 +115,7 @@ export class NetworkMonitor {
         return response;
       } catch (error) {
         // End tracking with error
-        this.endRequest(requestId, 0, error instanceof Error ? error.message : String(error));
+        this.endRequest(requestId, 0, getErrorMessage(error));
         throw error;
       }
     };

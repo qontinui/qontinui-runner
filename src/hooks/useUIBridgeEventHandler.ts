@@ -30,6 +30,7 @@ import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import { useUIBridge } from "ui-bridge";
 import type { StyleGuideConfig } from "ui-bridge";
 import { createLogger } from "@/lib/logger";
+import { getErrorMessage } from "@/lib/utils";
 
 const log = createLogger("UIBridgeEventHandler");
 
@@ -177,7 +178,7 @@ export function useUIBridgeEventHandler(): void {
           requestId,
           type,
           success: false,
-          error: error instanceof Error ? error.message : String(error),
+          error: getErrorMessage(error),
           timestamp: Date.now(),
         });
       }

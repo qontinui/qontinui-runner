@@ -7,6 +7,7 @@
 
 import { useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getErrorMessage } from "@/lib/utils";
 import type { CommandResponse } from "../../types/displayProfile";
 import type { LogFunction, LastConfigPathData } from "./types";
 import { createLogger } from "@/lib/logger";
@@ -80,7 +81,7 @@ export function useConfigAutoLoad(options: UseConfigAutoLoadOptions): UseConfigA
       }
     } catch (error) {
       console.error("[CONFIG] Error loading last config:", error);
-      const errorMsg = error instanceof Error ? error.message : String(error);
+      const errorMsg = getErrorMessage(error);
       onLog?.("error", `Failed to load last configuration: ${errorMsg}`);
     }
   }, [onLog, loadConfigFromPath, onLastConfigLoaded]);

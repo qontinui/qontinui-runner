@@ -9,6 +9,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { getErrorMessage } from "@/lib/utils";
 
 // ============================================================================
 // Type Definitions
@@ -291,7 +292,7 @@ export async function executeTransition(transitionId: string): Promise<Transitio
       success: false,
       transition_id: transitionId,
       active_states: [],
-      error: error instanceof Error ? error.message : String(error),
+      error: getErrorMessage(error),
     };
   }
 }
@@ -328,7 +329,7 @@ export async function navigateToState(stateId: string): Promise<NavigationResult
       path: [],
       active_states: [],
       target_state: stateId,
-      error: error instanceof Error ? error.message : String(error),
+      error: getErrorMessage(error),
     };
   }
 }
@@ -364,7 +365,7 @@ export async function navigateToMultipleStates(stateIds: string[]): Promise<Navi
       success: false,
       path: [],
       active_states: [],
-      error: error instanceof Error ? error.message : String(error),
+      error: getErrorMessage(error),
     };
   }
 }
@@ -395,7 +396,7 @@ export async function getActiveStates(): Promise<ActiveStatesResult> {
     return {
       success: false,
       active_states: [],
-      error: error instanceof Error ? error.message : String(error),
+      error: getErrorMessage(error),
     };
   }
 }
@@ -427,7 +428,7 @@ export async function getAvailableTransitions(): Promise<AvailableTransitionsRes
     return {
       success: false,
       transitions: [],
-      error: error instanceof Error ? error.message : String(error),
+      error: getErrorMessage(error),
     };
   }
 }
@@ -496,7 +497,7 @@ export async function getResolvedInitialStates(
       source: "defaults",
       states: [],
       workflowId,
-      error: error instanceof Error ? error.message : String(error),
+      error: getErrorMessage(error),
     };
   }
 }

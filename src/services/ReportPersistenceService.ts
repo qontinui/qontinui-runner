@@ -7,6 +7,7 @@
  */
 
 import { createLogger } from "@/lib/logger";
+import { getErrorMessage } from "@/lib/utils";
 import type { Finding, ExecutionReport } from "../types/findings";
 import type { SessionHistoryEntry } from "../findings/types";
 import {
@@ -193,7 +194,7 @@ export class ReportPersistenceService {
         result.errors = backendResult.errors;
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorMessage = getErrorMessage(error);
       this.addToPendingQueue("report", report, errorMessage);
       result.errors.push(errorMessage);
       console.error("[ReportPersistence] Report sync failed, queued for retry:", error);
@@ -239,7 +240,7 @@ export class ReportPersistenceService {
         result.errors = backendResult.errors;
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorMessage = getErrorMessage(error);
       this.addToPendingQueue("findings", findings, errorMessage);
       result.errors.push(errorMessage);
       console.error("[ReportPersistence] Findings sync failed, queued for retry:", error);
@@ -368,7 +369,7 @@ export class ReportPersistenceService {
 
         results.push(result);
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
+        const errorMessage = getErrorMessage(error);
         item.error = errorMessage;
         results.push({
           success: false,

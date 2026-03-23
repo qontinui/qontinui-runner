@@ -48,6 +48,7 @@ import { PageTutorialMenu } from "./tutorial";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { instanceStorage } from "@/lib/instance-storage";
 import { createLogger } from "@/lib/logger";
+import { getErrorMessage } from "@/lib/utils";
 
 const logger = createLogger("AiTab");
 
@@ -500,7 +501,7 @@ export function AiTab({
       console.error("Failed to resume workflow:", error);
       setLastResult({
         success: false,
-        message: `Failed to resume: ${error instanceof Error ? error.message : String(error)}`,
+        message: `Failed to resume: ${getErrorMessage(error)}`,
       });
     } finally {
       setIsResuming(false);
@@ -543,7 +544,7 @@ export function AiTab({
       console.error("Failed to force continue:", error);
       setLastResult({
         success: false,
-        message: `Failed to continue: ${error instanceof Error ? error.message : String(error)}`,
+        message: `Failed to continue: ${getErrorMessage(error)}`,
       });
     } finally {
       setIsForceContinuing(false);
@@ -568,7 +569,7 @@ export function AiTab({
       console.error("Failed to stop AI:", error);
       setLastResult({
         success: false,
-        message: `Failed to stop: ${error instanceof Error ? error.message : String(error)}`,
+        message: `Failed to stop: ${getErrorMessage(error)}`,
       });
     } finally {
       setIsStopping(false);

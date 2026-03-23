@@ -27,6 +27,7 @@ import type { SpecGroup, SpecGroupResult, SpecExecutionOptions } from "@qontinui
 import { executeSpecGroup, externalToDiscovered } from "../lib/spec-execution";
 import { IpcArtifactStore } from "@qontinui/ui-bridge/artifacts";
 import type { ExternalElement } from "../types/ui-bridge-types";
+import { getErrorMessage } from "@/lib/utils";
 
 /** Module-level singleton so all spec runs share one IPC-backed store. */
 const artifactStore = new IpcArtifactStore();
@@ -152,7 +153,7 @@ export function useSpecExecutionHandler(): void {
         await sendResponse({
           requestId,
           success: false,
-          error: error instanceof Error ? error.message : String(error),
+          error: getErrorMessage(error),
         });
       }
     },

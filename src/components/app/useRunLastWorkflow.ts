@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from "react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { getErrorMessage } from "@/lib/utils";
 import type { MainTabId } from "./tab-types";
 
 import type { TaskRun } from "@/types/aiData";
@@ -107,7 +108,7 @@ export function useRunLastWorkflow(
     } catch (error) {
       console.error("[APP] Failed to run last workflow:", error);
       setRunLastWorkflowError(
-        `Failed to run workflow: ${error instanceof Error ? error.message : String(error)}`,
+        `Failed to run workflow: ${getErrorMessage(error)}`,
       );
       setTimeout(() => setRunLastWorkflowError(null), 6000);
     } finally {
