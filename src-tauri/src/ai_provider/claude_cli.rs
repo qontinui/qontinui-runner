@@ -105,9 +105,10 @@ fn run_claude_cli_with_file(
             // This properly handles the stdin piping that cmd.exe struggles with
             // If config_dir is set, we need to set the env var in PowerShell
             let ps_command = if let Some(dir) = config_dir {
+                let escaped_dir = dir.replace('\'', "''");
                 format!(
                     "$env:CLAUDE_CONFIG_DIR = '{}'; Get-Content -Path '{}' -Raw -Encoding UTF8 | {} --print{}",
-                    dir, prompt_path, claude_program, model_flag
+                    escaped_dir, prompt_path, claude_program, model_flag
                 )
             } else {
                 format!(
@@ -132,9 +133,10 @@ fn run_claude_cli_with_file(
             let wsl_path = prompt_file.to_string_lossy().replace("\\", "/");
             // Convert Windows path to WSL path
             let wsl_prompt = if let Some(dir) = config_dir {
+                let escaped_dir = dir.replace('\'', "'\\''");
                 format!(
                     "export CLAUDE_CONFIG_DIR='{}'; cat '{}' | {} --print{}",
-                    dir,
+                    escaped_dir,
                     wsl_path.replace("C:", "/mnt/c"),
                     claude_program,
                     model_flag
@@ -156,9 +158,10 @@ fn run_claude_cli_with_file(
         CliExecutionMode::Native => {
             // On Unix, use cat to read and pipe
             let native_cmd = if let Some(dir) = config_dir {
+                let escaped_dir = dir.replace('\'', "'\\''");
                 format!(
                     "export CLAUDE_CONFIG_DIR='{}'; cat '{}' | {} --print{}",
-                    dir, prompt_path, claude_program, model_flag
+                    escaped_dir, prompt_path, claude_program, model_flag
                 )
             } else {
                 format!(

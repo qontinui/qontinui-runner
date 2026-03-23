@@ -216,7 +216,8 @@ fn extract_heredoc(cmd: &str) -> Option<String> {
 
     for delimiter in delimiters {
         // Match <<DELIMITER or <<'DELIMITER' patterns
-        let pattern = format!(r"<<'?{}'?\s*(.+?)\s*{}", delimiter, delimiter);
+        let escaped = regex::escape(delimiter);
+        let pattern = format!(r"<<'?{}'?\s*(.+?)\s*{}", escaped, escaped);
         if let Ok(re) = Regex::new(&pattern) {
             if let Some(caps) = re.captures(cmd) {
                 return Some(caps[1].trim().to_string());

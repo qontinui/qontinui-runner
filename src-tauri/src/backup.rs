@@ -224,7 +224,16 @@ pub fn restore_backup(data: &[u8]) -> Result<RestoreResult, String> {
         match archive.by_name(archive_name) {
             Ok(mut file) => match dest_path_opt {
                 Some(dest_path) => {
-                    // Ensure parent directory exists
+                    // Validate the destination path stays within expected directories
+                    let allowed_bases: Vec<PathBuf> = vec![
+                        dirs::config_dir(),
+                        dirs::data_local_dir(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|d| d.join("com.qontinui.runner"))
+                    .collect();
+
                     if let Some(parent) = dest_path.parent() {
                         if let Err(e) = fs::create_dir_all(parent) {
                             let msg =
@@ -233,6 +242,50 @@ pub fn restore_backup(data: &[u8]) -> Result<RestoreResult, String> {
                             errors.push(msg);
                             continue;
                         }
+                    }
+
+                    let canonical_dest = match dest_path.parent() {
+                        Some(parent) => match parent.canonicalize() {
+                            Ok(canonical_parent) => {
+                                canonical_parent.join(dest_path.file_name().unwrap_or_default())
+                            }
+                            Err(_) => {
+                                let msg = format!(
+                                    "Failed to resolve destination path for {}",
+                                    archive_name
+                                );
+                                error!("{}", msg);
+                                errors.push(msg);
+                                continue;
+                            }
+                        },
+                        None => {
+                            let msg = format!(
+                                "Failed to resolve destination path for {}",
+                                archive_name
+                            );
+                            error!("{}", msg);
+                            errors.push(msg);
+                            continue;
+                        }
+                    };
+
+                    let path_is_safe = allowed_bases.iter().any(|base| {
+                        if let Ok(canonical_base) = base.canonicalize() {
+                            canonical_dest.starts_with(&canonical_base)
+                        } else {
+                            false
+                        }
+                    });
+
+                    if !path_is_safe {
+                        let msg = format!(
+                            "Destination path for {} is outside allowed directories",
+                            archive_name
+                        );
+                        error!("{}", msg);
+                        errors.push(msg);
+                        continue;
                     }
 
                     // Read file contents
