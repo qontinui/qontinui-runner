@@ -58,13 +58,13 @@ async function discoverBridgeForms(bridge: {
 }) {
   const { discoverForms } = await import("ui-bridge/ai");
   const formElements = bridge.elements
-    .filter((el) => ["input", "select", "textarea", "checkbox", "radio"].includes(el.type))
+    .filter((el) => ["input", "select", "textarea", "checkbox", "radio"].includes(el.type) && el.element instanceof HTMLElement)
     .map((el) => ({
       id: el.id,
-      element: el.element,
+      element: el.element as HTMLElement,
       type: el.type,
       label: el.label,
-      getState: () => el.getState(),
+      getState: () => el.getState() as import("ui-bridge").ElementState,
     }));
   return discoverForms(formElements);
 }
@@ -382,7 +382,10 @@ export function useDebugInspectEvents(
         case "fill_form": {
           const fillParams = payload.params ?? payload.body ?? {};
           try {
-            const result = await currentBridge.executor.fillForm(fillParams as never);
+            const result = await currentBridge.executeAction(
+              (fillParams.elementId as string) ?? "",
+              { action: "fill", params: fillParams as Record<string, unknown> },
+            );
             await sendResponse({
               requestId,
               type,

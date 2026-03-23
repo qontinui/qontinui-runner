@@ -97,10 +97,8 @@ export function useAISearchEvents(
           const discovered = await currentBridge.discover({ includeHidden: true });
           const executor = new NLActionExecutor();
           executor.updateElements(discovered.elements);
-          // The bridge's ActionExecutor handles DOM actions
-          if (currentBridge.executor) {
-            executor.setActionExecutor(currentBridge.executor);
-          }
+          // Delegate DOM actions to the bridge (UseUIBridgeReturn is API-compatible)
+          executor.setActionExecutor(currentBridge as never);
           const instruction = (payload.params?.instruction as string) ?? "";
           try {
             const result = await executor.execute({ instruction });
@@ -176,7 +174,7 @@ export function useAISearchEvents(
           const { SemanticSnapshotManager } = await import("ui-bridge/ai");
           const controlSnapshot = await currentBridge.createSnapshotAsync();
           const manager = new SemanticSnapshotManager();
-          const snapshot = manager.createSnapshot(controlSnapshot, {
+          const snapshot = manager.createSnapshot(controlSnapshot as never, {
             url: window.location.href,
             title: document.title,
           });
@@ -195,7 +193,7 @@ export function useAISearchEvents(
           const controlSnapshot = await currentBridge.createSnapshotAsync();
           // Convert to AI elements via snapshot manager
           const manager = new SemanticSnapshotManager();
-          const semanticSnapshot = manager.createSnapshot(controlSnapshot, {
+          const semanticSnapshot = manager.createSnapshot(controlSnapshot as never, {
             url: window.location.href,
             title: document.title,
           });
@@ -243,7 +241,7 @@ export function useAISearchEvents(
           const { SemanticSnapshotManager } = await import("ui-bridge/ai");
           const diffSnapshot = await currentBridge.createSnapshotAsync();
           const diffManager = new SemanticSnapshotManager();
-          const currentSemantic = diffManager.createSnapshot(diffSnapshot, {
+          const currentSemantic = diffManager.createSnapshot(diffSnapshot as never, {
             url: window.location.href,
             title: document.title,
           });
@@ -402,9 +400,8 @@ export function useAISearchEvents(
             const discovered = await currentBridge.discover({ includeHidden: true });
             const executor = new NLActionExecutor();
             executor.updateElements(discovered.elements);
-            if (currentBridge.executor) {
-              executor.setActionExecutor(currentBridge.executor);
-            }
+            // Delegate DOM actions to the bridge (UseUIBridgeReturn is API-compatible)
+            executor.setActionExecutor(currentBridge as never);
             const result = await executor.execute({
               instruction: instruction || "recover from error state",
             });
@@ -550,9 +547,8 @@ export function useAISearchEvents(
               const discovered = await currentBridge.discover({ includeHidden: true });
               const executor = new NLActionExecutor();
               executor.updateElements(discovered.elements);
-              if (currentBridge.executor) {
-                executor.setActionExecutor(currentBridge.executor);
-              }
+              // Delegate DOM actions to the bridge (UseUIBridgeReturn is API-compatible)
+              executor.setActionExecutor(currentBridge as never);
               const result = await executor.execute({ instruction: nlQuery });
               await sendResponse({
                 requestId,
