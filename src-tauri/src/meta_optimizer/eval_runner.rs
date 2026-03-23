@@ -171,7 +171,7 @@ pub fn validate_recommendation(
     let rec_id = recommendation_id.to_string();
 
     // Get recommendation details
-    let (target_agent, _rec_type): (Option<String>, String) = db.with_conn({
+    let (target_agent, rec_type): (Option<String>, String) = db.with_conn({
         let rec_id = rec_id.clone();
         move |conn| {
             conn.query_row(
@@ -199,7 +199,34 @@ pub fn validate_recommendation(
         return Err("Cannot validate recommendation without target_agent".to_string());
     };
 
-    evaluate_spec(db, &spec, Some(recommendation_id))
+    let result = evaluate_spec(db, &spec, Some(recommendation_id))?;
+
+    // For prompt_rewrite recommendations, also run robustness tests
+    if rec_type == "prompt_rewrite" {
+        if let Some(ref agent) = target_agent {
+            match super::robustness::run_robustness_test(
+                db,
+                agent,
+                None, // no specific prompt variant
+                Some(recommendation_id),
+            ) {
+                Ok(report) => {
+                    tracing::info!(
+                        "Robustness test for recommendation {}: {}/{} passed",
+                        recommendation_id, report.passed, report.total_tests
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Robustness test failed for recommendation {}: {}",
+                        recommendation_id, e
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 // =============================================================================

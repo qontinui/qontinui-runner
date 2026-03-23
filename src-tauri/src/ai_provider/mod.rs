@@ -17,7 +17,7 @@ mod gemini_cli;
 pub mod middleware;
 mod process;
 mod retry;
-mod routing;
+pub(crate) mod routing;
 mod types;
 
 // Re-export public API

@@ -5535,6 +5535,72 @@ impl CheckpointDb {
             info!("Successfully migrated to version 141 (model profiles + comparison bridge)");
         }
 
+        // Migration to version 142: Add strict_cwd and tool_tags columns to unified_workflows
+        if current_version < 142 {
+            info!("Migrating to version 142 (strict_cwd + tool_tags on unified_workflows)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN strict_cwd INTEGER DEFAULT 0;
+                ALTER TABLE unified_workflows ADD COLUMN tool_tags TEXT DEFAULT '[]';
+                "#,
+            )
+            .map_err(|e| format!("Failed to add strict_cwd/tool_tags columns: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (142, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 142: {}", e))?;
+
+            info!("Successfully migrated to version 142 (strict_cwd + tool_tags)");
+        }
+
+        // Migration to version 143: Add enforce_token_budget column to unified_workflows
+        if current_version < 143 {
+            info!("Migrating to version 143 (enforce_token_budget on unified_workflows)...");
+
+            conn.execute_batch(
+                "ALTER TABLE unified_workflows ADD COLUMN enforce_token_budget INTEGER DEFAULT 0;",
+            )
+            .map_err(|e| format!("Failed to add enforce_token_budget column: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (143, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 143: {}", e))?;
+
+            info!("Successfully migrated to version 143 (enforce_token_budget)");
+        }
+
+        // Migration to version 144: Per-run canary records table
+        if current_version < 144 {
+            info!("Migrating to version 144 (canary_run_records table)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS canary_run_records (
+                    id TEXT PRIMARY KEY,
+                    canary_id TEXT NOT NULL,
+                    is_canary INTEGER NOT NULL,
+                    task_run_id TEXT,
+                    success INTEGER NOT NULL,
+                    cost_usd REAL DEFAULT 0.0,
+                    duration_ms REAL DEFAULT 0.0,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_canary_run_records ON canary_run_records(canary_id, is_canary);
+                "#,
+            )
+            .map_err(|e| format!("Failed to create canary_run_records table: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (144, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 144: {}", e))?;
+
+            info!("Successfully migrated to version 144 (canary_run_records)");
+        }
+
         // Repair migration: is_favorite column may be missing on databases created from
         // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
         // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,

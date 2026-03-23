@@ -594,11 +594,15 @@ impl ShellCommandHandler {
         if let Some(wd) = working_directory {
             let resolved = crate::paths::resolve_working_directory(wd);
             if !resolved.exists() {
-                warn!(
-                    "Shell command: working directory does not exist: {} (resolved from '{}')",
+                let err_msg = format!(
+                    "Working directory does not exist: {} (resolved from '{}').  \
+                     For cross-repo paths, use working_directory: \"..\" to resolve \
+                     from the workspace root, or use an absolute path.",
                     resolved.display(),
-                    wd
+                    wd,
                 );
+                warn!("Shell command: {}", err_msg);
+                return (false, None, String::new(), err_msg);
             }
             cmd.current_dir(&resolved);
         }

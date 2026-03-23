@@ -960,6 +960,69 @@ mod tests {
     }
 
     #[test]
+    fn test_skills_for_context_filters_by_tags() {
+        let registry = SkillRegistry::new();
+
+        // With empty tags, all skills returned (no tag filter)
+        let all = registry.skills_for_context(None, &[], None);
+        assert_eq!(all.len(), registry.all().len());
+
+        // Filter by a tag that exists on some skills
+        let testing_tags = vec!["testing".to_string()];
+        let filtered = registry.skills_for_context(None, &testing_tags, None);
+        assert!(
+            !filtered.is_empty(),
+            "Should find skills tagged with 'testing'"
+        );
+        for skill in &filtered {
+            assert!(
+                skill.tags.contains(&"testing".to_string()),
+                "Skill '{}' should have 'testing' tag but has {:?}",
+                skill.slug,
+                skill.tags
+            );
+        }
+        assert!(
+            filtered.len() < all.len(),
+            "Tag-filtered set should be smaller than all skills"
+        );
+    }
+
+    #[test]
+    fn test_skills_for_context_filters_by_phase_and_tags() {
+        let registry = SkillRegistry::new();
+
+        // Filter by phase only
+        let verification_skills = registry.skills_for_context(Some("verification"), &[], None);
+        for skill in &verification_skills {
+            assert!(
+                skill.allowed_phases.contains(&"verification".to_string()),
+                "Skill '{}' should be allowed in verification phase",
+                skill.slug
+            );
+        }
+
+        // Filter by phase + category
+        let code_quality_verification =
+            registry.skills_for_context(Some("verification"), &[], Some("code-quality"));
+        for skill in &code_quality_verification {
+            assert_eq!(skill.category, "code-quality");
+            assert!(skill.allowed_phases.contains(&"verification".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_skills_for_context_nonexistent_tag_returns_empty() {
+        let registry = SkillRegistry::new();
+        let tags = vec!["nonexistent-tag-xyz".to_string()];
+        let filtered = registry.skills_for_context(None, &tags, None);
+        assert!(
+            filtered.is_empty(),
+            "Nonexistent tag should return no skills"
+        );
+    }
+
+    #[test]
     fn test_search() {
         let registry = SkillRegistry::new();
 

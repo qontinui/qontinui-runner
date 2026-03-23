@@ -146,11 +146,20 @@ impl CheckpointDb {
             db_path
         );
 
-        Ok(Self {
+        let db = Self {
             pool,
             db_path: db_path.clone(),
             runner_port: std::sync::atomic::AtomicU16::new(0),
-        })
+        };
+
+        // Backfill deterministic agentic scores for historical runs (idempotent, fast)
+        match db.backfill_deterministic_scores() {
+            Ok(0) => {}
+            Ok(n) => info!("Backfilled agentic scores for {} historical runs", n),
+            Err(e) => tracing::warn!("Agentic score backfill failed (non-fatal): {}", e),
+        }
+
+        Ok(db)
     }
 
     /// Set the runner port for instance-level task_run filtering.

@@ -85,6 +85,29 @@ export function useChangeTrackingEvents(
                   }
                   return ids;
                 },
+                // Push-based change observation (allio-inspired):
+                // Subscribe to registry element events for event-driven waitForChange.
+                // Access via .registry (added to UseUIBridgeReturn) with fallback for older builds.
+                subscribeChanges: (() => {
+                  const bridge = currentBridge as { registry?: { on?: (type: string, cb: () => void) => () => void } };
+                  const reg = bridge.registry;
+                  if (!reg?.on) return undefined;
+                  const onEvent = reg.on.bind(reg);
+                  return (callback: (event: { type: string; timestamp: number }) => void) => {
+                    const unsubs = [
+                      onEvent("element:registered", () =>
+                        callback({ type: "snapshot:changed", timestamp: Date.now() }),
+                      ),
+                      onEvent("element:unregistered", () =>
+                        callback({ type: "snapshot:changed", timestamp: Date.now() }),
+                      ),
+                      onEvent("element:stateChanged", () =>
+                        callback({ type: "snapshot:changed", timestamp: Date.now() }),
+                      ),
+                    ];
+                    return () => unsubs.forEach((u) => u());
+                  };
+                })(),
               },
               {
                 defaultSettleTimeout: 3000,

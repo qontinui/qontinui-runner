@@ -64,6 +64,12 @@ pub struct ComparisonRun {
     /// Timestamps.
     pub created_at: String,
     pub updated_at: String,
+    /// Meta-optimizer recommendation ID (if created from comparison bridge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation_id: Option<String>,
+    /// How this comparison was triggered: "manual", "meta_optimizer", "autoresearch".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// One run within a comparison.

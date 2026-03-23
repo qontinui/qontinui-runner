@@ -494,6 +494,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .plugin(ui_bridge_plugin::init())
         .manage(shared_app_state)
         .manage(rag_state)
@@ -933,6 +934,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::learning::get_current_running_task,
             commands::learning::get_most_recent_task_with_checkpoints,
             commands::learning::get_learning_stats_summary,
+            // Agentic metric commands
+            commands::agentic_metrics::get_agentic_scores,
+            commands::agentic_metrics::get_agentic_metric_aggregates,
+            commands::agentic_metrics::get_composite_score_trend,
+            commands::agentic_metrics::recompute_agentic_baselines,
             // Flow designer commands
             commands::flow::list_flows,
             commands::flow::get_flow,

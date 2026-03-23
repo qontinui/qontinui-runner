@@ -210,6 +210,9 @@ fn build_calculator_workflow(
         ai_reviewed: None,
         workflow_architecture: None,
         enforce_token_budget: None,
+        strict_cwd: false,
+        tool_tags: Vec::new(),
+        rollback_policy: None,
     }
 }
 
@@ -298,6 +301,9 @@ fn build_tdd_workflow(
         ai_reviewed: None,
         workflow_architecture: None,
         enforce_token_budget: None,
+        strict_cwd: false,
+        tool_tags: Vec::new(),
+        rollback_policy: None,
     }
 }
 
@@ -387,5 +393,8 @@ fn build_pipeline_workflow(
         ai_reviewed: None,
         workflow_architecture: None,
         enforce_token_budget: None,
+        strict_cwd: false,
+        tool_tags: Vec::new(),
+        rollback_policy: None,
     }
 }

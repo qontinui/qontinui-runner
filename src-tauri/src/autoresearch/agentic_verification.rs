@@ -1176,7 +1176,24 @@ impl MultiAgentPipelineResult {
             } else {
                 None
             },
-            files_modified: Vec::new(),
+            files_modified: self
+                .agent_traces
+                .iter()
+                .filter(|t| t.agent_type == "implementer")
+                .filter_map(|t| {
+                    t.output_snapshot
+                        .get("files_modified")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|f| f.as_str().map(|s| s.to_string()))
+                                .collect::<Vec<_>>()
+                        })
+                })
+                .flatten()
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect(),
         }
     }
 

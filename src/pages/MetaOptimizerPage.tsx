@@ -11,8 +11,10 @@ import { RecommendationsTab } from "../components/meta-optimizer/Recommendations
 import { PromptRegistryTab } from "../components/meta-optimizer/PromptRegistryTab";
 import { ConfigSuggestionsTab } from "../components/meta-optimizer/ConfigSuggestionsTab";
 import { RunHistoryTab } from "../components/meta-optimizer/RunHistoryTab";
+import { EvalSpecsTab } from "../components/meta-optimizer/EvalSpecsTab";
+import { RobustnessTab } from "../components/meta-optimizer/RobustnessTab";
 
-type SubTab = "progress" | "recommendations" | "prompts" | "config" | "history";
+type SubTab = "progress" | "recommendations" | "prompts" | "config" | "history" | "eval_specs" | "robustness";
 
 const TABS: { id: SubTab; label: string }[] = [
   { id: "progress", label: "Progress" },
@@ -20,6 +22,8 @@ const TABS: { id: SubTab; label: string }[] = [
   { id: "prompts", label: "Prompt Registry" },
   { id: "config", label: "Config Suggestions" },
   { id: "history", label: "Run History" },
+  { id: "eval_specs", label: "Eval Specs" },
+  { id: "robustness", label: "Robustness" },
 ];
 
 export function MetaOptimizerPage() {
@@ -51,6 +55,8 @@ export function MetaOptimizerPage() {
         {tab === "prompts" && <PromptRegistryTab />}
         {tab === "config" && <ConfigSuggestionsTab />}
         {tab === "history" && <RunHistoryTab />}
+        {tab === "eval_specs" && <EvalSpecsTab />}
+        {tab === "robustness" && <RobustnessTab />}
       </div>
     </div>
   );

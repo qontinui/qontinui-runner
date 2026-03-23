@@ -213,6 +213,23 @@ impl LoopController {
         }
 
         // =====================================================================
+        // PROPAGATE MIDDLEWARE CHAIN to phase executors
+        // =====================================================================
+        // Apply the hardener sanitizers (CommandSanitizer + SdkUrlSanitizer) as
+        // middleware on all AI sessions, not just the hardener's own AI call.
+        // This ensures AI-generated commands are sanitized across all phases.
+        {
+            use crate::workflow_generation::hardener::build_hardener_middleware;
+            self.setup_executor
+                .set_middleware_chain(build_hardener_middleware());
+            if let Some(ae) = Arc::get_mut(&mut self.agentic_executor) {
+                ae.set_middleware_chain(build_hardener_middleware());
+            }
+            self.completion_executor
+                .set_middleware_chain(build_hardener_middleware());
+        }
+
+        // =====================================================================
         // CREATE ARTIFACT DIRECTORY
         // =====================================================================
         if config.artifact_dir.is_none() {
@@ -662,6 +679,63 @@ impl LoopController {
         let mut total_stage_failures: u32 = 0;
         let mut total_iterations_across_stages: u32 = 0;
 
+        // =====================================================================
+        // CANARY ROLLOUT: Detection + Config Injection
+        // =====================================================================
+        // Check for active canary rollouts and probabilistically assign this run
+        // as canary or baseline. Config overrides are applied here (shared across
+        // all architectures); prompt overrides are applied per-architecture
+        // (currently only multi-agent pipeline has named agent roles).
+        let mut canary_config_originals: Vec<(String, Option<serde_json::Value>)> = Vec::new();
+        {
+            let active_canary: Option<(String, String)> =
+                match crate::meta_optimizer::canary::get_active_canaries(&self.checkpoint_db) {
+                    Ok(canaries) => canaries.into_iter().find_map(|c| {
+                        if crate::meta_optimizer::canary::should_apply_canary(
+                            &self.checkpoint_db,
+                            &c.recommendation_id,
+                        ) {
+                            info!(
+                                "CANARY: Rollout {} active for this run ({}%)",
+                                c.id, c.percentage
+                            );
+                            Some((c.id, c.recommendation_id))
+                        } else {
+                            None
+                        }
+                    }),
+                    Err(_) => None,
+                };
+            let is_canary_run = active_canary.is_some();
+
+            // Apply config overrides for canary runs
+            if let Some((_, ref rec_id)) = active_canary {
+                match crate::meta_optimizer::canary::get_canary_config_overrides(
+                    &self.checkpoint_db,
+                    rec_id,
+                ) {
+                    Ok(overrides) => {
+                        for (key, value) in overrides {
+                            let original = self.checkpoint_db.get_setting(&key).ok().flatten();
+                            canary_config_originals.push((key.clone(), original));
+                            if let Err(e) = self.checkpoint_db.set_setting(&key, &value) {
+                                warn!("CANARY: Failed to set config {}={}: {}", key, value, e);
+                            } else {
+                                info!("CANARY: Injecting config override {}={}", key, value);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("CANARY: Failed to load config overrides: {}", e);
+                    }
+                }
+            }
+
+            // Store canary state on config so loop paths can access it
+            config.active_canary = active_canary;
+            config.is_canary_run = is_canary_run;
+        }
+
         for stage_idx in 0..config.stages.len() {
             let stage = &config.stages[stage_idx];
             // Skip stages that have already completed (resume support)
@@ -723,6 +797,7 @@ impl LoopController {
                         stage_num, total_stages
                     ))
                     .await;
+                Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
                 return WorkflowResult {
                     success: false,
                     verification_passed: false,
@@ -773,6 +848,7 @@ impl LoopController {
                                 max, stage_num, total_stages
                             ))
                             .await;
+                        Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
                         return WorkflowResult {
                             success: false,
                             verification_passed: false,
@@ -910,6 +986,7 @@ impl LoopController {
                             .await
                             .on_workflow_failed(&format!("Stage {} setup failed", stage_num))
                             .await;
+                        Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
                         return WorkflowResult {
                             success: false,
                             verification_passed: false,
@@ -1176,6 +1253,8 @@ impl LoopController {
                     workflow_architecture: config.workflow_architecture.clone(),
                     agentic_verification_config: config.agentic_verification_config.clone(),
                     multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                    active_canary: config.active_canary.clone(),
+                    is_canary_run: config.is_canary_run,
                     rollback_policy: config.rollback_policy.clone(),
                     iteration_diffs: Vec::new(),
                 };
@@ -1283,7 +1362,7 @@ impl LoopController {
                     // (loop iterations), which exceeds the intended budget by 1.
                     stage_loop_config.starting_iteration = agentic_iteration;
                     stage_loop_config.max_iterations =
-                        stage_loop_config.max_iterations.saturating_sub(1);
+                        stage_loop_config.max_iterations.saturating_sub(1).max(1);
 
                     if !injected_steps.is_empty() {
                         info!(
@@ -1380,6 +1459,19 @@ impl LoopController {
                     loop_result.summary()
                 );
 
+                // Record canary run outcome (all architectures)
+                if let Some((ref canary_id, _)) = config.active_canary {
+                    let stage_duration_ms = start.elapsed().as_millis() as f64;
+                    let _ = crate::meta_optimizer::canary::record_canary_run(
+                        &self.checkpoint_db,
+                        canary_id,
+                        config.is_canary_run,
+                        loop_result.verification_passed,
+                        loop_result.total_cost_usd.unwrap_or(0.0),
+                        stage_duration_ms,
+                    );
+                }
+
                 if loop_result.verification_passed {
                     any_stage_passed = true;
                 }
@@ -1463,6 +1555,7 @@ impl LoopController {
                             .on_workflow_complete(&loop_result, start.elapsed(), sessions)
                             .await;
                     }
+                    Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
                     return WorkflowResult {
                         success: false,
                         verification_passed: false,
@@ -1774,6 +1867,13 @@ impl LoopController {
                 total_tokens: last_loop_result.as_ref().and_then(|r| r.total_tokens),
                 total_cost_usd: last_loop_result.as_ref().and_then(|r| r.total_cost_usd),
             };
+            // Capture fields for async LLM judge before moving outcome into spawn
+            let judge_task_run_id = outcome.task_run_id.clone();
+            let judge_iterations = outcome.iterations;
+            let judge_verification_passed = outcome.verification_passed;
+            let judge_was_stopped = outcome.was_stopped;
+            let judge_db = db.clone();
+
             tokio::spawn(async move {
                 if let Err(e) = db.with_conn(|conn| {
                     crate::orchestrator::learning_recorder::record_workflow_learning(conn, &outcome)
@@ -1781,6 +1881,22 @@ impl LoopController {
                     warn!("Failed to record learning outcome: {}", e);
                 }
             });
+
+            // Async LLM-as-judge: scores plan_adherence, goal_accuracy, plan_quality
+            // Fire-and-forget — checks eligibility internally (skips zero-iter, simple successes)
+            crate::orchestrator::learning_recorder::spawn_llm_judge_if_eligible(
+                judge_db.clone(),
+                judge_task_run_id.clone(),
+                judge_iterations,
+                judge_verification_passed,
+                judge_was_stopped,
+            );
+
+            // Async RAG judge: scores retrieval quality if this run used hybrid search
+            crate::orchestrator::learning_recorder::spawn_rag_judge_if_eligible(
+                judge_db,
+                judge_task_run_id,
+            );
         }
 
         // Trigger reflection workflows
@@ -2044,6 +2160,9 @@ impl LoopController {
             );
         }
 
+        // Restore canary config overrides
+        Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
+
         WorkflowResult {
             success: overall_passed,
             verification_passed: overall_passed,
@@ -2055,6 +2174,23 @@ impl LoopController {
             workflow_architecture: config.workflow_architecture.clone(),
             agentic_verification_config: config.agentic_verification_config.clone(),
             multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+        }
+    }
+
+    /// Restore canary config overrides to their original values.
+    fn restore_canary_config(
+        db: &crate::database::CheckpointDb,
+        originals: &[(String, Option<serde_json::Value>)],
+    ) {
+        for (key, original) in originals {
+            match original {
+                Some(val) => {
+                    let _ = db.set_setting(key, val);
+                }
+                None => {
+                    let _ = db.delete_setting(key);
+                }
+            }
         }
     }
 

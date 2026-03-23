@@ -161,6 +161,8 @@ mod tests {
             max_iterations_reached: false,
             duration_secs: 100.0,
             error_type: None,
+            tools_used: Vec::new(),
+            agent_traces: Vec::new(),
         }
     }
 

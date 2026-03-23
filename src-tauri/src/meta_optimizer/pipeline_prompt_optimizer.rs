@@ -77,6 +77,8 @@ pub fn build_config(execution_id: &str, workflow_name: &str, style_index: u32) -
         multi_agent_pipeline_config: None,
         rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
         iteration_diffs: Vec::new(),
+        active_canary: None,
+        is_canary_run: false,
     }
 }
 

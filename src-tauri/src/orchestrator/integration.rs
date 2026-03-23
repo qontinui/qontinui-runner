@@ -274,6 +274,9 @@ pub struct OrchestratorConfig {
     /// The error context is curated to prioritize critical errors and detect
     /// patterns across multiple errors.
     pub include_error_monitor_context: bool,
+    /// Workflow architecture for learning outcome tracking.
+    /// Inferred from LoopConfig when available. Defaults to "traditional".
+    pub workflow_architecture: Option<String>,
 }
 
 impl Default for OrchestratorConfig {
@@ -287,6 +290,7 @@ impl Default for OrchestratorConfig {
             compression: Some(CompressionConfig::default()),
             enable_checkpointing: true,
             include_error_monitor_context: true, // Enable by default for debugging workflows
+            workflow_architecture: None,
         }
     }
 }
@@ -713,7 +717,11 @@ impl Orchestrator {
 
     /// Add hooks to the orchestrator.
     pub fn with_hooks(mut self, hooks: Vec<Hook>) -> Self {
-        self.hook_executor = HookExecutor::new(hooks);
+        self.hook_executor = if let Some(ref handle) = self.app_handle {
+            HookExecutor::with_app_handle(hooks, handle.clone())
+        } else {
+            HookExecutor::new(hooks)
+        };
         self
     }
 
@@ -2957,8 +2965,10 @@ pub async fn run_orchestrated_task(
     // Doctor health monitor handle
     doctor_handle: Option<DoctorHandle>,
 ) -> Result<TaskCompletionResult, String> {
+    let arch = config.workflow_architecture.clone();
     let orchestrator = Orchestrator::new(config.clone(), db, doctor_handle);
     let mut state = orchestrator.initialize_task(task_run_id, goal)?;
+    state.set_workflow_architecture(arch);
 
     loop {
         // Build worker prompt with context

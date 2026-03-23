@@ -182,9 +182,14 @@ pub fn check_and_launch_optimizers(
         &source_task_run_id,
     );
 
-    // Maintenance: dedup pending recommendations and reject stale ones (>30 days)
+    // Maintenance: dedup pending recommendations, reject stale ones, rollback stale canaries
     super::recommendations::dedup_pending_recommendations(db);
     super::recommendations::auto_reject_stale_recommendations(db);
+    super::canary::auto_rollback_stale_canaries(db);
+
+    // Sweep pending recommendations from previous runs that now qualify for
+    // auto-apply or canary entry (pass None to match all optimizer_run_ids).
+    super::parser::auto_apply_high_confidence(db, None);
 
     // Auto-evaluate applied recommendations that are due for re-evaluation.
     // Only re-evaluate recs applied >7 days ago whose verdict is still "insufficient_data".
@@ -196,6 +201,19 @@ pub fn check_and_launch_optimizers(
     // Run data-driven cost optimization analysis (no AI session needed).
     // Generates recommendations for high-token agents, cost concentration, etc.
     run_cost_analysis(db);
+
+    // Recompute agentic metric baselines from accumulated successful runs.
+    // Fast — only queries learning_outcomes aggregates, no LLM calls.
+    if let Err(e) = db.with_conn(|conn| {
+        crate::meta_optimizer::agentic_metrics::scoring::recompute_all_baselines(conn)
+            .map(|_| ())
+    }) {
+        debug!("Baseline recomputation skipped: {}", e);
+    }
+
+    // Evaluate applied recommendations using composite agentic scores.
+    // Compares pre/post-apply score averages to measure recommendation effectiveness.
+    super::recommendations::auto_evaluate_with_agentic_scores(db);
 
     Ok(launched)
 }
@@ -279,10 +297,11 @@ fn auto_evaluate_canaries(db: &CheckpointDb) {
                 }
                 "rollback" => {
                     info!(
-                            "Auto-rolling-back canary {} (delta={:+.1}pp, canary_sr={:.1}%, baseline_sr={:.1}%)",
-                            canary.id, eval.delta, eval.canary_success_rate, eval.baseline_success_rate
+                            "Auto-rolling-back canary {} (delta={:+.1}pp, canary_sr={:.1}%, baseline_sr={:.1}%, p={:?}, cost_delta={:?})",
+                            canary.id, eval.delta, eval.canary_success_rate, eval.baseline_success_rate,
+                            eval.p_value, eval.cost_delta_pct
                         );
-                    if let Err(e) = super::canary::rollback_canary(db, &canary.id) {
+                    if let Err(e) = super::canary::rollback_canary_with_eval(db, &canary.id, Some(&eval)) {
                         warn!("Failed to auto-rollback canary {}: {}", canary.id, e);
                     }
                 }

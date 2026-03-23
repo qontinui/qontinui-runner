@@ -164,9 +164,11 @@ export function useCommands(
         let body: unknown = undefined;
 
         switch (action) {
-          case "getElements":
-            url = `${getApiBase()}/ui-bridge/sdk/elements`;
+          case "getElements": {
+            const recency = (params?.recency as string) ?? "any";
+            url = `${getApiBase()}/ui-bridge/sdk/elements?recency=${recency}`;
             break;
+          }
           case "getElement":
             url = `${getApiBase()}/ui-bridge/sdk/element/${params?.elementId || params?.id}`;
             break;
@@ -175,12 +177,16 @@ export function useCommands(
             method = "POST";
             body = { action: params?.action, params: params?.actionParams };
             break;
-          case "getSnapshot":
-            url = `${getApiBase()}/ui-bridge/sdk/snapshot`;
+          case "getSnapshot": {
+            const recency = (params?.recency as string) ?? "any";
+            url = `${getApiBase()}/ui-bridge/sdk/snapshot?recency=${recency}`;
             break;
-          case "getComponents":
-            url = `${getApiBase()}/ui-bridge/sdk/components`;
+          }
+          case "getComponents": {
+            const recency = (params?.recency as string) ?? "any";
+            url = `${getApiBase()}/ui-bridge/sdk/components?recency=${recency}`;
             break;
+          }
           case "discover":
             url = `${getApiBase()}/ui-bridge/sdk/discover`;
             method = "POST";

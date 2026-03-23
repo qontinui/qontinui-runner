@@ -293,6 +293,45 @@ export function ComparisonTab() {
             </tbody>
           </table>
 
+          {/* Structured comparison summary */}
+          {activeData.entries.some((e) => e.result) && (
+            <div className="mt-3">
+              <div className="text-xs text-zinc-500 mb-1">Structured Comparison</div>
+              <table className="w-full text-xs border border-zinc-700 rounded overflow-hidden">
+                <thead>
+                  <tr className="text-zinc-400 bg-zinc-800 border-b border-zinc-700">
+                    <th className="text-left py-1.5 px-3">Variant</th>
+                    <th className="text-center py-1.5 px-3">Success</th>
+                    <th className="text-right py-1.5 px-3">Iterations</th>
+                    <th className="text-right py-1.5 px-3">Duration</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {activeData.entries
+                    .filter((e) => e.result)
+                    .map((entry, i) => (
+                      <tr key={`summary-${entry.label}-${i}`} className="border-b border-zinc-800/50">
+                        <td className="py-1.5 px-3 text-zinc-200">{entry.label}</td>
+                        <td className="py-1.5 px-3 text-center">
+                          {entry.result!.success ? (
+                            <span className="text-green-400">&#10003;</span>
+                          ) : (
+                            <span className="text-red-400">&#10007;</span>
+                          )}
+                        </td>
+                        <td className="py-1.5 px-3 text-right text-zinc-300">
+                          {entry.result!.iterations}
+                        </td>
+                        <td className="py-1.5 px-3 text-right text-zinc-300">
+                          {fmtDuration(entry.result!.duration_ms)}
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
           {activeData.report && (
             <div className="mt-3 p-2 bg-zinc-800 rounded text-xs text-zinc-300 whitespace-pre-wrap">
               {activeData.report}

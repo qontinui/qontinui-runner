@@ -132,13 +132,14 @@ export function useStateExploration(
       const fetchLatestElements = async (): Promise<ExternalElement[]> => {
         try {
           // Use snapshot endpoint which triggers a full DOM scan, unlike /elements
-          // which only returns pre-registered SDK elements (may be 0 for self-connections)
-          let resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/snapshot`);
+          // which only returns pre-registered SDK elements (may be 0 for self-connections).
+          // Use recency=current to guarantee fresh state for verification.
+          let resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/snapshot?recency=current`);
           let json = await resp.json();
 
           if (json.success === false) {
             // Fall back to elements endpoint
-            resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/elements`);
+            resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/elements?recency=current`);
             json = await resp.json();
             if (json.success === false) return [];
           }

@@ -515,15 +515,6 @@ impl UnifiedAiSessionExecutor {
         }
     }
 
-    /// Set the middleware chain for deterministic prompt/response transformations.
-    pub fn with_middleware_chain(
-        mut self,
-        chain: crate::ai_provider::middleware::AiMiddlewareChain,
-    ) -> Self {
-        self.middleware_chain = Some(chain);
-        self
-    }
-
     /// Set the session manager for interactive mode.
     pub fn with_session_manager(
         mut self,

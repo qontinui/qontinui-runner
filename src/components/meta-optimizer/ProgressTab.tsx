@@ -5,6 +5,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AgentEffectivenessPanel } from "./AgentEffectivenessPanel";
+import { AgenticMetricsPanel } from "./AgenticMetricsPanel";
 import { FailureAnalysisSection } from "./FailureAnalysisSection";
 import { RegressionAlertBanner } from "./RegressionAlertBanner";
 import { CanaryStatusPanel } from "./CanaryStatusPanel";
@@ -184,6 +185,9 @@ export function ProgressTab() {
     <div className="p-4 space-y-6">
       {/* Regression alert banner */}
       <RegressionAlertBanner />
+
+      {/* Agentic quality metrics (deepeval-inspired) */}
+      <AgenticMetricsPanel />
 
       {/* Active canary rollouts */}
       <CanaryStatusPanel />

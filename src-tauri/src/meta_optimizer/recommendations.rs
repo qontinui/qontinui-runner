@@ -780,6 +780,118 @@ pub fn list_optimizer_runs(db: &CheckpointDb) -> Result<Vec<MetaOptimizerRun>, S
     })
 }
 
+/// Evaluate applied recommendations using composite agentic scores.
+///
+/// Compares the average composite_agentic_score from runs BEFORE the recommendation
+/// was applied vs runs AFTER. If the delta is significant and positive, updates
+/// outcome_after_apply with the evidence. If negative, flags for rollback.
+///
+/// Called from the maintenance block in trigger.rs.
+pub fn auto_evaluate_with_agentic_scores(db: &CheckpointDb) {
+    let recs = match list_recommendations(db, None, Some("applied")) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    for rec in &recs {
+        let applied_at = match &rec.applied_at {
+            Some(a) => a.clone(),
+            None => continue,
+        };
+
+        // Need at least 5 post-apply runs for meaningful comparison
+        let rec_id = rec.id.clone();
+        let result = db.with_conn(move |conn| {
+            // Count post-apply runs with agentic scores
+            let post_count: i64 = conn
+                .query_row(
+                    r#"SELECT COUNT(*) FROM learning_outcomes
+                       WHERE created_at > ?1 AND composite_agentic_score IS NOT NULL
+                         AND (iterations IS NULL OR iterations > 0)"#,
+                    params![applied_at],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
+            if post_count < 5 {
+                return Ok(None); // Insufficient data
+            }
+
+            // Average composite score BEFORE the recommendation was applied
+            let pre_avg: Option<f64> = conn
+                .query_row(
+                    r#"SELECT AVG(composite_agentic_score) FROM learning_outcomes
+                       WHERE created_at <= ?1 AND composite_agentic_score IS NOT NULL
+                         AND (iterations IS NULL OR iterations > 0)"#,
+                    params![applied_at],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+
+            // Average composite score AFTER
+            let post_avg: Option<f64> = conn
+                .query_row(
+                    r#"SELECT AVG(composite_agentic_score) FROM learning_outcomes
+                       WHERE created_at > ?1 AND composite_agentic_score IS NOT NULL
+                         AND (iterations IS NULL OR iterations > 0)"#,
+                    params![applied_at],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+
+            match (pre_avg, post_avg) {
+                (Some(pre), Some(post)) if pre > 0.0 => {
+                    let delta = post - pre;
+                    let delta_pct = (delta / pre) * 100.0;
+                    let verdict = if delta_pct > 5.0 {
+                        "improved"
+                    } else if delta_pct < -5.0 {
+                        "degraded"
+                    } else {
+                        "neutral"
+                    };
+
+                    let outcome = serde_json::json!({
+                        "verdict": verdict,
+                        "pre_composite_score": format!("{:.3}", pre),
+                        "post_composite_score": format!("{:.3}", post),
+                        "delta": format!("{:+.3}", delta),
+                        "delta_pct": format!("{:+.1}%", delta_pct),
+                        "post_run_count": post_count,
+                        "evaluated_by": "agentic_metrics",
+                    });
+
+                    conn.execute(
+                        "UPDATE meta_optimizer_recommendations SET outcome_after_apply = ?1 WHERE id = ?2",
+                        params![outcome.to_string(), rec_id],
+                    )
+                    .map_err(|e| format!("Failed to update outcome: {}", e))?;
+
+                    Ok(Some((verdict.to_string(), delta_pct)))
+                }
+                _ => Ok(None),
+            }
+        });
+
+        match result {
+            Ok(Some((verdict, delta_pct))) => {
+                if verdict != "neutral" {
+                    info!(
+                        "Agentic score evaluation for rec {}: verdict={}, delta={:+.1}%",
+                        rec.id, verdict, delta_pct
+                    );
+                }
+            }
+            Ok(None) => {} // Insufficient data
+            Err(e) => {
+                tracing::debug!("Failed to evaluate rec {} with agentic scores: {}", rec.id, e);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,7 +995,7 @@ mod tests {
 
         let result = apply_recommendation(&db, &rec.id);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not found or not pending"));
+        assert!(result.unwrap_err().contains("not found or not in pending"));
     }
 
     #[test]

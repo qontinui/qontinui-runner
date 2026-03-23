@@ -487,6 +487,8 @@ pub fn build_reflection_config(
         multi_agent_pipeline_config: None,
         rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
         iteration_diffs: Vec::new(),
+        active_canary: None,
+        is_canary_run: false,
     }
 }
 
@@ -1089,6 +1091,8 @@ pub fn build_project_reflection_config(
         acceptance_criteria: None,
         rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
         iteration_diffs: Vec::new(),
+        active_canary: None,
+        is_canary_run: false,
     }
 }
 
@@ -1482,6 +1486,8 @@ pub fn build_ui_bridge_reflection_config(
         acceptance_criteria: None,
         rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
         iteration_diffs: Vec::new(),
+        active_canary: None,
+        is_canary_run: false,
     }
 }
 

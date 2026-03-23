@@ -21,6 +21,7 @@
     {
       "identifier": "fs:scope",
       "allow": [{ "path": "**" }]
-    }
+    },
+    "notification:default"
   ]
 }

@@ -4,7 +4,7 @@
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::database::CheckpointDb;
 
@@ -134,6 +134,52 @@ pub fn get_active_canaries(db: &CheckpointDb) -> Result<Vec<CanaryRollout>, Stri
                 })
             })
             .map_err(|e| format!("Failed to query canaries: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    })
+}
+
+/// Get completed canary rollouts (promoted or rolled back) for history display.
+pub fn get_canary_history(db: &CheckpointDb, limit: u32) -> Result<Vec<serde_json::Value>, String> {
+    let limit = limit.min(100) as i64;
+    db.with_conn(move |conn| {
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT c.id, c.recommendation_id, c.percentage, c.status,
+                          c.start_date, c.end_date,
+                          c.baseline_run_count, c.canary_run_count,
+                          c.baseline_metrics_json, c.canary_metrics_json, c.created_at,
+                          r.title, r.target_agent, r.recommendation_type
+                   FROM canary_rollouts c
+                   LEFT JOIN meta_optimizer_recommendations r ON r.id = c.recommendation_id
+                   WHERE c.status IN ('promoted', 'rolled_back')
+                   ORDER BY c.end_date DESC
+                   LIMIT ?1"#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let results: Vec<serde_json::Value> = stmt
+            .query_map(params![limit], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "recommendation_id": row.get::<_, String>(1)?,
+                    "percentage": row.get::<_, i64>(2)?,
+                    "status": row.get::<_, String>(3)?,
+                    "start_date": row.get::<_, String>(4)?,
+                    "end_date": row.get::<_, Option<String>>(5)?,
+                    "baseline_run_count": row.get::<_, i64>(6)?,
+                    "canary_run_count": row.get::<_, i64>(7)?,
+                    "baseline_metrics_json": row.get::<_, String>(8)?,
+                    "canary_metrics_json": row.get::<_, String>(9)?,
+                    "created_at": row.get::<_, String>(10)?,
+                    "recommendation_title": row.get::<_, Option<String>>(11)?,
+                    "target_agent": row.get::<_, Option<String>>(12)?,
+                    "recommendation_type": row.get::<_, Option<String>>(13)?,
+                }))
+            })
+            .map_err(|e| format!("Failed to query canary history: {}", e))?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -305,6 +351,26 @@ pub fn record_canary_run(
         )
         .map_err(|e| format!("Failed to record canary run: {}", e))?;
 
+        // Best-effort: insert a per-run record into canary_run_records
+        let record_id = format!("crr-{}", uuid::Uuid::new_v4());
+        let created_at = chrono::Utc::now().to_rfc3339();
+        if let Err(e) = conn.execute(
+            r#"INSERT INTO canary_run_records
+               (id, canary_id, is_canary, task_run_id, success, cost_usd, duration_ms, created_at)
+               VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)"#,
+            params![
+                record_id,
+                canary_id,
+                is_canary as i32,
+                success as i32,
+                cost,
+                duration_ms,
+                created_at,
+            ],
+        ) {
+            warn!("Failed to insert canary_run_record: {}", e);
+        }
+
         Ok(())
     })
 }
@@ -448,10 +514,26 @@ pub fn promote_canary(db: &CheckpointDb, canary_id: &str) -> Result<(), String> 
     Ok(())
 }
 
-/// Roll back a canary: revert to pending state.
+/// Roll back a canary: mark recommendation as rolled_back and record evaluation metrics.
+///
+/// Unlike the previous behavior (reverting to "pending"), this sets the recommendation
+/// status to "rolled_back" so it is not re-attempted, and records the canary evaluation
+/// metrics that triggered the rollback decision.
 pub fn rollback_canary(db: &CheckpointDb, canary_id: &str) -> Result<(), String> {
+    rollback_canary_with_eval(db, canary_id, None)
+}
+
+/// Roll back a canary with optional evaluation metrics to record on the recommendation.
+pub fn rollback_canary_with_eval(
+    db: &CheckpointDb,
+    canary_id: &str,
+    eval: Option<&CanaryEvaluation>,
+) -> Result<(), String> {
     let canary_id_str = canary_id.to_string();
     let now = chrono::Utc::now().to_rfc3339();
+    let eval_json = eval
+        .and_then(|e| serde_json::to_string(e).ok())
+        .unwrap_or_else(|| "{}".to_string());
 
     db.with_conn({
         let canary_id = canary_id_str.clone();
@@ -472,18 +554,59 @@ pub fn rollback_canary(db: &CheckpointDb, canary_id: &str) -> Result<(), String>
             )
             .map_err(|e| format!("Failed to rollback canary: {}", e))?;
 
-            // Revert recommendation to pending
+            // Mark recommendation as rolled_back (not pending) and record eval metrics
             conn.execute(
-                "UPDATE meta_optimizer_recommendations SET status = 'pending' WHERE id = ?1",
-                params![rec_id],
+                "UPDATE meta_optimizer_recommendations SET status = 'rolled_back', outcome_after_apply = ?1 WHERE id = ?2",
+                params![eval_json, rec_id],
             )
-            .map_err(|e| format!("Failed to revert recommendation: {}", e))?;
+            .map_err(|e| format!("Failed to update recommendation status: {}", e))?;
 
             info!(
-                "Rolled back canary {} (recommendation {})",
+                "Rolled back canary {} (recommendation {} -> rolled_back)",
                 canary_id, rec_id
             );
             Ok(())
         }
     })
+}
+
+/// Auto-rollback canary rollouts that have been active for more than 30 days
+/// without reaching a promote/rollback verdict. Stale canaries block the optimizer
+/// from generating fresh recommendations for the same target.
+pub fn auto_rollback_stale_canaries(db: &CheckpointDb) -> usize {
+    let canaries = match get_active_canaries(db) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    let mut rolled_back = 0;
+
+    for canary in &canaries {
+        // Only rollback canaries started more than 30 days ago
+        let started = if canary.start_date.is_empty() {
+            &canary.created_at
+        } else {
+            &canary.start_date
+        };
+        if started.as_str() >= cutoff.as_str() {
+            continue;
+        }
+
+        info!(
+            "Auto-rolling-back stale canary {} (active since {}, {} canary runs)",
+            canary.id, started, canary.canary_run_count
+        );
+        if let Err(e) = rollback_canary(db, &canary.id) {
+            warn!("Failed to auto-rollback stale canary {}: {}", canary.id, e);
+        } else {
+            rolled_back += 1;
+        }
+    }
+
+    if rolled_back > 0 {
+        info!("Auto-rolled-back {} stale canary rollout(s) (active >30 days)", rolled_back);
+    }
+
+    rolled_back
 }

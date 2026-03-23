@@ -425,6 +425,8 @@ pub async fn resume_interrupted_workflows(
                                 rollback_policy:
                                     crate::unified_workflow_executor::RollbackPolicy::None,
                                 iteration_diffs: Vec::new(),
+                                active_canary: None,
+                                is_canary_run: false,
                             };
 
                             controller
@@ -635,6 +637,8 @@ pub async fn resume_interrupted_workflows(
                                 rollback_policy:
                                     crate::unified_workflow_executor::RollbackPolicy::None,
                                 iteration_diffs: Vec::new(),
+                                active_canary: None,
+                                is_canary_run: false,
                             };
 
                             controller

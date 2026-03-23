@@ -241,7 +241,8 @@ pub async fn get_optimizer_context_handler(
                         ROUND(AVG(duration_secs), 1) as avg_duration,
                         ROUND(AVG(iterations), 1) as avg_iterations
                     FROM learning_outcomes
-                    WHERE created_at > ?1"#,
+                    WHERE created_at > ?1
+                      AND (iterations IS NULL OR iterations > 0)"#,
                     params![since],
                     |row| {
                         Ok((
@@ -288,6 +289,7 @@ pub async fn get_optimizer_context_handler(
                             ROUND(AVG(duration_secs), 1) as avg_duration
                         FROM learning_outcomes
                         WHERE created_at > ?1 AND workflow_architecture IS NOT NULL
+                          AND (iterations IS NULL OR iterations > 0)
                         GROUP BY workflow_architecture"#,
                     )
                     .map_err(|e| format!("Failed to prepare arch breakdown: {}", e))?;
@@ -1787,6 +1789,150 @@ async fn evaluate_recommendation_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Canary rollout endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /meta-optimizer/canaries
+///
+/// Returns all active canary rollouts with recommendation metadata.
+pub async fn get_canaries_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    let canaries =
+        crate::meta_optimizer::canary::get_active_canaries(&state.app_state.checkpoint_db)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to get canaries: {}", e))),
+                )
+            })?;
+
+    // Enrich with recommendation metadata
+    let enriched: Vec<serde_json::Value> = canaries
+        .iter()
+        .map(|c| {
+            let rec_info = state.app_state.checkpoint_db.with_conn({
+                let rec_id = c.recommendation_id.clone();
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT title, target_agent, recommendation_type FROM meta_optimizer_recommendations WHERE id = ?1",
+                        params![rec_id],
+                        |row| Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        )),
+                    ).ok())
+                }
+            }).ok().flatten();
+
+            let (title, agent, rec_type) = rec_info.unwrap_or((None, None, None));
+
+            serde_json::json!({
+                "id": c.id,
+                "recommendation_id": c.recommendation_id,
+                "percentage": c.percentage,
+                "status": c.status,
+                "start_date": c.start_date,
+                "end_date": c.end_date,
+                "baseline_run_count": c.baseline_run_count,
+                "canary_run_count": c.canary_run_count,
+                "baseline_metrics_json": c.baseline_metrics_json,
+                "canary_metrics_json": c.canary_metrics_json,
+                "created_at": c.created_at,
+                "recommendation_title": title,
+                "target_agent": agent,
+                "recommendation_type": rec_type,
+            })
+        })
+        .collect();
+
+    Ok(Json(ApiResponse::success(
+        serde_json::to_value(enriched).unwrap_or_default(),
+    )))
+}
+
+/// GET /meta-optimizer/canaries/history?limit=N
+///
+/// Returns completed canary rollouts (promoted or rolled back).
+pub async fn get_canary_history_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20u32);
+
+    let history =
+        crate::meta_optimizer::canary::get_canary_history(&state.app_state.checkpoint_db, limit)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to get canary history: {}", e))),
+                )
+            })?;
+
+    Ok(Json(ApiResponse::success(
+        serde_json::to_value(history).unwrap_or_default(),
+    )))
+}
+
+/// POST /meta-optimizer/canaries/{id}/promote
+pub async fn promote_canary_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    crate::meta_optimizer::canary::promote_canary(&state.app_state.checkpoint_db, &id).map_err(
+        |e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to promote canary: {}", e))),
+            )
+        },
+    )?;
+    Ok(Json(ApiResponse::success(())))
+}
+
+/// POST /meta-optimizer/canaries/{id}/rollback
+pub async fn rollback_canary_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    crate::meta_optimizer::canary::rollback_canary(&state.app_state.checkpoint_db, &id).map_err(
+        |e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to rollback canary: {}", e))),
+            )
+        },
+    )?;
+    Ok(Json(ApiResponse::success(())))
+}
+
+/// GET /meta-optimizer/canaries/{id}/evaluation
+pub async fn evaluate_canary_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    let eval =
+        crate::meta_optimizer::canary::evaluate_canary(&state.app_state.checkpoint_db, &id)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to evaluate canary: {}", e))),
+                )
+            })?;
+
+    Ok(Json(ApiResponse::success(
+        serde_json::to_value(eval).unwrap_or_default(),
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
 
@@ -1852,5 +1998,23 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route(
             "/meta-optimizer/recommendations/{id}/evaluate",
             post(evaluate_recommendation_handler),
+        )
+        // Canary rollout routes
+        .route("/meta-optimizer/canaries", get(get_canaries_handler))
+        .route(
+            "/meta-optimizer/canaries/history",
+            get(get_canary_history_handler),
+        )
+        .route(
+            "/meta-optimizer/canaries/{id}/promote",
+            post(promote_canary_handler),
+        )
+        .route(
+            "/meta-optimizer/canaries/{id}/rollback",
+            post(rollback_canary_handler),
+        )
+        .route(
+            "/meta-optimizer/canaries/{id}/evaluation",
+            get(evaluate_canary_handler),
         )
 }

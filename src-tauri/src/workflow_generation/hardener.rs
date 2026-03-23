@@ -2852,3 +2852,75 @@ fn enforce_required_on_steps(
         }
     }
 }
+
+/// Validate a prompt for basic robustness red flags (static analysis, no LLM).
+///
+/// Checks for patterns that indicate the prompt may be vulnerable to injection,
+/// overly permissive, or missing safety boundaries.
+///
+/// Returns a list of warnings (empty = no issues found).
+pub fn validate_prompt_robustness(prompt: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // Check for missing role/boundary instructions
+    let lower = prompt.to_lowercase();
+    if !lower.contains("you are") && !lower.contains("your role") && !lower.contains("as a") {
+        warnings.push("Prompt has no explicit role definition — vulnerable to role injection".to_string());
+    }
+
+    // Check for overly permissive instructions
+    if lower.contains("do anything") || lower.contains("no restrictions") || lower.contains("ignore safety") {
+        warnings.push("Prompt contains overly permissive language".to_string());
+    }
+
+    // Check for missing output format constraints
+    if !lower.contains("json") && !lower.contains("format") && !lower.contains("respond with") && !lower.contains("output") {
+        warnings.push("Prompt has no output format constraints — may produce unparseable results".to_string());
+    }
+
+    // Check prompt length (too short = likely underspecified)
+    if prompt.len() < 50 {
+        warnings.push(format!("Prompt is very short ({} chars) — may be underspecified", prompt.len()));
+    }
+
+    // Check for common injection vectors not being addressed
+    if !lower.contains("ignore") && !lower.contains("override") && !lower.contains("previous instructions") {
+        // The prompt doesn't mention these terms, which is fine — but if the prompt
+        // doesn't have any boundary-setting language at all, flag it
+        if !lower.contains("must") && !lower.contains("always") && !lower.contains("never") && !lower.contains("do not") {
+            warnings.push("Prompt lacks boundary-setting language (must/always/never/do not)".to_string());
+        }
+    }
+
+    warnings
+}
+
+#[cfg(test)]
+mod robustness_tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_prompt_robustness_good_prompt() {
+        let prompt = "You are a code verification agent. Your role is to analyze code changes. \
+                      Always respond with JSON format. You must never execute arbitrary commands. \
+                      Do not modify files outside the working directory.";
+        let warnings = validate_prompt_robustness(prompt);
+        assert!(warnings.is_empty(), "Good prompt should have no warnings: {:?}", warnings);
+    }
+
+    #[test]
+    fn test_validate_prompt_robustness_bad_prompt() {
+        let prompt = "fix it";
+        let warnings = validate_prompt_robustness(prompt);
+        assert!(!warnings.is_empty(), "Bad prompt should have warnings");
+        assert!(warnings.iter().any(|w| w.contains("very short")));
+    }
+
+    #[test]
+    fn test_validate_prompt_robustness_no_role() {
+        let prompt = "Please analyze the following code and return results in JSON format. You must check for errors.";
+        let warnings = validate_prompt_robustness(prompt);
+        // Has format constraints and boundary language, but no role definition
+        assert!(warnings.iter().any(|w| w.contains("role definition")), "Should warn about missing role: {:?}", warnings);
+    }
+}

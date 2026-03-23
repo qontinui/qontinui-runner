@@ -9,6 +9,7 @@
 //! replacing the previous pattern of passing failure context as concatenated strings.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
@@ -152,6 +153,47 @@ struct SubtreeOutput {
     verifier_failures: Vec<VerifierFailure>,
     iterations_used: u32,
     was_stopped: bool,
+}
+
+/// Lightweight, `Clone + Send + Sync` handle that carries only the shared state
+/// required by `process_subtree`.  Created once per pipeline invocation from the
+/// parent `LoopController` and cheaply cloned into each parallel subtree future
+/// so that `buffer_unordered` can satisfy `Send + 'static` bounds.
+#[derive(Clone)]
+struct PipelineShared {
+    checkpoint_db: Arc<crate::database::CheckpointDb>,
+    agentic_executor: Arc<super::phases::AgenticExecutor>,
+    verification_executor: Arc<super::phases::VerificationExecutor>,
+}
+
+impl PipelineShared {
+    fn from_controller(ctrl: &LoopController) -> Self {
+        Self {
+            checkpoint_db: Arc::clone(&ctrl.checkpoint_db),
+            agentic_executor: Arc::clone(&ctrl.agentic_executor),
+            verification_executor: Arc::clone(&ctrl.verification_executor),
+        }
+    }
+
+    /// Mirror of `LoopController::is_task_stopped` — only needs `checkpoint_db`.
+    fn is_task_stopped(&self, execution_id: &str) -> bool {
+        let task_id_to_check = super::types::get_parent_task_id(execution_id);
+        match self.checkpoint_db.get_task_run(&task_id_to_check) {
+            Ok(Some(task)) => {
+                if task.status == "stopped" {
+                    info!(
+                        "Task {} has been stopped externally - aborting workflow",
+                        task_id_to_check
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+            Ok(None) => false,
+            Err(_) => false,
+        }
+    }
 }
 
 // =============================================================================
@@ -446,37 +488,11 @@ impl LoopController {
             );
         }
 
-        // Track config overrides to restore after pipeline completes
-        let mut canary_config_originals: Vec<(String, Option<serde_json::Value>)> = Vec::new();
-
-        // Check for active canary rollouts targeting pipeline agents.
-        // If a canary is active, probabilistically decide whether this run uses the canary config.
-        let active_canary: Option<(String, String)> = {
-            // (canary_id, recommendation_id)
-            match crate::meta_optimizer::canary::get_active_canaries(&self.checkpoint_db) {
-                Ok(canaries) => canaries.into_iter().find_map(|c| {
-                    if crate::meta_optimizer::canary::should_apply_canary(
-                        &self.checkpoint_db,
-                        &c.recommendation_id,
-                    ) {
-                        info!(
-                            "MULTI-AGENT-PIPELINE: Canary rollout {} active for this run ({}%)",
-                            c.id, c.percentage
-                        );
-                        Some((c.id, c.recommendation_id))
-                    } else {
-                        None
-                    }
-                }),
-                Err(_) => None,
-            }
-        };
-        let is_canary_run = active_canary.is_some();
-
-        // For canary runs, load the recommendation's prompt overrides and inject them
-        // into the active_prompt_variants map, replacing any existing variants for those agents.
-        // For baseline runs (non-canary), the existing prompt variants remain as-is.
-        if let Some((_, ref rec_id)) = active_canary {
+        // Canary detection, config overrides, recording, and restoration are handled
+        // at the loop_controller::run() level (shared across all architectures).
+        // Here we only inject prompt overrides, which are pipeline-specific
+        // (they target named agent roles like "implementer", "locator").
+        if let Some((_, ref rec_id)) = config.active_canary {
             match crate::meta_optimizer::canary::get_canary_prompt_overrides(
                 &self.checkpoint_db,
                 rec_id,
@@ -493,39 +509,6 @@ impl LoopController {
                 Err(e) => {
                     warn!(
                         "MULTI-AGENT-PIPELINE: Failed to load canary prompt overrides: {}",
-                        e
-                    );
-                }
-            }
-
-            // For canary config_change recs, temporarily apply config overrides.
-            // Store original values to restore after the pipeline completes.
-            match crate::meta_optimizer::canary::get_canary_config_overrides(
-                &self.checkpoint_db,
-                rec_id,
-            ) {
-                Ok(overrides) => {
-                    for (key, value) in overrides {
-                        // Save original value for restoration
-                        let original = self.checkpoint_db.get_setting(&key).ok().flatten();
-                        canary_config_originals.push((key.clone(), original));
-                        // Apply canary config
-                        if let Err(e) = self.checkpoint_db.set_setting(&key, &value) {
-                            warn!(
-                                "MULTI-AGENT-PIPELINE: Failed to set canary config {}={}: {}",
-                                key, value, e
-                            );
-                        } else {
-                            info!(
-                                "MULTI-AGENT-PIPELINE: Canary injecting config override {}={}",
-                                key, value
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "MULTI-AGENT-PIPELINE: Failed to load canary config overrides: {}",
                         e
                     );
                 }
@@ -994,17 +977,7 @@ Only output the JSON array, nothing else."#,
                     total_tokens: budget_total_tokens,
                     total_cost_usd: budget_total_cost,
                 };
-                // Restore canary config before early return
-                for (key, original) in &canary_config_originals {
-                    match original {
-                        Some(val) => {
-                            let _ = self.checkpoint_db.set_setting(key, val);
-                        }
-                        None => {
-                            let _ = self.checkpoint_db.delete_setting(key);
-                        }
-                    }
-                }
+                // Canary config restoration handled at loop_controller::run() level
                 return result.to_loop_result();
             }
         }
@@ -1072,30 +1045,69 @@ Only output the JSON array, nothing else."#,
             .filter(|s| !checkpoint_completed_ids.contains(&s.id))
             .collect();
 
-        // Process subtrees sequentially via the extracted process_subtree method.
-        // NOTE: Parallel subtree processing (buffer_unordered) requires process_subtree
-        // to not borrow &self — each future must own its dependencies via Arc clones.
-        // This is a larger refactor tracked separately.
+        // Process independent subtrees concurrently using JoinSet.
+        // PipelineShared is Clone + Send + 'static (Arc-only fields), enabling tokio::spawn.
+        // A semaphore bounds concurrency to max_parallel_implementers.
+        let shared = PipelineShared::from_controller(self);
         {
-            for subtree in &pending_subtrees {
-                let output = self
-                    .process_subtree(
-                        subtree,
-                        config,
-                        &pipeline_config,
-                        &dag.levels,
-                        &located_criteria,
-                        &active_prompt_variants,
-                        &active_canary,
-                        is_canary_run,
-                        verification_steps,
-                        has_agentic_steps,
-                        agentic_steps,
-                        logger,
-                        &pipeline_ctx,
-                    )
-                    .await;
+            let max_parallel = pipeline_config.max_parallel_implementers.max(1) as usize;
+            let subtree_count = pending_subtrees.len();
 
+            if subtree_count > 1 && max_parallel > 1 {
+                info!(
+                    "MULTI-AGENT-PIPELINE: Processing {} subtrees with concurrency={}",
+                    subtree_count,
+                    max_parallel.min(subtree_count)
+                );
+            }
+
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallel));
+            let mut join_set = tokio::task::JoinSet::new();
+
+            for subtree in &pending_subtrees {
+                let sem = semaphore.clone();
+                let shared_clone = shared.clone();
+                // Clone all borrowed data for 'static lifetime in spawned task
+                let subtree_owned = (*subtree).clone();
+                let config_owned = config.clone();
+                let pipeline_config_owned = pipeline_config.clone();
+                let dag_levels_owned = dag.levels.clone();
+                let located_owned = located_criteria.clone();
+                let prompts_owned = active_prompt_variants.clone();
+                let vsteps_owned = verification_steps.to_vec();
+                let asteps_owned = agentic_steps.to_vec();
+                let logger_owned = logger.clone();
+                let pctx_owned = pipeline_ctx.clone();
+
+                join_set.spawn(async move {
+                    let _permit = sem.acquire().await.expect("semaphore closed");
+                    shared_clone
+                        .process_subtree(
+                            &subtree_owned,
+                            &config_owned,
+                            &pipeline_config_owned,
+                            &dag_levels_owned,
+                            &located_owned,
+                            &prompts_owned,
+                            &vsteps_owned,
+                            has_agentic_steps,
+                            &asteps_owned,
+                            &logger_owned,
+                            &pctx_owned,
+                        )
+                        .await
+                });
+            }
+
+            // Collect results as subtrees complete
+            while let Some(join_result) = join_set.join_next().await {
+                let output = match join_result {
+                    Ok(o) => o,
+                    Err(e) => {
+                        warn!("MULTI-AGENT-PIPELINE: Subtree task panicked: {}", e);
+                        continue;
+                    }
+                };
                 total_iterations += output.iterations_used;
                 agent_traces.extend(output.traces);
                 pipeline_ctx
@@ -1107,64 +1119,60 @@ Only output the JSON array, nothing else."#,
                 subtree_results.push(output.result.clone());
 
                 // Update checkpoint with this completed subtree so progress survives crashes.
-                {
-                    let cp = PipelineCheckpoint {
-                        last_completed_phase: 5,
-                        criteria: Some(criteria.clone()),
-                        located_criteria: Some(located_criteria.clone()),
-                        completed_subtrees: subtree_results.clone(),
-                        total_iterations,
-                        agent_trace_count: agent_traces.len(),
-                    };
-                    if let Err(e) = crate::database::pipeline_traces::save_pipeline_checkpoint(
-                        &self.checkpoint_db,
-                        &config.execution_id,
-                        &cp,
-                    ) {
-                        warn!("MULTI-AGENT-PIPELINE: Failed to update checkpoint after subtree '{}': {}", subtree.id, e);
-                    }
+                let cp = PipelineCheckpoint {
+                    last_completed_phase: 5,
+                    criteria: Some(criteria.clone()),
+                    located_criteria: Some(located_criteria.clone()),
+                    completed_subtrees: subtree_results.clone(),
+                    total_iterations,
+                    agent_trace_count: agent_traces.len(),
+                };
+                if let Err(e) = crate::database::pipeline_traces::save_pipeline_checkpoint(
+                    &self.checkpoint_db,
+                    &config.execution_id,
+                    &cp,
+                ) {
+                    warn!("MULTI-AGENT-PIPELINE: Failed to update checkpoint: {}", e);
                 }
+            }
 
-                if output.was_stopped {
-                    info!("MULTI-AGENT-PIPELINE: Stopped by user");
-                    let stopped_total_tokens: u64 = agent_traces
-                        .iter()
-                        .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
-                        .sum();
-                    let stopped_total_cost: f64 = agent_traces.iter().map(|t| t.cost_usd).sum();
-                    let stopped_passed_criteria = subtree_results
-                        .iter()
-                        .flat_map(|s| s.level_results.iter())
-                        .flat_map(|l| l.criterion_results.iter())
-                        .filter(|c| c.passed)
-                        .count() as u32;
-                    let result = MultiAgentPipelineResult {
-                        total_iterations,
-                        goal_achieved: false,
-                        was_stopped: true,
-                        max_iterations_reached: false,
-                        subtree_results,
-                        integration_result: None,
-                        agent_traces,
-                        dag: dag.clone(),
-                        total_criteria: criteria.len() as u32,
-                        passed_criteria: stopped_passed_criteria,
-                        total_tokens: stopped_total_tokens,
-                        total_cost_usd: stopped_total_cost,
-                    };
-                    // Restore canary config before early return
-                    for (key, original) in &canary_config_originals {
-                        match original {
-                            Some(val) => {
-                                let _ = self.checkpoint_db.set_setting(key, val);
-                            }
-                            None => {
-                                let _ = self.checkpoint_db.delete_setting(key);
-                            }
-                        }
-                    }
-                    return result.to_loop_result();
-                }
+        }
+
+        // Check for user stop after all parallel subtrees complete.
+        // In parallel mode, we can't break mid-stream, so check after collection.
+        // The process_subtree method checks is_task_stopped at entry and returns
+        // was_stopped=true, so subtrees started after a stop return early.
+        {
+            let any_stopped = self.is_task_stopped(&config.execution_id);
+            if any_stopped {
+                info!("MULTI-AGENT-PIPELINE: Stopped by user");
+                let stopped_total_tokens: u64 = agent_traces
+                    .iter()
+                    .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
+                    .sum();
+                let stopped_total_cost: f64 = agent_traces.iter().map(|t| t.cost_usd).sum();
+                let stopped_passed_criteria = subtree_results
+                    .iter()
+                    .flat_map(|s| s.level_results.iter())
+                    .flat_map(|l| l.criterion_results.iter())
+                    .filter(|c| c.passed)
+                    .count() as u32;
+                let result = MultiAgentPipelineResult {
+                    total_iterations,
+                    goal_achieved: false,
+                    was_stopped: true,
+                    max_iterations_reached: false,
+                    subtree_results,
+                    integration_result: None,
+                    agent_traces,
+                    dag: dag.clone(),
+                    total_criteria: criteria.len() as u32,
+                    passed_criteria: stopped_passed_criteria,
+                    total_tokens: stopped_total_tokens,
+                    total_cost_usd: stopped_total_cost,
+                };
+                // Canary config restoration handled at loop_controller::run() level
+                return result.to_loop_result();
             }
         }
 
@@ -1303,13 +1311,21 @@ Only output the JSON array, nothing else."#,
             );
         }
 
-        // Store the full pipeline result in task run result_data for autoresearch retrieval
-        if let Ok(result_json) = serde_json::to_string(&result) {
-            if let Err(e) = self
-                .checkpoint_db
-                .update_task_run_result_data(&config.execution_id, &result_json)
-            {
-                warn!("Failed to store pipeline result_data: {}", e);
+        // Store the full pipeline result + context in task run result_data for analytics.
+        // PipelineContext provides structured inter-agent data (implementer changes,
+        // verifier failures, locator mappings) that downstream analytics can query.
+        {
+            let result_with_context = serde_json::json!({
+                "pipeline_result": serde_json::to_value(&result).unwrap_or_default(),
+                "pipeline_context": serde_json::to_value(&pipeline_ctx).unwrap_or_default(),
+            });
+            if let Ok(result_json) = serde_json::to_string(&result_with_context) {
+                if let Err(e) = self
+                    .checkpoint_db
+                    .update_task_run_result_data(&config.execution_id, &result_json)
+                {
+                    warn!("Failed to store pipeline result_data: {}", e);
+                }
             }
         }
 
@@ -1322,32 +1338,18 @@ Only output the JSON array, nothing else."#,
             warn!("Failed to clear pipeline checkpoint: {}", e);
         }
 
-        // Restore any canary config overrides to their original values
-        for (key, original) in &canary_config_originals {
-            match original {
-                Some(val) => {
-                    if let Err(e) = self.checkpoint_db.set_setting(key, val) {
-                        warn!(
-                            "MULTI-AGENT-PIPELINE: Failed to restore config {}: {}",
-                            key, e
-                        );
-                    }
-                }
-                None => {
-                    let _ = self.checkpoint_db.delete_setting(key);
-                }
-            }
-        }
-
         result.to_loop_result()
     }
 
+}
+
+impl PipelineShared {
     /// Process a single subtree: iterate through levels, run implementer + verifier
     /// with retries, and return all collected outputs as a `SubtreeOutput`.
     ///
-    /// This method is called from both serial and parallel paths. It takes only
-    /// shared references (`&self`, `&LoopConfig`) so multiple instances can run
-    /// concurrently within the same tokio task via `buffer_unordered`.
+    /// Lives on `PipelineShared` (not `LoopController`) so that an `Arc<PipelineShared>`
+    /// can be cheaply cloned into each `buffer_unordered` future, satisfying
+    /// `Send + 'static` without wrapping the full controller in an Arc.
     #[allow(clippy::too_many_arguments)]
     async fn process_subtree(
         &self,
@@ -1357,8 +1359,6 @@ Only output the JSON array, nothing else."#,
         dag_levels: &[Vec<String>],
         located_criteria: &[LocatedCriterion],
         active_prompt_variants: &std::collections::HashMap<String, String>,
-        active_canary: &Option<(String, String)>,
-        is_canary_run: bool,
         verification_steps: &[ExecutionStepConfig],
         has_agentic_steps: bool,
         agentic_steps: &[ExecutionStepConfig],
@@ -1701,17 +1701,7 @@ Only output the JSON array, nothing else."#,
                     }
                 }
 
-                // Record canary run outcome if this is a canary run
-                if let Some((ref canary_id, _)) = active_canary {
-                    let _ = crate::meta_optimizer::canary::record_canary_run(
-                        &self.checkpoint_db,
-                        canary_id,
-                        is_canary_run,
-                        level_passed,
-                        impl_cost,
-                        (implementer_duration + verifier_duration) as f64,
-                    );
-                }
+                // Canary outcome recording handled at loop_controller::run() level
 
                 info!(
                     "MULTI-AGENT-PIPELINE: Subtree '{}' level {} attempt {} — {} (impl={}ms, verify={}ms, tokens={}+{})",

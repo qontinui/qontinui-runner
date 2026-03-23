@@ -27,6 +27,9 @@ pub struct FailureAnalysis {
     pub generation_quality: GenerationQualityMetrics,
     pub pipeline_agent_failures: Vec<PipelineAgentFailureRecord>,
     pub recurring_issues: Vec<RecurringIssue>,
+    /// Aggregate agentic metric scores over the analysis period.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agentic_metric_summary: Vec<crate::database::agentic_metrics_ops::AgenticMetricAggregate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +126,9 @@ pub fn get_failure_analysis(
             generation_quality: query_generation_quality(conn, &since),
             pipeline_agent_failures: query_pipeline_agent_failures(conn, &since, category),
             recurring_issues: query_recurring_issues(conn, &since, category),
+            agentic_metric_summary: db
+                .get_agentic_metric_aggregates(days as i64)
+                .unwrap_or_default(),
         })
     })
 }

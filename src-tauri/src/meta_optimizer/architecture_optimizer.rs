@@ -55,6 +55,8 @@ pub fn build_config(execution_id: &str, workflow_name: &str) -> LoopConfig {
         multi_agent_pipeline_config: None,
         rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
         iteration_diffs: Vec::new(),
+        active_canary: None,
+        is_canary_run: false,
     }
 }
 
@@ -232,9 +234,13 @@ Only drill into L1/L2 when the L0 summaries show a problem worth investigating.
 2. **Agentic Verification** — AI implements, then verifies in a loop (max_iterations, model, etc.)
 3. **Multi-Agent Pipeline** — DAG-based with spec_analyst → locator → implementer → verifier
 
+You will follow a **Generate → Critique → Refine** loop to produce high-quality recommendations.
+
 ## Your Task
 
-### Step 1: Analyze the Data
+### Phase 1: GENERATE — Analyze Data and Draft Candidates
+
+#### Step 1: Analyze the Data
 
 For each architecture, analyze:
 - Success rate (goal_achieved %)
@@ -243,9 +249,9 @@ For each architecture, analyze:
 - Average cost (USD)
 - Which workflow categories (UI tasks, backend, generation) each handles best
 
-### Step 2: Output Findings (for insights that need code changes)
+#### Step 2: Draft Candidate Findings and Recommendations
 
-For important insights that cannot be implemented via config changes, output:
+For important insights that cannot be implemented via config changes, draft as findings:
 
 ```
 [ARCH_FINDING]
@@ -263,11 +269,63 @@ Examples of correct findings:
 - "Pipeline runs with dag_strategy=parallel outperform sequential by 40%" → ARCH_FINDING (dag_strategy is pipeline config)
 - "Agentic verification succeeds 2x more often for UI tasks" → ARCH_FINDING (architecture selection is per-workflow)
 
-### Step 3: Output Config Recommendations (ONLY for actually configurable parameters)
+For actually configurable parameters, draft config candidates:
 
-ONLY output [CONFIG_RECOMMENDATION] if there is a real settings key that can be changed via `db.set_setting(key, value)`. Currently the only configurable parameters via settings are operational knobs in the dev_mode JSON.
+ONLY output [CONFIG_CANDIDATE] if there is a real settings key that can be changed via `db.set_setting(key, value)`. Currently the only configurable parameters via settings are operational knobs in the dev_mode JSON.
 
-If you have no real config changes to recommend, output ZERO [CONFIG_RECOMMENDATION] markers. That is perfectly acceptable.
+```
+[CONFIG_CANDIDATE]
+candidate_id: <A, B, or C>
+architecture: <agentic_verification|multi_agent_pipeline>
+parameter: <parameter name — must be an actual settings key>
+current_value: <current value>
+recommended_value: <recommended value>
+rationale: <why this change should improve performance>
+expected_impact: <estimated improvement>
+[/CONFIG_CANDIDATE]
+```
+
+For architecture selection recommendations, draft candidates:
+
+```
+[ARCH_CANDIDATE]
+candidate_id: <A, B, or C>
+workflow_category: <all|ui_tasks|backend|generation|testing>
+recommended_architecture: <traditional|agentic_verification|multi_agent_pipeline>
+current_architecture: <what is currently used>
+rationale: <why, with specific metrics>
+evidence: <key data points>
+[/ARCH_CANDIDATE]
+```
+
+### Phase 2: CRITIQUE — Self-Evaluate Each Candidate
+
+For each CONFIG_CANDIDATE and ARCH_CANDIDATE, evaluate:
+
+```
+[ARCH_CRITIQUE]
+candidate_id: <matching candidate_id>
+type: <config|architecture>
+failure_patterns_addressed: <which specific patterns from the data does this address?>
+regression_risk: <what currently-working behavior might this break?>
+duplicate_check: <does this duplicate a previously-rejected recommendation from {{optimizer_context}}?>
+data_support: <how many data points support this? is it statistically significant (>= 5 runs)?>
+verdict: <advance|discard>
+verdict_reason: <why>
+[/ARCH_CRITIQUE]
+```
+
+**Discard a candidate if:**
+- It duplicates a previously-rejected recommendation
+- It has fewer than 5 supporting data points
+- Its regression risk outweighs its expected improvement
+- It targets a parameter that isn't in the settings system (output as ARCH_FINDING instead)
+
+### Phase 3: REFINE — Produce Final Recommendations
+
+From surviving candidates (verdict=advance), produce final recommendations incorporating critique findings.
+
+For config changes:
 
 ```
 [CONFIG_RECOMMENDATION]
@@ -276,14 +334,12 @@ parameter: <parameter name — must be an actual settings key>
 current_value: <current value>
 recommended_value: <recommended value>
 confidence: <0.0 to 1.0>
-rationale: <why this change should improve performance>
+rationale: <why this change should improve performance, referencing critique findings>
 expected_impact: <estimated improvement>
 [/CONFIG_RECOMMENDATION]
 ```
 
-### Step 4: Architecture Selection Recommendations (if supported by data)
-
-If one architecture consistently outperforms others for certain categories, recommend it as an ARCH_RECOMMENDATION. Note: these are advisory — architecture selection is per-workflow in LoopConfig and cannot be changed globally via settings.
+For architecture selection:
 
 ```
 [ARCH_RECOMMENDATION]
@@ -291,10 +347,12 @@ workflow_category: <all|ui_tasks|backend|generation|testing>
 recommended_architecture: <traditional|agentic_verification|multi_agent_pipeline>
 current_architecture: <what is currently used>
 confidence: <0.0 to 1.0>
-rationale: <why, with specific metrics>
+rationale: <why, with specific metrics, referencing critique findings>
 evidence: <key data points>
 [/ARCH_RECOMMENDATION]
 ```
+
+If you have no candidates that survive critique, output ZERO recommendation markers. That is perfectly acceptable — it means the current configuration is adequate or the data is insufficient.
 
 ## Quality Gate
 
@@ -302,6 +360,7 @@ evidence: <key data points>
 - **Do NOT produce CONFIG_RECOMMENDATION for parameters that aren't in the settings system.** Output findings instead.
 - **Do NOT duplicate previous recommendations.** Check the optimizer_context for what was already recommended.
 - **If the data is insufficient, say so explicitly and produce no recommendations.** A clear "insufficient data" analysis is more valuable than guessing.
+- **Critique required.** Every CONFIG_RECOMMENDATION and ARCH_RECOMMENDATION must have a corresponding ARCH_CRITIQUE with verdict=advance. Recommendations without critique are invalid.
 
 ## Important Guidelines
 

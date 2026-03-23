@@ -14,6 +14,8 @@ pub fn compute_aggregate(trials: &[TrialResult]) -> AggregateMetrics {
             mean_duration_ms: 0.0,
             trial_count: 0,
             mean_spec_compliance: None,
+            mean_composite_agentic_score: None,
+            mean_agentic_scores: None,
         };
     }
 
@@ -33,13 +35,54 @@ pub fn compute_aggregate(trials: &[TrialResult]) -> AggregateMetrics {
         Some(compliance_scores.iter().sum::<f64>() / compliance_scores.len() as f64)
     };
 
+    // Compute mean composite agentic score from trials that have one
+    let agentic_scores: Vec<f64> = trials
+        .iter()
+        .filter_map(|t| t.composite_agentic_score)
+        .collect();
+    let mean_composite_agentic_score = if agentic_scores.is_empty() {
+        None
+    } else {
+        Some(agentic_scores.iter().sum::<f64>() / agentic_scores.len() as f64)
+    };
+
+    // Compute per-metric mean scores across trials
+    let mean_agentic_scores = compute_per_metric_means(trials);
+
     AggregateMetrics {
         pass_rate: passed / n,
         mean_iterations: total_iter / n,
         mean_duration_ms: total_dur / n,
         trial_count: trials.len() as u32,
         mean_spec_compliance,
+        mean_composite_agentic_score,
+        mean_agentic_scores,
     }
+}
+
+/// Compute per-metric mean scores across trials that have agentic_scores.
+fn compute_per_metric_means(trials: &[TrialResult]) -> Option<HashMap<String, f64>> {
+    let mut sums: HashMap<String, (f64, u32)> = HashMap::new();
+
+    for trial in trials {
+        if let Some(ref scores) = trial.agentic_scores {
+            for (metric, score) in scores {
+                let entry = sums.entry(metric.clone()).or_insert((0.0, 0));
+                entry.0 += score;
+                entry.1 += 1;
+            }
+        }
+    }
+
+    if sums.is_empty() {
+        return None;
+    }
+
+    Some(
+        sums.into_iter()
+            .map(|(metric, (sum, count))| (metric, sum / count as f64))
+            .collect(),
+    )
 }
 
 /// Compute aggregate metrics with multi-workflow aggregation strategy.
@@ -111,12 +154,26 @@ pub fn compute_aggregate_multi_workflow(
         Some(compliance_scores.iter().sum::<f64>() / compliance_scores.len() as f64)
     };
 
+    let agentic_scores: Vec<f64> = trials
+        .iter()
+        .filter_map(|t| t.composite_agentic_score)
+        .collect();
+    let mean_composite_agentic_score = if agentic_scores.is_empty() {
+        None
+    } else {
+        Some(agentic_scores.iter().sum::<f64>() / agentic_scores.len() as f64)
+    };
+
+    let mean_agentic_scores = compute_per_metric_means(trials);
+
     AggregateMetrics {
         pass_rate: combined_pass_rate,
         mean_iterations: total_iter / n,
         mean_duration_ms: total_dur / n,
         trial_count: trials.len() as u32,
         mean_spec_compliance,
+        mean_composite_agentic_score,
+        mean_agentic_scores,
     }
 }
 
@@ -166,6 +223,13 @@ pub fn compare_to_control(
             criteria,
         ),
         PrimaryMetric::SpecCompliance => compare_spec_compliance(
+            experiment,
+            control,
+            experiment_trials,
+            control_trials,
+            criteria,
+        ),
+        PrimaryMetric::CompositeAgentic => compare_composite_agentic(
             experiment,
             control,
             experiment_trials,
@@ -334,27 +398,12 @@ fn compare_spec_compliance(
         .sum();
 
     let p_value = if exp_total >= 2 && ctrl_total >= 2 {
-        let p_exp = exp_passed as f64 / exp_total as f64;
-        let p_ctrl = ctrl_passed as f64 / ctrl_total as f64;
-        let total = (exp_total + ctrl_total) as f64;
-        let p_pool = (exp_passed + ctrl_passed) as f64 / total;
-
-        if p_pool == 0.0 || p_pool == 1.0 {
-            if p_exp > p_ctrl {
-                Some(0.0)
-            } else {
-                Some(1.0)
-            }
-        } else {
-            let se = (p_pool * (1.0 - p_pool) * (1.0 / exp_total as f64 + 1.0 / ctrl_total as f64))
-                .sqrt();
-            if se > 0.0 {
-                let z = (p_exp - p_ctrl) / se;
-                Some(1.0 - normal_cdf(z))
-            } else {
-                None
-            }
-        }
+        Some(crate::stats::proportion_z_test_onesided(
+            exp_passed as u64,
+            exp_total as u64,
+            ctrl_passed as u64,
+            ctrl_total as u64,
+        ))
     } else {
         None
     };
@@ -365,6 +414,76 @@ fn compare_spec_compliance(
     let mut reason = format!(
         "spec_compliance: experiment={:.3}, control={:.3}, ratio={:.3} (threshold={:.3})",
         exp_compliance, ctrl_compliance, ratio, criteria.min_improvement_ratio,
+    );
+    if let Some(p) = p_value {
+        reason.push_str(&format!(
+            ", p={:.4} (threshold={:.2})",
+            p, criteria.significance_threshold
+        ));
+        if ratio_ok && !sig_ok {
+            reason.push_str(" [ratio OK but not significant]");
+        }
+    }
+
+    (accepted, reason, p_value)
+}
+
+/// Compare composite agentic scores (higher is better).
+///
+/// Uses Welch's t-test on per-trial composite agentic scores for significance.
+fn compare_composite_agentic(
+    experiment: &AggregateMetrics,
+    control: &AggregateMetrics,
+    experiment_trials: &[TrialResult],
+    control_trials: &[TrialResult],
+    criteria: &AcceptanceCriteria,
+) -> (bool, String, Option<f64>) {
+    let exp_score = experiment.mean_composite_agentic_score.unwrap_or(0.0);
+    let ctrl_score = control.mean_composite_agentic_score.unwrap_or(0.0);
+
+    if ctrl_score == 0.0 && exp_score > 0.0 {
+        return (
+            true,
+            format!(
+                "composite_agentic: experiment={:.3}, control=0 (infinite improvement)",
+                exp_score
+            ),
+            None,
+        );
+    }
+    if ctrl_score == 0.0 && exp_score == 0.0 {
+        return (
+            false,
+            "composite_agentic: both experiment and control are 0 — no improvement".into(),
+            None,
+        );
+    }
+
+    let ratio = exp_score / ctrl_score;
+    let ratio_ok = ratio >= criteria.min_improvement_ratio;
+
+    // Welch's t-test on composite scores
+    let exp_vals: Vec<f64> = experiment_trials
+        .iter()
+        .filter_map(|t| t.composite_agentic_score)
+        .collect();
+    let ctrl_vals: Vec<f64> = control_trials
+        .iter()
+        .filter_map(|t| t.composite_agentic_score)
+        .collect();
+
+    let p_value = if exp_vals.len() >= 2 && ctrl_vals.len() >= 2 {
+        Some(welch_t_test(&exp_vals, &ctrl_vals))
+    } else {
+        None
+    };
+
+    let sig_ok = p_value.is_none_or(|p| p <= criteria.significance_threshold);
+    let accepted = ratio_ok && sig_ok;
+
+    let mut reason = format!(
+        "composite_agentic: experiment={:.3}, control={:.3}, ratio={:.3} (threshold={:.3})",
+        exp_score, ctrl_score, ratio, criteria.min_improvement_ratio,
     );
     if let Some(p) = p_value {
         reason.push_str(&format!(
@@ -453,6 +572,8 @@ mod tests {
                 spec_compliance_score: None,
                 spec_assertions_passed: None,
                 spec_assertions_total: None,
+                composite_agentic_score: None,
+                agentic_scores: None,
             },
             TrialResult {
                 task_run_id: "t2".into(),
@@ -463,6 +584,8 @@ mod tests {
                 spec_compliance_score: None,
                 spec_assertions_passed: None,
                 spec_assertions_total: None,
+                composite_agentic_score: None,
+                agentic_scores: None,
             },
         ];
         let agg = compute_aggregate(&trials);
@@ -484,6 +607,8 @@ mod tests {
                 spec_compliance_score: None,
                 spec_assertions_passed: None,
                 spec_assertions_total: None,
+                composite_agentic_score: None,
+                agentic_scores: None,
             },
             TrialResult {
                 task_run_id: "e2".into(),
@@ -494,6 +619,8 @@ mod tests {
                 spec_compliance_score: None,
                 spec_assertions_passed: None,
                 spec_assertions_total: None,
+                composite_agentic_score: None,
+                agentic_scores: None,
             },
             TrialResult {
                 task_run_id: "e3".into(),
@@ -504,6 +631,8 @@ mod tests {
                 spec_compliance_score: None,
                 spec_assertions_passed: None,
                 spec_assertions_total: None,
+                composite_agentic_score: None,
+                agentic_scores: None,
             },
         ];
         let ctrl_trials = vec![
@@ -516,6 +645,8 @@ mod tests {
                 spec_compliance_score: None,
                 spec_assertions_passed: None,
                 spec_assertions_total: None,
+                composite_agentic_score: None,
+                agentic_scores: None,
             },
             TrialResult {
                 task_run_id: "c2".into(),
@@ -526,6 +657,8 @@ mod tests {
                 spec_compliance_score: None,
                 spec_assertions_passed: None,
                 spec_assertions_total: None,
+                composite_agentic_score: None,
+                agentic_scores: None,
             },
             TrialResult {
                 task_run_id: "c3".into(),
@@ -536,6 +669,8 @@ mod tests {
                 spec_compliance_score: None,
                 spec_assertions_passed: None,
                 spec_assertions_total: None,
+                composite_agentic_score: None,
+                agentic_scores: None,
             },
         ];
         let exp_agg = compute_aggregate(&exp_trials);
@@ -559,6 +694,8 @@ mod tests {
                 spec_compliance_score: None,
                 spec_assertions_passed: None,
                 spec_assertions_total: None,
+                composite_agentic_score: None,
+                agentic_scores: None,
             },
             TrialResult {
                 task_run_id: "e2".into(),
@@ -569,6 +706,8 @@ mod tests {
                 spec_compliance_score: None,
                 spec_assertions_passed: None,
                 spec_assertions_total: None,
+                composite_agentic_score: None,
+                agentic_scores: None,
             },
         ];
         let ctrl_trials = vec![
@@ -581,6 +720,8 @@ mod tests {
                 spec_compliance_score: None,
                 spec_assertions_passed: None,
                 spec_assertions_total: None,
+                composite_agentic_score: None,
+                agentic_scores: None,
             },
             TrialResult {
                 task_run_id: "c2".into(),
@@ -591,6 +732,8 @@ mod tests {
                 spec_compliance_score: None,
                 spec_assertions_passed: None,
                 spec_assertions_total: None,
+                composite_agentic_score: None,
+                agentic_scores: None,
             },
         ];
         let exp_agg = compute_aggregate(&exp_trials);

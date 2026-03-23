@@ -57,6 +57,11 @@ impl AgenticExecutor {
         self.ai_executor.session_manager = Some(sm);
     }
 
+    /// Set the middleware chain on the inner AI session executor.
+    pub fn set_middleware_chain(&mut self, chain: crate::ai_provider::middleware::AiMiddlewareChain) {
+        self.ai_executor.middleware_chain = Some(chain);
+    }
+
     /// Set the reflection fix context for parsing [REFLECTION_FIX:...] markers.
     pub fn set_reflection_fix_ctx(&mut self, ctx: crate::mcp::shared::ReflectionFixContext) {
         self.reflection_fix_ctx = Some(ctx);
@@ -613,6 +618,42 @@ impl AgenticExecutor {
                     format!("{}\n\n{}", enhanced_prompt, ctx)
                 }
                 None => enhanced_prompt,
+            }
+        } else {
+            enhanced_prompt
+        };
+
+        // Inject canary prompt overrides for non-pipeline architectures.
+        // The multi-agent pipeline injects its own prompt overrides via active_prompt_variants
+        // in the pipeline loop, so we skip injection here for pipeline runs to avoid duplication.
+        let is_pipeline = matches!(
+            config.workflow_architecture,
+            Some(crate::autoresearch::agentic_verification::WorkflowArchitecture::MultiAgentPipeline)
+        );
+        let enhanced_prompt = if !is_pipeline {
+            if let Some((_, ref rec_id)) = config.active_canary {
+                match crate::meta_optimizer::canary::get_canary_prompt_overrides(
+                    &self.checkpoint_db,
+                    rec_id,
+                ) {
+                    Ok(overrides) => {
+                        if let Some(override_prompt) = overrides.get("implementer") {
+                            info!(
+                                "AGENTIC-PHASE: Canary injecting implementer prompt override ({} chars)",
+                                override_prompt.len()
+                            );
+                            format!(
+                                "{}\n\n## Optimized Agent Instructions\n\n{}",
+                                enhanced_prompt, override_prompt
+                            )
+                        } else {
+                            enhanced_prompt
+                        }
+                    }
+                    Err(_) => enhanced_prompt,
+                }
+            } else {
+                enhanced_prompt
             }
         } else {
             enhanced_prompt

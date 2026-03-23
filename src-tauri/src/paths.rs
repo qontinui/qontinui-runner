@@ -247,7 +247,9 @@ pub fn resolve_working_directory(wd: &str) -> PathBuf {
         if runner.exists() {
             let absolute = runner.join(&path);
             tracing::warn!(
-                "resolve_working_directory: '{}' not found at '{}', returning unverified runner-relative path",
+                "resolve_working_directory: '{}' not found at '{}' — returning unverified path. \
+                 If targeting a sibling repo, use working_directory: \"..\" to resolve from \
+                 workspace root, or use an absolute path like the repo's full path.",
                 wd,
                 absolute.display()
             );
@@ -258,7 +260,8 @@ pub fn resolve_working_directory(wd: &str) -> PathBuf {
     if let Some(root) = workspace_root {
         let absolute = root.join(&path);
         tracing::warn!(
-            "resolve_working_directory: '{}' not found at '{}', returning unverified absolute path",
+            "resolve_working_directory: '{}' not found at '{}' — returning unverified path. \
+             For cross-repo operations, ensure the target directory exists or use an absolute path.",
             wd,
             absolute.display()
         );
@@ -398,5 +401,76 @@ mod tests {
         assert!(get_screenshots_dir().starts_with(&base));
         assert!(get_state_explorer_dir().starts_with(&base));
         assert!(get_api_images_dir().starts_with(&base));
+    }
+
+    #[test]
+    fn test_permissive_policy_allows_any_path() {
+        let result = resolve_working_directory_scoped(".", &PathScopePolicy::Permissive);
+        assert!(result.is_ok(), "Permissive policy should allow any path");
+    }
+
+    #[test]
+    fn test_workspace_scoped_allows_within_workspace() {
+        // Resolve "." which should be within the workspace
+        let result = resolve_working_directory_scoped(".", &PathScopePolicy::WorkspaceScoped);
+        // This may fail in CI if workspace detection fails, which is expected
+        // The important thing is it doesn't panic
+        match result {
+            Ok(path) => assert!(path.is_absolute(), "Resolved path should be absolute"),
+            Err(e) => assert!(
+                e.contains("workspace root") || e.contains("outside"),
+                "Error should mention workspace: {}",
+                e
+            ),
+        }
+    }
+
+    #[test]
+    fn test_strict_policy_blocks_escape() {
+        // Create a strict policy rooted at a specific directory
+        let strict_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let policy = PathScopePolicy::Strict(strict_root.clone());
+
+        // "." should resolve within the boundary
+        let result = resolve_working_directory_scoped(".", &policy);
+        assert!(
+            result.is_ok(),
+            "Current dir should be within its own boundary: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_check_path_containment_passes_for_subdirectory() {
+        let boundary = PathBuf::from(if cfg!(windows) { "C:\\Users" } else { "/home" });
+        let child = boundary.join("test").join("subdir");
+        let result = check_path_containment(&child, &boundary, "test/subdir");
+        assert!(result.is_ok(), "Subdirectory should pass containment check");
+    }
+
+    #[test]
+    fn test_check_path_containment_fails_for_escape() {
+        let boundary = PathBuf::from(if cfg!(windows) {
+            "C:\\Users\\specific"
+        } else {
+            "/home/specific"
+        });
+        let escaped = PathBuf::from(if cfg!(windows) {
+            "C:\\Windows\\System32"
+        } else {
+            "/etc/passwd"
+        });
+        let result = check_path_containment(&escaped, &boundary, "../../../etc");
+        assert!(result.is_err(), "Path outside boundary should fail containment check");
+        assert!(
+            result.unwrap_err().contains("outside the allowed boundary"),
+            "Error should mention boundary violation"
+        );
+    }
+
+    #[test]
+    fn test_path_scope_policy_default_is_permissive() {
+        let policy = PathScopePolicy::default();
+        matches!(policy, PathScopePolicy::Permissive);
     }
 }

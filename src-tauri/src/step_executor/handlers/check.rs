@@ -195,12 +195,15 @@ impl StepHandler for CheckHandler {
             match crate::paths::resolve_working_directory_scoped(wd, &context.path_scope_policy) {
                 Ok(resolved) => {
                     if !resolved.exists() {
-                        warn!(
-                            "Check '{}': working directory does not exist: {} (resolved from '{}')",
-                            step_name,
+                        let err_msg = format!(
+                            "Working directory does not exist: {} (resolved from '{}'). \
+                             For cross-repo paths, use working_directory: \"..\" to resolve \
+                             from the workspace root, or use an absolute path.",
                             resolved.display(),
-                            wd
+                            wd,
                         );
+                        warn!("Check '{}': {}", step_name, err_msg);
+                        return StepHandlerResult::failure(err_msg);
                     }
                     cmd.current_dir(&resolved);
                 }

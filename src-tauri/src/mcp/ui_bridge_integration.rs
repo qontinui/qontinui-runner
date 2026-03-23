@@ -316,13 +316,27 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
         framework = Framework::PlainHtml;
     }
 
-    // Detect Rust/Axum server framework from Cargo.toml (check project dir and parent)
+    // Detect Rust/Axum server framework from Cargo.toml (check project dir and parent).
+    // Use canonicalize to resolve symlinks safely. Check for "axum" specifically in
+    // the [dependencies] section to avoid false positives from comments or workspace members.
     if server_framework == ServerFramework::None {
-        for cargo_dir in &[project_path.clone(), project_path.join("..").to_path_buf()] {
+        let dirs_to_check: Vec<PathBuf> = vec![
+            project_path.clone(),
+            project_path.join(".."),
+        ];
+        for cargo_dir in dirs_to_check {
+            let cargo_dir = cargo_dir.canonicalize().unwrap_or(cargo_dir);
             let cargo_path = cargo_dir.join("Cargo.toml");
             if cargo_path.exists() {
                 if let Ok(cargo_content) = tokio::fs::read_to_string(&cargo_path).await {
-                    if cargo_content.contains("axum") {
+                    // Look for axum in [dependencies] section specifically
+                    let in_deps = cargo_content
+                        .lines()
+                        .skip_while(|line| !line.starts_with("[dependencies]"))
+                        .skip(1)
+                        .take_while(|line| !line.starts_with('['))
+                        .any(|line| line.starts_with("axum"));
+                    if in_deps {
                         server_framework = ServerFramework::Axum;
                         break;
                     }
@@ -751,9 +765,7 @@ async fn integrate_source(
         ServerFramework::None => {
             // For React (non-Next.js) apps with no server framework detected,
             // offer the standalone server option.
-            if analysis.framework == Framework::React
-                && analysis.server_framework == ServerFramework::None
-            {
+            if analysis.framework == Framework::React {
                 integrate_standalone_server(&project, &mut modifications, &mut warnings).await;
                 next_steps.push(
                     "Server-side: No server framework detected. Created a standalone UI Bridge server file. Run it with: npx tsx ui-bridge-server.ts"
@@ -1371,12 +1383,12 @@ const relay = new CommandRelay();
 const handlers = createRelayHandlers(relay);
 
 const server = new StandaloneServer(handlers, {
-  port: 4200,
+  port: 4201,
   cors: true,
 });
 
 server.start().then(() => {
-  console.log('UI Bridge server running on http://localhost:4200');
+  console.log('UI Bridge server running on http://localhost:4201');
 });
 "#;
 
@@ -1548,6 +1560,24 @@ async fn handle_preview(
                         &mut warnings,
                     )
                     .await;
+                }
+                _ => {}
+            }
+
+            // Include server-side integration files in preview
+            match analysis.server_framework {
+                ServerFramework::Express => {
+                    integrate_express_server(
+                        &project,
+                        &analysis,
+                        &mut modifications,
+                        &mut warnings,
+                    )
+                    .await;
+                }
+                ServerFramework::None if analysis.framework == Framework::React => {
+                    integrate_standalone_server(&project, &mut modifications, &mut warnings)
+                        .await;
                 }
                 _ => {}
             }

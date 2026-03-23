@@ -314,17 +314,32 @@ pub struct HookResult {
 /// Executes hooks based on triggers.
 pub struct HookExecutor {
     hooks: Vec<Hook>,
+    app_handle: Option<tauri::AppHandle>,
 }
 
 impl HookExecutor {
     /// Create a new hook executor with the given hooks.
     pub fn new(hooks: Vec<Hook>) -> Self {
-        Self { hooks }
+        Self {
+            hooks,
+            app_handle: None,
+        }
+    }
+
+    /// Create a new hook executor with hooks and an app handle for notifications.
+    pub fn with_app_handle(hooks: Vec<Hook>, app_handle: tauri::AppHandle) -> Self {
+        Self {
+            hooks,
+            app_handle: Some(app_handle),
+        }
     }
 
     /// Create an empty hook executor.
     pub fn empty() -> Self {
-        Self { hooks: Vec::new() }
+        Self {
+            hooks: Vec::new(),
+            app_handle: None,
+        }
     }
 
     /// Add a hook.
@@ -589,20 +604,27 @@ impl HookExecutor {
         }
     }
 
-    /// Execute a notification action.
+    /// Execute a notification action using the Tauri notification plugin.
     fn execute_notification(&self, title: &str, body: &str, context: &HookContext) {
+        use tauri_plugin_notification::NotificationExt;
+
         let title = context.substitute(title);
         let body = context.substitute(body);
 
         info!("Notification: {} - {}", title, body);
 
-        if let Err(e) = notify_rust::Notification::new()
-            .summary(&title)
-            .body(&body)
-            .appname("Qontinui Runner")
-            .show()
-        {
-            warn!("Failed to send system notification: {}", e);
+        if let Some(ref handle) = self.app_handle {
+            if let Err(e) = handle
+                .notification()
+                .builder()
+                .title(&title)
+                .body(&body)
+                .show()
+            {
+                warn!("Failed to send system notification: {}", e);
+            }
+        } else {
+            debug!("Notification skipped — no app handle (test context)");
         }
     }
 

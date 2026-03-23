@@ -13,10 +13,18 @@
 //! - `mod` — Core types, composite scoring, `compute_deterministic()`
 //! - `task_completion` — Score from outcome status + verification results
 //! - `step_efficiency` — Score from iterations vs baseline, zero-iter → 0.0
+//! - `tool_correctness` — Tools used vs expected tool baselines
+//! - `argument_correctness` — Pipeline trace input/output schema validation
+//! - `llm_judge` — Batched LLM-as-judge for plan adherence, goal accuracy, plan quality
 //! - `rag_*` (future) — RAG retrieval quality metrics
 
+pub mod argument_correctness;
+pub mod llm_judge;
+pub mod rag_judge;
+pub mod scoring;
 pub mod step_efficiency;
 pub mod task_completion;
+pub mod tool_correctness;
 
 use serde::{Deserialize, Serialize};
 
@@ -137,16 +145,43 @@ pub struct DeterministicInput {
     pub max_iterations_reached: bool,
     pub duration_secs: f64,
     pub error_type: Option<String>,
+    /// Tools used during the workflow run (from learning_outcomes.tools_used JSON).
+    pub tools_used: Vec<String>,
+    /// Pipeline agent trace snapshots for argument correctness validation.
+    /// Empty for traditional architecture runs (no traces).
+    pub agent_traces: Vec<argument_correctness::TraceSnapshot>,
+}
+
+/// Optional learned baselines for deterministic scoring.
+#[derive(Debug, Clone, Default)]
+pub struct LearnedBaselines {
+    pub step_baseline: Option<step_efficiency::StepBaseline>,
+    pub tool_baseline: Option<tool_correctness::ToolBaseline>,
 }
 
 /// Compute all deterministic (zero LLM cost) agentic metrics for a run.
 ///
-/// Currently scores: TaskCompletion, StepEfficiency.
-/// Phase 2 will add: ToolCorrectness, ArgumentCorrectness.
-pub fn compute_deterministic(input: &DeterministicInput) -> Vec<MetricResult> {
+/// Scores: TaskCompletion, StepEfficiency, ToolCorrectness, ArgumentCorrectness.
+/// Pass `baselines` to use learned baselines instead of defaults.
+pub fn compute_deterministic(
+    input: &DeterministicInput,
+    baselines: &LearnedBaselines,
+) -> Vec<MetricResult> {
+    let tool_input = tool_correctness::ToolCorrectnessInput {
+        tools_used: input.tools_used.clone(),
+        zero_iterations: input.iterations == 0,
+    };
+
+    let arg_input = argument_correctness::ArgumentCorrectnessInput {
+        traces: input.agent_traces.clone(),
+        zero_iterations: input.iterations == 0,
+    };
+
     vec![
         task_completion::score(input),
-        step_efficiency::score(input, None),
+        step_efficiency::score(input, baselines.step_baseline.as_ref()),
+        tool_correctness::score(&tool_input, baselines.tool_baseline.as_ref()),
+        argument_correctness::score(&arg_input),
     ]
 }
 
@@ -192,16 +227,20 @@ mod tests {
             max_iterations_reached: false,
             duration_secs: 100.0,
             error_type: None,
+            tools_used: vec!["read_file".to_string()],
+            agent_traces: vec![],
         }
     }
 
     #[test]
-    fn test_compute_deterministic_returns_two_scores() {
+    fn test_compute_deterministic_returns_four_scores() {
         let input = make_input("success", true, 2);
-        let scores = compute_deterministic(&input);
-        assert_eq!(scores.len(), 2);
+        let scores = compute_deterministic(&input, &LearnedBaselines::default());
+        assert_eq!(scores.len(), 4);
         assert_eq!(scores[0].metric, AgenticMetric::TaskCompletion);
         assert_eq!(scores[1].metric, AgenticMetric::StepEfficiency);
+        assert_eq!(scores[2].metric, AgenticMetric::ToolCorrectness);
+        assert_eq!(scores[3].metric, AgenticMetric::ArgumentCorrectness);
     }
 
     #[test]

@@ -199,8 +199,8 @@ pub fn should_launch_fixer_excluding(
                 .unwrap_or(false);
 
             if verification_passed {
-                debug!(
-                    "Skipping fixer for {} — source run passed verification",
+                info!(
+                    "Skipping fixer — parent workflow passed successfully (source: {})",
                     source_id
                 );
                 return Ok(false);

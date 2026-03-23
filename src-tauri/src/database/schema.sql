@@ -951,6 +951,13 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     -- Durable Execution (v139) — Conductor-inspired rollback policy
     rollback_policy TEXT DEFAULT 'none',  -- 'none' | 'last_good' | 'clean' — automatic git rollback on failure
 
+    -- CWD and tool filtering
+    strict_cwd INTEGER DEFAULT 0,  -- 0 = disabled (default), 1 = enforce strict CWD
+    tool_tags TEXT DEFAULT '[]',   -- JSON array of tool tag strings
+
+    -- Token budget enforcement
+    enforce_token_budget INTEGER DEFAULT 0,  -- 0 = warn only (default), 1 = stop execution on budget exceeded
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -3067,12 +3074,18 @@ CREATE TABLE IF NOT EXISTS pipeline_agent_traces (
     cost_usd REAL NOT NULL DEFAULT 0.0,
     downstream_success INTEGER,            -- NULL until backfilled; 0/1
     output_quality_score REAL,             -- NULL until scored
+    parent_span_id TEXT,                   -- Parent span ID for span hierarchy (v132)
+    span_type TEXT DEFAULT 'agent',        -- 'agent', 'tool', 'guardrail', 'handoff' (v132)
+    guardrail_results_json TEXT,           -- JSON: guardrail evaluation results (v132)
+    handoff_context_json TEXT,             -- JSON: context passed during agent handoffs (v132)
     created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_task_run ON pipeline_agent_traces(task_run_id);
 CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_agent_type ON pipeline_agent_traces(agent_type);
 CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_run_id ON pipeline_agent_traces(run_id);
+CREATE INDEX IF NOT EXISTS idx_pipeline_traces_parent_span ON pipeline_agent_traces(parent_span_id);
+CREATE INDEX IF NOT EXISTS idx_pipeline_traces_span_type ON pipeline_agent_traces(span_type);
 
 -- Stores prompt variants for pipeline agents. The optimizer creates new variants;
 -- humans activate them from the UI. Only one variant per agent_type can be active.
@@ -3110,7 +3123,9 @@ CREATE TABLE IF NOT EXISTS meta_optimizer_recommendations (
     outcome_after_apply TEXT,              -- JSON: measured impact after application
     optimizer_run_id TEXT,                 -- FK to meta_optimizer_runs
     created_at TEXT NOT NULL,
-    content_hash TEXT                      -- SHA256 of (optimizer_type, rec_type, target_agent, recommended_value) for dedup
+    content_hash TEXT,                     -- SHA256 of (optimizer_type, rec_type, target_agent, recommended_value) for dedup
+    eval_result_id TEXT,                   -- FK to eval_results (if evaluated before apply)
+    eval_status TEXT                       -- 'untested', 'passed', 'failed', 'inconclusive'
 );
 
 CREATE INDEX IF NOT EXISTS idx_meta_optimizer_recs_type ON meta_optimizer_recommendations(optimizer_type);
@@ -3430,3 +3445,23 @@ CREATE INDEX IF NOT EXISTS idx_model_profiles_model ON model_profiles(model_id);
 -- are added via ALTER TABLE in migration 141 (not repeatable in CREATE TABLE).
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (141, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (142, datetime('now'));
+
+-- =============================================================================
+-- Canary Run Records Table (migration 144)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS canary_run_records (
+    id TEXT PRIMARY KEY,
+    canary_id TEXT NOT NULL,
+    is_canary INTEGER NOT NULL,
+    task_run_id TEXT,
+    success INTEGER NOT NULL,
+    cost_usd REAL DEFAULT 0.0,
+    duration_ms REAL DEFAULT 0.0,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_canary_run_records ON canary_run_records(canary_id, is_canary);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (144, datetime('now'));

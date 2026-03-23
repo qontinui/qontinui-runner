@@ -359,23 +359,41 @@ struct RuleExample {
 /// When a rule has `examples_json`, up to 2 examples are appended as
 /// GOOD/BAD pairs to provide concrete demonstrations (PromptWizard-inspired).
 pub fn format_rules_as_markdown(rules: &[GenerationRule]) -> String {
+    format_rules_as_markdown_with_examples(rules, false)
+}
+
+/// Format rules as markdown, optionally including examples for all rules.
+///
+/// By default (and via `format_rules_as_markdown`), examples are only rendered
+/// for **critical-severity** rules to keep prompt context tight. Pass
+/// `all_examples = true` to render examples for every rule that has them
+/// (useful in fixer iterations where the extra context is worth the tokens).
+pub fn format_rules_as_markdown_with_examples(
+    rules: &[GenerationRule],
+    all_examples: bool,
+) -> String {
     rules
         .iter()
         .map(|r| {
             let mut s = format!("{}. **{}**: {}", r.rule_number, r.title, r.content);
 
-            // Append up to 2 synthetic examples if present
-            if let Some(ref json) = r.examples_json {
-                if let Ok(examples) = serde_json::from_str::<Vec<RuleExample>>(json) {
-                    for ex in examples.iter().take(2) {
-                        let label = if ex.example_type == "positive" {
-                            "GOOD"
-                        } else {
-                            "BAD"
-                        };
-                        s.push_str(&format!("\n   - {}: `{}`", label, ex.output));
-                        if !ex.explanation.is_empty() {
-                            s.push_str(&format!(" — {}", ex.explanation));
+            // Append up to 2 synthetic examples if present.
+            // Only render examples for critical-severity rules by default,
+            // to avoid inflating prompt context with examples on every rule.
+            let show_examples = all_examples || r.severity == "critical";
+            if show_examples {
+                if let Some(ref json) = r.examples_json {
+                    if let Ok(examples) = serde_json::from_str::<Vec<RuleExample>>(json) {
+                        for ex in examples.iter().take(2) {
+                            let label = if ex.example_type == "positive" {
+                                "GOOD"
+                            } else {
+                                "BAD"
+                            };
+                            s.push_str(&format!("\n   - {}: `{}`", label, ex.output));
+                            if !ex.explanation.is_empty() {
+                                s.push_str(&format!(" — {}", ex.explanation));
+                            }
                         }
                     }
                 }

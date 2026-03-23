@@ -908,6 +908,8 @@ function RunnerWorkflowBuilderInner({
         stages: workflow.stages,
         stop_on_failure: workflow.stop_on_failure,
         reflection_mode: workflow.reflection_mode,
+        strict_cwd: workflow.strict_cwd,
+        tool_tags: workflow.tool_tags,
         use_worktree: workflow.use_worktree,
         multi_agent_mode: workflow.multi_agent_mode,
         workflow_architecture: workflow.workflow_architecture,

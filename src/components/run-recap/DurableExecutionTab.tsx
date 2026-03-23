@@ -345,8 +345,6 @@ export function DurableExecutionTab({ taskRunId }: DurableExecutionTabProps) {
         {
           executionId: taskRunId,
           targetIteration: iteration,
-          // The working_dir is determined by the commit context, not passed from UI
-          workingDir: ".",
         },
       );
       setRollbackResult({ success: true, message: result });

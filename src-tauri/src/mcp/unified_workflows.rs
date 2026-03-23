@@ -1885,8 +1885,8 @@ pub async fn execute_inline_workflow(
             max_sessions: Some(workflow.max_iterations),
             auto_run_generated: false,
             multi_agent_mode: workflow.multi_agent_mode,
-            strict_cwd: false,
-            tool_tags: Vec::new(),
+            strict_cwd: workflow.strict_cwd,
+            tool_tags: workflow.tool_tags.clone(),
             use_worktree: workflow.use_worktree,
             worktree_path: None,
             worktree_branch: None,
@@ -1903,6 +1903,8 @@ pub async fn execute_inline_workflow(
             acceptance_criteria: workflow.acceptance_criteria.clone(),
             rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
             iteration_diffs: Vec::new(),
+            active_canary: None,
+            is_canary_run: false,
         };
 
         // Apply overrides if present (same logic as run_unified_workflow)
@@ -2400,6 +2402,8 @@ pub async fn run_composed_workflow(
                 acceptance_criteria: None,
                 rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
                 iteration_diffs: Vec::new(),
+            active_canary: None,
+            is_canary_run: false,
             };
 
             // Run the LoopController once with all stages

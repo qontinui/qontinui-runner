@@ -1007,4 +1007,53 @@ mod tests {
         let output = format_skills_for_generator(&registry);
         assert!(!output.is_empty());
     }
+
+    #[test]
+    fn test_format_skills_filtered_by_tags() {
+        let registry = SkillRegistry::new();
+
+        // Unfiltered should include all skills
+        let all_output = format_skills_for_generator(&registry);
+
+        // Filter by "testing" tag — should produce smaller output
+        let testing_tags = vec!["testing".to_string()];
+        let filtered_output =
+            format_skills_for_generator_filtered(&registry, None, &testing_tags, None);
+
+        // Filtered output should be shorter (fewer skills)
+        assert!(
+            filtered_output.len() < all_output.len(),
+            "Filtered output ({} chars) should be shorter than full output ({} chars)",
+            filtered_output.len(),
+            all_output.len()
+        );
+        assert!(
+            !filtered_output.is_empty(),
+            "Filtered output should not be empty for 'testing' tag"
+        );
+    }
+
+    #[test]
+    fn test_format_skills_filtered_nonexistent_tag_returns_empty() {
+        let registry = SkillRegistry::new();
+        let tags = vec!["nonexistent-tag".to_string()];
+        let output = format_skills_for_generator_filtered(&registry, None, &tags, None);
+        assert!(
+            output.is_empty(),
+            "Nonexistent tag should produce empty output"
+        );
+    }
+
+    #[test]
+    fn test_format_skills_filtered_delegates_correctly() {
+        let registry = SkillRegistry::new();
+
+        // Calling with no filters should produce same output as unfiltered
+        let unfiltered = format_skills_for_generator(&registry);
+        let filtered_empty = format_skills_for_generator_filtered(&registry, None, &[], None);
+        assert_eq!(
+            unfiltered, filtered_empty,
+            "Empty filter should match unfiltered output"
+        );
+    }
 }

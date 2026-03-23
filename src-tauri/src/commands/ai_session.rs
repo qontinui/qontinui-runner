@@ -776,6 +776,9 @@ pub async fn generate_workflow_from_session(
                         ai_reviewed: Some(workflow.ai_reviewed),
                         workflow_architecture: workflow.workflow_architecture.clone(),
                         enforce_token_budget: Some(workflow.enforce_token_budget),
+                        strict_cwd: workflow.strict_cwd,
+                        tool_tags: workflow.tool_tags.clone(),
+                        rollback_policy: workflow.rollback_policy.clone(),
                     };
 
                     let db_save = app_state.checkpoint_db.clone();

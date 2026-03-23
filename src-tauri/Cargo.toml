@@ -26,6 +26,7 @@ tauri-plugin-fs = "2"
 tauri-plugin-updater = "2.5"
 tauri-plugin-single-instance = "2"
 tauri-plugin-window-state = "2"
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -79,7 +80,7 @@ portable-pty = "0.8"
 arboard = "3.4"
 xcap = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "webp"] }
-notify-rust = "4"
+# notify-rust removed — replaced by tauri-plugin-notification (session 15)
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

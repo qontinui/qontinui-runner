@@ -33,6 +33,16 @@ pub struct ModelProfile {
     pub trial_count: u32,
     /// When this profile was last computed.
     pub last_updated: String,
+    /// Performance breakdown by task type (empty until task categorization data exists).
+    pub performance_by_task_type: Vec<TaskTypePerformance>,
+}
+
+/// Performance metrics for a specific task type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskTypePerformance {
+    pub task_type: String,
+    pub pass_rate: f64,
+    pub trial_count: u32,
 }
 
 /// Recommendation for which model to use, optionally constrained by budget.
@@ -129,6 +139,7 @@ pub fn build_model_profile(
             cost_efficiency_score: cost_efficiency,
             trial_count: run_count as u32,
             last_updated: chrono::Utc::now().to_rfc3339(),
+            performance_by_task_type: Vec::new(),
         }))
     })
 }

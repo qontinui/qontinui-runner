@@ -63,6 +63,11 @@ pub trait AiMiddleware: Send + Sync {
 
     /// Transform the AI response after receipt.
     /// Modify the response in-place (output text, success flag, etc.).
+    ///
+    /// Note: `post_call` is only invoked when the AI response is successful.
+    /// Failed responses skip post-processing to preserve error diagnostics.
+    /// If your middleware needs to handle errors, check `response.success`
+    /// in a wrapper or handle it at the call site.
     fn post_call(&self, _response: &mut AiResponse, _ctx: &MiddlewareContext) {}
 }
 

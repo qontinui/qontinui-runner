@@ -589,6 +589,8 @@ async fn run_trials(
                     spec_compliance_score: None,
                     spec_assertions_passed: None,
                     spec_assertions_total: None,
+                    composite_agentic_score: None,
+                    agentic_scores: None,
                 });
             }
         }
@@ -658,6 +660,8 @@ async fn get_control_aggregate(
                     spec_compliance_score: None,
                     spec_assertions_passed: None,
                     spec_assertions_total: None,
+                    composite_agentic_score: None,
+                    agentic_scores: None,
                 });
             }
         }
@@ -722,6 +726,8 @@ async fn run_single_trial(
         spec_compliance_score: None,
         spec_assertions_passed: None,
         spec_assertions_total: None,
+        composite_agentic_score: None,
+        agentic_scores: None,
     })
 }
 

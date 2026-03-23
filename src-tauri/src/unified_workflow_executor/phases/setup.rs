@@ -58,6 +58,11 @@ impl SetupExecutor {
         self.ai_executor.session_manager = Some(sm);
     }
 
+    /// Set the middleware chain on the inner AI session executor.
+    pub fn set_middleware_chain(&mut self, chain: crate::ai_provider::middleware::AiMiddlewareChain) {
+        self.ai_executor.middleware_chain = Some(chain);
+    }
+
     /// Set the task run ID on the inner step executor for database logging.
     pub fn set_task_run_id(&mut self, task_run_id: String) {
         self.executor.set_task_run_id(task_run_id);

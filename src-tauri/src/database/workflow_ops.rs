@@ -31,7 +31,8 @@ impl CheckpointDb {
                        stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                        completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
                        quality_report, acceptance_criteria, constraint_overrides,
-                       COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy
+                       COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy,
+                       strict_cwd, tool_tags, enforce_token_budget
                 FROM unified_workflows
                 ORDER BY is_favorite DESC, updated_at DESC
                 "#,
@@ -138,10 +139,14 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(41)?
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
-                    enforce_token_budget: false,
+                    enforce_token_budget: row.get::<_, Option<i32>>(45).unwrap_or(Some(0)).unwrap_or(0) != 0,
                     rollback_policy: row.get::<_, Option<String>>(42)?,
-                    strict_cwd: false,
-                    tool_tags: Vec::new(),
+                    strict_cwd: row.get::<_, Option<i32>>(43).unwrap_or(Some(0)).unwrap_or(0) != 0,
+                    tool_tags: row.get::<_, Option<String>>(44)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
@@ -172,7 +177,8 @@ impl CheckpointDb {
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
                    quality_report, acceptance_criteria, constraint_overrides,
-                   COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy
+                   COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy,
+                       strict_cwd, tool_tags, enforce_token_budget
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -258,10 +264,14 @@ impl CheckpointDb {
                     workflow_architecture: row.get::<_, Option<String>>(41)?
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
-                    enforce_token_budget: false,
+                    enforce_token_budget: row.get::<_, Option<i32>>(45).unwrap_or(Some(0)).unwrap_or(0) != 0,
                     rollback_policy: row.get::<_, Option<String>>(42)?,
-                    strict_cwd: false,
-                    tool_tags: Vec::new(),
+                    strict_cwd: row.get::<_, Option<i32>>(43).unwrap_or(Some(0)).unwrap_or(0) != 0,
+                    tool_tags: row.get::<_, Option<String>>(44)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
@@ -294,7 +304,8 @@ impl CheckpointDb {
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
                    quality_report, acceptance_criteria, constraint_overrides,
-                   COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy
+                   COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy,
+                       strict_cwd, tool_tags, enforce_token_budget
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -382,10 +393,14 @@ impl CheckpointDb {
                     workflow_architecture: row.get::<_, Option<String>>(41)?
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
-                    enforce_token_budget: false,
+                    enforce_token_budget: row.get::<_, Option<i32>>(45).unwrap_or(Some(0)).unwrap_or(0) != 0,
                     rollback_policy: row.get::<_, Option<String>>(42)?,
-                    strict_cwd: false,
-                    tool_tags: Vec::new(),
+                    strict_cwd: row.get::<_, Option<i32>>(43).unwrap_or(Some(0)).unwrap_or(0) != 0,
+                    tool_tags: row.get::<_, Option<String>>(44)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
@@ -454,8 +469,9 @@ impl CheckpointDb {
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                 stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                 completion_prompts_first, dependency_graph, cost_annotations, quality_report,
-                acceptance_criteria, constraint_overrides, ai_reviewed, workflow_architecture
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)
+                acceptance_criteria, constraint_overrides, ai_reviewed, workflow_architecture,
+                strict_cwd, tool_tags, rollback_policy, enforce_token_budget
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)
             "#,
             params![
                 id,
@@ -503,6 +519,10 @@ impl CheckpointDb {
                         .and_then(|v| v.as_str().map(|s| s.to_string()))
                         .unwrap_or_else(|| format!("{:?}", a).to_lowercase())
                 }),
+                request.strict_cwd,
+                serde_json::to_string(&request.tool_tags).unwrap_or_else(|_| "[]".to_string()),
+                request.rollback_policy.as_deref().unwrap_or("none"),
+                request.enforce_token_budget.unwrap_or(false),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -565,8 +585,9 @@ impl CheckpointDb {
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                 stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                 completion_prompts_first, dependency_graph, cost_annotations, quality_report,
-                acceptance_criteria, constraint_overrides, ai_reviewed, workflow_architecture
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)
+                acceptance_criteria, constraint_overrides, ai_reviewed, workflow_architecture,
+                strict_cwd, tool_tags, rollback_policy, enforce_token_budget
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)
             "#,
             params![
                 id,
@@ -614,6 +635,10 @@ impl CheckpointDb {
                         .and_then(|v| v.as_str().map(|s| s.to_string()))
                         .unwrap_or_else(|| format!("{:?}", a).to_lowercase())
                 }),
+                request.strict_cwd,
+                serde_json::to_string(&request.tool_tags).unwrap_or_else(|_| "[]".to_string()),
+                request.rollback_policy.as_deref().unwrap_or("none"),
+                request.enforce_token_budget.unwrap_or(false),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -743,6 +768,10 @@ impl CheckpointDb {
             .as_ref()
             .or(existing.acceptance_criteria.as_ref());
         let _ai_reviewed = request.ai_reviewed.unwrap_or(existing.ai_reviewed);
+        let strict_cwd = request.strict_cwd.unwrap_or(existing.strict_cwd);
+        let tool_tags = request.tool_tags.as_ref().unwrap_or(&existing.tool_tags);
+        let rollback_policy = request.rollback_policy.as_deref().or(existing.rollback_policy.as_deref()).unwrap_or("none");
+        let enforce_token_budget = request.enforce_token_budget.unwrap_or(existing.enforce_token_budget);
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
         let setup_steps_json =
@@ -805,8 +834,12 @@ impl CheckpointDb {
                 acceptance_criteria = ?35,
                 constraint_overrides = ?36,
                 ai_reviewed = ?37,
-                workflow_architecture = ?38
-            WHERE id = ?39
+                workflow_architecture = ?38,
+                strict_cwd = ?39,
+                tool_tags = ?40,
+                rollback_policy = ?41,
+                enforce_token_budget = ?42
+            WHERE id = ?43
             "#,
             params![
                 name,
@@ -856,6 +889,10 @@ impl CheckpointDb {
                             .and_then(|v| v.as_str().map(|s| s.to_string()))
                             .unwrap_or_else(|| format!("{:?}", a).to_lowercase())
                     }),
+                strict_cwd,
+                serde_json::to_string(tool_tags).unwrap_or_else(|_| "[]".to_string()),
+                rollback_policy,
+                enforce_token_budget,
                 id,
             ],
         )
@@ -894,7 +931,8 @@ impl CheckpointDb {
                    stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
                    quality_report, acceptance_criteria, constraint_overrides,
-                   COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy
+                   COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy,
+                       strict_cwd, tool_tags, enforce_token_budget
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -1030,10 +1068,14 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(41)?
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
-                    enforce_token_budget: false,
+                    enforce_token_budget: row.get::<_, Option<i32>>(45).unwrap_or(Some(0)).unwrap_or(0) != 0,
                     rollback_policy: row.get::<_, Option<String>>(42)?,
-                    strict_cwd: false,
-                    tool_tags: Vec::new(),
+                    strict_cwd: row.get::<_, Option<i32>>(43).unwrap_or(Some(0)).unwrap_or(0) != 0,
+                    tool_tags: row.get::<_, Option<String>>(44)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
@@ -1096,6 +1138,9 @@ impl CheckpointDb {
             ai_reviewed: Some(original.ai_reviewed),
             workflow_architecture: original.workflow_architecture,
             enforce_token_budget: Some(original.enforce_token_budget),
+            strict_cwd: original.strict_cwd,
+            tool_tags: original.tool_tags,
+            rollback_policy: original.rollback_policy,
         };
 
         self.create_unified_workflow(&create_request)
@@ -1150,7 +1195,8 @@ impl CheckpointDb {
                        max_sweep_iterations, stages, stop_on_failure, reflection_mode, model_overrides,
                        approval_gate, completion_prompts_first, is_favorite, dependency_graph,
                        cost_annotations, quality_report, acceptance_criteria, constraint_overrides,
-                       COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy
+                       COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy,
+                       strict_cwd, tool_tags, enforce_token_budget
                 FROM unified_workflows
                 WHERE sync_pending = 1
                 "#,
@@ -1257,10 +1303,14 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(41)?
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
-                    enforce_token_budget: false,
+                    enforce_token_budget: row.get::<_, Option<i32>>(45).unwrap_or(Some(0)).unwrap_or(0) != 0,
                     rollback_policy: row.get::<_, Option<String>>(42)?,
-                    strict_cwd: false,
-                    tool_tags: Vec::new(),
+                    strict_cwd: row.get::<_, Option<i32>>(43).unwrap_or(Some(0)).unwrap_or(0) != 0,
+                    tool_tags: row.get::<_, Option<String>>(44)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
                     use_worktree: false,
                     targeted_error_ids: vec![],
                 })

@@ -5,6 +5,12 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+interface RobustnessReport {
+  passed: number;
+  failed: number;
+  total: number;
+}
+
 interface RecommendationOutcome {
   verdict: string;
   success_rate_delta?: number;
@@ -12,6 +18,50 @@ interface RecommendationOutcome {
   cost_delta_usd?: number;
   metrics_before?: Record<string, number>;
   metrics_after?: Record<string, number>;
+  p_value?: number | null;
+  confidence_interval?: [number, number] | null;
+  effect_size?: number | null;
+}
+
+interface EvalResult {
+  id: string;
+  spec_id: string;
+  recommendation_id: string | null;
+  status: string;
+  test_case_results: {
+    test_case_id: string;
+    passed: boolean;
+    assertion_results: {
+      assertion_type: string;
+      passed: boolean;
+      actual_value: number;
+      threshold_value: number;
+      message: string;
+    }[];
+  }[];
+  baseline_metrics: {
+    success_rate: number;
+    mean_duration_ms: number;
+    mean_iterations: number;
+    mean_cost_cents: number;
+    trial_count: number;
+  } | null;
+  candidate_metrics: {
+    success_rate: number;
+    mean_duration_ms: number;
+    mean_iterations: number;
+    mean_cost_cents: number;
+    trial_count: number;
+  } | null;
+  comparison: {
+    success_rate_delta_pp: number;
+    p_value: number | null;
+    confidence_interval: [number, number] | null;
+    effect_size: number | null;
+    verdict: string;
+  } | null;
+  trials_run: number;
+  created_at: string;
 }
 
 interface CascadeEffect {
@@ -39,7 +89,16 @@ interface Recommendation {
   outcome_after_apply: string | null;
   optimizer_run_id: string | null;
   created_at: string;
+  eval_result_id: string | null;
+  eval_status: string | null;
 }
+
+const EVAL_STATUS_COLORS: Record<string, string> = {
+  untested: "text-zinc-400 bg-zinc-800/50",
+  passed: "text-green-400 bg-green-900/30",
+  failed: "text-red-400 bg-red-900/30",
+  inconclusive: "text-yellow-400 bg-yellow-900/30",
+};
 
 const STATUS_COLORS: Record<string, string> = {
   pending: "text-yellow-400 bg-yellow-900/30",
@@ -70,6 +129,10 @@ export function RecommendationsTab() {
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [cascadeEffects, setCascadeEffects] = useState<Record<string, CascadeEffect[]>>({});
+  const [evalResults, setEvalResults] = useState<Record<string, EvalResult[]>>({});
+  const [runningEval, setRunningEval] = useState<string | null>(null);
+  const [robustnessStatus, setRobustnessStatus] = useState<Record<string, RobustnessReport>>({});
+  const [runningRobustness, setRunningRobustness] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -130,6 +193,43 @@ export function RecommendationsTab() {
     }
   };
 
+  const handleRunEval = async (recommendationId: string) => {
+    try {
+      setRunningEval(recommendationId);
+      await invoke<EvalResult>("run_recommendation_eval", { recommendationId });
+      await load();
+    } catch (e) {
+      console.error("Failed to run eval:", e);
+    } finally {
+      setRunningEval(null);
+    }
+  };
+
+  const loadEvalResults = async (recId: string) => {
+    if (evalResults[recId]) return;
+    try {
+      const results = await invoke<EvalResult[]>("get_eval_results", { recommendationId: recId });
+      setEvalResults((prev) => ({ ...prev, [recId]: results }));
+    } catch {
+      // silently fail
+    }
+  };
+
+  const handleRunRobustness = async (rec: Recommendation) => {
+    try {
+      setRunningRobustness(rec.id);
+      const report = await invoke<RobustnessReport>("run_robustness_test", {
+        agentType: rec.target_agent,
+        recommendationId: rec.id,
+      });
+      setRobustnessStatus((prev) => ({ ...prev, [rec.id]: report }));
+    } catch (e) {
+      console.error("Failed to run robustness test:", e);
+    } finally {
+      setRunningRobustness(null);
+    }
+  };
+
   return (
     <div className="p-4 space-y-4">
       {/* Filters */}
@@ -180,8 +280,13 @@ export function RecommendationsTab() {
                 onClick={() => {
                   const newExpanded = expanded === rec.id ? null : rec.id;
                   setExpanded(newExpanded);
-                  if (newExpanded && rec.status === "applied" && rec.target_agent) {
-                    loadCascade(rec.id);
+                  if (newExpanded) {
+                    if (rec.status === "applied" && rec.target_agent) {
+                      loadCascade(rec.id);
+                    }
+                    if (rec.eval_result_id) {
+                      loadEvalResults(rec.id);
+                    }
                   }
                 }}
                 onKeyDown={(e) => {
@@ -189,8 +294,13 @@ export function RecommendationsTab() {
                     e.preventDefault();
                     const newExpanded = expanded === rec.id ? null : rec.id;
                     setExpanded(newExpanded);
-                    if (newExpanded && rec.status === "applied" && rec.target_agent) {
-                      loadCascade(rec.id);
+                    if (newExpanded) {
+                      if (rec.status === "applied" && rec.target_agent) {
+                        loadCascade(rec.id);
+                      }
+                      if (rec.eval_result_id) {
+                        loadEvalResults(rec.id);
+                      }
                     }
                   }
                 }}
@@ -200,6 +310,22 @@ export function RecommendationsTab() {
                 <span className={`text-xs px-2 py-0.5 rounded ${STATUS_COLORS[rec.status] || ""}`}>
                   {rec.status}
                 </span>
+                {rec.eval_status && (
+                  <span
+                    className={`text-xs px-1.5 py-0.5 rounded ${EVAL_STATUS_COLORS[rec.eval_status] || EVAL_STATUS_COLORS.untested}`}
+                  >
+                    eval: {rec.eval_status}
+                  </span>
+                )}
+                {rec.recommendation_type === "prompt_rewrite" && (
+                  robustnessStatus[rec.id] ? (
+                    <span className="text-xs text-zinc-400 ml-1">
+                      [robustness: {robustnessStatus[rec.id].passed}/{robustnessStatus[rec.id].total} passed]
+                    </span>
+                  ) : (
+                    <span className="text-xs text-zinc-500 ml-1">[robustness: untested]</span>
+                  )
+                )}
                 {rec.status === "applied" &&
                   rec.outcome_after_apply &&
                   (() => {
@@ -255,6 +381,13 @@ export function RecommendationsTab() {
                     </div>
                   )}
 
+                  {/* Model profile link for architecture/config recs */}
+                  {(rec.optimizer_type === "architecture" || rec.recommendation_type === "config_change") && (
+                    <p className="text-xs text-zinc-500 italic">
+                      Check Model Profiles in Autoresearch for cost-efficiency data.
+                    </p>
+                  )}
+
                   {/* Outcome details for applied recs */}
                   {rec.status === "applied" &&
                     rec.outcome_after_apply &&
@@ -297,6 +430,31 @@ export function RecommendationsTab() {
                                   <span className="text-zinc-300">
                                     {outcome.cost_delta_usd > 0 ? "+" : ""}$
                                     {outcome.cost_delta_usd.toFixed(4)}
+                                  </span>
+                                </div>
+                              )}
+                              {outcome.p_value != null && (
+                                <div>
+                                  <span className="text-zinc-500">p-value: </span>
+                                  <span className="text-zinc-300">
+                                    {outcome.p_value.toFixed(4)}
+                                  </span>
+                                </div>
+                              )}
+                              {outcome.confidence_interval != null && (
+                                <div>
+                                  <span className="text-zinc-500">CI: </span>
+                                  <span className="text-zinc-300">
+                                    [{outcome.confidence_interval[0].toFixed(2)},{" "}
+                                    {outcome.confidence_interval[1].toFixed(2)}]
+                                  </span>
+                                </div>
+                              )}
+                              {outcome.effect_size != null && (
+                                <div>
+                                  <span className="text-zinc-500">Effect Size: </span>
+                                  <span className="text-zinc-300">
+                                    {outcome.effect_size.toFixed(3)}
                                   </span>
                                 </div>
                               )}
@@ -347,6 +505,105 @@ export function RecommendationsTab() {
                       </div>
                     )}
 
+                  {/* Eval results detail */}
+                  {evalResults[rec.id] && evalResults[rec.id].length > 0 && (
+                    <div className="bg-zinc-800/50 rounded p-3 space-y-2">
+                      <div className="text-xs text-zinc-500">Eval Results</div>
+                      {evalResults[rec.id].map((er) => (
+                        <div key={er.id} className="space-y-2">
+                          <div className="flex gap-4 text-xs">
+                            <div>
+                              <span className="text-zinc-500">Status: </span>
+                              <span
+                                className={
+                                  er.status === "passed"
+                                    ? "text-green-400"
+                                    : er.status === "failed"
+                                      ? "text-red-400"
+                                      : "text-yellow-400"
+                                }
+                              >
+                                {er.status}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-zinc-500">Trials: </span>
+                              <span className="text-zinc-300">{er.trials_run}</span>
+                            </div>
+                            <div>
+                              <span className="text-zinc-500">Date: </span>
+                              <span className="text-zinc-400">
+                                {new Date(er.created_at).toLocaleDateString()}
+                              </span>
+                            </div>
+                          </div>
+                          {er.comparison && (
+                            <div className="flex gap-4 text-xs">
+                              <div>
+                                <span className="text-zinc-500">Delta: </span>
+                                <span
+                                  className={
+                                    er.comparison.success_rate_delta_pp > 0
+                                      ? "text-green-400"
+                                      : er.comparison.success_rate_delta_pp < -2
+                                        ? "text-red-400"
+                                        : "text-zinc-300"
+                                  }
+                                >
+                                  {er.comparison.success_rate_delta_pp > 0 ? "+" : ""}
+                                  {er.comparison.success_rate_delta_pp.toFixed(1)}pp
+                                </span>
+                              </div>
+                              {er.comparison.p_value != null && (
+                                <div>
+                                  <span className="text-zinc-500">p-value: </span>
+                                  <span className="text-zinc-300">
+                                    {er.comparison.p_value.toFixed(4)}
+                                  </span>
+                                </div>
+                              )}
+                              {er.comparison.effect_size != null && (
+                                <div>
+                                  <span className="text-zinc-500">Effect: </span>
+                                  <span className="text-zinc-300">
+                                    {er.comparison.effect_size.toFixed(3)}
+                                  </span>
+                                </div>
+                              )}
+                              <div>
+                                <span className="text-zinc-500">Verdict: </span>
+                                <span className="text-zinc-300">{er.comparison.verdict}</span>
+                              </div>
+                            </div>
+                          )}
+                          {er.test_case_results.length > 0 && (
+                            <div className="space-y-1">
+                              {er.test_case_results.map((tc, i) => (
+                                <div key={i} className="flex items-center gap-2 text-xs">
+                                  <span
+                                    className={`px-1 py-0.5 rounded ${tc.passed ? "bg-green-900/30 text-green-400" : "bg-red-900/30 text-red-400"}`}
+                                  >
+                                    {tc.passed ? "PASS" : "FAIL"}
+                                  </span>
+                                  <span className="text-zinc-400 font-mono text-[10px]">
+                                    {tc.test_case_id.slice(0, 8)}
+                                  </span>
+                                  {tc.assertion_results
+                                    .filter((ar) => !ar.passed)
+                                    .map((ar, j) => (
+                                      <span key={j} className="text-red-400">
+                                        {ar.message}
+                                      </span>
+                                    ))}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
                   <div className="flex gap-2 pt-2">
                     {rec.status === "pending" && (
                       <>
@@ -368,6 +625,22 @@ export function RecommendationsTab() {
                         >
                           Reject
                         </button>
+                        <button
+                          onClick={() => handleRunEval(rec.id)}
+                          disabled={runningEval === rec.id}
+                          className="px-3 py-1 text-xs bg-cyan-800 text-cyan-200 rounded hover:bg-cyan-700 disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          {runningEval === rec.id ? "Evaluating..." : "Evaluate"}
+                        </button>
+                        {rec.recommendation_type === "prompt_rewrite" && (
+                          <button
+                            onClick={() => handleRunRobustness(rec)}
+                            disabled={runningRobustness === rec.id}
+                            className="px-3 py-1 text-xs bg-zinc-700 text-zinc-200 rounded hover:bg-zinc-600 disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            {runningRobustness === rec.id ? "Testing..." : "Run Robustness"}
+                          </button>
+                        )}
                       </>
                     )}
                     {rec.status === "applied" && (

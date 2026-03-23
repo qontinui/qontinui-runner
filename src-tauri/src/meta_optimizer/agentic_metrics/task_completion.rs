@@ -146,6 +146,8 @@ mod tests {
             max_iterations_reached,
             duration_secs: 100.0,
             error_type: error_type.map(String::from),
+            tools_used: Vec::new(),
+            agent_traces: Vec::new(),
         }
     }
 

@@ -26,6 +26,11 @@ interface CanaryMetrics {
   failure_count: number;
   total_cost_usd: number;
   total_duration_ms: number;
+  p_value?: number | null;
+  confidence_interval?: [number, number] | null;
+  effect_size?: number | null;
+  cost_delta_pct?: number | null;
+  duration_delta_pct?: number | null;
 }
 
 const MIN_CANARY_RUNS = 20;
@@ -155,6 +160,71 @@ export function CanaryStatusPanel() {
                   </div>
                 </div>
               </div>
+
+              {/* Statistical details */}
+              {(canary.p_value != null ||
+                canary.confidence_interval != null ||
+                canary.effect_size != null ||
+                canary.cost_delta_pct != null ||
+                canary.duration_delta_pct != null) && (
+                <div className="flex flex-wrap gap-4 text-xs mb-3">
+                  {canary.p_value != null && (
+                    <div>
+                      <div className="text-zinc-500">p-value</div>
+                      <div className="text-zinc-300">{canary.p_value.toFixed(4)}</div>
+                    </div>
+                  )}
+                  {canary.confidence_interval != null && (
+                    <div>
+                      <div className="text-zinc-500">Confidence Interval</div>
+                      <div className="text-zinc-300">
+                        [{canary.confidence_interval[0].toFixed(2)},{" "}
+                        {canary.confidence_interval[1].toFixed(2)}]
+                      </div>
+                    </div>
+                  )}
+                  {canary.effect_size != null && (
+                    <div>
+                      <div className="text-zinc-500">Effect Size</div>
+                      <div className="text-zinc-300">{canary.effect_size.toFixed(3)}</div>
+                    </div>
+                  )}
+                  {canary.cost_delta_pct != null && (
+                    <div>
+                      <div className="text-zinc-500">Cost Delta</div>
+                      <div
+                        className={
+                          canary.cost_delta_pct < 0
+                            ? "text-green-400"
+                            : canary.cost_delta_pct > 0
+                              ? "text-red-400"
+                              : "text-zinc-300"
+                        }
+                      >
+                        {canary.cost_delta_pct > 0 ? "+" : ""}
+                        {canary.cost_delta_pct.toFixed(1)}%
+                      </div>
+                    </div>
+                  )}
+                  {canary.duration_delta_pct != null && (
+                    <div>
+                      <div className="text-zinc-500">Duration Delta</div>
+                      <div
+                        className={
+                          canary.duration_delta_pct < 0
+                            ? "text-green-400"
+                            : canary.duration_delta_pct > 0
+                              ? "text-red-400"
+                              : "text-zinc-300"
+                        }
+                      >
+                        {canary.duration_delta_pct > 0 ? "+" : ""}
+                        {canary.duration_delta_pct.toFixed(1)}%
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Progress bar toward minimum sample size */}
               <div>

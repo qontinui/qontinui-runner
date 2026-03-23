@@ -25,7 +25,7 @@ export interface UseElementsReturn {
   selectedElementId: string | null;
   selectedElement: ExternalElement | null;
   isLoadingElements: boolean;
-  fetchElements: () => Promise<void>;
+  fetchElements: (options?: { recency?: string }) => Promise<void>;
   refreshElements: () => Promise<void>;
   selectElement: (id: string | null) => void;
   setElements: React.Dispatch<React.SetStateAction<ExternalElement[]>>;
@@ -46,10 +46,13 @@ export function useElements(
     ? (elements.find((e) => e.id === selectedElementId) ?? null)
     : null;
 
-  const fetchElements = useCallback(async () => {
+  const fetchElements = useCallback(async (options?: { recency?: string }) => {
     setIsLoadingElements(true);
     try {
-      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/elements`);
+      const recency = options?.recency ?? "any";
+      const resp = await tracedFetch(
+        `${getApiBase()}/ui-bridge/sdk/elements?recency=${recency}`,
+      );
       const json = await resp.json();
 
       if (json.success === false) {

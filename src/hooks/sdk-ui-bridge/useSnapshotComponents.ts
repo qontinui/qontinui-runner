@@ -8,8 +8,8 @@ import { getApiBase, tracedFetch } from "@/lib/runner-api";
 export interface UseSnapshotComponentsReturn {
   snapshot: unknown | null;
   components: unknown[];
-  refreshSnapshot: () => Promise<void>;
-  refreshComponents: () => Promise<void>;
+  refreshSnapshot: (options?: { recency?: string }) => Promise<void>;
+  refreshComponents: (options?: { recency?: string }) => Promise<void>;
   setSnapshot: React.Dispatch<React.SetStateAction<unknown | null>>;
   setComponents: React.Dispatch<React.SetStateAction<unknown[]>>;
 }
@@ -18,9 +18,12 @@ export function useSnapshotComponents(): UseSnapshotComponentsReturn {
   const [snapshot, setSnapshot] = useState<unknown | null>(null);
   const [components, setComponents] = useState<unknown[]>([]);
 
-  const refreshSnapshot = useCallback(async () => {
+  const refreshSnapshot = useCallback(async (options?: { recency?: string }) => {
     try {
-      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/snapshot`);
+      const recency = options?.recency ?? "any";
+      const resp = await tracedFetch(
+        `${getApiBase()}/ui-bridge/sdk/snapshot?recency=${recency}`,
+      );
       const json = await resp.json();
       if (json.success !== false) {
         setSnapshot(json.data || json);
@@ -30,9 +33,12 @@ export function useSnapshotComponents(): UseSnapshotComponentsReturn {
     }
   }, []);
 
-  const refreshComponents = useCallback(async () => {
+  const refreshComponents = useCallback(async (options?: { recency?: string }) => {
     try {
-      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/components`);
+      const recency = options?.recency ?? "any";
+      const resp = await tracedFetch(
+        `${getApiBase()}/ui-bridge/sdk/components?recency=${recency}`,
+      );
       const json = await resp.json();
       if (json.success !== false) {
         setComponents(json.data?.components || json.components || json.data || []);

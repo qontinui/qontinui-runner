@@ -871,16 +871,33 @@ fn build_compressed_iteration_history(
 
         // Fall back to SQL-only retrieval if hybrid search failed
         let fixes_to_inject: Vec<(String, String, Option<String>)> = match universal_fixes {
-            Some(results) if !results.is_empty() => results
-                .iter()
-                .map(|r| {
-                    (
-                        r.item.fix_type.clone(),
-                        r.item.fix_description.clone(),
-                        r.item.applicability_context.clone(),
-                    )
-                })
-                .collect(),
+            Some(results) if !results.is_empty() => {
+                // Capture retrieval event for RAG metric evaluation
+                {
+                    let retrieval_event = crate::meta_optimizer::agentic_metrics::rag_judge::capture_retrieval_event(
+                        &query_text,
+                        "universal_fixes",
+                        &results,
+                        None,
+                        |fix| (fix.fix_type.clone(), fix.fix_description.clone()),
+                    );
+                    let _ = checkpoint_db.with_conn(|conn| {
+                        crate::meta_optimizer::agentic_metrics::rag_judge::persist_retrieval_event(
+                            conn, execution_id, &retrieval_event,
+                        )
+                    });
+                }
+                results
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.item.fix_type.clone(),
+                            r.item.fix_description.clone(),
+                            r.item.applicability_context.clone(),
+                        )
+                    })
+                    .collect()
+            }
             _ => {
                 // SQL-only fallback: get universal fixes by reuse_count
                 checkpoint_db

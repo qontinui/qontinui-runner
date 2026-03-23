@@ -25,7 +25,11 @@ import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import { useUIBridge } from "ui-bridge";
 import type { SpecGroup, SpecGroupResult, SpecExecutionOptions } from "@qontinui/ui-bridge/specs";
 import { executeSpecGroup, externalToDiscovered } from "../lib/spec-execution";
+import { IpcArtifactStore } from "@qontinui/ui-bridge/artifacts";
 import type { ExternalElement } from "../types/ui-bridge-types";
+
+/** Module-level singleton so all spec runs share one IPC-backed store. */
+const artifactStore = new IpcArtifactStore();
 
 /**
  * Payload for spec execution requests from Rust
@@ -98,7 +102,11 @@ export function useSpecExecutionHandler(): void {
           const discoveredElements = findResult.elements;
 
           // Execute the spec group against discovered elements
-          const result = await executeSpecGroup(group, discoveredElements, options);
+          const result = await executeSpecGroup(group, discoveredElements, {
+            ...options,
+            artifactStore,
+            specId: group.id,
+          });
 
           await sendResponse({
             requestId,
@@ -121,7 +129,11 @@ export function useSpecExecutionHandler(): void {
           const discoveredElements = externalElements.map(externalToDiscovered);
 
           // Execute the spec group against external elements
-          const result = await executeSpecGroup(group, discoveredElements, options);
+          const result = await executeSpecGroup(group, discoveredElements, {
+            ...options,
+            artifactStore,
+            specId: group.id,
+          });
 
           await sendResponse({
             requestId,

@@ -767,6 +767,29 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
           </div>
         );
 
+      case "tool_tags_input":
+        return (
+          <div key={def.key}>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">
+              Tool tags
+            </label>
+            <input
+              type="text"
+              value={(workflow.tool_tags ?? []).join(", ")}
+              onChange={(e) =>
+                updateWorkflow({
+                  tool_tags: e.target.value
+                    .split(",")
+                    .map((t: string) => t.trim())
+                    .filter(Boolean),
+                })
+              }
+              placeholder="testing, code-quality"
+              className={inputClass}
+            />
+          </div>
+        );
+
       default:
         return null;
     }

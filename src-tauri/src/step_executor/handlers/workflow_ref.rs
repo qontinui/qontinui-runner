@@ -232,6 +232,8 @@ impl StepHandler for WorkflowRefHandler {
             multi_agent_pipeline_config: None,
             rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
             iteration_diffs: Vec::new(),
+            active_canary: None,
+            is_canary_run: false,
         };
 
         // 9. Create LoopController with session manager

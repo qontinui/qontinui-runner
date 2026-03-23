@@ -37,6 +37,9 @@ pub struct SnapshotMetrics {
     pub partial_runs: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avg_spec_compliance: Option<f64>,
+    /// Average composite agentic metric score across runs in this snapshot period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_composite_agentic_score: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,7 +382,8 @@ pub fn capture_snapshot(
                            COALESCE(AVG(lo.iterations), 0.0)
                        FROM learning_outcomes lo
                        JOIN task_runs tr ON lo.task_id = tr.id
-                       WHERE lo.created_at > ?1{}"#,
+                       WHERE lo.created_at > ?1
+                         AND (lo.iterations IS NULL OR lo.iterations > 0){}"#,
                     helper_filter
                 ),
                 params![period_start],
@@ -430,6 +434,15 @@ pub fn capture_snapshot(
             )
             .unwrap_or(None);
 
+        // ── Composite agentic score average ──
+        let avg_composite_agentic_score: Option<f64> = conn
+            .query_row(
+                "SELECT AVG(composite_agentic_score) FROM learning_outcomes WHERE created_at > ?1 AND composite_agentic_score IS NOT NULL",
+                params![period_start],
+                |row| row.get::<_, Option<f64>>(0),
+            )
+            .unwrap_or(None);
+
         let metrics = SnapshotMetrics {
             success_rate,
             avg_duration_secs: avg_duration,
@@ -440,6 +453,7 @@ pub fn capture_snapshot(
             failed_runs,
             partial_runs,
             avg_spec_compliance,
+            avg_composite_agentic_score,
         };
 
         let metrics_json = serde_json::to_string(&metrics)
@@ -456,7 +470,8 @@ pub fn capture_snapshot(
                                   AVG(lo.iterations) as avg_iter
                            FROM learning_outcomes lo
                            JOIN task_runs tr ON lo.task_id = tr.id
-                           WHERE lo.created_at > ?1 AND lo.workflow_architecture IS NOT NULL{}
+                           WHERE lo.created_at > ?1 AND lo.workflow_architecture IS NOT NULL
+                             AND (lo.iterations IS NULL OR lo.iterations > 0){}
                            GROUP BY lo.workflow_architecture"#,
                         helper_filter
                     ),

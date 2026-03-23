@@ -768,12 +768,39 @@ pub fn save_parsed_recommendations(
 ///
 /// - `rule_create` and `rule_update` with confidence >= 0.85 are applied directly
 ///   (safest, most reversible).
-/// - `prompt_rewrite` with confidence >= 0.85 are started as canary rollouts at 20%
+/// - `prompt_rewrite` with confidence >= 0.75 are started as canary rollouts at 20%
 ///   so they can be evaluated before full promotion.
-/// - `config_change` with confidence >= 0.85 are started as canary rollouts at 10%
+/// - `config_change` with confidence >= 0.75 are started as canary rollouts at 10%
 ///   (more conservative since config changes affect global behavior).
 pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&str>) {
     let run_id = optimizer_run_id.map(|s| s.to_string());
+
+    // Auto-reject findings — they are diagnostic observations, not actionable changes
+    let findings_rejected: i64 = db
+        .with_conn({
+            let run_id = run_id.clone();
+            move |conn| {
+                conn.execute(
+                    r#"UPDATE meta_optimizer_recommendations
+                       SET status = 'rejected',
+                           outcome_after_apply = 'Auto-rejected: findings are diagnostic observations, not actionable changes'
+                       WHERE status = 'pending'
+                         AND recommendation_type = 'finding'
+                         AND (?1 IS NULL OR optimizer_run_id = ?1)"#,
+                    rusqlite::params![run_id],
+                )
+                .map(|n| n as i64)
+                .map_err(|e| format!("Failed to auto-reject findings: {}", e))
+            }
+        })
+        .unwrap_or(0);
+
+    if findings_rejected > 0 {
+        info!(
+            "Auto-rejected {} finding recommendation(s) (observations, not actionable)",
+            findings_rejected
+        );
+    }
 
     // Auto-apply rule changes (safest, most reversible)
     let rule_candidates: Vec<(String, f64)> = db
@@ -836,7 +863,7 @@ pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&s
                     r#"SELECT id, confidence FROM meta_optimizer_recommendations
                        WHERE status = 'pending'
                          AND recommendation_type = 'prompt_rewrite'
-                         AND confidence >= 0.85
+                         AND confidence >= 0.75
                          AND (?1 IS NULL OR optimizer_run_id = ?1)"#,
                 )
                 .map_err(|e| format!("Query error: {}", e))?;
@@ -888,7 +915,7 @@ pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&s
                         r#"SELECT id, confidence FROM meta_optimizer_recommendations
                            WHERE status = 'pending'
                              AND recommendation_type = 'config_change'
-                             AND confidence >= 0.85
+                             AND confidence >= 0.75
                              AND (?1 IS NULL OR optimizer_run_id = ?1)"#,
                     )
                     .map_err(|e| format!("Query error: {}", e))?;

@@ -385,6 +385,8 @@ pub enum PrimaryMetric {
     MeanIterations,
     MeanDuration,
     SpecCompliance,
+    /// Optimize for composite agentic metric score (weighted blend of all scored metrics).
+    CompositeAgentic,
 }
 
 /// Outcome of a single trial (one workflow run).
@@ -410,6 +412,13 @@ pub struct TrialResult {
     /// Total number of spec assertions.
     #[serde(default)]
     pub spec_assertions_total: Option<u32>,
+    /// Composite agentic metric score (0.0-1.0) from agentic_metric_scores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composite_agentic_score: Option<f64>,
+    /// Per-metric agentic scores (metric_type -> score). Enables per-dimension
+    /// analysis (e.g., "this config improved tool_correctness but degraded step_efficiency").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentic_scores: Option<HashMap<String, f64>>,
 }
 
 /// Aggregate metrics across multiple trials.
@@ -421,6 +430,12 @@ pub struct AggregateMetrics {
     pub trial_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mean_spec_compliance: Option<f64>,
+    /// Mean composite agentic score across trials that have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_composite_agentic_score: Option<f64>,
+    /// Per-metric mean scores across trials (metric_type -> mean_score).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_agentic_scores: Option<HashMap<String, f64>>,
 }
 
 /// Full result of one experiment (one config tested, possibly multiple trials).

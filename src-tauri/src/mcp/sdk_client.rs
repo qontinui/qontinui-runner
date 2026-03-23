@@ -655,7 +655,13 @@ async fn handle_elements(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    match sdk_request(&state, Method::GET, "/control/elements", None).await {
+    // Forward recency query param to the SDK app for cache control
+    let path = if let Some(recency) = query.get("recency") {
+        format!("/control/elements?recency={}", urlencoding::encode(recency))
+    } else {
+        "/control/elements".to_string()
+    };
+    match sdk_request(&state, Method::GET, &path, None).await {
         Ok(mut data) => {
             // Normalize: if data.data is an object with an "elements" array, flatten it
             // so the response is { "success": true, "data": [...elements...] }.
@@ -872,8 +878,17 @@ async fn handle_element_action(
 /// GET /ui-bridge/sdk/snapshot — Full UI snapshot
 ///
 /// Falls back to the runner's own control endpoint when no SDK app is connected.
-async fn handle_snapshot(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    match sdk_request(&state, Method::GET, "/control/snapshot", None).await {
+async fn handle_snapshot(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    // Forward recency query param to the SDK app for cache control
+    let path = if let Some(recency) = query.get("recency") {
+        format!("/control/snapshot?recency={}", urlencoding::encode(recency))
+    } else {
+        "/control/snapshot".to_string()
+    };
+    match sdk_request(&state, Method::GET, &path, None).await {
         Ok(data) => (StatusCode::OK, Json(data)),
         Err(_sdk_err) => {
             // No SDK app connected — fall back to the runner's own UI via control endpoint
@@ -923,8 +938,17 @@ async fn handle_discover(
 }
 
 /// GET /ui-bridge/sdk/components — List components
-async fn handle_components(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::GET, "/control/components", None).await {
+async fn handle_components(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    // Forward recency query param to the SDK app for cache control
+    let path = if let Some(recency) = query.get("recency") {
+        format!("/control/components?recency={}", urlencoding::encode(recency))
+    } else {
+        "/control/components".to_string()
+    };
+    match sdk_request(&state, Method::GET, &path, None).await {
         Ok(mut data) => {
             // Add helpful note if no components found
             if let Some(arr) = data.get("data").and_then(|d| d.as_array()) {

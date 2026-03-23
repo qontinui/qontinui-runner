@@ -700,6 +700,13 @@ pub struct CreateUnifiedWorkflowRequest {
     /// exceeds the token budget. Disabled by default.
     #[serde(default)]
     pub enforce_token_budget: Option<bool>,
+    #[serde(default)]
+    pub strict_cwd: bool,
+    #[serde(default)]
+    pub tool_tags: Vec<String>,
+    /// Policy for automatic git rollback on workflow failure.
+    #[serde(default)]
+    pub rollback_policy: Option<String>,
 }
 
 impl From<&UnifiedWorkflow> for CreateUnifiedWorkflowRequest {
@@ -745,6 +752,9 @@ impl From<&UnifiedWorkflow> for CreateUnifiedWorkflowRequest {
             ai_reviewed: Some(w.ai_reviewed),
             workflow_architecture: w.workflow_architecture.clone(),
             enforce_token_budget: Some(w.enforce_token_budget),
+            strict_cwd: w.strict_cwd,
+            tool_tags: w.tool_tags.clone(),
+            rollback_policy: w.rollback_policy.clone(),
         }
     }
 }
@@ -818,6 +828,12 @@ pub struct UpdateUnifiedWorkflowRequest {
     /// exceeds the token budget. Disabled by default.
     #[serde(default)]
     pub enforce_token_budget: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_cwd: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_tags: Option<Vec<String>>,
+    /// Policy for automatic git rollback on workflow failure.
+    pub rollback_policy: Option<String>,
 }
 
 /// Query parameters for searching unified workflows

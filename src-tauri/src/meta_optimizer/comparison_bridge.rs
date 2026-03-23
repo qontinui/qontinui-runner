@@ -75,6 +75,8 @@ pub fn comparison_to_recommendation(
                 recommendation,
                 created_at,
                 updated_at: String::new(),
+                recommendation_id: None,
+                source: None,
             })
         }
     })?;
@@ -170,4 +172,63 @@ pub fn has_bridge_columns(db: &CheckpointDb) -> bool {
         Ok(has_col)
     })
     .unwrap_or(false)
+}
+
+/// Create a comparison config to validate a recommendation via A/B testing.
+///
+/// Returns a ComparisonConfig that can be passed to the comparison system.
+/// The caller is responsible for actually starting the comparison run.
+pub fn build_validation_comparison(
+    db: &CheckpointDb,
+    recommendation_id: &str,
+) -> Result<Option<crate::comparison::ComparisonConfig>, String> {
+    // Look up the recommendation to determine what to compare
+    let rec_id = recommendation_id.to_string();
+    let (rec_type, recommended_value, _target_agent): (String, Option<String>, Option<String>) =
+        db.with_conn({
+            let rec_id = rec_id.clone();
+            move |conn| {
+                conn.query_row(
+                    "SELECT recommendation_type, recommended_value, target_agent FROM meta_optimizer_recommendations WHERE id = ?1",
+                    rusqlite::params![rec_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|e| format!("Recommendation not found: {}", e))
+            }
+        })?;
+
+    // Only config_change recommendations can be validated via comparison
+    if rec_type != "config_change" {
+        return Ok(None);
+    }
+
+    // Find a recent workflow to use as benchmark
+    let workflow_id: Option<String> = db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT id FROM unified_workflows WHERE is_deleted = 0 ORDER BY updated_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok()
+        .ok_or_else(|| "No workflows available for comparison".to_string())
+    }).ok();
+
+    let workflow_id = match workflow_id {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+
+    // Build custom overrides: one run with current config, one with recommendation applied
+    let recommended = recommended_value.unwrap_or_else(|| "{}".to_string());
+    let overrides = vec![
+        serde_json::json!({"label": "baseline"}),
+        serde_json::json!({"label": "candidate", "config_override": recommended}),
+    ];
+
+    Ok(Some(crate::comparison::ComparisonConfig {
+        workflow_id,
+        run_count: 2,
+        variation: crate::comparison::ComparisonVariation::Custom { overrides },
+        timeout_seconds: 600,
+    }))
 }
