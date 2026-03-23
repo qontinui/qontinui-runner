@@ -622,6 +622,7 @@ Be concise and actionable.`;
               />
               {aiFixActive && aiFixProcessId === selected.id && (
                 <AiFixPanel
+                  className="h-1/2"
                   messages={aiMessages}
                   streamingContent={aiStreamingContent}
                   sessionState={aiSessionState}

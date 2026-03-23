@@ -10,6 +10,7 @@ interface AiFixPanelProps {
   streamingContent: string;
   sessionState: AiSessionState;
   processName: string;
+  className?: string;
   onSendFollowUp: (message: string) => void;
   onInterrupt: () => void;
   onClose: () => void;
@@ -20,6 +21,7 @@ export function AiFixPanel({
   streamingContent,
   sessionState,
   processName,
+  className,
   onSendFollowUp,
   onInterrupt,
   onClose,
@@ -73,7 +75,7 @@ export function AiFixPanel({
   const hasAiContent = visibleMessages.some((m) => m.role === "ai");
 
   return (
-    <div className="flex flex-col h-full border-t border-white/10 bg-zinc-950">
+    <div className={cn("flex flex-col border-t border-white/10 bg-zinc-950", className)}>
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b border-white/10 bg-zinc-900/50">
         <div className="flex items-center gap-2 min-w-0">
