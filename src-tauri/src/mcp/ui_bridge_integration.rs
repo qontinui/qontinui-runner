@@ -320,10 +320,7 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
     // Use canonicalize to resolve symlinks safely. Check for "axum" specifically in
     // the [dependencies] section to avoid false positives from comments or workspace members.
     if server_framework == ServerFramework::None {
-        let dirs_to_check: Vec<PathBuf> = vec![
-            project_path.clone(),
-            project_path.join(".."),
-        ];
+        let dirs_to_check: Vec<PathBuf> = vec![project_path.clone(), project_path.join("..")];
         for cargo_dir in dirs_to_check {
             let cargo_dir = cargo_dir.canonicalize().unwrap_or(cargo_dir);
             let cargo_path = cargo_dir.join("Cargo.toml");
@@ -1576,8 +1573,7 @@ async fn handle_preview(
                     .await;
                 }
                 ServerFramework::None if analysis.framework == Framework::React => {
-                    integrate_standalone_server(&project, &mut modifications, &mut warnings)
-                        .await;
+                    integrate_standalone_server(&project, &mut modifications, &mut warnings).await;
                 }
                 _ => {}
             }

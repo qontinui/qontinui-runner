@@ -1384,7 +1384,12 @@ fn record_flow_learning(
         .iter()
         .filter(|s| {
             flow.get_step(&s.step_id)
-                .map(|step| matches!(step.step_type, crate::orchestrator::flow::StepType::Agent { .. }))
+                .map(|step| {
+                    matches!(
+                        step.step_type,
+                        crate::orchestrator::flow::StepType::Agent { .. }
+                    )
+                })
                 .unwrap_or(false)
         })
         .count() as i64;
@@ -1422,9 +1427,9 @@ fn record_flow_learning(
     let verification_passed = outcome.verification_passed;
     let was_stopped = outcome.was_stopped;
     tokio::spawn(async move {
-        if let Err(e) = db_arc.with_conn(|conn| {
-            learning_recorder::record_workflow_learning(conn, &outcome)
-        }) {
+        if let Err(e) =
+            db_arc.with_conn(|conn| learning_recorder::record_workflow_learning(conn, &outcome))
+        {
             warn!("Failed to record flow learning outcome: {}", e);
             return;
         }

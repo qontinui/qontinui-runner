@@ -54,7 +54,10 @@ impl CompletionExecutor {
     }
 
     /// Set the middleware chain on the inner AI session executor.
-    pub fn set_middleware_chain(&mut self, chain: crate::ai_provider::middleware::AiMiddlewareChain) {
+    pub fn set_middleware_chain(
+        &mut self,
+        chain: crate::ai_provider::middleware::AiMiddlewareChain,
+    ) {
         self.ai_executor.middleware_chain = Some(chain);
     }
 

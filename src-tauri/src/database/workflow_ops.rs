@@ -139,10 +139,19 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(41)?
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
-                    enforce_token_budget: row.get::<_, Option<i32>>(45).unwrap_or(Some(0)).unwrap_or(0) != 0,
+                    enforce_token_budget: row
+                        .get::<_, Option<i32>>(45)
+                        .unwrap_or(Some(0))
+                        .unwrap_or(0)
+                        != 0,
                     rollback_policy: row.get::<_, Option<String>>(42)?,
-                    strict_cwd: row.get::<_, Option<i32>>(43).unwrap_or(Some(0)).unwrap_or(0) != 0,
-                    tool_tags: row.get::<_, Option<String>>(44)
+                    strict_cwd: row
+                        .get::<_, Option<i32>>(43)
+                        .unwrap_or(Some(0))
+                        .unwrap_or(0)
+                        != 0,
+                    tool_tags: row
+                        .get::<_, Option<String>>(44)
                         .ok()
                         .flatten()
                         .and_then(|s| serde_json::from_str(&s).ok())
@@ -770,8 +779,14 @@ impl CheckpointDb {
         let _ai_reviewed = request.ai_reviewed.unwrap_or(existing.ai_reviewed);
         let strict_cwd = request.strict_cwd.unwrap_or(existing.strict_cwd);
         let tool_tags = request.tool_tags.as_ref().unwrap_or(&existing.tool_tags);
-        let rollback_policy = request.rollback_policy.as_deref().or(existing.rollback_policy.as_deref()).unwrap_or("none");
-        let enforce_token_budget = request.enforce_token_budget.unwrap_or(existing.enforce_token_budget);
+        let rollback_policy = request
+            .rollback_policy
+            .as_deref()
+            .or(existing.rollback_policy.as_deref())
+            .unwrap_or("none");
+        let enforce_token_budget = request
+            .enforce_token_budget
+            .unwrap_or(existing.enforce_token_budget);
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
         let setup_steps_json =
@@ -1068,10 +1083,19 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(41)?
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
-                    enforce_token_budget: row.get::<_, Option<i32>>(45).unwrap_or(Some(0)).unwrap_or(0) != 0,
+                    enforce_token_budget: row
+                        .get::<_, Option<i32>>(45)
+                        .unwrap_or(Some(0))
+                        .unwrap_or(0)
+                        != 0,
                     rollback_policy: row.get::<_, Option<String>>(42)?,
-                    strict_cwd: row.get::<_, Option<i32>>(43).unwrap_or(Some(0)).unwrap_or(0) != 0,
-                    tool_tags: row.get::<_, Option<String>>(44)
+                    strict_cwd: row
+                        .get::<_, Option<i32>>(43)
+                        .unwrap_or(Some(0))
+                        .unwrap_or(0)
+                        != 0,
+                    tool_tags: row
+                        .get::<_, Option<String>>(44)
                         .ok()
                         .flatten()
                         .and_then(|s| serde_json::from_str(&s).ok())
@@ -1303,10 +1327,19 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(41)?
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok()),
                     multi_agent_mode: true,
-                    enforce_token_budget: row.get::<_, Option<i32>>(45).unwrap_or(Some(0)).unwrap_or(0) != 0,
+                    enforce_token_budget: row
+                        .get::<_, Option<i32>>(45)
+                        .unwrap_or(Some(0))
+                        .unwrap_or(0)
+                        != 0,
                     rollback_policy: row.get::<_, Option<String>>(42)?,
-                    strict_cwd: row.get::<_, Option<i32>>(43).unwrap_or(Some(0)).unwrap_or(0) != 0,
-                    tool_tags: row.get::<_, Option<String>>(44)
+                    strict_cwd: row
+                        .get::<_, Option<i32>>(43)
+                        .unwrap_or(Some(0))
+                        .unwrap_or(0)
+                        != 0,
+                    tool_tags: row
+                        .get::<_, Option<String>>(44)
                         .ok()
                         .flatten()
                         .and_then(|s| serde_json::from_str(&s).ok())

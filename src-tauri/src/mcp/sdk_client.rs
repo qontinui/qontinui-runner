@@ -944,7 +944,10 @@ async fn handle_components(
 ) -> Json<serde_json::Value> {
     // Forward recency query param to the SDK app for cache control
     let path = if let Some(recency) = query.get("recency") {
-        format!("/control/components?recency={}", urlencoding::encode(recency))
+        format!(
+            "/control/components?recency={}",
+            urlencoding::encode(recency)
+        )
     } else {
         "/control/components".to_string()
     };

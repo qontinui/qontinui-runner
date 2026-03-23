@@ -89,11 +89,7 @@ fn compute(input: &ArgumentCorrectnessInput) -> (f64, String, f64) {
     }
 
     if total_checks == 0 {
-        return (
-            0.5,
-            "No validatable fields found in traces".into(),
-            0.3,
-        );
+        return (0.5, "No validatable fields found in traces".into(), 0.3);
     }
 
     let score_val = passed_checks as f64 / total_checks as f64;
@@ -137,7 +133,11 @@ fn validate_agent_trace(trace: &TraceSnapshot) -> (u32, u32, String) {
             if !trace.output_snapshot.is_null() && trace.output_snapshot != serde_json::json!({}) {
                 passed += 1;
             }
-            (passed, total, format!("unknown agent '{}': basic check", trace.agent_type))
+            (
+                passed,
+                total,
+                format!("unknown agent '{}': basic check", trace.agent_type),
+            )
         }
     }
 }
@@ -147,11 +147,17 @@ fn validate_spec_analyst(trace: &TraceSnapshot) -> (u32, u32, String) {
     let total = 3u32;
 
     // Input should have task description or goal
-    if has_nonempty_field(&trace.input_snapshot, &["task_description", "goal", "prompt", "description"]) {
+    if has_nonempty_field(
+        &trace.input_snapshot,
+        &["task_description", "goal", "prompt", "description"],
+    ) {
         passed += 1;
     }
     // Output should have criteria array
-    if has_array_field(&trace.output_snapshot, &["criteria", "acceptance_criteria", "requirements"]) {
+    if has_array_field(
+        &trace.output_snapshot,
+        &["criteria", "acceptance_criteria", "requirements"],
+    ) {
         passed += 1;
     }
     // Output should be non-empty
@@ -167,11 +173,17 @@ fn validate_locator(trace: &TraceSnapshot) -> (u32, u32, String) {
     let total = 3u32;
 
     // Input should have criteria or task context
-    if has_nonempty_field(&trace.input_snapshot, &["criteria", "task_description", "context"]) {
+    if has_nonempty_field(
+        &trace.input_snapshot,
+        &["criteria", "task_description", "context"],
+    ) {
         passed += 1;
     }
     // Output should have file paths
-    if has_array_field(&trace.output_snapshot, &["file_paths", "files", "paths", "relevant_files"]) {
+    if has_array_field(
+        &trace.output_snapshot,
+        &["file_paths", "files", "paths", "relevant_files"],
+    ) {
         passed += 1;
     }
     // Output should be non-empty
@@ -195,7 +207,11 @@ fn validate_implementer(trace: &TraceSnapshot) -> (u32, u32, String) {
         passed += 1;
     }
     // Output should have changes
-    if has_array_field(&trace.output_snapshot, &["changes", "modifications", "edits"]) || has_nonempty_field(&trace.output_snapshot, &["diff", "patch", "output"]) {
+    if has_array_field(
+        &trace.output_snapshot,
+        &["changes", "modifications", "edits"],
+    ) || has_nonempty_field(&trace.output_snapshot, &["diff", "patch", "output"])
+    {
         passed += 1;
     }
     // Output should be non-empty
@@ -215,7 +231,11 @@ fn validate_verifier(trace: &TraceSnapshot) -> (u32, u32, String) {
         passed += 1;
     }
     // Output should have results
-    if has_array_field(&trace.output_snapshot, &["results", "criterion_results", "checks"]) || has_nonempty_field(&trace.output_snapshot, &["passed", "verdict", "all_passed"]) {
+    if has_array_field(
+        &trace.output_snapshot,
+        &["results", "criterion_results", "checks"],
+    ) || has_nonempty_field(&trace.output_snapshot, &["passed", "verdict", "all_passed"])
+    {
         passed += 1;
     }
     // Output should be non-empty
@@ -231,11 +251,17 @@ fn validate_snapshot(trace: &TraceSnapshot) -> (u32, u32, String) {
     let total = 3u32;
 
     // Input should have URL or selector
-    if has_nonempty_field(&trace.input_snapshot, &["url", "selector", "page_url", "target"]) {
+    if has_nonempty_field(
+        &trace.input_snapshot,
+        &["url", "selector", "page_url", "target"],
+    ) {
         passed += 1;
     }
     // Output should have image data
-    if has_nonempty_field(&trace.output_snapshot, &["image_data", "screenshot", "base64", "path"]) {
+    if has_nonempty_field(
+        &trace.output_snapshot,
+        &["image_data", "screenshot", "base64", "path"],
+    ) {
         passed += 1;
     }
     // Output should be non-empty
@@ -285,7 +311,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn trace(agent_type: &str, input: serde_json::Value, output: serde_json::Value) -> TraceSnapshot {
+    fn trace(
+        agent_type: &str,
+        input: serde_json::Value,
+        output: serde_json::Value,
+    ) -> TraceSnapshot {
         TraceSnapshot {
             agent_type: agent_type.to_string(),
             input_snapshot: input,

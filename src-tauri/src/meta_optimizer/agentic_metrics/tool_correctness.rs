@@ -45,17 +45,10 @@ pub fn score(input: &ToolCorrectnessInput, baseline: Option<&ToolBaseline>) -> M
     }
 }
 
-fn compute(
-    input: &ToolCorrectnessInput,
-    baseline: Option<&ToolBaseline>,
-) -> (f64, String, f64) {
+fn compute(input: &ToolCorrectnessInput, baseline: Option<&ToolBaseline>) -> (f64, String, f64) {
     // Zero-iteration crash — no tools could have been used
     if input.zero_iterations {
-        return (
-            0.0,
-            "Zero iterations — no tools executed".into(),
-            0.95,
-        );
+        return (0.0, "Zero iterations — no tools executed".into(), 0.95);
     }
 
     let baseline = match baseline {

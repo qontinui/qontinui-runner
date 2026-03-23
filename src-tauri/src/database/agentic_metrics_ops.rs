@@ -161,9 +161,7 @@ impl CheckpointDb {
     ///
     /// Safe to call on every startup — idempotent due to the NOT IN subquery.
     pub fn backfill_deterministic_scores(&self) -> Result<usize, String> {
-        use crate::meta_optimizer::agentic_metrics::{
-            self, DeterministicInput, LearnedBaselines,
-        };
+        use crate::meta_optimizer::agentic_metrics::{self, DeterministicInput, LearnedBaselines};
 
         let conn = self.get_conn()?;
 
@@ -182,7 +180,17 @@ impl CheckpointDb {
             )
             .map_err(|e| format!("Failed to prepare backfill query: {}", e))?;
 
-        let rows: Vec<(String, String, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<f64>, Option<String>, Option<String>)> = stmt
+        let rows: Vec<(
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<f64>,
+            Option<String>,
+            Option<String>,
+        )> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get(0)?,
@@ -209,7 +217,18 @@ impl CheckpointDb {
         let now = Utc::now().to_rfc3339();
         let mut backfilled = 0usize;
 
-        for (task_id, status, iterations, step_count, ver_steps, ag_steps, duration, error_type, tools_json) in &rows {
+        for (
+            task_id,
+            status,
+            iterations,
+            step_count,
+            ver_steps,
+            ag_steps,
+            duration,
+            error_type,
+            tools_json,
+        ) in &rows
+        {
             let tools_used: Vec<String> = tools_json
                 .as_ref()
                 .and_then(|j| serde_json::from_str(j).ok())
@@ -245,9 +264,15 @@ impl CheckpointDb {
                          rationale, is_llm_judged, model_used, created_at)
                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
                     params![
-                        id, task_id, score.metric.as_str(), score.score,
-                        score.confidence, score.rationale,
-                        score.is_llm_judged as i32, score.model_used, now,
+                        id,
+                        task_id,
+                        score.metric.as_str(),
+                        score.score,
+                        score.confidence,
+                        score.rationale,
+                        score.is_llm_judged as i32,
+                        score.model_used,
+                        now,
                     ],
                 )
                 .map_err(|e| format!("Failed to backfill score: {}", e))?;
@@ -262,7 +287,10 @@ impl CheckpointDb {
             backfilled += 1;
         }
 
-        tracing::info!("Backfilled deterministic agentic scores for {} historical runs", backfilled);
+        tracing::info!(
+            "Backfilled deterministic agentic scores for {} historical runs",
+            backfilled
+        );
         Ok(backfilled)
     }
 

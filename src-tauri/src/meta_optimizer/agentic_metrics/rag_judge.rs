@@ -276,7 +276,10 @@ pub fn persist_retrieval_event(
             id,
             task_run_id,
             event.source_table,
-            format!("Retrieved {} results from {}", event.result_count, event.source_table),
+            format!(
+                "Retrieved {} results from {}",
+                event.result_count, event.source_table
+            ),
             data_json,
             now,
         ],

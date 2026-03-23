@@ -157,6 +157,50 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
           return true;
         }
 
+        case "scroll_page": {
+          const scrollParams = payload.params ?? {};
+          const beforeX = window.scrollX;
+          const beforeY = window.scrollY;
+          const useSmooth = !!(scrollParams.smooth as boolean);
+          window.scrollBy({
+            top: (scrollParams.top as number) ?? 0,
+            left: (scrollParams.left as number) ?? 0,
+            behavior: useSmooth ? "smooth" : "auto",
+          });
+
+          // When smooth scrolling, the position updates asynchronously.
+          // Wait for the scrollend event (with a fallback timeout) before reading.
+          if (useSmooth) {
+            await new Promise<void>((resolve) => {
+              const onScrollEnd = () => {
+                window.removeEventListener("scrollend", onScrollEnd);
+                clearTimeout(fallback);
+                resolve();
+              };
+              window.addEventListener("scrollend", onScrollEnd, { once: true });
+              // Fallback: if scrollend never fires (e.g. no actual scroll or
+              // browser doesn't support scrollend), resolve after 500ms
+              const fallback = setTimeout(() => {
+                window.removeEventListener("scrollend", onScrollEnd);
+                resolve();
+              }, 500);
+            });
+          }
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: {
+              before: { scrollX: beforeX, scrollY: beforeY },
+              after: { scrollX: window.scrollX, scrollY: window.scrollY },
+              changed: window.scrollX !== beforeX || window.scrollY !== beforeY,
+            },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
         case "query_selector": {
           const { selector, index: selectorIndex } = payload;
           // action field is typed as object for execute_action, but for

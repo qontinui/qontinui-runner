@@ -2865,30 +2865,53 @@ pub fn validate_prompt_robustness(prompt: &str) -> Vec<String> {
     // Check for missing role/boundary instructions
     let lower = prompt.to_lowercase();
     if !lower.contains("you are") && !lower.contains("your role") && !lower.contains("as a") {
-        warnings.push("Prompt has no explicit role definition — vulnerable to role injection".to_string());
+        warnings.push(
+            "Prompt has no explicit role definition — vulnerable to role injection".to_string(),
+        );
     }
 
     // Check for overly permissive instructions
-    if lower.contains("do anything") || lower.contains("no restrictions") || lower.contains("ignore safety") {
+    if lower.contains("do anything")
+        || lower.contains("no restrictions")
+        || lower.contains("ignore safety")
+    {
         warnings.push("Prompt contains overly permissive language".to_string());
     }
 
     // Check for missing output format constraints
-    if !lower.contains("json") && !lower.contains("format") && !lower.contains("respond with") && !lower.contains("output") {
-        warnings.push("Prompt has no output format constraints — may produce unparseable results".to_string());
+    if !lower.contains("json")
+        && !lower.contains("format")
+        && !lower.contains("respond with")
+        && !lower.contains("output")
+    {
+        warnings.push(
+            "Prompt has no output format constraints — may produce unparseable results".to_string(),
+        );
     }
 
     // Check prompt length (too short = likely underspecified)
     if prompt.len() < 50 {
-        warnings.push(format!("Prompt is very short ({} chars) — may be underspecified", prompt.len()));
+        warnings.push(format!(
+            "Prompt is very short ({} chars) — may be underspecified",
+            prompt.len()
+        ));
     }
 
     // Check for common injection vectors not being addressed
-    if !lower.contains("ignore") && !lower.contains("override") && !lower.contains("previous instructions") {
+    if !lower.contains("ignore")
+        && !lower.contains("override")
+        && !lower.contains("previous instructions")
+    {
         // The prompt doesn't mention these terms, which is fine — but if the prompt
         // doesn't have any boundary-setting language at all, flag it
-        if !lower.contains("must") && !lower.contains("always") && !lower.contains("never") && !lower.contains("do not") {
-            warnings.push("Prompt lacks boundary-setting language (must/always/never/do not)".to_string());
+        if !lower.contains("must")
+            && !lower.contains("always")
+            && !lower.contains("never")
+            && !lower.contains("do not")
+        {
+            warnings.push(
+                "Prompt lacks boundary-setting language (must/always/never/do not)".to_string(),
+            );
         }
     }
 
@@ -2905,7 +2928,11 @@ mod robustness_tests {
                       Always respond with JSON format. You must never execute arbitrary commands. \
                       Do not modify files outside the working directory.";
         let warnings = validate_prompt_robustness(prompt);
-        assert!(warnings.is_empty(), "Good prompt should have no warnings: {:?}", warnings);
+        assert!(
+            warnings.is_empty(),
+            "Good prompt should have no warnings: {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -2921,6 +2948,10 @@ mod robustness_tests {
         let prompt = "Please analyze the following code and return results in JSON format. You must check for errors.";
         let warnings = validate_prompt_robustness(prompt);
         // Has format constraints and boundary language, but no role definition
-        assert!(warnings.iter().any(|w| w.contains("role definition")), "Should warn about missing role: {:?}", warnings);
+        assert!(
+            warnings.iter().any(|w| w.contains("role definition")),
+            "Should warn about missing role: {:?}",
+            warnings
+        );
     }
 }

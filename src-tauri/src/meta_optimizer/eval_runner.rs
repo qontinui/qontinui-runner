@@ -213,13 +213,16 @@ pub fn validate_recommendation(
                 Ok(report) => {
                     tracing::info!(
                         "Robustness test for recommendation {}: {}/{} passed",
-                        recommendation_id, report.passed, report.total_tests
+                        recommendation_id,
+                        report.passed,
+                        report.total_tests
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
                         "Robustness test failed for recommendation {}: {}",
-                        recommendation_id, e
+                        recommendation_id,
+                        e
                     );
                 }
             }

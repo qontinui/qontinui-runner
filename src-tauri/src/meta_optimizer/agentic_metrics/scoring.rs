@@ -312,9 +312,7 @@ fn query_tool_data(
     let mut sample_count = 0i64;
 
     let rows = stmt
-        .query_map(params_vec.as_slice(), |row| {
-            row.get::<_, String>(0)
-        })
+        .query_map(params_vec.as_slice(), |row| row.get::<_, String>(0))
         .map_err(|e| format!("Failed to query tool data: {}", e))?;
 
     for tools_json in rows.flatten() {

@@ -461,7 +461,10 @@ mod tests {
             "/etc/passwd"
         });
         let result = check_path_containment(&escaped, &boundary, "../../../etc");
-        assert!(result.is_err(), "Path outside boundary should fail containment check");
+        assert!(
+            result.is_err(),
+            "Path outside boundary should fail containment check"
+        );
         assert!(
             result.unwrap_err().contains("outside the allowed boundary"),
             "Error should mention boundary violation"

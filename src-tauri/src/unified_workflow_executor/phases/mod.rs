@@ -874,16 +874,19 @@ fn build_compressed_iteration_history(
             Some(results) if !results.is_empty() => {
                 // Capture retrieval event for RAG metric evaluation
                 {
-                    let retrieval_event = crate::meta_optimizer::agentic_metrics::rag_judge::capture_retrieval_event(
-                        &query_text,
-                        "universal_fixes",
-                        &results,
-                        None,
-                        |fix| (fix.fix_type.clone(), fix.fix_description.clone()),
-                    );
+                    let retrieval_event =
+                        crate::meta_optimizer::agentic_metrics::rag_judge::capture_retrieval_event(
+                            &query_text,
+                            "universal_fixes",
+                            &results,
+                            None,
+                            |fix| (fix.fix_type.clone(), fix.fix_description.clone()),
+                        );
                     let _ = checkpoint_db.with_conn(|conn| {
                         crate::meta_optimizer::agentic_metrics::rag_judge::persist_retrieval_event(
-                            conn, execution_id, &retrieval_event,
+                            conn,
+                            execution_id,
+                            &retrieval_event,
                         )
                     });
                 }

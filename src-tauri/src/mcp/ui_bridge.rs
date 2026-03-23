@@ -1235,7 +1235,7 @@ pub async fn ui_bridge_clear_console_errors_handler(
 pub struct BrowserEventsQuery {
     #[serde(default, rename = "type")]
     event_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_timestamp")]
     since: Option<f64>,
     #[serde(default)]
     limit: Option<u32>,
@@ -1245,7 +1245,7 @@ pub struct BrowserEventsQuery {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_timestamp")]
     since: Option<f64>,
     #[serde(default)]
     limit: Option<u32>,
@@ -1572,14 +1572,89 @@ pub async fn ui_bridge_get_spec_handler(
 // Page Navigation Handlers
 // ============================================================================
 
-/// Query parameters for console errors endpoint
+/// Query parameters for console errors endpoint.
+/// Accepts `since` as either numeric (epoch ms) or ISO 8601 string.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsoleErrorsQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_timestamp")]
     since: Option<f64>,
     #[serde(default)]
     limit: Option<u32>,
+}
+
+/// Deserialize a timestamp that can be either a number (epoch ms) or an ISO 8601 string.
+fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct TimestampVisitor;
+    impl<'de> de::Visitor<'de> for TimestampVisitor {
+        type Value = Option<f64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a number (epoch ms) or ISO 8601 string")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(TimestampInnerVisitor)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    struct TimestampInnerVisitor;
+    impl<'de> de::Visitor<'de> for TimestampInnerVisitor {
+        type Value = Option<f64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a number or ISO 8601 string")
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v as f64))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v as f64))
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            // Try parsing as float first
+            if let Ok(f) = v.parse::<f64>() {
+                return Ok(Some(f));
+            }
+            // Try ISO 8601
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(v) {
+                return Ok(Some(dt.timestamp_millis() as f64));
+            }
+            // Try common ISO variants
+            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(v, "%Y-%m-%dT%H:%M:%S") {
+                return Ok(Some(dt.and_utc().timestamp_millis() as f64));
+            }
+            Err(de::Error::custom(format!(
+                "invalid timestamp: expected number (epoch ms) or ISO 8601 string, got '{}'",
+                v
+            )))
+        }
+    }
+
+    deserializer.deserialize_option(TimestampVisitor)
 }
 
 /// Query parameters for network requests endpoint
@@ -1594,7 +1669,7 @@ pub struct NetworkRequestsQuery {
     url_pattern: Option<String>,
     #[serde(default)]
     failures_only: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_timestamp")]
     since: Option<f64>,
     #[serde(default)]
     limit: Option<u32>,
@@ -1801,8 +1876,27 @@ pub async fn ui_bridge_page_evaluate_handler(
 /// Returns a job_id that can be used to poll for status and results
 pub async fn start_ui_bridge_exploration(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<StartUIBridgeExplorationRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let request: StartUIBridgeExplorationRequest = match serde_json::from_value(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ApiResponse::error(format!(
+                    "Invalid request: {}. Required fields: connection_url (string). \
+                     Optional: target_type (\"web\"|\"desktop\"|\"mobile\", default \"web\"), \
+                     max_depth (int, default 2), max_elements_per_page (int, default 20), \
+                     max_total_elements (int, default 100), action_delay_ms (int, default 500), \
+                     blocked_keywords (string[]), safe_keywords (string[]), \
+                     blocked_selectors (string[]), capture_screenshots (bool, default false), \
+                     run_state_discovery (bool, default true). \
+                     Example: {{\"connection_url\": \"http://localhost:3001\", \"target_type\": \"web\"}}",
+                    e
+                ))),
+            ));
+        }
+    };
     info!(
         "MCP API: Starting UI Bridge exploration for URL: {} (type: {})",
         request.connection_url, request.target_type
@@ -3954,6 +4048,601 @@ pub async fn ui_bridge_ai_find_handler(
     }
 }
 
+/// Natural language action execution.
+pub async fn ui_bridge_ai_execute_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: AI execute");
+    let payload = serde_json::json!({ "params": body });
+    match ui_bridge_request_sync(&state, "ai_execute", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: AI execute failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// AI assertion evaluation.
+pub async fn ui_bridge_ai_assert_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: AI assert");
+    let payload = serde_json::json!({ "params": body });
+    match ui_bridge_request_sync(&state, "ai_assert", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: AI assert failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Batch AI assertion evaluation.
+pub async fn ui_bridge_ai_assert_batch_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: AI assert batch");
+    let payload = serde_json::json!({ "params": body });
+    match ui_bridge_request_sync(&state, "ai_assert_batch", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: AI assert batch failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Semantic AI snapshot of the page.
+pub async fn ui_bridge_ai_snapshot_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: AI snapshot");
+    match ui_bridge_request_sync(&state, "ai_snapshot", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: AI snapshot failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Natural language page summary.
+pub async fn ui_bridge_ai_summary_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: AI summary");
+    match ui_bridge_request_sync(&state, "ai_summary", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: AI summary failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Capabilities endpoint — static listing of all supported features.
+pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Value>> {
+    Json(ApiResponse::success(serde_json::json!({
+        "version": "0.3.1",
+        "appId": "qontinui-runner",
+        "appType": "desktop",
+        "framework": "tauri",
+        "categories": {
+            "control": {
+                "description": "Element discovery, actions, navigation, forms",
+                "endpoints": ["snapshot", "elements", "element/:id", "element/:id/state", "element/:id/action",
+                    "discover", "find", "components", "component/:id/state", "page/navigate", "page/refresh",
+                    "page/back", "page/forward", "page/evaluate", "forms", "fill", "forms/snapshot", "forms/diff",
+                    "workflows", "specs", "query-selector", "keyboard-shortcuts"]
+            },
+            "ai": {
+                "description": "AI-powered search, assertions, semantic snapshots, NL actions",
+                "endpoints": ["find", "search", "execute", "assert", "assert-batch", "snapshot", "summary",
+                    "semantic-search", "diff", "execute-with-diff", "bookmarks", "scoped-diff",
+                    "summarize-diff", "categorize-last-diff"]
+            },
+            "media": {
+                "description": "Media element discovery, audits, and analysis",
+                "endpoints": ["media/find", "media/audit/accessibility", "media/audit/performance",
+                    "media/snapshot", "media/analyze", "media/analyze/batch", "media/analyze/page", "media/compare"]
+            },
+            "stateMachine": {
+                "description": "State discovery, activation, transitions, navigation",
+                "endpoints": ["states", "states/active", "states/snapshot", "states/find-path",
+                    "states/navigate", "state/:id", "state/:id/activate", "state/:id/deactivate",
+                    "state-groups", "transitions", "transition/:id/can-execute", "transition/:id/execute"]
+            },
+            "idle": {
+                "description": "Composite and per-signal idle detection",
+                "endpoints": ["idle-status", "idle-status/:signal", "wait-for-idle",
+                    "wait-for-idle/:signal", "wait-for-targets"]
+            },
+            "design": {
+                "description": "Design inspection, styles, audit, responsive, evaluation",
+                "endpoints": ["design/element/{id}/styles", "design/snapshot", "design/audit", "design/responsive",
+                    "design/evaluate", "design/evaluate/baseline", "design/evaluate/contexts", "design/evaluate/diff"]
+            },
+            "network": {
+                "description": "Network request monitoring",
+                "endpoints": ["network-requests", "network-requests/in-flight", "network-request/:id",
+                    "network-requests/wait"]
+            },
+            "errorTracking": {
+                "description": "Error sessions, baselines, reports",
+                "endpoints": ["error-sessions/start", "error-sessions", "error-sessions/end",
+                    "error-baselines/capture", "error-baselines/compare", "error-report", "error-snapshots"]
+            },
+            "clipboard": {
+                "description": "System clipboard read/write (OS-level via arboard)",
+                "available": true
+            },
+            "jsEvaluation": {
+                "description": "Arbitrary JavaScript evaluation in webview",
+                "available": true
+            },
+            "annotations": {
+                "description": "Element annotation CRUD with coverage tracking",
+                "endpoints": ["annotations", "annotation/{id}", "annotations/coverage", "annotations/export", "annotations/import"]
+            },
+            "intents": {
+                "description": "Intent registration, discovery, and execution",
+                "endpoints": ["intents", "intents/find", "intents/execute", "intents/execute-from-query"]
+            },
+            "history": {
+                "description": "Action history, interaction metrics, performance entries",
+                "endpoints": ["action-history", "metrics", "performance-entries"]
+            },
+            "timeline": {
+                "description": "Performance timeline, browser events, error snapshots",
+                "endpoints": ["timeline", "browser-events", "error-snapshots"]
+            },
+            "debug": {
+                "description": "Debug tools for element inspection and highlighting",
+                "endpoints": ["element-tree", "highlight/{id}"]
+            },
+            "analysis": {
+                "description": "AI-powered analysis: data extraction, regions, structured data, cross-app",
+                "endpoints": ["analyze/data", "analyze/regions", "analyze/structured-data",
+                    "analyze/cross-app-compare", "recovery/attempt"]
+            }
+        }
+    })))
+}
+
+/// Get individual idle signal status.
+pub async fn ui_bridge_get_idle_signal_handler(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(signal): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Get idle signal '{}'", signal);
+    let payload = serde_json::json!({ "params": { "signal": signal } });
+    match ui_bridge_request_sync(&state, "get_idle_signal", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Get idle signal failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Wait for a specific idle signal.
+pub async fn ui_bridge_wait_for_idle_signal_handler(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(signal): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Wait for idle signal '{}'", signal);
+    let mut params = body;
+    if let Some(obj) = params.as_object_mut() {
+        obj.insert("signal".to_string(), serde_json::json!(signal));
+    } else {
+        params = serde_json::json!({ "signal": signal });
+    }
+    let payload = serde_json::json!({ "params": params });
+    match ui_bridge_request_sync(&state, "wait_for_idle_signal", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Wait for idle signal failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Wait for multiple idle targets.
+pub async fn ui_bridge_wait_for_targets_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Wait for targets");
+    let payload = serde_json::json!({ "params": body });
+    match ui_bridge_request_sync(&state, "wait_for_targets", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Wait for targets failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get action history.
+pub async fn ui_bridge_get_action_history_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Get action history");
+    match ui_bridge_request_sync(&state, "get_action_history", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Get action history failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get interaction metrics.
+pub async fn ui_bridge_get_interaction_metrics_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Get interaction metrics");
+    match ui_bridge_request_sync(&state, "get_interaction_metrics", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Get interaction metrics failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// List all annotations.
+pub async fn ui_bridge_annotations_list_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: List annotations");
+    match ui_bridge_request_sync(&state, "annotations_list", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: List annotations failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Create annotation.
+pub async fn ui_bridge_annotations_create_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Create annotation");
+    let payload = serde_json::json!({ "params": body });
+    match ui_bridge_request_sync(&state, "annotations_create", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Create annotation failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get single annotation.
+pub async fn ui_bridge_annotations_get_handler(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Get annotation '{}'", id);
+    let payload = serde_json::json!({ "params": { "id": id } });
+    match ui_bridge_request_sync(&state, "annotations_get", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Get annotation failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Update annotation.
+pub async fn ui_bridge_annotations_update_handler(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Update annotation '{}'", id);
+    let payload = serde_json::json!({ "params": { "id": id, "updates": body } });
+    match ui_bridge_request_sync(&state, "annotations_update", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Update annotation failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Delete annotation.
+pub async fn ui_bridge_annotations_delete_handler(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Delete annotation '{}'", id);
+    let payload = serde_json::json!({ "params": { "id": id } });
+    match ui_bridge_request_sync(&state, "annotations_delete", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Delete annotation failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get annotation coverage metrics.
+pub async fn ui_bridge_annotations_coverage_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Annotation coverage");
+    match ui_bridge_request_sync(&state, "annotations_coverage", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Annotation coverage failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Export annotations.
+pub async fn ui_bridge_annotations_export_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Export annotations");
+    match ui_bridge_request_sync(&state, "annotations_export", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Export annotations failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
+// Media routes (IPC to webview SDK)
+// ============================================================================
+
+/// Find media elements.
+pub async fn ui_bridge_media_find_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let payload = serde_json::json!({ "params": body });
+    match ui_bridge_request_sync(&state, "find_media", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Media audit (accessibility or performance).
+pub async fn ui_bridge_media_audit_handler(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(audit_type): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let payload = serde_json::json!({ "params": { "auditType": audit_type } });
+    match ui_bridge_request_sync(&state, "media_audit", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Capture media snapshot.
+pub async fn ui_bridge_media_snapshot_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let payload = serde_json::json!({ "params": body });
+    match ui_bridge_request_sync(&state, "capture_media_snapshot", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Analyze media elements.
+pub async fn ui_bridge_media_analyze_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let payload = serde_json::json!({ "params": body });
+    match ui_bridge_request_sync(&state, "analyze_media", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+// ============================================================================
+// State machine routes (IPC to webview SDK)
+// ============================================================================
+
+macro_rules! ipc_handler_get {
+    ($fn_name:ident, $ipc_type:expr) => {
+        pub async fn $fn_name(
+            State(state): State<Arc<ApiState>>,
+        ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+            match ui_bridge_request_sync(&state, $ipc_type, serde_json::json!({})).await {
+                Ok(data) => Ok(Json(ApiResponse::success(data))),
+                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+            }
+        }
+    };
+}
+
+macro_rules! ipc_handler_post {
+    ($fn_name:ident, $ipc_type:expr) => {
+        pub async fn $fn_name(
+            State(state): State<Arc<ApiState>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+            let payload = serde_json::json!({ "params": body });
+            match ui_bridge_request_sync(&state, $ipc_type, payload).await {
+                Ok(data) => Ok(Json(ApiResponse::success(data))),
+                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+            }
+        }
+    };
+}
+
+macro_rules! ipc_handler_path_get {
+    ($fn_name:ident, $ipc_type:expr, $param_name:expr) => {
+        pub async fn $fn_name(
+            State(state): State<Arc<ApiState>>,
+            axum::extract::Path(id): axum::extract::Path<String>,
+        ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+            let payload = serde_json::json!({ "params": { $param_name: id } });
+            match ui_bridge_request_sync(&state, $ipc_type, payload).await {
+                Ok(data) => Ok(Json(ApiResponse::success(data))),
+                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+            }
+        }
+    };
+}
+
+macro_rules! ipc_handler_path_post {
+    ($fn_name:ident, $ipc_type:expr, $param_name:expr) => {
+        pub async fn $fn_name(
+            State(state): State<Arc<ApiState>>,
+            axum::extract::Path(id): axum::extract::Path<String>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+            let mut params = body;
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert($param_name.to_string(), serde_json::json!(id));
+            } else {
+                // Body wasn't an object; create one with just the path param
+                params = serde_json::json!({ $param_name: id });
+            }
+            let payload = serde_json::json!({ "params": params });
+            match ui_bridge_request_sync(&state, $ipc_type, payload).await {
+                Ok(data) => Ok(Json(ApiResponse::success(data))),
+                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+            }
+        }
+    };
+}
+
+// State machine
+ipc_handler_get!(ui_bridge_get_states_handler, "get_states");
+ipc_handler_get!(ui_bridge_get_active_states_handler, "get_active_states");
+ipc_handler_get!(ui_bridge_get_state_snapshot_handler, "get_state_snapshot");
+ipc_handler_path_get!(ui_bridge_get_state_handler, "get_state", "stateId");
+ipc_handler_path_post!(
+    ui_bridge_activate_state_handler,
+    "activate_state",
+    "stateId"
+);
+ipc_handler_path_post!(
+    ui_bridge_deactivate_state_handler,
+    "deactivate_state",
+    "stateId"
+);
+ipc_handler_get!(ui_bridge_get_state_groups_handler, "get_state_groups");
+ipc_handler_path_post!(
+    ui_bridge_activate_state_group_handler,
+    "activate_state_group",
+    "groupId"
+);
+ipc_handler_path_post!(
+    ui_bridge_deactivate_state_group_handler,
+    "deactivate_state_group",
+    "groupId"
+);
+ipc_handler_get!(ui_bridge_get_transitions_handler, "get_transitions");
+ipc_handler_path_get!(
+    ui_bridge_can_execute_transition_handler,
+    "can_execute_transition",
+    "transitionId"
+);
+ipc_handler_path_post!(
+    ui_bridge_execute_transition_handler,
+    "execute_transition",
+    "transitionId"
+);
+ipc_handler_post!(ui_bridge_find_state_path_handler, "find_state_path");
+ipc_handler_post!(ui_bridge_navigate_to_state_handler, "navigate_to_state");
+
+// AI semantic search & diff
+ipc_handler_post!(ui_bridge_ai_semantic_search_handler, "ai_semantic_search");
+ipc_handler_get!(ui_bridge_ai_diff_handler, "ai_diff");
+
+// Intents
+ipc_handler_get!(ui_bridge_get_intents_handler, "get_intents");
+ipc_handler_post!(ui_bridge_register_intent_handler, "register_intent");
+ipc_handler_post!(ui_bridge_find_intent_handler, "find_intent");
+ipc_handler_post!(ui_bridge_execute_intent_handler, "execute_intent");
+
+// Component state
+ipc_handler_path_get!(
+    ui_bridge_get_component_state_handler,
+    "get_component_state",
+    "componentId"
+);
+
+// Page scroll
+ipc_handler_post!(ui_bridge_scroll_page_handler, "scroll_page");
+
+// Performance entries
+ipc_handler_get!(
+    ui_bridge_get_performance_entries_handler,
+    "get_performance_entries"
+);
+ipc_handler_get!(
+    ui_bridge_clear_performance_entries_handler,
+    "clear_performance_entries"
+);
+
+// AI analysis
+ipc_handler_post!(ui_bridge_ai_analyze_data_handler, "ai_analyze_data");
+ipc_handler_post!(ui_bridge_ai_analyze_regions_handler, "ai_analyze_regions");
+ipc_handler_post!(
+    ui_bridge_ai_analyze_structured_handler,
+    "ai_analyze_structured_data"
+);
+ipc_handler_post!(
+    ui_bridge_ai_analyze_cross_app_handler,
+    "ai_analyze_cross_app"
+);
+ipc_handler_post!(ui_bridge_ai_recovery_attempt_handler, "ai_recovery_attempt");
+
+// Design evaluation
+ipc_handler_post!(ui_bridge_design_evaluate_handler, "design_evaluate");
+ipc_handler_post!(
+    ui_bridge_design_evaluate_baseline_handler,
+    "design_evaluate_baseline"
+);
+ipc_handler_get!(
+    ui_bridge_design_evaluate_contexts_handler,
+    "design_evaluate_contexts"
+);
+ipc_handler_post!(
+    ui_bridge_design_evaluate_diff_handler,
+    "design_evaluate_diff"
+);
+
+// Media compare
+ipc_handler_post!(ui_bridge_media_compare_handler, "media_compare");
+
+// Annotations import
+ipc_handler_post!(ui_bridge_annotations_import_handler, "annotations_import");
+
+// Intents from NL query
+ipc_handler_post!(
+    ui_bridge_execute_intent_from_query_handler,
+    "execute_intent_from_query"
+);
+
+// Debug
+ipc_handler_get!(ui_bridge_get_element_tree_handler, "get_element_tree");
+ipc_handler_path_get!(
+    ui_bridge_highlight_element_handler,
+    "highlight_element",
+    "elementId"
+);
+
 /// Find elements matching criteria.
 pub async fn ui_bridge_find_handler(
     State(state): State<Arc<ApiState>>,
@@ -4880,4 +5569,241 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route("/ui-bridge/ai/search", post(ui_bridge_ai_search_handler))
         .route("/ui-bridge/ai/find", post(ui_bridge_ai_find_handler))
+        // Phase 2: AI endpoints
+        .route("/ui-bridge/ai/execute", post(ui_bridge_ai_execute_handler))
+        .route("/ui-bridge/ai/assert", post(ui_bridge_ai_assert_handler))
+        .route(
+            "/ui-bridge/ai/assert-batch",
+            post(ui_bridge_ai_assert_batch_handler),
+        )
+        .route("/ui-bridge/ai/snapshot", get(ui_bridge_ai_snapshot_handler))
+        .route("/ui-bridge/ai/summary", get(ui_bridge_ai_summary_handler))
+        // Phase 3: Capabilities
+        .route(
+            "/ui-bridge/capabilities",
+            get(ui_bridge_capabilities_handler),
+        )
+        // Phase 4: Idle sub-signals
+        .route(
+            "/ui-bridge/control/idle-status/{signal}",
+            get(ui_bridge_get_idle_signal_handler),
+        )
+        .route(
+            "/ui-bridge/control/wait-for-idle/{signal}",
+            post(ui_bridge_wait_for_idle_signal_handler),
+        )
+        .route(
+            "/ui-bridge/control/wait-for-targets",
+            post(ui_bridge_wait_for_targets_handler),
+        )
+        // Phase 4: Action history & metrics
+        .route(
+            "/ui-bridge/control/action-history",
+            get(ui_bridge_get_action_history_handler),
+        )
+        .route(
+            "/ui-bridge/control/metrics",
+            get(ui_bridge_get_interaction_metrics_handler),
+        )
+        // Phase 5: Annotations
+        .route(
+            "/ui-bridge/control/annotations",
+            get(ui_bridge_annotations_list_handler).post(ui_bridge_annotations_create_handler),
+        )
+        .route(
+            "/ui-bridge/control/annotation/{id}",
+            get(ui_bridge_annotations_get_handler)
+                .put(ui_bridge_annotations_update_handler)
+                .delete(ui_bridge_annotations_delete_handler),
+        )
+        .route(
+            "/ui-bridge/control/annotations/coverage",
+            get(ui_bridge_annotations_coverage_handler),
+        )
+        .route(
+            "/ui-bridge/control/annotations/export",
+            get(ui_bridge_annotations_export_handler),
+        )
+        // Media routes
+        .route(
+            "/ui-bridge/ai/media/find",
+            post(ui_bridge_media_find_handler),
+        )
+        .route(
+            "/ui-bridge/ai/media/audit/{audit_type}",
+            post(ui_bridge_media_audit_handler),
+        )
+        .route(
+            "/ui-bridge/ai/media/snapshot",
+            post(ui_bridge_media_snapshot_handler),
+        )
+        .route(
+            "/ui-bridge/ai/media/analyze",
+            post(ui_bridge_media_analyze_handler),
+        )
+        .route(
+            "/ui-bridge/ai/media/analyze/batch",
+            post(ui_bridge_media_analyze_handler),
+        )
+        .route(
+            "/ui-bridge/ai/media/analyze/page",
+            post(ui_bridge_media_analyze_handler),
+        )
+        // State machine routes
+        .route(
+            "/ui-bridge/control/states",
+            get(ui_bridge_get_states_handler),
+        )
+        .route(
+            "/ui-bridge/control/states/active",
+            get(ui_bridge_get_active_states_handler),
+        )
+        .route(
+            "/ui-bridge/control/states/snapshot",
+            get(ui_bridge_get_state_snapshot_handler),
+        )
+        .route(
+            "/ui-bridge/control/states/find-path",
+            post(ui_bridge_find_state_path_handler),
+        )
+        .route(
+            "/ui-bridge/control/states/navigate",
+            post(ui_bridge_navigate_to_state_handler),
+        )
+        .route(
+            "/ui-bridge/control/state/{id}",
+            get(ui_bridge_get_state_handler),
+        )
+        .route(
+            "/ui-bridge/control/state/{id}/activate",
+            post(ui_bridge_activate_state_handler),
+        )
+        .route(
+            "/ui-bridge/control/state/{id}/deactivate",
+            post(ui_bridge_deactivate_state_handler),
+        )
+        .route(
+            "/ui-bridge/control/state-groups",
+            get(ui_bridge_get_state_groups_handler),
+        )
+        .route(
+            "/ui-bridge/control/state-group/{id}/activate",
+            post(ui_bridge_activate_state_group_handler),
+        )
+        .route(
+            "/ui-bridge/control/state-group/{id}/deactivate",
+            post(ui_bridge_deactivate_state_group_handler),
+        )
+        .route(
+            "/ui-bridge/control/transitions",
+            get(ui_bridge_get_transitions_handler),
+        )
+        .route(
+            "/ui-bridge/control/transition/{id}/can-execute",
+            get(ui_bridge_can_execute_transition_handler),
+        )
+        .route(
+            "/ui-bridge/control/transition/{id}/execute",
+            post(ui_bridge_execute_transition_handler),
+        )
+        // AI semantic search & diff
+        .route(
+            "/ui-bridge/ai/semantic-search",
+            post(ui_bridge_ai_semantic_search_handler),
+        )
+        .route("/ui-bridge/ai/diff", get(ui_bridge_ai_diff_handler))
+        // Intents
+        .route(
+            "/ui-bridge/control/intents",
+            get(ui_bridge_get_intents_handler).post(ui_bridge_register_intent_handler),
+        )
+        .route(
+            "/ui-bridge/control/intents/find",
+            post(ui_bridge_find_intent_handler),
+        )
+        .route(
+            "/ui-bridge/control/intents/execute",
+            post(ui_bridge_execute_intent_handler),
+        )
+        // Component state
+        .route(
+            "/ui-bridge/control/component/{id}/state",
+            get(ui_bridge_get_component_state_handler),
+        )
+        // Page scroll
+        .route(
+            "/ui-bridge/control/page/scroll",
+            post(ui_bridge_scroll_page_handler),
+        )
+        // Performance entries
+        .route(
+            "/ui-bridge/control/performance-entries",
+            get(ui_bridge_get_performance_entries_handler),
+        )
+        .route(
+            "/ui-bridge/control/performance-entries/clear",
+            post(ui_bridge_clear_performance_entries_handler),
+        )
+        // AI analysis
+        .route(
+            "/ui-bridge/ai/analyze/data",
+            post(ui_bridge_ai_analyze_data_handler),
+        )
+        .route(
+            "/ui-bridge/ai/analyze/regions",
+            post(ui_bridge_ai_analyze_regions_handler),
+        )
+        .route(
+            "/ui-bridge/ai/analyze/structured-data",
+            post(ui_bridge_ai_analyze_structured_handler),
+        )
+        .route(
+            "/ui-bridge/ai/analyze/cross-app-compare",
+            post(ui_bridge_ai_analyze_cross_app_handler),
+        )
+        .route(
+            "/ui-bridge/ai/recovery/attempt",
+            post(ui_bridge_ai_recovery_attempt_handler),
+        )
+        // Design evaluation
+        .route(
+            "/ui-bridge/control/design/evaluate",
+            post(ui_bridge_design_evaluate_handler),
+        )
+        .route(
+            "/ui-bridge/control/design/evaluate/baseline",
+            post(ui_bridge_design_evaluate_baseline_handler),
+        )
+        .route(
+            "/ui-bridge/control/design/evaluate/contexts",
+            get(ui_bridge_design_evaluate_contexts_handler),
+        )
+        .route(
+            "/ui-bridge/control/design/evaluate/diff",
+            post(ui_bridge_design_evaluate_diff_handler),
+        )
+        // Media compare
+        .route(
+            "/ui-bridge/ai/media/compare",
+            post(ui_bridge_media_compare_handler),
+        )
+        // Annotations import
+        .route(
+            "/ui-bridge/control/annotations/import",
+            post(ui_bridge_annotations_import_handler),
+        )
+        // Intents from NL query
+        .route(
+            "/ui-bridge/control/intents/execute-from-query",
+            post(ui_bridge_execute_intent_from_query_handler),
+        )
+        // Debug
+        .route(
+            "/ui-bridge/debug/element-tree",
+            get(ui_bridge_get_element_tree_handler),
+        )
+        .route(
+            "/ui-bridge/debug/highlight/{id}",
+            post(ui_bridge_highlight_element_handler),
+        )
 }

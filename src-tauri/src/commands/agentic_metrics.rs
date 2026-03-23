@@ -10,9 +10,7 @@ pub fn get_agentic_scores(
     state: State<'_, Arc<AppState>>,
     task_run_id: String,
 ) -> Result<Vec<crate::database::agentic_metrics_ops::AgenticMetricScoreRow>, String> {
-    state
-        .checkpoint_db
-        .get_agentic_scores_for_run(&task_run_id)
+    state.checkpoint_db.get_agentic_scores_for_run(&task_run_id)
 }
 
 /// Get aggregate agentic metric stats over a time period.
@@ -39,9 +37,7 @@ pub fn get_composite_score_trend(
 
 /// Manually trigger baseline recomputation.
 #[tauri::command]
-pub fn recompute_agentic_baselines(
-    state: State<'_, Arc<AppState>>,
-) -> Result<u32, String> {
+pub fn recompute_agentic_baselines(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
     state.checkpoint_db.with_conn(|conn| {
         crate::meta_optimizer::agentic_metrics::scoring::recompute_all_baselines(conn)
     })

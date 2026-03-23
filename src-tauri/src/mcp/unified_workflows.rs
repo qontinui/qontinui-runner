@@ -2402,8 +2402,8 @@ pub async fn run_composed_workflow(
                 acceptance_criteria: None,
                 rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
                 iteration_diffs: Vec::new(),
-            active_canary: None,
-            is_canary_run: false,
+                active_canary: None,
+                is_canary_run: false,
             };
 
             // Run the LoopController once with all stages

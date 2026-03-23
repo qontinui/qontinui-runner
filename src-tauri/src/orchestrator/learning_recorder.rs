@@ -538,8 +538,8 @@ fn score_and_persist_agentic_metrics(
     conn: &Connection,
     outcome: &WorkflowOutcome,
 ) -> Result<(), String> {
-    use crate::meta_optimizer::agentic_metrics::{self, DeterministicInput, LearnedBaselines};
     use crate::meta_optimizer::agentic_metrics::scoring;
+    use crate::meta_optimizer::agentic_metrics::{self, DeterministicInput, LearnedBaselines};
 
     let input = DeterministicInput {
         task_run_id: outcome.task_run_id.clone(),
@@ -655,23 +655,25 @@ pub fn spawn_llm_judge_if_eligible(
         let judge_input = match gather_llm_judge_input(&db, &task_run_id) {
             Ok(input) => input,
             Err(e) => {
-                tracing::warn!("Failed to gather LLM judge input for {}: {}", task_run_id, e);
+                tracing::warn!(
+                    "Failed to gather LLM judge input for {}: {}",
+                    task_run_id,
+                    e
+                );
                 return;
             }
         };
 
         // Run the LLM judge in a blocking task (it uses synchronous HTTP)
-        let results = match tokio::task::spawn_blocking(move || {
-            llm_judge::evaluate_sync(&judge_input)
-        })
-        .await
-        {
-            Ok(results) => results,
-            Err(e) => {
-                tracing::warn!("LLM judge task panicked for {}: {}", task_run_id, e);
-                return;
-            }
-        };
+        let results =
+            match tokio::task::spawn_blocking(move || llm_judge::evaluate_sync(&judge_input)).await
+            {
+                Ok(results) => results,
+                Err(e) => {
+                    tracing::warn!("LLM judge task panicked for {}: {}", task_run_id, e);
+                    return;
+                }
+            };
 
         // Persist the LLM-judged scores
         if let Err(e) = db.with_conn(|conn| {
@@ -802,15 +804,17 @@ fn gather_llm_judge_input(
             })
         };
 
-        Ok(crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput {
-            task_run_id: task_run_id.to_string(),
-            task_prompt: prompt.unwrap_or_default(),
-            execution_plan: execution_steps,
-            outcome_summary: summary,
-            goal_achieved,
-            status,
-            execution_trace_summary,
-        })
+        Ok(
+            crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput {
+                task_run_id: task_run_id.to_string(),
+                task_prompt: prompt.unwrap_or_default(),
+                execution_plan: execution_steps,
+                outcome_summary: summary,
+                goal_achieved,
+                status,
+                execution_trace_summary,
+            },
+        )
     })
 }
 
@@ -870,9 +874,15 @@ pub fn spawn_rag_judge_if_eligible(
                          rationale, is_llm_judged, model_used, created_at)
                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
                     params![
-                        id, task_run_id, score.metric.as_str(), score.score,
-                        score.confidence, score.rationale,
-                        score.is_llm_judged as i32, score.model_used, now,
+                        id,
+                        task_run_id,
+                        score.metric.as_str(),
+                        score.score,
+                        score.confidence,
+                        score.rationale,
+                        score.is_llm_judged as i32,
+                        score.model_used,
+                        now,
                     ],
                 )
                 .map_err(|e| format!("Failed to insert RAG score: {}", e))?;
@@ -896,13 +906,15 @@ pub fn spawn_rag_judge_if_eligible(
             let all_scores: Vec<crate::meta_optimizer::agentic_metrics::MetricResult> = raw_scores
                 .into_iter()
                 .filter_map(|(mt, s)| {
-                    metric_from_str(&mt).map(|m| crate::meta_optimizer::agentic_metrics::MetricResult {
-                        metric: m,
-                        score: s,
-                        confidence: 0.7,
-                        rationale: String::new(),
-                        is_llm_judged: false,
-                        model_used: None,
+                    metric_from_str(&mt).map(|m| {
+                        crate::meta_optimizer::agentic_metrics::MetricResult {
+                            metric: m,
+                            score: s,
+                            confidence: 0.7,
+                            rationale: String::new(),
+                            is_llm_judged: false,
+                            model_used: None,
+                        }
                     })
                 })
                 .collect();
@@ -917,12 +929,20 @@ pub fn spawn_rag_judge_if_eligible(
             info!(
                 "RAG judge completed for {}: {}, composite updated to {:.3}",
                 task_run_id,
-                results.iter().map(|r| format!("{}={:.2}", r.metric, r.score)).collect::<Vec<_>>().join(", "),
+                results
+                    .iter()
+                    .map(|r| format!("{}={:.2}", r.metric, r.score))
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 composite,
             );
             Ok(())
         }) {
-            tracing::warn!("Failed to persist RAG judge scores for {}: {}", task_run_id, e);
+            tracing::warn!(
+                "Failed to persist RAG judge scores for {}: {}",
+                task_run_id,
+                e
+            );
         }
     });
 }

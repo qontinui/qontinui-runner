@@ -1135,7 +1135,6 @@ Only output the JSON array, nothing else."#,
                     warn!("MULTI-AGENT-PIPELINE: Failed to update checkpoint: {}", e);
                 }
             }
-
         }
 
         // Check for user stop after all parallel subtrees complete.
@@ -1340,7 +1339,6 @@ Only output the JSON array, nothing else."#,
 
         result.to_loop_result()
     }
-
 }
 
 impl PipelineShared {

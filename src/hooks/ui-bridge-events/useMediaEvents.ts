@@ -3,7 +3,7 @@ import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 
 /**
  * Handles: find_media, media_audit, capture_media_snapshot, analyze_media,
- *          capture_element_images, get_element_images
+ *          capture_element_images, get_element_images, media_compare
  */
 export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">) {
   const { bridgeRef, sendResponse } = context;
@@ -236,6 +236,62 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
             type,
             success: true,
             data: { images: results, total: results.length },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "media_compare": {
+          const compareParams = (payload.params ?? payload.body ?? {}) as {
+            element_ids?: string[];
+            baseline?: { images: Array<{ src: string; alt: string }> };
+          };
+
+          // Discover current media elements
+          const discovered = await currentBridge.discover({
+            mediaOnly: true,
+            includeMedia: true,
+            includeHidden: true,
+          });
+
+          // If specific element IDs requested, filter
+          const targetIds = compareParams.element_ids;
+          const mediaElements = targetIds
+            ? discovered.elements.filter((el: { id: string }) => targetIds.includes(el.id))
+            : discovered.elements;
+
+          // Gather current media info
+          const currentMedia = mediaElements.map((el: { id: string; type: string; label?: string; element?: Element }) => {
+            const domEl = el.element;
+            let src = "";
+            let alt = "";
+            if (domEl instanceof HTMLImageElement) {
+              src = domEl.src;
+              alt = domEl.alt;
+            } else if (domEl instanceof HTMLVideoElement) {
+              src = domEl.src || domEl.currentSrc;
+            }
+            return { id: el.id, type: el.type, label: el.label, src, alt };
+          });
+
+          const baselineMedia = compareParams.baseline?.images ?? [];
+          const currentSrcs = new Set(currentMedia.map((m: { src: string }) => m.src));
+          const baselineSrcs = new Set(baselineMedia.map((m) => m.src));
+          const added = currentMedia.filter((m: { src: string }) => !baselineSrcs.has(m.src));
+          const removed = baselineMedia.filter((m) => !currentSrcs.has(m.src));
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: {
+              current: currentMedia,
+              added: added.length,
+              removed: removed.length,
+              addedMedia: added,
+              removedMedia: removed,
+              timestamp: Date.now(),
+            },
             timestamp: Date.now(),
           });
           return true;

@@ -605,7 +605,10 @@ pub fn auto_rollback_stale_canaries(db: &CheckpointDb) -> usize {
     }
 
     if rolled_back > 0 {
-        info!("Auto-rolled-back {} stale canary rollout(s) (active >30 days)", rolled_back);
+        info!(
+            "Auto-rolled-back {} stale canary rollout(s) (active >30 days)",
+            rolled_back
+        );
     }
 
     rolled_back

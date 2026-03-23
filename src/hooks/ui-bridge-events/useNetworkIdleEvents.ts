@@ -87,6 +87,102 @@ export function useNetworkIdleEvents(
           return true;
         }
 
+        case "get_idle_signal": {
+          const { CompositeIdleDetector } = await import("ui-bridge");
+          if (!idleDetectorRef.current) {
+            idleDetectorRef.current = CompositeIdleDetector.create();
+          }
+          const signalName = (payload.params?.signal as string) ?? "";
+          const signal = idleDetectorRef.current.getSignal(signalName);
+          if (signal) {
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { signal: signalName, ...signal.getStatus() },
+              timestamp: Date.now(),
+            });
+          } else {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: `Unknown idle signal: ${signalName}`,
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "wait_for_idle_signal": {
+          const { CompositeIdleDetector } = await import("ui-bridge");
+          if (!idleDetectorRef.current) {
+            idleDetectorRef.current = CompositeIdleDetector.create();
+          }
+          const signalName2 = (payload.params?.signal as string) ?? "";
+          const timeout2 = (payload.params?.timeout as number) ?? 30000;
+          const signal2 = idleDetectorRef.current.getSignal(signalName2);
+          if (signal2) {
+            const status = await signal2.waitForIdle({ timeout: timeout2 });
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { signal: signalName2, ...status },
+              timestamp: Date.now(),
+            });
+          } else {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: `Unknown idle signal: ${signalName2}`,
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "wait_for_targets": {
+          const { CompositeIdleDetector } = await import("ui-bridge");
+          if (!idleDetectorRef.current) {
+            idleDetectorRef.current = CompositeIdleDetector.create();
+          }
+          const targets = (payload.params?.targets as string[]) ?? [];
+          const timeout3 = (payload.params?.timeout as number) ?? 30000;
+          // Wait for all target signals concurrently with a shared deadline
+          // so total time never exceeds timeout_ms regardless of target count.
+          const deadline = Date.now() + timeout3;
+          const results: Record<string, unknown> = {};
+          const settled = await Promise.allSettled(
+            targets.map(async (target) => {
+              const signal = idleDetectorRef.current!.getSignal(target);
+              if (!signal) return { target, status: null };
+              const remaining = Math.max(0, deadline - Date.now());
+              const status = await signal.waitForIdle({ timeout: remaining });
+              return { target, status };
+            }),
+          );
+          for (const outcome of settled) {
+            if (outcome.status === "fulfilled" && outcome.value.status !== null) {
+              results[outcome.value.target] = outcome.value.status;
+            } else if (outcome.status === "rejected") {
+              // Record the error for this target
+              const errMsg =
+                outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+              results["_error"] = errMsg;
+            }
+          }
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: results,
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
         case "diagnose_stuck_screen": {
           const { CompositeIdleDetector, StuckScreenDetector } = await import("ui-bridge");
 

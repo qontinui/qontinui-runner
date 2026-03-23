@@ -205,8 +205,7 @@ pub fn check_and_launch_optimizers(
     // Recompute agentic metric baselines from accumulated successful runs.
     // Fast — only queries learning_outcomes aggregates, no LLM calls.
     if let Err(e) = db.with_conn(|conn| {
-        crate::meta_optimizer::agentic_metrics::scoring::recompute_all_baselines(conn)
-            .map(|_| ())
+        crate::meta_optimizer::agentic_metrics::scoring::recompute_all_baselines(conn).map(|_| ())
     }) {
         debug!("Baseline recomputation skipped: {}", e);
     }
@@ -301,7 +300,9 @@ fn auto_evaluate_canaries(db: &CheckpointDb) {
                             canary.id, eval.delta, eval.canary_success_rate, eval.baseline_success_rate,
                             eval.p_value, eval.cost_delta_pct
                         );
-                    if let Err(e) = super::canary::rollback_canary_with_eval(db, &canary.id, Some(&eval)) {
+                    if let Err(e) =
+                        super::canary::rollback_canary_with_eval(db, &canary.id, Some(&eval))
+                    {
                         warn!("Failed to auto-rollback canary {}: {}", canary.id, e);
                     }
                 }

@@ -6,8 +6,42 @@ import { createLogger } from "@/lib/logger";
 
 const logger = createLogger("UIBridgeDiscoveryEvents");
 
+/** Unified type for all state machine methods used across event handlers. */
+interface StateMachineAPI {
+  // Query methods
+  getStates?: () => unknown;
+  states?: unknown;
+  getActiveStates?: () => unknown;
+  activeStates?: unknown;
+  getGroups?: () => unknown;
+  groups?: unknown;
+  getTransitions?: () => unknown;
+  transitions?: unknown;
+  getState?: (id: string) => unknown;
+  // Mutation methods
+  activate?: (id: string) => unknown;
+  deactivate?: (id: string) => unknown;
+  setState?: (id: string, active: boolean) => unknown;
+  activateGroup?: (id: string) => unknown;
+  deactivateGroup?: (id: string) => unknown;
+  canExecuteTransition?: (id: string) => boolean;
+  executeTransition?: (id: string) => Promise<unknown> | unknown;
+  findPath?: (from: string, to: string) => unknown;
+  navigateTo?: (id: string) => Promise<unknown> | unknown;
+}
+
+/** Get the stateMachine from the UI Bridge global, cast to the known API. */
+function getStateMachine(): StateMachineAPI | undefined {
+  return getUIBridgeGlobal()?.stateMachine as StateMachineAPI | undefined;
+}
+
 /**
- * Handles: discover, find, get_snapshot
+ * Handles: discover, find, get_snapshot, get_component_state,
+ *          get_states, get_active_states, get_state_snapshot, get_state,
+ *          activate_state, deactivate_state, get_state_groups,
+ *          activate_state_group, deactivate_state_group, get_transitions,
+ *          can_execute_transition, execute_transition, find_state_path,
+ *          navigate_to_state
  */
 export function useDiscoveryEvents(
   context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">,
@@ -182,6 +216,426 @@ export function useDiscoveryEvents(
           logger.debug(
             `get_snapshot: response sent (${enrichedSnapshot.elements.length} elements)`,
           );
+          return true;
+        }
+
+        // ==================================================================
+        // Component State
+        // ==================================================================
+
+        case "get_component_state": {
+          const componentId = (payload.params?.componentId as string) ?? payload.componentId ?? "";
+          if (!componentId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "componentId is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          const component = currentBridge.getComponent(componentId);
+          if (!component) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: `Component not found: ${componentId}`,
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          // Gather state from the component's child elements
+          const childStates: Record<string, unknown> = {};
+          if (component.elementIds) {
+            for (const elId of component.elementIds) {
+              const el = currentBridge.getElement(elId);
+              if (el) {
+                childStates[elId] = el.getState();
+              }
+            }
+          }
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: {
+              id: component.id,
+              name: component.name,
+              description: component.description,
+              mounted: component.mounted,
+              elementIds: component.elementIds,
+              childStates,
+            },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        // ==================================================================
+        // State Machine
+        // ==================================================================
+
+        case "get_states": {
+          const sm = getStateMachine();
+          const states = sm?.getStates?.() ?? sm?.states ?? [];
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { states },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "get_active_states": {
+          const sm = getStateMachine();
+          const activeStates = sm?.getActiveStates?.() ?? sm?.activeStates ?? [];
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { states: activeStates },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "get_state_snapshot": {
+          const sm = getStateMachine();
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: {
+              states: sm?.getStates?.() ?? [],
+              activeStates: sm?.getActiveStates?.() ?? [],
+              groups: sm?.getGroups?.() ?? [],
+              transitions: sm?.getTransitions?.() ?? [],
+              timestamp: Date.now(),
+            },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "get_state": {
+          const stateId = (payload.params?.stateId as string) ?? "";
+          if (!stateId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "stateId is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const sm = getStateMachine();
+          const state = sm?.getState?.(stateId) ?? null;
+          if (state) {
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: state,
+              timestamp: Date.now(),
+            });
+          } else {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: `State not found: ${stateId}`,
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "activate_state": {
+          const activateId = (payload.params?.stateId as string) ?? "";
+          if (!activateId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "stateId is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const sm = getStateMachine();
+          try {
+            const result = sm?.activate?.(activateId) ?? sm?.setState?.(activateId, true);
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { activated: activateId, result: result ?? true },
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: err instanceof Error ? err.message : String(err),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "deactivate_state": {
+          const deactivateId = (payload.params?.stateId as string) ?? "";
+          if (!deactivateId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "stateId is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const sm = getStateMachine();
+          try {
+            const result = sm?.deactivate?.(deactivateId) ?? sm?.setState?.(deactivateId, false);
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { deactivated: deactivateId, result: result ?? true },
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: err instanceof Error ? err.message : String(err),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "get_state_groups": {
+          const sm = getStateMachine();
+          const groups = sm?.getGroups?.() ?? sm?.groups ?? [];
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { groups },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "activate_state_group": {
+          const groupId = (payload.params?.groupId as string) ?? "";
+          if (!groupId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "groupId is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const sm = getStateMachine();
+          try {
+            const result = sm?.activateGroup?.(groupId);
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { activated: groupId, result: result ?? true },
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: err instanceof Error ? err.message : String(err),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "deactivate_state_group": {
+          const deactivateGroupId = (payload.params?.groupId as string) ?? "";
+          if (!deactivateGroupId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "groupId is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const sm = getStateMachine();
+          try {
+            const result = sm?.deactivateGroup?.(deactivateGroupId);
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { deactivated: deactivateGroupId, result: result ?? true },
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: err instanceof Error ? err.message : String(err),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "get_transitions": {
+          const sm = getStateMachine();
+          const transitions = sm?.getTransitions?.() ?? sm?.transitions ?? [];
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { transitions },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "can_execute_transition": {
+          const transitionId = (payload.params?.transitionId as string) ?? "";
+          if (!transitionId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "transitionId is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const sm = getStateMachine();
+          const canExecute = sm?.canExecuteTransition?.(transitionId) ?? false;
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { canExecute, transitionId },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "execute_transition": {
+          const execTransitionId = (payload.params?.transitionId as string) ?? "";
+          if (!execTransitionId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "transitionId is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const sm = getStateMachine();
+          try {
+            const result = await Promise.resolve(sm?.executeTransition?.(execTransitionId));
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { executed: execTransitionId, result: result ?? true },
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: err instanceof Error ? err.message : String(err),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "find_state_path": {
+          const pathParams = payload.params ?? payload.body ?? {};
+          const fromState = (pathParams.from as string) ?? "";
+          const toState = (pathParams.to as string) ?? "";
+          if (!fromState || !toState) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "from and to state IDs are required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const sm = getStateMachine();
+          const path = sm?.findPath?.(fromState, toState) ?? null;
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { from: fromState, to: toState, path },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "navigate_to_state": {
+          const navParams = payload.params ?? payload.body ?? {};
+          const targetState = (navParams.targetState as string) ?? (navParams.to as string) ?? "";
+          if (!targetState) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "targetState is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+          const sm = getStateMachine();
+          try {
+            const result = await Promise.resolve(sm?.navigateTo?.(targetState));
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { navigatedTo: targetState, result: result ?? true },
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: err instanceof Error ? err.message : String(err),
+              timestamp: Date.now(),
+            });
+          }
           return true;
         }
 

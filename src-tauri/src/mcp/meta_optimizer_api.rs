@@ -1797,8 +1797,7 @@ async fn evaluate_recommendation_handler(
 /// Returns all active canary rollouts with recommendation metadata.
 pub async fn get_canaries_handler(
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>
-{
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let canaries =
         crate::meta_optimizer::canary::get_active_canaries(&state.app_state.checkpoint_db)
             .map_err(|e| {
@@ -1859,8 +1858,7 @@ pub async fn get_canaries_handler(
 pub async fn get_canary_history_handler(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>
-{
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let limit = params
         .get("limit")
         .and_then(|v| v.parse().ok())
@@ -1916,16 +1914,14 @@ pub async fn rollback_canary_handler(
 pub async fn evaluate_canary_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>
-{
-    let eval =
-        crate::meta_optimizer::canary::evaluate_canary(&state.app_state.checkpoint_db, &id)
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!("Failed to evaluate canary: {}", e))),
-                )
-            })?;
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let eval = crate::meta_optimizer::canary::evaluate_canary(&state.app_state.checkpoint_db, &id)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to evaluate canary: {}", e))),
+            )
+        })?;
 
     Ok(Json(ApiResponse::success(
         serde_json::to_value(eval).unwrap_or_default(),

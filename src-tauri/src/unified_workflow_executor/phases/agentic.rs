@@ -58,7 +58,10 @@ impl AgenticExecutor {
     }
 
     /// Set the middleware chain on the inner AI session executor.
-    pub fn set_middleware_chain(&mut self, chain: crate::ai_provider::middleware::AiMiddlewareChain) {
+    pub fn set_middleware_chain(
+        &mut self,
+        chain: crate::ai_provider::middleware::AiMiddlewareChain,
+    ) {
         self.ai_executor.middleware_chain = Some(chain);
     }
 
@@ -628,7 +631,9 @@ impl AgenticExecutor {
         // in the pipeline loop, so we skip injection here for pipeline runs to avoid duplication.
         let is_pipeline = matches!(
             config.workflow_architecture,
-            Some(crate::autoresearch::agentic_verification::WorkflowArchitecture::MultiAgentPipeline)
+            Some(
+                crate::autoresearch::agentic_verification::WorkflowArchitecture::MultiAgentPipeline
+            )
         );
         let enhanced_prompt = if !is_pipeline {
             if let Some((_, ref rec_id)) = config.active_canary {

@@ -21,9 +21,8 @@ fn resolve_working_dir(app_state: &AppState, execution_id: &str) -> Result<Strin
         }
         // Also check parent task run (execution_id might be a child)
         for wt in &worktrees {
-            if execution_id.starts_with(
-                wt.task_run_id.as_deref().unwrap_or(""),
-            ) && wt.task_run_id.is_some()
+            if execution_id.starts_with(wt.task_run_id.as_deref().unwrap_or(""))
+                && wt.task_run_id.is_some()
             {
                 return Ok(wt.worktree_path.clone());
             }
@@ -84,11 +83,7 @@ pub async fn replay_workflow(
     };
 
     let resume_point = replay_manager
-        .prepare_replay(
-            &execution_id,
-            &target,
-            std::path::Path::new(&resolved_dir),
-        )
+        .prepare_replay(&execution_id, &target, std::path::Path::new(&resolved_dir))
         .await?;
 
     Ok(format!(

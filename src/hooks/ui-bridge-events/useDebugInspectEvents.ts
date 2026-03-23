@@ -46,6 +46,29 @@ function getUndoTracker(): UndoTrackerAPI | undefined {
   return getUIBridgeGlobal()?.undoTracker as UndoTrackerAPI | undefined;
 }
 
+/** Filters bridge elements to form-related types and runs discoverForms. */
+async function discoverBridgeForms(bridge: {
+  elements: Array<{
+    id: string;
+    element: Element;
+    type: string;
+    label?: string;
+    getState: () => unknown;
+  }>;
+}) {
+  const { discoverForms } = await import("ui-bridge/ai");
+  const formElements = bridge.elements
+    .filter((el) => ["input", "select", "textarea", "checkbox", "radio"].includes(el.type))
+    .map((el) => ({
+      id: el.id,
+      element: el.element,
+      type: el.type,
+      label: el.label,
+      getState: () => el.getState(),
+    }));
+  return discoverForms(formElements);
+}
+
 // ---------------------------------------------------------------------------
 // Module-level state for error sessions and baselines
 // (mirrors the pattern in ui-bridge commandHandlers.ts)
@@ -75,7 +98,9 @@ const errorBaselines = new Map<string, ErrorBaseline>();
  *          get_browser_events, get_timeline, get_health_report, get_network_chains,
  *          get_error_snapshots, start_error_session, end_error_session,
  *          get_error_sessions, capture_error_baseline, compare_error_baseline,
- *          get_error_report
+ *          get_error_report, get_action_history, get_interaction_metrics,
+ *          get_performance_entries, clear_performance_entries,
+ *          get_element_tree, highlight_element
  */
 export function useDebugInspectEvents(
   context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">,
@@ -89,14 +114,15 @@ export function useDebugInspectEvents(
 
       switch (type) {
         case "get_console_errors": {
-          const capture = getConsoleCapture();
+          // Use browserCapture (not consoleCapture) to access console-specific filters
+          const capture = getBrowserCapture();
 
           if (!capture) {
             await sendResponse({
               requestId,
               type,
               success: true,
-              data: { errors: [], count: 0, note: "ConsoleCapture not installed" },
+              data: { errors: [], count: 0, note: "BrowserCapture not installed" },
               timestamp: Date.now(),
             });
             return true;
@@ -104,7 +130,10 @@ export function useDebugInspectEvents(
 
           const since = payload.params?.since as number | undefined;
           const limit = payload.params?.limit as number | undefined;
-          const errors = since ? capture.getSince(since) : capture.getRecent(limit ?? 50);
+          // Use console-specific methods to filter out navigation/long-task events
+          const errors = since
+            ? capture.getConsoleSince(since)
+            : capture.getConsoleRecent(limit ?? 50);
 
           await sendResponse({
             requestId,
@@ -210,16 +239,34 @@ export function useDebugInspectEvents(
 
         case "undo": {
           const undoTrackerUndo = getUndoTracker();
+          const undoState = undoTrackerUndo?.getSnapshotUndoContext() as
+            | { undoAvailable?: boolean }
+            | undefined;
 
           if (undoTrackerUndo?.executeUndo) {
-            const result = undoTrackerUndo.executeUndo();
-            await sendResponse({
-              requestId,
-              type,
-              success: true,
-              data: { success: result, method: "undoTracker" },
-              timestamp: Date.now(),
-            });
+            if (undoState && undoState.undoAvailable === false) {
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: {
+                  success: false,
+                  noOp: true,
+                  reason: "Nothing to undo",
+                  method: "undoTracker",
+                },
+                timestamp: Date.now(),
+              });
+            } else {
+              const result = undoTrackerUndo.executeUndo();
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: { success: result, method: "undoTracker" },
+                timestamp: Date.now(),
+              });
+            }
           } else {
             // Fallback: simulate Ctrl+Z keyboard shortcut
             document.dispatchEvent(
@@ -238,16 +285,34 @@ export function useDebugInspectEvents(
 
         case "redo": {
           const undoTrackerRedo = getUndoTracker();
+          const redoState = undoTrackerRedo?.getSnapshotUndoContext() as
+            | { redoAvailable?: boolean }
+            | undefined;
 
           if (undoTrackerRedo?.executeRedo) {
-            const result = undoTrackerRedo.executeRedo();
-            await sendResponse({
-              requestId,
-              type,
-              success: true,
-              data: { success: result, method: "undoTracker" },
-              timestamp: Date.now(),
-            });
+            if (redoState && redoState.redoAvailable === false) {
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: {
+                  success: false,
+                  noOp: true,
+                  reason: "Nothing to redo",
+                  method: "undoTracker",
+                },
+                timestamp: Date.now(),
+              });
+            } else {
+              const result = undoTrackerRedo.executeRedo();
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: { success: result, method: "undoTracker" },
+                timestamp: Date.now(),
+              });
+            }
           } else {
             // Fallback: simulate Ctrl+Shift+Z keyboard shortcut
             document.dispatchEvent(
@@ -303,23 +368,47 @@ export function useDebugInspectEvents(
         }
 
         case "get_forms": {
-          const { discoverForms } = await import("ui-bridge/ai");
-          const formElements = currentBridge.elements
-            .filter((el) => ["input", "select", "textarea", "checkbox", "radio"].includes(el.type))
-            .map((el) => ({
-              id: el.id,
-              element: el.element,
-              type: el.type,
-              label: el.label,
-              getState: () => el.getState(),
-            }));
-
-          const formsResult = discoverForms(formElements);
+          const formsResult = await discoverBridgeForms(currentBridge);
           await sendResponse({
             requestId,
             type,
             success: true,
             data: formsResult,
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "fill_form": {
+          const fillParams = payload.params ?? payload.body ?? {};
+          try {
+            const result = await currentBridge.executor.fillForm(fillParams as never);
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: result,
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: err instanceof Error ? err.message : String(err),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "snapshot_forms": {
+          const snapshot = await discoverBridgeForms(currentBridge);
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { snapshot, timestamp: Date.now() },
             timestamp: Date.now(),
           });
           return true;
@@ -652,6 +741,204 @@ export function useDebugInspectEvents(
             },
             timestamp: Date.now(),
           });
+          return true;
+        }
+
+        case "get_action_history": {
+          const uiBridgeGlobal = getUIBridgeGlobal();
+          const renderLog = uiBridgeGlobal?.renderLog as
+            | { getEntries?: () => unknown[] }
+            | undefined;
+          // Fall back to render log entries as action history
+          const entries = renderLog?.getEntries?.() ?? [];
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: entries,
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "get_interaction_metrics": {
+          const uiBridgeGlobal2 = getUIBridgeGlobal();
+          const renderLog2 = uiBridgeGlobal2?.renderLog as
+            | { getEntries?: () => Array<{ type?: string }> }
+            | undefined;
+          const allEntries = renderLog2?.getEntries?.() ?? [];
+          const byType: Record<string, number> = {};
+          for (const entry of allEntries) {
+            const t = entry.type ?? "unknown";
+            byType[t] = (byType[t] ?? 0) + 1;
+          }
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: {
+              totalActions: allEntries.length,
+              byType,
+              timestamp: Date.now(),
+            },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        // ==================================================================
+        // Performance Entries
+        // ==================================================================
+
+        case "get_performance_entries": {
+          const perfParams = payload.params ?? {};
+          const perfType = perfParams.type as string | undefined;
+          const perfLimit = (perfParams.limit as number) ?? 100;
+
+          let entries: PerformanceEntry[];
+          if (perfType) {
+            entries = performance.getEntriesByType(perfType);
+          } else {
+            entries = performance.getEntries();
+          }
+
+          // Serialize to plain objects (PerformanceEntry is not directly serializable)
+          const serialized = entries.slice(-perfLimit).map((e) => ({
+            name: e.name,
+            entryType: e.entryType,
+            startTime: e.startTime,
+            duration: e.duration,
+          }));
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { entries: serialized, count: serialized.length },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "clear_performance_entries": {
+          performance.clearMarks();
+          performance.clearMeasures();
+          performance.clearResourceTimings();
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { cleared: true },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        // ==================================================================
+        // Element Tree & Highlight
+        // ==================================================================
+
+        case "get_element_tree": {
+          // Build a lightweight DOM tree from the bridge's registered elements
+          const treeElements = currentBridge.elements;
+
+          interface TreeNode {
+            id: string;
+            type: string;
+            label?: string;
+            tagName: string;
+            children: TreeNode[];
+            depth: number;
+            visible: boolean;
+          }
+
+          const buildTree = (el: (typeof treeElements)[0], depth: number): TreeNode => {
+            const domEl = el.element;
+            const state = el.getState();
+            return {
+              id: el.id,
+              type: el.type,
+              label: el.label,
+              tagName: domEl instanceof HTMLElement ? domEl.tagName.toLowerCase() : "unknown",
+              children: [], // Flat list of registered elements (no parent-child in bridge)
+              depth,
+              visible: state.visible ?? true,
+            };
+          };
+
+          const tree = treeElements.map((el) => buildTree(el, 0));
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { tree, count: tree.length },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "highlight_element": {
+          const highlightId = (payload.params?.elementId as string) ?? payload.elementId ?? "";
+          if (!highlightId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "elementId is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          const highlightEl = currentBridge.getElement(highlightId);
+          if (!highlightEl) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: `Element not found: ${highlightId}`,
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          const domEl = highlightEl.element;
+          if (domEl instanceof HTMLElement) {
+            // Add a temporary highlight overlay
+            const originalOutline = domEl.style.outline;
+            const originalTransition = domEl.style.transition;
+            domEl.style.transition = "outline 0.2s ease-in-out";
+            domEl.style.outline = "3px solid #ff6b35";
+            domEl.scrollIntoView({ behavior: "smooth", block: "center" });
+
+            // Remove highlight after 2 seconds
+            setTimeout(() => {
+              domEl.style.outline = originalOutline;
+              domEl.style.transition = originalTransition;
+            }, 2000);
+
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: {
+                highlighted: true,
+                elementId: highlightId,
+                rect: domEl.getBoundingClientRect().toJSON(),
+              },
+              timestamp: Date.now(),
+            });
+          } else {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: `Element is not an HTMLElement: ${highlightId}`,
+              timestamp: Date.now(),
+            });
+          }
           return true;
         }
 

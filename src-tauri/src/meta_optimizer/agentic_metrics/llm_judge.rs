@@ -113,7 +113,11 @@ fn parse_judge_response(response: &str, model_used: &str) -> Vec<MetricResult> {
     let parsed: JudgeResponse = match serde_json::from_str(&json_str) {
         Ok(p) => p,
         Err(e) => {
-            warn!("Failed to parse LLM judge response: {}. Raw: {}", e, &response[..response.len().min(200)]);
+            warn!(
+                "Failed to parse LLM judge response: {}. Raw: {}",
+                e,
+                &response[..response.len().min(200)]
+            );
             return fallback_scores(model_used, "Failed to parse LLM response");
         }
     };
@@ -218,11 +222,7 @@ fn fallback_scores(model_used: &str, reason: &str) -> Vec<MetricResult> {
 ///
 /// Only runs with iterations > 0 and ambiguous outcomes justify the LLM cost.
 /// Clear successes and zero-iteration crashes are well-handled by deterministic metrics.
-pub fn should_llm_judge(
-    iterations: u32,
-    verification_passed: bool,
-    was_stopped: bool,
-) -> bool {
+pub fn should_llm_judge(iterations: u32, verification_passed: bool, was_stopped: bool) -> bool {
     // Skip zero-iteration crashes — deterministic metrics handle these
     if iterations == 0 {
         return false;
@@ -268,7 +268,10 @@ pub fn evaluate_sync(input: &LlmJudgeInput) -> Vec<MetricResult> {
 
     if !response.success {
         let error = response.error.unwrap_or_else(|| "Unknown error".into());
-        warn!("LLM judge call failed for task {}: {}", input.task_run_id, error);
+        warn!(
+            "LLM judge call failed for task {}: {}",
+            input.task_run_id, error
+        );
         return fallback_scores("unknown", &error);
     }
 
@@ -294,7 +297,8 @@ mod tests {
 
     #[test]
     fn test_extract_json_plain() {
-        let input = r#"{"scores": [{"metric": "plan_adherence", "score": 0.8, "rationale": "good"}]}"#;
+        let input =
+            r#"{"scores": [{"metric": "plan_adherence", "score": 0.8, "rationale": "good"}]}"#;
         let result = extract_json_from_response(input);
         assert!(result.starts_with('{'));
         assert!(result.contains("plan_adherence"));
@@ -336,7 +340,10 @@ mod tests {
         ]}"#;
         let results = parse_judge_response(response, "test");
         assert_eq!(results.len(), 3); // Missing ones filled with 0.5
-        let pa = results.iter().find(|r| r.metric == AgenticMetric::PlanAdherence).unwrap();
+        let pa = results
+            .iter()
+            .find(|r| r.metric == AgenticMetric::PlanAdherence)
+            .unwrap();
         assert_eq!(pa.score, 0.5);
         assert!(pa.confidence < 0.5);
     }

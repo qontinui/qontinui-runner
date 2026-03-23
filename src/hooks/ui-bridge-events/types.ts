@@ -58,6 +58,8 @@ export type UIBridgeRequestType =
   | "redo"
   // Forms
   | "get_forms"
+  | "fill_form"
+  | "snapshot_forms"
   // Network requests
   | "get_network_requests"
   | "get_network_requests_in_flight"
@@ -99,7 +101,78 @@ export type UIBridgeRequestType =
   | "capture_error_baseline"
   | "compare_error_baseline"
   // Error report
-  | "get_error_report";
+  | "get_error_report"
+  // AI endpoints (Phase 2)
+  | "ai_execute"
+  | "ai_assert"
+  | "ai_assert_batch"
+  | "ai_snapshot"
+  | "ai_summary"
+  // Idle sub-signals (Phase 4)
+  | "get_idle_signal"
+  | "wait_for_idle_signal"
+  | "wait_for_targets"
+  // Action history & metrics (Phase 4)
+  | "get_action_history"
+  | "get_interaction_metrics"
+  // Annotations (Phase 5)
+  | "annotations_list"
+  | "annotations_create"
+  | "annotations_get"
+  | "annotations_update"
+  | "annotations_delete"
+  | "annotations_coverage"
+  | "annotations_export"
+  // State machine
+  | "get_states"
+  | "get_active_states"
+  | "get_state_snapshot"
+  | "get_state"
+  | "activate_state"
+  | "deactivate_state"
+  | "get_state_groups"
+  | "activate_state_group"
+  | "deactivate_state_group"
+  | "get_transitions"
+  | "can_execute_transition"
+  | "execute_transition"
+  | "find_state_path"
+  | "navigate_to_state"
+  // AI semantic search & diff
+  | "ai_semantic_search"
+  | "ai_diff"
+  // Intents
+  | "get_intents"
+  | "register_intent"
+  | "find_intent"
+  | "execute_intent"
+  // Component state
+  | "get_component_state"
+  // Page scroll
+  | "scroll_page"
+  // Performance
+  | "get_performance_entries"
+  | "clear_performance_entries"
+  // AI analysis
+  | "ai_analyze_data"
+  | "ai_analyze_regions"
+  | "ai_analyze_structured_data"
+  | "ai_analyze_cross_app"
+  | "ai_recovery_attempt"
+  // Design evaluation
+  | "design_evaluate"
+  | "design_evaluate_baseline"
+  | "design_evaluate_contexts"
+  | "design_evaluate_diff"
+  // Media compare
+  | "media_compare"
+  // Annotations import
+  | "annotations_import"
+  // Intents NL
+  | "execute_intent_from_query"
+  // Debug
+  | "get_element_tree"
+  | "highlight_element";
 
 /**
  * Payload structure for UI Bridge requests from Rust

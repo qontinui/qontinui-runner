@@ -886,7 +886,11 @@ pub fn auto_evaluate_with_agentic_scores(db: &CheckpointDb) {
             }
             Ok(None) => {} // Insufficient data
             Err(e) => {
-                tracing::debug!("Failed to evaluate rec {} with agentic scores: {}", rec.id, e);
+                tracing::debug!(
+                    "Failed to evaluate rec {} with agentic scores: {}",
+                    rec.id,
+                    e
+                );
             }
         }
     }
