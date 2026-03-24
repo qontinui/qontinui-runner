@@ -378,6 +378,8 @@ pub fn build_meta_workflow_template(
         enforce_token_budget: false,
         rollback_policy: None,
         workflow_architecture: None,
+        flow_control_json: None,
+        phase_timeouts_json: None,
         created_at: now.clone(),
         updated_at: now,
     }

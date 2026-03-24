@@ -30,6 +30,7 @@ pub mod eval_spec;
 pub mod failure_analysis;
 pub mod generation_template_optimizer;
 pub mod golden_dataset;
+pub mod llm_judge_metrics;
 pub mod parser;
 pub mod pipeline_prompt_optimizer;
 pub mod prompt_registry;

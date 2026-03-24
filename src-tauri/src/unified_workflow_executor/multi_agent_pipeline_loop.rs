@@ -977,7 +977,7 @@ Only output the JSON array, nothing else."#,
                     total_tokens: budget_total_tokens,
                     total_cost_usd: budget_total_cost,
                 };
-                // Canary config restoration handled at loop_controller::run() level
+                // Canary config restoration is handled at the loop_controller::run() level.
                 return result.to_loop_result();
             }
         }
@@ -1045,69 +1045,37 @@ Only output the JSON array, nothing else."#,
             .filter(|s| !checkpoint_completed_ids.contains(&s.id))
             .collect();
 
-        // Process independent subtrees concurrently using JoinSet.
-        // PipelineShared is Clone + Send + 'static (Arc-only fields), enabling tokio::spawn.
-        // A semaphore bounds concurrency to max_parallel_implementers.
-        let shared = PipelineShared::from_controller(self);
+        // Process independent subtrees concurrently using buffer_unordered.
+        // Runs up to max_parallel_implementers subtrees at once. Results collected
+        // into a Vec first (to release the &pipeline_ctx borrow), then merged.
         {
+            use futures::stream::{self, StreamExt};
             let max_parallel = pipeline_config.max_parallel_implementers.max(1) as usize;
-            let subtree_count = pending_subtrees.len();
+            let shared = PipelineShared::from_controller(self);
 
-            if subtree_count > 1 && max_parallel > 1 {
-                info!(
-                    "MULTI-AGENT-PIPELINE: Processing {} subtrees with concurrency={}",
-                    subtree_count,
-                    max_parallel.min(subtree_count)
-                );
-            }
+            let all_outputs: Vec<SubtreeOutput> = stream::iter(
+                pending_subtrees.iter().map(|subtree| {
+                    shared.process_subtree(
+                        subtree,
+                        config,
+                        &pipeline_config,
+                        &dag.levels,
+                        &located_criteria,
+                        &active_prompt_variants,
+                        verification_steps,
+                        has_agentic_steps,
+                        agentic_steps,
+                        logger,
+                        &pipeline_ctx,
+                    )
+                }),
+            )
+            .buffer_unordered(max_parallel)
+            .collect()
+            .await;
 
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallel));
-            let mut join_set = tokio::task::JoinSet::new();
-
-            for subtree in &pending_subtrees {
-                let sem = semaphore.clone();
-                let shared_clone = shared.clone();
-                // Clone all borrowed data for 'static lifetime in spawned task
-                let subtree_owned = (*subtree).clone();
-                let config_owned = config.clone();
-                let pipeline_config_owned = pipeline_config.clone();
-                let dag_levels_owned = dag.levels.clone();
-                let located_owned = located_criteria.clone();
-                let prompts_owned = active_prompt_variants.clone();
-                let vsteps_owned = verification_steps.to_vec();
-                let asteps_owned = agentic_steps.to_vec();
-                let logger_owned = logger.clone();
-                let pctx_owned = pipeline_ctx.clone();
-
-                join_set.spawn(async move {
-                    let _permit = sem.acquire().await.expect("semaphore closed");
-                    shared_clone
-                        .process_subtree(
-                            &subtree_owned,
-                            &config_owned,
-                            &pipeline_config_owned,
-                            &dag_levels_owned,
-                            &located_owned,
-                            &prompts_owned,
-                            &vsteps_owned,
-                            has_agentic_steps,
-                            &asteps_owned,
-                            &logger_owned,
-                            &pctx_owned,
-                        )
-                        .await
-                });
-            }
-
-            // Collect results as subtrees complete
-            while let Some(join_result) = join_set.join_next().await {
-                let output = match join_result {
-                    Ok(o) => o,
-                    Err(e) => {
-                        warn!("MULTI-AGENT-PIPELINE: Subtree task panicked: {}", e);
-                        continue;
-                    }
-                };
+            // Merge results sequentially after all parallel subtrees complete.
+            for output in all_outputs {
                 total_iterations += output.iterations_used;
                 agent_traces.extend(output.traces);
                 pipeline_ctx
@@ -1135,7 +1103,9 @@ Only output the JSON array, nothing else."#,
                     warn!("MULTI-AGENT-PIPELINE: Failed to update checkpoint: {}", e);
                 }
             }
+
         }
+
 
         // Check for user stop after all parallel subtrees complete.
         // In parallel mode, we can't break mid-stream, so check after collection.
@@ -1170,7 +1140,7 @@ Only output the JSON array, nothing else."#,
                     total_tokens: stopped_total_tokens,
                     total_cost_usd: stopped_total_cost,
                 };
-                // Canary config restoration handled at loop_controller::run() level
+                // Canary config restoration is handled at the loop_controller::run() level.
                 return result.to_loop_result();
             }
         }

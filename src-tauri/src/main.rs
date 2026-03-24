@@ -28,6 +28,7 @@ mod config;
 mod config_facade;
 mod config_storage;
 mod constraint_engine;
+mod container;
 mod context;
 mod database;
 mod debug_lifecycle;
@@ -46,7 +47,9 @@ mod executor;
 mod exploration;
 mod findings;
 mod fixer;
+mod flow_control;
 mod follow_up;
+mod graphql;
 mod health_monitor;
 mod heartbeat;
 mod instance_manager;
@@ -67,6 +70,7 @@ mod middleware;
 mod orchestration_loop;
 mod orchestration_loop_configs;
 mod orchestrator;
+mod otel;
 mod paths;
 mod playwright;
 mod process_capture;
@@ -114,6 +118,7 @@ mod unified_ai_session;
 mod unified_workflow_executor;
 mod unified_workflows;
 mod video_recorder;
+mod workflow_event_bus;
 mod workflow_generation;
 mod workflow_queue;
 mod workflow_state;
@@ -164,7 +169,12 @@ fn main() {
 }
 
 fn run_app() -> Result<(), Box<dyn std::error::Error>> {
-    let logging_result = init_logging(LoggingConfig::default())?;
+    // Read persisted OTel settings so the tracing pipeline uses saved config
+    let otel_config = crate::settings::get_otel_settings();
+    let logging_result = init_logging(LoggingConfig {
+        otel: otel_config,
+        ..LoggingConfig::default()
+    })?;
     setup_panic_handler();
 
     // Start health monitoring to detect resource exhaustion
@@ -218,10 +228,34 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         checkpoint_db.path()
     );
 
+    // Initialize PostgreSQL connection (PG-primary with SQLite fallback during migration).
+    // Uses RUNNER_DATABASE_URL env var, or defaults to the local docker-compose PostgreSQL.
+    let pg_db = {
+        let pg_url = std::env::var("RUNNER_DATABASE_URL").unwrap_or_else(|_| {
+            "host=localhost port=5432 user=qontinui_user password=qontinui_dev_password dbname=qontinui_db options=-c search_path=runner,public".to_string()
+        });
+        tauri::async_runtime::block_on(crate::database::pg::PgDb::try_new(&pg_url))
+            .map(Arc::new)
+    };
+
     // Connect the SQLite span layer to the database pool
     if let Some(ref sqlite_layer) = logging_result.sqlite_span_layer {
         sqlite_layer.set_db_pool(checkpoint_db.get_pool());
         info!("SQLite span layer connected to database");
+    }
+
+    // Recover durable workflow queue from database (Inngest-inspired)
+    {
+        match checkpoint_db.queue_recover_crashed() {
+            Ok(count) if count > 0 => info!("Reset {} interrupted queue entries back to pending", count),
+            Err(e) => warn!("Queue crash recovery failed (non-fatal): {}", e),
+            _ => {}
+        }
+        match checkpoint_db.queue_load_pending() {
+            Ok(entries) if !entries.is_empty() => info!("Recovered {} pending workflows from durable queue", entries.len()),
+            Err(e) => warn!("Queue pending load failed (non-fatal): {}", e),
+            _ => {}
+        }
     }
 
     // Run one-time migration from JSON files (if any exist)
@@ -447,6 +481,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         video_recorder,
         event_broadcast,
         checkpoint_db: checkpoint_db.clone(),
+        pg_db,
         run_recording_handler,
         mcp_client_manager: tokio::sync::Mutex::new(mcp_client_manager),
         error_monitor_handle: TokioMutex::new(None), // Initialized in setup()
@@ -464,6 +499,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         orchestration_loop: std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::orchestration_loop::loop_engine::LoopState::new(),
         )),
+        container_executor: TokioMutex::new(None), // Initialized via container settings when enabled
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -939,6 +975,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::agentic_metrics::get_agentic_metric_aggregates,
             commands::agentic_metrics::get_composite_score_trend,
             commands::agentic_metrics::recompute_agentic_baselines,
+            commands::agentic_metrics::push_agentic_scores_to_backend,
+            commands::agentic_metrics::push_latest_agentic_scores,
             // Flow designer commands
             commands::flow::list_flows,
             commands::flow::get_flow,
@@ -1065,6 +1103,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Mobile settings commands
             commands::mobile_settings::get_mobile_settings,
             commands::mobile_settings::save_mobile_settings,
+            // OpenTelemetry settings commands
+            commands::otel_settings::get_otel_settings,
+            commands::otel_settings::update_otel_settings,
             // Global log source management commands
             commands::global_log_sources::get_global_log_sources,
             commands::global_log_sources::save_global_log_sources,

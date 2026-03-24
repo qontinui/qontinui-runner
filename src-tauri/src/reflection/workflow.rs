@@ -266,6 +266,9 @@ fn extract_referenced_files(
     if let Some(output) = shared_vars.get("source_ai_output") {
         texts.push(output);
     }
+    if let Some(events) = shared_vars.get("source_pipeline_events") {
+        texts.push(events);
+    }
 
     for text in &texts {
         for cap in re.captures_iter(text) {
@@ -489,6 +492,7 @@ pub fn build_reflection_config(
         iteration_diffs: Vec::new(),
         active_canary: None,
         is_canary_run: false,
+        phase_timeout_ms: None,
     }
 }
 
@@ -528,6 +532,17 @@ pub fn build_setup_steps(
             ),
             None,
             Some("source_ai_output"),
+            true,
+        ),
+        build_api_step(
+            "Load pipeline events",
+            "GET",
+            &format!(
+                "{}/graph/pipeline-events?task_run_id={}",
+                base_url, source_task_run_id
+            ),
+            None,
+            Some("source_pipeline_events"),
             true,
         ),
         // Step 4: Load workflow execution state
@@ -1093,6 +1108,7 @@ pub fn build_project_reflection_config(
         iteration_diffs: Vec::new(),
         active_canary: None,
         is_canary_run: false,
+        phase_timeout_ms: None,
     }
 }
 
@@ -1132,6 +1148,17 @@ pub fn build_project_setup_steps(
             ),
             None,
             Some("source_ai_output"),
+            true,
+        ),
+        build_api_step(
+            "Load pipeline events",
+            "GET",
+            &format!(
+                "{}/graph/pipeline-events?task_run_id={}",
+                base_url, source_task_run_id
+            ),
+            None,
+            Some("source_pipeline_events"),
             true,
         ),
         // Step 4: Load workflow execution state
@@ -1488,6 +1515,7 @@ pub fn build_ui_bridge_reflection_config(
         iteration_diffs: Vec::new(),
         active_canary: None,
         is_canary_run: false,
+        phase_timeout_ms: None,
     }
 }
 
@@ -1509,6 +1537,17 @@ pub fn build_ui_bridge_setup_steps(
             ),
             None,
             Some("source_ai_output"),
+            true,
+        ),
+        build_api_step(
+            "Load pipeline events",
+            "GET",
+            &format!(
+                "{}/graph/pipeline-events?task_run_id={}",
+                base_url, source_task_run_id
+            ),
+            None,
+            Some("source_pipeline_events"),
             true,
         ),
         // Step 2: Load workflow execution state (phases, steps, timing)

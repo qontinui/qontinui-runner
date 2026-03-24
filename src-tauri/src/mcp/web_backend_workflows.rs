@@ -313,6 +313,8 @@ pub async fn sync_workflows_from_backend(
                     enforce_token_budget: Some(workflow.enforce_token_budget),
                     strict_cwd: Some(workflow.strict_cwd),
                     tool_tags: Some(workflow.tool_tags.clone()),
+                    flow_control_json: workflow.flow_control_json.clone(),
+                    phase_timeouts_json: workflow.phase_timeouts_json.clone(),
                     rollback_policy: workflow.rollback_policy.clone(),
                 };
                 if let Err(e) = db.update_unified_workflow(&workflow.id, &update_req) {
@@ -364,6 +366,8 @@ pub async fn sync_workflows_from_backend(
                     enforce_token_budget: Some(workflow.enforce_token_budget),
                     strict_cwd: workflow.strict_cwd,
                     tool_tags: workflow.tool_tags.clone(),
+                    flow_control_json: None,
+                    phase_timeouts_json: None,
                     rollback_policy: workflow.rollback_policy.clone(),
                 };
                 if let Err(e) = db.create_unified_workflow(&create_req) {

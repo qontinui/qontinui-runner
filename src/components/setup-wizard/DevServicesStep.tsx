@@ -19,7 +19,23 @@ interface DevServiceConfig {
   dev_only: boolean;
 }
 
+interface ProcessConfig {
+  id: string;
+  name: string;
+  command: string;
+  args: string[];
+  cwd: string;
+  health_port?: number;
+  parser: string;
+  category: string;
+  auto_start: boolean;
+  enabled: boolean;
+  buffer_size: number;
+  env?: Record<string, string>;
+}
+
 interface DevServicesStepProps {
+  alreadySelectedConfigs?: ProcessConfig[];
   onNext: () => void;
   onBack: () => void;
 }
@@ -36,7 +52,7 @@ const CATEGORY_COLORS: Record<string, string> = {
   frontend: "badge-info",
 };
 
-export function DevServicesStep({ onNext, onBack }: DevServicesStepProps) {
+export function DevServicesStep({ alreadySelectedConfigs, onNext, onBack }: DevServicesStepProps) {
   const [services, setServices] = useState<DevServiceConfig[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
@@ -50,7 +66,9 @@ export function DevServicesStep({ onNext, onBack }: DevServicesStepProps) {
       setLoading(true);
       setError(null);
       try {
-        const result = await invoke<DevServiceConfig[]>("suggest_dev_services_for_setup");
+        const result = await invoke<DevServiceConfig[]>("suggest_dev_services_for_setup", {
+          alreadySelected: alreadySelectedConfigs ?? [],
+        });
         if (cancelled) return;
         setServices(result);
         // Auto-select all by default

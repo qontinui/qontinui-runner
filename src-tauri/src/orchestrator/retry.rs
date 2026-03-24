@@ -13,6 +13,7 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -445,6 +446,169 @@ fn truncate_error(error: &str, max_len: usize) -> String {
 }
 
 // ============================================================================
+// Non-Retriable Error Detection
+// ============================================================================
+
+/// Error patterns that should never be retried (deterministic failures).
+const NON_RETRIABLE_PATTERNS: &[&str] = &[
+    "syntax error",
+    "type error",
+    "compilation failed",
+    "invalid configuration",
+    "authentication failed",
+    "permission denied",
+    "not found",
+    "schema validation",
+    "missing required field",
+];
+
+/// Check if an error is definitively non-retriable.
+///
+/// Non-retriable errors are deterministic failures that will not resolve
+/// with retries (e.g., syntax errors, auth failures, missing resources).
+pub fn is_non_retriable(error: &str) -> bool {
+    let error_lower = error.to_lowercase();
+    NON_RETRIABLE_PATTERNS
+        .iter()
+        .any(|pattern| error_lower.contains(pattern))
+}
+
+// ============================================================================
+// Circuit Breaker
+// ============================================================================
+
+/// State of the circuit breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Circuit is closed — requests flow normally.
+    Closed,
+    /// Circuit is open — requests are rejected immediately.
+    Open,
+    /// Circuit is half-open — a single probe request is allowed through.
+    HalfOpen,
+}
+
+/// Circuit breaker to prevent cascading failures.
+///
+/// Tracks consecutive failures and opens the circuit when the threshold
+/// is reached. After a cooldown period, allows a single probe request
+/// through (half-open). If the probe succeeds, the circuit closes;
+/// if it fails, the circuit reopens.
+pub struct CircuitBreaker {
+    /// Current state of the circuit.
+    state: std::sync::Mutex<CircuitState>,
+    /// Number of consecutive failures.
+    failure_count: std::sync::Mutex<u32>,
+    /// Threshold of consecutive failures before the circuit opens.
+    failure_threshold: u32,
+    /// When the circuit was last opened (for cooldown calculation).
+    last_opened: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Cooldown duration before transitioning from Open to HalfOpen.
+    cooldown: Duration,
+}
+
+impl CircuitBreaker {
+    /// Create a new circuit breaker.
+    ///
+    /// - `failure_threshold`: number of consecutive failures to trip the circuit
+    /// - `cooldown`: how long to wait before allowing a probe request
+    pub fn new(failure_threshold: u32, cooldown: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(CircuitState::Closed),
+            failure_count: std::sync::Mutex::new(0),
+            failure_threshold,
+            last_opened: std::sync::Mutex::new(None),
+            cooldown,
+        })
+    }
+
+    /// Check if a request is allowed through the circuit.
+    ///
+    /// Returns `true` if the request should proceed, `false` if rejected.
+    pub fn allow_request(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        match *state {
+            CircuitState::Closed => true,
+            CircuitState::Open => {
+                // Check if cooldown has elapsed
+                let last_opened = self.last_opened.lock().unwrap();
+                if let Some(opened_at) = *last_opened {
+                    if opened_at.elapsed() >= self.cooldown {
+                        info!("Circuit breaker: cooldown elapsed, transitioning to HalfOpen");
+                        *state = CircuitState::HalfOpen;
+                        true
+                    } else {
+                        debug!(
+                            "Circuit breaker: open, rejecting request ({}ms remaining)",
+                            (self.cooldown - opened_at.elapsed()).as_millis()
+                        );
+                        false
+                    }
+                } else {
+                    // No timestamp — shouldn't happen, but allow through
+                    *state = CircuitState::HalfOpen;
+                    true
+                }
+            }
+            CircuitState::HalfOpen => {
+                // Only one probe request allowed; reject additional ones
+                // The probe is already in-flight
+                false
+            }
+        }
+    }
+
+    /// Record a successful operation.
+    pub fn record_success(&self) {
+        let mut state = self.state.lock().unwrap();
+        let mut count = self.failure_count.lock().unwrap();
+        *count = 0;
+        if *state == CircuitState::HalfOpen {
+            info!("Circuit breaker: probe succeeded, closing circuit");
+        }
+        *state = CircuitState::Closed;
+    }
+
+    /// Record a failed operation.
+    pub fn record_failure(&self) {
+        let mut state = self.state.lock().unwrap();
+        let mut count = self.failure_count.lock().unwrap();
+        *count += 1;
+
+        match *state {
+            CircuitState::Closed => {
+                if *count >= self.failure_threshold {
+                    warn!(
+                        "Circuit breaker: {} consecutive failures (threshold={}), opening circuit",
+                        *count, self.failure_threshold
+                    );
+                    *state = CircuitState::Open;
+                    *self.last_opened.lock().unwrap() = Some(std::time::Instant::now());
+                }
+            }
+            CircuitState::HalfOpen => {
+                warn!("Circuit breaker: probe failed, reopening circuit");
+                *state = CircuitState::Open;
+                *self.last_opened.lock().unwrap() = Some(std::time::Instant::now());
+            }
+            CircuitState::Open => {
+                // Already open, just count
+            }
+        }
+    }
+
+    /// Get the current circuit state.
+    pub fn state(&self) -> CircuitState {
+        *self.state.lock().unwrap()
+    }
+
+    /// Get the current consecutive failure count.
+    pub fn failure_count(&self) -> u32 {
+        *self.failure_count.lock().unwrap()
+    }
+}
+
+// ============================================================================
 // Retry Wrapper
 // ============================================================================
 
@@ -661,5 +825,84 @@ mod tests {
             truncate_error("this is a longer error message", 10),
             "this is a ..."
         );
+    }
+
+    #[test]
+    fn test_is_non_retriable() {
+        assert!(is_non_retriable("Syntax error on line 42"));
+        assert!(is_non_retriable("Authentication failed: invalid token"));
+        assert!(is_non_retriable("compilation failed with 3 errors"));
+        assert!(is_non_retriable("Permission Denied for resource"));
+        assert!(is_non_retriable("schema validation: missing field 'name'"));
+
+        // These ARE retriable
+        assert!(!is_non_retriable("Connection timeout"));
+        assert!(!is_non_retriable("Rate limit exceeded"));
+        assert!(!is_non_retriable("Service unavailable"));
+    }
+
+    #[test]
+    fn test_circuit_breaker_closed_allows_requests() {
+        let cb = CircuitBreaker::new(3, Duration::from_millis(100));
+        assert!(cb.allow_request());
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_circuit_breaker_opens_after_threshold() {
+        let cb = CircuitBreaker::new(3, Duration::from_millis(100));
+        cb.record_failure();
+        cb.record_failure();
+        assert!(cb.allow_request()); // Still closed
+        cb.record_failure(); // 3rd failure = threshold
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert!(!cb.allow_request()); // Rejected
+    }
+
+    #[test]
+    fn test_circuit_breaker_success_resets() {
+        let cb = CircuitBreaker::new(3, Duration::from_millis(100));
+        cb.record_failure();
+        cb.record_failure();
+        cb.record_success(); // Reset
+        assert_eq!(cb.failure_count(), 0);
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open_on_cooldown() {
+        let cb = CircuitBreaker::new(2, Duration::from_millis(10));
+        cb.record_failure();
+        cb.record_failure(); // Opens
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Wait for cooldown
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(cb.allow_request()); // Transitions to HalfOpen
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open_success_closes() {
+        let cb = CircuitBreaker::new(2, Duration::from_millis(10));
+        cb.record_failure();
+        cb.record_failure(); // Opens
+
+        std::thread::sleep(Duration::from_millis(15));
+        cb.allow_request(); // HalfOpen
+        cb.record_success(); // Close
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open_failure_reopens() {
+        let cb = CircuitBreaker::new(2, Duration::from_millis(10));
+        cb.record_failure();
+        cb.record_failure(); // Opens
+
+        std::thread::sleep(Duration::from_millis(15));
+        cb.allow_request(); // HalfOpen
+        cb.record_failure(); // Reopen
+        assert_eq!(cb.state(), CircuitState::Open);
     }
 }

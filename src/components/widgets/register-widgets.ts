@@ -5,7 +5,11 @@
  * This must be called before using the dashboard.
  */
 
-import { widgetRegistry, defaultDetectors } from "@/types/dashboard/widget-registry";
+import {
+  widgetRegistry,
+  defaultDetectors,
+  type SummaryWidthTier,
+} from "@/types/dashboard/widget-registry";
 
 // Import GUI Automation widget
 import { GuiAutomationWidget, GuiAutomationSummary, useGuiAutomationData } from "./gui-automation";
@@ -94,6 +98,7 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.execution_timeline,
     defaultPriority: 5, // Highest priority - shows first
     detailRoute: "/logs/timeline",
+    getSummaryWidthTier: (): SummaryWidthTier => "wide",
   });
 
   // Flow Execution - Flow Designer deterministic workflow execution
@@ -108,6 +113,7 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.flow_execution,
     defaultPriority: 8,
     detailRoute: "/flow-designer",
+    getSummaryWidthTier: (): SummaryWidthTier => "medium",
   });
 
   // GUI Automation - primary widget for GUI automation setup/navigation
@@ -122,6 +128,7 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.gui_automation,
     defaultPriority: 10,
     detailRoute: "/logs/actions",
+    getSummaryWidthTier: (): SummaryWidthTier => "wide",
   });
 
   // Playwright - for Playwright test execution
@@ -136,6 +143,8 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.playwright,
     defaultPriority: 15,
     detailRoute: "/logs/playwright",
+    getSummaryWidthTier: (data): SummaryWidthTier =>
+      data.totalTests === 0 ? "narrow" : "medium",
   });
 
   // AI Conversation - for AI analysis and chat
@@ -150,6 +159,7 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.ai_conversation,
     defaultPriority: 20,
     detailRoute: "/ai-output",
+    getSummaryWidthTier: (): SummaryWidthTier => "full",
   });
 
   // Verification - answers "Did the fix work?"
@@ -164,6 +174,8 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.verification,
     defaultPriority: 25,
     detailRoute: "/verification",
+    getSummaryWidthTier: (data): SummaryWidthTier =>
+      data.stats.total === 0 ? "narrow" : "medium",
   });
 
   // Findings - AI-detected issues
@@ -178,6 +190,8 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.findings,
     defaultPriority: 30,
     detailRoute: "/findings",
+    getSummaryWidthTier: (data): SummaryWidthTier =>
+      data.totalCount === 0 ? "narrow" : "medium",
   });
 
   // Execution Status - Real-time agentic feature status
@@ -192,6 +206,7 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.execution_status,
     defaultPriority: 35,
     detailRoute: "/settings/agentic",
+    getSummaryWidthTier: (): SummaryWidthTier => "medium",
   });
 
   // Shell Command - Shell/terminal command execution
@@ -206,6 +221,8 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.shell_command,
     defaultPriority: 18,
     detailRoute: "/logs/shell",
+    getSummaryWidthTier: (data): SummaryWidthTier =>
+      data.commands.length === 0 ? "narrow" : "medium",
   });
 
   // API Request - HTTP API request/response
@@ -220,6 +237,8 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.api_request,
     defaultPriority: 22,
     detailRoute: "/logs/api",
+    getSummaryWidthTier: (data): SummaryWidthTier =>
+      data.requests.length === 0 ? "narrow" : "medium",
   });
 
   // Playwright Test - Script execution
@@ -234,6 +253,7 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.script,
     defaultPriority: 19,
     detailRoute: "/logs/scripts",
+    getSummaryWidthTier: (): SummaryWidthTier => "narrow",
   });
 
   // Workflow Ref - Sub-workflow execution
@@ -248,6 +268,7 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.workflow_ref,
     defaultPriority: 25,
     detailRoute: "/logs/workflows",
+    getSummaryWidthTier: (): SummaryWidthTier => "narrow",
   });
 
   // MCP Call - MCP tool calls to external servers
@@ -262,6 +283,8 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.mcp_call,
     defaultPriority: 24,
     detailRoute: "/logs/mcp",
+    getSummaryWidthTier: (data): SummaryWidthTier =>
+      data.calls.length === 0 ? "narrow" : "medium",
   });
 
   // Canvas - Agent-rendered rich panels
@@ -276,6 +299,8 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.canvas,
     defaultPriority: 3,
     detailRoute: "/canvas",
+    getSummaryWidthTier: (data): SummaryWidthTier =>
+      data.panelCount === 0 ? "narrow" : "medium",
   });
 
   // Trace Viewer - Jaeger-inspired waterfall execution trace viewer
@@ -290,6 +315,7 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.trace_viewer,
     defaultPriority: 40,
     detailRoute: "/runs/traces",
+    getSummaryWidthTier: (): SummaryWidthTier => "wide",
   });
 
   // Mark registry as initialized

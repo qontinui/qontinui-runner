@@ -111,7 +111,7 @@ pub fn convert_json_steps_with_phase(
         // Filter out prompt steps - they're handled separately to avoid duplicate logging
         .filter(|step| {
             let step_type = step.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            step_type != "prompt" && step_type != "ai_session"
+            !matches!(step_type, "prompt" | "ai_session" | "ai_prompt" | "run_prompt_sequence")
         })
         .filter_map(|step| {
             let mut config =
@@ -256,7 +256,7 @@ pub fn extract_prompt_steps_with_phase(
         .filter(|step| {
             step.get("type")
                 .and_then(|t| t.as_str())
-                .map(|t| t == "prompt")
+                .map(|t| matches!(t, "prompt" | "ai_prompt" | "run_prompt_sequence"))
                 .unwrap_or(false)
         })
         .filter_map(|step| {

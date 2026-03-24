@@ -105,6 +105,16 @@ pub fn build_already_tried_summary(fixes: &[ReflectionFix]) -> String {
                         .map(|e| format!(" -- Reason: {}", truncate_str(e, 150)))
                         .unwrap_or_default();
                     output.push_str(&format!("- [{}] {}{}\n", label, desc, evidence));
+                    if let Some(ref reasoning) = fix.reasoning {
+                        if !reasoning.is_empty() {
+                            output.push_str(&format!("  Reasoning: {}\n", truncate_str(reasoning, 200)));
+                        }
+                    }
+                    if let Some(ref alternatives) = fix.alternatives_considered {
+                        if !alternatives.is_empty() {
+                            output.push_str(&format!("  Alternatives considered: {}\n", truncate_str(alternatives, 200)));
+                        }
+                    }
                 }
                 Some("caused_regression") => {
                     let evidence = fix
@@ -113,9 +123,29 @@ pub fn build_already_tried_summary(fixes: &[ReflectionFix]) -> String {
                         .map(|e| format!(" -- Caused: {}", truncate_str(e, 150)))
                         .unwrap_or_default();
                     output.push_str(&format!("- [{}] {}{}\n", label, desc, evidence));
+                    if let Some(ref reasoning) = fix.reasoning {
+                        if !reasoning.is_empty() {
+                            output.push_str(&format!("  Reasoning: {}\n", truncate_str(reasoning, 200)));
+                        }
+                    }
+                    if let Some(ref alternatives) = fix.alternatives_considered {
+                        if !alternatives.is_empty() {
+                            output.push_str(&format!("  Alternatives considered: {}\n", truncate_str(alternatives, 200)));
+                        }
+                    }
                 }
                 _ => {
                     output.push_str(&format!("- [{}] {}\n", label, desc));
+                    if let Some(ref reasoning) = fix.reasoning {
+                        if !reasoning.is_empty() {
+                            output.push_str(&format!("  Reasoning: {}\n", truncate_str(reasoning, 200)));
+                        }
+                    }
+                    if let Some(ref alternatives) = fix.alternatives_considered {
+                        if !alternatives.is_empty() {
+                            output.push_str(&format!("  Alternatives considered: {}\n", truncate_str(alternatives, 200)));
+                        }
+                    }
                 }
             }
         }

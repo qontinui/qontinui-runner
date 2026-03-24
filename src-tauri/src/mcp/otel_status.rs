@@ -33,13 +33,13 @@ impl From<&OtelConfig> for OtelStatus {
 
 /// GET /otel/status — return the current OpenTelemetry configuration.
 ///
-/// TODO: OtelConfig is not yet persisted in the runner settings file.
-/// Once it is added to `RunnerSettings`, this should read from there
-/// instead of returning defaults.
+/// Reads from persisted runner settings so the status reflects what the
+/// user has configured (even if OTel is not yet active because a restart
+/// is needed).
 pub async fn get_otel_status(
     axum::extract::State(_state): axum::extract::State<Arc<ApiState>>,
 ) -> Json<OtelStatus> {
-    let config = OtelConfig::default();
+    let config = crate::settings::get_otel_settings();
     Json(OtelStatus::from(&config))
 }
 

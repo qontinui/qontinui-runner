@@ -199,6 +199,20 @@ impl SettingsField for CloudRelaySettings {
     }
 }
 
+impl SettingsField for crate::otel::OtelConfig {
+    fn get_from(settings: &Settings) -> &Self {
+        &settings.otel
+    }
+
+    fn set_in(settings: &mut Settings, value: Self) {
+        settings.otel = value;
+    }
+
+    fn field_name() -> &'static str {
+        "otel"
+    }
+}
+
 // ============================================================================
 // Generic Settings Functions
 // ============================================================================

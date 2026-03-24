@@ -56,6 +56,8 @@
 
 pub mod agent_roles;
 pub mod agent_tool;
+pub mod role_specializations;
+pub mod tool_guard;
 pub mod checkpoint;
 pub mod compression;
 pub mod config;

@@ -794,6 +794,85 @@ pub fn get_impact_analysis(
 }
 
 // =============================================================================
+// Graph-Enhanced Impact Analysis
+// =============================================================================
+
+/// Extended impact analysis that supplements the BFS-on-component_relationships approach
+/// with additional relationship data from step_finding_links and step_provenance tables.
+pub fn rebuild_architecture_with_graph(
+    conn: &Connection,
+    workflow_name: &str,
+) -> Result<RebuildResult, String> {
+    let base_result = rebuild_architecture_model(conn, workflow_name)?;
+
+    let cross_finding_edges: Vec<(String, String)> = conn
+        .prepare(
+            r#"SELECT DISTINCT
+                   sfl.step_name,
+                   rf.file_changed
+               FROM step_finding_links sfl
+               JOIN task_run_findings trf ON sfl.finding_id = trf.id
+               JOIN task_runs t ON sfl.task_run_id = t.id
+               JOIN reflection_fixes rf ON rf.source_finding_id = trf.id
+               WHERE t.workflow_name = ?1
+               AND rf.file_changed IS NOT NULL"#,
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(params![workflow_name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    let mut new_edges = 0u32;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    for (step_name, file_changed) in &cross_finding_edges {
+        let source = normalize_component_path(step_name);
+        let target = normalize_component_path(file_changed);
+        if source == target {
+            continue;
+        }
+
+        let id = Uuid::new_v4().to_string();
+        match conn.execute(
+            r#"INSERT OR IGNORE INTO component_relationships
+               (id, workflow_name, source_component, target_component, relationship_type, strength, last_seen_at, created_at)
+               VALUES (?1, ?2, ?3, ?4, 'finding_link', 1, ?5, ?5)"#,
+            params![id, workflow_name, source, target, now],
+        ) {
+            Ok(1) => new_edges += 1,
+            Ok(_) => {}
+            Err(e) => warn!("Failed to insert finding_link edge: {}", e),
+        }
+    }
+
+    if new_edges > 0 {
+        info!(
+            "Graph-enhanced rebuild added {} finding_link edges for '{}'",
+            new_edges, workflow_name
+        );
+    }
+
+    Ok(RebuildResult {
+        components_count: base_result.components_count,
+        relationships_count: base_result.relationships_count + new_edges,
+        workflow_name: workflow_name.to_string(),
+    })
+}
+
+/// Graph-enhanced impact analysis.
+pub fn get_impact_analysis_with_graph(
+    conn: &Connection,
+    workflow_name: &str,
+    component_path: &str,
+) -> Result<ImpactAnalysis, String> {
+    let _ = rebuild_architecture_with_graph(conn, workflow_name);
+    get_impact_analysis(conn, workflow_name, component_path)
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 

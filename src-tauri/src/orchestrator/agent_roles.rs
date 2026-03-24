@@ -92,6 +92,25 @@ impl ToolSpec {
 }
 
 // ============================================================================
+// Model Tier
+// ============================================================================
+
+/// Model capability tier for role-based model selection.
+///
+/// Maps to the routing config's simple/medium/complex models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTier {
+    /// Fast, cheap model (e.g., Haiku) — for read-only analysis, simple tasks.
+    Simple,
+    /// Balanced model (e.g., Sonnet) — default for most roles.
+    #[default]
+    Medium,
+    /// Powerful model (e.g., Opus) — for complex planning, architecture.
+    Complex,
+}
+
+// ============================================================================
 // Agent Role Definition
 // ============================================================================
 
@@ -120,6 +139,13 @@ pub struct AgentRole {
     pub tags: Vec<String>,
     /// Custom metadata.
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Tool whitelist — when `Some`, only these tools may be invoked.
+    /// `None` means unrestricted (legacy roles use `tools` field instead).
+    pub allowed_tools: Option<Vec<String>>,
+    /// Preferred model capability tier for this role.
+    pub preferred_model_tier: ModelTier,
+    /// Maximum token budget for responses from this role.
+    pub max_tokens_budget: Option<u32>,
 }
 
 /// Communication style preferences for an agent.
@@ -168,6 +194,9 @@ impl Default for AgentRole {
             autonomy_level: AutonomyLevel::default(),
             tags: Vec::new(),
             metadata: HashMap::new(),
+            allowed_tools: None,
+            preferred_model_tier: ModelTier::default(),
+            max_tokens_budget: None,
         }
     }
 }
@@ -240,6 +269,24 @@ impl AgentRole {
     /// Add metadata.
     pub fn with_metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
         self.metadata.insert(key.into(), value);
+        self
+    }
+
+    /// Set the tool whitelist (for role specializations).
+    pub fn with_allowed_tools(mut self, tools: Vec<String>) -> Self {
+        self.allowed_tools = Some(tools);
+        self
+    }
+
+    /// Set the preferred model tier.
+    pub fn with_model_tier(mut self, tier: ModelTier) -> Self {
+        self.preferred_model_tier = tier;
+        self
+    }
+
+    /// Set the maximum token budget for responses.
+    pub fn with_max_tokens_budget(mut self, budget: u32) -> Self {
+        self.max_tokens_budget = Some(budget);
         self
     }
 

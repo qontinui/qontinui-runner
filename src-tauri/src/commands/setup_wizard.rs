@@ -816,13 +816,26 @@ pub async fn suggest_process_configs_for_setup(projects: Vec<Value>) -> Result<V
 /// Each suggested config includes `start_group` for ordered startup and
 /// `dev_only: true` to ensure they're only active in dev builds.
 #[tauri::command]
-pub async fn suggest_dev_services_for_setup() -> Result<Vec<Value>, String> {
+pub async fn suggest_dev_services_for_setup(
+    already_selected: Option<Vec<Value>>,
+) -> Result<Vec<Value>, String> {
     info!("Setup wizard: suggesting dev services");
 
     let workspace = crate::dev_services::find_workspace_root()
         .ok_or_else(|| "Could not find qontinui workspace root".to_string())?;
 
-    let existing = settings::get_managed_process_configs();
+    let mut existing = settings::get_managed_process_configs();
+
+    // Include process configs already selected in earlier wizard steps so we
+    // don't suggest dev services that duplicate them (same health_port).
+    if let Some(selected) = already_selected {
+        for val in selected {
+            if let Ok(cfg) = serde_json::from_value::<crate::process_capture::ProcessConfig>(val) {
+                existing.push(cfg);
+            }
+        }
+    }
+
     let services = crate::dev_services::get_missing_dev_services(&workspace, &existing);
 
     let result: Vec<Value> = services

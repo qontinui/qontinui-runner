@@ -12,6 +12,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { createLogger } from "@/lib/logger";
 import { ActionStatus, ActionType } from "../types/execution";
 import type {
+  LLMMetrics,
   RunType,
   RunStatus,
   RunnerMetadata,
@@ -32,6 +33,7 @@ import type {
 
 // Re-export types for convenience
 export type {
+  LLMMetrics,
   RunType,
   RunStatus,
   ActionStatus,
@@ -44,6 +46,22 @@ export type {
   ExecutionScreenshotCreate,
   ExecutionIssueCreate,
 };
+
+/**
+ * Data for reporting a single AI prompt action (LLM call).
+ */
+export interface AiPromptActionData {
+  name: string;
+  status: "success" | "failed" | "error" | "timeout" | "skipped";
+  input?: Record<string, unknown>;
+  output?: Record<string, unknown>;
+  error?: string;
+  startTime: Date;
+  endTime?: Date;
+  duration_ms?: number;
+  llmMetrics?: LLMMetrics;
+  metadata?: Record<string, unknown>;
+}
 
 // ============================================================================
 // Legacy Compatibility Types
@@ -106,6 +124,11 @@ interface InternalExecutionStats {
   totalRecognitions: number;
   successfulRecognitions: number;
   failedRecognitions: number;
+  // LLM tracking stats
+  llmActionCount: number;
+  totalTokensInput: number;
+  totalTokensOutput: number;
+  totalCostUsd: number;
 }
 
 // ============================================================================
@@ -275,6 +298,142 @@ class ExecutionReportingServiceImpl {
     } catch (error) {
       console.error("[ExecutionReporting] Failed to report issues:", error);
     }
+  }
+
+  /**
+   * Report a single AI prompt action (LLM call) to the execution service.
+   *
+   * @param data - The AI prompt action data
+   */
+  async reportAiPromptAction(data: AiPromptActionData): Promise<void> {
+    if (!this.activeRunId) {
+      return;
+    }
+
+    const statusMap: Record<AiPromptActionData["status"], ActionStatus> = {
+      success: ActionStatus.SUCCESS,
+      failed: ActionStatus.FAILED,
+      error: ActionStatus.ERROR,
+      timeout: ActionStatus.TIMEOUT,
+      skipped: ActionStatus.SKIPPED,
+    };
+
+    const endTime = data.endTime ?? new Date();
+    const durationMs = data.duration_ms ?? endTime.getTime() - data.startTime.getTime();
+
+    const action: ActionExecutionCreate = {
+      sequence_number: this.getNextActionSequenceNumber(),
+      action_type: ActionType.AI_PROMPT,
+      action_name: data.name,
+      status: statusMap[data.status],
+      started_at: data.startTime.toISOString(),
+      completed_at: endTime.toISOString(),
+      duration_ms: durationMs,
+      input_data: data.input,
+      output_data: data.output,
+      error_message: data.error,
+      llm_metrics: data.llmMetrics,
+      span_type: "llm_call",
+      metadata: data.metadata,
+    };
+
+    await this.reportAction(action);
+  }
+
+  /**
+   * Report a prompt sequence: a parent "agent" span with N child "llm_call" spans.
+   *
+   * @param sequenceName - Name for the parent agent span
+   * @param actions - Array of child AI prompt action data
+   * @param parentMetadata - Optional metadata for the parent span
+   */
+  async reportPromptSequence(
+    sequenceName: string,
+    actions: AiPromptActionData[],
+    parentMetadata?: Record<string, unknown>,
+  ): Promise<void> {
+    if (!this.activeRunId || actions.length === 0) {
+      return;
+    }
+
+    const parentId = `seq-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const traceId = `trace-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+    const statusMap: Record<AiPromptActionData["status"], ActionStatus> = {
+      success: ActionStatus.SUCCESS,
+      failed: ActionStatus.FAILED,
+      error: ActionStatus.ERROR,
+      timeout: ActionStatus.TIMEOUT,
+      skipped: ActionStatus.SKIPPED,
+    };
+
+    // Build child actions
+    const childActions: ActionExecutionCreate[] = actions.map((data) => {
+      const endTime = data.endTime ?? new Date();
+      const durationMs = data.duration_ms ?? endTime.getTime() - data.startTime.getTime();
+
+      return {
+        sequence_number: this.getNextActionSequenceNumber(),
+        action_type: ActionType.AI_PROMPT,
+        action_name: data.name,
+        status: statusMap[data.status],
+        started_at: data.startTime.toISOString(),
+        completed_at: endTime.toISOString(),
+        duration_ms: durationMs,
+        input_data: data.input,
+        output_data: data.output,
+        error_message: data.error,
+        llm_metrics: data.llmMetrics,
+        span_type: "llm_call",
+        trace_id: traceId,
+        parent_id: parentId,
+        metadata: data.metadata,
+      };
+    });
+
+    // Determine parent status from children
+    const hasFailure = actions.some((a) => a.status === "failed" || a.status === "error");
+    const allSkipped = actions.every((a) => a.status === "skipped");
+    const parentStatus = allSkipped
+      ? ActionStatus.SKIPPED
+      : hasFailure
+        ? ActionStatus.FAILED
+        : ActionStatus.SUCCESS;
+
+    // Calculate parent timing
+    const earliestStart = actions.reduce(
+      (min, a) => (a.startTime < min ? a.startTime : min),
+      actions[0].startTime,
+    );
+    const latestEnd = actions.reduce((max, a) => {
+      const end = a.endTime ?? new Date();
+      return end > max ? end : max;
+    }, actions[0].endTime ?? new Date());
+
+    const parentDurationMs = latestEnd.getTime() - earliestStart.getTime();
+    const aggregatedMetrics = this.aggregateLLMMetrics(actions);
+
+    // Build parent action
+    const parentAction: ActionExecutionCreate = {
+      sequence_number: this.getNextActionSequenceNumber(),
+      action_type: ActionType.RUN_PROMPT_SEQUENCE,
+      action_name: sequenceName,
+      status: parentStatus,
+      started_at: earliestStart.toISOString(),
+      completed_at: latestEnd.toISOString(),
+      duration_ms: parentDurationMs,
+      llm_metrics: aggregatedMetrics,
+      span_type: "agent",
+      trace_id: traceId,
+      metadata: {
+        child_count: actions.length,
+        ...parentMetadata,
+      },
+    };
+
+    // Report parent first, then children
+    await this.reportAction(parentAction);
+    await this.reportActions(childActions);
   }
 
   // ============================================================================
@@ -507,6 +666,10 @@ class ExecutionReportingServiceImpl {
       totalRecognitions: 0,
       successfulRecognitions: 0,
       failedRecognitions: 0,
+      llmActionCount: 0,
+      totalTokensInput: 0,
+      totalTokensOutput: 0,
+      totalCostUsd: 0,
     };
   }
 
@@ -557,6 +720,14 @@ class ExecutionReportingServiceImpl {
       const transitionKey = `${action.from_state}->${action.to_state}`;
       this.executionStats.transitionsCovered.add(transitionKey);
     }
+
+    // Accumulate LLM metrics
+    if (action.llm_metrics) {
+      this.executionStats.llmActionCount++;
+      this.executionStats.totalTokensInput += action.llm_metrics.tokens_input ?? 0;
+      this.executionStats.totalTokensOutput += action.llm_metrics.tokens_output ?? 0;
+      this.executionStats.totalCostUsd += action.llm_metrics.cost_usd ?? 0;
+    }
   }
 
   private buildExecutionStats(): ExecutionStats {
@@ -571,6 +742,10 @@ class ExecutionReportingServiceImpl {
       skipped_actions: this.executionStats.skippedActions,
       total_duration_ms: durationMs,
       avg_action_duration_ms: totalActions > 0 ? Math.round(durationMs / totalActions) : 0,
+      llm_action_count: this.executionStats.llmActionCount,
+      total_tokens_input: this.executionStats.totalTokensInput,
+      total_tokens_output: this.executionStats.totalTokensOutput,
+      total_cost_usd: this.executionStats.totalCostUsd,
     };
   }
 
@@ -589,6 +764,34 @@ class ExecutionReportingServiceImpl {
       total_states: 0, // Would need workflow metadata
       transitions_covered: transitionsCovered,
       total_transitions: 0, // Would need workflow metadata
+    };
+  }
+
+  /**
+   * Aggregate LLM metrics from multiple AI prompt actions.
+   */
+  private aggregateLLMMetrics(actions: AiPromptActionData[]): LLMMetrics | undefined {
+    const metricsActions = actions.filter((a) => a.llmMetrics);
+    if (metricsActions.length === 0) {
+      return undefined;
+    }
+
+    let tokensInput = 0;
+    let tokensOutput = 0;
+    let costUsd = 0;
+
+    for (const action of metricsActions) {
+      const m = action.llmMetrics!;
+      tokensInput += m.tokens_input ?? 0;
+      tokensOutput += m.tokens_output ?? 0;
+      costUsd += m.cost_usd ?? 0;
+    }
+
+    return {
+      tokens_input: tokensInput,
+      tokens_output: tokensOutput,
+      tokens_total: tokensInput + tokensOutput,
+      cost_usd: costUsd,
     };
   }
 
@@ -657,3 +860,7 @@ export const reportTransition =
 export const completeRun = executionReportingService.completeRun.bind(executionReportingService);
 export const getNextActionSequenceNumber =
   executionReportingService.getNextActionSequenceNumber.bind(executionReportingService);
+export const reportAiPromptAction =
+  executionReportingService.reportAiPromptAction.bind(executionReportingService);
+export const reportPromptSequence =
+  executionReportingService.reportPromptSequence.bind(executionReportingService);

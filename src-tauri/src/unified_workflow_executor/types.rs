@@ -369,6 +369,9 @@ pub struct LoopConfig {
     pub active_canary: Option<(String, String)>,
     /// Whether this run was selected as the canary variant (vs baseline).
     pub is_canary_run: bool,
+    /// Optional per-phase timeout in milliseconds.
+    /// When set, each phase (setup/verification/agentic/completion) is capped at this duration.
+    pub phase_timeout_ms: Option<u64>,
 }
 
 impl LoopConfig {
@@ -433,6 +436,7 @@ impl LoopConfig {
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
             acceptance_criteria: workflow.acceptance_criteria.clone(),
+            phase_timeout_ms: None,
         }
     }
 

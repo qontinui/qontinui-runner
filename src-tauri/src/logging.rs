@@ -57,6 +57,9 @@ pub struct LoggingConfig {
     pub enable_span_jsonl: bool,
     /// Enable SQLite span output for AI analysis
     pub enable_span_sqlite: bool,
+    /// OpenTelemetry configuration, read from persisted settings at startup.
+    /// The tracing subscriber is set once, so OTel changes require a restart.
+    pub otel: crate::otel::OtelConfig,
 }
 
 impl Default for LoggingConfig {
@@ -73,6 +76,7 @@ impl Default for LoggingConfig {
             log_dir,
             enable_span_jsonl: true,
             enable_span_sqlite: true,
+            otel: crate::otel::OtelConfig::default(),
         }
     }
 }
@@ -81,6 +85,8 @@ impl Default for LoggingConfig {
 pub struct LoggingInitResult {
     /// SQLite span layer (needs database pool to be set after DB init)
     pub sqlite_span_layer: Option<Arc<SqliteSpanLayer>>,
+    /// OTel guard — keeps the TracerProvider alive; drops on shutdown.
+    pub _otel_guard: crate::otel::OtelGuard,
 }
 
 pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> {
@@ -88,6 +94,12 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
 
     // Clear the spans JSONL file on startup
     crate::tracing_layers::clear_spans_jsonl();
+
+    // Initialise OpenTelemetry from persisted settings.
+    // The guard must outlive the subscriber so the provider flushes on shutdown.
+    // The optional layer is `None` when OTel is disabled — tracing-subscriber
+    // treats `Option<Layer>` as a no-op in that case.
+    let (otel_guard, otel_layer) = crate::otel::init_otel(&config.otel);
 
     let env_filter = EnvFilter::new(
         std::env::var("RUST_LOG")
@@ -110,9 +122,9 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
     // Store log_dir for logging before it's moved
     let log_dir_path = config.log_dir.clone();
 
-    // Build the subscriber with all layers
-    // Note: We need to use a boxed approach to handle the conditional layers
-    let registry = Registry::default().with(env_filter);
+    // Build the subscriber with all layers.
+    // OTel layer is added first (directly on Registry) so its type matches.
+    let registry = Registry::default().with(otel_layer).with(env_filter);
 
     if config.log_to_file {
         let file_appender = rolling::daily(config.log_dir, "qontinui-runner.log");
@@ -170,6 +182,7 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
 
     Ok(LoggingInitResult {
         sqlite_span_layer: Some(sqlite_layer),
+        _otel_guard: otel_guard,
     })
 }
 

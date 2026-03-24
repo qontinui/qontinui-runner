@@ -19,10 +19,10 @@
 //!
 //! ## ToolGuard Integration
 //!
-//! The `ToolGuard` is created in `flow_executor.rs` from these whitelists but is
-//! currently stored as `_tool_guard` (unused). When enforcement is wired in, the
-//! guard's `check_tool()` method should be called with the bare tool name (without
-//! the `mcp__qontinui__` prefix) before each tool invocation in the agent step.
+//! The `ToolGuard` is created in `flow_executor.rs` from these whitelists and
+//! enforced in `execute_tool_step`. The guard's `check_tool()` method is called
+//! with the bare tool name (without the `mcp__qontinui__` prefix) before each
+//! tool invocation, blocking tools not in the role's whitelist.
 
 #![allow(dead_code)]
 

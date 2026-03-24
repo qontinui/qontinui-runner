@@ -396,6 +396,24 @@ impl TaskRouter {
 }
 
 // ============================================================================
+// Model Tier Resolution
+// ============================================================================
+
+/// Resolve a `ModelTier` to a concrete model name using the current routing config.
+///
+/// This bridges the agent-role `ModelTier` enum to the routing config's
+/// simple/medium/complex model strings.
+pub fn model_for_tier(tier: crate::orchestrator::agent_roles::ModelTier) -> String {
+    use crate::orchestrator::agent_roles::ModelTier;
+    let config = crate::settings::get_ai_settings().routing;
+    match tier {
+        ModelTier::Simple => config.simple_model,
+        ModelTier::Medium => config.medium_model,
+        ModelTier::Complex => config.complex_model,
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

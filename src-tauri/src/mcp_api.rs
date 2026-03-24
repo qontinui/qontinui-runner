@@ -54,6 +54,7 @@
 //! The fix: Always calculate the virtual desktop origin (min X, min Y across all monitors)
 //! regardless of which monitor is specified, because FIND always captures the full virtual desktop.
 
+use async_graphql_axum::{GraphQL, GraphQLSubscription};
 use axum::{
     response::Json,
     routing::{get, post},
@@ -393,6 +394,9 @@ pub fn create_router(
     // Start cascade event buffer (collects cascade detection events for /cascade/events)
     crate::mcp::cascade::start_buffer_task(&api_state);
 
+    // Build GraphQL schema with ApiState as context data
+    let graphql_schema = crate::graphql::build_schema(api_state.clone());
+
     // CORS: Permissive (allow any origin) is intentional.
     // This localhost-only API (port 9876) must be accessible from:
     //   - The Tauri webview (tauri://localhost origin)
@@ -406,6 +410,12 @@ pub fn create_router(
         .allow_headers(Any);
 
     Router::new()
+        // GraphQL endpoints (typed API alongside REST)
+        .route("/graphql", post(crate::graphql::schema::graphql_handler))
+        .route_service(
+            "/graphql/ws",
+            GraphQLSubscription::new(graphql_schema.clone()),
+        )
         // Local routes
         .route("/health", get(health))
         .route("/ui-bridge/health", get(health))
@@ -436,6 +446,7 @@ pub fn create_router(
         .merge(crate::mcp::meta_optimizer_api::routes())
         .merge(crate::mcp::generator_eval::routes())
         .merge(crate::mcp::hooks::routes())
+        .merge(crate::mcp::inngest::routes())
         .merge(crate::mcp::interaction_recording::routes())
         .merge(crate::mcp::log_sources::routes())
         .merge(crate::mcp::macros::routes())
@@ -456,6 +467,7 @@ pub fn create_router(
         .merge(crate::mcp::rag::routes())
         .merge(crate::mcp::recordings::routes())
         .merge(crate::mcp::reflection_api::routes())
+        .merge(crate::mcp::graph_api::routes())
         .merge(crate::mcp::saved_api_requests::routes())
         .merge(crate::mcp::scheduler::routes())
         .merge(crate::mcp::sdk_client::routes())
@@ -487,6 +499,7 @@ pub fn create_router(
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))
+        .layer(axum::Extension(graphql_schema))
         .with_state(api_state)
 }
 

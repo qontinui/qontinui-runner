@@ -10,7 +10,7 @@
 
 import { useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { Calendar, History, Settings, Plus, RefreshCw, Wrench } from "lucide-react";
+import { Calendar, History, Settings, Plus, RefreshCw, Wrench, Sparkles } from "lucide-react";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import { useScheduler } from "../../hooks/useScheduler";
 import { SchedulerTaskList } from "./SchedulerTaskList";
@@ -18,6 +18,7 @@ import { SchedulerTaskForm } from "./SchedulerTaskForm";
 import { SchedulerHistory } from "./SchedulerHistory";
 import { SchedulerSettings } from "./SchedulerSettings";
 import { SchedulerStats } from "./SchedulerStats";
+import { AiScheduleBuilder } from "./AiScheduleBuilder";
 import type { ScheduledTask, CreateScheduledTaskRequest } from "../../types/scheduler";
 
 type SchedulerSubTab = "tasks" | "history" | "settings";
@@ -29,7 +30,9 @@ interface SchedulerTabProps {
 export function SchedulerTab({ className = "" }: SchedulerTabProps) {
   const [activeSubTab, setActiveSubTab] = useState<SchedulerSubTab>("tasks");
   const [isCreating, setIsCreating] = useState(false);
+  const [isAiBuilding, setIsAiBuilding] = useState(false);
   const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
+  const [prefillRequest, setPrefillRequest] = useState<CreateScheduledTaskRequest | null>(null);
 
   const {
     tasks,
@@ -53,6 +56,7 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
     const task = await createTask(request);
     if (task) {
       setIsCreating(false);
+      setPrefillRequest(null);
     }
   };
 
@@ -64,6 +68,19 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
     }
   };
 
+  const handleAiSubmit = async (requests: CreateScheduledTaskRequest[]) => {
+    for (const request of requests) {
+      await createTask(request);
+    }
+    setIsAiBuilding(false);
+  };
+
+  const handleAiEditManually = (request: CreateScheduledTaskRequest) => {
+    setIsAiBuilding(false);
+    setPrefillRequest(request);
+    setIsCreating(true);
+  };
+
   const handleDeleteTask = async (task: ScheduledTask) => {
     if (window.confirm(`Delete scheduled task "${task.name}"?`)) {
       await deleteTask(task.id);
@@ -73,6 +90,8 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
   const handleToggleEnabled = async (task: ScheduledTask) => {
     await updateTask(task.id, { enabled: !task.enabled });
   };
+
+  const isFormOpen = isCreating || isAiBuilding || !!editingTask;
 
   return (
     <div className={`flex flex-col h-full ${className}`}>
@@ -113,14 +132,23 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
           >
             <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} />
           </button>
-          {activeSubTab === "tasks" && !isCreating && !editingTask && (
-            <button
-              onClick={() => setIsCreating(true)}
-              className="flex items-center gap-2 px-3 py-1.5 text-sm bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors"
-            >
-              <Plus className="w-4 h-4" />
-              New Task
-            </button>
+          {activeSubTab === "tasks" && !isFormOpen && (
+            <>
+              <button
+                onClick={() => setIsAiBuilding(true)}
+                className="flex items-center gap-2 px-3 py-1.5 text-sm bg-purple-600 text-white rounded-lg hover:bg-purple-500 transition-colors"
+              >
+                <Sparkles className="w-4 h-4" />
+                AI Schedule
+              </button>
+              <button
+                onClick={() => setIsCreating(true)}
+                className="flex items-center gap-2 px-3 py-1.5 text-sm bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors"
+              >
+                <Plus className="w-4 h-4" />
+                New Task
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -133,7 +161,7 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
       )}
 
       {/* Statistics dashboard - hidden when creating/editing a task */}
-      {!isCreating && !editingTask && (
+      {!isFormOpen && (
         <SchedulerStats tasks={tasks} taskHistory={taskHistory} status={status} />
       )}
 
@@ -169,10 +197,21 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
 
         <div className="flex-1 overflow-auto">
           <Tabs.Content value="tasks" className="h-full p-4">
-            {isCreating ? (
+            {isAiBuilding ? (
+              <AiScheduleBuilder
+                onSubmit={handleAiSubmit}
+                onCancel={() => setIsAiBuilding(false)}
+                onEditManually={handleAiEditManually}
+                loading={loading}
+              />
+            ) : isCreating ? (
               <SchedulerTaskForm
+                prefill={prefillRequest ?? undefined}
                 onSubmit={handleCreateTask}
-                onCancel={() => setIsCreating(false)}
+                onCancel={() => {
+                  setIsCreating(false);
+                  setPrefillRequest(null);
+                }}
                 loading={loading}
               />
             ) : editingTask ? (

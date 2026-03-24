@@ -4,6 +4,7 @@
 //! phase executors themselves:
 //!
 //! - **Token usage tracking** — `record_phase_token_usage()`
+//! - **LLM metrics conversion** — build_llm_metrics() for Opik integration
 //! - **Reflection mode preamble** — `REFLECTION_MODE_PREAMBLE` constant
 //! - **UI Bridge integration** — console error fetching, health checks, browser events, network failures
 //! - **Environment readiness** — `check_environment_readiness()` and `EnvironmentReadinessResult`
@@ -18,6 +19,7 @@ use crate::doctor::DoctorHandle;
 use crate::findings::storage as finding_storage;
 use crate::findings::{FindingParser, ParsedFinding};
 use crate::mcp::types::MCP_API_PORT;
+use crate::commands::execution_reporting::LLMMetrics;
 use crate::step_executor::ExecutionStepConfig;
 
 // =============================================================================
@@ -47,6 +49,10 @@ pub(super) fn record_phase_token_usage(
     // Simple cost estimation (cents): rough per-token pricing
     // This is approximate — actual cost depends on model
     let cost_cents = 0u64; // Cost calculation deferred to a pricing table
+    info!(
+        "Recording phase token usage: task={}, phase={}, input={}, output={}",
+        task_run_id, phase, input, output
+    );
     if let Err(e) = db.create_phase_token_usage(
         task_run_id,
         phase,
@@ -61,6 +67,31 @@ pub(super) fn record_phase_token_usage(
     ) {
         warn!("Failed to record phase token usage: {}", e);
     }
+}
+
+/// Build LLM metrics for Opik integration from token usage data.
+///
+/// Returns `None` if both input and output tokens are zero (no meaningful data).
+pub(super) fn build_llm_metrics(
+    model: Option<&str>,
+    provider: Option<&str>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+) -> Option<LLMMetrics> {
+    let input = input_tokens.unwrap_or(0) as i64;
+    let output = output_tokens.unwrap_or(0) as i64;
+    if input == 0 && output == 0 {
+        return None;
+    }
+    Some(LLMMetrics {
+        model: model.map(|s| s.to_string()),
+        provider: provider.map(|s| s.to_string()),
+        tokens_input: Some(input),
+        tokens_output: Some(output),
+        tokens_total: Some(input + output),
+        cost_usd: None,
+        generation_params: None,
+    })
 }
 
 // =============================================================================

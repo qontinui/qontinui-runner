@@ -5601,6 +5601,225 @@ impl CheckpointDb {
             info!("Successfully migrated to version 144 (canary_run_records)");
         }
 
+        if current_version < 145 {
+            info!("Migrating to version 145 (queued_workflows table)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS queued_workflows (
+                    id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL,
+                    priority INTEGER DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    payload_json TEXT,
+                    enqueued_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    error TEXT,
+                    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_queued_workflows_status ON queued_workflows(status);
+                CREATE INDEX IF NOT EXISTS idx_queued_workflows_workflow ON queued_workflows(workflow_id);
+                CREATE INDEX IF NOT EXISTS idx_queued_workflows_priority ON queued_workflows(priority DESC, enqueued_at ASC);
+                "#,
+            )
+            .map_err(|e| format!("Failed to create queued_workflows table: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (145, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 145: {}", e))?;
+
+            info!("Successfully migrated to version 145 (queued_workflows)");
+        }
+
+        if current_version < 146 {
+            info!("Migrating to version 146 (execution_spans enrichment columns)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE execution_spans ADD COLUMN queue_wait_ms INTEGER;
+                ALTER TABLE execution_spans ADD COLUMN retry_attempt INTEGER;
+                ALTER TABLE execution_spans ADD COLUMN phase TEXT;
+                ALTER TABLE execution_spans ADD COLUMN iteration INTEGER;
+                ALTER TABLE execution_spans ADD COLUMN workflow_id TEXT;
+                "#,
+            )
+            .map_err(|e| format!("Failed to add execution_spans columns: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (146, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 146: {}", e))?;
+
+            info!("Successfully migrated to version 146 (execution_spans enrichment)");
+        }
+
+        if current_version < 147 {
+            info!("Migrating to version 147 (unified_workflows flow_control + phase_timeouts)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN flow_control_json TEXT DEFAULT NULL;
+                ALTER TABLE unified_workflows ADD COLUMN phase_timeouts_json TEXT DEFAULT NULL;
+                "#,
+            )
+            .map_err(|e| format!("Failed to add flow_control/phase_timeouts columns: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (147, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 147: {}", e))?;
+
+            info!("Successfully migrated to version 147 (flow_control_json + phase_timeouts_json)");
+        }
+
+        if current_version < 152 {
+            info!("Migrating to version 152 (workflow versions, step finding links, step provenance)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS workflow_versions (
+                    id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL,
+                    version_number INTEGER NOT NULL,
+                    parent_version_id TEXT,
+                    generation_task_run_id TEXT,
+                    workflow_json TEXT NOT NULL,
+                    diff_summary TEXT,
+                    diff_json TEXT,
+                    trigger TEXT NOT NULL DEFAULT 'manual',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(workflow_id, version_number),
+                    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE,
+                    FOREIGN KEY (parent_version_id) REFERENCES workflow_versions(id) ON DELETE SET NULL,
+                    FOREIGN KEY (generation_task_run_id) REFERENCES task_runs(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_wv_workflow ON workflow_versions(workflow_id);
+                CREATE INDEX IF NOT EXISTS idx_wv_task_run ON workflow_versions(generation_task_run_id);
+
+                CREATE TABLE IF NOT EXISTS step_finding_links (
+                    id TEXT PRIMARY KEY,
+                    task_run_id TEXT NOT NULL,
+                    step_name TEXT NOT NULL,
+                    step_index INTEGER NOT NULL,
+                    finding_id TEXT NOT NULL,
+                    link_type TEXT NOT NULL DEFAULT 'detected_during',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+                    FOREIGN KEY (finding_id) REFERENCES task_run_findings(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_sfl_task_run ON step_finding_links(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_sfl_step ON step_finding_links(step_name);
+                CREATE INDEX IF NOT EXISTS idx_sfl_finding ON step_finding_links(finding_id);
+
+                CREATE TABLE IF NOT EXISTS step_provenance (
+                    id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL,
+                    workflow_version_id TEXT,
+                    step_name TEXT NOT NULL,
+                    step_index INTEGER NOT NULL,
+                    phase TEXT NOT NULL,
+                    generating_agent TEXT NOT NULL,
+                    generation_iteration INTEGER,
+                    original_step_json TEXT,
+                    final_step_json TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE,
+                    FOREIGN KEY (workflow_version_id) REFERENCES workflow_versions(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_sp_workflow ON step_provenance(workflow_id);
+                CREATE INDEX IF NOT EXISTS idx_sp_agent ON step_provenance(generating_agent);
+                "#,
+            )
+            .map_err(|e| format!("Failed to create workflow graph tables: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (152, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 152: {}", e))?;
+
+            info!("Successfully migrated to version 152 (workflow versions, step finding links, step provenance)");
+        }
+
+        if current_version < 153 {
+            info!("Migrating to version 153 (pipeline events, rule influence, cross-run patterns)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS generation_pipeline_events (
+                    id TEXT PRIMARY KEY,
+                    task_run_id TEXT NOT NULL,
+                    workflow_id TEXT,
+                    event_type TEXT NOT NULL,
+                    phase TEXT,
+                    iteration INTEGER,
+                    payload TEXT,
+                    duration_ms INTEGER,
+                    token_count INTEGER,
+                    validation_errors_before INTEGER,
+                    validation_errors_after INTEGER,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+                    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_gpe_task_run ON generation_pipeline_events(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_gpe_type ON generation_pipeline_events(event_type);
+                CREATE INDEX IF NOT EXISTS idx_gpe_phase ON generation_pipeline_events(phase);
+
+                CREATE TABLE IF NOT EXISTS rule_influence_log (
+                    id TEXT PRIMARY KEY,
+                    rule_id TEXT NOT NULL,
+                    task_run_id TEXT NOT NULL,
+                    workflow_id TEXT,
+                    influence_type TEXT NOT NULL DEFAULT 'loaded',
+                    evidence TEXT,
+                    phase TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (rule_id) REFERENCES generation_rules(id) ON DELETE CASCADE,
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+                    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ril_rule ON rule_influence_log(rule_id);
+                CREATE INDEX IF NOT EXISTS idx_ril_task_run ON rule_influence_log(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_ril_influence ON rule_influence_log(influence_type);
+
+                CREATE TABLE IF NOT EXISTS cross_run_patterns (
+                    id TEXT PRIMARY KEY,
+                    pattern_type TEXT NOT NULL,
+                    signature_hash TEXT NOT NULL,
+                    workflow_name TEXT,
+                    occurrence_count INTEGER NOT NULL DEFAULT 1,
+                    first_seen_task_run_id TEXT,
+                    last_seen_task_run_id TEXT,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    affected_components TEXT,
+                    pattern_data TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    resolved_by_fix_id TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(pattern_type, signature_hash),
+                    FOREIGN KEY (resolved_by_fix_id) REFERENCES reflection_fixes(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_crp_type ON cross_run_patterns(pattern_type);
+                CREATE INDEX IF NOT EXISTS idx_crp_workflow ON cross_run_patterns(workflow_name);
+                CREATE INDEX IF NOT EXISTS idx_crp_status ON cross_run_patterns(status);
+                CREATE INDEX IF NOT EXISTS idx_crp_signature ON cross_run_patterns(signature_hash);
+                "#,
+            )
+            .map_err(|e| format!("Failed to create pipeline telemetry tables: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (153, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 153: {}", e))?;
+
+            info!("Successfully migrated to version 153 (pipeline events, rule influence, cross-run patterns)");
+        }
+
         // Repair migration: is_favorite column may be missing on databases created from
         // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
         // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,

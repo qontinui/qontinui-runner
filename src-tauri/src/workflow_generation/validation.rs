@@ -1420,6 +1420,8 @@ mod tests {
             enforce_token_budget: false,
             ai_reviewed: true,
             model_overrides: std::collections::HashMap::new(),
+            flow_control_json: None,
+            phase_timeouts_json: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1550,6 +1552,8 @@ mod tests {
             enforce_token_budget: false,
             ai_reviewed: true,
             model_overrides: std::collections::HashMap::new(),
+            flow_control_json: None,
+            phase_timeouts_json: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
@@ -1691,6 +1695,8 @@ mod tests {
             enforce_token_budget: false,
             ai_reviewed: true,
             model_overrides: std::collections::HashMap::new(),
+            flow_control_json: None,
+            phase_timeouts_json: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1778,6 +1784,8 @@ mod tests {
             enforce_token_budget: false,
             ai_reviewed: true,
             model_overrides: std::collections::HashMap::new(),
+            flow_control_json: None,
+            phase_timeouts_json: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -2137,6 +2145,8 @@ mod tests {
             enforce_token_budget: false,
             ai_reviewed: true,
             model_overrides: std::collections::HashMap::new(),
+            flow_control_json: None,
+            phase_timeouts_json: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };

@@ -234,6 +234,7 @@ impl StepHandler for WorkflowRefHandler {
             iteration_diffs: Vec::new(),
             active_canary: None,
             is_canary_run: false,
+            phase_timeout_ms: None,
         };
 
         // 9. Create LoopController with session manager

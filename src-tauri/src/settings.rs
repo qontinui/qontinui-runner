@@ -809,6 +809,10 @@ pub struct Settings {
     /// Used by Terminal > Browse Sessions to find transcript files.
     #[serde(default)]
     pub claude_config_dirs: Vec<String>,
+    /// OpenTelemetry configuration for optional OTLP trace export.
+    /// Note: OTel cannot be hot-reloaded; changes require a runner restart.
+    #[serde(default)]
+    pub otel: crate::otel::OtelConfig,
 }
 
 // ============================================================================
@@ -1203,4 +1207,19 @@ pub fn save_runner_instance(config: RunnerInstanceConfig) -> Result<(), String> 
 /// Delete a runner instance configuration by ID.
 pub fn delete_runner_instance(id: &str) -> Result<(), String> {
     crate::config_facade::delete_runner_instance(id)
+}
+
+// ============================================================================
+// OpenTelemetry Settings
+// ============================================================================
+
+/// Get the current OpenTelemetry settings.
+pub fn get_otel_settings() -> crate::otel::OtelConfig {
+    crate::config_facade::get_setting::<crate::otel::OtelConfig>()
+}
+
+/// Save OpenTelemetry settings.
+/// Note: OTel cannot be hot-reloaded; changes take effect on next runner restart.
+pub fn save_otel_settings(config: crate::otel::OtelConfig) -> Result<(), String> {
+    crate::config_facade::save_setting(config)
 }

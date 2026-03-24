@@ -344,6 +344,8 @@ pub async fn generate_workflow_standalone(
                         enforce_token_budget: Some(workflow.enforce_token_budget),
                         strict_cwd: workflow.strict_cwd,
                         tool_tags: workflow.tool_tags.clone(),
+                        flow_control_json: None,
+                        phase_timeouts_json: None,
                         rollback_policy: workflow.rollback_policy.clone(),
                     };
 

@@ -835,6 +835,8 @@ mod tests {
             rollback_policy: None,
             enforce_token_budget: false,
             ai_reviewed: true,
+            flow_control_json: None,
+            phase_timeouts_json: None,
             created_at: String::new(),
             updated_at: String::new(),
         }

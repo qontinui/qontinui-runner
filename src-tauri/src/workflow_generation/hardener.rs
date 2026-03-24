@@ -1860,6 +1860,8 @@ mod tests {
             enforce_token_budget: false,
             ai_reviewed: true,
             model_overrides: std::collections::HashMap::new(),
+            flow_control_json: None,
+            phase_timeouts_json: None,
             created_at: "2025-01-01T00:00:00Z".to_string(),
             updated_at: "2025-01-01T00:00:00Z".to_string(),
         }

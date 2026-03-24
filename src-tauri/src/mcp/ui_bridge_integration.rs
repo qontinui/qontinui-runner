@@ -268,9 +268,13 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
                     // Detect server framework from dependencies
                     if framework == Framework::NextJs {
                         server_framework = ServerFramework::NextJs;
-                    } else if deps.get("express").is_some() || dev_deps.get("express").is_some() {
+                    } else if deps.get("express").is_some()
+                        || dev_deps.get("express").is_some()
+                    {
                         server_framework = ServerFramework::Express;
-                    } else if deps.get("fastify").is_some() || dev_deps.get("fastify").is_some() {
+                    } else if deps.get("fastify").is_some()
+                        || dev_deps.get("fastify").is_some()
+                    {
                         server_framework = ServerFramework::Fastify;
                     }
 
@@ -316,24 +320,13 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
         framework = Framework::PlainHtml;
     }
 
-    // Detect Rust/Axum server framework from Cargo.toml (check project dir and parent).
-    // Use canonicalize to resolve symlinks safely. Check for "axum" specifically in
-    // the [dependencies] section to avoid false positives from comments or workspace members.
+    // Detect Rust/Axum server framework from Cargo.toml (check project dir and parent)
     if server_framework == ServerFramework::None {
-        let dirs_to_check: Vec<PathBuf> = vec![project_path.clone(), project_path.join("..")];
-        for cargo_dir in dirs_to_check {
-            let cargo_dir = cargo_dir.canonicalize().unwrap_or(cargo_dir);
+        for cargo_dir in &[project_path.clone(), project_path.join("..").to_path_buf()] {
             let cargo_path = cargo_dir.join("Cargo.toml");
             if cargo_path.exists() {
                 if let Ok(cargo_content) = tokio::fs::read_to_string(&cargo_path).await {
-                    // Look for axum in [dependencies] section specifically
-                    let in_deps = cargo_content
-                        .lines()
-                        .skip_while(|line| !line.starts_with("[dependencies]"))
-                        .skip(1)
-                        .take_while(|line| !line.starts_with('['))
-                        .any(|line| line.starts_with("axum"));
-                    if in_deps {
+                    if cargo_content.contains("axum") {
                         server_framework = ServerFramework::Axum;
                         break;
                     }
@@ -741,7 +734,13 @@ async fn integrate_source(
     // Next.js server relay is already handled in integrate_nextjs().
     match analysis.server_framework {
         ServerFramework::Express => {
-            integrate_express_server(&project, analysis, &mut modifications, &mut warnings).await;
+            integrate_express_server(
+                &project,
+                analysis,
+                &mut modifications,
+                &mut warnings,
+            )
+            .await;
             next_steps.push(
                 "Server-side: Express relay router created. Mount it in your server with: app.use('/api/ui-bridge', uiBridgeRouter)"
                     .to_string(),
@@ -762,7 +761,9 @@ async fn integrate_source(
         ServerFramework::None => {
             // For React (non-Next.js) apps with no server framework detected,
             // offer the standalone server option.
-            if analysis.framework == Framework::React {
+            if analysis.framework == Framework::React
+                && analysis.server_framework == ServerFramework::None
+            {
                 integrate_standalone_server(&project, &mut modifications, &mut warnings).await;
                 next_steps.push(
                     "Server-side: No server framework detected. Created a standalone UI Bridge server file. Run it with: npx tsx ui-bridge-server.ts"
@@ -1144,7 +1145,11 @@ async fn integrate_express_server(
     warnings: &mut Vec<String>,
 ) {
     // Create relay setup file (shared pattern with Next.js)
-    let relay_path = "src/lib/ui-bridge.ts";
+    let relay_path = if project.join("src/lib").exists() {
+        "src/lib/ui-bridge.ts"
+    } else {
+        "src/lib/ui-bridge.ts"
+    };
 
     if !project.join(relay_path).exists() {
         if let Some(parent) = project.join(relay_path).parent() {
@@ -1380,12 +1385,12 @@ const relay = new CommandRelay();
 const handlers = createRelayHandlers(relay);
 
 const server = new StandaloneServer(handlers, {
-  port: 4201,
+  port: 4200,
   cors: true,
 });
 
 server.start().then(() => {
-  console.log('UI Bridge server running on http://localhost:4201');
+  console.log('UI Bridge server running on http://localhost:4200');
 });
 "#;
 

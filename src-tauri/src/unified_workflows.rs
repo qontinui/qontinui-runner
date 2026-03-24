@@ -501,6 +501,14 @@ pub struct UnifiedWorkflow {
     #[serde(default = "default_ai_reviewed")]
     pub ai_reviewed: bool,
 
+    /// Flow control configuration as a JSON string (e.g., concurrency limits, queue behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_control_json: Option<String>,
+
+    /// Per-phase timeout configuration as a JSON string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_timeouts_json: Option<String>,
+
     /// ISO 8601 timestamp of creation
     #[serde(default)]
     pub created_at: String,
@@ -704,6 +712,12 @@ pub struct CreateUnifiedWorkflowRequest {
     pub strict_cwd: bool,
     #[serde(default)]
     pub tool_tags: Vec<String>,
+    /// Flow control configuration as a JSON string.
+    #[serde(default)]
+    pub flow_control_json: Option<String>,
+    /// Per-phase timeout configuration as a JSON string.
+    #[serde(default)]
+    pub phase_timeouts_json: Option<String>,
     /// Policy for automatic git rollback on workflow failure.
     #[serde(default)]
     pub rollback_policy: Option<String>,
@@ -754,6 +768,8 @@ impl From<&UnifiedWorkflow> for CreateUnifiedWorkflowRequest {
             enforce_token_budget: Some(w.enforce_token_budget),
             strict_cwd: w.strict_cwd,
             tool_tags: w.tool_tags.clone(),
+            flow_control_json: w.flow_control_json.clone(),
+            phase_timeouts_json: w.phase_timeouts_json.clone(),
             rollback_policy: w.rollback_policy.clone(),
         }
     }
@@ -832,6 +848,10 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub strict_cwd: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_tags: Option<Vec<String>>,
+    /// Flow control configuration as a JSON string.
+    pub flow_control_json: Option<String>,
+    /// Per-phase timeout configuration as a JSON string.
+    pub phase_timeouts_json: Option<String>,
     /// Policy for automatic git rollback on workflow failure.
     pub rollback_policy: Option<String>,
 }

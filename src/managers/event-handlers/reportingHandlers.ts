@@ -26,6 +26,7 @@ import {
   type ActionExecutionCreate,
 } from "../../services/ExecutionReportingService";
 import { ActionType, ActionStatus, ErrorType } from "../../types/execution";
+import type { LLMMetrics } from "../../types/execution";
 
 /**
  * Setup reporting event handlers
@@ -144,6 +145,43 @@ function processTreeEventForReporting(eventData: TreeEventData): void {
 }
 
 /**
+ * Extract LLM metrics from action metadata/runtime if available.
+ */
+function extractLLMMetrics(metadata: any, runtime?: any): LLMMetrics | undefined {
+  // Check for pre-structured llm_metrics
+  if (metadata?.llm_metrics) {
+    return metadata.llm_metrics as LLMMetrics;
+  }
+
+  // Fall back to individual fields
+  const source = runtime || metadata;
+  if (!source) return undefined;
+
+  const model = source.model;
+  const provider = source.provider;
+  const tokensInput = source.tokens_input ?? source.input_tokens;
+  const tokensOutput = source.tokens_output ?? source.output_tokens;
+  const costUsd = source.cost_usd;
+
+  // Return undefined if no LLM data found
+  if (model == null && provider == null && tokensInput == null && tokensOutput == null && costUsd == null) {
+    return undefined;
+  }
+
+  const inputTokens = typeof tokensInput === "number" ? tokensInput : 0;
+  const outputTokens = typeof tokensOutput === "number" ? tokensOutput : 0;
+
+  return {
+    model: typeof model === "string" ? model : undefined,
+    provider: typeof provider === "string" ? provider : undefined,
+    tokens_input: inputTokens,
+    tokens_output: outputTokens,
+    tokens_total: inputTokens + outputTokens,
+    cost_usd: typeof costUsd === "number" ? costUsd : undefined,
+  };
+}
+
+/**
  * Report action to the new unified execution service
  */
 function reportToExecutionService(
@@ -162,9 +200,18 @@ function reportToExecutionService(
   const actionTypeStr =
     typeof actionTypeFromMeta === "string" ? actionTypeFromMeta.toLowerCase() : "";
 
+  // Determine span_type for LLM-related actions
+  let spanType: string | undefined;
+
   // First check action_type from metadata, then fall back to node_type
   const typeToCheck = actionTypeStr || nodeTypeStr;
-  if (typeToCheck.includes("find")) actionType = ActionType.FIND;
+  if (typeToCheck.includes("ai_prompt")) {
+    actionType = ActionType.AI_PROMPT;
+    spanType = "llm_call";
+  } else if (typeToCheck.includes("run_prompt_sequence")) {
+    actionType = ActionType.RUN_PROMPT_SEQUENCE;
+    spanType = "agent";
+  } else if (typeToCheck.includes("find")) actionType = ActionType.FIND;
   else if (typeToCheck.includes("click")) actionType = ActionType.CLICK;
   else if (typeToCheck.includes("type")) actionType = ActionType.TYPE;
   else if (typeToCheck.includes("wait")) actionType = ActionType.WAIT;
@@ -174,6 +221,10 @@ function reportToExecutionService(
   // Map node status to ActionStatus
   const actionStatus: ActionStatus =
     node.status === "success" ? ActionStatus.SUCCESS : ActionStatus.FAILED;
+
+  // Extract LLM metrics if available
+  const runtime = metadata.runtime as Record<string, unknown> | undefined;
+  const llmMetrics = extractLLMMetrics(metadata, runtime);
 
   const actionExecution: ActionExecutionCreate = {
     sequence_number: executionReportingService.getNextActionSequenceNumber(),
@@ -190,6 +241,10 @@ function reportToExecutionService(
     error_message: node.error ?? undefined,
     error_type: node.error ? ErrorType.OTHER : undefined,
     screenshot_id: metadata.screenshot_reference as string | undefined,
+    llm_metrics: llmMetrics,
+    span_type: spanType,
+    trace_id: metadata.trace_id as string | undefined,
+    parent_id: metadata.parent_id as string | undefined,
     metadata: {
       node_id: node.id,
       node_type: node.node_type,

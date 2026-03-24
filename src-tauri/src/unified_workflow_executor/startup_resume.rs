@@ -427,6 +427,7 @@ pub async fn resume_interrupted_workflows(
                                 iteration_diffs: Vec::new(),
                                 active_canary: None,
                                 is_canary_run: false,
+                                phase_timeout_ms: None,
                             };
 
                             controller
@@ -639,6 +640,7 @@ pub async fn resume_interrupted_workflows(
                                 iteration_diffs: Vec::new(),
                                 active_canary: None,
                                 is_canary_run: false,
+                                phase_timeout_ms: None,
                             };
 
                             controller

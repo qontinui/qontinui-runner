@@ -1764,6 +1764,8 @@ pub async fn execute_inline_workflow(
         enforce_token_budget: false,
         rollback_policy: None,
         workflow_architecture: None,
+        flow_control_json: None,
+        phase_timeouts_json: None,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -1905,6 +1907,7 @@ pub async fn execute_inline_workflow(
             iteration_diffs: Vec::new(),
             active_canary: None,
             is_canary_run: false,
+            phase_timeout_ms: None,
         };
 
         // Apply overrides if present (same logic as run_unified_workflow)
@@ -2404,6 +2407,7 @@ pub async fn run_composed_workflow(
                 iteration_diffs: Vec::new(),
                 active_canary: None,
                 is_canary_run: false,
+                phase_timeout_ms: None,
             };
 
             // Run the LoopController once with all stages

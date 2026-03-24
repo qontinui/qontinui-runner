@@ -27,7 +27,24 @@ pub enum ScheduleExpression {
     Cron(String),
     /// Interval in seconds (for testing/debugging)
     Interval(u64),
+    /// Condition-only: no time trigger, runs when conditions are met.
+    Condition(ConditionScheduleConfig),
 }
+
+/// Configuration for condition-only schedules
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionScheduleConfig {
+    #[serde(default = "default_rearm_delay")]
+    pub rearm_delay_minutes: u32,
+}
+
+impl Default for ConditionScheduleConfig {
+    fn default() -> Self {
+        Self { rearm_delay_minutes: default_rearm_delay() }
+    }
+}
+
+fn default_rearm_delay() -> u32 { 60 }
 
 impl Default for ScheduleExpression {
     fn default() -> Self {
@@ -354,6 +371,26 @@ impl ScheduledTask {
         self.last_run.as_ref().map(|r| r.success).unwrap_or(false)
     }
 
+    /// For Condition schedule tasks, check if the rearm delay has elapsed since last execution
+    pub fn is_rearm_ready(&self) -> bool {
+        match &self.schedule {
+            ScheduleExpression::Condition(config) => match &self.last_run {
+                Some(record) => match &record.ended_at {
+                    Some(ended) => match chrono::DateTime::parse_from_rfc3339(ended) {
+                        Ok(ended_dt) => {
+                            let elapsed = chrono::Utc::now() - ended_dt.with_timezone(&chrono::Utc);
+                            elapsed >= chrono::Duration::minutes(config.rearm_delay_minutes as i64)
+                        }
+                        Err(_) => true,
+                    },
+                    None => false,
+                },
+                None => true,
+            },
+            _ => true,
+        }
+    }
+
     /// Update the modified timestamp
     pub fn touch(&mut self) {
         self.modified_at = chrono::Utc::now().to_rfc3339();
@@ -673,6 +710,9 @@ pub fn compute_next_run(
         ScheduleExpression::Interval(seconds) => {
             // Next run is from + interval
             Some(from + chrono::Duration::seconds(*seconds as i64))
+        }
+        ScheduleExpression::Condition(_) => {
+            Some(from)
         }
     }
 }

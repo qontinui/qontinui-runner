@@ -47,6 +47,9 @@ pub mod types;
 pub mod verification_ops;
 pub mod workflow_ops;
 
+// PostgreSQL layer (Clorinde-generated queries, runs alongside SQLite during migration)
+pub mod pg;
+
 // Newly extracted submodules
 pub mod agentic_metrics_ops;
 pub mod approval_gates;
@@ -60,12 +63,17 @@ pub mod generator_eval;
 pub mod learning_ops;
 pub mod orchestrator_checkpoint_ops;
 pub mod process_sessions;
+pub mod queue_ops;
 pub mod settings_ops;
 pub mod skills_ops;
 pub mod task_run_events;
 pub mod token_usage;
 pub mod workflow_state_ops;
 pub mod worktree_ops;
+
+// Graph-based workflow improvement
+pub mod cross_run_ops;
+pub mod graph_ops;
 
 // Re-export all types for backward compatibility
 pub use types::*;

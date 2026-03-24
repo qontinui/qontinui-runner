@@ -81,8 +81,12 @@ export {
   reportIssues,
   completeRun,
   getNextActionSequenceNumber,
+  reportAiPromptAction,
+  reportPromptSequence,
 } from "./ExecutionReportingService";
 export type {
+  LLMMetrics,
+  AiPromptActionData,
   RunnerMetadata,
   WorkflowMetadata,
   ExecutionStats,
@@ -135,6 +139,10 @@ export { checkpointService } from "./checkpoint-service";
 // Element Description Service (UI Bridge element annotation persistence)
 export { ElementDescriptionService } from "./element-description-service";
 export type { PersistedElementDescription } from "./element-description-service";
+
+// Agentic Metrics Service (deepeval-inspired workflow quality evaluation)
+export { agenticMetricsService } from "./agentic-metrics-service";
+export type { PushFeedbackScoresResult } from "./agentic-metrics-service";
 
 // Workflow Generator Service (State Machine → Unified Workflow conversion)
 export { WorkflowGeneratorService, workflowGeneratorService } from "./WorkflowGeneratorService";

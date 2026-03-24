@@ -57,6 +57,11 @@ fn row_to_scheduled_task(row: &rusqlite::Row) -> rusqlite::Result<ScheduledTask>
             };
             ScheduleExpression::Interval(secs)
         }
+        "condition" => {
+            let config: crate::scheduler::ConditionScheduleConfig =
+                serde_json::from_str(&schedule_value).unwrap_or_default();
+            ScheduleExpression::Condition(config)
+        }
         _ => ScheduleExpression::Once(schedule_value),
     };
 
@@ -101,6 +106,10 @@ fn schedule_to_parts(schedule: &ScheduleExpression) -> (&'static str, String) {
         ScheduleExpression::Cron(s) => ("cron", s.clone()),
         ScheduleExpression::Once(s) => ("once", s.clone()),
         ScheduleExpression::Interval(n) => ("interval", n.to_string()),
+        ScheduleExpression::Condition(config) => (
+            "condition",
+            serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string()),
+        ),
     }
 }
 

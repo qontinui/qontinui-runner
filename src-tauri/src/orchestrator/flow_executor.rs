@@ -14,17 +14,29 @@
 //! Tool steps use the EmbeddedMcp for in-process tool execution, or fall back to
 //! HTTP API calls for tools requiring external communication.
 
+use super::agent_roles::RoleRegistry;
 use super::flow::{Flow, FlowState, FlowStatus, FlowStep, ParallelMerge, StepType};
+use super::role_specializations::register_default_specializations;
+use super::tool_guard::ToolGuard;
 use crate::ai_provider;
-use crate::ai_router::TaskContext;
+use crate::ai_router::{model_for_tier, TaskContext};
 use crate::doctor::DoctorHandle;
 use crate::execution_core::builtin_tools::{execute_builtin_tool, BuiltinToolRegistry};
 use crate::execution_core::unified_tools::{execute_unified_tool, UnifiedToolRegistry};
 use crate::mcp_embedded::EmbeddedMcp;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+
+/// Global role registry, initialised once with both the generic predefined
+/// roles and the four Analyze-Plan-Execute-Verify specializations.
+static ROLE_REGISTRY: Lazy<RoleRegistry> = Lazy::new(|| {
+    let mut registry = RoleRegistry::with_defaults();
+    register_default_specializations(&mut registry);
+    registry
+});
 
 // ============================================================================
 // Flow Executor Configuration
@@ -640,21 +652,79 @@ impl FlowExecutor {
             "Executing agent step with real AI provider"
         );
 
-        // Build the full prompt with role context
-        let full_prompt = self.build_agent_prompt(role, prompt, context);
+        // -----------------------------------------------------------------
+        // Resolve the agent role from the global registry (lazy-initialised).
+        // When a matching role is found we use its system prompt, model tier,
+        // max-tokens budget, and tool guard.  When no role matches we fall
+        // through to the previous generic behaviour.
+        // -----------------------------------------------------------------
+        let resolved_role = ROLE_REGISTRY.get(role);
+
+        let (system_prompt, model_override, max_tokens, tool_guard) =
+            if let Some(agent_role) = resolved_role {
+                let sys = agent_role.build_system_prompt();
+                let model = model_for_tier(agent_role.preferred_model_tier);
+                let max_tok = agent_role.max_tokens_budget;
+                let guard = agent_role
+                    .allowed_tools
+                    .as_ref()
+                    .map(|tools| ToolGuard::new(&agent_role.id, tools));
+
+                info!(
+                    step_id = %step_id,
+                    role_id = %agent_role.id,
+                    model = %model,
+                    max_tokens = ?max_tok,
+                    has_tool_guard = guard.is_some(),
+                    "Resolved agent role specialization"
+                );
+
+                (Some(sys), Some(model), max_tok, guard)
+            } else {
+                debug!(
+                    step_id = %step_id,
+                    role = %role,
+                    "No matching role in registry, using default behaviour"
+                );
+                (None, None, None, None)
+            };
+
+        // Build the full prompt — if we have a role system prompt, prepend it.
+        let base_prompt = self.build_agent_prompt(role, prompt, context);
+        let full_prompt = match &system_prompt {
+            Some(sys) => format!("{}\n\n---\n\n{}", sys, base_prompt),
+            None => base_prompt,
+        };
 
         // Build task context for AI routing (helps select appropriate model)
         let task_context = TaskContext::from_prompt(&full_prompt);
 
-        // Call AI provider in a blocking task (ai_provider is synchronous)
+        // Call AI provider in a blocking task (ai_provider is synchronous).
+        // When a role specified a model override we use run_prompt_with_model_override
+        // so the tier-derived model takes precedence over the generic router.
         let prompt_clone = full_prompt.clone();
         let doctor_handle_clone = self.doctor_handle.clone();
+        let model_clone = model_override.clone();
         let ai_result = tokio::task::spawn_blocking(move || {
-            ai_provider::run_prompt_with_routing(
-                &prompt_clone,
-                &task_context,
-                doctor_handle_clone.as_ref(),
-            )
+            if let Some(ref model) = model_clone {
+                ai_provider::run_prompt_with_model_override(
+                    &prompt_clone,
+                    &task_context,
+                    doctor_handle_clone.as_ref(),
+                    Some(model.as_str()),
+                    None,  // provider_override
+                    None,  // temperature_override
+                    max_tokens,
+                    None,  // fallback_model
+                    None,  // fallback_provider
+                )
+            } else {
+                ai_provider::run_prompt_with_routing(
+                    &prompt_clone,
+                    &task_context,
+                    doctor_handle_clone.as_ref(),
+                )
+            }
         })
         .await;
 
@@ -678,6 +748,22 @@ impl FlowExecutor {
                     result = result
                         .with_output("response".to_string(), serde_json::json!(response.output));
                     result = result.with_output("role".to_string(), serde_json::json!(role));
+
+                    // Store the tool guard's allowed-tool list in the step
+                    // context so downstream tool steps can enforce it.
+                    if let Some(ref guard) = tool_guard {
+                        if !guard.is_unrestricted() {
+                            result = result.with_output(
+                                "_tool_guard_allowed".to_string(),
+                                serde_json::json!(
+                                    resolved_role
+                                        .and_then(|r| r.allowed_tools.as_ref())
+                                        .unwrap_or(&Vec::new())
+                                ),
+                            );
+                        }
+                    }
+
                     result
                 } else {
                     let error_msg = response
@@ -808,6 +894,37 @@ impl FlowExecutor {
             input_count = inputs.len(),
             "Executing tool step"
         );
+
+        // -----------------------------------------------------------------
+        // Tool guard enforcement: if a preceding agent step stored a tool
+        // whitelist in the context, reconstruct the guard and check whether
+        // this tool invocation is permitted.
+        // -----------------------------------------------------------------
+        if let Some(serde_json::Value::Array(allowed)) = context.get("_tool_guard_allowed") {
+            let allowed_strs: Vec<String> = allowed
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            let role_id = context
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let guard = ToolGuard::new(role_id, &allowed_strs);
+            // Strip the MCP prefix if present so guard matches bare tool names
+            let bare_tool = tool_id
+                .strip_prefix("mcp__qontinui__")
+                .unwrap_or(tool_id);
+            if let Err(e) = guard.check_tool(bare_tool) {
+                warn!(
+                    step_id = %step_id,
+                    tool_id = %tool_id,
+                    role = %role_id,
+                    "Tool guard blocked invocation: {}",
+                    e
+                );
+                return StepResult::failure(step_id, e.to_string());
+            }
+        }
 
         // Convert inputs HashMap to serde_json::Value for MCP call
         let args = serde_json::json!(inputs);

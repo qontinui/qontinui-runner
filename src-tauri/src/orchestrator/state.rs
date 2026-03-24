@@ -112,6 +112,44 @@ pub enum TransitionReason {
     Error { message: String },
     /// User extended iterations
     Extended { additional: u32 },
+    /// A phase exceeded its configured timeout
+    PhaseTimeout { phase: String, elapsed_ms: u64 },
+    /// Orchestrator is waiting for an external event (Inngest-style waitForEvent)
+    WaitingForEvent { event_name: String },
+    /// An expected event was received, unblocking the orchestrator
+    EventReceived { event_name: String },
+}
+
+/// Per-phase timeout configuration (milliseconds).
+///
+/// When set, the orchestrator checks elapsed time in each phase and
+/// triggers a `PhaseTimeout` transition if the phase exceeds its limit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PhaseTimeouts {
+    /// Timeout for the Setup phase (ms).
+    pub setup_ms: Option<u64>,
+    /// Timeout for the Execution (agentic) phase (ms).
+    pub execution_ms: Option<u64>,
+    /// Timeout for the DeterministicVerification phase (ms).
+    pub verification_ms: Option<u64>,
+    /// Timeout for the AiVerification phase (ms).
+    pub ai_verification_ms: Option<u64>,
+    /// Timeout for the Completion phase (ms).
+    pub completion_ms: Option<u64>,
+}
+
+impl PhaseTimeouts {
+    /// Get the timeout for a given state, if configured.
+    pub fn timeout_for_state(&self, state: &TaskState) -> Option<u64> {
+        match state {
+            TaskState::Setup => self.setup_ms,
+            TaskState::Execution => self.execution_ms,
+            TaskState::DeterministicVerification => self.verification_ms,
+            TaskState::AiVerification => self.ai_verification_ms,
+            TaskState::Completion => self.completion_ms,
+            _ => None,
+        }
+    }
 }
 
 /// Context for the task orchestrator.
@@ -151,6 +189,14 @@ pub struct TaskOrchestrator {
     /// State transition history
     #[serde(default)]
     pub transition_history: Vec<StateTransition>,
+
+    /// Per-phase timeout configuration.
+    #[serde(default)]
+    pub phase_timeouts: PhaseTimeouts,
+
+    /// Timestamp when the current state was entered (for timeout checking).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_entered_at: Option<String>,
 }
 
 /// Record of a state transition.
@@ -182,6 +228,8 @@ impl TaskOrchestrator {
             worker_feedback: None,
             skip_ai_verification: false,
             transition_history: Vec::new(),
+            phase_timeouts: PhaseTimeouts::default(),
+            state_entered_at: Some(chrono::Utc::now().to_rfc3339()),
         }
     }
 
@@ -213,6 +261,7 @@ impl TaskOrchestrator {
 
         self.transition_history.push(transition);
         self.state = to;
+        self.state_entered_at = Some(chrono::Utc::now().to_rfc3339());
 
         Ok(())
     }
@@ -480,6 +529,23 @@ impl TaskOrchestrator {
             "Task {}: Extended iterations by {}, new max: {}",
             self.task_run_id, additional, self.max_iterations
         );
+    }
+
+    /// Check if the current phase has exceeded its timeout.
+    ///
+    /// Returns `Some(elapsed_ms)` if the timeout is exceeded, `None` otherwise.
+    pub fn check_timeout(&self) -> Option<u64> {
+        let timeout_ms = self.phase_timeouts.timeout_for_state(&self.state)?;
+        let entered_at = self.state_entered_at.as_ref()?;
+        let entered: chrono::DateTime<chrono::Utc> = entered_at.parse().ok()?;
+        let elapsed_ms = chrono::Utc::now()
+            .signed_duration_since(entered)
+            .num_milliseconds() as u64;
+        if elapsed_ms > timeout_ms {
+            Some(elapsed_ms)
+        } else {
+            None
+        }
     }
 
     /// Get the completion result based on current state.

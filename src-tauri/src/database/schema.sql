@@ -958,6 +958,10 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     -- Token budget enforcement
     enforce_token_budget INTEGER DEFAULT 0,  -- 0 = warn only (default), 1 = stop execution on budget exceeded
 
+    -- Flow control and phase timeouts (v147)
+    flow_control_json TEXT DEFAULT NULL,      -- JSON config for concurrency limits, queue behavior
+    phase_timeouts_json TEXT DEFAULT NULL,    -- JSON config for per-phase timeout overrides
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -2212,6 +2216,13 @@ CREATE TABLE IF NOT EXISTS execution_spans (
     success INTEGER DEFAULT 1,              -- 1 = success, 0 = had error
     error TEXT,                             -- Error message if failed
 
+    -- Enrichment columns (v146)
+    queue_wait_ms INTEGER,                  -- Time spent waiting in queue before execution
+    retry_attempt INTEGER,                  -- Retry attempt number (0 = first attempt)
+    phase TEXT,                             -- Workflow phase (setup, verification, agentic, completion)
+    iteration INTEGER,                      -- Loop iteration number
+    workflow_id TEXT,                        -- Workflow that owns this span
+
     created_at TEXT NOT NULL,
 
     FOREIGN KEY (execution_id) REFERENCES task_runs(id) ON DELETE CASCADE
@@ -3465,3 +3476,147 @@ CREATE TABLE IF NOT EXISTS canary_run_records (
 CREATE INDEX IF NOT EXISTS idx_canary_run_records ON canary_run_records(canary_id, is_canary);
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (144, datetime('now'));
+
+-- =============================================================================
+-- Queued Workflows Table (migration 145)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS queued_workflows (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    priority INTEGER DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    payload_json TEXT,
+    enqueued_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    error TEXT,
+    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_queued_workflows_status ON queued_workflows(status);
+CREATE INDEX IF NOT EXISTS idx_queued_workflows_workflow ON queued_workflows(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_queued_workflows_priority ON queued_workflows(priority DESC, enqueued_at ASC);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (145, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (146, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (147, datetime('now'));
+
+-- Workflow versions for tracking workflow evolution (v152)
+CREATE TABLE IF NOT EXISTS workflow_versions (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    version_number INTEGER NOT NULL,
+    parent_version_id TEXT,
+    generation_task_run_id TEXT,
+    workflow_json TEXT NOT NULL,
+    diff_summary TEXT,
+    diff_json TEXT,
+    trigger TEXT NOT NULL DEFAULT 'manual',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(workflow_id, version_number),
+    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_version_id) REFERENCES workflow_versions(id) ON DELETE SET NULL,
+    FOREIGN KEY (generation_task_run_id) REFERENCES task_runs(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wv_workflow ON workflow_versions(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_wv_task_run ON workflow_versions(generation_task_run_id);
+
+CREATE TABLE IF NOT EXISTS step_finding_links (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    step_name TEXT NOT NULL,
+    step_index INTEGER NOT NULL,
+    finding_id TEXT NOT NULL,
+    link_type TEXT NOT NULL DEFAULT 'detected_during',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (finding_id) REFERENCES task_run_findings(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_sfl_task_run ON step_finding_links(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_sfl_step ON step_finding_links(step_name);
+CREATE INDEX IF NOT EXISTS idx_sfl_finding ON step_finding_links(finding_id);
+
+CREATE TABLE IF NOT EXISTS step_provenance (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    workflow_version_id TEXT,
+    step_name TEXT NOT NULL,
+    step_index INTEGER NOT NULL,
+    phase TEXT NOT NULL,
+    generating_agent TEXT NOT NULL,
+    generation_iteration INTEGER,
+    original_step_json TEXT,
+    final_step_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_version_id) REFERENCES workflow_versions(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sp_workflow ON step_provenance(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_sp_agent ON step_provenance(generating_agent);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (152, datetime('now'));
+
+CREATE TABLE IF NOT EXISTS generation_pipeline_events (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    workflow_id TEXT,
+    event_type TEXT NOT NULL,
+    phase TEXT,
+    iteration INTEGER,
+    payload TEXT,
+    duration_ms INTEGER,
+    token_count INTEGER,
+    validation_errors_before INTEGER,
+    validation_errors_after INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gpe_task_run ON generation_pipeline_events(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_gpe_type ON generation_pipeline_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_gpe_phase ON generation_pipeline_events(phase);
+
+CREATE TABLE IF NOT EXISTS rule_influence_log (
+    id TEXT PRIMARY KEY,
+    rule_id TEXT NOT NULL,
+    task_run_id TEXT NOT NULL,
+    workflow_id TEXT,
+    influence_type TEXT NOT NULL DEFAULT 'loaded',
+    evidence TEXT,
+    phase TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (rule_id) REFERENCES generation_rules(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ril_rule ON rule_influence_log(rule_id);
+CREATE INDEX IF NOT EXISTS idx_ril_task_run ON rule_influence_log(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_ril_influence ON rule_influence_log(influence_type);
+
+CREATE TABLE IF NOT EXISTS cross_run_patterns (
+    id TEXT PRIMARY KEY,
+    pattern_type TEXT NOT NULL,
+    signature_hash TEXT NOT NULL,
+    workflow_name TEXT,
+    occurrence_count INTEGER NOT NULL DEFAULT 1,
+    first_seen_task_run_id TEXT,
+    last_seen_task_run_id TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    affected_components TEXT,
+    pattern_data TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    resolved_by_fix_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(pattern_type, signature_hash),
+    FOREIGN KEY (resolved_by_fix_id) REFERENCES reflection_fixes(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_crp_type ON cross_run_patterns(pattern_type);
+CREATE INDEX IF NOT EXISTS idx_crp_workflow ON cross_run_patterns(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_crp_status ON cross_run_patterns(status);
+CREATE INDEX IF NOT EXISTS idx_crp_signature ON cross_run_patterns(signature_hash);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (153, datetime('now'));

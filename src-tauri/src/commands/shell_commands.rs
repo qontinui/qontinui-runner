@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tauri::State;
 use tokio::time::{timeout, Duration};
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // ============================================================================
@@ -703,61 +703,111 @@ pub async fn execute_shell_command(
         name, command, timeout_seconds, working_directory
     );
 
-    // Build the command
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = crate::process_helpers::tokio_cmd_no_window();
-        c.args(["/C", &command]);
-        c
-    } else {
-        let mut c = crate::process_helpers::tokio_no_window("sh");
-        c.args(["-c", &command]);
-        c
+    // ── Container isolation path ──────────────────────────────────────
+    // If container isolation is enabled and Docker is available, try to
+    // execute the command inside an isolated container first. On failure
+    // or unavailability, fall through to host execution.
+    let container_result = {
+        let executor_guard = state.container_executor.lock().await;
+        if let Some(ref executor) = *executor_guard {
+            debug!("Container executor present, attempting container execution for '{}'", name);
+            match executor
+                .try_execute(&command, working_directory.as_deref())
+                .await
+            {
+                Ok(Some(cr)) => {
+                    info!(
+                        "Shell command '{}' executed in container {} (exit_code={:?}, duration={}ms)",
+                        name, cr.container_id, cr.exit_code, cr.duration_ms
+                    );
+                    let exit_code_i32 = cr.exit_code.map(|c| c as i32);
+                    Some((
+                        cr.exit_code == Some(0),
+                        exit_code_i32,
+                        cr.stdout,
+                        cr.stderr,
+                        cr.duration_ms,
+                    ))
+                }
+                Ok(None) => {
+                    debug!(
+                        "Container isolation not available for '{}', falling back to host execution",
+                        name
+                    );
+                    None
+                }
+                Err(e) => {
+                    warn!(
+                        "Container execution error for '{}': {}, falling back to host execution",
+                        name, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
     };
 
-    // Set working directory if specified
-    if let Some(ref wd) = working_directory {
-        cmd.current_dir(wd);
-    }
+    let (success, exit_code, stdout, stderr, duration_ms) = if let Some(cr) = container_result {
+        cr
+    } else {
+        // ── Host execution path ───────────────────────────────────────
+        debug!("Executing command '{}' on host", name);
 
-    // Capture stdout and stderr
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut c = crate::process_helpers::tokio_cmd_no_window();
+            c.args(["/C", &command]);
+            c
+        } else {
+            let mut c = crate::process_helpers::tokio_no_window("sh");
+            c.args(["-c", &command]);
+            c
+        };
 
-    // Execute with timeout
-    let start = Instant::now();
-    let timeout_duration = Duration::from_secs(timeout_seconds as u64);
-
-    let output_result = timeout(timeout_duration, cmd.output()).await;
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-
-    // Process the result
-    let (success, exit_code, stdout, stderr) = match output_result {
-        Ok(Ok(output)) => {
-            let exit_code = output.status.code();
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let success = output.status.success();
-            (success, exit_code, stdout, stderr)
+        if let Some(ref wd) = working_directory {
+            cmd.current_dir(wd);
         }
-        Ok(Err(e)) => {
-            error!("Failed to execute command '{}': {}", name, e);
-            (
-                false,
-                None,
-                String::new(),
-                format!("Failed to execute command: {}", e),
-            )
-        }
-        Err(_) => {
-            error!("Command '{}' timed out after {}s", name, timeout_seconds);
-            (
-                false,
-                None,
-                String::new(),
-                format!("Command timed out after {} seconds", timeout_seconds),
-            )
-        }
+
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let start = Instant::now();
+        let timeout_duration = Duration::from_secs(timeout_seconds as u64);
+
+        let output_result = timeout(timeout_duration, cmd.output()).await;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        let (success, exit_code, stdout, stderr) = match output_result {
+            Ok(Ok(output)) => {
+                let exit_code = output.status.code();
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let success = output.status.success();
+                (success, exit_code, stdout, stderr)
+            }
+            Ok(Err(e)) => {
+                error!("Failed to execute command '{}': {}", name, e);
+                (
+                    false,
+                    None,
+                    String::new(),
+                    format!("Failed to execute command: {}", e),
+                )
+            }
+            Err(_) => {
+                error!("Command '{}' timed out after {}s", name, timeout_seconds);
+                (
+                    false,
+                    None,
+                    String::new(),
+                    format!("Command timed out after {} seconds", timeout_seconds),
+                )
+            }
+        };
+
+        (success, exit_code, stdout, stderr, duration_ms)
     };
 
     // Store the result in the database

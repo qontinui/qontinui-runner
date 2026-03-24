@@ -40,6 +40,23 @@ export interface TaskActivityInfo {
 }
 
 /**
+ * Width tier for summary widget layout.
+ * Determines how much horizontal space a widget requests in the summary grid.
+ */
+export type SummaryWidthTier = "narrow" | "medium" | "wide" | "full";
+
+/**
+ * Minimum width (CSS value) for each summary width tier.
+ * Used by the grid layout to determine how many widgets fit per row.
+ */
+export const SUMMARY_WIDTH_MIN: Record<SummaryWidthTier, string> = {
+  narrow: "160px",
+  medium: "240px",
+  wide: "360px",
+  full: "100%",
+};
+
+/**
  * Configuration for a widget type.
  *
  * @template TData The type of data the widget receives
@@ -65,6 +82,8 @@ export interface WidgetConfig<TData = unknown> {
   defaultPriority: number;
   /** Route to detail page for "View All" links */
   detailRoute: string;
+  /** Returns the width tier for the summary layout based on current data. Defaults to "medium". */
+  getSummaryWidthTier?: (data: TData) => SummaryWidthTier;
 }
 
 /**
@@ -134,6 +153,17 @@ class WidgetRegistryImpl {
       const priorityB = this.widgets.get(b)?.defaultPriority ?? 999;
       return priorityA - priorityB;
     });
+  }
+
+  /**
+   * Get the summary width tier for a widget based on its current data.
+   */
+  getSummaryWidthTier(id: ActivityType, data: unknown): SummaryWidthTier {
+    const config = this.widgets.get(id);
+    if (config?.getSummaryWidthTier) {
+      return config.getSummaryWidthTier(data);
+    }
+    return "medium";
   }
 
   /**

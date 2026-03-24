@@ -32,7 +32,8 @@ impl CheckpointDb {
                        completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
                        quality_report, acceptance_criteria, constraint_overrides,
                        COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy,
-                       strict_cwd, tool_tags, enforce_token_budget
+                       strict_cwd, tool_tags, enforce_token_budget,
+                       flow_control_json, phase_timeouts_json
                 FROM unified_workflows
                 ORDER BY is_favorite DESC, updated_at DESC
                 "#,
@@ -156,6 +157,8 @@ impl CheckpointDb {
                         .flatten()
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    flow_control_json: row.get::<_, Option<String>>(46)?,
+                    phase_timeouts_json: row.get::<_, Option<String>>(47)?,
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
@@ -187,7 +190,8 @@ impl CheckpointDb {
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
                    quality_report, acceptance_criteria, constraint_overrides,
                    COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy,
-                       strict_cwd, tool_tags, enforce_token_budget
+                       strict_cwd, tool_tags, enforce_token_budget,
+                       flow_control_json, phase_timeouts_json
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -281,6 +285,8 @@ impl CheckpointDb {
                         .flatten()
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    flow_control_json: row.get::<_, Option<String>>(46)?,
+                    phase_timeouts_json: row.get::<_, Option<String>>(47)?,
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
@@ -314,7 +320,8 @@ impl CheckpointDb {
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
                    quality_report, acceptance_criteria, constraint_overrides,
                    COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy,
-                       strict_cwd, tool_tags, enforce_token_budget
+                       strict_cwd, tool_tags, enforce_token_budget,
+                       flow_control_json, phase_timeouts_json
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -410,6 +417,8 @@ impl CheckpointDb {
                         .flatten()
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    flow_control_json: row.get::<_, Option<String>>(46)?,
+                    phase_timeouts_json: row.get::<_, Option<String>>(47)?,
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
@@ -479,8 +488,9 @@ impl CheckpointDb {
                 stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                 completion_prompts_first, dependency_graph, cost_annotations, quality_report,
                 acceptance_criteria, constraint_overrides, ai_reviewed, workflow_architecture,
-                strict_cwd, tool_tags, rollback_policy, enforce_token_budget
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)
+                strict_cwd, tool_tags, rollback_policy, enforce_token_budget,
+                flow_control_json, phase_timeouts_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47)
             "#,
             params![
                 id,
@@ -532,6 +542,8 @@ impl CheckpointDb {
                 serde_json::to_string(&request.tool_tags).unwrap_or_else(|_| "[]".to_string()),
                 request.rollback_policy.as_deref().unwrap_or("none"),
                 request.enforce_token_budget.unwrap_or(false),
+                request.flow_control_json,
+                request.phase_timeouts_json,
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -595,8 +607,9 @@ impl CheckpointDb {
                 stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
                 completion_prompts_first, dependency_graph, cost_annotations, quality_report,
                 acceptance_criteria, constraint_overrides, ai_reviewed, workflow_architecture,
-                strict_cwd, tool_tags, rollback_policy, enforce_token_budget
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)
+                strict_cwd, tool_tags, rollback_policy, enforce_token_budget,
+                flow_control_json, phase_timeouts_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47)
             "#,
             params![
                 id,
@@ -648,6 +661,8 @@ impl CheckpointDb {
                 serde_json::to_string(&request.tool_tags).unwrap_or_else(|_| "[]".to_string()),
                 request.rollback_policy.as_deref().unwrap_or("none"),
                 request.enforce_token_budget.unwrap_or(false),
+                request.flow_control_json,
+                request.phase_timeouts_json,
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -787,6 +802,14 @@ impl CheckpointDb {
         let enforce_token_budget = request
             .enforce_token_budget
             .unwrap_or(existing.enforce_token_budget);
+        let flow_control_json = request
+            .flow_control_json
+            .as_ref()
+            .or(existing.flow_control_json.as_ref());
+        let phase_timeouts_json = request
+            .phase_timeouts_json
+            .as_ref()
+            .or(existing.phase_timeouts_json.as_ref());
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
         let setup_steps_json =
@@ -853,8 +876,10 @@ impl CheckpointDb {
                 strict_cwd = ?39,
                 tool_tags = ?40,
                 rollback_policy = ?41,
-                enforce_token_budget = ?42
-            WHERE id = ?43
+                enforce_token_budget = ?42,
+                flow_control_json = ?43,
+                phase_timeouts_json = ?44
+            WHERE id = ?45
             "#,
             params![
                 name,
@@ -908,6 +933,8 @@ impl CheckpointDb {
                 serde_json::to_string(tool_tags).unwrap_or_else(|_| "[]".to_string()),
                 rollback_policy,
                 enforce_token_budget,
+                flow_control_json,
+                phase_timeouts_json,
                 id,
             ],
         )
@@ -947,7 +974,8 @@ impl CheckpointDb {
                    completion_prompts_first, is_favorite, dependency_graph, cost_annotations,
                    quality_report, acceptance_criteria, constraint_overrides,
                    COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy,
-                       strict_cwd, tool_tags, enforce_token_budget
+                       strict_cwd, tool_tags, enforce_token_budget,
+                       flow_control_json, phase_timeouts_json
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -1100,6 +1128,8 @@ impl CheckpointDb {
                         .flatten()
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    flow_control_json: row.get::<_, Option<String>>(46)?,
+                    phase_timeouts_json: row.get::<_, Option<String>>(47)?,
                     use_worktree: false,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
@@ -1164,6 +1194,8 @@ impl CheckpointDb {
             enforce_token_budget: Some(original.enforce_token_budget),
             strict_cwd: original.strict_cwd,
             tool_tags: original.tool_tags,
+            flow_control_json: original.flow_control_json,
+            phase_timeouts_json: original.phase_timeouts_json,
             rollback_policy: original.rollback_policy,
         };
 
@@ -1220,7 +1252,8 @@ impl CheckpointDb {
                        approval_gate, completion_prompts_first, is_favorite, dependency_graph,
                        cost_annotations, quality_report, acceptance_criteria, constraint_overrides,
                        COALESCE(ai_reviewed, 1) as ai_reviewed, workflow_architecture, rollback_policy,
-                       strict_cwd, tool_tags, enforce_token_budget
+                       strict_cwd, tool_tags, enforce_token_budget,
+                       flow_control_json, phase_timeouts_json
                 FROM unified_workflows
                 WHERE sync_pending = 1
                 "#,
@@ -1344,6 +1377,8 @@ impl CheckpointDb {
                         .flatten()
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    flow_control_json: row.get::<_, Option<String>>(46)?,
+                    phase_timeouts_json: row.get::<_, Option<String>>(47)?,
                     use_worktree: false,
                     targeted_error_ids: vec![],
                 })

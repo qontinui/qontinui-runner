@@ -483,6 +483,14 @@ pub fn generate_workflow(
 
     artifact_builder.discovery_duration_ms = Some(discovery_start.elapsed().as_millis() as u64);
     artifact_builder.discovery_calls = serde_json::to_value(&discovery_calls).ok();
+        if let Some(c) = conn {
+            super::instrumentation::emit_pipeline_event(
+                c, "", None, "phase_end", "discovery",
+                None, None,
+                Some(discovery_start.elapsed().as_millis() as u64),
+                None, None, None,
+            );
+        }
 
     // ── Resolve per-phase model overrides for generation pipeline ────────
     let generation_model: Option<&str> = request
@@ -882,6 +890,14 @@ pub fn generate_workflow(
             artifact_builder.builder_duration_ms = Some(builder_start.elapsed().as_millis() as u64);
             artifact_builder.builder_parsed_json = serde_json::to_value(&w).ok();
             artifact_builder.builder_prompt = Some(prompt);
+                if let Some(c) = conn {
+                    super::instrumentation::emit_pipeline_event(
+                        c, "", None, "phase_end", "builder",
+                        None, None,
+                        Some(builder_start.elapsed().as_millis() as u64),
+                        None, None, None,
+                    );
+                }
             w
         }
         Err(resp) => {
@@ -1069,6 +1085,14 @@ pub fn generate_workflow(
                     // Capture fixer snapshot
                     if let Ok(snapshot) = serde_json::to_value(&workflow) {
                         artifact_builder.fixer_snapshots.push(snapshot);
+                    }
+                    if let Some(c) = conn {
+                        super::instrumentation::emit_pipeline_event(
+                            c, "", None, "phase_end", "fixer",
+                            Some(iter_num as i32), None,
+                            None, None,
+                            Some(issue_count as i32), None,
+                        );
                     }
                 }
                 Err(e) => {
@@ -1483,6 +1507,13 @@ pub fn generate_workflow(
         if let Ok(active) = active_rules {
             if !active.is_empty() {
                 rules::record_rule_applications(c, &active, Some(&workflow.id), None);
+                    let rule_tuples: Vec<(String, String, String)> = active
+                        .iter()
+                        .map(|r| (r.id.clone(), r.agent.clone(), r.section.clone()))
+                        .collect();
+                    super::instrumentation::record_rule_influences(
+                        c, &rule_tuples, "", Some(&workflow.id), "generation",
+                    );
             }
         }
     }
@@ -1522,6 +1553,17 @@ pub fn generate_workflow(
                 criteria_json["step_mapping"] = serde_json::Value::Object(step_mapping);
             }
             workflow.acceptance_criteria = Some(criteria_json);
+        }
+    }
+
+    if let Some(c) = conn {
+        if let Ok(wf_json) = serde_json::to_value(&workflow) {
+            let version_id = super::instrumentation::create_workflow_version(
+                c, &workflow.id, None, &wf_json, "generation",
+            );
+            super::instrumentation::record_all_step_provenance(
+                c, &workflow.id, version_id.as_deref(), &wf_json, "builder", None,
+            );
         }
     }
 

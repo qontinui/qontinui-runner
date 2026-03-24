@@ -96,6 +96,12 @@ export const METRIC_INFO: Record<
   },
 };
 
+export interface PushFeedbackScoresResult {
+  pushed: number;
+  failed: number;
+  errors: string[];
+}
+
 export const agenticMetricsService = {
   /** Get all metric scores for a specific task run. */
   async getScoresForRun(taskRunId: string): Promise<AgenticMetricScore[]> {
@@ -115,5 +121,22 @@ export const agenticMetricsService = {
   /** Manually trigger baseline recomputation. */
   async recomputeBaselines(): Promise<number> {
     return invoke("recompute_agentic_baselines");
+  },
+
+  /** Push feedback scores for a specific task run to the backend. */
+  async pushScoresToBackend(
+    taskRunId: string,
+    targetId: string,
+    targetType: string,
+  ): Promise<PushFeedbackScoresResult> {
+    return invoke("push_agentic_scores_to_backend", { taskRunId, targetId, targetType });
+  },
+
+  /** Push the latest agentic scores to the backend. */
+  async pushLatestScoresToBackend(
+    targetId: string,
+    targetType: string,
+  ): Promise<PushFeedbackScoresResult> {
+    return invoke("push_latest_agentic_scores", { targetId, targetType });
   },
 };

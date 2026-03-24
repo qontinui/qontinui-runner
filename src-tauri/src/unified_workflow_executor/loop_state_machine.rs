@@ -96,6 +96,8 @@ pub(crate) enum CompletionReason {
     UnfixableErrors,
     /// Human aborted via approval gate
     ApprovalAborted,
+    /// A phase exceeded its configured timeout
+    PhaseTimeout { phase: String, elapsed_ms: u64 },
 }
 
 // =============================================================================
@@ -245,6 +247,7 @@ impl CompletionReason {
             CompletionReason::Stopped => (false, true, false, false, false),
             CompletionReason::UnfixableErrors => (false, false, false, false, true),
             CompletionReason::ApprovalAborted => (false, true, false, false, false),
+            CompletionReason::PhaseTimeout { .. } => (false, false, false, true, false),
         };
 
         LoopResult {
@@ -327,6 +330,20 @@ mod tests {
         let result = CompletionReason::ApprovalAborted.into_loop_result(&ctx);
         assert!(!result.verification_passed);
         assert!(result.was_stopped);
+    }
+
+    #[test]
+    fn test_completion_reason_phase_timeout() {
+        let ctx = make_test_context(2);
+        let result = CompletionReason::PhaseTimeout {
+            phase: "agentic".to_string(),
+            elapsed_ms: 60000,
+        }
+        .into_loop_result(&ctx);
+        assert!(!result.verification_passed);
+        assert!(result.critical_failure);
+        assert!(!result.was_stopped);
+        assert_eq!(result.iterations_run, 2);
     }
 
     /// Helper: build a minimal LoopContext with a given iteration count.
@@ -732,8 +749,12 @@ mod tests {
             CompletionReason::Stopped,
             CompletionReason::UnfixableErrors,
             CompletionReason::ApprovalAborted,
+            CompletionReason::PhaseTimeout {
+                phase: "verification".to_string(),
+                elapsed_ms: 30000,
+            },
         ];
-        assert_eq!(completion_variants.len(), 7);
+        assert_eq!(completion_variants.len(), 8);
 
         // Each completion reason must produce a valid LoopResult
         let ctx = make_test_context(1);

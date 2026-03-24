@@ -12,7 +12,7 @@ import { Pin, EyeOff } from "lucide-react";
 import type { ActivityType, ActivityStatus } from "../../types/dashboard/activity-types";
 import type { DashboardLayoutState } from "../../hooks/dashboard/useDashboardLayout";
 import type { UseWidgetPreferencesResult } from "../../hooks/dashboard/useWidgetPreferences";
-import { widgetRegistry } from "../../types/dashboard/widget-registry";
+import { widgetRegistry, SUMMARY_WIDTH_MIN } from "../../types/dashboard/widget-registry";
 import { WidgetHeader } from "./WidgetHeader";
 import { IdleState } from "./IdleState";
 
@@ -907,72 +907,86 @@ function SummaryContainer({
   const SummaryComponent = config.SummaryComponent;
   const borderClasses = getWidgetBorderClasses(config.accentColor, status, false);
 
+  // Compute width tier from live data for grid layout
+  const tier = config.getSummaryWidthTier
+    ? config.getSummaryWidthTier(data)
+    : "medium";
+  const isFull = tier === "full";
+
   return (
     <div
-      className={cn(
-        "relative group rounded-lg border overflow-hidden bg-background cursor-pointer",
-        "hover:border-foreground/30 transition-colors duration-200",
-        "focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 focus-visible:ring-offset-background",
-        borderClasses,
-      )}
-      onClick={onClick}
-      role="button"
-      tabIndex={0}
-      aria-label={`Switch to ${config.displayName} widget`}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onClick();
-        }
+      style={{
+        gridColumn: isFull ? "1 / -1" : undefined,
+        minWidth: isFull ? undefined : SUMMARY_WIDTH_MIN[tier],
       }}
+      className="transition-all duration-300 ease-in-out"
     >
-      {/* Pin/Hide controls - appear on hover */}
-      {(onPin || onHide) && (
-        <div className="absolute top-1 right-1 hidden group-hover:flex gap-0.5 z-10">
-          {onPin && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onPin();
-              }}
-              className={cn(
-                "p-0.5 rounded hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50",
-                isPinned && "text-cyan-500",
-              )}
-              aria-label={isPinned ? "Unpin widget" : "Pin widget"}
-              title={isPinned ? "Unpin widget" : "Pin widget"}
-            >
-              <Pin
-                className={cn("h-3 w-3", isPinned ? "text-cyan-500" : "text-muted-foreground")}
-              />
-            </button>
-          )}
-          {onHide && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onHide();
-              }}
-              className="p-0.5 rounded hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50"
-              aria-label="Hide widget"
-              title="Hide widget"
-            >
-              <EyeOff className="h-3 w-3 text-muted-foreground" />
-            </button>
-          )}
+      <div
+        className={cn(
+          "relative group rounded-lg border overflow-hidden bg-background cursor-pointer",
+          "hover:border-foreground/30 transition-colors duration-200",
+          "focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 focus-visible:ring-offset-background",
+          borderClasses,
+        )}
+        onClick={onClick}
+        role="button"
+        tabIndex={0}
+        aria-label={`Switch to ${config.displayName} widget`}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onClick();
+          }
+        }}
+      >
+        {/* Pin/Hide controls - appear on hover */}
+        {(onPin || onHide) && (
+          <div className="absolute top-1 right-1 hidden group-hover:flex gap-0.5 z-10">
+            {onPin && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onPin();
+                }}
+                className={cn(
+                  "p-0.5 rounded hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50",
+                  isPinned && "text-cyan-500",
+                )}
+                aria-label={isPinned ? "Unpin widget" : "Pin widget"}
+                title={isPinned ? "Unpin widget" : "Pin widget"}
+              >
+                <Pin
+                  className={cn("h-3 w-3", isPinned ? "text-cyan-500" : "text-muted-foreground")}
+                />
+              </button>
+            )}
+            {onHide && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onHide();
+                }}
+                className="p-0.5 rounded hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50"
+                aria-label="Hide widget"
+                title="Hide widget"
+              >
+                <EyeOff className="h-3 w-3 text-muted-foreground" />
+              </button>
+            )}
+          </div>
+        )}
+        <WidgetHeader
+          title={config.displayName}
+          icon={config.icon}
+          accentColor={config.accentColor}
+          status={status}
+          isActive={false}
+          compact={true}
+          onViewAll={onClick}
+        />
+        <div className="p-3">
+          <SummaryComponent isActive={false} isSummary={true} status={status} data={data} />
         </div>
-      )}
-      <WidgetHeader
-        title={config.displayName}
-        icon={config.icon}
-        accentColor={config.accentColor}
-        status={status}
-        isActive={false}
-        compact={true}
-        onViewAll={onClick}
-      />
-      <div className="p-3">
-        <SummaryComponent isActive={false} isSummary={true} status={status} data={data} />
       </div>
     </div>
   );
@@ -1434,12 +1448,19 @@ export function DashboardLayout({
       </div>
 
       {/* Summary Widgets - fills remaining space */}
-      <div className="flex-1 min-w-0 flex flex-col gap-3 overflow-y-auto pl-1">
+      <div
+        className="flex-1 min-w-0 grid gap-3 overflow-y-auto pl-1 auto-rows-min content-start"
+        style={{
+          containerType: "inline-size",
+          gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))",
+        }}
+      >
         {/* Restore to Active Process button */}
         {showRestoreButton && (
           <button
             onClick={handleRestoreToRunning}
             className="flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium text-primary bg-primary/10 hover:bg-primary/20 border border-primary/30 rounded-lg transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+            style={{ gridColumn: "1 / -1" }}
           >
             <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
             Restore to Active Process
@@ -1447,9 +1468,9 @@ export function DashboardLayout({
         )}
 
         {/* Standalone widgets: convergence tracking, constraint results, and AI output stream */}
-        <ConvergenceWidget />
-        <ConstraintResultsWidget />
-        <AiStreamWidget />
+        <div style={{ gridColumn: "1 / -1" }}><ConvergenceWidget /></div>
+        <div style={{ gridColumn: "1 / -1" }}><ConstraintResultsWidget /></div>
+        <div style={{ gridColumn: "1 / -1" }}><AiStreamWidget /></div>
 
         {summaryWidgets.map((type) => (
           <SummaryWidget

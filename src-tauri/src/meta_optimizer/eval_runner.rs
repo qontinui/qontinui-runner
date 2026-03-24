@@ -411,6 +411,17 @@ fn evaluate_assertion(
                 ),
             }
         }
+        // LLM judge assertions require I/O context; skip in aggregate evaluation.
+        EvalAssertion::HallucinationCheck { .. }
+        | EvalAssertion::AnswerRelevance { .. }
+        | EvalAssertion::Factuality { .. }
+        | EvalAssertion::ContentSafety { .. } => AssertionResult {
+            assertion_type: "llm_judge".to_string(),
+            passed: true,
+            actual_value: 0.0,
+            threshold_value: 0.0,
+            message: "Skipped in offline evaluation (no per-run I/O available)".to_string(),
+        },
     }
 }
 

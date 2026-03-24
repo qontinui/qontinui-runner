@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 
 use crate::event_system::EventBroadcaster;
 use crate::step_executor::ExecutionStepConfig;
+use crate::workflow_event_bus::{events, get_workflow_event_bus};
 
 use super::loop_controller::LoopController;
 use super::types::LoopConfig;
@@ -150,6 +151,21 @@ impl LoopController {
                 self.check_chain_triggers(execution_id, wf_id, "completed")
                     .await;
             }
+
+            // Emit workflow.completed event on the event bus
+            let bus = get_workflow_event_bus().clone();
+            let eid = execution_id.to_string();
+            let wf_id = workflow_id.map(|s| s.to_string());
+            tokio::spawn(async move {
+                bus.emit_workflow_event(
+                    events::WORKFLOW_COMPLETED,
+                    &eid,
+                    wf_id.as_deref(),
+                    None,
+                    serde_json::json!({ "task_run_id": eid }),
+                )
+                .await;
+            });
         }
     }
 
@@ -190,6 +206,22 @@ impl LoopController {
                 self.check_chain_triggers(execution_id, wf_id, "failed")
                     .await;
             }
+
+            // Emit workflow.failed event on the event bus
+            let bus = get_workflow_event_bus().clone();
+            let eid = execution_id.to_string();
+            let wf_id = workflow_id.map(|s| s.to_string());
+            let fail_reason = reason.to_string();
+            tokio::spawn(async move {
+                bus.emit_workflow_event(
+                    events::WORKFLOW_FAILED,
+                    &eid,
+                    wf_id.as_deref(),
+                    None,
+                    serde_json::json!({ "task_run_id": eid, "reason": fail_reason }),
+                )
+                .await;
+            });
         }
     }
 

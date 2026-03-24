@@ -170,7 +170,7 @@ impl SchedulerService {
 
         // Execute due tasks up to the concurrent limit
         let available_slots = (settings.max_concurrent - running_count) as usize;
-        for task in due_tasks.into_iter().take(available_slots) {
+        for mut task in due_tasks.into_iter().take(available_slots) {
             // Skip if already running
             {
                 let running = self.running_tasks.read().await;
@@ -187,6 +187,20 @@ impl SchedulerService {
                 );
                 self.record_skipped(&task).await;
                 continue;
+            }
+
+            // For Condition schedule tasks, check rearm delay.
+            if matches!(task.schedule, crate::scheduler::ScheduleExpression::Condition(_)) {
+                if task.last_run.is_none() {
+                    if let Ok(history) = self.db.get_execution_history(&task.id, 1) {
+                        if let Some(latest) = history.into_iter().next() {
+                            task.last_run = Some(latest);
+                        }
+                    }
+                }
+                if !task.is_rearm_ready() {
+                    continue;
+                }
             }
 
             // Check conditions if task has any

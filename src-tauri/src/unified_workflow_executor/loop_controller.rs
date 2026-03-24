@@ -635,6 +635,10 @@ impl LoopController {
         start: std::time::Instant,
         resume_point: &ResumePoint,
     ) -> WorkflowResult {
+        // Record flow control start for concurrency tracking
+        let flow_enforcer = crate::flow_control::get_flow_control_enforcer();
+        flow_enforcer.record_start(&config.workflow_id, None).await;
+
         let total_stages = config.stages.len();
 
         // Determine which stage to start from based on resume point
@@ -791,6 +795,7 @@ impl LoopController {
                     ))
                     .await;
                 Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
+                flow_enforcer.record_end(&config.workflow_id, None).await;
                 return WorkflowResult {
                     success: false,
                     verification_passed: false,
@@ -842,6 +847,7 @@ impl LoopController {
                             ))
                             .await;
                         Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
+                        flow_enforcer.record_end(&config.workflow_id, None).await;
                         return WorkflowResult {
                             success: false,
                             verification_passed: false,
@@ -980,6 +986,7 @@ impl LoopController {
                             .on_workflow_failed(&format!("Stage {} setup failed", stage_num))
                             .await;
                         Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
+                        flow_enforcer.record_end(&config.workflow_id, None).await;
                         return WorkflowResult {
                             success: false,
                             verification_passed: false,
@@ -1250,6 +1257,7 @@ impl LoopController {
                     is_canary_run: config.is_canary_run,
                     rollback_policy: config.rollback_policy.clone(),
                     iteration_diffs: Vec::new(),
+                    phase_timeout_ms: config.phase_timeout_ms,
                 };
 
                 // Handle agentic-first: run the agentic phase before the verification loop.
@@ -1534,6 +1542,7 @@ impl LoopController {
                             .await;
                     }
                     Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
+                    flow_enforcer.record_end(&config.workflow_id, None).await;
                     return WorkflowResult {
                         success: false,
                         verification_passed: false,
@@ -2140,6 +2149,9 @@ impl LoopController {
 
         // Restore canary config overrides
         Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
+
+        // Record flow control end for concurrency tracking
+        flow_enforcer.record_end(&config.workflow_id, None).await;
 
         WorkflowResult {
             success: overall_passed,

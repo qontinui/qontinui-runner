@@ -182,6 +182,7 @@ pub fn execute_triggered_workflow(
         iteration_diffs: Vec::new(),
         active_canary: None,
         is_canary_run: false,
+        phase_timeout_ms: None,
     };
 
     // 7. Spawn the workflow

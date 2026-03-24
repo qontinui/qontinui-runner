@@ -116,7 +116,13 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
           />
         )}
 
-        {currentStep === 3 && <DevServicesStep onNext={goNext} onBack={goBack} />}
+        {currentStep === 3 && (
+          <DevServicesStep
+            alreadySelectedConfigs={selectedProcessConfigs}
+            onNext={goNext}
+            onBack={goBack}
+          />
+        )}
 
         {currentStep === 4 && (
           <AiProviderStep onComplete={handleAiProviderComplete} onBack={goBack} />

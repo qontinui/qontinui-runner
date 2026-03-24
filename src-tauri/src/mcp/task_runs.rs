@@ -647,6 +647,7 @@ pub async fn resume_task_run(
         iteration_diffs: Vec::new(),
         active_canary: None,
         is_canary_run: false,
+        phase_timeout_ms: None,
     };
 
     // Spawn the workflow execution in background with panic protection

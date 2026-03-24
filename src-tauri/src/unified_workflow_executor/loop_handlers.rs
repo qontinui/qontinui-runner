@@ -366,6 +366,26 @@ impl LoopController {
             broadcaster.task_run_update(&config.execution_id, "running", Some(ctx.iteration), None);
         }
 
+        // Check phase_timeout_ms: if configured, verify the loop hasn't exceeded its budget
+        if let Some(timeout_ms) = config.phase_timeout_ms {
+            if let Some(ref start) = ctx.agentic_phase_start {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                if elapsed_ms > timeout_ms {
+                    warn!(
+                        "Phase timeout exceeded: {}ms > {}ms budget - exiting loop",
+                        elapsed_ms, timeout_ms
+                    );
+                    ctx.iteration -= 1;
+                    return LoopState::Complete {
+                        reason: CompletionReason::PhaseTimeout {
+                            phase: "loop".to_string(),
+                            elapsed_ms,
+                        },
+                    };
+                }
+            }
+        }
+
         // Check if we've exceeded max iterations BEFORE running verification
         if ctx.iteration > config.max_iterations {
             warn!(

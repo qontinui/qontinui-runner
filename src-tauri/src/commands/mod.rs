@@ -27,6 +27,8 @@
 //! Common types and state used across all command modules are defined here.
 
 use crate::config::QontinuiConfig;
+use crate::container::isolated_executor::IsolatedExecutor;
+use crate::database::pg::PgDb;
 use crate::database::CheckpointDb;
 use crate::display::DisplayProcessor;
 use crate::doctor::DoctorHandle;
@@ -83,6 +85,7 @@ pub mod mcp; // MCP client management and tool calling
 pub mod meta_optimizer; // Meta-optimizer recommendations and prompt registry
 pub mod mobile; // Mobile development feedback (ADB, screenshots, logcat)
 pub mod mobile_settings; // Mobile settings (ADB path, device config)
+pub mod otel_settings; // OpenTelemetry settings (endpoint, sampling, enable/disable)
 pub mod orchestration_loop_configs; // Orchestration loop saved config CRUD
 pub mod performance_metrics; // Performance metrics dashboard
 pub mod playwright_settings;
@@ -153,6 +156,9 @@ pub struct AppState {
     pub event_broadcast: broadcast::Sender<serde_json::Value>,
     /// SQLite database for checkpoints, sessions, settings, and scheduler state.
     pub checkpoint_db: Arc<CheckpointDb>,
+    /// PostgreSQL database (Clorinde-generated queries). None if PG unavailable.
+    /// During migration, callers prefer PG and fall back to SQLite.
+    pub pg_db: Option<Arc<PgDb>>,
     /// Run recording handler for automatic workflow execution recording.
     /// Records runs to the Tiered Information system.
     pub run_recording_handler: Arc<RunRecordingHandler>,
@@ -190,6 +196,10 @@ pub struct AppState {
     pub canvas_state: Arc<tokio::sync::RwLock<crate::mcp::canvas::CanvasState>>,
     /// Orchestration loop state for runner-side workflow loop management.
     pub orchestration_loop: crate::orchestration_loop::loop_engine::SharedLoopState,
+    /// Container isolation executor for running shell commands inside Docker containers.
+    /// When `Some` and `is_available()`, shell commands are executed in isolated containers
+    /// instead of on the host. Falls back to host execution when `None` or unavailable.
+    pub container_executor: TokioMutex<Option<IsolatedExecutor>>,
 }
 
 /// Standard response structure for command handlers.

@@ -89,6 +89,8 @@ pub enum ActionType {
     Log,
     Assert,
     Custom,
+    AiPrompt,
+    RunPromptSequence,
 }
 
 /// Type of error that occurred
@@ -125,6 +127,29 @@ pub enum ScreenshotType {
     Periodic,
     ActionResult,
     StateVerification,
+}
+
+// ============================================================================
+// LLM Metrics
+// ============================================================================
+
+/// Token usage and cost metrics for LLM-powered actions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LLMMetrics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_input: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_output: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_total: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_params: Option<serde_json::Value>,
 }
 
 // ============================================================================
@@ -178,6 +203,14 @@ pub struct ExecutionStats {
     pub total_duration_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avg_action_duration_ms: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens_input: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens_output: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_action_count: Option<i64>,
 }
 
 /// Coverage data for test runs
@@ -303,6 +336,14 @@ pub struct ActionExecutionCreate {
     pub output_data: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_metrics: Option<LLMMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 /// Request payload for reporting action executions

@@ -212,6 +212,8 @@ fn build_calculator_workflow(
         enforce_token_budget: None,
         strict_cwd: false,
         tool_tags: Vec::new(),
+        flow_control_json: None,
+        phase_timeouts_json: None,
         rollback_policy: None,
     }
 }
@@ -303,6 +305,8 @@ fn build_tdd_workflow(
         enforce_token_budget: None,
         strict_cwd: false,
         tool_tags: Vec::new(),
+        flow_control_json: None,
+        phase_timeouts_json: None,
         rollback_policy: None,
     }
 }
@@ -395,6 +399,8 @@ fn build_pipeline_workflow(
         enforce_token_budget: None,
         strict_cwd: false,
         tool_tags: Vec::new(),
+        flow_control_json: None,
+        phase_timeouts_json: None,
         rollback_policy: None,
     }
 }

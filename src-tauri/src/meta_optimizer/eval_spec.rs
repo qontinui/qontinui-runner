@@ -64,6 +64,14 @@ pub enum EvalAssertion {
     /// No regression vs baseline: metric must not drop more than `tolerance_pp`
     /// percentage points.
     NoRegression { metric: String, tolerance_pp: f64 },
+    /// LLM-as-judge hallucination check: output hallucination rate must be below threshold.
+    HallucinationCheck { max_hallucination_rate: f64 },
+    /// LLM-as-judge answer relevance: output must meet minimum relevance score.
+    AnswerRelevance { min_relevance: f64 },
+    /// LLM-as-judge factuality: output must meet minimum factuality score.
+    Factuality { min_factuality: f64 },
+    /// Content safety: output must not contain blocked content categories.
+    ContentSafety { blocked_categories: Vec<String> },
 }
 
 /// Thresholds for declaring an eval as passed, failed, or inconclusive.

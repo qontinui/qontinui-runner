@@ -215,6 +215,7 @@ impl Executor for AgenticExecutor {
             iteration_diffs: Vec::new(),
             active_canary: None,
             is_canary_run: false,
+            phase_timeout_ms: None,
         };
 
         let (outcome, _injected_steps) = self

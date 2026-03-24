@@ -228,6 +228,8 @@ fn build_workflow_request(parsed: &SlashCommandParsed) -> CreateUnifiedWorkflowR
         enforce_token_budget: None,
         strict_cwd: false,
         tool_tags: Vec::new(),
+        flow_control_json: None,
+        phase_timeouts_json: None,
         rollback_policy: None,
     }
 }
@@ -349,6 +351,8 @@ pub fn sync_slash_commands(db: &CheckpointDb) -> Result<SyncResult, String> {
                     enforce_token_budget: None,
                     strict_cwd: None,
                     tool_tags: None,
+                    flow_control_json: None,
+                    phase_timeouts_json: None,
                     rollback_policy: None,
                 };
 

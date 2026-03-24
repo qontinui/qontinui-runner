@@ -20,6 +20,7 @@ import type { HandlerSetupFunction } from "./types";
 import type { EventPayload } from "../../types/eventPayloads";
 import { findingsTracker } from "../../services/FindingsTracker";
 import { executionReportingService } from "../../services/ExecutionReportingService";
+import { agenticMetricsService } from "../../services/agentic-metrics-service";
 import { RunType, RunStatus } from "../../types/execution";
 
 /**
@@ -134,10 +135,18 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
 
       // Complete execution run (success)
       if (executionReportingService.isActive) {
+        const capturedRunId = executionReportingService.currentRunId;
         logger.debug("Completing execution run (success)");
         await executionReportingService.completeRun(RunStatus.COMPLETED).catch((error) => {
           console.error("[EXECUTION_HANDLER] Failed to complete execution run:", error);
         });
+
+        // Push agentic scores to backend after run completes
+        if (capturedRunId) {
+          agenticMetricsService
+            .pushLatestScoresToBackend(capturedRunId, "run")
+            .catch((err) => console.warn("Failed to push scores:", err));
+        }
       }
 
       // Restore window if it was auto-minimized
@@ -165,12 +174,20 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
 
       // Complete execution run (failure)
       if (executionReportingService.isActive) {
+        const capturedRunId = executionReportingService.currentRunId;
         logger.debug("Completing execution run (failed)");
         await executionReportingService
           .completeRun(RunStatus.FAILED, undefined, undefined, errorMessage)
           .catch((error) => {
             console.error("[EXECUTION_HANDLER] Failed to complete execution run:", error);
           });
+
+        // Push agentic scores to backend after run completes
+        if (capturedRunId) {
+          agenticMetricsService
+            .pushLatestScoresToBackend(capturedRunId, "run")
+            .catch((err) => console.warn("Failed to push scores:", err));
+        }
       }
 
       // Archive findings from the session (even on failure)

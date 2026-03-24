@@ -998,6 +998,30 @@ pub async fn architecture_impact_handler(
     Ok(Json(ApiResponse::success(impact)))
 }
 
+/// GET /reflection/architecture/impact-graph?workflow_name=...&component=...
+pub async fn architecture_impact_graph_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ImpactQuery>,
+) -> Result<Json<ApiResponse<ImpactAnalysis>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let impact = state
+        .app_state
+        .checkpoint_db
+        .with_conn(|conn| {
+            architecture::get_impact_analysis_with_graph(conn, &query.workflow_name, &query.component)
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "Failed to get graph-enhanced impact analysis: {}",
+                    e
+                ))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(impact)))
+}
+
 /// GET /reflection/trends?workflow_name=...&time_range=7d
 ///
 /// Returns workflow-level convergence trends over time.
@@ -1165,6 +1189,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/reflection/architecture/impact",
             get(architecture_impact_handler),
+        )
+        .route(
+            "/reflection/architecture/impact-graph",
+            get(architecture_impact_graph_handler),
         )
         // Temporal trends API (v103)
         .route("/reflection/trends", get(workflow_trends_handler))

@@ -390,11 +390,37 @@ impl SqliteSpanLayer {
         // Empty string violates FK constraint, NULL is allowed
         let exec_id: Option<&str> = execution_id.filter(|s| !s.is_empty());
 
+        // Extract denormalized columns from attributes for efficient querying
+        let queue_wait_ms: Option<i64> = entry
+            .attributes
+            .get("queue_wait_ms")
+            .and_then(|v| v.as_i64());
+        let retry_attempt: Option<i64> = entry
+            .attributes
+            .get("retry_attempt")
+            .and_then(|v| v.as_i64());
+        let phase: Option<String> = entry
+            .attributes
+            .get("phase")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let iteration: Option<i64> = entry
+            .attributes
+            .get("iteration")
+            .and_then(|v| v.as_i64());
+        let workflow_id: Option<String> = entry
+            .attributes
+            .get("workflow_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         let result = conn.execute(
             "INSERT INTO execution_spans (
                 execution_id, trace_id, span_id, parent_span_id, name,
-                start_ts, end_ts, duration_ms, attributes, success, error, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))",
+                start_ts, end_ts, duration_ms, attributes, success, error,
+                queue_wait_ms, retry_attempt, phase, iteration, workflow_id,
+                created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, datetime('now'))",
             rusqlite::params![
                 exec_id,
                 entry.trace_id,
@@ -407,6 +433,11 @@ impl SqliteSpanLayer {
                 attributes_json,
                 entry.success,
                 entry.error,
+                queue_wait_ms,
+                retry_attempt,
+                phase,
+                iteration,
+                workflow_id,
             ],
         );
 
