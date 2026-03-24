@@ -310,7 +310,10 @@ export function ComparisonTab() {
                   {activeData.entries
                     .filter((e) => e.result)
                     .map((entry, i) => (
-                      <tr key={`summary-${entry.label}-${i}`} className="border-b border-zinc-800/50">
+                      <tr
+                        key={`summary-${entry.label}-${i}`}
+                        className="border-b border-zinc-800/50"
+                      >
                         <td className="py-1.5 px-3 text-zinc-200">{entry.label}</td>
                         <td className="py-1.5 px-3 text-center">
                           {entry.result!.success ? (

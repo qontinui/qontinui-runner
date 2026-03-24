@@ -317,15 +317,15 @@ export function RecommendationsTab() {
                     eval: {rec.eval_status}
                   </span>
                 )}
-                {rec.recommendation_type === "prompt_rewrite" && (
-                  robustnessStatus[rec.id] ? (
+                {rec.recommendation_type === "prompt_rewrite" &&
+                  (robustnessStatus[rec.id] ? (
                     <span className="text-xs text-zinc-400 ml-1">
-                      [robustness: {robustnessStatus[rec.id].passed}/{robustnessStatus[rec.id].total} passed]
+                      [robustness: {robustnessStatus[rec.id].passed}/
+                      {robustnessStatus[rec.id].total} passed]
                     </span>
                   ) : (
                     <span className="text-xs text-zinc-500 ml-1">[robustness: untested]</span>
-                  )
-                )}
+                  ))}
                 {rec.status === "applied" &&
                   rec.outcome_after_apply &&
                   (() => {
@@ -382,7 +382,8 @@ export function RecommendationsTab() {
                   )}
 
                   {/* Model profile link for architecture/config recs */}
-                  {(rec.optimizer_type === "architecture" || rec.recommendation_type === "config_change") && (
+                  {(rec.optimizer_type === "architecture" ||
+                    rec.recommendation_type === "config_change") && (
                     <p className="text-xs text-zinc-500 italic">
                       Check Model Profiles in Autoresearch for cost-efficiency data.
                     </p>

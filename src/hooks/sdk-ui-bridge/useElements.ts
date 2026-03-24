@@ -46,65 +46,66 @@ export function useElements(
     ? (elements.find((e) => e.id === selectedElementId) ?? null)
     : null;
 
-  const fetchElements = useCallback(async (options?: { recency?: string }) => {
-    setIsLoadingElements(true);
-    try {
-      const recency = options?.recency ?? "any";
-      const resp = await tracedFetch(
-        `${getApiBase()}/ui-bridge/sdk/elements?recency=${recency}`,
-      );
-      const json = await resp.json();
+  const fetchElements = useCallback(
+    async (options?: { recency?: string }) => {
+      setIsLoadingElements(true);
+      try {
+        const recency = options?.recency ?? "any";
+        const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/elements?recency=${recency}`);
+        const json = await resp.json();
 
-      if (json.success === false) {
-        return;
+        if (json.success === false) {
+          return;
+        }
+
+        // The response might have elements at different locations depending on SDK
+        const rawElements: unknown[] = json.data?.elements || json.elements || json.data || [];
+
+        const mapped = (rawElements as Record<string, unknown>[]).map(mapSdkElement);
+
+        // Generate fingerprints for all elements
+        const { catalog } = generateFingerprints(mapped);
+
+        setElements(mapped);
+
+        // Auto-capture if session is active
+        const session = captureSessionRef.current;
+        const connectedApp = connectedAppRef.current;
+        if (session) {
+          const hashes = extractFingerprintHashes(mapped);
+          const captureId = `cap-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+          const capture: CaptureRecord = {
+            captureId,
+            timestamp: Date.now(),
+            url: connectedApp?.port ? `http://localhost:${connectedApp.port}` : "unknown",
+            title: connectedApp?.appName || "SDK App",
+            elementFingerprints: hashes,
+            elementCount: mapped.length,
+          };
+
+          session.captures.push(capture);
+          session.lastCaptureId = captureId;
+
+          // Merge new fingerprints into catalog
+          Object.assign(session.fingerprintCatalog, catalog);
+
+          setCaptureSession({
+            active: true,
+            sessionId: session.sessionId,
+            startedAt: session.startedAt,
+            captureCount: session.captures.length,
+            uniqueFingerprints: Object.keys(session.fingerprintCatalog).length,
+          });
+        }
+      } catch {
+        // Error handled silently — caller can check elements state
+      } finally {
+        setIsLoadingElements(false);
       }
-
-      // The response might have elements at different locations depending on SDK
-      const rawElements: unknown[] = json.data?.elements || json.elements || json.data || [];
-
-      const mapped = (rawElements as Record<string, unknown>[]).map(mapSdkElement);
-
-      // Generate fingerprints for all elements
-      const { catalog } = generateFingerprints(mapped);
-
-      setElements(mapped);
-
-      // Auto-capture if session is active
-      const session = captureSessionRef.current;
-      const connectedApp = connectedAppRef.current;
-      if (session) {
-        const hashes = extractFingerprintHashes(mapped);
-        const captureId = `cap-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-        const capture: CaptureRecord = {
-          captureId,
-          timestamp: Date.now(),
-          url: connectedApp?.port ? `http://localhost:${connectedApp.port}` : "unknown",
-          title: connectedApp?.appName || "SDK App",
-          elementFingerprints: hashes,
-          elementCount: mapped.length,
-        };
-
-        session.captures.push(capture);
-        session.lastCaptureId = captureId;
-
-        // Merge new fingerprints into catalog
-        Object.assign(session.fingerprintCatalog, catalog);
-
-        setCaptureSession({
-          active: true,
-          sessionId: session.sessionId,
-          startedAt: session.startedAt,
-          captureCount: session.captures.length,
-          uniqueFingerprints: Object.keys(session.fingerprintCatalog).length,
-        });
-      }
-    } catch {
-      // Error handled silently — caller can check elements state
-    } finally {
-      setIsLoadingElements(false);
-    }
-  }, [connectedAppRef, captureSessionRef, setCaptureSession]);
+    },
+    [connectedAppRef, captureSessionRef, setCaptureSession],
+  );
 
   const refreshElements = useCallback(async () => {
     await fetchElements();

@@ -29,10 +29,7 @@ use super::canvas_panels::CanvasPanelManager;
 use super::phases::{AgenticExecutor, CompletionExecutor, SetupExecutor, VerificationExecutor};
 use super::resume::{ResumeManager, ResumePoint};
 use super::states::UnifiedWorkflowState;
-use super::types::{
-    AgenticOutcome, LoopConfig, LoopResult,
-    SweepResult,
-};
+use super::types::{AgenticOutcome, LoopConfig, LoopResult, SweepResult};
 
 /// The main loop controller for unified workflows.
 ///

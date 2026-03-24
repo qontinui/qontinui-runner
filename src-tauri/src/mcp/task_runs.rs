@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 
 use crate::database::{CreateTaskRunInput, TaskRun};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext};
-use crate::mcp::types::{ApiState, ApiResponse};
+use crate::mcp::types::{ApiResponse, ApiState};
 use crate::safe_lock::safe_lock_or_recover;
 use crate::summary_generator;
 use tauri::Manager;

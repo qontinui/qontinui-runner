@@ -89,7 +89,9 @@ export function useChangeTrackingEvents(
                 // Subscribe to registry element events for event-driven waitForChange.
                 // Access via .registry (added to UseUIBridgeReturn) with fallback for older builds.
                 subscribeChanges: (() => {
-                  const bridge = currentBridge as { registry?: { on?: (type: string, cb: () => void) => () => void } };
+                  const bridge = currentBridge as {
+                    registry?: { on?: (type: string, cb: () => void) => () => void };
+                  };
                   const reg = bridge.registry;
                   if (!reg?.on) return undefined;
                   const onEvent = reg.on.bind(reg);

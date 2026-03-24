@@ -770,9 +770,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
       case "tool_tags_input":
         return (
           <div key={def.key}>
-            <label className="block text-sm font-medium text-zinc-400 mb-1">
-              Tool tags
-            </label>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">Tool tags</label>
             <input
               type="text"
               value={(workflow.tool_tags ?? []).join(", ")}

@@ -100,9 +100,7 @@ export function TaskRunCostTable({ data }: TaskRunCostTableProps) {
       className="flex items-center gap-1 hover:text-foreground transition-colors"
     >
       {label}
-      {sortField === field && (
-        <ArrowUpDown className="w-3 h-3" />
-      )}
+      {sortField === field && <ArrowUpDown className="w-3 h-3" />}
     </button>
   );
 

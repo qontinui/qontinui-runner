@@ -219,10 +219,7 @@ export function RobustnessTab() {
                             </thead>
                             <tbody>
                               {report.category_breakdown.map((cat) => (
-                                <tr
-                                  key={cat.category}
-                                  className="border-t border-zinc-700/50"
-                                >
+                                <tr key={cat.category} className="border-t border-zinc-700/50">
                                   <td className="py-1 text-zinc-300">
                                     {CATEGORY_LABELS[cat.category] || cat.category}
                                   </td>
@@ -256,16 +253,14 @@ export function RobustnessTab() {
                                   <span className="text-xs text-zinc-300">{f.description}</span>
                                 </div>
                                 <div className="text-xs text-zinc-500">
-                                  Input:{" "}
-                                  <span className="text-zinc-400 font-mono">{f.input}</span>
+                                  Input: <span className="text-zinc-400 font-mono">{f.input}</span>
                                 </div>
                                 <div className="text-xs text-zinc-500">
                                   Expected:{" "}
                                   <span className="text-green-400 font-mono">{f.expected}</span>
                                 </div>
                                 <div className="text-xs text-zinc-500">
-                                  Actual:{" "}
-                                  <span className="text-red-400 font-mono">{f.actual}</span>
+                                  Actual: <span className="text-red-400 font-mono">{f.actual}</span>
                                 </div>
                               </div>
                             ))}
@@ -316,9 +311,7 @@ export function RobustnessTab() {
               >
                 <div
                   className="flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-zinc-800/50"
-                  onClick={() =>
-                    setExpandedDataset(expandedDataset === ds.id ? null : ds.id)
-                  }
+                  onClick={() => setExpandedDataset(expandedDataset === ds.id ? null : ds.id)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();

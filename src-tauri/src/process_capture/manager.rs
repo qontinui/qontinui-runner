@@ -525,6 +525,300 @@ impl ProcessCaptureManager {
         }
     }
 
+    /// Rebuild and restart a process: stop → run build command → start.
+    pub async fn rebuild_and_restart_process(&self, id: &str) -> Result<(), String> {
+        // 1. Get config and validate build_command exists and rebuild is enabled
+        let (build_cmd, build_args, cwd, env, health_port, process_name) = {
+            let processes = self.processes.read().await;
+            let process = processes
+                .get(id)
+                .ok_or_else(|| format!("Process '{}' not found", id))?;
+            if !process.config.rebuild_enabled {
+                return Err("Rebuild is disabled for this process".to_string());
+            }
+            // Guard against concurrent rebuilds
+            if process.runtime.state == ProcessState::Building {
+                return Err("Process is already being rebuilt".to_string());
+            }
+            let bc = process
+                .config
+                .build_command
+                .as_ref()
+                .ok_or("No build command configured for this process")?
+                .clone();
+            let ba = process.config.build_args.clone();
+            let c = process.config.cwd.clone();
+            let e = process.config.env.clone();
+            let hp = process.config.health_port;
+            let name = process.config.name.clone();
+            (bc, ba, c, e, hp, name)
+        };
+
+        // 2. Stop the process (idempotent — safe to call on already-stopped processes)
+        let _ = self.stop_process(id).await;
+
+        // Wait for port to be free
+        if let Some(port) = health_port {
+            if !health::wait_for_port_free(port, Duration::from_secs(10)).await {
+                warn!("Port {} still occupied before rebuild", port);
+            }
+        }
+
+        // 3. Set state to Building
+        {
+            let mut processes = self.processes.write().await;
+            if let Some(p) = processes.get_mut(id) {
+                p.runtime.state = ProcessState::Building;
+                let status = p.status();
+                self.emit_state_change(&status);
+            }
+        }
+
+        // 4. Emit a separator line to the output buffer
+        let separator = OutputLine {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            stream: OutputStream::Stdout,
+            line: format!("━━━ Rebuilding {} ━━━", process_name),
+        };
+        {
+            let processes = self.processes.read().await;
+            if let Some(p) = processes.get(id) {
+                p.push_output(separator.clone()).await;
+            }
+        }
+        let _ = tauri::Emitter::emit(
+            &self.app_handle,
+            "process-output",
+            serde_json::json!({
+                "id": id,
+                "line": separator,
+            }),
+        );
+
+        // 5. Run the build command
+        info!(
+            "Running build command for '{}': {} {:?}",
+            process_name, build_cmd, build_args
+        );
+
+        let build_result = self
+            .run_build_command(id, &build_cmd, &build_args, &cwd, &env)
+            .await;
+
+        match build_result {
+            Ok(()) => {
+                // Check if stop was called during the build (state would no longer be Building)
+                let was_cancelled = {
+                    let processes = self.processes.read().await;
+                    processes
+                        .get(id)
+                        .map(|p| p.runtime.state != ProcessState::Building)
+                        .unwrap_or(true)
+                };
+                if was_cancelled {
+                    info!("Build for '{}' completed but process was stopped during build — not starting", process_name);
+                    return Ok(());
+                }
+
+                info!("Build succeeded for '{}'", process_name);
+                let success_line = OutputLine {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    stream: OutputStream::Stdout,
+                    line: "━━━ Build succeeded, starting process ━━━".to_string(),
+                };
+                {
+                    let processes = self.processes.read().await;
+                    if let Some(p) = processes.get(id) {
+                        p.push_output(success_line.clone()).await;
+                    }
+                }
+                let _ = tauri::Emitter::emit(
+                    &self.app_handle,
+                    "process-output",
+                    serde_json::json!({
+                        "id": id,
+                        "line": success_line,
+                    }),
+                );
+
+                // 6. Start the process
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                self.start_process(id).await
+            }
+            Err(e) => {
+                error!("Build failed for '{}': {}", process_name, e);
+                let fail_line = OutputLine {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    stream: OutputStream::Stderr,
+                    line: format!("━━━ Build failed: {} ━━━", e),
+                };
+                {
+                    let processes = self.processes.read().await;
+                    if let Some(p) = processes.get(id) {
+                        p.push_output(fail_line.clone()).await;
+                    }
+                }
+                let _ = tauri::Emitter::emit(
+                    &self.app_handle,
+                    "process-output",
+                    serde_json::json!({
+                        "id": id,
+                        "line": fail_line,
+                    }),
+                );
+
+                // Set state to Failed
+                {
+                    let mut processes = self.processes.write().await;
+                    if let Some(p) = processes.get_mut(id) {
+                        p.runtime.state = ProcessState::Failed;
+                        let status = p.status();
+                        self.emit_state_change(&status);
+                    }
+                }
+                Err(format!("Build failed: {}", e))
+            }
+        }
+    }
+
+    /// Run a build command and stream its output to the process's output buffer.
+    async fn run_build_command(
+        &self,
+        process_id: &str,
+        build_cmd: &str,
+        build_args: &[String],
+        cwd: &str,
+        env: &std::collections::HashMap<String, String>,
+    ) -> Result<(), String> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let mut cmd;
+
+        #[cfg(windows)]
+        {
+            let full_command = if build_args.is_empty() {
+                build_cmd.to_string()
+            } else {
+                format!("{} {}", build_cmd, build_args.join(" "))
+            };
+            cmd = tokio::process::Command::new("cmd");
+            cmd.args(["/C", &full_command]);
+
+            #[allow(unused_imports)]
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        }
+
+        #[cfg(not(windows))]
+        {
+            cmd = tokio::process::Command::new(build_cmd);
+            cmd.args(build_args);
+        }
+
+        cmd.current_dir(cwd);
+        cmd.envs(env);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::null());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn build command: {}", e))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("Failed to capture build stdout")?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or("Failed to capture build stderr")?;
+
+        let processes = self.processes.clone();
+        let app_handle = self.app_handle.clone();
+
+        // Stream stdout
+        let pid_stdout = process_id.to_string();
+        let procs_stdout = processes.clone();
+        let ah_stdout = app_handle.clone();
+        let stdout_task = tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let output_line = OutputLine {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    stream: OutputStream::Stdout,
+                    line,
+                };
+                {
+                    let procs = procs_stdout.read().await;
+                    if let Some(p) = procs.get(&pid_stdout) {
+                        p.push_output(output_line.clone()).await;
+                    }
+                }
+                let _ = tauri::Emitter::emit(
+                    &ah_stdout,
+                    "process-output",
+                    serde_json::json!({
+                        "id": pid_stdout,
+                        "line": output_line,
+                    }),
+                );
+            }
+        });
+
+        // Stream stderr
+        let pid_stderr = process_id.to_string();
+        let procs_stderr = processes.clone();
+        let ah_stderr = app_handle.clone();
+        let stderr_task = tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let output_line = OutputLine {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    stream: OutputStream::Stderr,
+                    line,
+                };
+                {
+                    let procs = procs_stderr.read().await;
+                    if let Some(p) = procs.get(&pid_stderr) {
+                        p.push_output(output_line.clone()).await;
+                    }
+                }
+                let _ = tauri::Emitter::emit(
+                    &ah_stderr,
+                    "process-output",
+                    serde_json::json!({
+                        "id": pid_stderr,
+                        "line": output_line,
+                    }),
+                );
+            }
+        });
+
+        // Wait for the build command to finish (5 min timeout)
+        let status = tokio::time::timeout(Duration::from_secs(300), child.wait())
+            .await
+            .map_err(|_| "Build timed out after 5 minutes".to_string())?
+            .map_err(|e| format!("Build process error: {}", e))?;
+
+        // Wait for output tasks to finish
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Build exited with code {}",
+                status.code().unwrap_or(-1)
+            ))
+        }
+    }
+
     fn emit_state_change(&self, status: &ProcessStatus) {
         let _ = tauri::Emitter::emit(&self.app_handle, "process-state-changed", status);
     }

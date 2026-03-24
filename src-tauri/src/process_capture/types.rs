@@ -52,6 +52,48 @@ pub struct ProcessConfig {
     /// Whether this is a dev-mode-only service (not started in production builds)
     #[serde(default)]
     pub dev_only: bool,
+    /// Whether rebuild and AI fix features are enabled for this process
+    #[serde(default = "default_true")]
+    pub rebuild_enabled: bool,
+    /// Build command to run before restarting (e.g., "cargo", "npm")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_command: Option<String>,
+    /// Build command arguments (e.g., ["build"], ["run", "build"])
+    #[serde(default)]
+    pub build_args: Vec<String>,
+}
+
+impl ProcessConfig {
+    /// If no build command is configured, infer one from the run command.
+    /// This ensures existing configs automatically get rebuild support.
+    pub fn backfill_build_command(&mut self) {
+        if self.build_command.is_some() {
+            return;
+        }
+        let (cmd, args) = match self.command.as_str() {
+            "cargo" => ("cargo", vec!["build"]),
+            "npm" | "npx" => ("npm", vec!["run", "build"]),
+            "poetry" => ("poetry", vec!["install"]),
+            "python" => {
+                // Check for build system indicators in the cwd
+                let cwd = std::path::Path::new(&self.cwd);
+                if cwd.join("poetry.lock").exists() {
+                    ("poetry", vec!["install"])
+                } else if cwd.join("setup.py").exists()
+                    || cwd.join("setup.cfg").exists()
+                    || cwd.join("pyproject.toml").exists()
+                {
+                    ("pip", vec!["install", "-e", "."])
+                } else {
+                    return;
+                }
+            }
+            "docker" => return,
+            _ => return,
+        };
+        self.build_command = Some(cmd.to_string());
+        self.build_args = args.into_iter().map(|s| s.to_string()).collect();
+    }
 }
 
 fn default_category() -> String {
@@ -72,6 +114,7 @@ fn default_true() -> bool {
 pub enum ProcessState {
     Stopped,
     Starting,
+    Building,
     Running,
     Healthy,
     Stopping,
@@ -83,6 +126,7 @@ impl std::fmt::Display for ProcessState {
         match self {
             ProcessState::Stopped => write!(f, "stopped"),
             ProcessState::Starting => write!(f, "starting"),
+            ProcessState::Building => write!(f, "building"),
             ProcessState::Running => write!(f, "running"),
             ProcessState::Healthy => write!(f, "healthy"),
             ProcessState::Stopping => write!(f, "stopping"),
@@ -126,6 +170,8 @@ pub struct ProcessStatus {
     /// Number of errors detected from this process
     pub error_count: u32,
     pub category: String,
+    /// Whether this process has a build command configured
+    pub has_build_command: bool,
 }
 
 /// Internal runtime state for a managed process.

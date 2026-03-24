@@ -83,6 +83,8 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
         return "interval";
       case "State":
         return "state";
+      default:
+        return "cron";
     }
   });
   const [onceDateTime, setOnceDateTime] = useState(() => {

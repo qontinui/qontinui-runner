@@ -188,17 +188,21 @@ export function PromptSnippetSelector({
   };
 
   // Group prompt snippets by category for display
-  const groupedSnippets = useMemo(() => filteredSnippets.reduce(
-    (acc, snippet) => {
-      const category = snippet.category || "Uncategorized";
-      if (!acc[category]) {
-        acc[category] = [];
-      }
-      acc[category].push(snippet);
-      return acc;
-    },
-    {} as Record<string, PromptSnippet[]>,
-  ), [filteredSnippets]);
+  const groupedSnippets = useMemo(
+    () =>
+      filteredSnippets.reduce(
+        (acc, snippet) => {
+          const category = snippet.category || "Uncategorized";
+          if (!acc[category]) {
+            acc[category] = [];
+          }
+          acc[category].push(snippet);
+          return acc;
+        },
+        {} as Record<string, PromptSnippet[]>,
+      ),
+    [filteredSnippets],
+  );
 
   const snippetListContent = useMemo(
     () => (

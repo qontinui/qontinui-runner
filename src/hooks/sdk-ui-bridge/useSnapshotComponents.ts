@@ -21,9 +21,7 @@ export function useSnapshotComponents(): UseSnapshotComponentsReturn {
   const refreshSnapshot = useCallback(async (options?: { recency?: string }) => {
     try {
       const recency = options?.recency ?? "any";
-      const resp = await tracedFetch(
-        `${getApiBase()}/ui-bridge/sdk/snapshot?recency=${recency}`,
-      );
+      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/snapshot?recency=${recency}`);
       const json = await resp.json();
       if (json.success !== false) {
         setSnapshot(json.data || json);
@@ -36,9 +34,7 @@ export function useSnapshotComponents(): UseSnapshotComponentsReturn {
   const refreshComponents = useCallback(async (options?: { recency?: string }) => {
     try {
       const recency = options?.recency ?? "any";
-      const resp = await tracedFetch(
-        `${getApiBase()}/ui-bridge/sdk/components?recency=${recency}`,
-      );
+      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/components?recency=${recency}`);
       const json = await resp.json();
       if (json.success !== false) {
         setComponents(json.data?.components || json.components || json.data || []);

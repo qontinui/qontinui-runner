@@ -1,7 +1,14 @@
 import { cn } from "../../lib/utils";
-import { Circle, Loader2, CheckCircle2, XCircle, Square, ArrowDown } from "lucide-react";
+import { Circle, Loader2, CheckCircle2, XCircle, Square, ArrowDown, Hammer } from "lucide-react";
 
-type ProcessState = "stopped" | "starting" | "running" | "healthy" | "stopping" | "failed";
+type ProcessState =
+  | "stopped"
+  | "starting"
+  | "building"
+  | "running"
+  | "healthy"
+  | "stopping"
+  | "failed";
 
 interface ProcessStatusBadgeProps {
   state: ProcessState;
@@ -19,6 +26,11 @@ const stateConfig: Record<ProcessState, { icon: React.ReactNode; label: string; 
       icon: <Loader2 className="w-3 h-3 animate-spin" />,
       label: "Starting",
       classes: "bg-yellow-900/30 text-yellow-400 border-yellow-800",
+    },
+    building: {
+      icon: <Hammer className="w-3 h-3 animate-pulse" />,
+      label: "Building",
+      classes: "bg-amber-900/30 text-amber-400 border-amber-800",
     },
     running: {
       icon: <Circle className="w-3 h-3 fill-current" />,

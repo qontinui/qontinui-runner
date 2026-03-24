@@ -58,7 +58,11 @@ async function discoverBridgeForms(bridge: {
 }) {
   const { discoverForms } = await import("ui-bridge/ai");
   const formElements = bridge.elements
-    .filter((el) => ["input", "select", "textarea", "checkbox", "radio"].includes(el.type) && el.element instanceof HTMLElement)
+    .filter(
+      (el) =>
+        ["input", "select", "textarea", "checkbox", "radio"].includes(el.type) &&
+        el.element instanceof HTMLElement,
+    )
     .map((el) => ({
       id: el.id,
       element: el.element as HTMLElement,

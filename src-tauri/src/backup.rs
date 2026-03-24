@@ -225,14 +225,12 @@ pub fn restore_backup(data: &[u8]) -> Result<RestoreResult, String> {
             Ok(mut file) => match dest_path_opt {
                 Some(dest_path) => {
                     // Validate the destination path stays within expected directories
-                    let allowed_bases: Vec<PathBuf> = vec![
-                        dirs::config_dir(),
-                        dirs::data_local_dir(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .map(|d| d.join("com.qontinui.runner"))
-                    .collect();
+                    let allowed_bases: Vec<PathBuf> =
+                        vec![dirs::config_dir(), dirs::data_local_dir()]
+                            .into_iter()
+                            .flatten()
+                            .map(|d| d.join("com.qontinui.runner"))
+                            .collect();
 
                     if let Some(parent) = dest_path.parent() {
                         if let Err(e) = fs::create_dir_all(parent) {
@@ -260,10 +258,8 @@ pub fn restore_backup(data: &[u8]) -> Result<RestoreResult, String> {
                             }
                         },
                         None => {
-                            let msg = format!(
-                                "Failed to resolve destination path for {}",
-                                archive_name
-                            );
+                            let msg =
+                                format!("Failed to resolve destination path for {}", archive_name);
                             error!("{}", msg);
                             errors.push(msg);
                             continue;

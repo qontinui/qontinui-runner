@@ -60,6 +60,23 @@ pub async fn restart_managed_process(
     manager.restart_process(&id).await
 }
 
+/// Rebuild and restart a managed process by ID.
+/// Runs the configured build command, then starts the process.
+#[tauri::command]
+pub async fn rebuild_and_restart_process(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    if primary_proxy::is_secondary() {
+        return primary_proxy::rebuild_and_restart_process(&id).await;
+    }
+    let manager = state.process_capture_manager.lock().await;
+    let manager = manager
+        .as_ref()
+        .ok_or("Process capture manager not initialized")?;
+    manager.rebuild_and_restart_process(&id).await
+}
+
 /// Start all managed processes.
 #[tauri::command]
 pub async fn start_all_managed_processes(state: State<'_, Arc<AppState>>) -> Result<(), String> {

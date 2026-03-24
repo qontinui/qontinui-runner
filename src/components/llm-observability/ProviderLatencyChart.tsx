@@ -77,19 +77,20 @@ export function ProviderLatencyChart({ data }: ProviderLatencyChartProps) {
       <div className="h-64">
         <ResponsiveContainer width="100%" height="100%">
           <BarChart data={chartData} margin={{ left: 10, right: 20, top: 5, bottom: 5 }}>
-            <XAxis
-              dataKey="provider"
-              tick={{ fontSize: 11, fill: "hsl(var(--foreground))" }}
-            />
+            <XAxis dataKey="provider" tick={{ fontSize: 11, fill: "hsl(var(--foreground))" }} />
             <YAxis
               tick={{ fontSize: 11, fill: "hsl(var(--muted-foreground))" }}
               tickFormatter={(value) => `${value}ms`}
             />
             <Tooltip content={<CustomTooltip />} />
-            <Legend
-              wrapperStyle={{ fontSize: 11 }}
+            <Legend wrapperStyle={{ fontSize: 11 }} />
+            <Bar
+              dataKey="avg"
+              name="Avg"
+              fill="hsl(var(--primary))"
+              radius={[4, 4, 0, 0]}
+              maxBarSize={24}
             />
-            <Bar dataKey="avg" name="Avg" fill="hsl(var(--primary))" radius={[4, 4, 0, 0]} maxBarSize={24} />
             <Bar dataKey="min" name="Min" fill="#22c55e" radius={[4, 4, 0, 0]} maxBarSize={24} />
             <Bar dataKey="max" name="Max" fill="#f97316" radius={[4, 4, 0, 0]} maxBarSize={24} />
           </BarChart>

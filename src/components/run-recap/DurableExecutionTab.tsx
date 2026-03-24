@@ -94,13 +94,7 @@ function CommitBadge({ hash }: { hash: string | null }) {
   );
 }
 
-function DiffStats({
-  insertions,
-  deletions,
-}: {
-  insertions: number;
-  deletions: number;
-}) {
+function DiffStats({ insertions, deletions }: { insertions: number; deletions: number }) {
   return (
     <span className="flex items-center gap-2 text-xs">
       {insertions > 0 && (
@@ -119,29 +113,17 @@ function DiffStats({
   );
 }
 
-function VerificationBadge({
-  passed,
-  failed,
-}: {
-  passed: number;
-  failed: number;
-}) {
+function VerificationBadge({ passed, failed }: { passed: number; failed: number }) {
   const total = passed + failed;
   if (total === 0) return null;
   const allPassed = failed === 0;
   return (
     <span
       className={`text-xs px-1.5 py-0.5 rounded flex items-center gap-1 ${
-        allPassed
-          ? "bg-green-500/10 text-green-400"
-          : "bg-red-500/10 text-red-400"
+        allPassed ? "bg-green-500/10 text-green-400" : "bg-red-500/10 text-red-400"
       }`}
     >
-      {allPassed ? (
-        <CheckCircle2 className="w-3 h-3" />
-      ) : (
-        <XCircle className="w-3 h-3" />
-      )}
+      {allPassed ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
       {passed}/{total}
     </span>
   );
@@ -240,9 +222,7 @@ function IterationDiffCard({
           {/* Truncated diff */}
           {diff.diff_summary && (
             <div>
-              <h4 className="text-xs font-medium text-muted-foreground mb-1.5">
-                Diff Preview
-              </h4>
+              <h4 className="text-xs font-medium text-muted-foreground mb-1.5">Diff Preview</h4>
               <pre className="text-[11px] font-mono text-zinc-400 bg-zinc-900 rounded p-2 overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap">
                 {diff.diff_summary}
               </pre>
@@ -253,18 +233,12 @@ function IterationDiffCard({
           <div className="flex items-center gap-4 text-xs text-muted-foreground">
             {diff.commit_before && (
               <span>
-                Before:{" "}
-                <span className="font-mono">
-                  {diff.commit_before.substring(0, 8)}
-                </span>
+                Before: <span className="font-mono">{diff.commit_before.substring(0, 8)}</span>
               </span>
             )}
             {diff.commit_after && (
               <span>
-                After:{" "}
-                <span className="font-mono">
-                  {diff.commit_after.substring(0, 8)}
-                </span>
+                After: <span className="font-mono">{diff.commit_after.substring(0, 8)}</span>
               </span>
             )}
             {replayPoint?.timestamp && (
@@ -280,23 +254,14 @@ function IterationDiffCard({
   );
 }
 
-function ReplayPointCard({
-  point,
-  hasDiff,
-}: {
-  point: ReplayPoint;
-  hasDiff: boolean;
-}) {
+function ReplayPointCard({ point, hasDiff }: { point: ReplayPoint; hasDiff: boolean }) {
   if (hasDiff) return null; // Already shown in diff card
   return (
     <div className="border border-border rounded-lg p-3 flex items-center gap-3">
       <Play className="w-4 h-4 text-blue-400 shrink-0" />
       <span className="text-sm font-medium">Iteration {point.iteration}</span>
       <CommitBadge hash={point.commit_hash} />
-      <VerificationBadge
-        passed={point.passed_checks}
-        failed={point.failed_checks}
-      />
+      <VerificationBadge passed={point.passed_checks} failed={point.failed_checks} />
       {point.timestamp && (
         <span className="text-xs text-muted-foreground flex items-center gap-1">
           <Clock className="w-3 h-3" />
@@ -316,10 +281,8 @@ interface DurableExecutionTabProps {
 }
 
 export function DurableExecutionTab({ taskRunId }: DurableExecutionTabProps) {
-  const { data: diffs, isLoading: diffsLoading } =
-    useIterationDiffs(taskRunId);
-  const { data: replayPoints, isLoading: pointsLoading } =
-    useReplayPoints(taskRunId);
+  const { data: diffs, isLoading: diffsLoading } = useIterationDiffs(taskRunId);
+  const { data: replayPoints, isLoading: pointsLoading } = useReplayPoints(taskRunId);
   const [rollingBack, setRollingBack] = useState(false);
   const [rollbackResult, setRollbackResult] = useState<{
     success: boolean;
@@ -340,13 +303,10 @@ export function DurableExecutionTab({ taskRunId }: DurableExecutionTabProps) {
     setRollingBack(true);
     setRollbackResult(null);
     try {
-      const result = await invoke<string>(
-        "rollback_workflow_to_iteration",
-        {
-          executionId: taskRunId,
-          targetIteration: iteration,
-        },
-      );
+      const result = await invoke<string>("rollback_workflow_to_iteration", {
+        executionId: taskRunId,
+        targetIteration: iteration,
+      });
       setRollbackResult({ success: true, message: result });
     } catch (err) {
       setRollbackResult({
@@ -378,8 +338,8 @@ export function DurableExecutionTab({ taskRunId }: DurableExecutionTabProps) {
         <GitCommitHorizontal className="w-10 h-10 mb-3 opacity-40" />
         <p className="text-sm font-medium">No iteration data</p>
         <p className="text-xs mt-1">
-          Diffs and commit checkpoints appear after the workflow runs 1+
-          iterations in a git repository.
+          Diffs and commit checkpoints appear after the workflow runs 1+ iterations in a git
+          repository.
         </p>
       </div>
     );
@@ -445,11 +405,7 @@ export function DurableExecutionTab({ taskRunId }: DurableExecutionTabProps) {
       {replayPoints
         ?.filter((p) => !diffIterations.has(p.iteration))
         .map((point) => (
-          <ReplayPointCard
-            key={point.iteration}
-            point={point}
-            hasDiff={false}
-          />
+          <ReplayPointCard key={point.iteration} point={point} hasDiff={false} />
         ))}
     </div>
   );

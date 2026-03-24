@@ -366,7 +366,11 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
             className="w-5 h-5 flex items-center justify-center text-muted-foreground hover:text-foreground transition-colors"
             aria-label={isExpanded ? "Collapse" : "Expand"}
           >
-            {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+            {isExpanded ? (
+              <ChevronDown className="w-4 h-4" />
+            ) : (
+              <ChevronRight className="w-4 h-4" />
+            )}
           </button>
         ) : (
           <div className="w-5 h-5" />

@@ -53,7 +53,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [devAutoLoginPending, setDevAutoLoginPending] = useState(false);
   const mountCountRef = useRef(0);
   const refreshCallCountRef = useRef(0);
-  const hasAttemptedDevLogin = useRef(false);
+  // Timer ID for retrying dev auto-login when backend is temporarily unavailable
+  const devLoginRetryTimer = useRef<number | null>(null);
+  const devLoginRetryCount = useRef(0);
+  const MAX_DEV_LOGIN_RETRIES = 10;
 
   // Log mount/unmount
   useEffect(() => {
@@ -61,6 +64,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
     log.debug(`AuthProvider MOUNTED (mount #${mountCountRef.current})`);
     return () => {
       log.debug(`AuthProvider UNMOUNTED (was mount #${mountCountRef.current})`);
+      if (devLoginRetryTimer.current) {
+        clearTimeout(devLoginRetryTimer.current);
+      }
     };
   }, []);
 
@@ -205,14 +211,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
     if (authStatus?.authenticated) {
       log.debug("Dev mode: Authenticated, clearing devAutoLoginPending");
       setDevAutoLoginPending(false);
-      return;
-    }
-
-    // Only attempt auto-login once to avoid infinite loops
-    if (hasAttemptedDevLogin.current) {
-      // Already attempted but not authenticated - login must have failed
-      // Clear pending flag so user can see login screen
-      setDevAutoLoginPending(false);
+      if (devLoginRetryTimer.current) {
+        clearTimeout(devLoginRetryTimer.current);
+        devLoginRetryTimer.current = null;
+      }
+      devLoginRetryCount.current = 0;
       return;
     }
 
@@ -223,9 +226,13 @@ export function AuthProvider({ children }: AuthProviderProps) {
       return;
     }
 
+    // If a retry timer is already scheduled, don't start another attempt
+    if (devLoginRetryTimer.current) {
+      return;
+    }
+
     // Auto-login in development
     log.debug("Dev mode: Not authenticated, attempting auto-login...");
-    hasAttemptedDevLogin.current = true;
     // Set pending flag BEFORE starting login so UI shows "Signing in..."
     setDevAutoLoginPending(true);
     login(DEV_AUTO_LOGIN.email, DEV_AUTO_LOGIN.password)
@@ -234,11 +241,30 @@ export function AuthProvider({ children }: AuthProviderProps) {
         log.debug("Dev mode auto-login succeeded");
       })
       .catch((err) => {
-        log.error("Dev mode auto-login failed:", err);
-        // Clear pending flag on failure so user can see login screen
-        setDevAutoLoginPending(false);
+        const errStr = String(err);
+        const isNetworkError =
+          errStr.includes("Network error") || errStr.includes("Failed to fetch");
+        if (isNetworkError && devLoginRetryCount.current < MAX_DEV_LOGIN_RETRIES) {
+          // Backend unreachable — retry after a delay (keep pending so UI shows "Signing in...")
+          devLoginRetryCount.current += 1;
+          log.warn(
+            `Dev mode auto-login failed (backend unavailable), retry ${devLoginRetryCount.current}/${MAX_DEV_LOGIN_RETRIES} in 5s...`,
+          );
+          devLoginRetryTimer.current = window.setTimeout(() => {
+            devLoginRetryTimer.current = null;
+            checkAuthStatus();
+          }, 5000);
+        } else {
+          if (isNetworkError) {
+            log.error("Dev mode auto-login failed: max retries exceeded");
+          } else {
+            log.error("Dev mode auto-login failed (auth error):", err);
+          }
+          // Clear pending flag on non-retryable failure so user can see login screen
+          setDevAutoLoginPending(false);
+        }
       });
-  }, [loading, authStatus?.authenticated, login]);
+  }, [loading, authStatus?.authenticated, login, checkAuthStatus]);
 
   /**
    * Failsafe timeout for loading state

@@ -16,6 +16,9 @@ interface ProcessConfig {
   auto_start: boolean;
   category: string;
   buffer_size: number;
+  rebuild_enabled?: boolean;
+  build_command?: string;
+  build_args?: string[];
   enabled: boolean;
   start_group?: number;
   dev_only?: boolean;
@@ -61,7 +64,9 @@ export function ProcessConfigEditor({
   const [autoStart, setAutoStart] = useState(config?.auto_start || false);
   const [category, setCategory] = useState(config?.category || "general");
   const [startGroup, setStartGroup] = useState(config?.start_group?.toString() || "0");
-  const [devOnly, setDevOnly] = useState(config?.dev_only || false);
+  const [rebuildEnabled, setRebuildEnabled] = useState(config?.rebuild_enabled ?? true);
+  const [buildCommand, setBuildCommand] = useState(config?.build_command || "");
+  const [buildArgsStr, setBuildArgsStr] = useState(config?.build_args?.join(" ") || "");
   const [saving, setSaving] = useState(false);
 
   const browseCwd = useCallback(async () => {
@@ -90,6 +95,14 @@ export function ProcessConfigEditor({
           .filter((a) => a),
         cwd: cwd.trim(),
         env: config?.env || {},
+        rebuild_enabled: rebuildEnabled,
+        build_command: buildCommand.trim() || undefined,
+        build_args: buildArgsStr.trim()
+          ? buildArgsStr
+              .trim()
+              .split(/\s+/)
+              .filter((a) => a)
+          : [],
         health_port: healthPort ? parseInt(healthPort) || null : null,
         parser,
         auto_start: autoStart,
@@ -97,7 +110,7 @@ export function ProcessConfigEditor({
         buffer_size: config?.buffer_size || 2000,
         enabled: true,
         start_group: parseInt(startGroup) || 0,
-        dev_only: devOnly,
+        dev_only: config?.dev_only || false,
       };
 
       await invoke("save_process_config", { config: newConfig });
@@ -112,12 +125,14 @@ export function ProcessConfigEditor({
     command,
     argsStr,
     cwd,
+    rebuildEnabled,
+    buildCommand,
+    buildArgsStr,
     healthPort,
     parser,
     autoStart,
     category,
     startGroup,
-    devOnly,
     config,
     onSave,
   ]);
@@ -190,6 +205,46 @@ export function ProcessConfigEditor({
           </div>
         </div>
 
+        {/* Rebuild & AI Fix */}
+        <div>
+          <div className="flex items-center gap-2 mb-2">
+            <input
+              type="checkbox"
+              id="rebuild-enabled"
+              checked={rebuildEnabled}
+              onChange={(e) => setRebuildEnabled(e.target.checked)}
+              className="w-4 h-4 rounded border-white/10 bg-zinc-800 text-cyan-500 focus:ring-cyan-500"
+            />
+            <label htmlFor="rebuild-enabled" className="text-xs font-medium text-zinc-300">
+              Enable Rebuild & AI Fix
+            </label>
+          </div>
+          {rebuildEnabled && (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-zinc-400 mb-1">Build Command</label>
+                <input
+                  type="text"
+                  value={buildCommand}
+                  onChange={(e) => setBuildCommand(e.target.value)}
+                  placeholder="e.g., cargo, npm, poetry"
+                  className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 placeholder:text-zinc-600 focus:outline-hidden focus:border-cyan-500/50"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-zinc-400 mb-1">Build Arguments</label>
+                <input
+                  type="text"
+                  value={buildArgsStr}
+                  onChange={(e) => setBuildArgsStr(e.target.value)}
+                  placeholder="e.g., build, run build, install"
+                  className="w-full px-3 py-1.5 text-sm bg-zinc-800 border border-white/10 rounded text-zinc-200 placeholder:text-zinc-600 focus:outline-hidden focus:border-cyan-500/50"
+                />
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* Health Port + Parser + Category */}
         <div className="grid grid-cols-3 gap-3">
           <div>
@@ -232,7 +287,7 @@ export function ProcessConfigEditor({
           </div>
         </div>
 
-        {/* Start group + Auto-start + Dev-only */}
+        {/* Start group + Auto-start */}
         <div className="grid grid-cols-3 gap-3 items-end">
           <div>
             <label className="block text-xs text-zinc-400 mb-1">Start Group</label>
@@ -254,18 +309,6 @@ export function ProcessConfigEditor({
             />
             <label htmlFor="auto-start" className="text-xs text-zinc-400">
               Auto-start
-            </label>
-          </div>
-          <div className="flex items-center gap-2 pb-1">
-            <input
-              type="checkbox"
-              id="dev-only"
-              checked={devOnly}
-              onChange={(e) => setDevOnly(e.target.checked)}
-              className="w-4 h-4 rounded border-white/10 bg-zinc-800 text-cyan-500 focus:ring-cyan-500"
-            />
-            <label htmlFor="dev-only" className="text-xs text-zinc-400">
-              Dev-mode only
             </label>
           </div>
         </div>

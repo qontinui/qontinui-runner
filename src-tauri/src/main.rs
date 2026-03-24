@@ -1156,6 +1156,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             process_capture::commands::start_managed_process,
             process_capture::commands::stop_managed_process,
             process_capture::commands::restart_managed_process,
+            process_capture::commands::rebuild_and_restart_process,
             process_capture::commands::start_all_managed_processes,
             process_capture::commands::stop_all_managed_processes,
             process_capture::commands::get_managed_processes,
@@ -1466,6 +1467,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Load configs from settings and register them
                 let mut configs = settings::get_managed_process_configs();
+
+                // Backfill build commands for configs that don't have them yet
+                for config in &mut configs {
+                    config.backfill_build_command();
+                }
 
                 // In dev-mode, upgrade legacy configs and inject missing dev services
                 if dev_services::is_dev_mode() {

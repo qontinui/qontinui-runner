@@ -115,6 +115,9 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
             ignore_patterns: vec![],
             start_group: 0,
             dev_only: true,
+            rebuild_enabled: false,
+            build_command: None,
+            build_args: vec![],
         });
     }
 
@@ -140,6 +143,9 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
             ignore_patterns: vec![],
             start_group: 1,
             dev_only: true,
+            rebuild_enabled: true,
+            build_command: Some("poetry".to_string()),
+            build_args: vec!["install".to_string()],
         });
     }
 
@@ -167,6 +173,9 @@ pub fn get_default_dev_services(workspace: &Path) -> Vec<ProcessConfig> {
             ignore_patterns: vec![],
             start_group: 1,
             dev_only: true,
+            rebuild_enabled: true,
+            build_command: Some("npm".to_string()),
+            build_args: vec!["run".to_string(), "build".to_string()],
         });
     }
 

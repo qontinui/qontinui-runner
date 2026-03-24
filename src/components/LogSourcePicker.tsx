@@ -66,7 +66,12 @@ export function LogSourcePicker({
   const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
   const [prevSelectedSourceIds, setPrevSelectedSourceIds] = useState(selectedSourceIds);
   const [prevGlobalProfileId, setPrevGlobalProfileId] = useState(globalProfileId);
-  if (isOpen && (isOpen !== prevIsOpen || selectedSourceIds !== prevSelectedSourceIds || globalProfileId !== prevGlobalProfileId)) {
+  if (
+    isOpen &&
+    (isOpen !== prevIsOpen ||
+      selectedSourceIds !== prevSelectedSourceIds ||
+      globalProfileId !== prevGlobalProfileId)
+  ) {
     setPrevIsOpen(isOpen);
     setPrevSelectedSourceIds(selectedSourceIds);
     setPrevGlobalProfileId(globalProfileId);

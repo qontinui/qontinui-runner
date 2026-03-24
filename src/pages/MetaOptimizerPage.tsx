@@ -14,7 +14,14 @@ import { RunHistoryTab } from "../components/meta-optimizer/RunHistoryTab";
 import { EvalSpecsTab } from "../components/meta-optimizer/EvalSpecsTab";
 import { RobustnessTab } from "../components/meta-optimizer/RobustnessTab";
 
-type SubTab = "progress" | "recommendations" | "prompts" | "config" | "history" | "eval_specs" | "robustness";
+type SubTab =
+  | "progress"
+  | "recommendations"
+  | "prompts"
+  | "config"
+  | "history"
+  | "eval_specs"
+  | "robustness";
 
 const TABS: { id: SubTab; label: string }[] = [
   { id: "progress", label: "Progress" },

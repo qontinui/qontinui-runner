@@ -169,6 +169,51 @@ pub async fn restart_process(
     Ok(Json(ApiResponse::success("restarted".to_string())))
 }
 
+/// Rebuild and restart a process (run build command, then start).
+pub async fn rebuild_and_restart_process(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if primary_proxy::is_secondary() {
+        primary_proxy::rebuild_and_restart_process(&id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(api_error(format!("Primary runner proxy error: {}", e))),
+                )
+            })?;
+        return Ok(Json(ApiResponse::success(
+            "rebuild-and-restarted".to_string(),
+        )));
+    }
+
+    let manager = state.app_state.process_capture_manager.lock().await;
+    let manager = manager.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(api_error("Process capture manager not initialized")),
+        )
+    })?;
+
+    manager
+        .rebuild_and_restart_process(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!(
+                    "Failed to rebuild and restart process: {}",
+                    e
+                ))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(
+        "rebuild-and-restarted".to_string(),
+    )))
+}
+
 /// Get recent output from a process.
 pub async fn get_output(
     State(state): State<Arc<ApiState>>,
@@ -217,5 +262,9 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route("/processes/{id}/start", post(start_process))
         .route("/processes/{id}/stop", post(stop_process))
         .route("/processes/{id}/restart", post(restart_process))
+        .route(
+            "/processes/{id}/rebuild-and-restart",
+            post(rebuild_and_restart_process),
+        )
         .route("/processes/{id}/output", get(get_output))
 }

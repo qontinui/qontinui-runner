@@ -254,8 +254,7 @@ export function HookGenerationPanel({
 
     // Only process when transitioning from "processing" to "ready" —
     // ignore the initial "ready" from createSession (before sendMessage)
-    const shouldProcess =
-      session.sessionState === "ready" && prevState === "processing";
+    const shouldProcess = session.sessionState === "ready" && prevState === "processing";
     const currentStep = shouldProcess ? pendingStepRef.current : null;
 
     if (!shouldProcess || !currentStep) {

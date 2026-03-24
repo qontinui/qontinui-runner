@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { X, Send, Square } from "lucide-react";
+import { X, Send, Square, Hammer } from "lucide-react";
 import { cn } from "../../lib/utils";
 import type { AiMessage, AiSessionState } from "@qontinui/shared-types";
 
@@ -14,6 +14,7 @@ interface AiFixPanelProps {
   onSendFollowUp: (message: string) => void;
   onInterrupt: () => void;
   onClose: () => void;
+  onRebuildAndRestart?: () => void;
 }
 
 export function AiFixPanel({
@@ -25,6 +26,7 @@ export function AiFixPanel({
   onSendFollowUp,
   onInterrupt,
   onClose,
+  onRebuildAndRestart,
 }: AiFixPanelProps) {
   const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -84,13 +86,25 @@ export function AiFixPanel({
           </span>
           <StatusBadge state={sessionState} />
         </div>
-        <button
-          onClick={onClose}
-          className="p-0.5 text-zinc-500 hover:text-zinc-300 transition-colors"
-          title="Close AI panel"
-        >
-          <X className="w-3.5 h-3.5" />
-        </button>
+        <div className="flex items-center gap-1.5">
+          {onRebuildAndRestart && (
+            <button
+              onClick={onRebuildAndRestart}
+              className="flex items-center gap-1 px-3 py-1 text-xs bg-cyan-900/40 border border-cyan-700/50 rounded text-cyan-300 hover:bg-cyan-800/40 transition-colors"
+              title="Rebuild & Restart process"
+            >
+              <Hammer className="w-3 h-3" />
+              Rebuild & Restart
+            </button>
+          )}
+          <button
+            onClick={onClose}
+            className="p-0.5 text-zinc-500 hover:text-zinc-300 transition-colors"
+            title="Close AI panel"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
       </div>
 
       {/* Message area */}

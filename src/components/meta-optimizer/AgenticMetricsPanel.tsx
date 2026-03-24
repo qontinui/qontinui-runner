@@ -42,10 +42,7 @@ function scoreBarColor(score: number): string {
   return "bg-red-500";
 }
 
-export function AgenticMetricsPanel({
-  selectedTaskRunId,
-  days = 30,
-}: AgenticMetricsPanelProps) {
+export function AgenticMetricsPanel({ selectedTaskRunId, days = 30 }: AgenticMetricsPanelProps) {
   const [aggregates, setAggregates] = useState<AgenticMetricAggregate[]>([]);
   const [trend, setTrend] = useState<CompositeScoreTrendPoint[]>([]);
   const [runScores, setRunScores] = useState<AgenticMetricScore[]>([]);
@@ -87,25 +84,15 @@ export function AgenticMetricsPanel({
   }, [selectedTaskRunId]);
 
   if (loading) {
-    return (
-      <div className="p-4 text-zinc-500 text-sm">Loading agentic metrics...</div>
-    );
+    return <div className="p-4 text-zinc-500 text-sm">Loading agentic metrics...</div>;
   }
 
   if (error) {
-    return (
-      <div className="p-4 text-red-400 text-sm">
-        Failed to load metrics: {error}
-      </div>
-    );
+    return <div className="p-4 text-red-400 text-sm">Failed to load metrics: {error}</div>;
   }
 
-  const latestComposite =
-    trend.length > 0 ? trend[trend.length - 1].avg_composite_score : null;
-  const totalRuns = aggregates.reduce(
-    (max, a) => Math.max(max, a.runs_scored),
-    0
-  );
+  const latestComposite = trend.length > 0 ? trend[trend.length - 1].avg_composite_score : null;
+  const totalRuns = aggregates.reduce((max, a) => Math.max(max, a.runs_scored), 0);
 
   return (
     <div className="space-y-4">
@@ -115,14 +102,10 @@ export function AgenticMetricsPanel({
         {latestComposite !== null && (
           <div className="flex items-center gap-2">
             <span className="text-xs text-zinc-500">Composite:</span>
-            <span
-              className={`text-lg font-bold ${scoreColor(latestComposite)}`}
-            >
+            <span className={`text-lg font-bold ${scoreColor(latestComposite)}`}>
               {formatScore(latestComposite)}
             </span>
-            <span className="text-xs text-zinc-600">
-              ({totalRuns} runs scored)
-            </span>
+            <span className="text-xs text-zinc-600">({totalRuns} runs scored)</span>
           </div>
         )}
       </div>
@@ -133,9 +116,7 @@ export function AgenticMetricsPanel({
       {/* Per-metric aggregates */}
       {aggregates.length > 0 && (
         <div className="space-y-1">
-          <div className="text-xs text-zinc-500 mb-2">
-            {days}-day averages by metric
-          </div>
+          <div className="text-xs text-zinc-500 mb-2">{days}-day averages by metric</div>
           {aggregates
             .sort((a, b) => {
               const infoA = METRIC_INFO[a.metric_type];
@@ -213,9 +194,7 @@ function RunScoreRow({ score }: { score: AgenticMetricScore }) {
           style={{ width: `${score.score * 100}%` }}
         />
       </div>
-      <div className={`w-10 text-right ${scoreColor(score.score)}`}>
-        {formatScore(score.score)}
-      </div>
+      <div className={`w-10 text-right ${scoreColor(score.score)}`}>{formatScore(score.score)}</div>
       <div className="w-4">
         {score.is_llm_judged && (
           <span title="LLM-judged" className="text-purple-400">
@@ -224,10 +203,7 @@ function RunScoreRow({ score }: { score: AgenticMetricScore }) {
         )}
       </div>
       {score.rationale && (
-        <div
-          className="w-48 truncate text-zinc-600"
-          title={score.rationale}
-        >
+        <div className="w-48 truncate text-zinc-600" title={score.rationale}>
           {score.rationale}
         </div>
       )}
@@ -236,11 +212,7 @@ function RunScoreRow({ score }: { score: AgenticMetricScore }) {
 }
 
 /** Simple text-based composite score trend (CSS-only, no chart library). */
-function CompositeTrendChart({
-  data,
-}: {
-  data: CompositeScoreTrendPoint[];
-}) {
+function CompositeTrendChart({ data }: { data: CompositeScoreTrendPoint[] }) {
   const scores = data.map((d) => d.avg_composite_score);
   const min = Math.min(...scores);
   const max = Math.max(...scores);
@@ -257,9 +229,7 @@ function CompositeTrendChart({
         return (
           <div
             key={point.date}
-            className={`flex-1 rounded-t ${
-              isLast ? "bg-blue-400" : "bg-zinc-700"
-            }`}
+            className={`flex-1 rounded-t ${isLast ? "bg-blue-400" : "bg-zinc-700"}`}
             style={{ height: `${Math.max(height, 8)}%` }}
             title={`${point.date}: ${formatScore(point.avg_composite_score)} (${point.run_count} runs)`}
           />

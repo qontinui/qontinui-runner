@@ -261,18 +261,20 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
             : discovered.elements;
 
           // Gather current media info
-          const currentMedia = mediaElements.map((el: { id: string; type: string; label?: string; element?: Element }) => {
-            const domEl = el.element;
-            let src = "";
-            let alt = "";
-            if (domEl instanceof HTMLImageElement) {
-              src = domEl.src;
-              alt = domEl.alt;
-            } else if (domEl instanceof HTMLVideoElement) {
-              src = domEl.src || domEl.currentSrc;
-            }
-            return { id: el.id, type: el.type, label: el.label, src, alt };
-          });
+          const currentMedia = mediaElements.map(
+            (el: { id: string; type: string; label?: string; element?: Element }) => {
+              const domEl = el.element;
+              let src = "";
+              let alt = "";
+              if (domEl instanceof HTMLImageElement) {
+                src = domEl.src;
+                alt = domEl.alt;
+              } else if (domEl instanceof HTMLVideoElement) {
+                src = domEl.src || domEl.currentSrc;
+              }
+              return { id: el.id, type: el.type, label: el.label, src, alt };
+            },
+          );
 
           const baselineMedia = compareParams.baseline?.images ?? [];
           const currentSrcs = new Set(currentMedia.map((m: { src: string }) => m.src));

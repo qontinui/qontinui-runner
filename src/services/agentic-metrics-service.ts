@@ -98,23 +98,17 @@ export const METRIC_INFO: Record<
 
 export const agenticMetricsService = {
   /** Get all metric scores for a specific task run. */
-  async getScoresForRun(
-    taskRunId: string
-  ): Promise<AgenticMetricScore[]> {
+  async getScoresForRun(taskRunId: string): Promise<AgenticMetricScore[]> {
     return invoke("get_agentic_scores", { taskRunId });
   },
 
   /** Get aggregate stats over a time period (default 30 days). */
-  async getAggregates(
-    days?: number
-  ): Promise<AgenticMetricAggregate[]> {
+  async getAggregates(days?: number): Promise<AgenticMetricAggregate[]> {
     return invoke("get_agentic_metric_aggregates", { days: days ?? 30 });
   },
 
   /** Get composite score trend over time. */
-  async getCompositeScoreTrend(
-    days?: number
-  ): Promise<CompositeScoreTrendPoint[]> {
+  async getCompositeScoreTrend(days?: number): Promise<CompositeScoreTrendPoint[]> {
     return invoke("get_composite_score_trend", { days: days ?? 30 });
   },
 

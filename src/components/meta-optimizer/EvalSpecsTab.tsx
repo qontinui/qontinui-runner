@@ -44,7 +44,7 @@ export function EvalSpecsTab() {
   const [generating, setGenerating] = useState(false);
 
   const agentOptions = Array.from(
-    new Set(specs.map((s) => s.target_agent).filter(Boolean) as string[])
+    new Set(specs.map((s) => s.target_agent).filter(Boolean) as string[]),
   );
 
   const load = useCallback(async () => {
@@ -87,7 +87,7 @@ export function EvalSpecsTab() {
         console.error("Failed to delete eval spec:", e);
       }
     },
-    [load]
+    [load],
   );
 
   const formatAssertionLabel = (a: EvalAssertion): string => {

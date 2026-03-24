@@ -363,10 +363,10 @@ declare module "react-window" {
   export function useListRef(initial: unknown): Ref<unknown>;
 
   // v1 exports (still available at runtime)
-  export class FixedSizeList<T = unknown> extends Component<Record<string, unknown>> {}
-  export class VariableSizeList<T = unknown> extends Component<Record<string, unknown>> {}
-  export class FixedSizeGrid<T = unknown> extends Component<Record<string, unknown>> {}
-  export class VariableSizeGrid<T = unknown> extends Component<Record<string, unknown>> {}
+  export class FixedSizeList<_T = unknown> extends Component<Record<string, unknown>> {}
+  export class VariableSizeList<_T = unknown> extends Component<Record<string, unknown>> {}
+  export class FixedSizeGrid<_T = unknown> extends Component<Record<string, unknown>> {}
+  export class VariableSizeGrid<_T = unknown> extends Component<Record<string, unknown>> {}
   export function areEqual(
     prevProps: Record<string, unknown>,
     nextProps: Record<string, unknown>,

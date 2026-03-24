@@ -67,7 +67,9 @@ impl ManagedProcess {
     /// Start the process, spawning stream reader and exit monitor tasks.
     /// Returns a receiver for process messages (output lines, errors, exit).
     pub fn start(&mut self) -> Result<mpsc::Receiver<ProcessMessage>, String> {
-        if self.runtime.state != ProcessState::Stopped && self.runtime.state != ProcessState::Failed
+        if self.runtime.state != ProcessState::Stopped
+            && self.runtime.state != ProcessState::Failed
+            && self.runtime.state != ProcessState::Building
         {
             return Err(format!(
                 "Process '{}' is in state {}, cannot start",
@@ -325,6 +327,12 @@ impl ManagedProcess {
             restart_count: self.runtime.restart_count,
             error_count: self.runtime.error_count,
             category: self.config.category.clone(),
+            has_build_command: self.config.rebuild_enabled
+                && self
+                    .config
+                    .build_command
+                    .as_ref()
+                    .is_some_and(|s| !s.is_empty()),
         }
     }
 }

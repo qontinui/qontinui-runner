@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { cn } from "../../lib/utils";
-import { Search, ArrowDown, Trash2, Wand2 } from "lucide-react";
+import { Search, ArrowDown, Trash2, Wand2, Hammer } from "lucide-react";
 
 interface OutputLine {
   timestamp: string;
@@ -17,6 +17,8 @@ interface ProcessOutputViewerProps {
   processState?: string;
   errorCount?: number;
   onFixWithAi?: () => void;
+  onRebuildAndRestart?: () => void;
+  hasBuildCommand?: boolean;
   isFixActive?: boolean;
 }
 
@@ -27,6 +29,8 @@ export function ProcessOutputViewer({
   processState,
   errorCount = 0,
   onFixWithAi,
+  onRebuildAndRestart,
+  hasBuildCommand = false,
   isFixActive = false,
 }: ProcessOutputViewerProps) {
   const [lines, setLines] = useState<OutputLine[]>([]);
@@ -144,6 +148,22 @@ export function ProcessOutputViewer({
           >
             <Wand2 className="w-3 h-3" />
             Fix with AI
+          </button>
+        )}
+        {onRebuildAndRestart && hasBuildCommand && (
+          <button
+            onClick={onRebuildAndRestart}
+            disabled={processState === "building"}
+            className={cn(
+              "flex items-center gap-1 px-2 py-0.5 text-xs rounded border transition-colors",
+              processState === "building"
+                ? "text-zinc-500 border-zinc-700 cursor-not-allowed"
+                : "text-cyan-300 border-cyan-700/50 bg-cyan-900/30 hover:bg-cyan-800/40",
+            )}
+            title="Run build command then restart"
+          >
+            <Hammer className="w-3 h-3" />
+            Rebuild
           </button>
         )}
         <span className="text-xs text-zinc-600">{lines.length} lines</span>

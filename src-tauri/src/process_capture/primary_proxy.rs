@@ -162,6 +162,32 @@ pub async fn restart_process(id: &str) -> Result<(), String> {
     }
 }
 
+/// Proxy: POST /processes/{id}/rebuild-and-restart
+pub async fn rebuild_and_restart_process(id: &str) -> Result<(), String> {
+    let url = format!("{}/processes/{}/rebuild-and-restart", base_url(), id);
+    // Builds can take minutes — use a longer timeout (build=300s + stop/start overhead)
+    let long_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let resp = long_client
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach primary runner: {}", e))?;
+
+    let api: ApiResponse<String> = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse primary response: {}", e))?;
+
+    if api.success {
+        Ok(())
+    } else {
+        Err(api.error.unwrap_or_else(|| "Unknown error".to_string()))
+    }
+}
+
 /// Proxy: POST /processes/start-all (via individual starts)
 pub async fn start_all() -> Result<(), String> {
     use super::types::ProcessState;
@@ -169,7 +195,10 @@ pub async fn start_all() -> Result<(), String> {
     for status in statuses {
         if !matches!(
             status.state,
-            ProcessState::Running | ProcessState::Healthy | ProcessState::Starting
+            ProcessState::Running
+                | ProcessState::Healthy
+                | ProcessState::Starting
+                | ProcessState::Building
         ) {
             let _ = start_process(&status.id).await;
         }
@@ -184,7 +213,10 @@ pub async fn stop_all() -> Result<(), String> {
     for status in statuses {
         if matches!(
             status.state,
-            ProcessState::Running | ProcessState::Healthy | ProcessState::Starting
+            ProcessState::Running
+                | ProcessState::Healthy
+                | ProcessState::Starting
+                | ProcessState::Building
         ) {
             let _ = stop_process(&status.id).await;
         }

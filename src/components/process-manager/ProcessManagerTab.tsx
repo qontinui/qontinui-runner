@@ -17,6 +17,8 @@ import {
   ChevronRight,
   Cpu,
   FolderSearch,
+  Hammer,
+  Settings2,
 } from "lucide-react";
 
 import { ProcessStatusBadge } from "./ProcessStatusBadge";
@@ -29,13 +31,14 @@ import { useAiSession } from "../../hooks/useAiSession";
 interface ProcessStatus {
   id: string;
   name: string;
-  state: "stopped" | "starting" | "running" | "healthy" | "stopping" | "failed";
+  state: "stopped" | "starting" | "building" | "running" | "healthy" | "stopping" | "failed";
   pid: number | null;
   uptime_secs: number | null;
   port_healthy: boolean | null;
   restart_count: number;
   error_count: number;
   category: string;
+  has_build_command: boolean;
 }
 
 interface ProcessConfig {
@@ -45,12 +48,17 @@ interface ProcessConfig {
   args: string[];
   cwd: string;
   env: Record<string, string>;
+  rebuild_enabled?: boolean;
+  build_command?: string;
+  build_args?: string[];
   health_port: number | null;
   parser: string;
   auto_start: boolean;
   category: string;
   buffer_size: number;
   enabled: boolean;
+  start_group?: number;
+  dev_only?: boolean;
 }
 
 function formatUptime(secs: number | null): string {
@@ -99,11 +107,18 @@ export function ProcessManagerTab() {
     resetSession: aiResetSession,
   } = useAiSession();
 
+  // Cached configs for editing (refreshed alongside process list)
+  const configsRef = useRef<ProcessConfig[]>([]);
+
   // Load processes
   const loadProcesses = useCallback(async () => {
     try {
-      const statuses = await invoke<ProcessStatus[]>("get_managed_processes");
+      const [statuses, configs] = await Promise.all([
+        invoke<ProcessStatus[]>("get_managed_processes"),
+        invoke<ProcessConfig[]>("get_process_configs"),
+      ]);
       setProcesses(statuses);
+      configsRef.current = configs;
     } catch (e) {
       console.error("Failed to load processes:", e);
     } finally {
@@ -192,9 +207,30 @@ export function ProcessManagerTab() {
     [selectedId],
   );
 
+  const handleRebuildAndRestart = useCallback(
+    async (id: string, e?: React.MouseEvent) => {
+      e?.stopPropagation();
+      try {
+        await invoke("rebuild_and_restart_process", { id });
+        await loadProcesses();
+      } catch (err) {
+        console.error("Failed to rebuild:", err);
+      }
+    },
+    [loadProcesses],
+  );
+
   const handleAddNew = useCallback(() => {
     setEditConfig(undefined);
     setShowEditor(true);
+  }, []);
+
+  const handleEditConfig = useCallback((id: string) => {
+    const config = configsRef.current.find((c) => c.id === id);
+    if (config) {
+      setEditConfig(config);
+      setShowEditor(true);
+    }
   }, []);
 
   const handleSaveConfig = useCallback(() => {
@@ -445,7 +481,7 @@ Be concise and actionable.`;
   });
 
   const isRunning = (state: string) =>
-    ["starting", "running", "healthy", "stopping"].includes(state);
+    ["starting", "building", "running", "healthy", "stopping"].includes(state);
 
   const selected = selectedId ? processes.find((p) => p.id === selectedId) : null;
 
@@ -524,7 +560,11 @@ Be concise and actionable.`;
             processes.map((proc) => (
               <div
                 key={proc.id}
-                onClick={() => setSelectedId(selectedId === proc.id ? null : proc.id)}
+                onClick={(e) => {
+                  // Ignore clicks on child buttons (start, stop, edit, etc.)
+                  if ((e.target as HTMLElement).closest("button")) return;
+                  setSelectedId(selectedId === proc.id ? null : proc.id);
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ")
                     setSelectedId(selectedId === proc.id ? null : proc.id);
@@ -592,6 +632,28 @@ Be concise and actionable.`;
                       </button>
                     </>
                   )}
+                  {proc.has_build_command && (
+                    <button
+                      onClick={(e) => handleRebuildAndRestart(proc.id, e)}
+                      className={cn(
+                        "p-1.5 rounded transition-colors",
+                        proc.state === "building"
+                          ? "text-amber-500/50 cursor-not-allowed"
+                          : "text-amber-500 hover:text-amber-400 hover:bg-amber-500/10",
+                      )}
+                      title="Rebuild & Restart"
+                      disabled={proc.state === "building"}
+                    >
+                      <Hammer className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                  <button
+                    onClick={() => handleEditConfig(proc.id)}
+                    className="p-1.5 text-zinc-600 hover:text-zinc-300 hover:bg-white/5 rounded transition-colors"
+                    title="Edit configuration"
+                  >
+                    <Settings2 className="w-3.5 h-3.5" />
+                  </button>
                   {!isRunning(proc.state) && (
                     <button
                       onClick={(e) => handleDelete(proc.id, e)}
@@ -617,6 +679,8 @@ Be concise and actionable.`;
                 processState={selected.state}
                 errorCount={selected.error_count}
                 onFixWithAi={() => handleFixWithAi(selected.id, selected.name)}
+                onRebuildAndRestart={() => handleRebuildAndRestart(selected.id)}
+                hasBuildCommand={selected.has_build_command}
                 isFixActive={aiFixActive}
                 className={aiFixActive && aiFixProcessId === selected.id ? "h-1/2" : "h-full"}
               />
@@ -630,6 +694,11 @@ Be concise and actionable.`;
                   onSendFollowUp={aiSendMessage}
                   onInterrupt={aiInterrupt}
                   onClose={closeAiFix}
+                  onRebuildAndRestart={
+                    selected.has_build_command
+                      ? () => handleRebuildAndRestart(selected.id)
+                      : undefined
+                  }
                 />
               )}
             </>

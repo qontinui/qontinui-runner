@@ -433,8 +433,7 @@ async function captureFallbackScreenshot(
       const { mapSdkElement } = await import("./sdk-ui-bridge/utils");
       const snapJson = await snapResp.json();
       if (snapJson.success) {
-        const candidate =
-          snapJson.data?.elements || snapJson.elements || snapJson.data || [];
+        const candidate = snapJson.data?.elements || snapJson.elements || snapJson.data || [];
         const rawElements: Record<string, unknown>[] = Array.isArray(candidate) ? candidate : [];
         const mapped = rawElements.map(mapSdkElement);
         const { elementFingerprintMap } = generateFingerprints(mapped);

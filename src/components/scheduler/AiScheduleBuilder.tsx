@@ -22,10 +22,7 @@ import {
   Check,
   Pencil,
 } from "lucide-react";
-import type {
-  CreateScheduledTaskRequest,
-  ScheduledTask,
-} from "../../types/scheduler";
+import type { CreateScheduledTaskRequest } from "../../types/scheduler";
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
@@ -141,7 +138,8 @@ export function AiScheduleBuilder({
   const filteredWorkflows = useMemo(() => {
     let list = workflows;
     if (workflowFilter === "favorites") list = list.filter((w) => w.is_favorite);
-    else if (workflowFilter === "commands") list = list.filter((w) => w.category === "slash-command");
+    else if (workflowFilter === "commands")
+      list = list.filter((w) => w.category === "slash-command");
     if (workflowSearch) {
       const q = workflowSearch.toLowerCase();
       list = list.filter(
@@ -154,23 +152,20 @@ export function AiScheduleBuilder({
   }, [workflows, workflowFilter, workflowSearch, selectedWorkflows]);
 
   // Add workflow to selection
-  const addWorkflow = useCallback(
-    (wf: UnifiedWorkflow) => {
-      setSelectedWorkflows((prev) => [
-        ...prev,
-        {
-          id: wf.id,
-          name: wf.name,
-          description: wf.description,
-          category: wf.category,
-          is_favorite: wf.is_favorite,
-        },
-      ]);
-      setPickerOpen(false);
-      setWorkflowSearch("");
-    },
-    [],
-  );
+  const addWorkflow = useCallback((wf: UnifiedWorkflow) => {
+    setSelectedWorkflows((prev) => [
+      ...prev,
+      {
+        id: wf.id,
+        name: wf.name,
+        description: wf.description,
+        category: wf.category,
+        is_favorite: wf.is_favorite,
+      },
+    ]);
+    setPickerOpen(false);
+    setWorkflowSearch("");
+  }, []);
 
   // Remove workflow from selection
   const removeWorkflow = useCallback((index: number) => {
@@ -207,9 +202,7 @@ export function AiScheduleBuilder({
   const buildAiPrompt = useCallback(() => {
     const workflowList =
       selectedWorkflows.length > 0
-        ? selectedWorkflows
-            .map((w, i) => `  ${i + 1}. "${w.name}" (id: ${w.id})`)
-            .join("\n")
+        ? selectedWorkflows.map((w, i) => `  ${i + 1}. "${w.name}" (id: ${w.id})`).join("\n")
         : "(no workflows selected — user will configure task type separately)";
 
     return `You are a scheduling assistant. Given a natural language description, generate one or more scheduled task configurations as JSON.
@@ -535,16 +528,11 @@ Only output the JSON array, nothing else.`;
 
           <div className="space-y-2">
             {generatedTasks.map((task, idx) => (
-              <div
-                key={idx}
-                className="p-3 bg-card border border-border rounded-lg space-y-2"
-              >
+              <div key={idx} className="p-3 bg-card border border-border rounded-lg space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     {generatedTasks.length > 1 && (
-                      <span className="text-xs text-muted-foreground font-mono">
-                        {idx + 1}.
-                      </span>
+                      <span className="text-xs text-muted-foreground font-mono">{idx + 1}.</span>
                     )}
                     <span className="text-sm font-medium">{task.request.name}</span>
                   </div>

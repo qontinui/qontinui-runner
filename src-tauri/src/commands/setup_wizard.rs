@@ -361,6 +361,21 @@ fn build_process_config(
     parser: &str,
     category: &str,
 ) -> Value {
+    // Auto-populate build command based on the run command/framework
+    let (build_cmd, build_args_val): (Option<&str>, Vec<&str>) = match command {
+        "cargo" => (Some("cargo"), vec!["build"]),
+        "npm" | "npx" => (Some("npm"), vec!["run", "build"]),
+        "poetry" => (Some("poetry"), vec!["install"]),
+        "python" => {
+            if parser == "python" {
+                (Some("pip"), vec!["install", "-e", "."])
+            } else {
+                (None, vec![])
+            }
+        }
+        _ => (None, vec![]),
+    };
+
     let mut config = serde_json::json!({
         "id": Uuid::new_v4().to_string(),
         "name": format!("{} ({})", name, framework_label),
@@ -377,6 +392,10 @@ fn build_process_config(
     });
     if let Some(port) = health_port {
         config["health_port"] = serde_json::json!(port);
+    }
+    if let Some(bc) = build_cmd {
+        config["build_command"] = serde_json::json!(bc);
+        config["build_args"] = serde_json::json!(build_args_val);
     }
     config
 }
