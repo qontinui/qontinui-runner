@@ -7,6 +7,8 @@ export { UpdateSettings } from "./UpdateSettings";
 export { AiSettings } from "./AiSettings";
 export { AgenticSettings } from "./AgenticSettings";
 export { SelfHealingSettings } from "./SelfHealingSettings";
+export { OtelSettings } from "./OtelSettings";
+export { ContainerSettings } from "./ContainerSettings";
 export { ExecutionVariablesSettings } from "./ExecutionVariablesSettings";
 export { SectionHeader } from "./SectionHeader";
 export * from "./types";

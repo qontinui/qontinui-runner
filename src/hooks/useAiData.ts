@@ -6,7 +6,12 @@
  */
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 import { aiDataService } from "../services/ai-data-service";
+import {
+  useRunnerEvents,
+  useTaskRunProgress as useTaskRunProgressGql,
+} from "./graphql";
 import type {
   TaskRun,
   JsonlLogsResult,
@@ -31,6 +36,14 @@ import type {
   ProcessSessionOutputLine,
 } from "../types/aiData";
 import type { TaskRunMcpCallsDbResult } from "../types/mcp-config";
+
+// Thin wrappers for GraphQL subscriptions used for cache invalidation
+function useRunnerEventsForInvalidation() {
+  return useRunnerEvents(["TaskRunUpdate", "StepProgress"]);
+}
+function useTaskRunProgressForInvalidation(taskRunId: string, skip: boolean) {
+  return useTaskRunProgressGql(taskRunId, skip);
+}
 
 // Keys for react-query cache
 export const aiDataKeys = {
@@ -67,10 +80,33 @@ export const aiDataKeys = {
 };
 
 /**
- * Hook to get recent task runs
- * Polls more frequently when any task is running to detect completion quickly
+ * Hook to get recent task runs.
+ * Uses GraphQL subscription for instant status updates when tasks are running,
+ * with relaxed polling as fallback (was 3s, now 10s with sub / 30s without).
  */
 export function useTaskRuns(limit?: number) {
+  const queryClient = useQueryClient();
+
+  // GraphQL subscription for real-time task updates — invalidates React Query cache
+  // when any task status changes, replacing aggressive 3s polling
+  const { data: eventData } = useRunnerEventsForInvalidation();
+  const lastEventRef = useRef<string>("");
+  useEffect(() => {
+    const event = eventData?.runnerEvents;
+    if (!event) return;
+    const key = `${event.taskRunId}:${event.status}:${event.__typename}`;
+    if (key !== lastEventRef.current) {
+      lastEventRef.current = key;
+      // Invalidate task runs list so React Query refetches
+      queryClient.invalidateQueries({ queryKey: aiDataKeys.taskRuns() });
+      if (event.taskRunId) {
+        queryClient.invalidateQueries({
+          queryKey: aiDataKeys.taskRun(event.taskRunId),
+        });
+      }
+    }
+  }, [eventData, queryClient]);
+
   return useQuery({
     queryKey: [...aiDataKeys.taskRuns(), limit],
     queryFn: async (): Promise<TaskRun[]> => {
@@ -80,20 +116,40 @@ export function useTaskRuns(limit?: number) {
       }
       return response.data;
     },
-    staleTime: 5000, // 5 seconds
-    // Poll every 3 seconds when any task is running, every 30 seconds otherwise
+    staleTime: 5000,
+    // Relaxed polling — subscription handles real-time; this is fallback
     refetchInterval: (query) => {
       const hasRunningTask = query.state.data?.some((run) => run.status === "running");
-      return hasRunningTask ? 3000 : 30000;
+      return hasRunningTask ? 10000 : 30000;
     },
   });
 }
 
 /**
- * Hook to get a specific task run
- * Polls more frequently when the task is running to detect completion quickly
+ * Hook to get a specific task run.
+ * Uses GraphQL taskRunProgress subscription for instant status updates,
+ * with relaxed polling as fallback.
  */
 export function useTaskRun(taskId: string | null) {
+  const queryClient = useQueryClient();
+  const isRunning = useRef(false);
+
+  // Subscribe to this task's progress when it's running
+  const { data: progressData } = useTaskRunProgressForInvalidation(
+    taskId ?? "",
+    !taskId || !isRunning.current,
+  );
+
+  // Invalidate cache when subscription delivers a status change
+  useEffect(() => {
+    const event = progressData?.taskRunProgress;
+    if (!event || !taskId) return;
+    if (event.__typename === "TaskRunUpdateEvent" || event.__typename === "StepProgressEvent") {
+      queryClient.invalidateQueries({ queryKey: aiDataKeys.taskRun(taskId) });
+      queryClient.invalidateQueries({ queryKey: aiDataKeys.taskRuns() });
+    }
+  }, [progressData, taskId, queryClient]);
+
   const query = useQuery({
     queryKey: aiDataKeys.taskRun(taskId ?? ""),
     queryFn: async (): Promise<TaskRun | null> => {
@@ -105,11 +161,12 @@ export function useTaskRun(taskId: string | null) {
       return response.data;
     },
     enabled: !!taskId,
-    staleTime: 5000, // 5 seconds
-    // Poll every 3 seconds when task is running, stop polling when finished
+    staleTime: 5000,
+    // Relaxed polling — subscription handles real-time updates
     refetchInterval: (query) => {
       const status = query.state.data?.status;
-      return status === "running" ? 3000 : false;
+      isRunning.current = status === "running";
+      return status === "running" ? 10000 : false;
     },
   });
   return query;

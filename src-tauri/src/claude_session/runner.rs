@@ -845,6 +845,44 @@ fn run_claude_session_inline(
                                 );
                             }));
 
+                            // Async-enrich security findings with vulnerability intelligence
+                            if parsed_finding.category == crate::findings::FindingCategory::Security {
+                                let description = finding.description.clone();
+                                let task_run_id = ctx.task_run_id.clone();
+                                let finding_title = finding.title.clone();
+                                tokio::spawn(async move {
+                                    let ka = crate::knowledge_acquisition::KnowledgeAcquisition::new();
+                                    if let Some(data) = crate::knowledge_acquisition::vuln_enrichment::enrich_from_description(&description, &ka).await {
+                                        tracing::info!(
+                                            "[knowledge_acquisition] Enriched security finding '{}': {} CVEs, exploit_available={}",
+                                            finding_title,
+                                            data.cve_ids.len(),
+                                            data.exploit_available
+                                        );
+                                        // Store enrichment as task_knowledge for retrieval
+                                        if let Ok(db) = crate::database::CheckpointDb::new() {
+                                            let content = format!(
+                                                "## Vulnerability Enrichment: {}\n\n{}",
+                                                finding_title,
+                                                data.to_markdown()
+                                            );
+                                            if let Err(e) = db.create_task_knowledge(
+                                                &task_run_id,
+                                                "vulnerability_enrichment",
+                                                "system",
+                                                0,
+                                                &content,
+                                                None,
+                                                "high",
+                                                &[],
+                                            ) {
+                                                tracing::warn!("[knowledge_acquisition] Failed to store enrichment: {}", e);
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+
                             detected_findings.push(finding);
                         }
                         Err(e) => {

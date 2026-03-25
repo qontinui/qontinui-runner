@@ -8,6 +8,7 @@
 //! 2. `is_meta_optimizer` column check on source task run
 //! 3. `is_fixer` / `is_reflection` / `is_follow_up` column checks on source
 
+use tauri::Emitter;
 use tracing::{debug, info, warn};
 
 use super::types::{MetaOptimizerDeps, OptimizerType};
@@ -196,7 +197,7 @@ pub fn check_and_launch_optimizers(
     auto_evaluate_outcomes(db);
 
     // Auto-evaluate canary rollouts and promote/rollback when threshold is met.
-    auto_evaluate_canaries(db);
+    auto_evaluate_canaries(db, Some(&deps.app_handle));
 
     // Run data-driven cost optimization analysis (no AI session needed).
     // Generates recommendations for high-token agents, cost concentration, etc.
@@ -271,7 +272,10 @@ fn auto_evaluate_outcomes(db: &CheckpointDb) {
 
 /// Check active canary rollouts and auto-promote or rollback when the minimum
 /// sample size threshold (10 canary runs) is met.
-fn auto_evaluate_canaries(db: &CheckpointDb) {
+///
+/// When `app_handle` is provided and a rollback verdict is reached, a
+/// `canary-alert` Tauri event is emitted so the frontend can show a notification.
+fn auto_evaluate_canaries(db: &CheckpointDb, app_handle: Option<&tauri::AppHandle>) {
     let canaries = match super::canary::get_active_canaries(db) {
         Ok(c) => c,
         Err(_) => return,
@@ -300,6 +304,24 @@ fn auto_evaluate_canaries(db: &CheckpointDb) {
                             canary.id, eval.delta, eval.canary_success_rate, eval.baseline_success_rate,
                             eval.p_value, eval.cost_delta_pct
                         );
+
+                    // Emit canary-alert event to the frontend before rolling back
+                    if let Some(handle) = app_handle {
+                        let payload = serde_json::json!({
+                            "canary_id": canary.id,
+                            "recommendation_id": canary.recommendation_id,
+                            "verdict": "rollback",
+                            "message": "Canary detected significant regression",
+                            "p_value": eval.p_value,
+                            "delta": eval.delta,
+                            "baseline_success_rate": eval.baseline_success_rate,
+                            "canary_success_rate": eval.canary_success_rate,
+                        });
+                        if let Err(e) = handle.emit("canary-alert", &payload) {
+                            warn!("Failed to emit canary-alert event: {}", e);
+                        }
+                    }
+
                     if let Err(e) =
                         super::canary::rollback_canary_with_eval(db, &canary.id, Some(&eval))
                     {

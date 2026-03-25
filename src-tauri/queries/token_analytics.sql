@@ -79,3 +79,29 @@ SELECT COUNT(DISTINCT provider_used)::bigint as count
 FROM phase_token_usage
 WHERE created_at >= NOW() - make_interval(days => :days)
   AND provider_used IS NOT NULL;
+
+--! get_cost_by_target_app
+SELECT COALESCE(target_app, '(no app)') as target_app,
+       COALESCE(SUM(cost_cents), 0)::bigint as total_cost_cents,
+       COALESCE(SUM(input_tokens), 0)::bigint as total_input_tokens,
+       COALESCE(SUM(output_tokens), 0)::bigint as total_output_tokens,
+       COUNT(*)::bigint as call_count,
+       COALESCE(AVG(duration_ms), 0)::bigint as avg_duration_ms
+FROM phase_token_usage
+WHERE created_at >= NOW() - make_interval(days => :days)
+  AND target_app IS NOT NULL
+GROUP BY target_app
+ORDER BY SUM(cost_cents) DESC;
+
+--! get_cost_by_target_page
+SELECT COALESCE(target_page_url, '(no page)') as target_page_url,
+       COALESCE(SUM(cost_cents), 0)::bigint as total_cost_cents,
+       COALESCE(SUM(input_tokens), 0)::bigint as total_input_tokens,
+       COALESCE(SUM(output_tokens), 0)::bigint as total_output_tokens,
+       COUNT(*)::bigint as call_count
+FROM phase_token_usage
+WHERE created_at >= NOW() - make_interval(days => :days)
+  AND target_page_url IS NOT NULL
+GROUP BY target_page_url
+ORDER BY SUM(cost_cents) DESC
+LIMIT 50;

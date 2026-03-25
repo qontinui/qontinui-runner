@@ -922,6 +922,7 @@ impl CheckpointDb {
             None => return Ok(None),
         };
 
+        // TODO: Wire to PG when orchestrator_ops callers go async
         let events = self.get_task_run_events(&task.id, None, None)?;
         Ok(Some((task, events)))
     }

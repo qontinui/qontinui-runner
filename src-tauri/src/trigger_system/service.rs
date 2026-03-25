@@ -87,6 +87,80 @@ impl TriggerService {
             error!("Failed to register trigger watchers: {}", e);
         }
 
+        // Subscribe to workflow event bus for reactive chain triggers.
+        // When a workflow completes/fails, the event bus fires and we convert
+        // the WorkflowEvent into TriggerEvents for matching WorkflowChain triggers.
+        {
+            let bus = crate::workflow_event_bus::get_workflow_event_bus();
+            let mut event_rx = bus.subscribe_broadcast();
+            let event_tx_clone = self.event_tx.clone();
+            let db = self.deps.app_state.checkpoint_db.clone();
+            let stop = self.stop_signal.clone();
+            tokio::spawn(async move {
+                loop {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match event_rx.recv().await {
+                        Ok(event) => {
+                            if event.name.starts_with("workflow.") {
+                                let status = match event.name.as_str() {
+                                    "workflow.completed" => "completed",
+                                    "workflow.failed" => "failed",
+                                    _ => continue,
+                                };
+                                let task_run_id = event
+                                    .source
+                                    .task_run_id
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let workflow_id = event
+                                    .source
+                                    .workflow_id
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                    .to_string();
+
+                                if workflow_id.is_empty() {
+                                    debug!(
+                                        "Skipping chain trigger check: no workflow_id in event '{}'",
+                                        event.name
+                                    );
+                                    continue;
+                                }
+
+                                // Delegate to the existing chain-matching logic, which
+                                // loads triggers from DB, filters by source_workflow_id
+                                // and on_status, and sends TriggerEvents through the channel.
+                                super::watchers::workflow_chain::check_workflow_chains(
+                                    &db,
+                                    &event_tx_clone,
+                                    &workflow_id,
+                                    &task_run_id,
+                                    status,
+                                    None,
+                                )
+                                .await;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(
+                                "TriggerService event bus subscriber lagged, missed {} events",
+                                n
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            info!("TriggerService: workflow event bus closed");
+                            break;
+                        }
+                    }
+                }
+                debug!("TriggerService: event bus bridge task exiting");
+            });
+            info!("TriggerService: subscribed to workflow event bus for chain triggers");
+        }
+
         // Take the receiver (can only be called once)
         let mut rx = match self.event_rx.lock().await.take() {
             Some(rx) => rx,

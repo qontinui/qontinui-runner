@@ -8,6 +8,7 @@ export interface TranscriptSession {
   config_dir: string;
   message_count: number;
   last_modified: string;
+  started_at: string | null;
   first_message_preview: string | null;
   has_plans: boolean;
   display_name: string;

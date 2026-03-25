@@ -187,6 +187,78 @@ pub struct GetTokenUsageTotals {
     pub total_calls: i64,
     pub avg_duration_ms: i64,
 }
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GetCostByTargetApp {
+    pub target_app: String,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub call_count: i64,
+    pub avg_duration_ms: i64,
+}
+pub struct GetCostByTargetAppBorrowed<'a> {
+    pub target_app: &'a str,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub call_count: i64,
+    pub avg_duration_ms: i64,
+}
+impl<'a> From<GetCostByTargetAppBorrowed<'a>> for GetCostByTargetApp {
+    fn from(
+        GetCostByTargetAppBorrowed {
+            target_app,
+            total_cost_cents,
+            total_input_tokens,
+            total_output_tokens,
+            call_count,
+            avg_duration_ms,
+        }: GetCostByTargetAppBorrowed<'a>,
+    ) -> Self {
+        Self {
+            target_app: target_app.into(),
+            total_cost_cents,
+            total_input_tokens,
+            total_output_tokens,
+            call_count,
+            avg_duration_ms,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GetCostByTargetPage {
+    pub target_page_url: String,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub call_count: i64,
+}
+pub struct GetCostByTargetPageBorrowed<'a> {
+    pub target_page_url: &'a str,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub call_count: i64,
+}
+impl<'a> From<GetCostByTargetPageBorrowed<'a>> for GetCostByTargetPage {
+    fn from(
+        GetCostByTargetPageBorrowed {
+            target_page_url,
+            total_cost_cents,
+            total_input_tokens,
+            total_output_tokens,
+            call_count,
+        }: GetCostByTargetPageBorrowed<'a>,
+    ) -> Self {
+        Self {
+            target_page_url: target_page_url.into(),
+            total_cost_cents,
+            total_input_tokens,
+            total_output_tokens,
+            call_count,
+        }
+    }
+}
 use crate::client::async_::GenericClient;
 use futures::{self, StreamExt, TryStreamExt};
 pub struct GetDailyCostQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
@@ -656,6 +728,142 @@ where
         Ok(mapped)
     }
 }
+pub struct GetCostByTargetAppQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+    client: &'c C,
+    params: [&'a (dyn postgres_types::ToSql + Sync); N],
+    query: &'static str,
+    cached: Option<&'s tokio_postgres::Statement>,
+    extractor:
+        fn(&tokio_postgres::Row) -> Result<GetCostByTargetAppBorrowed, tokio_postgres::Error>,
+    mapper: fn(GetCostByTargetAppBorrowed) -> T,
+}
+impl<'c, 'a, 's, C, T: 'c, const N: usize> GetCostByTargetAppQuery<'c, 'a, 's, C, T, N>
+where
+    C: GenericClient,
+{
+    pub fn map<R>(
+        self,
+        mapper: fn(GetCostByTargetAppBorrowed) -> R,
+    ) -> GetCostByTargetAppQuery<'c, 'a, 's, C, R, N> {
+        GetCostByTargetAppQuery {
+            client: self.client,
+            params: self.params,
+            query: self.query,
+            cached: self.cached,
+            extractor: self.extractor,
+            mapper,
+        }
+    }
+    pub async fn one(self) -> Result<T, tokio_postgres::Error> {
+        let row =
+            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        Ok((self.mapper)((self.extractor)(&row)?))
+    }
+    pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
+        self.iter().await?.try_collect().await
+    }
+    pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
+        let opt_row =
+            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
+        Ok(opt_row
+            .map(|row| {
+                let extracted = (self.extractor)(&row)?;
+                Ok((self.mapper)(extracted))
+            })
+            .transpose()?)
+    }
+    pub async fn iter(
+        self,
+    ) -> Result<
+        impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + 'c,
+        tokio_postgres::Error,
+    > {
+        let stream = crate::client::async_::raw(
+            self.client,
+            self.query,
+            crate::slice_iter(&self.params),
+            self.cached,
+        )
+        .await?;
+        let mapped = stream
+            .map(move |res| {
+                res.and_then(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+            })
+            .into_stream();
+        Ok(mapped)
+    }
+}
+pub struct GetCostByTargetPageQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+    client: &'c C,
+    params: [&'a (dyn postgres_types::ToSql + Sync); N],
+    query: &'static str,
+    cached: Option<&'s tokio_postgres::Statement>,
+    extractor:
+        fn(&tokio_postgres::Row) -> Result<GetCostByTargetPageBorrowed, tokio_postgres::Error>,
+    mapper: fn(GetCostByTargetPageBorrowed) -> T,
+}
+impl<'c, 'a, 's, C, T: 'c, const N: usize> GetCostByTargetPageQuery<'c, 'a, 's, C, T, N>
+where
+    C: GenericClient,
+{
+    pub fn map<R>(
+        self,
+        mapper: fn(GetCostByTargetPageBorrowed) -> R,
+    ) -> GetCostByTargetPageQuery<'c, 'a, 's, C, R, N> {
+        GetCostByTargetPageQuery {
+            client: self.client,
+            params: self.params,
+            query: self.query,
+            cached: self.cached,
+            extractor: self.extractor,
+            mapper,
+        }
+    }
+    pub async fn one(self) -> Result<T, tokio_postgres::Error> {
+        let row =
+            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        Ok((self.mapper)((self.extractor)(&row)?))
+    }
+    pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
+        self.iter().await?.try_collect().await
+    }
+    pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
+        let opt_row =
+            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
+        Ok(opt_row
+            .map(|row| {
+                let extracted = (self.extractor)(&row)?;
+                Ok((self.mapper)(extracted))
+            })
+            .transpose()?)
+    }
+    pub async fn iter(
+        self,
+    ) -> Result<
+        impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + 'c,
+        tokio_postgres::Error,
+    > {
+        let stream = crate::client::async_::raw(
+            self.client,
+            self.query,
+            crate::slice_iter(&self.params),
+            self.cached,
+        )
+        .await?;
+        let mapped = stream
+            .map(move |res| {
+                res.and_then(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+            })
+            .into_stream();
+        Ok(mapped)
+    }
+}
 pub struct GetDailyCostStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_daily_cost() -> GetDailyCostStmt {
     GetDailyCostStmt(
@@ -971,6 +1179,87 @@ impl GetUniqueProvidersCountStmt {
             cached: self.1.as_ref(),
             extractor: |row| Ok(row.try_get(0)?),
             mapper: |it| it,
+        }
+    }
+}
+pub struct GetCostByTargetAppStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn get_cost_by_target_app() -> GetCostByTargetAppStmt {
+    GetCostByTargetAppStmt(
+        "SELECT COALESCE(target_app, '(no app)') as target_app, COALESCE(SUM(cost_cents), 0)::bigint as total_cost_cents, COALESCE(SUM(input_tokens), 0)::bigint as total_input_tokens, COALESCE(SUM(output_tokens), 0)::bigint as total_output_tokens, COUNT(*)::bigint as call_count, COALESCE(AVG(duration_ms), 0)::bigint as avg_duration_ms FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) AND target_app IS NOT NULL GROUP BY target_app ORDER BY SUM(cost_cents) DESC",
+        None,
+    )
+}
+impl GetCostByTargetAppStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient>(
+        &'s self,
+        client: &'c C,
+        days: &'a i32,
+    ) -> GetCostByTargetAppQuery<'c, 'a, 's, C, GetCostByTargetApp, 1> {
+        GetCostByTargetAppQuery {
+            client,
+            params: [days],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<GetCostByTargetAppBorrowed, tokio_postgres::Error> {
+                Ok(GetCostByTargetAppBorrowed {
+                    target_app: row.try_get(0)?,
+                    total_cost_cents: row.try_get(1)?,
+                    total_input_tokens: row.try_get(2)?,
+                    total_output_tokens: row.try_get(3)?,
+                    call_count: row.try_get(4)?,
+                    avg_duration_ms: row.try_get(5)?,
+                })
+            },
+            mapper: |it| GetCostByTargetApp::from(it),
+        }
+    }
+}
+pub struct GetCostByTargetPageStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn get_cost_by_target_page() -> GetCostByTargetPageStmt {
+    GetCostByTargetPageStmt(
+        "SELECT COALESCE(target_page_url, '(no page)') as target_page_url, COALESCE(SUM(cost_cents), 0)::bigint as total_cost_cents, COALESCE(SUM(input_tokens), 0)::bigint as total_input_tokens, COALESCE(SUM(output_tokens), 0)::bigint as total_output_tokens, COUNT(*)::bigint as call_count FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) AND target_page_url IS NOT NULL GROUP BY target_page_url ORDER BY SUM(cost_cents) DESC LIMIT 50",
+        None,
+    )
+}
+impl GetCostByTargetPageStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient>(
+        &'s self,
+        client: &'c C,
+        days: &'a i32,
+    ) -> GetCostByTargetPageQuery<'c, 'a, 's, C, GetCostByTargetPage, 1> {
+        GetCostByTargetPageQuery {
+            client,
+            params: [days],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<GetCostByTargetPageBorrowed, tokio_postgres::Error> {
+                Ok(GetCostByTargetPageBorrowed {
+                    target_page_url: row.try_get(0)?,
+                    total_cost_cents: row.try_get(1)?,
+                    total_input_tokens: row.try_get(2)?,
+                    total_output_tokens: row.try_get(3)?,
+                    call_count: row.try_get(4)?,
+                })
+            },
+            mapper: |it| GetCostByTargetPage::from(it),
         }
     }
 }

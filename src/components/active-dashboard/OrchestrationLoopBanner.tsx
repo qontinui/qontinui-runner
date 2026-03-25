@@ -7,10 +7,11 @@
  * Hidden when no orchestration loop is running.
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "../../lib/utils";
 import { Repeat, Square, Zap } from "lucide-react";
+import { useOrchestrationLoopStream } from "@/hooks/graphql";
 
 interface OrchestrationLoopStatus {
   running: boolean;
@@ -61,6 +62,10 @@ const PHASE_LABELS: Record<string, string> = {
 
 export function OrchestrationLoopBanner() {
   const [status, setStatus] = useState<OrchestrationLoopStatus | null>(null);
+  const lastPhaseRef = useRef<string>("");
+
+  // GraphQL subscription for lightweight real-time phase/iteration updates (2s push)
+  const { data: subData } = useOrchestrationLoopStream(2000);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -71,11 +76,23 @@ export function OrchestrationLoopBanner() {
     }
   }, []);
 
+  // Fetch full status via Tauri on mount
   useEffect(() => {
     fetchStatus();
-    const interval = setInterval(fetchStatus, 3000);
-    return () => clearInterval(interval);
   }, [fetchStatus]);
+
+  // When subscription delivers a phase/iteration change, refetch rich data from Tauri.
+  // This replaces the 3s setInterval with event-driven updates.
+  useEffect(() => {
+    const sub = subData?.orchestrationLoopStatusStream;
+    if (!sub) return;
+
+    const key = `${sub.running}:${sub.phase}:${sub.currentIteration}`;
+    if (key !== lastPhaseRef.current) {
+      lastPhaseRef.current = key;
+      fetchStatus();
+    }
+  }, [subData, fetchStatus]);
 
   // Only show when loop is running or just completed/errored
   if (!status || (!status.running && status.phase === "idle")) {

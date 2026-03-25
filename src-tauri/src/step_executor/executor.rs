@@ -299,6 +299,16 @@ impl StepExecutor {
             duration_ms,
         };
 
+        // PG-primary: fire-and-forget async write to PostgreSQL
+        if let Some(pg) = &self.app_state.pg_db {
+            let pg = pg.clone();
+            let event_clone = event_input.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pg.create_task_run_event(&event_clone).await {
+                    tracing::warn!("PG event write failed: {}", e);
+                }
+            });
+        }
         if let Err(e) = self
             .app_state
             .checkpoint_db
@@ -587,6 +597,31 @@ impl StepExecutor {
             }
 
             let ended_at = chrono::Utc::now().to_rfc3339();
+
+            // Link any findings detected during this step's execution window
+            if let Some(ref task_run_id) = self.task_run_id {
+                if let Ok(conn) = self.app_state.checkpoint_db.connection() {
+                    match crate::database::graph_ops::link_findings_to_steps_by_timestamp(
+                        &conn,
+                        task_run_id,
+                        &step_name,
+                        index as i32,
+                        &started_at,
+                        &ended_at,
+                    ) {
+                        Ok(count) if count > 0 => {
+                            info!(
+                                "Linked {} findings to step '{}' (index {})",
+                                count, step_name, index
+                            );
+                        }
+                        Ok(_) => {} // No findings to link
+                        Err(e) => {
+                            warn!("Failed to link findings to step '{}': {}", step_name, e);
+                        }
+                    }
+                }
+            }
 
             results.push(StepExecutionResult {
                 step_index: index,

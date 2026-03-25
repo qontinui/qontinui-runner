@@ -294,3 +294,138 @@ export function useGraphAnalyticsRefresh() {
   const queryClient = useQueryClient();
   return () => queryClient.invalidateQueries({ queryKey: graphAnalyticsKeys.all });
 }
+
+// ============================================================================
+// Analytics types (Phase 1 + 2)
+// ============================================================================
+
+export interface DecayCurveBucket {
+  bucket: number;
+  total: number;
+  successes: number;
+  success_rate: number;
+}
+
+export interface ActionBaseline {
+  action: string;
+  count: number;
+  avg_duration_ms: number | null;
+  min_duration_ms: number | null;
+  max_duration_ms: number | null;
+  success_rate: number;
+}
+
+export interface FailureCluster {
+  error_message: string;
+  count: number;
+  affected_elements: string;
+}
+
+export interface ElementFragility {
+  element_id: string;
+  bounds: string | null;
+  interaction_count: number;
+  success_rate: number;
+}
+
+export interface AutomationRegression {
+  element_id: string;
+  action: string;
+  prior_success_rate: number;
+  recent_success_rate: number;
+  delta: number;
+}
+
+export interface StallFrequencyRow {
+  pattern_type: string;
+  count: number;
+}
+
+export interface InterventionStatsRow {
+  intervention_action: string;
+  total: number;
+  successful: number;
+  success_rate: number;
+}
+
+// ============================================================================
+// Analytics hooks (Phase 1)
+// ============================================================================
+
+/** Selector success rate decay curve over time windows. */
+export function useDecayCurve(elementId: string, windowMs = 86_400_000, windows = 7) {
+  return useQuery({
+    queryKey: [...graphAnalyticsKeys.all, "decay-curve", elementId, windowMs, windows] as const,
+    queryFn: () =>
+      fetchJson<DecayCurveBucket[]>(
+        `/ui-bridge/analytics/decay-curve?element_id=${encodeURIComponent(elementId)}&window_ms=${windowMs}&windows=${windows}`
+      ),
+    staleTime: 30_000,
+    enabled: !!elementId,
+  });
+}
+
+/** Per-action-type latency and success baselines. */
+export function useActionBaselines(days = 7) {
+  return useQuery({
+    queryKey: [...graphAnalyticsKeys.all, "action-baselines", days] as const,
+    queryFn: () => fetchJson<ActionBaseline[]>(`/ui-bridge/analytics/action-baselines?days=${days}`),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+}
+
+/** Failure clusters grouped by error message. */
+export function useFailureTaxonomy(days = 7) {
+  return useQuery({
+    queryKey: [...graphAnalyticsKeys.all, "failure-taxonomy", days] as const,
+    queryFn: () => fetchJson<FailureCluster[]>(`/ui-bridge/analytics/failure-taxonomy?days=${days}`),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+}
+
+/** Element fragility data with bounds for heatmap visualization. */
+export function useFragilityHeatmap(days = 7) {
+  return useQuery({
+    queryKey: [...graphAnalyticsKeys.all, "fragility-heatmap", days] as const,
+    queryFn: () => fetchJson<ElementFragility[]>(`/ui-bridge/analytics/fragility-heatmap?days=${days}`),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+}
+
+// ============================================================================
+// Analytics hooks (Phase 2)
+// ============================================================================
+
+/** Detect element+action pairs that degraded between runs. */
+export function useAutomationRegressions(days = 7) {
+  return useQuery({
+    queryKey: [...graphAnalyticsKeys.all, "regressions", days] as const,
+    queryFn: () => fetchJson<AutomationRegression[]>(`/ui-bridge/analytics/regressions?days=${days}`),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+}
+
+/** Stall frequency grouped by pattern type. */
+export function useStallFrequency(days = 7) {
+  return useQuery({
+    queryKey: [...graphAnalyticsKeys.all, "stall-frequency", days] as const,
+    queryFn: () => fetchJson<StallFrequencyRow[]>(`/ui-bridge/analytics/stall-frequency?days=${days}`),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+}
+
+/** Intervention action effectiveness. */
+export function useInterventionEffectiveness(days = 7) {
+  return useQuery({
+    queryKey: [...graphAnalyticsKeys.all, "intervention-effectiveness", days] as const,
+    queryFn: () =>
+      fetchJson<InterventionStatsRow[]>(`/ui-bridge/analytics/intervention-effectiveness?days=${days}`),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+}

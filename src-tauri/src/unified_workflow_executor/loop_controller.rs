@@ -635,8 +635,46 @@ impl LoopController {
         start: std::time::Instant,
         resume_point: &ResumePoint,
     ) -> WorkflowResult {
-        // Record flow control start for concurrency tracking
+        // Load and enforce flow control from the workflow's flow_control_json
         let flow_enforcer = crate::flow_control::get_flow_control_enforcer();
+        let flow_control: crate::flow_control::FlowControl = match self
+            .checkpoint_db
+            .get_unified_workflow(&config.workflow_id)
+        {
+            Ok(Some(workflow)) => match &workflow.flow_control_json {
+                Some(json) => serde_json::from_str(json).unwrap_or_default(),
+                None => crate::flow_control::FlowControl::default(),
+            },
+            _ => crate::flow_control::FlowControl::default(),
+        };
+
+        match flow_enforcer.check(&config.workflow_id, &flow_control).await {
+            crate::flow_control::FlowControlDecision::Allow => {}
+            crate::flow_control::FlowControlDecision::Skip { reason } => {
+                warn!("Workflow {} skipped by flow control: {}", config.workflow_id, reason);
+                return WorkflowResult {
+                    success: false,
+                    verification_passed: false,
+                    step_results: all_step_results,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    loop_result: None,
+                    worktree_path: config.worktree_path.clone(),
+                    worktree_branch: config.worktree_branch.clone(),
+                    workflow_architecture: config.workflow_architecture.clone(),
+                    agentic_verification_config: config.agentic_verification_config.clone(),
+                    multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                };
+            }
+            crate::flow_control::FlowControlDecision::Wait { wait_ms, reason } => {
+                info!(
+                    "Workflow {} throttled: {} (waiting {}ms)",
+                    config.workflow_id, reason, wait_ms
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
+            }
+        }
+
+        // Record flow control start for concurrency tracking (after admission)
         flow_enforcer.record_start(&config.workflow_id, None).await;
 
         let total_stages = config.stages.len();
@@ -2101,6 +2139,52 @@ impl LoopController {
             }
         }
 
+        // Cross-run analysis after reflection completes
+        // When a reflection workflow finishes, run post_run_analysis to detect
+        // recurring patterns, disable ineffective rules, and auto-apply fixes.
+        if config.reflection_mode {
+            let cra_db = self.checkpoint_db.clone();
+            let cra_task_run_id = config.execution_id.clone();
+            let cra_workflow_name = config.workflow_name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = cra_db.with_conn(|conn| {
+                    // Look up the source workflow name from the reflection_source_task_run_id
+                    let source_wf_name: String = conn
+                        .query_row(
+                            r#"SELECT COALESCE(
+                                (SELECT workflow_name FROM task_runs WHERE id = (
+                                    SELECT reflection_source_task_run_id FROM task_runs WHERE id = ?1
+                                )),
+                                ?2
+                            )"#,
+                            rusqlite::params![cra_task_run_id, cra_workflow_name],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or_else(|_| cra_workflow_name.clone());
+
+                    match crate::reflection::cross_run_learning::post_run_analysis(
+                        conn,
+                        &source_wf_name,
+                        &cra_task_run_id,
+                    ) {
+                        Ok((patterns, rules, fixes)) => {
+                            info!(
+                                "Cross-run analysis after reflection: {} patterns, {} rules disabled, {} fixes applied",
+                                patterns, rules, fixes
+                            );
+                            Ok(())
+                        }
+                        Err(e) => {
+                            warn!("Cross-run analysis failed after reflection: {}", e);
+                            Ok(())
+                        }
+                    }
+                }) {
+                    warn!("Cross-run analysis DB error: {}", e);
+                }
+            });
+        }
+
         // Auto-run generated workflow (for "Generate & Run" flow)
         // Always attempt if auto_run_generated is set — don't gate on overall_passed.
         // The save_workflow_artifact step already gates on stage completion, so if
@@ -2136,7 +2220,9 @@ impl LoopController {
             });
         }
 
-        // Aggregate phase token usage totals for the task run
+        // Aggregate phase token usage totals for the task run.
+        // Stays on SQLite: task_runs table not yet migrated to PG (only a stub exists).
+        // Move to PG when task_runs migration completes.
         if let Err(e) = self
             .checkpoint_db
             .update_task_run_token_totals(&config.execution_id)

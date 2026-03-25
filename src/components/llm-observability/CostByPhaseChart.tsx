@@ -4,6 +4,7 @@
  * Horizontal bar chart showing cost breakdown by workflow phase.
  */
 
+import { useMemo } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { Layers } from "lucide-react";
 import type { PhaseCostRow } from "./types";
@@ -43,14 +44,18 @@ function CustomTooltip({
 }
 
 export function CostByPhaseChart({ data }: CostByPhaseChartProps) {
-  const chartData: ChartData[] = data
-    .map((row) => ({
-      phase: row.phase,
-      cost: row.total_cost_cents / 100,
-      inputTokens: row.total_input_tokens,
-      outputTokens: row.total_output_tokens,
-    }))
-    .sort((a, b) => b.cost - a.cost);
+  const chartData: ChartData[] = useMemo(
+    () =>
+      data
+        .map((row) => ({
+          phase: row.phase,
+          cost: row.total_cost_cents / 100,
+          inputTokens: row.total_input_tokens,
+          outputTokens: row.total_output_tokens,
+        }))
+        .sort((a, b) => b.cost - a.cost),
+    [data],
+  );
 
   if (chartData.length === 0) {
     return (
@@ -91,7 +96,7 @@ export function CostByPhaseChart({ data }: CostByPhaseChartProps) {
               width={leftMargin - 10}
             />
             <Tooltip content={<CustomTooltip />} />
-            <Bar dataKey="cost" fill="#8B5CF6" radius={[0, 4, 4, 0]} maxBarSize={20} />
+            <Bar dataKey="cost" fill="hsl(var(--secondary))" radius={[0, 4, 4, 0]} maxBarSize={20} />
           </BarChart>
         </ResponsiveContainer>
       </div>

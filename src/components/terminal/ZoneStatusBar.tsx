@@ -86,6 +86,8 @@ interface ZoneStatusBarProps {
   onSetActiveTagFilters?: (filters: Set<string>) => void;
   allTags?: string[];
   lastOutputLines?: Record<string, string[]>;
+  // Session manager
+  frozenSessionCount?: number;
   // Action bar props (always visible)
   showSidebar: boolean;
   onToggleSidebar: () => void;
@@ -152,6 +154,7 @@ export function ZoneStatusBar({
   assignments,
   stateDurations,
   lastOutputLines,
+  frozenSessionCount,
   showSidebar,
   onToggleSidebar,
   isGenerating,
@@ -249,6 +252,11 @@ export function ZoneStatusBar({
       >
         {showSidebar ? <PanelLeft className="w-3 h-3" /> : <FileText className="w-3 h-3" />}
         {showSidebar ? "Hide" : "Sessions"}
+        {!showSidebar && frozenSessionCount != null && frozenSessionCount > 0 && (
+          <span className="ml-0.5 px-1 py-0 rounded-full text-[9px] font-bold bg-[#f7768e] text-[#13141f] leading-tight">
+            {frozenSessionCount}
+          </span>
+        )}
       </button>
 
       {onOpenDocFile && (

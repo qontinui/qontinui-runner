@@ -72,6 +72,12 @@ export type MainTabId =
   | "image-quality-tests"
   | "terminal"
   | "llm-analytics"
+  | "evaluation"
+  | "element-reliability"
+  | "pipeline-events"
+  | "rule-influence"
+  | "unified-search"
+  | "workflow-versions"
   | "help";
 
 const VALID_TAB_IDS: MainTabId[] = [
@@ -146,6 +152,12 @@ const VALID_TAB_IDS: MainTabId[] = [
   "image-quality-tests",
   "terminal",
   "llm-analytics",
+  "evaluation",
+  "element-reliability",
+  "pipeline-events",
+  "rule-influence",
+  "unified-search",
+  "workflow-versions",
   "help",
 ];
 

@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Loader2, History, ChevronDown, ChevronUp } from "lucide-react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { useTaskRunProgress } from "@/hooks/graphql";
 
 interface ApprovalRequest {
   id: string;
@@ -52,7 +53,12 @@ export function ApprovalDialog({ taskRunId, onResolved }: ApprovalDialogProps) {
   const commentRef = useRef<HTMLTextAreaElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
 
-  // Poll for pending approvals + listen for Tauri events
+  // GraphQL subscription triggers re-fetch on task progress events
+  const { data: progressData } = useTaskRunProgress(taskRunId);
+  const lastProgressKeyRef = useRef("");
+
+  // Poll for pending approvals — subscription replaces aggressive 3s polling
+  const pollRef = useRef<() => Promise<void>>(undefined);
   useEffect(() => {
     let cancelled = false;
 
@@ -87,14 +93,15 @@ export function ApprovalDialog({ taskRunId, onResolved }: ApprovalDialogProps) {
         // API not available, ignore
       }
     };
+    pollRef.current = poll;
 
     poll();
-    const interval = setInterval(poll, 3000);
+    // Relaxed from 3s to 10s — subscription handles real-time events
+    const interval = setInterval(poll, 10000);
 
     // Also listen for Tauri "approval-required" events for instant notification
     let unlisten: (() => void) | undefined;
     listen("approval-required", () => {
-      // Immediately re-poll when we get the event
       poll();
     }).then((fn) => {
       unlisten = fn;
@@ -106,6 +113,17 @@ export function ApprovalDialog({ taskRunId, onResolved }: ApprovalDialogProps) {
       unlisten?.();
     };
   }, [taskRunId]);
+
+  // Re-fetch approvals immediately when subscription delivers a step progress event
+  useEffect(() => {
+    const event = progressData?.taskRunProgress;
+    if (!event) return;
+    const key = `${event.__typename}:${event.status}:${event.timestamp}`;
+    if (key !== lastProgressKeyRef.current) {
+      lastProgressKeyRef.current = key;
+      pollRef.current?.();
+    }
+  }, [progressData]);
 
   const handleRespond = useCallback(
     async (approvalId: string, action: string) => {

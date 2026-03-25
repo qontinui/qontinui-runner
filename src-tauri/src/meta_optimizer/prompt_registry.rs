@@ -205,6 +205,47 @@ pub fn list_variants(
     })
 }
 
+/// Get a prompt variant by agent_type and version number.
+/// Returns None if no variant with that version exists.
+pub fn get_prompt_by_version(
+    db: &CheckpointDb,
+    agent_type: &str,
+    version: i32,
+) -> Result<Option<PromptVariant>, String> {
+    let agent_type = agent_type.to_string();
+    db.with_conn(move |conn| {
+        let result = conn.query_row(
+            r#"SELECT id, agent_type, variant_name, prompt_content, version,
+                      is_active, source_recommendation_id, performance_metrics,
+                      created_at, updated_at
+               FROM prompt_registry
+               WHERE agent_type = ?1 AND version = ?2
+               LIMIT 1"#,
+            params![agent_type, version],
+            |row| {
+                Ok(PromptVariant {
+                    id: row.get(0)?,
+                    agent_type: row.get(1)?,
+                    variant_name: row.get(2)?,
+                    prompt_content: row.get(3)?,
+                    version: row.get(4)?,
+                    is_active: row.get::<_, i32>(5)? != 0,
+                    source_recommendation_id: row.get(6)?,
+                    performance_metrics: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(variant) => Ok(Some(variant)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get prompt by version: {}", e)),
+        }
+    })
+}
+
 /// Update performance metrics for a prompt variant.
 pub fn update_performance_metrics(
     db: &CheckpointDb,

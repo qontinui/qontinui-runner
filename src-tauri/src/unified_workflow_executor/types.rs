@@ -436,7 +436,11 @@ impl LoopConfig {
             routing_context: Default::default(),
             project_path: crate::mcp::shared::current_project_path(),
             acceptance_criteria: workflow.acceptance_criteria.clone(),
-            phase_timeout_ms: None,
+            phase_timeout_ms: workflow.phase_timeouts_json.as_ref().and_then(|json| {
+                serde_json::from_str::<crate::orchestrator::state::PhaseTimeouts>(json)
+                    .ok()
+                    .and_then(|pt| pt.execution_ms)
+            }),
         }
     }
 

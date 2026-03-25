@@ -146,11 +146,9 @@ impl LoopController {
                 });
             }
 
-            // Check workflow chain triggers
-            if let Some(wf_id) = workflow_id {
-                self.check_chain_triggers(execution_id, wf_id, "completed")
-                    .await;
-            }
+            // Chain triggers are now handled reactively via the TriggerService's
+            // event bus subscription (see trigger_system/service.rs start()).
+            // The emit below fires the event that the bridge picks up.
 
             // Emit workflow.completed event on the event bus
             let bus = get_workflow_event_bus().clone();
@@ -201,11 +199,9 @@ impl LoopController {
                 }
             });
 
-            // Check workflow chain triggers
-            if let Some(wf_id) = workflow_id {
-                self.check_chain_triggers(execution_id, wf_id, "failed")
-                    .await;
-            }
+            // Chain triggers are now handled reactively via the TriggerService's
+            // event bus subscription (see trigger_system/service.rs start()).
+            // The emit below fires the event that the bridge picks up.
 
             // Emit workflow.failed event on the event bus
             let bus = get_workflow_event_bus().clone();
@@ -226,6 +222,10 @@ impl LoopController {
     }
 
     /// Fire-and-forget: check if any workflow chain triggers match this completion.
+    ///
+    /// NOTE: Chain triggers are now handled reactively via the TriggerService's
+    /// event bus subscription. This method is retained for manual/fallback use.
+    #[allow(dead_code)]
     pub(crate) async fn check_chain_triggers(
         &self,
         execution_id: &str,

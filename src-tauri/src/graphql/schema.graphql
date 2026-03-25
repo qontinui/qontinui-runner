@@ -1,0 +1,722 @@
+"""
+Result of a UI Bridge action (click, navigate, etc.).
+"""
+type ActionResult {
+	"""
+	Whether the action succeeded.
+	"""
+	success: Boolean!
+	"""
+	Response data from the browser (if successful).
+	"""
+	data: JSON
+	"""
+	Structured error detail (if failed).
+	"""
+	error: UiBridgeErrorDetail
+	"""
+	Action execution time in milliseconds.
+	"""
+	durationMs: String!
+}
+
+type AiOutputChunkEvent {
+	taskRunId: String!
+	chunk: String!
+	accumulatedLength: Int!
+}
+
+"""
+Circuit breaker state for the UI Bridge relay.
+"""
+enum CircuitBreakerState {
+	"""
+	Circuit is closed — requests flow normally.
+	"""
+	CLOSED
+	"""
+	Circuit is open — requests are rejected to prevent cascading failure.
+	"""
+	OPEN
+	"""
+	Circuit is half-open — a single probe request is allowed through.
+	"""
+	HALF_OPEN
+}
+
+"""
+Input for creating a new task run.
+"""
+input CreateTaskRunInput {
+	taskName: String!
+	prompt: String
+	taskType: String! = "task"
+	configId: String
+	workflowName: String
+	workflowId: String
+	maxSessions: Int
+	autoContinue: Boolean! = true
+}
+
+type FindingDetectedEvent {
+	finding: JSON!
+}
+
+type FindingResolvedEvent {
+	finding: JSON!
+}
+
+type GenericRunnerEvent {
+	eventType: String!
+	data: JSON!
+}
+
+"""
+A finding detected by AI analysis.
+"""
+type GqlFinding {
+	id: String!
+	taskRunId: String!
+	sessionNum: Int!
+	category: GqlFindingCategory!
+	severity: GqlFindingSeverity!
+	status: GqlFindingStatus!
+	actionType: GqlFindingActionType!
+	title: String!
+	description: String!
+	resolution: String
+	codeContext: GqlFindingCodeContext
+	signatureHash: String!
+	userResponse: String
+	detectedAt: String!
+	resolvedAt: String
+	resolvedInSession: Int
+	updatedAt: String!
+}
+
+"""
+Finding action type.
+"""
+enum GqlFindingActionType {
+	AUTO_FIX
+	NEEDS_USER_INPUT
+	INFORMATIONAL
+}
+
+"""
+Finding category enum for GraphQL.
+"""
+enum GqlFindingCategory {
+	CODE_BUG
+	SECURITY
+	PERFORMANCE
+	TODO
+	ENHANCEMENT
+	CONFIG_ISSUE
+	TEST_ISSUE
+	DOCUMENTATION
+	RUNTIME_ISSUE
+	ALREADY_FIXED
+	EXPECTED_BEHAVIOR
+	WARNING
+	DATA_MIGRATION
+}
+
+"""
+Code context for a finding.
+"""
+type GqlFindingCodeContext {
+	file: String
+	line: Int
+	column: Int
+	snippet: String
+}
+
+"""
+Finding severity enum for GraphQL.
+"""
+enum GqlFindingSeverity {
+	CRITICAL
+	HIGH
+	MEDIUM
+	LOW
+	INFO
+}
+
+"""
+Finding lifecycle status.
+"""
+enum GqlFindingStatus {
+	DETECTED
+	IN_PROGRESS
+	NEEDS_INPUT
+	RESOLVED
+	WONT_FIX
+	DEFERRED
+}
+
+"""
+Summary statistics for findings in a task run.
+"""
+type GqlFindingSummary {
+	taskRunId: String!
+	total: Int!
+	byCategory: JSON!
+	bySeverity: JSON!
+	byStatus: JSON!
+	needsInputCount: Int!
+	resolvedCount: Int!
+	outstandingCount: Int!
+}
+
+"""
+Orchestration loop status.
+"""
+type GqlOrchestrationLoopStatus {
+	running: Boolean!
+	phase: String!
+	currentIteration: Int!
+	startedAt: String
+	error: String
+}
+
+"""
+Overall runner status.
+"""
+type GqlRunnerStatus {
+	instanceName: String
+	apiPort: Int!
+	executorRunning: Boolean!
+	executorState: String!
+	configLoaded: Boolean!
+	configPath: String
+	aiAnalysisRunning: Boolean!
+}
+
+"""
+A task run — the single concept for all runs (AI, automation, or mixed).
+"""
+type GqlTaskRun {
+	id: String!
+	taskName: String!
+	prompt: String
+	taskType: String!
+	status: String!
+	sessionsCount: Int!
+	maxSessions: Int
+	autoContinue: Boolean!
+	errorMessage: String
+	configId: String
+	workflowName: String
+	workflowId: String
+	summary: String
+	goalAchieved: Boolean
+	remainingWork: String
+	workflowType: String
+	workspaceId: String
+	triggeredBy: String
+	parentTaskRunId: String
+	rootTaskRunId: String
+	depth: Int!
+	bridgeId: String
+	resultData: JSON
+	isReflection: Boolean!
+	reflectionSourceTaskRunId: String
+	isFollowUp: Boolean!
+	followUpSourceTaskRunId: String
+	isFixer: Boolean!
+	fixerSourceTaskRunId: String
+	isMetaOptimizer: Boolean!
+	createdAt: String!
+	updatedAt: String!
+	completedAt: String
+}
+
+"""
+Paginated task run output.
+"""
+type GqlTaskRunOutput {
+	"""
+	The task run ID.
+	"""
+	taskRunId: String!
+	"""
+	Output text (may be truncated by offset/limit).
+	"""
+	content: String!
+	"""
+	Total length of the full output in characters.
+	"""
+	totalLength: Int!
+	"""
+	Character offset of this content within the full output.
+	"""
+	offset: Int!
+	"""
+	Whether there is more content after this chunk.
+	"""
+	hasMore: Boolean!
+}
+
+"""
+Full unified workflow definition including step details as JSON.
+"""
+type GqlWorkflow {
+	id: String!
+	name: String!
+	description: String!
+	category: String!
+	tags: [String!]!
+	setupSteps: JSON!
+	verificationSteps: JSON!
+	agenticSteps: JSON!
+	completionSteps: JSON!
+	maxIterations: Int!
+	timeoutSeconds: Int
+	provider: String
+	model: String
+	isFavorite: Boolean!
+	multiAgentMode: Boolean!
+	reflectionMode: Boolean!
+	approvalGate: Boolean!
+	stopOnFailure: Boolean!
+	useWorktree: Boolean!
+	strictCwd: Boolean!
+	enforceTokenBudget: Boolean!
+	workflowArchitecture: String
+	stages: JSON!
+	createdAt: String!
+	updatedAt: String!
+}
+
+"""
+Summary of a unified workflow (lightweight, no step details).
+"""
+type GqlWorkflowSummary {
+	id: String!
+	name: String!
+	description: String!
+	category: String!
+	tags: [String!]!
+	maxIterations: Int!
+	timeoutSeconds: Int
+	provider: String
+	model: String
+	isFavorite: Boolean!
+	multiAgentMode: Boolean!
+	workflowArchitecture: String
+	stageCount: Int!
+	createdAt: String!
+	updatedAt: String!
+}
+
+"""
+A scalar that can represent any JSON value.
+"""
+scalar JSON
+
+type MutationRoot {
+	"""
+	Execute an action on a UI element (click, type, scroll, etc.).
+	"""
+	uiBridgeExecuteAction(elementId: String!, action: String!, params: JSON): ActionResult!
+	"""
+	Navigate to a URL.
+	"""
+	uiBridgePageNavigate(url: String!): ActionResult!
+	"""
+	Refresh the current page.
+	"""
+	uiBridgePageRefresh(hard: Boolean! = false): ActionResult!
+	"""
+	Navigate back in browser history.
+	"""
+	uiBridgePageBack: ActionResult!
+	"""
+	Navigate forward in browser history.
+	"""
+	uiBridgePageForward: ActionResult!
+	"""
+	Fill a form with the provided values.
+	"""
+	uiBridgeFillForm(formId: String, values: JSON!): ActionResult!
+	"""
+	Execute a CSS selector query in the browser.
+	"""
+	uiBridgeQuerySelector(selector: String!): JSON!
+	"""
+	Evaluate a JavaScript expression in the browser.
+	"""
+	uiBridgeEvaluate(expression: String!): JSON!
+	"""
+	Trigger undo in the connected browser.
+	"""
+	uiBridgeUndo: ActionResult!
+	"""
+	Trigger redo in the connected browser.
+	"""
+	uiBridgeRedo: ActionResult!
+	"""
+	Clear captured console errors.
+	"""
+	uiBridgeClearConsoleErrors: ActionResult!
+	"""
+	Reset the UI Bridge circuit breaker to Closed state.
+	"""
+	uiBridgeResetCircuitBreaker: Boolean!
+	"""
+	Execute any UI Bridge command with raw JSON params.
+	"""
+	uiBridgeRawCommand(command: String!, params: JSON): ActionResult!
+	"""
+	Simple ping mutation for connectivity testing.
+	"""
+	ping: String!
+	"""
+	Create a new task run.
+	"""
+	createTaskRun(input: CreateTaskRunInput!): GqlTaskRun!
+	"""
+	Stop a running task run (kills AI processes and marks as stopped).
+	"""
+	stopTaskRun(id: String!): Boolean!
+	"""
+	Pause a running task run.
+	"""
+	pauseTaskRun(id: String!): Boolean!
+	"""
+	Unpause a paused task run.
+	"""
+	unpauseTaskRun(id: String!): Boolean!
+	"""
+	Delete a task run by ID.
+	"""
+	deleteTaskRun(id: String!): Boolean!
+	"""
+	Update a finding's status (e.g., resolve, defer, mark won't-fix).
+	"""
+	updateFindingStatus(input: UpdateFindingStatusInput!): Boolean!
+	"""
+	Set a user response on a finding that needs input.
+	"""
+	respondToFinding(findingId: String!, response: String!): Boolean!
+	"""
+	Run a unified workflow by ID. Creates a task run record and returns it.
+	Note: For full workflow execution (verification-agentic loop), use
+	POST /unified-workflows/{id}/run which handles session management,
+	command sanitization, and the full executor pipeline.
+	"""
+	runWorkflow(workflowId: String!, prompt: String): GqlTaskRun!
+	"""
+	Delete a unified workflow by ID.
+	"""
+	deleteWorkflow(id: String!): Boolean!
+}
+
+type OrchestratorStateChangeEvent {
+	taskRunId: String!
+	workflowStage: String!
+	iteration: Int
+	phase: String!
+	stateData: JSON
+}
+
+type QueryRoot {
+	"""
+	Get the current health status of the UI Bridge relay.
+	"""
+	uiBridgeHealth: UiBridgeHealth!
+	"""
+	Get full UI Bridge diagnostics as raw JSON.
+	"""
+	uiBridgeDiagnostics: JSON!
+	"""
+	Get all registered UI elements from the connected browser.
+	"""
+	uiBridgeElements: JSON!
+	"""
+	Get a specific element by ID.
+	"""
+	uiBridgeElement(id: String!): JSON!
+	"""
+	Get a full DOM snapshot from the connected browser.
+	"""
+	uiBridgeSnapshot: JSON!
+	"""
+	Get all registered React/Vue/etc. components.
+	"""
+	uiBridgeComponents: JSON!
+	"""
+	Get a specific component by ID.
+	"""
+	uiBridgeComponent(id: String!): JSON!
+	"""
+	List all open windows/tabs.
+	"""
+	uiBridgeWindows: JSON!
+	"""
+	Get console errors from the connected browser.
+	"""
+	uiBridgeConsoleErrors: JSON!
+	"""
+	Get network requests captured by the browser.
+	"""
+	uiBridgeNetworkRequests: JSON!
+	"""
+	Get all forms on the current page.
+	"""
+	uiBridgeForms: JSON!
+	"""
+	Get the idle/busy status of the browser.
+	"""
+	uiBridgeIdleStatus: JSON!
+	"""
+	Get keyboard shortcuts registered in the connected app.
+	"""
+	uiBridgeKeyboardShortcuts: JSON!
+	"""
+	Get the render log (in-memory circular buffer of render operations).
+	"""
+	uiBridgeRenderLog(limit: Int): JSON!
+	"""
+	Get undo/redo state from the connected browser.
+	"""
+	uiBridgeUndoState: JSON!
+	"""
+	Get page specs registered via the UI Bridge SDK.
+	"""
+	uiBridgeSpecs: JSON!
+	"""
+	Get a specific page spec by ID.
+	"""
+	uiBridgeSpec(id: String!): JSON!
+	"""
+	Generic UI Bridge query — send any command and get raw JSON back.
+	Use this for commands not yet covered by typed resolvers.
+	"""
+	uiBridgeRawQuery(command: String!, params: JSON): JSON!
+	"""
+	List all connected SDK app connections.
+	"""
+	sdkConnections: [SdkConnectionInfo!]!
+	"""
+	List recent task runs with optional filters.
+	"""
+	taskRuns(limit: Int! = 50, workflowType: String): [GqlTaskRun!]!
+	"""
+	Get a single task run by ID.
+	"""
+	taskRun(id: String!): GqlTaskRun
+	"""
+	Get task run output with optional offset/limit for pagination.
+	Defaults to last 10000 characters (tail) if no offset specified.
+	"""
+	taskRunOutput(id: String!, offset: Int! = 0, limit: Int! = 10000): GqlTaskRunOutput!
+	"""
+	List only currently running task runs.
+	"""
+	runningTaskRuns: [GqlTaskRun!]!
+	"""
+	Get child task runs of a parent task.
+	"""
+	childTaskRuns(parentTaskRunId: String!): [GqlTaskRun!]!
+	"""
+	List all unified workflows (summary view).
+	"""
+	workflows: [GqlWorkflowSummary!]!
+	"""
+	Get a full workflow definition by ID.
+	"""
+	workflow(id: String!): GqlWorkflow
+	"""
+	Get findings for a specific task run.
+	"""
+	findings(taskRunId: String!): [GqlFinding!]!
+	"""
+	Get finding summary statistics for a task run.
+	"""
+	findingSummary(taskRunId: String!): GqlFindingSummary!
+	"""
+	Get the current runner status.
+	"""
+	runnerStatus: GqlRunnerStatus!
+	"""
+	Get orchestration loop status.
+	"""
+	orchestrationLoopStatus: GqlOrchestrationLoopStatus!
+}
+
+"""
+Typed runner event for the `runnerEvents` subscription.
+Replaces untyped serde_json::Value events from /ws/events.
+"""
+union RunnerEvent = OrchestratorStateChangeEvent | StepProgressEvent | TaskRunUpdateEvent | FindingDetectedEvent | FindingResolvedEvent | AiOutputChunkEvent | GenericRunnerEvent
+
+"""
+Information about an external SDK app connection.
+"""
+type SdkConnectionInfo {
+	"""
+	App identifier.
+	"""
+	appId: String!
+	"""
+	Display name.
+	"""
+	appName: String!
+	"""
+	Base URL of the connected app.
+	"""
+	url: String!
+	"""
+	Whether the app is currently responsive.
+	"""
+	responsive: Boolean!
+	"""
+	Whether this is the active (selected) connection.
+	"""
+	isActive: Boolean!
+}
+
+type StepProgressEvent {
+	taskRunId: String!
+	stepIndex: Int!
+	stepName: String!
+	status: String!
+	details: JSON
+	timestamp: String!
+}
+
+type SubscriptionRoot {
+	"""
+	Health status stream — pushes UI Bridge health at a configurable interval.
+	Replaces polling GET /health with server push.
+	"""
+	uiBridgeHealthStream(intervalMs: Int! = 3000): UiBridgeHealth!
+	"""
+	Typed runner event stream — replaces untyped /ws/events endpoint.
+	Optional filter to receive only specific event types.
+	"""
+	runnerEvents(filter: [String!]): RunnerEvent!
+	"""
+	Task run progress stream — replaces 3s polling for task run status.
+	Filters events to only those matching the specified task run ID.
+	"""
+	taskRunProgress(taskRunId: String!): RunnerEvent!
+	"""
+	Finding updates stream — polls DB for finding changes on a task run.
+	Emits the full findings list whenever the count or statuses change.
+	"""
+	findingUpdates(taskRunId: String!, intervalMs: Int! = 2000): [GqlFinding!]!
+	"""
+	Orchestration loop status stream — pushes loop state at a configurable interval.
+	"""
+	orchestrationLoopStatusStream(intervalMs: Int! = 2000): GqlOrchestrationLoopStatus!
+}
+
+type TaskRunUpdateEvent {
+	taskRunId: String!
+	status: String!
+	iteration: Int
+	details: JSON
+	timestamp: String!
+}
+
+"""
+Machine-readable error codes for UI Bridge operations.
+Maps 1:1 to the existing UiBridgeErrorCode enum.
+"""
+enum UiBridgeErrorCode {
+	TIMEOUT
+	CIRCUIT_BREAKER_OPEN
+	CONCURRENCY_LIMIT_REACHED
+	FRONTEND_UNRESPONSIVE
+	WINDOW_NOT_FOUND
+	ELEMENT_NOT_FOUND
+	ELEMENT_NOT_VISIBLE
+	ELEMENT_NOT_ENABLED
+	ELEMENT_STALE
+	ACTION_FAILED
+	ASSERTION_FAILED
+	UNKNOWN_ASSERTION_TYPE
+	INTERNAL_ERROR
+}
+
+"""
+Structured error detail with recovery hint.
+"""
+type UiBridgeErrorDetail {
+	"""
+	Machine-readable error code.
+	"""
+	code: UiBridgeErrorCode!
+	"""
+	Human-readable error message.
+	"""
+	message: String!
+	"""
+	Suggested recovery action (e.g., "Resnapshot", "RetryAfterDelay").
+	"""
+	recovery: String
+	"""
+	Additional context as JSON.
+	"""
+	context: JSON
+}
+
+"""
+Real-time health status of the UI Bridge relay.
+"""
+type UiBridgeHealth {
+	"""
+	Whether the browser frontend is responsive (last pong < 15s).
+	"""
+	responsive: Boolean!
+	"""
+	Timestamp of the last frontend heartbeat (epoch ms).
+	"""
+	lastHeartbeat: String!
+	"""
+	Milliseconds since the last heartbeat.
+	"""
+	heartbeatAgeMs: String!
+	"""
+	Server uptime in seconds.
+	"""
+	uptimeSeconds: String!
+	"""
+	Number of pending UI Bridge requests awaiting browser response.
+	"""
+	pendingRequests: Int!
+	"""
+	Current circuit breaker state.
+	"""
+	circuitBreaker: CircuitBreakerState!
+	"""
+	Number of available semaphore permits (out of 6 max).
+	"""
+	semaphoreAvailable: Int!
+}
+
+"""
+Input for updating a finding's status.
+"""
+input UpdateFindingStatusInput {
+	findingId: String!
+	status: GqlFindingStatus!
+	resolution: String
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+schema {
+	query: QueryRoot
+	mutation: MutationRoot
+	subscription: SubscriptionRoot
+}

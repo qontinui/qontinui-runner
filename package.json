@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "@apollo/client": "^4.1.6",
     "@monaco-editor/react": "^4.7.0",
     "@qontinui/design-tokens": "^1.0.0",
     "@qontinui/shared-types": "file:../qontinui-schemas/ts",
@@ -36,6 +37,8 @@
     "dagre": "^0.8.5",
     "date-fns": "^4.1.0",
     "diff": "^8.0.2",
+    "graphql": "^16.13.2",
+    "graphql-ws": "^6.0.7",
     "html2canvas": "^1.4.1",
     "html5-qrcode": "^2.3.8",
     "lucide-react": "^0.577.0",
@@ -50,6 +53,7 @@
     "recharts": "^3.8.0",
     "rehype-raw": "^7.0.0",
     "remark-gfm": "^4.0.1",
+    "rxjs": "^7.8.2",
     "tailwind-merge": "^3.3.1",
     "tailwindcss": "^4.0.0",
     "tailwindcss-animate": "^1.0.7",
@@ -58,6 +62,9 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@graphql-codegen/cli": "^6.2.1",
+    "@graphql-codegen/typescript": "^5.0.9",
+    "@graphql-codegen/typescript-operations": "^5.0.9",
     "@playwright/test": "^1.57.0",
     "@storybook/react-vite": "^10.3.1",
     "@tailwindcss/vite": "^4.2.2",
@@ -96,6 +103,9 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
+    "graphql:codegen": "graphql-codegen",
+    "graphql:check": "graphql-codegen && git diff --exit-code src/generated/graphql.ts || (echo 'GraphQL codegen output is stale — run npm run graphql:codegen' && exit 1)",
+    "graphql:schema": "cd src-tauri && cargo test --bin qontinui-runner schema_exports_valid_sdl -- --nocapture",
     "typecheck": "tsc --noEmit"
   },
   "type": "module",

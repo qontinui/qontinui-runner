@@ -1,9 +1,11 @@
-import { useEffect, useCallback, useRef, useMemo, createRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, createRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import { type TerminalInstanceHandle } from "./TerminalInstance";
 import { TerminalTabBar } from "./TerminalTabBar";
 import { TerminalNotification } from "./TerminalNotification";
-import { TranscriptSessionSidebar } from "./TranscriptSessionSidebar";
+import { SessionManagerPanel } from "./SessionManagerPanel";
+import { useSessionManager } from "./useSessionManager";
 import { useTerminalManager } from "./useTerminalManager";
 import { useZoneLayout } from "./useZoneLayout";
 import { ZoneGrid } from "./ZoneGrid";
@@ -209,6 +211,21 @@ export function TerminalPage({
     loadMessages,
   } = useTranscriptSessions();
 
+  const sessionManager = useSessionManager({
+    tabs,
+    sessionStates: stateTracking.sessionStates,
+    staleTabs: stateTracking.staleTabs,
+    transcriptSessions,
+    sessionsLoading,
+    desktopNotify: transitionEffects.desktopNotify,
+    onRefreshSessions: refreshSessions,
+    onResumeSession: shellIntegration.handleResumeSession,
+    onSelectSession: (sessionId: string) => {
+      selectedSessionSetterRef.current(sessionId);
+      rightPanelModeSetterRef.current("transcript" as never);
+    },
+  });
+
   const { processOutput, activeFindings, allFindings } = useTerminalFindings(activeId ?? null);
 
   const workflowGen = useWorkflowGeneration({
@@ -238,6 +255,49 @@ export function TerminalPage({
     runGeneration: workflowGen.runGeneration,
     setRightPanelMode: workflowGen.setRightPanelMode,
   });
+
+  // Session summary (AI Tier 2)
+  const [sessionSummary, setSessionSummary] = useState<string | null>(null);
+  const [sessionSummaryLoading, setSessionSummaryLoading] = useState(false);
+
+  const handleSummarizeSession = useCallback(
+    async (messages: Array<{ msg_type: string; text: string }>) => {
+      setSessionSummaryLoading(true);
+      setSessionSummary(null);
+      try {
+        // Build text from transcript messages
+        const text = messages
+          .map((m) => `${m.msg_type === "user" ? "User" : "Assistant"}: ${m.text}`)
+          .join("\n\n");
+        const result = await invoke<{ success: boolean; data?: unknown; message?: string }>(
+          "analyze_session_summary",
+          { input: text },
+        );
+        if (result.success && result.data) {
+          // Extract markdown content from first panel in the response
+          const data = result.data as Array<{ type?: string; content?: string }> | { panels?: Array<{ content?: string }> };
+          let summaryContent: string | null = null;
+
+          if (Array.isArray(data)) {
+            // Direct array of panels
+            const markdownPanel = data.find((p) => p.type === "markdown" || p.content);
+            summaryContent = markdownPanel?.content ?? null;
+          } else if (data && "panels" in data && Array.isArray(data.panels)) {
+            summaryContent = data.panels[0]?.content ?? null;
+          }
+
+          setSessionSummary(summaryContent || "Summary generated but no content available.");
+        } else {
+          setSessionSummary(result.message || "Unable to generate summary.");
+        }
+      } catch {
+        setSessionSummary("Failed to generate summary.");
+      } finally {
+        setSessionSummaryLoading(false);
+      }
+    },
+    [],
+  );
 
   processOutputRef.current = processOutput;
   rightPanelModeSetterRef.current = workflowGen.setRightPanelMode;
@@ -348,6 +408,12 @@ export function TerminalPage({
     addHistoryEvent,
     terminalRefs: terminalRefs.current,
     workflowGen,
+    sessionManager: {
+      frozenCount: sessionManager.frozenCount,
+      needsInputCount: sessionManager.needsInputCount,
+      sessions: sessionManager.sessions,
+      resumeSession: sessionManager.resumeSession,
+    },
   });
 
   return (
@@ -503,6 +569,7 @@ export function TerminalPage({
         onSetActiveTagFilters={labelsAndTags.setActiveTagFilters}
         allTags={labelsAndTags.allTags}
         lastOutputLines={stateTracking.lastOutputLines}
+        frozenSessionCount={sessionManager.frozenCount}
         showSidebar={workflowGen.showSidebar}
         onToggleSidebar={() => workflowGen.setShowSidebar((v) => !v)}
         isGenerating={workflowGen.isGenerating}
@@ -545,13 +612,9 @@ export function TerminalPage({
 
       <div className="flex-1 flex flex-row overflow-hidden">
         {workflowGen.showSidebar && (
-          <TranscriptSessionSidebar
-            sessions={transcriptSessions}
-            loading={sessionsLoading}
+          <SessionManagerPanel
+            manager={sessionManager}
             selectedSessionId={workflowGen.selectedTranscriptSessionId}
-            onSelectSession={workflowGen.handleSelectTranscriptSession}
-            onRefresh={refreshSessions}
-            onResume={shellIntegration.handleResumeSession}
           />
         )}
 
@@ -721,6 +784,9 @@ export function TerminalPage({
           onGenerateAndRunFromTranscript={workflowGen.handleGenerateAndRunFromTranscript}
           onBuildPlanWorkflow={workflowGen.handleBuildPlanWorkflow}
           onResumeSession={shellIntegration.handleResumeSession}
+          onSummarizeSession={handleSummarizeSession}
+          sessionSummary={sessionSummary}
+          sessionSummaryLoading={sessionSummaryLoading}
           onClosePanel={() => {
             workflowGen.setRightPanelMode(null);
             workflowGen.setSelectedTranscriptSessionId(null);

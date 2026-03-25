@@ -19,6 +19,7 @@ pub struct TranscriptSession {
     pub config_dir: String,
     pub message_count: usize,
     pub last_modified: String,                 // ISO 8601
+    pub started_at: Option<String>,            // ISO 8601 — timestamp of first record
     pub first_message_preview: Option<String>, // first ~80 chars of first user message
     pub has_plans: bool,                       // true if any message has planContent
     pub display_name: String,                  // human-readable title derived from content
@@ -34,6 +35,20 @@ pub struct TranscriptMessage {
     pub plan_content: Option<String>, // planContent field from user records
     pub model: Option<String>,        // from assistant records
     pub has_tool_use: bool,           // whether assistant used tools
+}
+
+/// Lightweight digest of a session's tail — used for frozen detection and work summary hints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDigest {
+    pub session_id: String,
+    pub config_dir: String,
+    pub project_path: String,
+    pub last_message_type: String,        // "user" | "assistant" | ""
+    pub last_message_timestamp: String,   // ISO 8601
+    pub last_message_preview: String,     // last ~200 chars of text
+    pub last_assistant_had_tool_use: bool,
+    pub likely_frozen: bool,              // heuristic: recent + mid-task + not completed
+    pub work_summary_hint: String,        // "Task: {first} — Last: {last_snippet}"
 }
 
 // ── Config Dir Discovery ─────────────────────────────────────────────────────
@@ -190,12 +205,16 @@ pub fn list_sessions(
                 let first_message_preview = extract_first_user_preview(&content);
                 let display_name = generate_display_name(&first_message_preview, &last_modified);
 
+                // Extract started_at from first record's timestamp
+                let started_at = extract_first_timestamp(&content);
+
                 sessions.push(TranscriptSession {
                     session_id,
                     project_path: project_path.to_string(),
                     config_dir: config_dir.to_string_lossy().to_string(),
                     message_count,
                     last_modified,
+                    started_at,
                     first_message_preview,
                     has_plans,
                     display_name,
@@ -449,6 +468,7 @@ pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<Tr
                         .count();
                     let has_plans = content.contains("\"planContent\"");
                     let first_message_preview = extract_first_user_preview(&content);
+                    let started_at = extract_first_timestamp(&content);
                     let display_name =
                         generate_display_name(&first_message_preview, &last_modified);
 
@@ -458,6 +478,7 @@ pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<Tr
                         config_dir: config_dir.to_string_lossy().to_string(),
                         message_count,
                         last_modified,
+                        started_at,
                         first_message_preview,
                         has_plans,
                         display_name,
@@ -603,6 +624,24 @@ fn strip_generic_prefix(text: &str) -> &str {
     text
 }
 
+/// Extract the timestamp from the first record in a JSONL transcript.
+fn extract_first_timestamp(content: &str) -> Option<String> {
+    for line in content.lines().take(10) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(ts) = record.get("timestamp").and_then(|t| t.as_str()) {
+                if !ts.is_empty() {
+                    return Some(ts.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Extract a preview from the first meaningful user message in a JSONL transcript.
 ///
 /// Scans user records, skipping system-generated content (caveats, command
@@ -667,6 +706,312 @@ fn extract_first_user_preview(content: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ── Session Digests (for frozen detection) ───────────────────────────────────
+
+/// Read the tail of a JSONL session file to produce a lightweight digest.
+///
+/// Reads the last ~4KB of the file (seeking from end) to extract the last
+/// user and assistant messages without parsing the entire transcript.
+pub fn session_digest(
+    config_dir: &Path,
+    project_path: &str,
+    session_id: &str,
+    first_preview: &Option<String>,
+) -> Result<SessionDigest, String> {
+    let encoded = encode_project_path(project_path);
+    let file_path = config_dir
+        .join("projects")
+        .join(&encoded)
+        .join(format!("{}.jsonl", session_id));
+
+    if !file_path.exists() {
+        return Err(format!("Session file not found: {:?}", file_path));
+    }
+
+    // Read last ~4KB for efficiency (enough for 2-3 messages)
+    let content = {
+        let metadata = fs::metadata(&file_path)
+            .map_err(|e| format!("Failed to read metadata: {}", e))?;
+        let file_size = metadata.len();
+
+        if file_size <= 4096 {
+            fs::read_to_string(&file_path)
+                .map_err(|e| format!("Failed to read file: {}", e))?
+        } else {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = fs::File::open(&file_path)
+                .map_err(|e| format!("Failed to open file: {}", e))?;
+            file.seek(SeekFrom::End(-4096))
+                .map_err(|e| format!("Failed to seek: {}", e))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|e| format!("Failed to read tail: {}", e))?;
+            // Use lossy conversion to handle mid-character seek gracefully
+            let buf = String::from_utf8_lossy(&bytes).into_owned();
+            // Drop the first partial line (may be truncated from seek)
+            if let Some(pos) = buf.find('\n') {
+                buf[pos + 1..].to_string()
+            } else {
+                buf
+            }
+        }
+    };
+
+    let last_modified = fs::metadata(&file_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(|t| {
+            chrono::DateTime::<chrono::Utc>::from(t)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        })
+        .unwrap_or_default();
+
+    // Parse lines from the tail to find the last user and assistant messages
+    let mut last_msg_type = String::new();
+    let mut last_msg_timestamp = String::new();
+    let mut last_msg_preview = String::new();
+    let mut last_assistant_had_tool_use = false;
+    let mut last_assistant_preview = String::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let record: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let record_type = record
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default();
+
+        match record_type {
+            "user" => {
+                if let Some(msg) = parse_user_record(&record) {
+                    if !is_system_or_noise(&msg.text) {
+                        last_msg_type = "user".to_string();
+                        last_msg_timestamp = msg.timestamp.clone();
+                        let preview_text = if msg.text.len() > 200 {
+                            let mut end = 200;
+                            while end > 0 && !msg.text.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            format!("{}...", &msg.text[..end])
+                        } else {
+                            msg.text.clone()
+                        };
+                        last_msg_preview = preview_text;
+                    }
+                }
+            }
+            "assistant" => {
+                if let Some(msg) = parse_assistant_record(&record) {
+                    last_msg_type = "assistant".to_string();
+                    last_msg_timestamp = msg.timestamp.clone();
+                    last_assistant_had_tool_use = msg.has_tool_use;
+                    let preview_text = if msg.text.len() > 200 {
+                        let mut end = 200;
+                        while end > 0 && !msg.text.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}...", &msg.text[..end])
+                    } else {
+                        msg.text.clone()
+                    };
+                    last_msg_preview = preview_text.clone();
+                    last_assistant_preview = preview_text;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Frozen heuristic:
+    // 1. Last modified within 4 hours but at least 5 minutes ago (too recent = likely still active)
+    // 2. Last message is assistant with tool_use (mid-task) OR last message is user (no response)
+    let likely_frozen = {
+        let age_secs = fs::metadata(&file_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| {
+                std::time::SystemTime::now()
+                    .duration_since(modified)
+                    .ok()
+                    .map(|d| d.as_secs())
+            })
+            .unwrap_or(u64::MAX);
+
+        let is_in_frozen_window = age_secs >= 5 * 60 && age_secs < 4 * 3600;
+
+        is_in_frozen_window
+            && ((last_msg_type == "assistant" && last_assistant_had_tool_use)
+                || last_msg_type == "user")
+    };
+
+    // Build work summary hint
+    let task_part = first_preview
+        .as_deref()
+        .unwrap_or("Unknown task");
+    let last_part = if last_assistant_preview.is_empty() {
+        "No assistant output".to_string()
+    } else {
+        let truncated = if last_assistant_preview.len() > 100 {
+            let mut end = 100;
+            while end > 0 && !last_assistant_preview.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...", &last_assistant_preview[..end])
+        } else {
+            last_assistant_preview.clone()
+        };
+        truncated
+    };
+    let work_summary_hint = format!("Task: {} — Last: {}", task_part, last_part);
+
+    Ok(SessionDigest {
+        session_id: session_id.to_string(),
+        config_dir: config_dir.to_string_lossy().to_string(),
+        project_path: project_path.to_string(),
+        last_message_type: last_msg_type,
+        last_message_timestamp: if last_msg_timestamp.is_empty() {
+            last_modified
+        } else {
+            last_msg_timestamp
+        },
+        last_message_preview: last_msg_preview,
+        last_assistant_had_tool_use,
+        likely_frozen,
+        work_summary_hint,
+    })
+}
+
+/// Compute digests for a batch of sessions.
+pub fn session_digests_batch(
+    sessions: &[TranscriptSession],
+) -> Vec<SessionDigest> {
+    sessions
+        .iter()
+        .filter_map(|s| {
+            session_digest(
+                Path::new(&s.config_dir),
+                &s.project_path,
+                &s.session_id,
+                &s.first_message_preview,
+            )
+            .ok()
+        })
+        .collect()
+}
+
+// ── External Claude Process Detection ────────────────────────────────────────
+
+/// A Claude Code process running outside this Runner instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalClaudeProcess {
+    pub pid: u32,
+    pub working_directory: Option<String>,
+}
+
+/// Try to extract a project working directory from a Claude Code command line.
+/// Looks for common patterns in the command line arguments.
+fn extract_workdir_from_cmdline(cmdline: &str) -> Option<String> {
+    // Look for --project or -p flag
+    for (i, part) in cmdline.split_whitespace().enumerate() {
+        if part == "--project" || part == "-p" {
+            return cmdline.split_whitespace().nth(i + 1).map(|s| s.to_string());
+        }
+    }
+    // Look for a path-like argument that's not a flag or node binary
+    for part in cmdline.split_whitespace().rev() {
+        if !part.starts_with('-')
+            && !part.contains("node")
+            && !part.contains("claude")
+            && (part.contains('/') || part.contains('\\'))
+            && !part.contains("node_modules")
+        {
+            return Some(part.to_string());
+        }
+    }
+    None
+}
+
+/// Detect Claude Code processes running outside this Runner.
+///
+/// Uses `wmic` on Windows to find node.exe processes whose command line
+/// contains Claude Code markers. Excludes PIDs from the runner's own tracker.
+pub fn find_external_claude_processes(exclude_pids: &[u32]) -> Vec<ExternalClaudeProcess> {
+    let exclude_set: std::collections::HashSet<u32> = exclude_pids.iter().copied().collect();
+    let mut results = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        // Use PowerShell to get Claude Code processes with their PIDs and command lines
+        // Note: Win32_Process doesn't expose CWD directly, so we extract the
+        // CLAUDE_CONFIG_DIR or project path from the command line as a proxy.
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                r#"Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match 'claude' } | Select-Object ProcessId, CommandLine | ForEach-Object { "$($_.ProcessId)|$($_.CommandLine)" }"#,
+            ])
+            .output();
+
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.splitn(2, '|').collect();
+                if let Some(pid_str) = parts.first() {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        if !exclude_set.contains(&pid) {
+                            // Try to extract a meaningful working directory from the command line
+                            let cmdline = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                            let working_dir = extract_workdir_from_cmdline(cmdline);
+                            results.push(ExternalClaudeProcess {
+                                pid,
+                                working_directory: working_dir,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On Unix, use ps + grep
+        let output = std::process::Command::new("ps")
+            .args(["aux"])
+            .output();
+
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if line.contains("claude") && line.contains("node") {
+                    let fields: Vec<&str> = line.split_whitespace().collect();
+                    if let Some(pid_str) = fields.get(1) {
+                        if let Ok(pid) = pid_str.parse::<u32>() {
+                            if !exclude_set.contains(&pid) {
+                                results.push(ExternalClaudeProcess {
+                                    pid,
+                                    working_directory: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    results
 }
 
 #[cfg(test)]

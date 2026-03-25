@@ -97,6 +97,7 @@ export function TaskRunCostTable({ data }: TaskRunCostTableProps) {
   const SortButton = ({ field, label }: { field: SortField; label: string }) => (
     <button
       onClick={() => handleSort(field)}
+      aria-label={`Sort by ${label}`}
       className="flex items-center gap-1 hover:text-foreground transition-colors"
     >
       {label}

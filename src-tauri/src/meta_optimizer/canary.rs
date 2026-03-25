@@ -613,3 +613,456 @@ pub fn auto_rollback_stale_canaries(db: &CheckpointDb) -> usize {
 
     rolled_back
 }
+
+// ── Prompt Template A/B Testing ──────────────────────────────────────────
+
+/// Per-version metrics for prompt template canary testing.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PromptVersionMetrics {
+    pub run_count: i64,
+    pub success_count: i64,
+    pub failure_count: i64,
+    pub total_cost_usd: f64,
+    pub total_latency_ms: f64,
+    pub total_tokens: i64,
+}
+
+impl PromptVersionMetrics {
+    pub fn success_rate(&self) -> f64 {
+        let total = self.success_count + self.failure_count;
+        if total > 0 {
+            self.success_count as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    pub fn avg_cost(&self) -> f64 {
+        if self.run_count > 0 {
+            self.total_cost_usd / self.run_count as f64
+        } else {
+            0.0
+        }
+    }
+
+    pub fn avg_latency(&self) -> f64 {
+        if self.run_count > 0 {
+            self.total_latency_ms / self.run_count as f64
+        } else {
+            0.0
+        }
+    }
+
+    pub fn avg_tokens(&self) -> f64 {
+        if self.run_count > 0 {
+            self.total_tokens as f64 / self.run_count as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+/// A prompt template canary for A/B testing two versions of a prompt template.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptTemplateCanary {
+    pub id: String,
+    pub template_id: String,
+    pub baseline_version: i32,
+    pub candidate_version: i32,
+    pub traffic_percentage: f64,
+    pub status: String,
+    pub baseline_metrics: PromptVersionMetrics,
+    pub candidate_metrics: PromptVersionMetrics,
+    pub created_at: String,
+    pub ended_at: Option<String>,
+}
+
+/// Randomly decide whether to use the candidate version based on traffic_percentage.
+pub fn should_use_candidate(canary: &PromptTemplateCanary) -> bool {
+    let pct = canary.traffic_percentage.clamp(0.0, 1.0);
+    rand::random::<f64>() < pct
+}
+
+/// Accumulate metrics for the version that was used in a given execution.
+pub fn record_canary_result(
+    canary: &mut PromptTemplateCanary,
+    used_candidate: bool,
+    success: bool,
+    cost: f64,
+    latency_ms: f64,
+    tokens: i64,
+) {
+    let metrics = if used_candidate {
+        &mut canary.candidate_metrics
+    } else {
+        &mut canary.baseline_metrics
+    };
+    metrics.run_count += 1;
+    if success {
+        metrics.success_count += 1;
+    } else {
+        metrics.failure_count += 1;
+    }
+    metrics.total_cost_usd += cost;
+    metrics.total_latency_ms += latency_ms;
+    metrics.total_tokens += tokens;
+}
+
+/// Compare baseline vs candidate metrics using statistical analysis (p-value, CI, effect size).
+pub fn evaluate_prompt_canary(canary: &PromptTemplateCanary) -> CanaryEvaluation {
+    let b = &canary.baseline_metrics;
+    let c = &canary.candidate_metrics;
+
+    let baseline_total = (b.success_count + b.failure_count) as u64;
+    let candidate_total = (c.success_count + c.failure_count) as u64;
+
+    let baseline_sr = b.success_rate();
+    let candidate_sr = c.success_rate();
+    let delta = candidate_sr - baseline_sr;
+
+    let min_runs: i64 = 10;
+    let min_runs_met = c.run_count >= min_runs && b.run_count >= min_runs;
+
+    let analysis = crate::stats::proportion_analysis(
+        (c.success_count as u64, candidate_total),
+        (b.success_count as u64, baseline_total),
+        2,
+    );
+
+    let cost_delta_pct = if baseline_total > 0 && candidate_total > 0 && b.avg_cost() > 0.0 {
+        Some((c.avg_cost() - b.avg_cost()) / b.avg_cost() * 100.0)
+    } else {
+        None
+    };
+
+    let duration_delta_pct =
+        if baseline_total > 0 && candidate_total > 0 && b.avg_latency() > 0.0 {
+            Some((c.avg_latency() - b.avg_latency()) / b.avg_latency() * 100.0)
+        } else {
+            None
+        };
+
+    let verdict_enum = if !min_runs_met {
+        crate::stats::Verdict::Neutral
+    } else {
+        crate::stats::compute_verdict(
+            delta,
+            &analysis,
+            candidate_total,
+            &crate::stats::VerdictThresholds::canary(),
+        )
+    };
+
+    CanaryEvaluation {
+        verdict: verdict_enum.as_canary_str().to_string(),
+        baseline_success_rate: baseline_sr,
+        canary_success_rate: candidate_sr,
+        delta,
+        min_runs_met,
+        p_value: analysis.p_value,
+        confidence_interval: analysis.confidence_interval,
+        effect_size: analysis.effect_size,
+        cost_delta_pct,
+        duration_delta_pct,
+    }
+}
+
+// ── DB-backed prompt template canary operations ─────────────────────────
+
+/// Create a new prompt template canary and persist it to the database.
+pub fn create_prompt_template_canary(
+    db: &CheckpointDb,
+    template_id: &str,
+    baseline_version: i32,
+    candidate_version: i32,
+    traffic_pct: f64,
+) -> Result<String, String> {
+    let id = format!("ptc-{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now().to_rfc3339();
+    let traffic_pct = traffic_pct.clamp(0.0, 1.0);
+    let empty_metrics = serde_json::to_string(&PromptVersionMetrics::default())
+        .unwrap_or_else(|_| "{}".to_string());
+
+    let id_clone = id.clone();
+    let template_id = template_id.to_string();
+
+    db.with_conn(move |conn| {
+        conn.execute(
+            r#"INSERT INTO prompt_template_canaries
+               (id, template_id, baseline_version, candidate_version,
+                traffic_percentage, status,
+                baseline_metrics_json, candidate_metrics_json,
+                created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7)"#,
+            params![
+                id_clone,
+                template_id,
+                baseline_version,
+                candidate_version,
+                traffic_pct,
+                empty_metrics,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to create prompt template canary: {}", e))?;
+
+        info!(
+            "Created prompt template canary {} for template {} (v{} vs v{}, {}% candidate traffic)",
+            id_clone,
+            template_id,
+            baseline_version,
+            candidate_version,
+            (traffic_pct * 100.0) as i64,
+        );
+        Ok(())
+    })?;
+
+    Ok(id)
+}
+
+/// Load a prompt template canary from the database by id.
+pub fn get_prompt_template_canary(
+    db: &CheckpointDb,
+    canary_id: &str,
+) -> Result<PromptTemplateCanary, String> {
+    let canary_id = canary_id.to_string();
+    db.with_conn(move |conn| {
+        conn.query_row(
+            r#"SELECT id, template_id, baseline_version, candidate_version,
+                      traffic_percentage, status,
+                      baseline_metrics_json, candidate_metrics_json,
+                      created_at, ended_at
+               FROM prompt_template_canaries WHERE id = ?1"#,
+            params![canary_id],
+            |row| {
+                let baseline_json: String = row.get(6)?;
+                let candidate_json: String = row.get(7)?;
+                Ok(PromptTemplateCanary {
+                    id: row.get(0)?,
+                    template_id: row.get(1)?,
+                    baseline_version: row.get(2)?,
+                    candidate_version: row.get(3)?,
+                    traffic_percentage: row.get(4)?,
+                    status: row.get(5)?,
+                    baseline_metrics: serde_json::from_str(&baseline_json).unwrap_or_default(),
+                    candidate_metrics: serde_json::from_str(&candidate_json).unwrap_or_default(),
+                    created_at: row.get(8)?,
+                    ended_at: row.get(9)?,
+                })
+            },
+        )
+        .map_err(|e| format!("Prompt template canary not found: {}", e))
+    })
+}
+
+/// Record a result for a prompt template canary and persist updated metrics.
+pub fn record_prompt_canary_run(
+    db: &CheckpointDb,
+    canary_id: &str,
+    used_candidate: bool,
+    success: bool,
+    cost: f64,
+    latency_ms: f64,
+    tokens: i64,
+) -> Result<(), String> {
+    let canary_id = canary_id.to_string();
+
+    db.with_conn(move |conn| {
+        let (baseline_json, candidate_json): (String, String) = conn
+            .query_row(
+                "SELECT baseline_metrics_json, candidate_metrics_json FROM prompt_template_canaries WHERE id = ?1",
+                params![canary_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| format!("Prompt template canary not found: {}", e))?;
+
+        let mut baseline: PromptVersionMetrics =
+            serde_json::from_str(&baseline_json).unwrap_or_default();
+        let mut candidate: PromptVersionMetrics =
+            serde_json::from_str(&candidate_json).unwrap_or_default();
+
+        let metrics = if used_candidate {
+            &mut candidate
+        } else {
+            &mut baseline
+        };
+        metrics.run_count += 1;
+        if success {
+            metrics.success_count += 1;
+        } else {
+            metrics.failure_count += 1;
+        }
+        metrics.total_cost_usd += cost;
+        metrics.total_latency_ms += latency_ms;
+        metrics.total_tokens += tokens;
+
+        let baseline_json = serde_json::to_string(&baseline).unwrap_or_default();
+        let candidate_json = serde_json::to_string(&candidate).unwrap_or_default();
+
+        conn.execute(
+            "UPDATE prompt_template_canaries SET baseline_metrics_json = ?1, candidate_metrics_json = ?2 WHERE id = ?3",
+            params![baseline_json, candidate_json, canary_id],
+        )
+        .map_err(|e| format!("Failed to record prompt canary run: {}", e))?;
+
+        Ok(())
+    })
+}
+
+/// Evaluate a prompt template canary from persisted DB state.
+pub fn evaluate_prompt_canary_from_db(
+    db: &CheckpointDb,
+    canary_id: &str,
+) -> Result<CanaryEvaluation, String> {
+    let canary = get_prompt_template_canary(db, canary_id)?;
+    Ok(evaluate_prompt_canary(&canary))
+}
+
+// ── Prompt canary A/B traffic splitting integration ─────────────────────
+
+/// Result of resolving a prompt through the canary system.
+#[derive(Debug, Clone)]
+pub struct CanaryResolvedPrompt {
+    /// The prompt content to use (either baseline or candidate version).
+    pub content: String,
+    /// The canary ID if an active canary was found, None otherwise.
+    pub canary_id: Option<String>,
+    /// Whether the candidate version was selected (true) or baseline (false).
+    /// Only meaningful when canary_id is Some.
+    pub used_candidate: bool,
+}
+
+/// Check for an active prompt template canary for the given template_id (agent_type),
+/// perform the traffic split, and return the appropriate prompt content.
+///
+/// If no active canary exists, returns the `default_content` as-is.
+/// If a canary is active, uses `should_use_candidate()` to pick baseline vs candidate,
+/// loads the chosen version from the prompt registry, and returns it.
+pub fn resolve_prompt_with_canary(
+    db: &CheckpointDb,
+    template_id: &str,
+    default_content: &str,
+) -> CanaryResolvedPrompt {
+    // Look up an active canary for this template_id
+    let template_id_owned = template_id.to_string();
+    let canary_opt: Option<PromptTemplateCanary> = db
+        .with_conn(move |conn| {
+            let result = conn.query_row(
+                r#"SELECT id, template_id, baseline_version, candidate_version,
+                          traffic_percentage, status,
+                          baseline_metrics_json, candidate_metrics_json,
+                          created_at, ended_at
+                   FROM prompt_template_canaries
+                   WHERE template_id = ?1 AND status = 'active'
+                   LIMIT 1"#,
+                params![template_id_owned],
+                |row| {
+                    let baseline_json: String = row.get(6)?;
+                    let candidate_json: String = row.get(7)?;
+                    Ok(PromptTemplateCanary {
+                        id: row.get(0)?,
+                        template_id: row.get(1)?,
+                        baseline_version: row.get(2)?,
+                        candidate_version: row.get(3)?,
+                        traffic_percentage: row.get(4)?,
+                        status: row.get(5)?,
+                        baseline_metrics: serde_json::from_str(&baseline_json).unwrap_or_default(),
+                        candidate_metrics: serde_json::from_str(&candidate_json)
+                            .unwrap_or_default(),
+                        created_at: row.get(8)?,
+                        ended_at: row.get(9)?,
+                    })
+                },
+            );
+            match result {
+                Ok(c) => Ok(Some(c)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => {
+                    warn!("Failed to query prompt template canary: {}", e);
+                    Ok(None)
+                }
+            }
+        })
+        .unwrap_or(None);
+
+    let Some(canary) = canary_opt else {
+        return CanaryResolvedPrompt {
+            content: default_content.to_string(),
+            canary_id: None,
+            used_candidate: false,
+        };
+    };
+
+    let use_candidate = should_use_candidate(&canary);
+    let version = if use_candidate {
+        canary.candidate_version
+    } else {
+        canary.baseline_version
+    };
+
+    // Load the prompt content for the selected version from the registry
+    let content = match super::prompt_registry::get_prompt_by_version(
+        db,
+        &canary.template_id,
+        version,
+    ) {
+        Ok(Some(variant)) => {
+            info!(
+                "Canary {}: using {} version v{} for template '{}'",
+                canary.id,
+                if use_candidate { "candidate" } else { "baseline" },
+                version,
+                canary.template_id,
+            );
+            variant.prompt_content
+        }
+        Ok(None) => {
+            warn!(
+                "Canary {}: version v{} not found in prompt registry for '{}', falling back to default",
+                canary.id, version, canary.template_id,
+            );
+            default_content.to_string()
+        }
+        Err(e) => {
+            warn!(
+                "Canary {}: failed to load version v{} for '{}': {}, falling back to default",
+                canary.id, version, canary.template_id, e,
+            );
+            default_content.to_string()
+        }
+    };
+
+    CanaryResolvedPrompt {
+        content,
+        canary_id: Some(canary.id),
+        used_candidate: use_candidate,
+    }
+}
+
+/// Record the outcome of a prompt execution that went through canary routing.
+/// This is a convenience wrapper around `record_prompt_canary_run` that handles
+/// the case where no canary was active (canary_id is None — silently no-ops).
+pub fn record_canary_outcome(
+    db: &CheckpointDb,
+    canary_id: &str,
+    used_candidate: bool,
+    success: bool,
+    cost_usd: f64,
+    latency_ms: f64,
+    tokens: i64,
+) {
+    if let Err(e) = record_prompt_canary_run(
+        db,
+        canary_id,
+        used_candidate,
+        success,
+        cost_usd,
+        latency_ms,
+        tokens,
+    ) {
+        warn!(
+            "Failed to record canary outcome for {}: {}",
+            canary_id, e
+        );
+    }
+}

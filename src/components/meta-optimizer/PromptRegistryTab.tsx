@@ -4,6 +4,9 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { PromptVersionHistory } from "../prompt-versions";
+import { PromptCanaryPanel } from "./PromptCanaryPanel";
+import { CreatePromptCanaryForm } from "./CreatePromptCanaryForm";
 
 interface PromptVariant {
   id: string;
@@ -25,6 +28,8 @@ export function PromptRegistryTab() {
   const [filterAgent, setFilterAgent] = useState<string>("all");
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [versionHistoryId, setVersionHistoryId] = useState<string | null>(null);
+  const [canaryFormVariantId, setCanaryFormVariantId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -63,6 +68,10 @@ export function PromptRegistryTab() {
 
   return (
     <div className="p-4 space-y-4">
+      <PromptCanaryPanel />
+
+      <div className="border-t border-zinc-800 pt-4" />
+
       <div className="flex items-center gap-3">
         <select
           className="bg-zinc-800 text-zinc-200 text-sm px-2 py-1 rounded border border-zinc-700"
@@ -155,13 +164,58 @@ export function PromptRegistryTab() {
                             </div>
                           )}
 
-                          {!v.is_active && (
+                          <div className="flex items-center gap-2">
+                            {!v.is_active && (
+                              <button
+                                onClick={() => handleActivate(v.id)}
+                                className="px-3 py-1 text-xs bg-green-800 text-green-200 rounded hover:bg-green-700"
+                              >
+                                Activate
+                              </button>
+                            )}
                             <button
-                              onClick={() => handleActivate(v.id)}
-                              className="px-3 py-1 text-xs bg-green-800 text-green-200 rounded hover:bg-green-700"
+                              onClick={() =>
+                                setVersionHistoryId(versionHistoryId === v.id ? null : v.id)
+                              }
+                              className={`px-3 py-1 text-xs rounded ${
+                                versionHistoryId === v.id
+                                  ? "bg-blue-800 text-blue-200"
+                                  : "bg-zinc-700 text-zinc-300 hover:bg-zinc-600"
+                              }`}
                             >
-                              Activate
+                              Version History
                             </button>
+                            <button
+                              onClick={() =>
+                                setCanaryFormVariantId(
+                                  canaryFormVariantId === v.id ? null : v.id,
+                                )
+                              }
+                              className={`px-3 py-1 text-xs rounded ${
+                                canaryFormVariantId === v.id
+                                  ? "bg-purple-800 text-purple-200"
+                                  : "bg-zinc-700 text-zinc-300 hover:bg-zinc-600"
+                              }`}
+                            >
+                              Create A/B Test
+                            </button>
+                          </div>
+
+                          {versionHistoryId === v.id && (
+                            <div className="border border-zinc-700 rounded-lg overflow-hidden mt-2">
+                              <PromptVersionHistory templateId={v.id} />
+                            </div>
+                          )}
+
+                          {canaryFormVariantId === v.id && (
+                            <div className="mt-2">
+                              <CreatePromptCanaryForm
+                                defaultTemplateId={v.id}
+                                defaultBaselineVersion={v.version}
+                                onCreated={() => setCanaryFormVariantId(null)}
+                                onClose={() => setCanaryFormVariantId(null)}
+                              />
+                            </div>
                           )}
                         </div>
                       )}

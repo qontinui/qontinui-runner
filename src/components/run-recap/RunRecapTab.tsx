@@ -11,7 +11,7 @@
  */
 
 import { useState } from "react";
-import { Activity, AlertCircle, XCircle, LayoutDashboard, GitCommitHorizontal } from "lucide-react";
+import { Activity, AlertCircle, XCircle, LayoutDashboard, GitCommitHorizontal, BarChart3, DollarSign } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { useTaskRunRecap } from "../../hooks/useTaskRunRecap";
@@ -30,6 +30,8 @@ import { ErrorMonitorTab } from "../error-monitor/ErrorMonitorTab";
 import { CanvasRecapTab } from "./CanvasRecapTab";
 import { DurableExecutionTab } from "./DurableExecutionTab";
 import { useErrorBadge } from "../../hooks/useErrorMonitor";
+import { FeedbackScoresPanel } from "../feedback-scores/FeedbackScoresPanel";
+import { RunCostBreakdown } from "./RunCostBreakdown";
 
 // ============================================================================
 // Main Component
@@ -167,6 +169,14 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
             <GitCommitHorizontal className="w-3.5 h-3.5" />
             Diffs &amp; Replay
           </TabsTrigger>
+          <TabsTrigger value="feedback" className="flex items-center gap-1.5">
+            <BarChart3 className="w-3.5 h-3.5" />
+            Feedback Scores
+          </TabsTrigger>
+          <TabsTrigger value="llm-costs" className="flex items-center gap-1.5">
+            <DollarSign className="w-3.5 h-3.5" />
+            LLM Costs
+          </TabsTrigger>
           <TabsTrigger value="errors" className="flex items-center gap-1.5">
             <AlertCircle className="w-3.5 h-3.5" />
             Errors
@@ -212,6 +222,14 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
 
         <TabsContent value="durable">
           <DurableExecutionTab taskRunId={taskRunId} />
+        </TabsContent>
+
+        <TabsContent value="feedback">
+          <FeedbackScoresPanel runId={taskRunId} />
+        </TabsContent>
+
+        <TabsContent value="llm-costs">
+          <RunCostBreakdown runId={taskRunId} />
         </TabsContent>
 
         <TabsContent value="errors" className="h-full">

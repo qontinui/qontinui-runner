@@ -262,3 +262,315 @@ pub fn provenance_based_fix_routing(
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Create an in-memory SQLite database with all tables needed by cross_run_learning.
+    fn setup_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE task_runs (
+                id TEXT PRIMARY KEY,
+                task_name TEXT NOT NULL DEFAULT '',
+                task_type TEXT NOT NULL DEFAULT 'task',
+                status TEXT NOT NULL DEFAULT 'running',
+                sessions_count INTEGER NOT NULL DEFAULT 0,
+                auto_continue BOOLEAN NOT NULL DEFAULT 1,
+                output_log TEXT DEFAULT '',
+                workflow_name TEXT,
+                workflow_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE unified_workflows (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                category TEXT DEFAULT 'general',
+                tags TEXT DEFAULT '[]',
+                setup_steps TEXT DEFAULT '[]',
+                verification_steps TEXT DEFAULT '[]',
+                agentic_steps TEXT DEFAULT '[]',
+                completion_steps TEXT DEFAULT '[]',
+                max_iterations INTEGER DEFAULT 10,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE task_run_findings (
+                id TEXT PRIMARY KEY,
+                task_run_id TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'code_bug',
+                severity TEXT NOT NULL DEFAULT 'medium',
+                signature_hash TEXT,
+                title TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'detected',
+                action_type TEXT NOT NULL DEFAULT 'auto_fix',
+                detected_in_session INTEGER NOT NULL DEFAULT 0,
+                detected_at TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE reflection_fixes (
+                id TEXT PRIMARY KEY,
+                source_task_run_id TEXT NOT NULL,
+                reflection_task_run_id TEXT NOT NULL,
+                source_finding_id TEXT,
+                fix_type TEXT NOT NULL,
+                fix_description TEXT NOT NULL,
+                file_changed TEXT,
+                old_value TEXT,
+                new_value TEXT,
+                confidence TEXT NOT NULL DEFAULT 'medium',
+                status TEXT NOT NULL DEFAULT 'applied',
+                effectiveness TEXT,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+                evaluated_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                reuse_count INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE generation_rules (
+                id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL,
+                section TEXT NOT NULL,
+                rule_number INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                provenance TEXT NOT NULL DEFAULT 'seed',
+                source_fix_id TEXT,
+                confidence REAL DEFAULT 1.0,
+                severity TEXT NOT NULL DEFAULT 'normal',
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE fix_applications (
+                id TEXT PRIMARY KEY,
+                fix_id TEXT NOT NULL,
+                task_run_id TEXT NOT NULL,
+                error_signature_hash TEXT,
+                outcome TEXT DEFAULT 'pending',
+                applied_at TEXT NOT NULL,
+                evaluated_at TEXT
+            );
+
+            CREATE TABLE cross_run_patterns (
+                id TEXT PRIMARY KEY,
+                pattern_type TEXT NOT NULL,
+                signature_hash TEXT NOT NULL,
+                workflow_name TEXT,
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                first_seen_task_run_id TEXT,
+                last_seen_task_run_id TEXT,
+                first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                affected_components TEXT,
+                pattern_data TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                resolved_by_fix_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(pattern_type, signature_hash)
+            );
+
+            CREATE TABLE step_provenance (
+                id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                workflow_version_id TEXT,
+                step_name TEXT NOT NULL,
+                step_index INTEGER NOT NULL,
+                phase TEXT NOT NULL,
+                generating_agent TEXT NOT NULL,
+                generation_iteration INTEGER,
+                original_step_json TEXT,
+                final_step_json TEXT,
+                ui_bridge_event_ids TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE rule_influence_log (
+                id TEXT PRIMARY KEY,
+                rule_id TEXT NOT NULL,
+                task_run_id TEXT NOT NULL,
+                workflow_id TEXT,
+                influence_type TEXT NOT NULL DEFAULT 'loaded',
+                evidence TEXT,
+                phase TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_auto_disable_ineffective_rules() {
+        let conn = setup_test_db();
+
+        // Create a reflection fix marked 'ineffective'
+        conn.execute(
+            "INSERT INTO reflection_fixes (id, source_task_run_id, reflection_task_run_id, fix_type, fix_description, effectiveness)
+             VALUES ('fix-1', 'tr-1', 'rtr-1', 'workflow_step_rewrite', 'Fix login step', 'ineffective')",
+            [],
+        )
+        .unwrap();
+
+        // Create an active generation rule that points to the ineffective fix
+        conn.execute(
+            "INSERT INTO generation_rules (id, agent, section, rule_number, title, content, status, source_fix_id, created_at, updated_at)
+             VALUES ('rule-1', 'builder', 'important_rules', 1, 'Login rule', 'Always check login', 'active', 'fix-1', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        // Insert 3 'no_effect' entries in rule_influence_log (meets threshold of 3)
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO rule_influence_log (id, rule_id, task_run_id, influence_type, created_at)
+                 VALUES (?1, 'rule-1', ?2, 'no_effect', datetime('now'))",
+                params![format!("ri-{}", i), format!("tr-run-{}", i)],
+            )
+            .unwrap();
+        }
+
+        // Act
+        let disabled = auto_disable_ineffective_rules(&conn, 3).unwrap();
+
+        // Assert: rule should be disabled
+        assert_eq!(disabled, 1);
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM generation_rules WHERE id = 'rule-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "disabled");
+    }
+
+    #[test]
+    fn test_auto_disable_skips_effective_rules() {
+        let conn = setup_test_db();
+
+        // Create a generation rule with NO source fix (will rely on influence log alone)
+        conn.execute(
+            "INSERT INTO generation_rules (id, agent, section, rule_number, title, content, status, created_at, updated_at)
+             VALUES ('rule-eff', 'builder', 'important_rules', 1, 'Good rule', 'Always verify', 'active', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        // Insert 3 'no_effect' entries
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO rule_influence_log (id, rule_id, task_run_id, influence_type, created_at)
+                 VALUES (?1, 'rule-eff', ?2, 'no_effect', datetime('now'))",
+                params![format!("ri-ne-{}", i), format!("tr-ne-{}", i)],
+            )
+            .unwrap();
+        }
+
+        // Also insert 1 'prevented_error' entry — this should protect the rule
+        conn.execute(
+            "INSERT INTO rule_influence_log (id, rule_id, task_run_id, influence_type, created_at)
+             VALUES ('ri-pe-0', 'rule-eff', 'tr-pe-0', 'prevented_error', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        // Act
+        let disabled = auto_disable_ineffective_rules(&conn, 3).unwrap();
+
+        // Assert: rule should NOT be disabled because it has a 'prevented_error' entry
+        assert_eq!(disabled, 0);
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM generation_rules WHERE id = 'rule-eff'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn test_provenance_based_fix_routing() {
+        let conn = setup_test_db();
+
+        let workflow_id = "wf-test-1";
+
+        // Use graph_ops::insert_step_provenance so the data goes through the same
+        // code path used by the production read query.
+        graph_ops::insert_step_provenance(
+            &conn,
+            workflow_id,
+            None,
+            "login_step",
+            0,
+            "setup",
+            "builder",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        graph_ops::insert_step_provenance(
+            &conn,
+            workflow_id,
+            None,
+            "verify_dashboard",
+            1,
+            "verification",
+            "hardener",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Verify provenance entries exist
+        let provs = graph_ops::get_provenance_for_workflow(&conn, workflow_id).unwrap();
+        assert_eq!(provs.len(), 2, "Expected 2 provenance entries, got {}", provs.len());
+
+        // Fix description mentions 'login_step' — should match the builder agent
+        let result = provenance_based_fix_routing(
+            &conn,
+            "Fix the login_step selector to use #email-input",
+            None,
+            Some(workflow_id),
+        );
+
+        assert!(result.is_some(), "Expected Some routing result but got None");
+        let (agent, phase) = result.unwrap();
+        assert_eq!(agent, "builder");
+        assert_eq!(phase, "setup");
+    }
+
+    #[test]
+    fn test_provenance_based_fix_routing_no_match() {
+        let conn = setup_test_db();
+
+        // No provenance entries exist for this workflow
+        let result = provenance_based_fix_routing(
+            &conn,
+            "Fix something unrelated",
+            None,
+            Some("wf-nonexistent"),
+        );
+
+        assert!(result.is_none());
+    }
+}

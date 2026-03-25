@@ -39,6 +39,11 @@ export default defineConfig({
   },
   resolve: {
     alias: [
+      // Force all React imports to the app's single copy (prevents duplicate
+      // React instances from symlinked packages with their own node_modules)
+      { find: /^react$/, replacement: path.resolve(__dirname, "node_modules/react") },
+      { find: /^react-dom($|\/)/, replacement: path.resolve(__dirname, "node_modules/react-dom$1") },
+      { find: /^react\//, replacement: path.resolve(__dirname, "node_modules/react/") },
       { find: "@", replacement: path.resolve(__dirname, "./src") },
       { find: "@qontinui/schemas", replacement: path.resolve(__dirname, "../qontinui-schemas/generated/typescript") },
       // Explicit subpath aliases for symlinked packages (Vite can't resolve

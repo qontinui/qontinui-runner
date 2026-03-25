@@ -56,6 +56,7 @@ mod instance_manager;
 mod iteration_bundle;
 #[cfg(windows)]
 mod job_object;
+mod knowledge_acquisition;
 mod known_issues;
 mod log_consolidation;
 mod log_migration;
@@ -230,13 +231,36 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize PostgreSQL connection (PG-primary with SQLite fallback during migration).
     // Uses RUNNER_DATABASE_URL env var, or defaults to the local docker-compose PostgreSQL.
+    // Uses a dedicated tokio runtime for the one-shot async connection — cannot use
+    // tauri::async_runtime::block_on here because the Tauri runtime hasn't started yet.
     let pg_db = {
         let pg_url = std::env::var("RUNNER_DATABASE_URL").unwrap_or_else(|_| {
-            "host=localhost port=5432 user=qontinui_user password=qontinui_dev_password dbname=qontinui_db options=-c search_path=runner,public".to_string()
+            "host=localhost port=5432 user=qontinui_user password=qontinui_dev_password dbname=qontinui_db".to_string()
         });
-        tauri::async_runtime::block_on(crate::database::pg::PgDb::try_new(&pg_url))
-            .map(Arc::new)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok();
+        rt.and_then(|rt| {
+            rt.block_on(crate::database::pg::PgDb::try_new(&pg_url))
+                .map(Arc::new)
+        })
     };
+
+    // One-time migration of token usage data from SQLite to PostgreSQL
+    if let Some(ref pg) = pg_db {
+        if let Some(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()
+        {
+            match rt.block_on(pg.migrate_token_data_from_sqlite(&checkpoint_db)) {
+                Ok(0) => {} // No migration needed or already done
+                Ok(n) => info!("Migrated {} token usage rows to PostgreSQL", n),
+                Err(e) => warn!("Token data migration to PG failed (non-fatal): {}", e),
+            }
+        }
+    }
 
     // Connect the SQLite span layer to the database pool
     if let Some(ref sqlite_layer) = logging_result.sqlite_span_layer {
@@ -1257,6 +1281,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::transcript::transcript_list_sessions,
             commands::transcript::transcript_read_session,
             commands::transcript::transcript_get_latest,
+            commands::transcript::transcript_session_digests,
+            commands::transcript::transcript_find_external_processes,
             commands::transcript::generate_workflow_standalone,
             // Terminal session analysis commands
             commands::terminal_analysis::analyze_session_summary,
@@ -1293,6 +1319,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::meta_optimizer::get_canary_rollouts,
             commands::meta_optimizer::promote_canary_rollout,
             commands::meta_optimizer::rollback_canary_rollout,
+            // Prompt template A/B testing
+            commands::meta_optimizer::create_prompt_canary,
+            commands::meta_optimizer::get_prompt_canary_status,
             // Eval spec commands (promptfoo-inspired declarative evaluation)
             commands::meta_optimizer::get_eval_specs,
             commands::meta_optimizer::create_eval_spec,
@@ -1300,6 +1329,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::meta_optimizer::get_eval_results,
             commands::meta_optimizer::run_recommendation_eval,
             commands::meta_optimizer::generate_default_eval_spec,
+            commands::meta_optimizer::evaluate_with_io,
             // Robustness testing and golden datasets
             commands::meta_optimizer::run_robustness_test,
             commands::meta_optimizer::get_robustness_reports,
@@ -1338,6 +1368,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::token_analytics::get_cost_by_phase,
             commands::token_analytics::get_provider_latency,
             commands::token_analytics::get_task_run_costs,
+            commands::token_analytics::get_cost_by_target_app,
             // Container settings commands (Docker isolation)
             commands::container_settings::get_container_settings,
             commands::container_settings::update_container_settings,

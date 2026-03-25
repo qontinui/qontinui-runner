@@ -600,6 +600,16 @@ impl StepExecutor {
                     builder.build_error(duration_ms as i64, result.error.as_deref())
                 };
 
+                // PG-primary: fire-and-forget async write to PostgreSQL
+                if let Some(pg) = &self.app_state.pg_db {
+                    let pg = pg.clone();
+                    let event_clone = event.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = pg.create_task_run_event(&event_clone).await {
+                            tracing::warn!("PG event write failed: {}", e);
+                        }
+                    });
+                }
                 if let Err(e) = self.app_state.checkpoint_db.create_task_run_event(&event) {
                     warn!("Failed to emit verification step completion event: {}", e);
                 }

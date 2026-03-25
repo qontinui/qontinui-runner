@@ -14,6 +14,7 @@ import type {
   PhaseCostRow,
   ProviderLatencyRow,
   TaskRunCostRow,
+  TargetAppCostRow,
   LlmTimeRange,
 } from "../components/llm-observability/types";
 
@@ -40,6 +41,7 @@ export const llmAnalyticsKeys = {
   costByPhase: (days: number) => [...llmAnalyticsKeys.all, "cost-by-phase", days] as const,
   providerLatency: (days: number) => [...llmAnalyticsKeys.all, "provider-latency", days] as const,
   taskRunCosts: (days: number) => [...llmAnalyticsKeys.all, "task-run-costs", days] as const,
+  costByTargetApp: (days: number) => [...llmAnalyticsKeys.all, "cost-by-target-app", days] as const,
 };
 
 export interface UseLlmAnalyticsResult {
@@ -49,6 +51,7 @@ export interface UseLlmAnalyticsResult {
   costByPhase: PhaseCostRow[];
   providerLatency: ProviderLatencyRow[];
   taskRunCosts: TaskRunCostRow[];
+  costByTargetApp: TargetAppCostRow[];
   loading: boolean;
   error: string | null;
   refresh: () => void;
@@ -103,13 +106,21 @@ export function useLlmAnalytics(timeRange: LlmTimeRange = "7d"): UseLlmAnalytics
     refetchInterval: 60000,
   });
 
+  const costByTargetAppQuery = useQuery({
+    queryKey: llmAnalyticsKeys.costByTargetApp(days),
+    queryFn: () => invoke<TargetAppCostRow[]>("get_cost_by_target_app", { days }),
+    staleTime: 30000,
+    refetchInterval: 60000,
+  });
+
   const loading =
     summaryQuery.isLoading ||
     dailyCostQuery.isLoading ||
     costByModelQuery.isLoading ||
     costByPhaseQuery.isLoading ||
     providerLatencyQuery.isLoading ||
-    taskRunCostsQuery.isLoading;
+    taskRunCostsQuery.isLoading ||
+    costByTargetAppQuery.isLoading;
 
   const error =
     summaryQuery.error?.message ??
@@ -118,6 +129,7 @@ export function useLlmAnalytics(timeRange: LlmTimeRange = "7d"): UseLlmAnalytics
     costByPhaseQuery.error?.message ??
     providerLatencyQuery.error?.message ??
     taskRunCostsQuery.error?.message ??
+    costByTargetAppQuery.error?.message ??
     null;
 
   const refresh = () => {
@@ -131,6 +143,7 @@ export function useLlmAnalytics(timeRange: LlmTimeRange = "7d"): UseLlmAnalytics
     costByPhase: costByPhaseQuery.data ?? [],
     providerLatency: providerLatencyQuery.data ?? [],
     taskRunCosts: taskRunCostsQuery.data ?? [],
+    costByTargetApp: costByTargetAppQuery.data ?? [],
     loading,
     error,
     refresh,

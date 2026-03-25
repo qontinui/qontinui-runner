@@ -5241,6 +5241,180 @@ async fn ui_bridge_batch_handler(
     Ok(Json(ApiResponse::success(response)))
 }
 
+// ============================================================================
+// Analytics endpoints (selector performance, cross-run quality)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct AnalyticsDaysQuery {
+    #[serde(default = "default_analytics_days")]
+    pub days: u32,
+    #[serde(default = "default_analytics_limit")]
+    pub limit: i64,
+}
+fn default_analytics_days() -> u32 { 7 }
+fn default_analytics_limit() -> i64 { 20 }
+
+#[derive(Debug, Deserialize)]
+pub struct DecayCurveQuery {
+    pub element_id: String,
+    #[serde(default = "default_window_ms")]
+    pub window_ms: i64,
+    #[serde(default = "default_num_windows")]
+    pub windows: i64,
+}
+fn default_window_ms() -> i64 { 86_400_000 } // 1 day
+fn default_num_windows() -> i64 { 7 }
+
+fn days_to_epoch_ms(days: u32) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    now - (days as i64 * 86_400_000)
+}
+
+fn days_to_sqlite_datetime(days: u32) -> String {
+    format!("-{} days", days)
+}
+
+/// GET /ui-bridge/analytics/decay-curve
+pub async fn analytics_decay_curve_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<DecayCurveQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::DecayCurveBucket>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.app_state.checkpoint_db.clone();
+    let eid = q.element_id;
+    let wms = q.window_ms;
+    let nw = q.windows;
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|c| crate::database::ui_bridge_ops::get_element_decay_curve(c, &eid, wms, nw))
+    }).await {
+        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    }
+}
+
+/// GET /ui-bridge/analytics/action-baselines
+pub async fn analytics_action_baselines_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<AnalyticsDaysQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::ActionBaseline>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.app_state.checkpoint_db.clone();
+    let since = days_to_epoch_ms(q.days);
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|c| crate::database::ui_bridge_ops::get_action_latency_baselines(c, since))
+    }).await {
+        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    }
+}
+
+/// GET /ui-bridge/analytics/failure-taxonomy
+pub async fn analytics_failure_taxonomy_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<AnalyticsDaysQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::FailureCluster>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.app_state.checkpoint_db.clone();
+    let since = days_to_epoch_ms(q.days);
+    let limit = q.limit;
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|c| crate::database::ui_bridge_ops::get_failure_taxonomy(c, since, limit))
+    }).await {
+        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    }
+}
+
+/// GET /ui-bridge/analytics/fragility-heatmap
+pub async fn analytics_fragility_heatmap_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<AnalyticsDaysQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::ElementFragility>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.app_state.checkpoint_db.clone();
+    let since = days_to_epoch_ms(q.days);
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|c| crate::database::ui_bridge_ops::get_element_fragility_by_region(c, since))
+    }).await {
+        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    }
+}
+
+/// GET /ui-bridge/analytics/regressions
+pub async fn analytics_regressions_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<AnalyticsDaysQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::AutomationRegression>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.app_state.checkpoint_db.clone();
+    let since = days_to_epoch_ms(q.days);
+    let limit = q.limit;
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|c| crate::database::ui_bridge_ops::get_automation_regressions(c, since, limit))
+    }).await {
+        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    }
+}
+
+/// GET /ui-bridge/analytics/stall-frequency
+pub async fn analytics_stall_frequency_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<AnalyticsDaysQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::StallFrequency>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.app_state.checkpoint_db.clone();
+    let since = format!("datetime('now', '{}')", days_to_sqlite_datetime(q.days));
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|c| crate::database::ui_bridge_ops::get_stall_frequency(c, &since))
+    }).await {
+        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    }
+}
+
+/// GET /ui-bridge/analytics/intervention-effectiveness
+pub async fn analytics_intervention_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<AnalyticsDaysQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::InterventionStats>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.app_state.checkpoint_db.clone();
+    let since = format!("datetime('now', '{}')", days_to_sqlite_datetime(q.days));
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|c| crate::database::ui_bridge_ops::get_intervention_effectiveness(c, &since))
+    }).await {
+        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StateCoverageQuery {
+    pub task_run_id: i64,
+}
+
+/// GET /ui-bridge/analytics/state-coverage
+pub async fn analytics_state_coverage_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<StateCoverageQuery>,
+) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.app_state.checkpoint_db.clone();
+    let tr = q.task_run_id;
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|c| crate::database::ui_bridge_ops::get_state_coverage(c, tr))
+    }).await {
+        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    }
+}
+
 /// Create routes for this module.
 // ============================================================================
 // Health signals endpoint (combined idle + stuck screen diagnosis)
@@ -6116,4 +6290,13 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/graph/element-reliability",
             get(ui_bridge_element_reliability_handler),
         )
+        // Analytics endpoints (Phase 1 + 2)
+        .route("/ui-bridge/analytics/decay-curve", get(analytics_decay_curve_handler))
+        .route("/ui-bridge/analytics/action-baselines", get(analytics_action_baselines_handler))
+        .route("/ui-bridge/analytics/failure-taxonomy", get(analytics_failure_taxonomy_handler))
+        .route("/ui-bridge/analytics/fragility-heatmap", get(analytics_fragility_heatmap_handler))
+        .route("/ui-bridge/analytics/regressions", get(analytics_regressions_handler))
+        .route("/ui-bridge/analytics/stall-frequency", get(analytics_stall_frequency_handler))
+        .route("/ui-bridge/analytics/intervention-effectiveness", get(analytics_intervention_handler))
+        .route("/ui-bridge/analytics/state-coverage", get(analytics_state_coverage_handler))
 }

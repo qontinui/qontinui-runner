@@ -125,3 +125,5 @@ vite.config.js
 # Storybook build output
 storybook-static/
 target-new/
+target-test/
+target-test2/

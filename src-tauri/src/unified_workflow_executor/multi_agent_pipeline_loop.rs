@@ -418,13 +418,33 @@ fn build_dependency_dag(criteria: &[PipelineAcceptanceCriterion]) -> ExecutionDA
 }
 
 /// Query token usage from the database for a specific execution_id and iteration.
+/// Uses PG when available, falls back to SQLite.
 ///
 /// Returns (input_tokens, output_tokens). Falls back to (0, 0) on error.
 pub(super) fn query_iteration_tokens(
     db: &crate::database::CheckpointDb,
+    pg_db: Option<&std::sync::Arc<crate::database::pg::PgDb>>,
     execution_id: &str,
     iteration: u32,
 ) -> (u64, u64) {
+    // Try PG first if available and we're in a tokio context.
+    // Uses catch_unwind because Handle::block_on panics if called from within
+    // an async context (which these sync helpers are called from). On panic,
+    // we silently fall through to the SQLite path.
+    if let Some(pg) = pg_db {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let pg = pg.clone();
+            let id = execution_id.to_string();
+            let pg_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.block_on(async move { pg.get_iteration_token_totals(&id, iteration).await })
+            }));
+            if let Ok(Ok(totals)) = pg_result {
+                return totals;
+            }
+        }
+    }
+
+    // SQLite fallback
     match db.get_iteration_token_totals(execution_id, iteration) {
         Ok(totals) => totals,
         Err(e) => {
@@ -464,7 +484,13 @@ impl LoopController {
 
         // Load active prompt variants from the registry (populated by meta-optimizer).
         // If a variant exists for an agent type, it can be used to customize that agent's behavior.
-        // Currently a no-op until the meta-optimizer populates the registry.
+        // If an active prompt template canary exists for that agent type, traffic is split
+        // between baseline and candidate versions automatically.
+        //
+        // canary_assignments tracks (canary_id, used_candidate) per agent_type so we can
+        // record outcomes after execution completes.
+        let mut canary_assignments: std::collections::HashMap<String, (String, bool)> =
+            std::collections::HashMap::new();
         let mut active_prompt_variants: std::collections::HashMap<String, String> = {
             let mut variants = std::collections::HashMap::new();
             for agent_type in &["spec_analyst", "locator", "implementer", "verifier"] {
@@ -476,15 +502,34 @@ impl LoopController {
                         "MULTI-AGENT-PIPELINE: Using prompt variant '{}' v{} for {}",
                         variant.variant_name, variant.version, agent_type
                     );
-                    variants.insert(agent_type.to_string(), variant.prompt_content);
+                    // Route through canary A/B split if an active canary exists
+                    let resolved = crate::meta_optimizer::canary::resolve_prompt_with_canary(
+                        &self.checkpoint_db,
+                        agent_type,
+                        &variant.prompt_content,
+                    );
+                    if let Some(ref cid) = resolved.canary_id {
+                        info!(
+                            "MULTI-AGENT-PIPELINE: Canary {} active for {}, using {} version",
+                            cid,
+                            agent_type,
+                            if resolved.used_candidate { "candidate" } else { "baseline" },
+                        );
+                        canary_assignments.insert(
+                            agent_type.to_string(),
+                            (cid.clone(), resolved.used_candidate),
+                        );
+                    }
+                    variants.insert(agent_type.to_string(), resolved.content);
                 }
             }
             variants
         };
         if !active_prompt_variants.is_empty() {
             info!(
-                "MULTI-AGENT-PIPELINE: {} active prompt variant(s) loaded from registry",
-                active_prompt_variants.len()
+                "MULTI-AGENT-PIPELINE: {} active prompt variant(s) loaded from registry ({} with canary A/B split)",
+                active_prompt_variants.len(),
+                canary_assignments.len(),
             );
         }
 
@@ -861,7 +906,7 @@ Only output the JSON array, nothing else."#,
             // Query token usage recorded during the locator's run_agentic call (iteration=0).
             // Fall back to tokens carried on AgenticOutcome when DB has no records.
             let (mut locator_tokens_in, mut locator_tokens_out) =
-                query_iteration_tokens(&self.checkpoint_db, &config.execution_id, 0);
+                query_iteration_tokens(&self.checkpoint_db, self.app_state.pg_db.as_ref(), &config.execution_id, 0);
             if locator_tokens_in == 0 && locator_tokens_out == 0 {
                 let (ot_in, ot_out) = locator_outcome.token_usage();
                 locator_tokens_in = ot_in.unwrap_or(0);
@@ -977,6 +1022,22 @@ Only output the JSON array, nothing else."#,
                     total_tokens: budget_total_tokens,
                     total_cost_usd: budget_total_cost,
                 };
+                // Record canary outcomes on early exit (budget exhaustion).
+                for (agent_type, (canary_id, used_candidate)) in &canary_assignments {
+                    let mut ac = 0.0_f64;
+                    let mut al = 0.0_f64;
+                    let mut at = 0_i64;
+                    for t in &result.agent_traces {
+                        if t.agent_type == *agent_type {
+                            ac += t.cost_usd;
+                            al += t.duration_ms as f64;
+                            at += (t.tokens_in as i64) + (t.tokens_out as i64);
+                        }
+                    }
+                    crate::meta_optimizer::canary::record_canary_outcome(
+                        &self.checkpoint_db, canary_id, *used_candidate, false, ac, al, at,
+                    );
+                }
                 // Canary config restoration is handled at the loop_controller::run() level.
                 return result.to_loop_result();
             }
@@ -1140,6 +1201,22 @@ Only output the JSON array, nothing else."#,
                     total_tokens: stopped_total_tokens,
                     total_cost_usd: stopped_total_cost,
                 };
+                // Record canary outcomes on early exit (user stopped).
+                for (agent_type, (canary_id, used_candidate)) in &canary_assignments {
+                    let mut ac = 0.0_f64;
+                    let mut al = 0.0_f64;
+                    let mut at = 0_i64;
+                    for t in &result.agent_traces {
+                        if t.agent_type == *agent_type {
+                            ac += t.cost_usd;
+                            al += t.duration_ms as f64;
+                            at += (t.tokens_in as i64) + (t.tokens_out as i64);
+                        }
+                    }
+                    crate::meta_optimizer::canary::record_canary_outcome(
+                        &self.checkpoint_db, canary_id, *used_candidate, false, ac, al, at,
+                    );
+                }
                 // Canary config restoration is handled at the loop_controller::run() level.
                 return result.to_loop_result();
             }
@@ -1298,6 +1375,39 @@ Only output the JSON array, nothing else."#,
             }
         }
 
+        // Run LLM-as-judge evaluations on agent traces if eval specs exist.
+        // This evaluates live I/O from each agent against any configured judge
+        // assertions (hallucination, relevance, factuality, content safety).
+        if !config.is_dev_mode {
+            self.run_llm_judge_evaluations(&config, &result);
+        }
+
+        // Record canary outcomes for any agent types that were A/B split.
+        // Aggregate per-agent cost/latency/tokens from the traces.
+        if !canary_assignments.is_empty() {
+            for (agent_type, (canary_id, used_candidate)) in &canary_assignments {
+                let mut agent_cost: f64 = 0.0;
+                let mut agent_latency: f64 = 0.0;
+                let mut agent_tokens: i64 = 0;
+                for trace in &result.agent_traces {
+                    if trace.agent_type == *agent_type {
+                        agent_cost += trace.cost_usd;
+                        agent_latency += trace.duration_ms as f64;
+                        agent_tokens += (trace.tokens_in as i64) + (trace.tokens_out as i64);
+                    }
+                }
+                crate::meta_optimizer::canary::record_canary_outcome(
+                    &self.checkpoint_db,
+                    canary_id,
+                    *used_candidate,
+                    result.goal_achieved,
+                    agent_cost,
+                    agent_latency,
+                    agent_tokens,
+                );
+            }
+        }
+
         // Clear the checkpoint now that the pipeline completed successfully.
         // This prevents stale checkpoint data from being used on a future re-run.
         if let Err(e) = crate::database::pipeline_traces::clear_pipeline_checkpoint(
@@ -1308,6 +1418,150 @@ Only output the JSON array, nothing else."#,
         }
 
         result.to_loop_result()
+    }
+
+    /// Run LLM-as-judge evaluations on agent traces after pipeline completion.
+    ///
+    /// For each unique agent type in the traces, looks up eval specs that target
+    /// that agent. If any spec contains LLM judge assertions, evaluates them
+    /// against the agent's actual input/output snapshots.
+    fn run_llm_judge_evaluations(
+        &self,
+        _config: &LoopConfig,
+        result: &MultiAgentPipelineResult,
+    ) {
+        // Collect unique agent types that have traces
+        let agent_types: HashSet<&str> = result
+            .agent_traces
+            .iter()
+            .map(|t| t.agent_type.as_str())
+            .collect();
+
+        for agent_type in agent_types {
+            // Look up eval specs for this agent type
+            let specs = match crate::meta_optimizer::eval_spec::list_eval_specs(
+                &self.checkpoint_db,
+                Some(agent_type),
+            ) {
+                Ok(specs) => specs,
+                Err(e) => {
+                    debug!(
+                        "No eval specs for agent type {}: {}",
+                        agent_type, e
+                    );
+                    continue;
+                }
+            };
+
+            if specs.is_empty() {
+                continue;
+            }
+
+            // Check if any spec has LLM judge assertions
+            let has_judge_assertions = specs.iter().any(|spec| {
+                spec.test_cases.iter().any(|tc| {
+                    tc.assertions.iter().any(|a| {
+                        matches!(
+                            a,
+                            crate::meta_optimizer::eval_spec::EvalAssertion::HallucinationCheck { .. }
+                                | crate::meta_optimizer::eval_spec::EvalAssertion::AnswerRelevance { .. }
+                                | crate::meta_optimizer::eval_spec::EvalAssertion::Factuality { .. }
+                                | crate::meta_optimizer::eval_spec::EvalAssertion::ContentSafety { .. }
+                        )
+                    })
+                })
+            });
+
+            if !has_judge_assertions {
+                continue;
+            }
+
+            // Build aggregate metrics for this agent type
+            let period_start =
+                (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+            let period_end = chrono::Utc::now().to_rfc3339();
+            let metrics = crate::database::pipeline_traces::get_agent_aggregates_for_period(
+                &self.checkpoint_db,
+                agent_type,
+                &period_start,
+                &period_end,
+            )
+            .ok()
+            .flatten()
+            .map(|agg| crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
+                success_rate: if agg.run_count > 0 {
+                    agg.success_count as f64 / agg.run_count as f64
+                } else {
+                    0.0
+                },
+                mean_duration_ms: agg.avg_duration_ms,
+                mean_iterations: 0.0,
+                mean_cost_cents: agg.avg_cost_usd * 100.0,
+                trial_count: agg.run_count as u32,
+            })
+            .unwrap_or(crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
+                success_rate: 0.0,
+                mean_duration_ms: 0.0,
+                mean_iterations: 0.0,
+                mean_cost_cents: 0.0,
+                trial_count: 0,
+            });
+
+            // Get traces for this agent type
+            let agent_traces: Vec<&PipelineAgentTrace> = result
+                .agent_traces
+                .iter()
+                .filter(|t| t.agent_type == agent_type)
+                .collect();
+
+            // Evaluate each spec against each trace
+            for spec in &specs {
+                for trace in &agent_traces {
+                    let input = trace.input_snapshot.to_string();
+                    let output = trace.output_snapshot.to_string();
+
+                    for tc in &spec.test_cases {
+                        let results =
+                            crate::meta_optimizer::eval_runner::evaluate_test_case_with_io(
+                                tc, &input, &output, None, &metrics,
+                            );
+
+                        let judge_results: Vec<_> = results
+                            .iter()
+                            .filter(|r| {
+                                r.assertion_type != "success_rate"
+                                    && r.assertion_type != "max_duration"
+                                    && r.assertion_type != "max_cost"
+                                    && r.assertion_type != "max_iterations"
+                                    && r.assertion_type != "no_regression"
+                            })
+                            .collect();
+
+                        if !judge_results.is_empty() {
+                            let passed = judge_results.iter().all(|r| r.passed);
+                            info!(
+                                "LLM judge eval for {} (trace {}, spec {}): {} — {}/{} assertions passed",
+                                agent_type,
+                                trace.agent_id,
+                                spec.id,
+                                if passed { "PASSED" } else { "FAILED" },
+                                judge_results.iter().filter(|r| r.passed).count(),
+                                judge_results.len(),
+                            );
+
+                            for r in &judge_results {
+                                if !r.passed {
+                                    warn!(
+                                        "  FAILED: {} — {}",
+                                        r.assertion_type, r.message
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1473,8 +1727,11 @@ impl PipelineShared {
                 let implementer_duration = implementer_start.elapsed().as_millis() as u64;
 
                 // Query token usage recorded during the implementer's run_agentic call.
+                // PipelineShared doesn't carry pg_db — use SQLite only here.
+                // PG data is always available via dual-write.
                 let (mut impl_tokens_in, mut impl_tokens_out) = query_iteration_tokens(
                     &self.checkpoint_db,
+                    None,
                     &config.execution_id,
                     local_iterations,
                 );

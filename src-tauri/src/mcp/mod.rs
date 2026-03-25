@@ -46,6 +46,7 @@ pub mod hooks;
 pub mod image_quality_tests;
 pub mod inngest;
 pub mod interaction_recording;
+pub mod knowledge_acquisition_api;
 pub mod log_sources;
 pub mod macros;
 pub mod mcp_servers;

@@ -1464,6 +1464,7 @@ impl LoopController {
         let (mut trace_tokens_in, mut trace_tokens_out) =
             super::multi_agent_pipeline_loop::query_iteration_tokens(
                 &self.checkpoint_db,
+                self.app_state.pg_db.as_ref(),
                 &config.execution_id,
                 ctx.iteration,
             );
@@ -1758,6 +1759,16 @@ impl LoopController {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     duration_ms: None,
                 };
+                // PG-primary: fire-and-forget async write to PostgreSQL
+                if let Some(pg) = &self.app_state.pg_db {
+                    let pg = pg.clone();
+                    let event_clone = findings_event.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = pg.create_task_run_event(&event_clone).await {
+                            tracing::warn!("PG event write failed: {}", e);
+                        }
+                    });
+                }
                 if let Err(e) = self.checkpoint_db.create_task_run_event(&findings_event) {
                     warn!("Failed to store agentic findings event: {}", e);
                 }

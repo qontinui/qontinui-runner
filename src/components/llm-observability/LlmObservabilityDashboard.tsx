@@ -15,6 +15,7 @@ import { SummaryCards } from "./SummaryCards";
 import { CostOverTimeChart } from "./CostOverTimeChart";
 import { CostByModelChart } from "./CostByModelChart";
 import { CostByPhaseChart } from "./CostByPhaseChart";
+import { CostTrendChart } from "./CostTrendChart";
 import { ProviderLatencyChart } from "./ProviderLatencyChart";
 import { TaskRunCostTable } from "./TaskRunCostTable";
 import { CostByTargetAppChart } from "./CostByTargetAppChart";
@@ -123,6 +124,9 @@ export default function LlmObservabilityDashboard() {
         <CostOverTimeChart data={dailyCost} />
         <CostByModelChart data={costByModel} />
       </div>
+
+      {/* Cost Trend (fetches its own data from the web backend) */}
+      <CostTrendChart />
 
       {/* Charts Row 2 */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

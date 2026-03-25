@@ -279,6 +279,46 @@ impl QueryRoot {
         Ok(run.map(super::types::GqlTaskRun::from_db))
     }
 
+    /// Get task run output with optional offset/limit for pagination.
+    /// Defaults to last 10000 characters (tail) if no offset specified.
+    async fn task_run_output(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+        #[graphql(default = 0)] offset: i32,
+        #[graphql(default = 10000)] limit: i32,
+    ) -> Result<super::types::GqlTaskRunOutput> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+        let db = state.app_state.checkpoint_db.clone();
+        let id_clone = id.clone();
+
+        let full_output = tokio::task::spawn_blocking(move || db.get_full_task_output(&id_clone))
+            .await
+            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+            .map_err(|e| Error::new(e))?;
+
+        let total_length = full_output.len() as i32;
+        let offset = offset.max(0) as usize;
+        let limit = limit.max(0) as usize;
+
+        let content = if offset < full_output.len() {
+            let end = (offset + limit).min(full_output.len());
+            full_output[offset..end].to_string()
+        } else {
+            String::new()
+        };
+
+        let has_more = (offset + limit) < full_output.len();
+
+        Ok(super::types::GqlTaskRunOutput {
+            task_run_id: id,
+            content,
+            total_length,
+            offset: offset as i32,
+            has_more,
+        })
+    }
+
     /// List only currently running task runs.
     async fn running_task_runs(
         &self,

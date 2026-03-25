@@ -208,7 +208,7 @@ pub enum RunnerEvent {
 pub struct OrchestratorStateChangeEvent {
     pub task_run_id: String,
     pub workflow_stage: String,
-    pub iteration: i32,
+    pub iteration: Option<i32>,
     pub phase: String,
     pub state_data: Option<Json<serde_json::Value>>,
 }
@@ -677,6 +677,21 @@ pub struct GqlQueueStatus {
 // ==========================================================================
 // Input Types
 // ==========================================================================
+
+/// Paginated task run output.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlTaskRunOutput {
+    /// The task run ID.
+    pub task_run_id: String,
+    /// Output text (may be truncated by offset/limit).
+    pub content: String,
+    /// Total length of the full output in characters.
+    pub total_length: i32,
+    /// Character offset of this content within the full output.
+    pub offset: i32,
+    /// Whether there is more content after this chunk.
+    pub has_more: bool,
+}
 
 /// Input for creating a new task run.
 #[derive(InputObject, Debug)]

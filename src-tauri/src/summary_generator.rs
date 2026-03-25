@@ -204,6 +204,7 @@ pub(crate) fn format_findings_for_summary(findings: &[Finding]) -> String {
 /// (event_type='ai_output') rather than in the output_log field. This function
 /// reconstructs the output from those events for summary generation.
 fn assemble_output_from_events(db: &CheckpointDb, task_run_id: &str) -> String {
+    // TODO: Wire to PG when summary_generator callers go async
     let events = db
         .get_task_run_events(task_run_id, Some("ai_output"), None)
         .unwrap_or_default();

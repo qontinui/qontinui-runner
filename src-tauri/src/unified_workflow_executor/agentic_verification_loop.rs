@@ -13,10 +13,46 @@ use super::loop_controller::LoopController;
 use super::types::{AgenticOutcome, LoopConfig, LoopResult};
 
 /// Query total tokens consumed across all iterations for a given execution.
+/// Uses PG when available (via tokio Handle), falls back to SQLite.
 fn query_total_tokens(
     db: &crate::database::CheckpointDb,
+    pg_db: Option<&std::sync::Arc<crate::database::pg::PgDb>>,
     execution_id: &str,
 ) -> (Option<u64>, Option<f64>) {
+    // Try PG first if available and we're in a tokio context.
+    // Uses catch_unwind because Handle::block_on panics if called from within
+    // an async context (which these sync helpers are called from). On panic,
+    // we silently fall through to the SQLite path.
+    if let Some(pg) = pg_db {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let pg = pg.clone();
+            let id = execution_id.to_string();
+            let pg_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.block_on(async move { pg.get_phase_token_usage(&id).await })
+            }));
+            if let Ok(Ok(rows)) = pg_result {
+                if !rows.is_empty() {
+                    let total_in: u64 = rows.iter().map(|r| r.input_tokens).sum();
+                    let total_out: u64 = rows.iter().map(|r| r.output_tokens).sum();
+                    let total_tokens = total_in + total_out;
+                    let total_cost = crate::ai_pricing::calculate_cost_usd(
+                        total_in,
+                        total_out,
+                        rows.first()
+                            .and_then(|r| r.model_used.as_deref())
+                            .unwrap_or("claude-sonnet-4-20250514"),
+                    );
+                    return (
+                        if total_tokens > 0 { Some(total_tokens) } else { None },
+                        if total_cost > 0.0 { Some(total_cost) } else { None },
+                    );
+                }
+                return (None, None);
+            }
+        }
+    }
+
+    // SQLite fallback
     match db.get_phase_token_usage(execution_id) {
         Ok(rows) if !rows.is_empty() => {
             let total_in: u64 = rows.iter().map(|r| r.input_tokens).sum();
@@ -320,8 +356,8 @@ impl LoopController {
                     max_iterations_reached: false,
                     iteration_results,
                     final_verdict: None,
-                    total_tokens: query_total_tokens(&self.checkpoint_db, &config.execution_id).0,
-                    total_cost_usd: query_total_tokens(&self.checkpoint_db, &config.execution_id).1,
+                    total_tokens: query_total_tokens(&self.checkpoint_db, self.app_state.pg_db.as_ref(), &config.execution_id).0,
+                    total_cost_usd: query_total_tokens(&self.checkpoint_db, self.app_state.pg_db.as_ref(), &config.execution_id).1,
                 };
                 self.canvas_manager
                     .lock()
@@ -346,8 +382,8 @@ impl LoopController {
                     max_iterations_reached: true,
                     iteration_results: iteration_results.clone(),
                     final_verdict: iteration_results.last().map(|r| r.verdict.clone()),
-                    total_tokens: query_total_tokens(&self.checkpoint_db, &config.execution_id).0,
-                    total_cost_usd: query_total_tokens(&self.checkpoint_db, &config.execution_id).1,
+                    total_tokens: query_total_tokens(&self.checkpoint_db, self.app_state.pg_db.as_ref(), &config.execution_id).0,
+                    total_cost_usd: query_total_tokens(&self.checkpoint_db, self.app_state.pg_db.as_ref(), &config.execution_id).1,
                 };
                 self.canvas_manager
                     .lock()
@@ -560,12 +596,12 @@ impl LoopController {
                             final_verdict: Some(v.clone()),
                             total_tokens: {
                                 let (t, _) =
-                                    query_total_tokens(&self.checkpoint_db, &config.execution_id);
+                                    query_total_tokens(&self.checkpoint_db, self.app_state.pg_db.as_ref(), &config.execution_id);
                                 t
                             },
                             total_cost_usd: {
                                 let (_, c) =
-                                    query_total_tokens(&self.checkpoint_db, &config.execution_id);
+                                    query_total_tokens(&self.checkpoint_db, self.app_state.pg_db.as_ref(), &config.execution_id);
                                 c
                             },
                         };
@@ -616,12 +652,12 @@ impl LoopController {
                         final_verdict: Some(v.clone()),
                         total_tokens: {
                             let (t, _) =
-                                query_total_tokens(&self.checkpoint_db, &config.execution_id);
+                                query_total_tokens(&self.checkpoint_db, self.app_state.pg_db.as_ref(), &config.execution_id);
                             t
                         },
                         total_cost_usd: {
                             let (_, c) =
-                                query_total_tokens(&self.checkpoint_db, &config.execution_id);
+                                query_total_tokens(&self.checkpoint_db, self.app_state.pg_db.as_ref(), &config.execution_id);
                             c
                         },
                     };

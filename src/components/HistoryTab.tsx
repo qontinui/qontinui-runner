@@ -39,6 +39,7 @@ import { createLogger } from "@/lib/logger";
 
 const logger = createLogger("HistoryTab");
 import { FixedVirtualList } from "./ui";
+import { PatternIndicator } from "./history/PatternIndicator";
 
 /** Threshold for switching to virtual scrolling */
 const VIRTUAL_SCROLL_THRESHOLD = 100;
@@ -519,7 +520,10 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
 
                   {/* Run info */}
                   <div className="flex-1 min-w-0">
-                    <div className="font-medium truncate">{run.name}</div>
+                    <div className="font-medium truncate flex items-center gap-2">
+                      {run.name}
+                      <PatternIndicator workflowName={run.workflowName || run.name} />
+                    </div>
                     <div className="text-xs text-muted-foreground flex items-center gap-2">
                       <Calendar className="w-3 h-3" />
                       {formatTime(run.startedAt)}
@@ -612,7 +616,10 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
 
                 {/* Run info */}
                 <div className="flex-1 min-w-0">
-                  <div className="font-medium truncate">{run.name}</div>
+                  <div className="font-medium truncate flex items-center gap-2">
+                    {run.name}
+                    <PatternIndicator workflowName={run.workflowName || run.name} />
+                  </div>
                   <div className="text-xs text-muted-foreground flex items-center gap-2">
                     <Calendar className="w-3 h-3" />
                     {formatTime(run.startedAt)}

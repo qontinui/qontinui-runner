@@ -5,6 +5,12 @@
  * - Tauri events when running in a Tauri desktop app
  * - WebSocket events when running in a browser or external client
  *
+ * Note: GraphQL subscriptions (useRunnerEvents, useTaskRunProgress) now provide
+ * an additional event transport layer that works in both environments.
+ * Components that only need cache invalidation on status changes can use
+ * the GraphQL hooks directly instead of this hook. This hook remains
+ * for components that need the full event payload (orchestrator state, step details).
+ *
  * This enables the same frontend code to work seamlessly in both contexts.
  *
  * Usage:

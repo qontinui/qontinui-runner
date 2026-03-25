@@ -353,6 +353,7 @@ pub async fn collect_step_outputs(
     };
 
     // Get events for this task run
+    // TODO: Wire to PG when Tauri commands go async
     let events = state
         .checkpoint_db
         .get_task_run_events(&task_run_id, None, input.limit)
@@ -397,6 +398,7 @@ pub async fn collect_step_outputs(
     }
 
     // Also check for Playwright results
+    // TODO: Wire to PG when Tauri commands go async
     let playwright_results = state
         .checkpoint_db
         .get_task_run_playwright_results(&task_run_id, None)

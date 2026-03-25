@@ -289,6 +289,43 @@ pub fn rollback_canary_rollout(
     crate::meta_optimizer::canary::rollback_canary(&app_state.checkpoint_db, &canary_id)
 }
 
+// ── Prompt Template A/B Testing ──────────────────────────────────────────
+
+#[tauri::command]
+pub fn create_prompt_canary(
+    app_state: State<'_, Arc<AppState>>,
+    template_id: String,
+    baseline_version: i32,
+    candidate_version: i32,
+    traffic_pct: f64,
+) -> Result<String, String> {
+    crate::meta_optimizer::canary::create_prompt_template_canary(
+        &app_state.checkpoint_db,
+        &template_id,
+        baseline_version,
+        candidate_version,
+        traffic_pct,
+    )
+}
+
+#[tauri::command]
+pub fn get_prompt_canary_status(
+    app_state: State<'_, Arc<AppState>>,
+    canary_id: String,
+) -> Result<serde_json::Value, String> {
+    let canary = crate::meta_optimizer::canary::get_prompt_template_canary(
+        &app_state.checkpoint_db,
+        &canary_id,
+    )?;
+    let evaluation = crate::meta_optimizer::canary::evaluate_prompt_canary(&canary);
+
+    let mut val =
+        serde_json::to_value(&canary).map_err(|e| format!("Serialization error: {}", e))?;
+    val["evaluation"] =
+        serde_json::to_value(&evaluation).map_err(|e| format!("Serialization error: {}", e))?;
+    Ok(val)
+}
+
 // ── Manual Trigger ─────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -383,6 +420,83 @@ pub fn generate_default_eval_spec(
     )?;
     crate::meta_optimizer::eval_spec::save_eval_spec(&app_state.checkpoint_db, &spec)?;
     Ok(spec)
+}
+
+// ── Live Evaluation with I/O ──────────────────────────────────────────
+
+/// Evaluate an eval spec against live input/output data using LLM-as-judge assertions.
+///
+/// This is the on-demand evaluation path for when actual I/O from a workflow run
+/// is available. Unlike the offline `run_recommendation_eval` which uses aggregate
+/// metrics, this evaluates LLM judge assertions (hallucination, relevance, factuality,
+/// content safety) against concrete input/output pairs.
+#[tauri::command]
+pub fn evaluate_with_io(
+    app_state: State<'_, Arc<AppState>>,
+    eval_spec_json: String,
+    input: String,
+    output: String,
+    context: Option<String>,
+) -> Result<Vec<crate::meta_optimizer::eval_spec::AssertionResult>, String> {
+    let spec: crate::meta_optimizer::eval_spec::EvalSpec =
+        serde_json::from_str(&eval_spec_json)
+            .map_err(|e| format!("Failed to parse eval spec: {}", e))?;
+
+    // Build dummy aggregate metrics for non-judge assertions.
+    // If a target agent is specified, try to load real metrics from the database.
+    let metrics = if let Some(ref agent) = spec.target_agent {
+        let period_start = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let period_end = chrono::Utc::now().to_rfc3339();
+
+        crate::database::pipeline_traces::get_agent_aggregates_for_period(
+            &app_state.checkpoint_db,
+            agent,
+            &period_start,
+            &period_end,
+        )
+        .ok()
+        .flatten()
+        .map(|agg| crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
+            success_rate: if agg.run_count > 0 {
+                agg.success_count as f64 / agg.run_count as f64
+            } else {
+                0.0
+            },
+            mean_duration_ms: agg.avg_duration_ms,
+            mean_iterations: 0.0,
+            mean_cost_cents: agg.avg_cost_usd * 100.0,
+            trial_count: agg.run_count as u32,
+        })
+        .unwrap_or_else(default_aggregate_metrics)
+    } else {
+        default_aggregate_metrics()
+    };
+
+    // Evaluate all test cases, collecting results
+    let mut all_results = Vec::new();
+    for tc in &spec.test_cases {
+        let results = crate::meta_optimizer::eval_runner::evaluate_test_case_with_io(
+            tc,
+            &input,
+            &output,
+            context.as_deref(),
+            &metrics,
+        );
+        all_results.extend(results);
+    }
+
+    Ok(all_results)
+}
+
+/// Build default aggregate metrics when no historical data is available.
+fn default_aggregate_metrics() -> crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
+    crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
+        success_rate: 0.0,
+        mean_duration_ms: 0.0,
+        mean_iterations: 0.0,
+        mean_cost_cents: 0.0,
+        trial_count: 0,
+    }
 }
 
 // ── Robustness Testing ────────────────────────────────────────────────

@@ -60,7 +60,7 @@ async-graphql-axum = "7"
 futures = "0.3"
 futures-util = "0.3"
 async-stream = "0.3"
-tower = "0.5"
+tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
 urlencoding = "2.1"
 zip = "8"

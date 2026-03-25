@@ -11,11 +11,12 @@
  * - Event system: real-time updates (future)
  */
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useExecution } from "../../contexts";
 import type { ExecutionStatus, ExecutionState, ActionItem, ScreenshotsResult } from "./types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
+import { useRunnerEvents } from "@/hooks/graphql";
 
 const log = createLogger("useDashboardState");
 
@@ -153,12 +154,27 @@ export function useDashboardState(): DashboardState {
     }
   }, [fetchRunningTasks, fetchActionLog, fetchScreenshots]);
 
-  // Initial fetch and polling with backoff when idle/failed
-  // Use faster polling (2s) when tasks are running, slower (10s) when idle
+  // GraphQL subscription triggers refresh on task status changes,
+  // replacing aggressive 2s polling with event-driven updates
+  const { data: eventData } = useRunnerEvents(
+    ["TaskRunUpdate", "StepProgress"],
+  );
+  const lastEventKeyRef = useRef("");
+  useEffect(() => {
+    const event = eventData?.runnerEvents;
+    if (!event) return;
+    const key = `${event.taskRunId}:${event.status}:${event.__typename}`;
+    if (key !== lastEventKeyRef.current) {
+      lastEventKeyRef.current = key;
+      refresh();
+    }
+  }, [eventData, refresh]);
+
+  // Polling as fallback — relaxed from 2s to 5s (running) / 15s (idle)
   const hasRunningTasks = runningTasks.length > 0;
   useEffect(() => {
     refresh();
-    const intervalMs = hasRunningTasks ? 2000 : 10000;
+    const intervalMs = hasRunningTasks ? 5000 : 15000;
     const interval = setInterval(refresh, intervalMs);
     return () => clearInterval(interval);
   }, [refresh, hasRunningTasks]);

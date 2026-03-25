@@ -19,6 +19,7 @@ import { ShortcutsModal } from "./ShortcutsModal";
 import { CompletionSummary } from "./CompletionSummary";
 import { ApprovalDialog } from "./ApprovalDialog";
 import { OrchestrationLoopBanner } from "./OrchestrationLoopBanner";
+import { TopPatternsWidget } from "./TopPatternsWidget";
 import { registerAllWidgets } from "@/components/widgets";
 import { useFlowExecutionData } from "@/components/widgets/flow-execution";
 import { windowManager } from "../../managers";
@@ -506,6 +507,11 @@ export function DashboardPage({
 
           {/* Orchestration Loop Banner - shown when this runner is orchestrating */}
           <OrchestrationLoopBanner />
+
+          {/* Cross-Run Patterns Alert */}
+          <div className="px-4 pt-2">
+            <TopPatternsWidget />
+          </div>
 
           {/* Main Content Area */}
           <div className="flex-1 overflow-hidden">

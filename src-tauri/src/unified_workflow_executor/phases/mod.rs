@@ -60,6 +60,7 @@ fn build_execution_timing_context(
     checkpoint_db: &CheckpointDb,
     execution_id: &str,
 ) -> Option<String> {
+    // TODO: Wire to PG when get_execution_spans PG wrapper is implemented
     let spans = checkpoint_db
         .get_execution_spans(Some(execution_id), None, None, Some(100))
         .ok()?;

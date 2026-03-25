@@ -91,8 +91,8 @@ export function ProviderLatencyChart({ data }: ProviderLatencyChartProps) {
               radius={[4, 4, 0, 0]}
               maxBarSize={24}
             />
-            <Bar dataKey="min" name="Min" fill="#22c55e" radius={[4, 4, 0, 0]} maxBarSize={24} />
-            <Bar dataKey="max" name="Max" fill="#f97316" radius={[4, 4, 0, 0]} maxBarSize={24} />
+            <Bar dataKey="min" name="Min" fill="hsl(var(--accent))" radius={[4, 4, 0, 0]} maxBarSize={24} />
+            <Bar dataKey="max" name="Max" fill="hsl(var(--secondary))" radius={[4, 4, 0, 0]} maxBarSize={24} />
           </BarChart>
         </ResponsiveContainer>
       </div>

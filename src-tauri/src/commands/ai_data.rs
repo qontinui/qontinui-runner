@@ -1181,6 +1181,7 @@ pub struct TaskRunEventsResult {
 
 /// Get task run events from SQLite database.
 /// This replaces JSONL file reading for historical analysis.
+// TODO: Wire to PG when Tauri commands go async
 #[tauri::command]
 pub async fn get_task_run_events_from_db(
     state: State<'_, Arc<AppState>>,
@@ -1216,6 +1217,7 @@ pub struct TaskRunScreenshotsResult {
 }
 
 /// Get task run screenshots from SQLite database.
+// TODO: Wire to PG when Tauri commands go async
 #[tauri::command]
 pub async fn get_task_run_screenshots_from_db(
     state: State<'_, Arc<AppState>>,
@@ -1249,6 +1251,7 @@ pub struct TaskRunPlaywrightResultsResult {
 }
 
 /// Get Playwright test results from SQLite database.
+// TODO: Wire to PG when Tauri commands go async
 #[tauri::command]
 pub async fn get_task_run_playwright_results_from_db(
     state: State<'_, Arc<AppState>>,
@@ -1285,6 +1288,7 @@ pub struct TaskRunMigratedLogsSummary {
 }
 
 /// Get summary of migrated logs for a task run.
+// TODO: Wire to PG when Tauri commands go async
 #[tauri::command]
 pub async fn get_task_run_migrated_logs_summary(
     state: State<'_, Arc<AppState>>,
@@ -1334,6 +1338,7 @@ pub struct TaskRunApiRequestsResult {
 }
 
 /// Get API requests for a task run from SQLite database.
+// TODO: Wire to PG when Tauri commands go async
 #[tauri::command]
 pub async fn get_task_run_api_requests_from_db(
     state: State<'_, Arc<AppState>>,
@@ -1371,6 +1376,7 @@ pub struct TaskRunAwasStepsResult {
 }
 
 /// Get AWAS steps for a task run from SQLite database.
+// TODO: Wire to PG when Tauri commands go async
 #[tauri::command]
 pub async fn get_task_run_awas_steps_from_db(
     state: State<'_, Arc<AppState>>,

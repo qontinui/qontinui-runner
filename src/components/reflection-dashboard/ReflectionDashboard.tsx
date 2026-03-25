@@ -43,6 +43,12 @@ import type {
   EffectivenessBucket,
 } from "../../types/architecture";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { CrossRunPatternsPanel } from "./CrossRunPatternsPanel";
+import { StepProvenanceTimeline } from "./StepProvenanceTimeline";
+import { PipelineEventsTimeline } from "../pipeline-events/PipelineEventsTimeline";
+import { RuleInfluencePanel } from "../rule-influence/RuleInfluencePanel";
+import { WorkflowVersionLineage } from "../workflow-versions/WorkflowVersionLineage";
+import { usePipelineEvents, useIneffectiveRules } from "../../hooks/useGraphAnalytics";
 
 // ============================================================================
 // Constants
@@ -292,6 +298,11 @@ export function ReflectionDashboard() {
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  // Graph Insights data
+  const latestTaskRunId = history.length > 0 ? history[0].task_run_id : "";
+  const { data: pipelineEvents, isLoading: eventsLoading } = usePipelineEvents(latestTaskRunId);
+  const { data: _ineffectiveRules, isLoading: _rulesLoading } = useIneffectiveRules();
 
   const toggleFix = (id: string) => {
     setExpandedFixes((prev) => {
@@ -715,6 +726,20 @@ export function ReflectionDashboard() {
                 )}
               </div>
             </div>
+
+            {/* Graph Insights Section */}
+            {workflowName && (
+              <div className="space-y-4">
+                <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">Graph Insights</h3>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <CrossRunPatternsPanel workflowName={workflowName} />
+                  <RuleInfluencePanel />
+                </div>
+                <PipelineEventsTimeline events={pipelineEvents || []} isLoading={eventsLoading} />
+                <StepProvenanceTimeline workflowId={workflowName} />
+                <WorkflowVersionLineage />
+              </div>
+            )}
           </>
         )}
       </div>

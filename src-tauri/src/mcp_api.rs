@@ -410,9 +410,16 @@ pub fn create_router(
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // GraphQL sub-router with concurrency limit (max 20 concurrent GraphQL requests).
+    // This prevents a burst of expensive queries from starving REST endpoints.
+    // WebSocket subscriptions are excluded — they're long-lived by design.
+    let graphql_routes = Router::new()
+        .route("/graphql", get(crate::graphql::schema::graphiql_handler).post(crate::graphql::schema::graphql_handler))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(20));
+
     Router::new()
         // GraphQL endpoints (typed API alongside REST)
-        .route("/graphql", get(crate::graphql::schema::graphiql_handler).post(crate::graphql::schema::graphql_handler))
+        .merge(graphql_routes)
         .route_service(
             "/graphql/ws",
             GraphQLSubscription::new(graphql_schema.clone()),

@@ -319,3 +319,191 @@ impl CheckpointDb {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::CheckpointDb;
+
+    fn test_db() -> CheckpointDb {
+        CheckpointDb::new_in_memory().expect("Failed to create test DB")
+    }
+
+    fn test_entry(id: &str) -> PersistedQueueEntry {
+        PersistedQueueEntry {
+            id: id.to_string(),
+            workflow_id: format!("wf-{}", id),
+            workflow_name: format!("Test Workflow {}", id),
+            queued_at: chrono::Utc::now().to_rfc3339(),
+            priority: 0,
+            status: QueueEntryStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            error_message: None,
+            task_run_id: None,
+            retry_count: 0,
+            max_retries: 3,
+        }
+    }
+
+    #[test]
+    fn test_queue_insert_and_get() {
+        let db = test_db();
+        let entry = test_entry("q1");
+
+        db.queue_insert(&entry).expect("insert failed");
+
+        let fetched = db.queue_get("q1").expect("get failed").expect("entry not found");
+        assert_eq!(fetched.id, "q1");
+        assert_eq!(fetched.workflow_id, "wf-q1");
+        assert_eq!(fetched.workflow_name, "Test Workflow q1");
+        assert_eq!(fetched.priority, 0);
+        assert_eq!(fetched.status, QueueEntryStatus::Pending);
+        assert!(fetched.started_at.is_none());
+        assert!(fetched.completed_at.is_none());
+        assert!(fetched.error_message.is_none());
+        assert!(fetched.task_run_id.is_none());
+        assert_eq!(fetched.retry_count, 0);
+        assert_eq!(fetched.max_retries, 3);
+    }
+
+    #[test]
+    fn test_queue_update_status() {
+        let db = test_db();
+        let entry = test_entry("q2");
+        db.queue_insert(&entry).expect("insert failed");
+
+        // Update to Running — started_at should be set
+        db.queue_update_status("q2", &QueueEntryStatus::Running)
+            .expect("update to running failed");
+        let fetched = db.queue_get("q2").expect("get failed").expect("not found");
+        assert_eq!(fetched.status, QueueEntryStatus::Running);
+        assert!(fetched.started_at.is_some(), "started_at should be set after Running");
+        assert!(fetched.completed_at.is_none());
+
+        // Update to Completed — completed_at should be set
+        db.queue_update_status("q2", &QueueEntryStatus::Completed)
+            .expect("update to completed failed");
+        let fetched = db.queue_get("q2").expect("get failed").expect("not found");
+        assert_eq!(fetched.status, QueueEntryStatus::Completed);
+        assert!(fetched.started_at.is_some());
+        assert!(fetched.completed_at.is_some(), "completed_at should be set after Completed");
+    }
+
+    #[test]
+    fn test_queue_load_pending() {
+        let db = test_db();
+
+        // Insert 3 entries with different statuses and priorities
+        let mut e1 = test_entry("p1");
+        e1.priority = 5;
+        e1.queued_at = "2026-01-01T00:00:00+00:00".to_string();
+        db.queue_insert(&e1).expect("insert p1");
+
+        let mut e2 = test_entry("p2");
+        e2.status = QueueEntryStatus::Running;
+        e2.priority = 10;
+        e2.queued_at = "2026-01-01T00:00:01+00:00".to_string();
+        // Insert as pending first, then update to running so started_at is set
+        e2.status = QueueEntryStatus::Pending;
+        db.queue_insert(&e2).expect("insert p2");
+        db.queue_update_status("p2", &QueueEntryStatus::Running).expect("update p2");
+
+        let mut e3 = test_entry("p3");
+        e3.priority = 20;
+        e3.status = QueueEntryStatus::Pending;
+        db.queue_insert(&e3).expect("insert p3");
+        db.queue_update_status("p3", &QueueEntryStatus::Completed).expect("update p3");
+
+        let pending = db.queue_load_pending().expect("load_pending failed");
+        // Only pending + running should be returned (p1 and p2), not completed (p3)
+        assert_eq!(pending.len(), 2);
+        // Ordered by priority DESC: p2 (priority 10) first, p1 (priority 5) second
+        assert_eq!(pending[0].id, "p2");
+        assert_eq!(pending[1].id, "p1");
+    }
+
+    #[test]
+    fn test_queue_recover_crashed() {
+        let db = test_db();
+
+        // Insert 2 entries and set both to running
+        let e1 = test_entry("r1");
+        let e2 = test_entry("r2");
+        db.queue_insert(&e1).expect("insert r1");
+        db.queue_insert(&e2).expect("insert r2");
+        db.queue_update_status("r1", &QueueEntryStatus::Running).expect("update r1");
+        db.queue_update_status("r2", &QueueEntryStatus::Running).expect("update r2");
+
+        let count = db.queue_recover_crashed().expect("recover failed");
+        assert_eq!(count, 2);
+
+        let fetched1 = db.queue_get("r1").expect("get r1").expect("r1 not found");
+        let fetched2 = db.queue_get("r2").expect("get r2").expect("r2 not found");
+        assert_eq!(fetched1.status, QueueEntryStatus::Pending);
+        assert_eq!(fetched2.status, QueueEntryStatus::Pending);
+        assert!(fetched1.started_at.is_none(), "started_at should be cleared after recovery");
+        assert!(fetched2.started_at.is_none(), "started_at should be cleared after recovery");
+    }
+
+    #[test]
+    fn test_queue_increment_retry() {
+        let db = test_db();
+        let entry = test_entry("rt1");
+        db.queue_insert(&entry).expect("insert failed");
+
+        // Set to failed first, then increment retry
+        db.queue_update_status("rt1", &QueueEntryStatus::Failed).expect("update failed");
+
+        let count1 = db.queue_increment_retry("rt1").expect("first increment failed");
+        assert_eq!(count1, 1);
+
+        let count2 = db.queue_increment_retry("rt1").expect("second increment failed");
+        assert_eq!(count2, 2);
+
+        let fetched = db.queue_get("rt1").expect("get failed").expect("not found");
+        assert_eq!(fetched.retry_count, 2);
+        assert_eq!(fetched.status, QueueEntryStatus::Pending, "status should be reset to pending after retry");
+    }
+
+    #[test]
+    fn test_queue_set_error() {
+        let db = test_db();
+        let entry = test_entry("e1");
+        db.queue_insert(&entry).expect("insert failed");
+
+        db.queue_set_error("e1", "Something went wrong").expect("set_error failed");
+
+        let fetched = db.queue_get("e1").expect("get failed").expect("not found");
+        assert_eq!(fetched.error_message.as_deref(), Some("Something went wrong"));
+    }
+
+    #[test]
+    fn test_queue_cleanup() {
+        let db = test_db();
+
+        // Insert two completed entries with old timestamps
+        let e1 = test_entry("c1");
+        let e2 = test_entry("c2");
+        db.queue_insert(&e1).expect("insert c1");
+        db.queue_insert(&e2).expect("insert c2");
+        db.queue_update_status("c1", &QueueEntryStatus::Completed).expect("update c1");
+        db.queue_update_status("c2", &QueueEntryStatus::Completed).expect("update c2");
+
+        // Set both to old timestamps so cleanup(0) will catch them
+        {
+            let conn = db.get_conn().expect("get conn");
+            conn.execute(
+                "UPDATE queued_workflows SET completed_at = '2020-01-01T00:00:00+00:00' WHERE id IN ('c1', 'c2')",
+                [],
+            )
+            .expect("manual timestamp update");
+        } // drop conn so the pool connection is returned
+
+        let deleted = db.queue_cleanup(0).expect("cleanup failed");
+        assert_eq!(deleted, 2, "both old completed entries should be deleted");
+
+        assert!(db.queue_get("c1").expect("get c1").is_none(), "c1 should be gone");
+        assert!(db.queue_get("c2").expect("get c2").is_none(), "c2 should be gone");
+    }
+}

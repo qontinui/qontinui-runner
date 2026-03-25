@@ -19,7 +19,9 @@ import {
   Globe,
   File,
   CheckCircle,
+  History,
 } from "lucide-react";
+import { PromptVersionHistory } from "../prompt-versions";
 import {
   DEFAULT_UNIFIED_PROMPT_TEMPLATE,
   TEMPLATE_VARIABLES,
@@ -38,12 +40,15 @@ interface PromptTemplateEditorProps {
   onWorkflowTemplateChange: (template: string | null) => void;
   /** Whether the workflow has agentic steps (template only makes sense for agentic workflows) */
   hasAgenticSteps?: boolean;
+  /** Optional template ID to enable version history */
+  templateId?: string | null;
 }
 
 export function PromptTemplateEditor({
   workflowTemplate,
   onWorkflowTemplateChange,
   hasAgenticSteps = false,
+  templateId = null,
 }: PromptTemplateEditorProps) {
   // Track which scope we're editing
   const [activeScope, setActiveScope] = useState<PromptTemplateScope>(
@@ -64,6 +69,9 @@ export function PromptTemplateEditor({
 
   // Track if there are unsaved changes
   const [hasChanges, setHasChanges] = useState(false);
+
+  // Version history panel
+  const [showVersionHistory, setShowVersionHistory] = useState(false);
 
   // Get the effective template being used
   const _getEffectiveTemplate = useCallback((): string => {
@@ -304,17 +312,41 @@ export function PromptTemplateEditor({
               </button>
             </div>
 
-            {/* Use global button (only for workflow scope when there's a custom template) */}
-            {activeScope === "workflow" && isUsingWorkflowTemplate && (
-              <button
-                onClick={handleUseGlobal}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-zinc-400 hover:text-zinc-200 text-sm transition-colors"
-              >
-                <X className="w-3.5 h-3.5" />
-                Remove custom template
-              </button>
-            )}
+            <div className="flex items-center gap-2">
+              {/* Version History button */}
+              {templateId && (
+                <button
+                  onClick={() => setShowVersionHistory(!showVersionHistory)}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md transition-colors ${
+                    showVersionHistory
+                      ? "bg-blue-500/20 text-blue-400 border border-blue-500/30"
+                      : "bg-zinc-700 hover:bg-zinc-600 text-zinc-200"
+                  }`}
+                >
+                  <History className="w-3.5 h-3.5" />
+                  Version History
+                </button>
+              )}
+
+              {/* Use global button (only for workflow scope when there's a custom template) */}
+              {activeScope === "workflow" && isUsingWorkflowTemplate && (
+                <button
+                  onClick={handleUseGlobal}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-zinc-400 hover:text-zinc-200 text-sm transition-colors"
+                >
+                  <X className="w-3.5 h-3.5" />
+                  Remove custom template
+                </button>
+              )}
+            </div>
           </div>
+
+          {/* Version History panel */}
+          {showVersionHistory && templateId && (
+            <div className="border border-zinc-700 rounded-lg overflow-hidden">
+              <PromptVersionHistory templateId={templateId} />
+            </div>
+          )}
         </div>
       )}
     </div>

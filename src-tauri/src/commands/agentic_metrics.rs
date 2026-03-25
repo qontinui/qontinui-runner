@@ -71,8 +71,8 @@ pub struct PushScoresResult {
 
 /// Push agentic metric scores for a task run to the backend API.
 ///
-/// Reads scores from the local SQLite database and POSTs each to
-/// `/api/v1/feedback-scores` with bearer auth.
+/// Reads scores from the local SQLite database and POSTs them as a single
+/// batch to `/api/v1/feedback-scores/batch` with bearer auth.
 #[tauri::command]
 pub async fn push_agentic_scores_to_backend(
     state: State<'_, Arc<AppState>>,
@@ -110,66 +110,67 @@ pub async fn push_agentic_scores_to_backend(
     })?;
 
     let client = reqwest::Client::new();
-    let url = format!("{}/api/v1/feedback-scores", get_api_base_url());
+    let url = format!("{}/api/v1/feedback-scores/batch", get_api_base_url());
 
-    let mut pushed = 0u32;
-    let mut failed = 0u32;
-    let mut errors = Vec::new();
+    // Collect all scores into a single batch payload.
+    let payloads: Vec<serde_json::Value> = scores
+        .iter()
+        .map(|score| {
+            serde_json::json!({
+                "target_id": target_id,
+                "target_type": target_type,
+                "name": score.metric_type,
+                "value": score.score,
+                "source": "runner_agentic_metrics",
+                "metadata": {
+                    "confidence": score.confidence,
+                    "task_run_id": task_run_id,
+                },
+            })
+        })
+        .collect();
 
-    for score in &scores {
-        let payload = serde_json::json!({
-            "target_id": target_id,
-            "target_type": target_type,
-            "metric_type": score.metric_type,
-            "score": score.score,
-            "confidence": score.confidence,
-            "task_run_id": task_run_id,
-            "source": "runner_agentic_metrics",
-        });
+    let total = payloads.len() as u32;
 
-        match client
-            .post(&url)
-            .bearer_auth(&access_token)
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                pushed += 1;
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                let err_text = resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Unknown error".to_string());
-                let msg = format!(
-                    "Failed to push {} score: {} - {}",
-                    score.metric_type, status, err_text
-                );
-                warn!("{}", msg);
-                errors.push(msg);
-                failed += 1;
-            }
-            Err(e) => {
-                let msg = format!("Network error pushing {} score: {}", score.metric_type, e);
-                error!("{}", msg);
-                errors.push(msg);
-                failed += 1;
-            }
+    match client
+        .post(&url)
+        .bearer_auth(&access_token)
+        .json(&payloads)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            info!("Pushed {} agentic scores in a single batch", total);
+            Ok(PushScoresResult {
+                pushed: total,
+                failed: 0,
+                errors: vec![],
+            })
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let err_text = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            let msg = format!("Batch push failed: {} - {}", status, err_text);
+            warn!("{}", msg);
+            Ok(PushScoresResult {
+                pushed: 0,
+                failed: total,
+                errors: vec![msg],
+            })
+        }
+        Err(e) => {
+            let msg = format!("Network error pushing batch scores: {}", e);
+            error!("{}", msg);
+            Ok(PushScoresResult {
+                pushed: 0,
+                failed: total,
+                errors: vec![msg],
+            })
         }
     }
-
-    info!(
-        "Pushed agentic scores: {} succeeded, {} failed",
-        pushed, failed
-    );
-
-    Ok(PushScoresResult {
-        pushed,
-        failed,
-        errors,
-    })
 }
 
 /// Push agentic scores for the most recent task run to the backend.

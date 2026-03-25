@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ApolloProvider } from "@apollo/client/react";
 
 import {
   ExecutionProvider,
@@ -11,6 +12,7 @@ import { RenderLogWrapper, UIBridgeHooks } from "./lib/ui-bridge";
 import { AuthProvider, useAuth } from "./components/AuthProvider";
 import { TutorialProvider } from "./contexts/TutorialContext";
 import { ContextualTutorial } from "./components/tutorial";
+import { getGraphQLClient } from "./lib/graphql-client";
 
 import { UIBridgeProvider, AutoRegisterProvider } from "ui-bridge";
 
@@ -32,6 +34,8 @@ import {
   SpecExecutionHandler,
 } from "./hooks";
 import { useGlobalLogSources } from "./hooks/useGlobalLogSources";
+import { useCanaryAlerts } from "./hooks/useCanaryAlerts";
+import { useGraphDataRefresh } from "./hooks/useGraphDataRefresh";
 
 import StatusIndicator from "./components/StatusIndicator";
 import ActionDetailModal from "./components/ActionDetailModal";
@@ -42,6 +46,7 @@ import { LogSourcePicker } from "./components/LogSourcePicker";
 import { Sidebar } from "./components/navigation";
 import { TerminalPage } from "./components/terminal";
 import { PerformanceOverlay } from "./components/dev";
+import { CommandPalette } from "./components/unified-search/CommandPalette";
 import { useTaskRuns } from "./hooks/useAiData";
 import { getAllSpecs } from "./lib/spec-registry";
 import { getGlobalSpecStore } from "@qontinui/ui-bridge/specs";
@@ -147,6 +152,7 @@ function AppContent() {
   const projectSelection = useProjectSelection();
   const projectLogs = useProjectLogs();
   const globalLogSources = useGlobalLogSources();
+  const { alerts: canaryAlerts, dismissAlert: dismissCanaryAlert } = useCanaryAlerts();
 
   const { activities: backgroundActivities } = useBackgroundActivities({
     isExtracting: false,
@@ -161,6 +167,10 @@ function AppContent() {
   });
 
   useCloudRelayAutoConnect();
+
+  // Subscribe to runner events and auto-invalidate graph analytics queries
+  // when tasks complete, findings change, or workflows are generated.
+  useGraphDataRefresh();
 
   useEffect(() => {
     if (auth.authStatus?.authenticated && !auth.loading) {
@@ -399,7 +409,34 @@ function AppContent() {
             onDismissStaleTask={() => setStaleTaskMessage(null)}
           />
 
+          {/* Canary rollback alerts */}
+          {canaryAlerts.map((alert, idx) => (
+            <div
+              key={alert.id}
+              className="fixed p-4 rounded-lg shadow-lg border max-w-md z-toast bg-card border-destructive/50"
+              style={{ bottom: `${1 + (idx + 1) * 5}rem`, right: "1rem" }}
+            >
+              <div className="flex items-start gap-3">
+                <div className="flex-1 min-w-0">
+                  <h4 className="font-medium text-sm text-destructive">Canary Rollback</h4>
+                  <p className="text-sm text-muted-foreground mt-1">{alert.message}</p>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Canary {alert.canary_id.slice(0, 12)}...
+                    {alert.p_value != null && ` | p={${alert.p_value.toFixed(4)}}`}
+                  </p>
+                </div>
+                <button
+                  onClick={() => dismissCanaryAlert(alert.id)}
+                  className="text-muted-foreground hover:text-foreground shrink-0"
+                >
+                  &times;
+                </button>
+              </div>
+            </div>
+          ))}
+
           <PerformanceOverlay position="bottom-right" />
+          <CommandPalette />
         </div>
       </RenderLogWrapper>
     </ProfilerWrapper>
@@ -445,37 +482,39 @@ function CtrAutoPopulator() {
 
 export default function App() {
   return (
-    <UIBridgeProvider
-      features={{ renderLog: true, control: true, debug: true }}
-      browserCaptureConfig={{ console: true }}
-    >
-      <UIBridgeEventHandler />
-      <SpecExecutionHandler />
-      <BundledSpecsLoader />
-      <CtrAutoPopulator />
-      <AutoRegisterProvider
-        enabled={import.meta.env.DEV}
-        idStrategy="prefer-existing"
-        debounceMs={100}
-        excludeSelectors={["[data-no-register]"]}
-        contentDiscovery={{ enabled: true, maxContentElements: 200 }}
+    <ApolloProvider client={getGraphQLClient()}>
+      <UIBridgeProvider
+        features={{ renderLog: true, control: true, debug: true }}
+        browserCaptureConfig={{ console: true }}
       >
-        <AuthProvider>
-          <NavigationProvider>
-            <EventManagerProvider>
-              <ExecutionProvider
-                onLog={(_level, _message) => {
-                  // Logs are handled by LogManager through event handlers
-                }}
-              >
-                <AutoContinueProvider>
-                  <AppWithTutorials />
-                </AutoContinueProvider>
-              </ExecutionProvider>
-            </EventManagerProvider>
-          </NavigationProvider>
-        </AuthProvider>
-      </AutoRegisterProvider>
-    </UIBridgeProvider>
+        <UIBridgeEventHandler />
+        <SpecExecutionHandler />
+        <BundledSpecsLoader />
+        <CtrAutoPopulator />
+        <AutoRegisterProvider
+          enabled={import.meta.env.DEV}
+          idStrategy="prefer-existing"
+          debounceMs={100}
+          excludeSelectors={["[data-no-register]"]}
+          contentDiscovery={{ enabled: true, maxContentElements: 200 }}
+        >
+          <AuthProvider>
+            <NavigationProvider>
+              <EventManagerProvider>
+                <ExecutionProvider
+                  onLog={(_level, _message) => {
+                    // Logs are handled by LogManager through event handlers
+                  }}
+                >
+                  <AutoContinueProvider>
+                    <AppWithTutorials />
+                  </AutoContinueProvider>
+                </ExecutionProvider>
+              </EventManagerProvider>
+            </NavigationProvider>
+          </AuthProvider>
+        </AutoRegisterProvider>
+      </UIBridgeProvider>
+    </ApolloProvider>
   );
 }

@@ -24,6 +24,8 @@ import { LogSourcesSettings } from "./LogSourcesSettings";
 import { McpSettings } from "./McpSettings";
 import { ExecutionVariablesSettings } from "./ExecutionVariablesSettings";
 import { RunnerInstancesSettings } from "./RunnerInstancesSettings";
+import { OtelSettings } from "./OtelSettings";
+import { ContainerSettings } from "./ContainerSettings";
 import type { Project, ConnectionInfo } from "../../types/auth";
 
 interface WebSocketState {
@@ -62,6 +64,8 @@ type SettingsTab =
   | "storage"
   | "backup"
   | "instances"
+  | "otel"
+  | "containers"
   | "advanced"
   | "updates";
 
@@ -82,6 +86,8 @@ const VALID_TABS = [
   "storage",
   "backup",
   "instances",
+  "otel",
+  "containers",
   "advanced",
   "updates",
 ] as const;
@@ -194,6 +200,10 @@ export function Settings({
         return <BackupSettings onLog={onLog} />;
       case "instances":
         return <RunnerInstancesSettings onLog={onLog} />;
+      case "otel":
+        return <OtelSettings onLog={onLog} />;
+      case "containers":
+        return <ContainerSettings onLog={onLog} />;
       case "advanced":
         return <AdvancedSettings onLog={onLog} onDebugModeChange={onDebugModeChange} />;
       case "updates":

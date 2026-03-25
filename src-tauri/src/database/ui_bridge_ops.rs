@@ -566,6 +566,378 @@ pub fn get_stall_patterns_by_workflow(
 }
 
 // ============================================================================
+// Analytics: Selector & Action Performance (Phase 1)
+// ============================================================================
+
+/// A single time-window bucket in a decay curve.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DecayCurveBucket {
+    pub bucket: i64,
+    pub total: i64,
+    pub successes: i64,
+    pub success_rate: f64,
+}
+
+/// Action type performance baseline.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ActionBaseline {
+    pub action: String,
+    pub count: i64,
+    pub avg_duration_ms: Option<f64>,
+    pub min_duration_ms: Option<f64>,
+    pub max_duration_ms: Option<f64>,
+    pub success_rate: f64,
+}
+
+/// A cluster of failures grouped by error message.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FailureCluster {
+    pub error_message: String,
+    pub count: i64,
+    pub affected_elements: String,
+}
+
+/// Element with its bounds and success rate for fragility mapping.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ElementFragility {
+    pub element_id: String,
+    pub bounds: Option<String>,
+    pub interaction_count: i64,
+    pub success_rate: f64,
+}
+
+/// Automation regression: element+action that degraded between runs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AutomationRegression {
+    pub element_id: String,
+    pub action: String,
+    pub prior_success_rate: f64,
+    pub recent_success_rate: f64,
+    pub delta: f64,
+}
+
+/// Stall frequency grouped by pattern type.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StallFrequency {
+    pub pattern_type: String,
+    pub count: i64,
+}
+
+/// Intervention effectiveness stats.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InterventionStats {
+    pub intervention_action: String,
+    pub total: i64,
+    pub successful: i64,
+    pub success_rate: f64,
+}
+
+/// Element success rate decay curve over time windows.
+///
+/// Each bucket represents a time window of `window_ms` milliseconds.
+/// Returns `num_windows` most recent buckets, newest first.
+pub fn get_element_decay_curve(
+    conn: &Connection,
+    element_id: &str,
+    window_ms: i64,
+    num_windows: i64,
+) -> Result<Vec<DecayCurveBucket>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"SELECT (timestamp / ?2) AS bucket,
+                      COUNT(*) AS total,
+                      COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS successes,
+                      CAST(COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS REAL) / COUNT(*) AS rate
+               FROM ui_bridge_events
+               WHERE element_id = ?1 AND event_type = 'action_executed'
+               GROUP BY bucket
+               ORDER BY bucket DESC
+               LIMIT ?3"#,
+        )
+        .map_err(|e| format!("Failed to prepare decay curve query: {e}"))?;
+
+    let results = stmt
+        .query_map(params![element_id, window_ms, num_windows], |row| {
+            Ok(DecayCurveBucket {
+                bucket: row.get(0)?,
+                total: row.get(1)?,
+                successes: row.get(2)?,
+                success_rate: row.get(3)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query decay curve: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
+/// Per-action-type performance baselines (latency + success rate).
+pub fn get_action_latency_baselines(
+    conn: &Connection,
+    since_epoch_ms: i64,
+) -> Result<Vec<ActionBaseline>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"SELECT action,
+                      COUNT(*) AS cnt,
+                      AVG(duration_ms),
+                      MIN(duration_ms),
+                      MAX(duration_ms),
+                      CAST(COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS REAL) / COUNT(*) AS rate
+               FROM ui_bridge_events
+               WHERE event_type = 'action_executed'
+                 AND action IS NOT NULL
+                 AND timestamp >= ?1
+               GROUP BY action
+               ORDER BY cnt DESC
+               LIMIT 50"#,
+        )
+        .map_err(|e| format!("Failed to prepare action baselines query: {e}"))?;
+
+    let results = stmt
+        .query_map(params![since_epoch_ms], |row| {
+            Ok(ActionBaseline {
+                action: row.get(0)?,
+                count: row.get(1)?,
+                avg_duration_ms: row.get(2)?,
+                min_duration_ms: row.get(3)?,
+                max_duration_ms: row.get(4)?,
+                success_rate: row.get(5)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query action baselines: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
+/// Cluster failures by error message, with affected element IDs.
+pub fn get_failure_taxonomy(
+    conn: &Connection,
+    since_epoch_ms: i64,
+    limit: i64,
+) -> Result<Vec<FailureCluster>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"SELECT error_message,
+                      COUNT(*) AS freq,
+                      GROUP_CONCAT(DISTINCT element_id) AS elements
+               FROM ui_bridge_events
+               WHERE success = 0
+                 AND error_message IS NOT NULL
+                 AND timestamp >= ?1
+               GROUP BY error_message
+               ORDER BY freq DESC
+               LIMIT ?2"#,
+        )
+        .map_err(|e| format!("Failed to prepare failure taxonomy query: {e}"))?;
+
+    let results = stmt
+        .query_map(params![since_epoch_ms, limit], |row| {
+            Ok(FailureCluster {
+                error_message: row.get(0)?,
+                count: row.get(1)?,
+                affected_elements: row.get::<_, String>(2).unwrap_or_default(),
+            })
+        })
+        .map_err(|e| format!("Failed to query failure taxonomy: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
+/// Element fragility: join bounds with success rates for heatmap visualization.
+pub fn get_element_fragility_by_region(
+    conn: &Connection,
+    since_epoch_ms: i64,
+) -> Result<Vec<ElementFragility>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"SELECT ev.element_id,
+                      el.bounds,
+                      COUNT(*) AS cnt,
+                      CAST(COALESCE(SUM(CASE WHEN ev.success = 1 THEN 1 ELSE 0 END), 0) AS REAL) / COUNT(*) AS rate
+               FROM ui_bridge_events ev
+               LEFT JOIN ui_bridge_elements el ON ev.element_id = el.element_id
+               WHERE ev.event_type = 'action_executed'
+                 AND ev.element_id IS NOT NULL
+                 AND ev.timestamp >= ?1
+               GROUP BY ev.element_id
+               HAVING cnt >= 3
+               ORDER BY rate ASC
+               LIMIT 100"#,
+        )
+        .map_err(|e| format!("Failed to prepare fragility query: {e}"))?;
+
+    let results = stmt
+        .query_map(params![since_epoch_ms], |row| {
+            Ok(ElementFragility {
+                element_id: row.get(0)?,
+                bounds: row.get(1)?,
+                interaction_count: row.get(2)?,
+                success_rate: row.get(3)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query element fragility: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
+// ============================================================================
+// Analytics: Cross-Run Quality (Phase 2)
+// ============================================================================
+
+/// Detect automation regressions: elements that succeeded in older runs but fail in recent ones.
+pub fn get_automation_regressions(
+    conn: &Connection,
+    since_epoch_ms: i64,
+    limit: i64,
+) -> Result<Vec<AutomationRegression>, String> {
+    // Compare recent half vs older half of events per element+action pair
+    let mut stmt = conn
+        .prepare(
+            r#"WITH element_splits AS (
+                 SELECT element_id, action,
+                        timestamp,
+                        success,
+                        NTILE(2) OVER (PARTITION BY element_id, action ORDER BY timestamp) AS half
+                 FROM ui_bridge_events
+                 WHERE event_type = 'action_executed'
+                   AND element_id IS NOT NULL
+                   AND action IS NOT NULL
+                   AND timestamp >= ?1
+               )
+               SELECT element_id, action,
+                      CAST(SUM(CASE WHEN half = 1 THEN success ELSE 0 END) AS REAL) /
+                        MAX(1, SUM(CASE WHEN half = 1 THEN 1 ELSE 0 END)) AS prior_rate,
+                      CAST(SUM(CASE WHEN half = 2 THEN success ELSE 0 END) AS REAL) /
+                        MAX(1, SUM(CASE WHEN half = 2 THEN 1 ELSE 0 END)) AS recent_rate
+               FROM element_splits
+               GROUP BY element_id, action
+               HAVING COUNT(*) >= 4
+                 AND recent_rate < prior_rate - 0.1
+               ORDER BY (prior_rate - recent_rate) DESC
+               LIMIT ?2"#,
+        )
+        .map_err(|e| format!("Failed to prepare regressions query: {e}"))?;
+
+    let results = stmt
+        .query_map(params![since_epoch_ms, limit], |row| {
+            let prior: f64 = row.get(2)?;
+            let recent: f64 = row.get(3)?;
+            Ok(AutomationRegression {
+                element_id: row.get(0)?,
+                action: row.get(1)?,
+                prior_success_rate: prior,
+                recent_success_rate: recent,
+                delta: recent - prior,
+            })
+        })
+        .map_err(|e| format!("Failed to query regressions: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
+/// Stall frequency grouped by pattern type.
+pub fn get_stall_frequency(
+    conn: &Connection,
+    since_timestamp: &str,
+) -> Result<Vec<StallFrequency>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"SELECT pattern_type, COUNT(*) AS cnt
+               FROM stall_events
+               WHERE created_at >= ?1
+               GROUP BY pattern_type
+               ORDER BY cnt DESC"#,
+        )
+        .map_err(|e| format!("Failed to prepare stall frequency query: {e}"))?;
+
+    let results = stmt
+        .query_map(params![since_timestamp], |row| {
+            Ok(StallFrequency {
+                pattern_type: row.get(0)?,
+                count: row.get(1)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query stall frequency: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
+/// Intervention effectiveness: success rate per intervention action type.
+pub fn get_intervention_effectiveness(
+    conn: &Connection,
+    since_timestamp: &str,
+) -> Result<Vec<InterventionStats>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"SELECT COALESCE(intervention_action, 'none'),
+                      COUNT(*) AS total,
+                      SUM(CASE WHEN intervention_result = 'success' THEN 1 ELSE 0 END) AS successful
+               FROM stall_events
+               WHERE created_at >= ?1
+                 AND intervention_action IS NOT NULL
+               GROUP BY intervention_action
+               ORDER BY total DESC"#,
+        )
+        .map_err(|e| format!("Failed to prepare intervention effectiveness query: {e}"))?;
+
+    let results = stmt
+        .query_map(params![since_timestamp], |row| {
+            let total: i64 = row.get(1)?;
+            let successful: i64 = row.get(2)?;
+            Ok(InterventionStats {
+                intervention_action: row.get(0)?,
+                total,
+                successful,
+                success_rate: if total > 0 {
+                    successful as f64 / total as f64
+                } else {
+                    0.0
+                },
+            })
+        })
+        .map_err(|e| format!("Failed to query intervention effectiveness: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
+/// Count distinct states observed in a task run.
+pub fn get_state_coverage(
+    conn: &Connection,
+    task_run_id: i64,
+) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"SELECT DISTINCT state_id
+               FROM ui_bridge_events
+               WHERE task_run_id = ?1
+                 AND state_id IS NOT NULL"#,
+        )
+        .map_err(|e| format!("Failed to prepare state coverage query: {e}"))?;
+
+    let results = stmt
+        .query_map(params![task_run_id], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("Failed to query state coverage: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

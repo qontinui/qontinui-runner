@@ -1,5 +1,5 @@
 import { useState, useCallback } from "react";
-import { X, Check, Wand2, Play, User, Bot, TerminalSquare, ListChecks } from "lucide-react";
+import { X, Check, Wand2, Play, User, Bot, TerminalSquare, ListChecks, Sparkles } from "lucide-react";
 import type { TranscriptMessage, TranscriptSession } from "./useTranscriptSessions";
 
 interface TranscriptContentPanelProps {
@@ -11,7 +11,10 @@ interface TranscriptContentPanelProps {
   onGenerateAndRun?: (description: string, inlineContext: string) => void;
   onBuildPlanWorkflow?: (planContent: string) => void;
   onResume: (session: TranscriptSession) => void;
+  onSummarize?: (messages: TranscriptMessage[]) => void;
   onClose: () => void;
+  summaryText?: string | null;
+  summaryLoading?: boolean;
 }
 
 export function TranscriptContentPanel({
@@ -23,7 +26,10 @@ export function TranscriptContentPanel({
   onGenerateAndRun,
   onBuildPlanWorkflow,
   onResume,
+  onSummarize,
   onClose,
+  summaryText,
+  summaryLoading,
 }: TranscriptContentPanelProps) {
   const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(
     () => new Set(messages.map((m) => m.uuid)),
@@ -117,6 +123,21 @@ export function TranscriptContentPanel({
           <span className="text-[10px] text-[#565f89] shrink-0">{messages.length} messages</span>
         </div>
         <div className="flex items-center gap-1 shrink-0">
+          {onSummarize && messages.length > 0 && (
+            <button
+              onClick={() => onSummarize(messages)}
+              disabled={summaryLoading}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
+                summaryLoading
+                  ? "bg-[#bb9af7]/10 text-[#bb9af7]/50 cursor-wait"
+                  : "bg-[#bb9af7]/10 text-[#bb9af7] hover:bg-[#bb9af7]/20"
+              }`}
+              title="Generate AI summary of this session"
+            >
+              <Sparkles className={`w-3 h-3 ${summaryLoading ? "animate-pulse" : ""}`} />
+              {summaryLoading ? "Summarizing..." : "Summarize"}
+            </button>
+          )}
           {session && (
             <button
               onClick={() => onResume(session)}
@@ -162,6 +183,19 @@ export function TranscriptContentPanel({
           >
             Clear
           </button>
+        </div>
+      )}
+
+      {/* AI Summary */}
+      {summaryText && (
+        <div className="px-3 py-2 border-b border-[#2a2d3d] bg-[#bb9af7]/5">
+          <div className="flex items-center gap-1.5 mb-1">
+            <Sparkles className="w-3 h-3 text-[#bb9af7]" />
+            <span className="text-[10px] font-medium text-[#bb9af7]">AI Summary</span>
+          </div>
+          <p className="text-[11px] text-[#a9b1d6] whitespace-pre-wrap leading-relaxed">
+            {summaryText}
+          </p>
         </div>
       )}
 

@@ -9,9 +9,10 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import type { TaskRun, RunPromptRequest, RunPromptResponse } from "../types/taskRun";
 import { isTaskFinished } from "../types/taskRun";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { useTaskRunProgress } from "@/hooks/graphql";
 
-// Polling is now fallback only - real-time events provide instant updates
-const DEFAULT_POLL_INTERVAL_MS = 5000;
+// Polling is now fallback only - GraphQL subscription is primary
+const DEFAULT_POLL_INTERVAL_MS = 15000; // Relaxed from 5s since subscription handles real-time
 const DEFAULT_TIMEOUT_MS = 600000; // 10 minutes
 
 export interface UseAiTaskPollingOptions {
@@ -62,17 +63,20 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
   const startTimeRef = useRef<number>(0);
   const taskIdRef = useRef<string | null>(null);
   const isMountedRef = useRef(true);
+  const [activeTaskId, setActiveTaskId] = useState<string>("");
 
-  // Cleanup on unmount
-  useEffect(() => {
-    isMountedRef.current = true;
-    return () => {
-      isMountedRef.current = false;
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-      }
-    };
-  }, []);
+  // Stable refs for callbacks (avoids re-subscribing on every render)
+  const onCompleteRef = useRef(onComplete);
+  const onErrorRef = useRef(onError);
+  const onProgressRef = useRef(onProgress);
+  onCompleteRef.current = onComplete;
+  onErrorRef.current = onError;
+  onProgressRef.current = onProgress;
+
+  // GraphQL subscription for real-time task progress (replaces frequent polling).
+  // The subscription streams events for the active task; polling is kept as a
+  // slow fallback (15s) in case the WS connection drops.
+  const { data: progressData } = useTaskRunProgress(activeTaskId, !activeTaskId);
 
   /**
    * Fetch task run status by ID
@@ -95,6 +99,48 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
     }
   }, []);
 
+  // React to subscription events — detect completion/status changes instantly
+  useEffect(() => {
+    const event = progressData?.taskRunProgress;
+    if (!event || !activeTaskId || !isMountedRef.current) return;
+
+    // TaskRunUpdate events carry status changes
+    if (event.__typename === "TaskRunUpdateEvent" && event.status) {
+      const taskStatus = event.status;
+      if (taskStatus === "complete" || taskStatus === "failed" || taskStatus === "stopped") {
+        // Fetch final state and trigger callbacks
+        fetchTaskRun(activeTaskId).then((task) => {
+          if (!task || !isMountedRef.current) return;
+          setCurrentTask(task);
+          if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+          }
+          setIsRunning(false);
+          setActiveTaskId("");
+          taskIdRef.current = null;
+          if (taskStatus === "complete") {
+            onCompleteRef.current?.(task);
+          } else {
+            const errorMsg = task.error_message || `Task ${taskStatus}`;
+            setError(errorMsg);
+            onErrorRef.current?.(errorMsg, task);
+          }
+        });
+      }
+    }
+
+    // StepProgress events — update current task state
+    if (event.__typename === "StepProgressEvent") {
+      fetchTaskRun(activeTaskId).then((task) => {
+        if (task && isMountedRef.current) {
+          setCurrentTask(task);
+          onProgressRef.current?.(task);
+        }
+      });
+    }
+  }, [progressData, activeTaskId, fetchTaskRun]);
+
   /**
    * Stop polling for current task
    */
@@ -104,9 +150,20 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
       pollIntervalRef.current = null;
     }
     taskIdRef.current = null;
+    setActiveTaskId("");
     if (isMountedRef.current) {
       setIsRunning(false);
     }
+  }, []);
+
+  // Cleanup on unmount — cancel polling and mark as unmounted
+  useEffect(() => {
+    return () => {
+      isMountedRef.current = false;
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+      }
+    };
   }, []);
 
   /**
@@ -115,6 +172,7 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
   const startPolling = useCallback(
     (taskId: string) => {
       taskIdRef.current = taskId;
+      setActiveTaskId(taskId); // Activate GraphQL subscription
       startTimeRef.current = Date.now();
 
       const poll = async () => {
@@ -127,7 +185,7 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
           stopPolling();
           const timeoutError = "Task polling timed out";
           setError(timeoutError);
-          onError?.(timeoutError);
+          onErrorRef.current?.(timeoutError);
           return;
         }
 
@@ -137,16 +195,16 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
         }
 
         setCurrentTask(task);
-        onProgress?.(task);
+        onProgressRef.current?.(task);
 
         if (isTaskFinished(task)) {
           stopPolling();
           if (task.status === "complete") {
-            onComplete?.(task);
+            onCompleteRef.current?.(task);
           } else {
             const errorMsg = task.error_message || `Task ${task.status}`;
             setError(errorMsg);
-            onError?.(errorMsg, task);
+            onErrorRef.current?.(errorMsg, task);
           }
         }
       };
@@ -157,7 +215,7 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
       // Set up interval
       pollIntervalRef.current = setInterval(poll, pollIntervalMs);
     },
-    [fetchTaskRun, pollIntervalMs, timeoutMs, stopPolling, onComplete, onError, onProgress],
+    [fetchTaskRun, pollIntervalMs, timeoutMs, stopPolling],
   );
 
   /**
@@ -183,7 +241,7 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
           const errorMsg = result.error || "Failed to trigger AI analysis";
           setError(errorMsg);
           setIsRunning(false);
-          onError?.(errorMsg);
+          onErrorRef.current?.(errorMsg);
           return null;
         }
 
@@ -199,7 +257,7 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
             const errorMsg = "Failed to fetch initial task state";
             setError(errorMsg);
             setIsRunning(false);
-            onError?.(errorMsg);
+            onErrorRef.current?.(errorMsg);
             return null;
           }
         }
@@ -222,17 +280,17 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
         };
         setCurrentTask(syntheticTask);
         setIsRunning(false);
-        onComplete?.(syntheticTask);
+        onCompleteRef.current?.(syntheticTask);
         return syntheticTask;
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         setError(errorMsg);
         setIsRunning(false);
-        onError?.(errorMsg);
+        onErrorRef.current?.(errorMsg);
         return null;
       }
     },
-    [stopPolling, fetchTaskRun, startPolling, onComplete, onError],
+    [stopPolling, fetchTaskRun, startPolling],
   );
 
   /**

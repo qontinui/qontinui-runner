@@ -4,7 +4,7 @@ export type { TerminalInstanceHandle } from "./TerminalInstance";
 export { TerminalTabBar } from "./TerminalTabBar";
 
 export { TerminalNotification } from "./TerminalNotification";
-export { TranscriptSessionSidebar } from "./TranscriptSessionSidebar";
+export { SessionManagerPanel } from "./SessionManagerPanel";
 export { TranscriptContentPanel } from "./TranscriptContentPanel";
 export { useTranscriptSessions } from "./useTranscriptSessions";
 export type { TranscriptSession, TranscriptMessage } from "./useTranscriptSessions";

@@ -33,6 +33,8 @@ pub enum QueryType {
     Vector,
     /// Hybrid: SQL filter → vector re-rank.
     Hybrid,
+    /// Web: external search via knowledge acquisition.
+    Web,
 }
 
 /// Request payload for the query_runner_data tool.
@@ -101,6 +103,7 @@ pub async fn query_runner_data(
         QueryType::Sql => execute_sql_query(&state, &request),
         QueryType::Vector => execute_vector_query(&state, &request).await,
         QueryType::Hybrid => execute_hybrid_query(&state, &request).await,
+        QueryType::Web => execute_web_query(&request).await,
     };
 
     match result {
@@ -394,6 +397,7 @@ fn execute_hybrid_with_embedding(
                     QueryType::Vector => "vector",
                     QueryType::Hybrid => "hybrid",
                     QueryType::Sql => "sql",
+                    QueryType::Web => "web",
                 }
                 .to_string(),
                 table: request.table.clone(),
@@ -401,5 +405,51 @@ fn execute_hybrid_with_embedding(
                 embedding_used: true,
             },
         })
+    })
+}
+
+/// Execute a web search via the knowledge acquisition system.
+async fn execute_web_query(
+    request: &QueryRunnerDataRequest,
+) -> Result<QueryRunnerDataResponse, String> {
+    let search_text = request
+        .search_text
+        .as_deref()
+        .ok_or("search_text is required for web queries")?;
+
+    let domain = match request.filters.get("domain").map(|s| s.as_str()) {
+        Some("vulnerability") => {
+            crate::knowledge_acquisition::KnowledgeDomain::VulnerabilityIntelligence
+        }
+        Some("error") => crate::knowledge_acquisition::KnowledgeDomain::ErrorResolution,
+        Some("api") => crate::knowledge_acquisition::KnowledgeDomain::ApiDocumentation,
+        _ => crate::knowledge_acquisition::KnowledgeDomain::General,
+    };
+
+    let ka = crate::knowledge_acquisition::KnowledgeAcquisition::new();
+    let results = ka.search(search_text, domain, request.limit).await?;
+
+    let json_results: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "provider": r.provider.as_str(),
+                "title": r.title,
+                "content": r.content,
+                "url": r.url,
+                "relevance_score": r.relevance_score,
+            })
+        })
+        .collect();
+
+    Ok(QueryRunnerDataResponse {
+        count: json_results.len(),
+        results: json_results,
+        metadata: QueryMetadata {
+            query_type: "web".to_string(),
+            table: "web_search".to_string(),
+            filters_applied: request.filters.len(),
+            embedding_used: false,
+        },
     })
 }

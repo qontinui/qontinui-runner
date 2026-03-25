@@ -13,7 +13,7 @@ use crate::workflow_state::{CheckpointManager, StepCheckpoint};
 use crate::AppState;
 
 use super::super::phase_configs::{CompletionConfig, CompletionResult};
-use super::super::phase_helpers::{execute_prompt_response_mode, record_phase_token_usage};
+use super::super::phase_helpers::{build_llm_metrics, execute_prompt_response_mode, record_phase_token_usage};
 
 // =============================================================================
 // Completion Phase Executor
@@ -451,6 +451,7 @@ impl CompletionExecutor {
                             let duration_ms = start.elapsed().as_millis() as u64;
                             record_phase_token_usage(
                                 &self.checkpoint_db,
+                                self.app_state.pg_db.as_ref(),
                                 execution_id,
                                 "completion",
                                 stage_index,
@@ -460,6 +461,12 @@ impl CompletionExecutor {
                                 resp.input_tokens,
                                 resp.output_tokens,
                                 Some(duration_ms),
+                            );
+                            let llm_metrics = build_llm_metrics(
+                                step_model.as_deref(),
+                                step_provider.as_deref(),
+                                resp.input_tokens,
+                                resp.output_tokens,
                             );
                             let output = resp.output;
                             info!(
@@ -527,7 +534,10 @@ impl CompletionExecutor {
                                 duration_ms,
                                 config: crate::step_executor::StepExecutionConfig::default(),
                                 verification_details: None,
-                                output_data: Some(serde_json::json!({ "output": output })),
+                                output_data: Some(serde_json::json!({
+                                    "output": output,
+                                    "llm_metrics": llm_metrics,
+                                })),
                                 required: None,
                                 resolved_inputs: None,
                                 extracted_values: None,

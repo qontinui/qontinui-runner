@@ -1,12 +1,16 @@
 /**
  * useRunnerConnectionStatus Hook
  *
- * Polls the runner's /health endpoint to determine real connection status.
- * Replaces the hardcoded "Connected" badge in the BottomBar with live data.
+ * Uses the GraphQL health subscription for real-time connection status.
+ * Falls back to REST polling if the subscription isn't available.
+ *
+ * Migration: replaced 10s setInterval polling of GET /health with
+ * the uiBridgeHealthStream GraphQL subscription (5s push).
  */
 
 import { useState, useEffect, useCallback } from "react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { useHealthStream } from "@/hooks/graphql";
 
 export interface ConnectionStatus {
   isConnected: boolean;
@@ -14,36 +18,46 @@ export interface ConnectionStatus {
   lastCheckedAt: number | null;
 }
 
-const HEALTH_POLL_INTERVAL = 10_000; // 10 seconds
-const HEALTH_TIMEOUT = 5_000; // 5 second timeout
+const HEALTH_POLL_INTERVAL = 30_000; // 30s fallback (was 10s before subscription)
+const HEALTH_TIMEOUT = 5_000;
 
+/**
+ * Primary implementation: GraphQL subscription-based health monitoring.
+ * The subscription pushes health data every 5s over WebSocket,
+ * eliminating HTTP polling overhead entirely.
+ */
 export function useRunnerConnectionStatus(): ConnectionStatus {
-  const [status, setStatus] = useState<ConnectionStatus>({
-    isConnected: true, // Optimistic — assume connected on mount
-    latencyMs: null,
-    lastCheckedAt: null,
-  });
+  const { data, error: subError } = useHealthStream(5000);
+  const [fallbackStatus, setFallbackStatus] = useState<ConnectionStatus | null>(null);
 
+  // If subscription is delivering data, derive status from it
+  if (data?.uiBridgeHealthStream) {
+    const health = data.uiBridgeHealthStream;
+    return {
+      isConnected: health.responsive,
+      latencyMs: parseInt(health.heartbeatAgeMs, 10) || null,
+      lastCheckedAt: Date.now(),
+    };
+  }
+
+  // Fallback: poll REST endpoint if subscription not connected yet
   const checkHealth = useCallback(async () => {
     const start = performance.now();
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), HEALTH_TIMEOUT);
-
       const response = await tracedFetch(`${getApiBase()}/health`, {
         signal: controller.signal,
       });
       clearTimeout(timeout);
-
       const latency = Math.round(performance.now() - start);
-
-      setStatus({
+      setFallbackStatus({
         isConnected: response.ok,
         latencyMs: latency,
         lastCheckedAt: Date.now(),
       });
     } catch {
-      setStatus({
+      setFallbackStatus({
         isConnected: false,
         latencyMs: null,
         lastCheckedAt: Date.now(),
@@ -51,11 +65,17 @@ export function useRunnerConnectionStatus(): ConnectionStatus {
     }
   }, []);
 
+  // Only start fallback polling if subscription has an error or no data yet
   useEffect(() => {
+    if (data?.uiBridgeHealthStream) return; // Subscription is working
     checkHealth();
     const interval = setInterval(checkHealth, HEALTH_POLL_INTERVAL);
     return () => clearInterval(interval);
-  }, [checkHealth]);
+  }, [checkHealth, data, subError]);
 
-  return status;
+  return fallbackStatus ?? {
+    isConnected: !subError, // Optimistic if no data yet
+    latencyMs: null,
+    lastCheckedAt: null,
+  };
 }

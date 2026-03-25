@@ -107,6 +107,48 @@ pub struct DurableQueueStatus {
 }
 
 // ============================================================================
+// Circuit Breaker Status Endpoint
+// ============================================================================
+
+/// Response payload for circuit breaker status.
+#[derive(Debug, Serialize)]
+pub struct CircuitBreakerStatus {
+    /// Current state: "closed", "open", or "half_open"
+    pub state: String,
+    /// Number of failures within the rolling window
+    pub failure_count: u32,
+    /// Failure threshold before the circuit opens
+    pub failure_threshold: u32,
+    /// Cooldown period in milliseconds before transitioning from open to half-open
+    pub cooldown_ms: u64,
+}
+
+/// Get circuit breaker status.
+///
+/// Returns the current state of the UI Bridge circuit breaker including
+/// failure counts, threshold, and cooldown configuration.
+pub async fn get_circuit_breaker_status(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<CircuitBreakerStatus>> {
+    let cb = &state.ui_bridge_circuit_breaker;
+    let cb_state = cb.get_state().await;
+    let failure_count = cb.get_failure_count().await;
+
+    let state_str = match cb_state {
+        crate::mcp::ui_bridge::CircuitBreakerState::Closed => "closed",
+        crate::mcp::ui_bridge::CircuitBreakerState::Open => "open",
+        crate::mcp::ui_bridge::CircuitBreakerState::HalfOpen => "half_open",
+    };
+
+    Json(ApiResponse::success(CircuitBreakerStatus {
+        state: state_str.to_string(),
+        failure_count,
+        failure_threshold: cb.get_threshold(),
+        cooldown_ms: cb.get_cooldown_ms(),
+    }))
+}
+
+// ============================================================================
 // Routes
 // ============================================================================
 
@@ -119,4 +161,5 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route("/inngest/subscriptions", get(list_subscriptions))
         .route("/inngest/flow-control", get(get_flow_control_status))
         .route("/inngest/queue", get(get_durable_queue_status))
+        .route("/inngest/circuit-breaker", get(get_circuit_breaker_status))
 }

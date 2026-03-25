@@ -4,6 +4,7 @@
  * Horizontal bar chart showing cost breakdown by LLM model.
  */
 
+import { useMemo } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { Cpu } from "lucide-react";
 import type { ModelCostRow } from "./types";
@@ -47,16 +48,20 @@ function CustomTooltip({
 }
 
 export function CostByModelChart({ data }: CostByModelChartProps) {
-  const chartData: ChartData[] = data
-    .map((row) => ({
-      model: row.model_used,
-      cost: row.total_cost_cents / 100,
-      calls: row.call_count,
-      inputTokens: row.total_input_tokens,
-      outputTokens: row.total_output_tokens,
-      avgDuration: row.avg_duration_ms,
-    }))
-    .sort((a, b) => b.cost - a.cost);
+  const chartData: ChartData[] = useMemo(
+    () =>
+      data
+        .map((row) => ({
+          model: row.model_used,
+          cost: row.total_cost_cents / 100,
+          calls: row.call_count,
+          inputTokens: row.total_input_tokens,
+          outputTokens: row.total_output_tokens,
+          avgDuration: row.avg_duration_ms,
+        }))
+        .sort((a, b) => b.cost - a.cost),
+    [data],
+  );
 
   if (chartData.length === 0) {
     return (

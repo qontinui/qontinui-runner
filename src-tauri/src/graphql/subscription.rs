@@ -104,6 +104,7 @@ impl SubscriptionRoot {
 
     /// Finding updates stream — polls DB for finding changes on a task run.
     /// Emits the full findings list whenever the count or statuses change.
+    /// Auto-closes when the task reaches a terminal status or after 30 minutes.
     async fn finding_updates(
         &self,
         ctx: &Context<'_>,
@@ -116,11 +117,32 @@ impl SubscriptionRoot {
         Ok(async_stream::stream! {
             let mut ticker = tokio::time::interval(interval);
             let mut last_hash: u64 = 0;
+            let started = std::time::Instant::now();
+            let max_duration = std::time::Duration::from_secs(30 * 60); // 30 min TTL
+            let mut terminal_ticks = 0u32; // count ticks after task finishes
 
             loop {
                 ticker.tick().await;
+
+                // TTL: auto-close after max duration
+                if started.elapsed() > max_duration {
+                    break;
+                }
+
                 let db = state.app_state.checkpoint_db.clone();
                 let trid = task_run_id.clone();
+
+                // Check task status — stop polling if terminal
+                let db2 = state.app_state.checkpoint_db.clone();
+                let trid2 = task_run_id.clone();
+                let task_status = tokio::task::spawn_blocking(move || {
+                    db2.get_task_run(&trid2).ok().flatten().map(|t| t.status)
+                }).await.ok().flatten();
+
+                let is_terminal = matches!(
+                    task_status.as_deref(),
+                    Some("complete") | Some("failed") | Some("stopped")
+                );
 
                 let findings = match tokio::task::spawn_blocking(move || {
                     db.get_findings_for_task(&trid)
@@ -147,11 +169,21 @@ impl SubscriptionRoot {
                     last_hash = hash;
                     yield findings.into_iter().map(GqlFinding::from_domain).collect();
                 }
+
+                // After task finishes, emit one more update then close
+                if is_terminal {
+                    terminal_ticks += 1;
+                    if terminal_ticks >= 2 {
+                        break;
+                    }
+                }
             }
         })
     }
 
     /// Orchestration loop status stream — pushes loop state at a configurable interval.
+    /// Auto-closes after the loop reaches a terminal phase (Complete/Stopped/Error)
+    /// or after 2 hours.
     async fn orchestration_loop_status_stream(
         &self,
         ctx: &Context<'_>,
@@ -162,23 +194,46 @@ impl SubscriptionRoot {
 
         Ok(async_stream::stream! {
             let mut ticker = tokio::time::interval(interval);
+            let started = std::time::Instant::now();
+            let max_duration = std::time::Duration::from_secs(2 * 60 * 60); // 2h TTL
+            let mut terminal_ticks = 0u32;
+
             loop {
                 ticker.tick().await;
+
+                if started.elapsed() > max_duration {
+                    break;
+                }
+
                 let loop_state = state
                     .app_state
                     .orchestration_loop
                     .lock()
                     .await;
 
+                let phase_str = format!("{:?}", loop_state.phase);
+                let is_terminal = matches!(
+                    phase_str.as_str(),
+                    "Complete" | "Stopped" | "Error"
+                );
+
                 yield GqlOrchestrationLoopStatus {
                     running: loop_state.running,
-                    phase: format!("{:?}", loop_state.phase),
+                    phase: phase_str,
                     current_iteration: loop_state.current_iteration as i32,
                     started_at: loop_state
                         .started_at
                         .map(|t: chrono::DateTime<chrono::Utc>| t.to_rfc3339()),
                     error: loop_state.error.clone(),
                 };
+
+                // After loop finishes, emit final state then close
+                if is_terminal && !loop_state.running {
+                    terminal_ticks += 1;
+                    if terminal_ticks >= 2 {
+                        break;
+                    }
+                }
             }
         })
     }
@@ -205,7 +260,7 @@ fn convert_raw_event_to_runner_event(raw: &serde_json::Value) -> Option<RunnerEv
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    iteration: data.get("iteration").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                    iteration: data.get("iteration").and_then(|v| v.as_i64()).map(|v| v as i32),
                     phase: data
                         .get("phase")
                         .and_then(|v| v.as_str())

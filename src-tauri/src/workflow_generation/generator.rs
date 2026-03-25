@@ -855,6 +855,11 @@ pub fn generate_workflow(
         }
     });
 
+    // ── Graph-informed context ─────────────────────────────────────────────
+    let graph_context = conn
+        .map(|c| super::instrumentation::build_graph_context(c, None))
+        .unwrap_or_default();
+
     // ── Step 1: Builder Agent ──────────────────────────────────────────────
     let builder_start = Instant::now();
     let mut builder_insights_parts: Vec<String> = Vec::new();
@@ -869,6 +874,9 @@ pub fn generate_workflow(
     }
     if let Some(ref templates) = template_context {
         builder_insights_parts.push(templates.clone());
+    }
+    if !graph_context.is_empty() {
+        builder_insights_parts.push(graph_context);
     }
     let builder_insights_section = if builder_insights_parts.is_empty() {
         None

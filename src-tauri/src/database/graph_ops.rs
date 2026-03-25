@@ -852,6 +852,7 @@ mod tests {
                 generation_iteration INTEGER,
                 original_step_json TEXT,
                 final_step_json TEXT,
+                ui_bridge_event_ids TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE,
                 FOREIGN KEY (workflow_version_id) REFERENCES workflow_versions(id) ON DELETE SET NULL

@@ -75,6 +75,12 @@ import { ImageQualityTestsPage } from "@/pages/ImageQualityTestsPage";
 import { lazy } from "react";
 
 const LlmObservabilityDashboard = lazy(() => import("../llm-observability/LlmObservabilityDashboard"));
+const EvaluationDashboard = lazy(() => import("../evaluation/EvaluationDashboard"));
+const ElementReliabilityDashboard = lazy(() => import("../element-reliability/ElementReliabilityDashboard"));
+const PipelineEventsTimeline = lazy(() => import("../pipeline-events/PipelineEventsTimeline").then(m => ({ default: m.PipelineEventsTimeline })));
+const RuleInfluencePanel = lazy(() => import("../rule-influence/RuleInfluencePanel").then(m => ({ default: m.RuleInfluencePanel })));
+const UnifiedSearchPanel = lazy(() => import("../unified-search/UnifiedSearchPanel"));
+const WorkflowVersionLineage = lazy(() => import("../workflow-versions/WorkflowVersionLineage").then(m => ({ default: m.WorkflowVersionLineage })));
 
 interface ActionLogViewData {
   actions: ActionLogEntry[];
@@ -704,8 +710,50 @@ export function TabContent({
         </div>
       );
 
+    case "evaluation":
+      return (
+        <div className="h-full overflow-hidden">
+          <EvaluationDashboard />
+        </div>
+      );
+
     case "terminal":
       return null;
+
+    case "element-reliability":
+      return (
+        <div className="h-full overflow-hidden">
+          <ElementReliabilityDashboard />
+        </div>
+      );
+
+    case "pipeline-events":
+      return (
+        <div className="h-full overflow-hidden">
+          <PipelineEventsTimeline />
+        </div>
+      );
+
+    case "rule-influence":
+      return (
+        <div className="h-full overflow-hidden">
+          <RuleInfluencePanel />
+        </div>
+      );
+
+    case "unified-search":
+      return (
+        <div className="h-full overflow-hidden">
+          <UnifiedSearchPanel onSearch={() => {}} />
+        </div>
+      );
+
+    case "workflow-versions":
+      return (
+        <div className="h-full overflow-hidden">
+          <WorkflowVersionLineage />
+        </div>
+      );
 
     case "help":
       return <HelpTab />;

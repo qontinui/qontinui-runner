@@ -49,10 +49,20 @@ interface UseKeyboardShortcutsParams {
   terminalRefs: Map<string, React.RefObject<{ writeToTerminal: (data: string) => void } | null>>;
   workflowGen: {
     rightPanelMode: string | null;
+    showSidebar: boolean;
+    setShowSidebar: React.Dispatch<React.SetStateAction<boolean>>;
     setRightPanelMode: React.Dispatch<
       React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | null>
     >;
     setSelectedTranscriptSessionId: React.Dispatch<React.SetStateAction<string | null>>;
+  };
+  sessionManager?: {
+    frozenCount: number;
+    needsInputCount: number;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sessions: Array<any>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    resumeSession: (session: any) => void;
   };
 }
 
@@ -75,6 +85,7 @@ export function useKeyboardShortcuts({
   addHistoryEvent,
   terminalRefs,
   workflowGen,
+  sessionManager,
 }: UseKeyboardShortcutsParams) {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -243,6 +254,27 @@ export function useKeyboardShortcuts({
         focusHistory.goForward();
         return;
       }
+      // Ctrl+Shift+B: Toggle session manager sidebar
+      if (e.ctrlKey && e.shiftKey && e.key === "B") {
+        e.preventDefault();
+        workflowGen.setShowSidebar((v) => !v);
+        return;
+      }
+      // Ctrl+Shift+J: Jump to next frozen session (resume first frozen)
+      if (e.ctrlKey && e.shiftKey && e.key === "J") {
+        e.preventDefault();
+        if (sessionManager) {
+          const frozen = sessionManager.sessions.find(
+            (s: { liveStatus: string }) => s.liveStatus === "frozen",
+          );
+          if (frozen) {
+            // Pass the full session object (includes _transcript) to resumeSession
+            sessionManager.resumeSession(frozen);
+            addHistoryEvent("Resume frozen", `Session ${frozen.sessionId?.slice(0, 8) ?? ""}`, undefined, "#f7768e");
+          }
+        }
+        return;
+      }
       if (e.key === "Escape") {
         if (swapSource !== null) {
           dispatch({ type: "SET_SWAP_SOURCE", payload: null });
@@ -280,5 +312,6 @@ export function useKeyboardShortcuts({
     incrementMetric,
     addHistoryEvent,
     terminalRefs,
+    sessionManager,
   ]);
 }

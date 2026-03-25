@@ -9,4 +9,4 @@ pub mod schema;
 pub mod subscription;
 pub mod types;
 
-pub use schema::{build_schema, QontinuiSchema};
+pub use schema::{build_schema, export_sdl, QontinuiSchema};

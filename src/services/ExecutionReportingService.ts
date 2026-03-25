@@ -124,6 +124,8 @@ interface InternalExecutionStats {
   totalRecognitions: number;
   successfulRecognitions: number;
   failedRecognitions: number;
+  // Accumulated action durations for accurate averaging
+  totalActionDurationMs: number;
   // LLM tracking stats
   llmActionCount: number;
   totalTokensInput: number;
@@ -356,8 +358,8 @@ class ExecutionReportingServiceImpl {
       return;
     }
 
-    const parentId = `seq-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
     const traceId = `trace-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const clientSpanId = `span-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 
     const statusMap: Record<AiPromptActionData["status"], ActionStatus> = {
       success: ActionStatus.SUCCESS,
@@ -367,7 +369,12 @@ class ExecutionReportingServiceImpl {
       skipped: ActionStatus.SKIPPED,
     };
 
-    // Build child actions
+    // Reserve the parent's sequence number before building children,
+    // so children can reference it in metadata for parent-child linking.
+    const parentSequenceNumber = this.getNextActionSequenceNumber();
+
+    // Build child actions — parent-child linking is stored in metadata, not the
+    // parent_id FK column (which expects a server-assigned UUID we don't have).
     const childActions: ActionExecutionCreate[] = actions.map((data) => {
       const endTime = data.endTime ?? new Date();
       const durationMs = data.duration_ms ?? endTime.getTime() - data.startTime.getTime();
@@ -386,8 +393,11 @@ class ExecutionReportingServiceImpl {
         llm_metrics: data.llmMetrics,
         span_type: "llm_call",
         trace_id: traceId,
-        parent_id: parentId,
-        metadata: data.metadata,
+        metadata: {
+          ...data.metadata,
+          parent_span_id: clientSpanId,
+          parent_sequence_number: parentSequenceNumber,
+        },
       };
     });
 
@@ -413,9 +423,10 @@ class ExecutionReportingServiceImpl {
     const parentDurationMs = latestEnd.getTime() - earliestStart.getTime();
     const aggregatedMetrics = this.aggregateLLMMetrics(actions);
 
-    // Build parent action
+    // Build parent action — includes client_span_id so children can be correlated
+    // via metadata.parent_span_id == metadata.client_span_id
     const parentAction: ActionExecutionCreate = {
-      sequence_number: this.getNextActionSequenceNumber(),
+      sequence_number: parentSequenceNumber,
       action_type: ActionType.RUN_PROMPT_SEQUENCE,
       action_name: sequenceName,
       status: parentStatus,
@@ -427,6 +438,8 @@ class ExecutionReportingServiceImpl {
       trace_id: traceId,
       metadata: {
         child_count: actions.length,
+        is_parent_span: true,
+        client_span_id: clientSpanId,
         ...parentMetadata,
       },
     };
@@ -663,6 +676,7 @@ class ExecutionReportingServiceImpl {
       statesCovered: new Set(),
       transitionsCovered: new Set(),
       startTime: Date.now(),
+      totalActionDurationMs: 0,
       totalRecognitions: 0,
       successfulRecognitions: 0,
       failedRecognitions: 0,
@@ -700,6 +714,11 @@ class ExecutionReportingServiceImpl {
       case "skipped":
         this.executionStats.skippedActions++;
         break;
+    }
+
+    // Accumulate action duration for accurate averaging
+    if (action.duration_ms) {
+      this.executionStats.totalActionDurationMs += action.duration_ms;
     }
 
     // Track states covered
@@ -741,7 +760,7 @@ class ExecutionReportingServiceImpl {
       timeout_actions: this.executionStats.timeoutActions,
       skipped_actions: this.executionStats.skippedActions,
       total_duration_ms: durationMs,
-      avg_action_duration_ms: totalActions > 0 ? Math.round(durationMs / totalActions) : 0,
+      avg_action_duration_ms: totalActions > 0 ? Math.round(this.executionStats.totalActionDurationMs / totalActions) : 0,
       llm_action_count: this.executionStats.llmActionCount,
       total_tokens_input: this.executionStats.totalTokensInput,
       total_tokens_output: this.executionStats.totalTokensOutput,

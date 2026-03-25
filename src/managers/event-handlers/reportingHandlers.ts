@@ -219,8 +219,15 @@ function reportToExecutionService(
   else if (typeToCheck.includes("go_to_state")) actionType = ActionType.GO_TO_STATE;
 
   // Map node status to ActionStatus
-  const actionStatus: ActionStatus =
-    node.status === "success" ? ActionStatus.SUCCESS : ActionStatus.FAILED;
+  const statusMap: Record<string, ActionStatus> = {
+    success: ActionStatus.SUCCESS,
+    failed: ActionStatus.FAILED,
+    error: ActionStatus.ERROR,
+    timeout: ActionStatus.TIMEOUT,
+    skipped: ActionStatus.SKIPPED,
+    pending: ActionStatus.PENDING,
+  };
+  const actionStatus = statusMap[node.status] ?? ActionStatus.FAILED;
 
   // Extract LLM metrics if available
   const runtime = metadata.runtime as Record<string, unknown> | undefined;
@@ -244,10 +251,12 @@ function reportToExecutionService(
     llm_metrics: llmMetrics,
     span_type: spanType,
     trace_id: metadata.trace_id as string | undefined,
-    parent_id: metadata.parent_id as string | undefined,
     metadata: {
       node_id: node.id,
       node_type: node.node_type,
+      // Store parent linkage in metadata rather than parent_id FK column,
+      // since we don't have the server-assigned UUID for the parent action.
+      ...(metadata.parent_id ? { parent_span_id: metadata.parent_id } : {}),
     },
   };
 

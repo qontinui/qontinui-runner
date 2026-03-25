@@ -180,6 +180,16 @@ impl AgenticExecutor {
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 duration_ms: None,
             };
+            // PG-primary: fire-and-forget async write to PostgreSQL
+            if let Some(pg) = &self.app_state.pg_db {
+                let pg = pg.clone();
+                let event_clone = resp_start_event.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = pg.create_task_run_event(&event_clone).await {
+                        tracing::warn!("PG event write failed: {}", e);
+                    }
+                });
+            }
             if let Err(e) = self.checkpoint_db.create_task_run_event(&resp_start_event) {
                 warn!("Failed to emit agentic response-mode start event: {}", e);
             }
@@ -327,6 +337,16 @@ impl AgenticExecutor {
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             duration_ms: Some(resp_duration),
                         };
+                        // PG-primary: fire-and-forget async write to PostgreSQL
+                        if let Some(pg) = &self.app_state.pg_db {
+                            let pg = pg.clone();
+                            let event_clone = complete_event.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = pg.create_task_run_event(&event_clone).await {
+                                    tracing::warn!("PG event write failed: {}", e);
+                                }
+                            });
+                        }
                         if let Err(e) = self.checkpoint_db.create_task_run_event(&complete_event) {
                             warn!(
                                 "Failed to emit agentic response-mode completion event: {}",
@@ -398,6 +418,16 @@ impl AgenticExecutor {
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             duration_ms: Some(resp_duration),
                         };
+                        // PG-primary: fire-and-forget async write to PostgreSQL
+                        if let Some(pg) = &self.app_state.pg_db {
+                            let pg = pg.clone();
+                            let event_clone = error_event.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = pg.create_task_run_event(&event_clone).await {
+                                    tracing::warn!("PG event write failed: {}", e);
+                                }
+                            });
+                        }
                         if let Err(e2) = self.checkpoint_db.create_task_run_event(&error_event) {
                             warn!("Failed to emit agentic response-mode error event: {}", e2);
                         }
@@ -457,6 +487,16 @@ impl AgenticExecutor {
             timestamp: chrono::Utc::now().to_rfc3339(),
             duration_ms: None,
         };
+        // PG-primary: fire-and-forget async write to PostgreSQL
+        if let Some(pg) = &self.app_state.pg_db {
+            let pg = pg.clone();
+            let event_clone = start_event.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pg.create_task_run_event(&event_clone).await {
+                    tracing::warn!("PG event write failed: {}", e);
+                }
+            });
+        }
         if let Err(e) = self.checkpoint_db.create_task_run_event(&start_event) {
             warn!("Failed to emit agentic start event: {}", e);
         }
@@ -1052,6 +1092,16 @@ impl AgenticExecutor {
             timestamp: chrono::Utc::now().to_rfc3339(),
             duration_ms: Some(agentic_duration_ms),
         };
+        // PG-primary: fire-and-forget async write to PostgreSQL
+        if let Some(pg) = &self.app_state.pg_db {
+            let pg = pg.clone();
+            let event_clone = completion_event.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pg.create_task_run_event(&event_clone).await {
+                    tracing::warn!("PG event write failed: {}", e);
+                }
+            });
+        }
         if let Err(e) = self.checkpoint_db.create_task_run_event(&completion_event) {
             warn!("Failed to emit agentic completion event: {}", e);
         }

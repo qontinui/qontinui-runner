@@ -1789,6 +1789,128 @@ async fn evaluate_recommendation_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Live evaluation with I/O (LLM-as-judge)
+// ---------------------------------------------------------------------------
+
+/// Request body for the evaluate-with-io endpoint.
+#[derive(Debug, Deserialize)]
+struct EvaluateWithIoRequest {
+    /// The eval spec (inline JSON or a spec_id to look up).
+    eval_spec: serde_json::Value,
+    /// The input that was provided to the agent/workflow.
+    input: String,
+    /// The output the agent/workflow produced.
+    output: String,
+    /// Optional context (e.g., reference documents, ground truth).
+    context: Option<String>,
+}
+
+/// POST /meta-optimizer/evaluate-with-io
+///
+/// Evaluate an eval spec against live input/output data using LLM-as-judge assertions.
+/// Accepts either an inline EvalSpec object or a `{ "spec_id": "..." }` reference.
+async fn evaluate_with_io_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<EvaluateWithIoRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let make_err = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to evaluate with I/O: {}", e))),
+        )
+    };
+
+    // Resolve the eval spec: either inline or by spec_id lookup.
+    let spec: crate::meta_optimizer::eval_spec::EvalSpec =
+        if let Some(spec_id) = body.eval_spec.get("spec_id").and_then(|v| v.as_str()) {
+            // Look up by ID
+            let specs = crate::meta_optimizer::eval_spec::list_eval_specs(
+                &state.app_state.checkpoint_db,
+                None,
+            )
+            .map_err(make_err)?;
+            specs
+                .into_iter()
+                .find(|s| s.id == spec_id)
+                .ok_or_else(|| make_err(format!("Eval spec not found: {}", spec_id)))?
+        } else {
+            serde_json::from_value(body.eval_spec)
+                .map_err(|e| make_err(format!("Invalid eval spec: {}", e)))?
+        };
+
+    // Build aggregate metrics for non-judge assertions
+    let metrics = if let Some(ref agent) = spec.target_agent {
+        let period_start = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let period_end = chrono::Utc::now().to_rfc3339();
+
+        crate::database::pipeline_traces::get_agent_aggregates_for_period(
+            &state.app_state.checkpoint_db,
+            agent,
+            &period_start,
+            &period_end,
+        )
+        .ok()
+        .flatten()
+        .map(|agg| crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
+            success_rate: if agg.run_count > 0 {
+                agg.success_count as f64 / agg.run_count as f64
+            } else {
+                0.0
+            },
+            mean_duration_ms: agg.avg_duration_ms,
+            mean_iterations: 0.0,
+            mean_cost_cents: agg.avg_cost_usd * 100.0,
+            trial_count: agg.run_count as u32,
+        })
+        .unwrap_or_else(|| crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
+            success_rate: 0.0,
+            mean_duration_ms: 0.0,
+            mean_iterations: 0.0,
+            mean_cost_cents: 0.0,
+            trial_count: 0,
+        })
+    } else {
+        crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
+            success_rate: 0.0,
+            mean_duration_ms: 0.0,
+            mean_iterations: 0.0,
+            mean_cost_cents: 0.0,
+            trial_count: 0,
+        }
+    };
+
+    // Evaluate all test cases
+    let mut all_results = Vec::new();
+    let mut test_case_results = Vec::new();
+    for tc in &spec.test_cases {
+        let results = crate::meta_optimizer::eval_runner::evaluate_test_case_with_io(
+            tc,
+            &body.input,
+            &body.output,
+            body.context.as_deref(),
+            &metrics,
+        );
+        let passed = results.iter().all(|r| r.passed);
+        test_case_results.push(serde_json::json!({
+            "test_case_id": tc.id,
+            "passed": passed,
+            "assertion_results": results,
+        }));
+        all_results.extend(results);
+    }
+
+    let all_passed = all_results.iter().all(|r| r.passed);
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "status": if all_passed { "passed" } else { "failed" },
+        "test_case_results": test_case_results,
+        "assertion_results": all_results,
+        "total_assertions": all_results.len(),
+        "passed_assertions": all_results.iter().filter(|r| r.passed).count(),
+    }))))
+}
+
+// ---------------------------------------------------------------------------
 // Canary rollout endpoints
 // ---------------------------------------------------------------------------
 
@@ -1994,6 +2116,11 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route(
             "/meta-optimizer/recommendations/{id}/evaluate",
             post(evaluate_recommendation_handler),
+        )
+        // Live evaluation with I/O (LLM-as-judge)
+        .route(
+            "/meta-optimizer/evaluate-with-io",
+            post(evaluate_with_io_handler),
         )
         // Canary rollout routes
         .route("/meta-optimizer/canaries", get(get_canaries_handler))

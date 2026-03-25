@@ -12,7 +12,7 @@ use tracing::info;
 use crate::mcp::types::ApiState;
 use crate::mcp::ui_bridge;
 
-use super::types::{ActionResult, GqlFinding, GqlFindingStatus, GqlTaskRun};
+use super::types::{ActionResult, GqlFindingStatus, GqlTaskRun};
 
 pub struct MutationRoot;
 
@@ -396,7 +396,10 @@ impl MutationRoot {
     // Workflow Execution
     // ======================================================================
 
-    /// Run a unified workflow by ID. Returns the created task run.
+    /// Run a unified workflow by ID. Creates a task run record and returns it.
+    /// Note: For full workflow execution (verification-agentic loop), use
+    /// POST /unified-workflows/{id}/run which handles session management,
+    /// command sanitization, and the full executor pipeline.
     async fn run_workflow(
         &self,
         ctx: &Context<'_>,
