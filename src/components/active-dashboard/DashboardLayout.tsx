@@ -12,7 +12,7 @@ import { Pin, EyeOff } from "lucide-react";
 import type { ActivityType, ActivityStatus } from "../../types/dashboard/activity-types";
 import type { DashboardLayoutState } from "../../hooks/dashboard/useDashboardLayout";
 import type { UseWidgetPreferencesResult } from "../../hooks/dashboard/useWidgetPreferences";
-import { widgetRegistry, SUMMARY_WIDTH_MIN } from "../../types/dashboard/widget-registry";
+import { widgetRegistry } from "../../types/dashboard/widget-registry";
 import { WidgetHeader } from "./WidgetHeader";
 import { IdleState } from "./IdleState";
 
@@ -907,19 +907,19 @@ function SummaryContainer({
   const SummaryComponent = config.SummaryComponent;
   const borderClasses = getWidgetBorderClasses(config.accentColor, status, false);
 
-  // Compute width tier from live data for grid layout
+  // Compute width tier from live data for grid layout.
+  // narrow/medium = 1 column, wide/full = span all columns.
   const tier = config.getSummaryWidthTier
     ? config.getSummaryWidthTier(data)
     : "medium";
-  const isFull = tier === "full";
+  const gridColumn =
+    tier === "full" || tier === "wide" ? "1 / -1"
+    : undefined;
 
   return (
     <div
-      style={{
-        gridColumn: isFull ? "1 / -1" : undefined,
-        minWidth: isFull ? undefined : SUMMARY_WIDTH_MIN[tier],
-      }}
-      className="transition-all duration-300 ease-in-out"
+      style={{ gridColumn }}
+      className="min-w-0"
     >
       <div
         className={cn(

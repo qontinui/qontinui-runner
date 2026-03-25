@@ -186,7 +186,7 @@ pub async fn push_latest_agentic_scores(
 
     let task_run_id: String = state.checkpoint_db.with_conn(|conn| {
         conn.query_row(
-            "SELECT DISTINCT task_run_id FROM agentic_metric_scores ORDER BY scored_at DESC LIMIT 1",
+            "SELECT task_run_id FROM agentic_metric_scores ORDER BY scored_at DESC LIMIT 1",
             [],
             |row| row.get(0),
         )

@@ -1045,16 +1045,18 @@ Only output the JSON array, nothing else."#,
             .filter(|s| !checkpoint_completed_ids.contains(&s.id))
             .collect();
 
-        // Process independent subtrees concurrently using buffer_unordered.
-        // Runs up to max_parallel_implementers subtrees at once. Results collected
-        // into a Vec first (to release the &pipeline_ctx borrow), then merged.
+        // Process subtrees sequentially.
+        // NOTE: buffer_unordered was reverted to sequential iteration because it
+        // causes `Send` lifetime errors — the futures borrow from the enclosing
+        // async fn which must be Send + 'static for tokio::spawn.  A JoinSet-based
+        // approach (cloning all data into 'static spawned tasks) could restore
+        // parallelism if needed.
         {
-            use futures::stream::{self, StreamExt};
-            let max_parallel = pipeline_config.max_parallel_implementers.max(1) as usize;
             let shared = PipelineShared::from_controller(self);
 
-            let all_outputs: Vec<SubtreeOutput> = stream::iter(
-                pending_subtrees.iter().map(|subtree| {
+            let mut all_outputs: Vec<SubtreeOutput> = Vec::with_capacity(pending_subtrees.len());
+            for subtree in &pending_subtrees {
+                all_outputs.push(
                     shared.process_subtree(
                         subtree,
                         config,
@@ -1068,13 +1070,11 @@ Only output the JSON array, nothing else."#,
                         logger,
                         &pipeline_ctx,
                     )
-                }),
-            )
-            .buffer_unordered(max_parallel)
-            .collect()
-            .await;
+                    .await,
+                );
+            }
 
-            // Merge results sequentially after all parallel subtrees complete.
+            // Merge results sequentially after all subtrees complete.
             for output in all_outputs {
                 total_iterations += output.iterations_used;
                 agent_traces.extend(output.traces);

@@ -7,9 +7,15 @@ use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
 
+use super::context_summarizer::{ContextSummarizer, IterationContext, estimate_tokens};
 use super::fix_agent;
+use super::intervention;
 use super::remote_client::{RunnerClient, SupervisorClient};
+use super::stall_detector::StallDetector;
+use super::subtask_executor;
+use super::task_decomposer;
 use super::types::*;
+use crate::ai_provider::routing::run_prompt_sync;
 
 /// Shared loop state, protected by a mutex for concurrent access from commands/API.
 pub type SharedLoopState = Arc<Mutex<LoopState>>;
@@ -206,6 +212,35 @@ async fn run_loop(
         return;
     }
 
+    // Initialize stall detector and context summarizer from config
+    let mut stall_detector = config.stall_detection.as_ref().map(|c| StallDetector::new(c.clone()));
+    let mut context_summarizer_opt = config.summarization.as_ref().map(|c| ContextSummarizer::new(c.clone()));
+
+    // Task decomposition / planning phase
+    if let Some(ref decomp_config) = config.decomposition {
+        if decomp_config.enabled {
+            {
+                let mut state = loop_state.lock().await;
+                state.phase = LoopPhase::Planning;
+            }
+            let goal = config.workflow_id.clone();
+            let prompt = task_decomposer::build_decomposition_prompt(&goal, decomp_config);
+            info!("Task decomposition: planning phase for goal '{}'", goal);
+            // TODO: AI call via run_prompt_sync(&prompt, None) — prompt and parser are ready
+            // let ai_response = run_prompt_sync(&prompt, None);
+            // if ai_response.success {
+            //     if let Ok(plan) = task_decomposer::parse_decomposition_response(&goal, &ai_response.output, decomp_config) {
+            //         info!("Decomposition plan: {} subtasks", plan.subtasks.len());
+            //     }
+            // }
+            info!("Task decomposition: planning phase complete");
+            {
+                let mut state = loop_state.lock().await;
+                state.phase = LoopPhase::Idle;
+            }
+        }
+    }
+
     for iteration in 1..=config.max_iterations {
         // Check stop signal
         if *stop_rx.borrow() {
@@ -265,6 +300,60 @@ async fn run_loop(
             .get_task_run_status_pub(&task_run_id)
             .await
             .unwrap_or_else(|_| "unknown".to_string());
+
+        // Stall detection: record this iteration's action and check for patterns
+        let mut stall_detected_this_iteration = None;
+        if let Some(ref mut detector) = stall_detector {
+            let sig = format!("{}:{}", config.workflow_id, workflow_status);
+            detector.record_action(sig, "workflow".to_string(), iteration, None);
+            if let Some(pattern) = detector.check() {
+                warn!("Stall detected: {}", pattern);
+                stall_detected_this_iteration = Some(format!("{}", pattern));
+                {
+                    let mut state = loop_state.lock().await;
+                    state.phase = LoopPhase::StallDetecting;
+                }
+                // Build intervention prompt for AI (prompt + parser ready)
+                let recent_actions: Vec<String> = detector.recent_actions(5)
+                    .iter()
+                    .map(|a| a.signature.clone())
+                    .collect();
+                let _intervention_prompt = intervention::build_intervention_prompt(&pattern, &recent_actions);
+                // TODO: AI call for intervention
+                // let ai_response = run_prompt_sync(&_intervention_prompt, None);
+                // if ai_response.success {
+                //     let intervention = intervention::parse_intervention_response(&pattern, &ai_response.output);
+                //     info!("Intervention suggested: {:?}", intervention.suggested_action);
+                // }
+                info!("Breaking loop due to stall: {}", pattern);
+                // Record iteration result with stall info before breaking
+                let result = IterationResult {
+                    iteration,
+                    started_at: iter_start.to_rfc3339(),
+                    completed_at: Utc::now().to_rfc3339(),
+                    task_run_id: task_run_id.clone(),
+                    reflection_task_run_id: None,
+                    fix_count: None,
+                    exit_check: ExitCheckResult {
+                        should_exit: true,
+                        reason: format!("Stall detected: {}", pattern),
+                    },
+                    generated_workflow_id: None,
+                    fixes_implemented: None,
+                    rebuild_triggered: None,
+                    stall_detected: stall_detected_this_iteration.clone(),
+                    context_summarized: None,
+                };
+                {
+                    let mut state = loop_state.lock().await;
+                    state.iteration_results.push(result);
+                    state.phase = LoopPhase::Complete;
+                    state.running = false;
+                }
+                return;
+            }
+        }
+
         let workflow_failed = !matches!(workflow_status.as_str(), "completed" | "complete");
 
         if workflow_failed {
@@ -318,6 +407,8 @@ async fn run_loop(
                     generated_workflow_id: None,
                     fixes_implemented: None,
                     rebuild_triggered: None,
+                    stall_detected: None,
+                    context_summarized: None,
                 };
 
                 {
@@ -431,6 +522,35 @@ async fn run_loop(
             exit_check.should_exit, exit_check.reason
         );
 
+        // Context summarization: track this iteration's context
+        let mut context_summarized_this_iteration = None;
+        if let Some(ref mut summarizer) = context_summarizer_opt {
+            let ctx = IterationContext {
+                iteration,
+                workflow_output: format!("Iteration {} completed with status: {}", iteration, workflow_status),
+                reflection_findings: vec![],
+                fixes_applied: vec![],
+                exit_check_reason: exit_check.reason.clone(),
+                token_estimate: estimate_tokens(&format!("Iteration {} context", iteration)) + 100,
+            };
+            summarizer.add_iteration_context(ctx);
+            if summarizer.should_summarize() {
+                info!("Context summarization triggered at iteration {}", iteration);
+                if let Some(prompt) = summarizer.build_summarization_prompt() {
+                    // TODO: AI call for summarization
+                    // let ai_response = run_prompt_sync(&prompt, None);
+                    // if ai_response.success {
+                    //     let original_tokens = summarizer.total_token_estimate();
+                    //     let summary = summarizer.parse_summary_response(&ai_response.output, original_tokens);
+                    //     summarizer.apply_summary(summary);
+                    //     context_summarized_this_iteration = Some(true);
+                    // }
+                    let _ = prompt; // prompt is ready for when AI call is wired
+                    context_summarized_this_iteration = Some(false); // not yet wired
+                }
+            }
+        }
+
         // Record iteration result
         let result = IterationResult {
             iteration,
@@ -443,6 +563,8 @@ async fn run_loop(
             generated_workflow_id: None,
             fixes_implemented: None,
             rebuild_triggered: None,
+            stall_detected: stall_detected_this_iteration,
+            context_summarized: context_summarized_this_iteration,
         };
 
         {
@@ -963,6 +1085,8 @@ async fn record_pipeline_result(
         generated_workflow_id,
         fixes_implemented,
         rebuild_triggered,
+        stall_detected: None,
+        context_summarized: None,
     };
 
     let mut state = loop_state.lock().await;

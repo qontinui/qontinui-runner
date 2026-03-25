@@ -20,7 +20,7 @@ import { TaskRunCostTable } from "./TaskRunCostTable";
 
 const TIME_RANGE_OPTIONS: LlmTimeRange[] = ["1d", "7d", "30d", "all"];
 
-export function LlmObservabilityDashboard() {
+export default function LlmObservabilityDashboard() {
   const [timeRange, setTimeRange] = useState<LlmTimeRange>("7d");
   const {
     summary,

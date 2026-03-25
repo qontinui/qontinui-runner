@@ -115,7 +115,7 @@ pub struct WorkflowEventBus {
     /// One-shot waiters: event_pattern → list of (waiter_id, oneshot_sender).
     waiters: Mutex<HashMap<String, Vec<(String, tokio::sync::oneshot::Sender<WorkflowEvent>)>>>,
     /// Recent event history for debugging (bounded circular buffer).
-    history: Mutex<Vec<WorkflowEvent>>,
+    history: Mutex<std::collections::VecDeque<WorkflowEvent>>,
     /// Maximum history size.
     max_history: usize,
 }
@@ -129,7 +129,7 @@ impl WorkflowEventBus {
             broadcast_tx,
             subscriptions: RwLock::new(Vec::new()),
             waiters: Mutex::new(HashMap::new()),
-            history: Mutex::new(Vec::new()),
+            history: Mutex::new(std::collections::VecDeque::new()),
             max_history: 500,
         }
     }
@@ -143,9 +143,9 @@ impl WorkflowEventBus {
         {
             let mut history = self.history.lock().await;
             if history.len() >= self.max_history {
-                history.remove(0);
+                history.pop_front();
             }
-            history.push(event.clone());
+            history.push_back(event.clone());
         }
 
         // 2. Broadcast to all subscribers
@@ -154,14 +154,19 @@ impl WorkflowEventBus {
         // 3. Wake any one-shot waiters matching this event
         let waiters_woken = self.wake_waiters(&event).await;
 
-        // 4. Find matching subscriptions
-        let matched_subscriptions = self.find_matching_subscriptions(&event_name).await;
-
-        // 5. Remove any once-only subscriptions that matched
-        if !matched_subscriptions.is_empty() {
+        // 4. Find matching subscriptions and remove once-only matches atomically
+        let matched_subscriptions = {
             let mut subs = self.subscriptions.write().await;
-            subs.retain(|s| !s.once || !matched_subscriptions.contains(&s.id));
-        }
+            let matched: Vec<String> = subs.iter()
+                .filter(|s| event_matches(&event_name, &s.event_pattern))
+                .map(|s| s.id.clone())
+                .collect();
+            // Remove once-only subscriptions that matched
+            if !matched.is_empty() {
+                subs.retain(|s| !s.once || !matched.contains(&s.id));
+            }
+            matched
+        };
 
         info!(
             "Event '{}': {} broadcast, {} waiters woken, {} subscriptions matched",
@@ -289,12 +294,7 @@ impl WorkflowEventBus {
     /// Get recent event history.
     pub async fn history(&self, limit: usize) -> Vec<WorkflowEvent> {
         let history = self.history.lock().await;
-        let start = if history.len() > limit {
-            history.len() - limit
-        } else {
-            0
-        };
-        history[start..].to_vec()
+        history.iter().rev().take(limit).rev().cloned().collect()
     }
 
     /// List active subscriptions.
@@ -433,41 +433,85 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_and_wait() {
-        let bus = WorkflowEventBus::new();
+        let bus = Arc::new(WorkflowEventBus::new());
 
         // Start a waiter in a background task
-        let bus_ref = &bus;
-        let waiter = tokio::spawn({
-            let bus = Arc::new(WorkflowEventBus::new());
-            let bus_clone = bus.clone();
-            async move {
-                bus_clone
-                    .wait_for_event(
-                        "test-waiter",
-                        "test.event",
-                        std::time::Duration::from_secs(5),
-                    )
-                    .await
-            }
+        let bus_clone = bus.clone();
+        let waiter = tokio::spawn(async move {
+            bus_clone.wait_for_event(
+                "test-waiter",
+                "test.event",
+                std::time::Duration::from_secs(5),
+            ).await
         });
 
         // Give the waiter a moment to register
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // This tests the standalone bus (waiter is on a different instance,
-        // so it won't actually receive — but the test verifies no panics)
-        let result = bus
-            .emit(WorkflowEvent {
-                name: "test.event".to_string(),
-                data: serde_json::json!({"key": "value"}),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                idempotency_key: None,
-                source: EventSource::default(),
-            })
-            .await;
+        // Emit on the same bus
+        bus.emit(WorkflowEvent {
+            name: "test.event".to_string(),
+            data: serde_json::json!({"key": "value"}),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            idempotency_key: None,
+            source: EventSource::default(),
+        }).await;
 
-        assert_eq!(result.broadcast_count, 0); // No broadcast subscribers
-        // Waiter is on different bus instance, so won't be woken here
+        // Waiter should receive the event
+        let result = waiter.await.unwrap();
+        assert!(result.is_some(), "Waiter should have received the event");
+        assert_eq!(result.unwrap().name, "test.event");
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_event_timeout() {
+        let bus = WorkflowEventBus::new();
+
+        // Wait for an event that never arrives, with a short timeout
+        let result = bus.wait_for_event(
+            "timeout-waiter",
+            "never.arrives",
+            std::time::Duration::from_millis(50),
+        ).await;
+
+        assert!(result.is_none(), "Should have timed out");
+    }
+
+    #[tokio::test]
+    async fn test_unsubscribe() {
+        let bus = WorkflowEventBus::new();
+
+        bus.subscribe(EventSubscription {
+            id: "unsub-test".to_string(),
+            event_pattern: "test.*".to_string(),
+            condition: None,
+            target_workflow_id: None,
+            once: false,
+        }).await;
+
+        // Should match before unsubscribe
+        let r1 = bus.emit(WorkflowEvent {
+            name: "test.event".to_string(),
+            data: serde_json::json!({}),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            idempotency_key: None,
+            source: EventSource::default(),
+        }).await;
+        assert_eq!(r1.matched_subscriptions.len(), 1);
+
+        // Unsubscribe
+        assert!(bus.unsubscribe("unsub-test").await);
+        assert!(!bus.unsubscribe("unsub-test").await); // Already removed
+
+        // Should NOT match after unsubscribe
+        let r2 = bus.emit(WorkflowEvent {
+            name: "test.event".to_string(),
+            data: serde_json::json!({}),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            idempotency_key: None,
+            source: EventSource::default(),
+        }).await;
+        assert_eq!(r2.matched_subscriptions.len(), 0);
     }
 
     #[tokio::test]

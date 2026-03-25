@@ -162,6 +162,7 @@ pub fn launch_generated_workflow(
         iteration_diffs: Vec::new(),
         active_canary: None,
         is_canary_run: false,
+        phase_timeout_ms: None,
     };
 
     // 6. Spawn the workflow

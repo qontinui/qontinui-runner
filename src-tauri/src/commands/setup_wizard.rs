@@ -828,9 +828,16 @@ pub async fn suggest_dev_services_for_setup(
 
     // Include process configs already selected in earlier wizard steps so we
     // don't suggest dev services that duplicate them (same health_port).
+    // We force auto_start + enabled so port_has_auto_start() treats them as
+    // active — the originals default to auto_start=false but the user has
+    // explicitly selected them, so they'll be started.
     if let Some(selected) = already_selected {
         for val in selected {
-            if let Ok(cfg) = serde_json::from_value::<crate::process_capture::ProcessConfig>(val) {
+            if let Ok(mut cfg) =
+                serde_json::from_value::<crate::process_capture::ProcessConfig>(val)
+            {
+                cfg.auto_start = true;
+                cfg.enabled = true;
                 existing.push(cfg);
             }
         }

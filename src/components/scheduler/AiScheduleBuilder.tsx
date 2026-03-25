@@ -111,23 +111,24 @@ export function AiScheduleBuilder({
   useEffect(() => {
     const controller = new AbortController();
     let cancelled = false;
-    const fetch = async () => {
+    const loadWorkflows = async () => {
       setLoadingWorkflows(true);
       try {
         const resp = await tracedFetch(`${getApiBase()}/unified-workflows`, {
           signal: controller.signal,
         });
+        if (!resp.ok) return;
         const result = await resp.json();
         if (!cancelled && result.success && result.data) {
           setWorkflows(result.data);
         }
       } catch {
-        /* ignore */
+        /* ignore — aborted or network error */
       } finally {
         if (!cancelled) setLoadingWorkflows(false);
       }
     };
-    fetch();
+    loadWorkflows();
     return () => {
       cancelled = true;
       controller.abort();
@@ -264,6 +265,11 @@ Only output the JSON array, nothing else.`;
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: aiPrompt, timeout_seconds: 30 }),
       });
+
+      if (!resp.ok) {
+        throw new Error(`AI service returned ${resp.status}`);
+      }
+
       const result = await resp.json();
 
       if (!result.success || !result.response) {

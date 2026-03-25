@@ -257,6 +257,8 @@ The Verification/Agentic loop continues until all blocking checks pass or max_it
   "max_iterations": number (default: 10),
   "category": "string (e.g., 'testing', 'development', 'deployment')",
   "tags": ["string"],
+  "flow_control_json": "optional JSON — per-workflow flow control (concurrency, throttle, debounce, rate_limit)",
+  "phase_timeouts_json": "optional JSON — per-phase timeout overrides in ms (setup_ms, execution_ms, verification_ms, completion_ms, summary_ms)",
   "created_at": "ISO 8601 timestamp",
   "modified_at": "ISO 8601 timestamp"
 }}

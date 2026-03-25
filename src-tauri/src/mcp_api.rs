@@ -491,6 +491,9 @@ pub fn create_router(
         .merge(crate::mcp::verification_tests::routes())
         .merge(crate::mcp::websocket::routes())
         .merge(crate::mcp::worktrees::routes())
+        .merge(crate::mcp::token_analytics::routes())
+        .merge(crate::mcp::otel_status::routes())
+        .merge(crate::mcp::container_status::routes())
         .route("/cloud-relay/start", post(cloud_relay_start))
         .route("/cloud-relay/status", get(cloud_relay_status))
         .layer(axum::middleware::from_fn(

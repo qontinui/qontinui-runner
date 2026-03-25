@@ -224,7 +224,7 @@ impl FlowControlEnforcer {
             let key = self.make_key(workflow_id, debounce.key.as_deref());
             let timers = self.debounce_timers.lock().await;
             if let Some(&last_trigger) = timers.get(&key) {
-                if now_ms - last_trigger < debounce.window_ms {
+                if now_ms.saturating_sub(last_trigger) < debounce.window_ms {
                     return FlowControlDecision::Skip {
                         reason: format!(
                             "Debounced (within {}ms window) for key '{}'",
@@ -233,6 +233,13 @@ impl FlowControlEnforcer {
                     };
                 }
             }
+        }
+
+        // Record debounce trigger for next check
+        if let Some(ref debounce) = flow_control.debounce {
+            let key = self.make_key(workflow_id, debounce.key.as_deref());
+            let mut timers = self.debounce_timers.lock().await;
+            timers.insert(key, now_ms);
         }
 
         FlowControlDecision::Allow

@@ -72,6 +72,9 @@ import { SpecsPage } from "@/pages/specs/SpecsPage";
 import { UIBridgeIntegrationPage } from "@/pages/ui-bridge-integration/UIBridgeIntegrationPage";
 import { UIBridgeStateMachinePage } from "@/pages/state-machine";
 import { ImageQualityTestsPage } from "@/pages/ImageQualityTestsPage";
+import { lazy } from "react";
+
+const LlmObservabilityDashboard = lazy(() => import("../llm-observability/LlmObservabilityDashboard"));
 
 interface ActionLogViewData {
   actions: ActionLogEntry[];
@@ -693,6 +696,13 @@ export function TabContent({
         </div>
       );
     }
+
+    case "llm-analytics":
+      return (
+        <div className="h-full overflow-hidden">
+          <LlmObservabilityDashboard />
+        </div>
+      );
 
     case "terminal":
       return null;

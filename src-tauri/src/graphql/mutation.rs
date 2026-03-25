@@ -1,16 +1,18 @@
 //! GraphQL mutation resolvers for qontinui-runner.
 //!
-//! Mutations for UI Bridge actions, navigation, form filling, circuit breaker control.
-//! All mutations delegate to existing `ui_bridge_request_sync()` preserving
+//! Mutations for UI Bridge actions, navigation, form filling, circuit breaker control,
+//! task run lifecycle, finding management, and workflow execution.
+//! All mutations delegate to existing service functions preserving
 //! circuit breaker, semaphore, and error classification.
 
 use async_graphql::*;
 use std::sync::Arc;
+use tracing::info;
 
 use crate::mcp::types::ApiState;
 use crate::mcp::ui_bridge;
 
-use super::types::ActionResult;
+use super::types::{ActionResult, GqlFinding, GqlFindingStatus, GqlTaskRun};
 
 pub struct MutationRoot;
 
@@ -196,6 +198,267 @@ impl MutationRoot {
     async fn ping(&self) -> Result<String> {
         Ok("pong".to_string())
     }
+
+    // ======================================================================
+    // Task Run Lifecycle
+    // ======================================================================
+
+    /// Create a new task run.
+    async fn create_task_run(
+        &self,
+        ctx: &Context<'_>,
+        input: super::types::CreateTaskRunInput,
+    ) -> Result<GqlTaskRun> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+        let id = uuid::Uuid::new_v4().to_string();
+
+        let mut db_input =
+            crate::database::CreateTaskRunInput::new(&id, &input.task_name)
+                .with_task_type(&input.task_type);
+        if let Some(ref p) = input.prompt {
+            db_input = db_input.with_prompt(p);
+        }
+        if let Some(ref cid) = input.config_id {
+            db_input = db_input.with_config_id(cid);
+        }
+        if let Some(ref wn) = input.workflow_name {
+            db_input = db_input.with_workflow_name(wn);
+        }
+        if let Some(ref wid) = input.workflow_id {
+            db_input = db_input.with_workflow_id(wid);
+        }
+        if let Some(ms) = input.max_sessions {
+            db_input = db_input.with_max_sessions(ms as u32);
+        }
+        db_input = db_input.with_auto_continue(input.auto_continue);
+
+        let port = state
+            .app_state
+            .api_port
+            .load(std::sync::atomic::Ordering::Relaxed);
+        db_input.runner_port = Some(port);
+
+        let run = state
+            .app_state
+            .checkpoint_db
+            .create_task_run(&db_input)
+            .map_err(|e| Error::new(e))?;
+
+        Ok(GqlTaskRun::from_db(run))
+    }
+
+    /// Stop a running task run (kills AI processes and marks as stopped).
+    async fn stop_task_run(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+    ) -> Result<bool> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+
+        let task_run = state
+            .app_state
+            .checkpoint_db
+            .get_task_run(&id)
+            .map_err(|e| Error::new(e))?
+            .ok_or_else(|| Error::new(format!("Task run not found: {}", id)))?;
+
+        if task_run.status != "running" {
+            return Err(Error::new(format!(
+                "Task is not running (status: {})",
+                task_run.status
+            )));
+        }
+
+        // Kill tracked AI processes
+        let pids_to_kill: Vec<u32> = {
+            let mut pids = crate::safe_lock::safe_lock_or_recover(
+                &state.current_ai_pids,
+                "current_ai_pids",
+            );
+            let copy = pids.clone();
+            pids.clear();
+            copy
+        };
+        for pid in &pids_to_kill {
+            info!("GraphQL: Killing AI process PID {} for task {}", pid, id);
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .output();
+        }
+
+        state
+            .app_state
+            .checkpoint_db
+            .stop_task_run(&id)
+            .map_err(|e| Error::new(e))?;
+
+        // Release URL locks
+        state.app_state.url_lock_manager.release_all(&id).await;
+
+        // Broadcast update
+        let broadcaster =
+            crate::event_system::EventBroadcaster::new(state.app_handle.clone());
+        broadcaster.task_run_update(&id, "stopped", None, None);
+
+        Ok(true)
+    }
+
+    /// Pause a running task run.
+    async fn pause_task_run(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+    ) -> Result<bool> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+        state
+            .app_state
+            .checkpoint_db
+            .pause_task_run(&id)
+            .map_err(|e| Error::new(e))
+    }
+
+    /// Unpause a paused task run.
+    async fn unpause_task_run(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+    ) -> Result<bool> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+        state
+            .app_state
+            .checkpoint_db
+            .unpause_task_run(&id)
+            .map_err(|e| Error::new(e))
+    }
+
+    /// Delete a task run by ID.
+    async fn delete_task_run(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+    ) -> Result<bool> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+        let db = state.app_state.checkpoint_db.clone();
+        tokio::task::spawn_blocking(move || db.delete_task_run(&id))
+            .await
+            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+            .map_err(|e| Error::new(e))
+    }
+
+    // ======================================================================
+    // Finding Management
+    // ======================================================================
+
+    /// Update a finding's status (e.g., resolve, defer, mark won't-fix).
+    async fn update_finding_status(
+        &self,
+        ctx: &Context<'_>,
+        input: super::types::UpdateFindingStatusInput,
+    ) -> Result<bool> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+        let db = state.app_state.checkpoint_db.clone();
+
+        let domain_status = gql_status_to_domain(input.status);
+        let resolution = input.resolution;
+        let finding_id = input.finding_id;
+
+        tokio::task::spawn_blocking(move || {
+            db.update_finding_status(&finding_id, &domain_status, resolution.as_deref(), None)
+        })
+        .await
+        .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+        .map_err(|e| Error::new(e))?;
+
+        Ok(true)
+    }
+
+    /// Set a user response on a finding that needs input.
+    async fn respond_to_finding(
+        &self,
+        ctx: &Context<'_>,
+        finding_id: String,
+        response: String,
+    ) -> Result<bool> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+        let db = state.app_state.checkpoint_db.clone();
+
+        tokio::task::spawn_blocking(move || {
+            db.set_finding_user_response(&finding_id, &response)
+        })
+        .await
+        .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+        .map_err(|e| Error::new(e))?;
+
+        Ok(true)
+    }
+
+    // ======================================================================
+    // Workflow Execution
+    // ======================================================================
+
+    /// Run a unified workflow by ID. Returns the created task run.
+    async fn run_workflow(
+        &self,
+        ctx: &Context<'_>,
+        workflow_id: String,
+        prompt: Option<String>,
+    ) -> Result<GqlTaskRun> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+        let db = state.app_state.checkpoint_db.clone();
+        let wf_id = workflow_id.clone();
+
+        // Fetch workflow to get its name
+        let workflow = tokio::task::spawn_blocking(move || db.get_unified_workflow(&wf_id))
+            .await
+            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+            .map_err(|e| Error::new(e))?
+            .ok_or_else(|| Error::new(format!("Workflow not found: {}", workflow_id)))?;
+
+        // Create a task run for the workflow
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let port = state
+            .app_state
+            .api_port
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let mut input = crate::database::CreateTaskRunInput::new(&task_id, &workflow.name)
+            .with_task_type("task")
+            .with_workflow_name(&workflow.name)
+            .with_workflow_id(&workflow_id)
+            .with_workflow_type("unified")
+            .with_max_sessions(workflow.max_iterations);
+        input.runner_port = Some(port);
+        if let Some(ref p) = prompt {
+            input = input.with_prompt(p);
+        }
+
+        let run = state
+            .app_state
+            .checkpoint_db
+            .create_task_run(&input)
+            .map_err(|e| Error::new(e))?;
+
+        // Broadcast the new task run event
+        let broadcaster =
+            crate::event_system::EventBroadcaster::new(state.app_handle.clone());
+        broadcaster.task_run_update(&task_id, "running", None, None);
+
+        Ok(GqlTaskRun::from_db(run))
+    }
+
+    /// Delete a unified workflow by ID.
+    async fn delete_workflow(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+    ) -> Result<bool> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+        let db = state.app_state.checkpoint_db.clone();
+        tokio::task::spawn_blocking(move || db.delete_unified_workflow(&id))
+            .await
+            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+            .map_err(|e| Error::new(e))
+    }
 }
 
 // ==========================================================================
@@ -230,6 +493,21 @@ async fn bridge_mutation(
                 duration_ms: start.elapsed().as_millis().to_string(),
             })
         }
+    }
+}
+
+/// Convert GraphQL finding status enum to domain enum.
+fn gql_status_to_domain(
+    status: GqlFindingStatus,
+) -> crate::findings::types::FindingStatus {
+    use crate::findings::types::FindingStatus;
+    match status {
+        GqlFindingStatus::Detected => FindingStatus::Detected,
+        GqlFindingStatus::InProgress => FindingStatus::InProgress,
+        GqlFindingStatus::NeedsInput => FindingStatus::NeedsInput,
+        GqlFindingStatus::Resolved => FindingStatus::Resolved,
+        GqlFindingStatus::WontFix => FindingStatus::WontFix,
+        GqlFindingStatus::Deferred => FindingStatus::Deferred,
     }
 }
 

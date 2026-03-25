@@ -43,12 +43,14 @@ interface RepositoryWatchWithId extends RepositoryWatch {
 
 interface SchedulerTaskFormProps {
   task?: ScheduledTask;
+  /** Pre-fill form fields from an AI-generated or external request (for new tasks only) */
+  prefill?: CreateScheduledTaskRequest;
   onSubmit: (request: CreateScheduledTaskRequest) => void;
   onCancel: () => void;
   loading: boolean;
 }
 
-type ScheduleType = "once" | "cron" | "interval" | "state";
+type ScheduleType = "once" | "cron" | "interval" | "state" | "condition";
 type TaskType = "workflow" | "prompt" | "autofix";
 
 const CRON_PRESETS = [
@@ -61,20 +63,28 @@ const CRON_PRESETS = [
   { label: "First of month at midnight", value: "0 0 1 * *" },
 ];
 
-export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: SchedulerTaskFormProps) {
+export function SchedulerTaskForm({ task, prefill, onSubmit, onCancel, loading }: SchedulerTaskFormProps) {
   const isEditing = !!task;
+  const src = task ?? prefill;
 
   // Form state
-  const [name, setName] = useState(task?.name || "");
-  const [description, setDescription] = useState(task?.description || "");
-  const [skipIfCompleted, setSkipIfCompleted] = useState(task?.skip_if_completed || false);
-  const [autoFixOnFailure, setAutoFixOnFailure] = useState(task?.auto_fix_on_failure || false);
-  const [successCriteria, setSuccessCriteria] = useState(task?.success_criteria || "");
+  const [name, setName] = useState(src?.name || "");
+  const [description, setDescription] = useState(src?.description || "");
+  const [skipIfCompleted, setSkipIfCompleted] = useState(
+    (task ? task.skip_if_completed : prefill?.skip_if_completed) || false,
+  );
+  const [autoFixOnFailure, setAutoFixOnFailure] = useState(
+    (task ? task.auto_fix_on_failure : prefill?.auto_fix_on_failure) || false,
+  );
+  const [successCriteria, setSuccessCriteria] = useState(
+    (task ? task.success_criteria : prefill?.success_criteria) || "",
+  );
 
   // Schedule state
+  const initSchedule = task?.schedule ?? prefill?.schedule;
   const [scheduleType, setScheduleType] = useState<ScheduleType>(() => {
-    if (!task) return "cron";
-    switch (task.schedule.type) {
+    if (!initSchedule) return "cron";
+    switch (initSchedule.type) {
       case "Once":
         return "once";
       case "Cron":
@@ -83,40 +93,44 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
         return "interval";
       case "State":
         return "state";
+      case "Condition":
+        return "condition";
       default:
         return "cron";
     }
   });
   const [onceDateTime, setOnceDateTime] = useState(() => {
-    if (task?.schedule.type === "Once") {
-      // Convert to local datetime-local format
-      const date = new Date(task.schedule.value);
+    if (initSchedule?.type === "Once") {
+      const date = new Date(initSchedule.value);
       return date.toISOString().slice(0, 16);
     }
-    // Default to 1 hour from now
     const date = new Date(Date.now() + 60 * 60 * 1000);
     return date.toISOString().slice(0, 16);
   });
   const [cronExpression, setCronExpression] = useState(
-    task?.schedule.type === "Cron" ? task.schedule.value : "0 9 * * *",
+    initSchedule?.type === "Cron" ? initSchedule.value : "0 9 * * *",
   );
   const [intervalSeconds, setIntervalSeconds] = useState(
-    task?.schedule.type === "Interval" ? task.schedule.value : 3600,
+    initSchedule?.type === "Interval" ? initSchedule.value : 3600,
   );
   const [stateId, setStateId] = useState(
-    task?.schedule.type === "State" ? task.schedule.state_id : "",
+    initSchedule?.type === "State" ? initSchedule.state_id : "",
   );
   const [checkDelay, setCheckDelay] = useState(
-    task?.schedule.type === "State" ? (task.schedule.check_delay_seconds ?? 0) : 0,
+    initSchedule?.type === "State" ? (initSchedule.check_delay_seconds ?? 0) : 0,
   );
   const [rebuildDelay, setRebuildDelay] = useState(
-    task?.schedule.type === "State" ? (task.schedule.rebuild_delay_seconds ?? 300) : 300,
+    initSchedule?.type === "State" ? (initSchedule.rebuild_delay_seconds ?? 300) : 300,
+  );
+  const [rearmDelay, setRearmDelay] = useState(
+    initSchedule?.type === "Condition" ? (initSchedule.value?.rearm_delay_minutes ?? 60) : 60,
   );
 
   // Task type state
+  const initTask = task?.task ?? prefill?.task;
   const [taskType, setTaskType] = useState<TaskType>(() => {
-    if (!task) return "workflow";
-    switch (task.task.task_type) {
+    if (!initTask) return "workflow";
+    switch (initTask.task_type) {
       case "Workflow":
         return "workflow";
       case "Prompt":
@@ -126,48 +140,58 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
     }
   });
   const [workflowId, setWorkflowId] = useState(
-    task?.task.task_type === "Workflow" ? task.task.workflow_id || "" : "",
+    initTask?.task_type === "Workflow" ? initTask.workflow_id || "" : "",
   );
   const [workflowName, setWorkflowName] = useState(
-    task?.task.task_type === "Workflow" ? task.task.workflow_name : "",
+    initTask?.task_type === "Workflow" ? initTask.workflow_name : "",
   );
   const [taskConfigPath, _setTaskConfigPath] = useState(
-    task?.task.task_type === "Workflow" ? task.task.config_path || "" : "",
+    initTask?.task_type === "Workflow" ? initTask.config_path || "" : "",
   );
   const [monitorIndex, setMonitorIndex] = useState<string>(
-    task?.task.task_type === "Workflow" && task.task.monitor_index !== undefined
-      ? String(task.task.monitor_index)
+    initTask?.task_type === "Workflow" && initTask.monitor_index !== undefined
+      ? String(initTask.monitor_index)
       : "",
   );
   const [promptId, setPromptId] = useState(
-    task?.task.task_type === "Prompt" ? task.task.prompt_id : "",
+    initTask?.task_type === "Prompt" ? initTask.prompt_id : "",
   );
   const [maxSessions, setMaxSessions] = useState<string>(
-    task?.task.task_type === "Prompt" && task.task.max_sessions !== undefined
-      ? String(task.task.max_sessions)
+    initTask?.task_type === "Prompt" && initTask.max_sessions !== undefined
+      ? String(initTask.max_sessions)
       : "",
   );
   const [checkFindings, setCheckFindings] = useState(
-    task?.task.task_type === "AutoFix" ? task.task.check_findings : true,
+    initTask?.task_type === "AutoFix" ? initTask.check_findings : true,
   );
   const [forceRun, setForceRun] = useState(
-    task?.task.task_type === "AutoFix" ? task.task.force_run : false,
+    initTask?.task_type === "AutoFix" ? initTask.force_run : false,
   );
 
   // Conditions state
-  const [requireIdle, setRequireIdle] = useState(task?.conditions?.require_idle?.enabled ?? false);
+  const initConditions = task?.conditions ?? prefill?.conditions;
+  const [requireIdle, setRequireIdle] = useState(initConditions?.require_idle?.enabled ?? false);
   const [requireRepoInactive, setRequireRepoInactive] = useState(
-    task?.conditions?.require_repo_inactive?.enabled ?? false,
+    initConditions?.require_repo_inactive?.enabled ?? false,
   );
   const [repositories, setRepositories] = useState<RepositoryWatchWithId[]>(
-    (task?.conditions?.require_repo_inactive?.repositories ?? []).map((r) => ({
+    (initConditions?.require_repo_inactive?.repositories ?? []).map((r) => ({
       ...r,
       _formId: crypto.randomUUID(),
     })),
   );
   const [timeoutMinutes, setTimeoutMinutes] = useState<number | undefined>(
-    task?.conditions?.timeout_minutes,
+    initConditions?.timeout_minutes,
   );
+
+  // Auto-enable conditions when Condition schedule type is selected
+  useEffect(() => {
+    if (scheduleType === "condition") {
+      if (!requireIdle && !requireRepoInactive) {
+        setRequireIdle(true);
+      }
+    }
+  }, [scheduleType]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Unified workflows from API
   const [unifiedWorkflows, setUnifiedWorkflows] = useState<UnifiedWorkflow[]>([]);
@@ -280,6 +304,11 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
           state_id: stateId,
           check_delay_seconds: checkDelay || undefined,
           rebuild_delay_seconds: rebuildDelay || undefined,
+        };
+      case "condition":
+        return {
+          type: "Condition",
+          value: { rearm_delay_minutes: rearmDelay || undefined },
         };
     }
   };
@@ -395,6 +424,7 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
 
     // Schedule-type validation
     if (scheduleType === "state" && !stateId.trim()) return false;
+    if (scheduleType === "condition" && !requireIdle && !requireRepoInactive) return false;
 
     switch (taskType) {
       case "workflow":
@@ -493,6 +523,16 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
               State Trigger
             </span>
           </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              name="scheduleType"
+              checked={scheduleType === "condition"}
+              onChange={() => setScheduleType("condition")}
+              className="text-primary"
+            />
+            <span className="text-sm">Condition</span>
+          </label>
         </div>
 
         {scheduleType === "cron" && (
@@ -541,6 +581,28 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
               className="w-32 px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50"
             />
             <span className="text-sm text-muted-foreground">seconds</span>
+          </div>
+        )}
+
+        {scheduleType === "condition" && (
+          <div className="space-y-4">
+            <p className="text-xs text-muted-foreground">
+              Runs when the conditions below are met. No time schedule required.
+            </p>
+            <div className="space-y-2">
+              <label className="block text-sm font-medium mb-1">Rearm Delay (minutes)</label>
+              <input
+                type="number"
+                value={rearmDelay}
+                onChange={(e) => setRearmDelay(Number(e.target.value) || 60)}
+                placeholder="60"
+                min={1}
+                className="w-32 px-3 py-2 bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary/50"
+              />
+              <p className="text-xs text-muted-foreground">
+                After executing, wait this long before re-evaluating conditions
+              </p>
+            </div>
           </div>
         )}
 
@@ -853,9 +915,13 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
       {/* Execution Conditions */}
       <div className="space-y-4">
         <div>
-          <h4 className="text-sm font-medium">Execution Conditions</h4>
+          <h4 className="text-sm font-medium">
+            Execution Conditions{scheduleType === "condition" ? " *" : ""}
+          </h4>
           <p className="text-xs text-muted-foreground mt-1">
-            Optional conditions that must be met before the task executes
+            {scheduleType === "condition"
+              ? "At least one condition is required for condition-based scheduling"
+              : "Optional conditions that must be met before the task executes"}
           </p>
         </div>
 

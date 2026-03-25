@@ -1331,6 +1331,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             spec_experimentation::commands::get_spec_version_history,
             spec_experimentation::commands::diff_spec_versions,
             spec_experimentation::commands::diff_spec_json,
+            // Token analytics commands (LLM cost and usage tracking)
+            commands::token_analytics::get_token_usage_summary,
+            commands::token_analytics::get_daily_cost,
+            commands::token_analytics::get_cost_by_model,
+            commands::token_analytics::get_cost_by_phase,
+            commands::token_analytics::get_provider_latency,
+            commands::token_analytics::get_task_run_costs,
+            // Container settings commands (Docker isolation)
+            commands::container_settings::get_container_settings,
+            commands::container_settings::update_container_settings,
+            commands::container_settings::check_docker_status,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

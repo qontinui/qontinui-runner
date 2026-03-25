@@ -3484,19 +3484,21 @@ INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (144, datetime
 CREATE TABLE IF NOT EXISTS queued_workflows (
     id TEXT PRIMARY KEY,
     workflow_id TEXT NOT NULL,
-    priority INTEGER DEFAULT 0,
+    workflow_name TEXT NOT NULL,
+    queued_at TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
-    payload_json TEXT,
-    enqueued_at TEXT NOT NULL,
     started_at TEXT,
     completed_at TEXT,
-    error TEXT,
-    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    error_message TEXT,
+    task_run_id TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 3
 );
 
 CREATE INDEX IF NOT EXISTS idx_queued_workflows_status ON queued_workflows(status);
-CREATE INDEX IF NOT EXISTS idx_queued_workflows_workflow ON queued_workflows(workflow_id);
-CREATE INDEX IF NOT EXISTS idx_queued_workflows_priority ON queued_workflows(priority DESC, enqueued_at ASC);
+CREATE INDEX IF NOT EXISTS idx_queued_workflows_priority ON queued_workflows(priority DESC, queued_at ASC);
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (145, datetime('now'));
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (146, datetime('now'));
@@ -3619,4 +3621,62 @@ CREATE INDEX IF NOT EXISTS idx_crp_workflow ON cross_run_patterns(workflow_name)
 CREATE INDEX IF NOT EXISTS idx_crp_status ON cross_run_patterns(status);
 CREATE INDEX IF NOT EXISTS idx_crp_signature ON cross_run_patterns(signature_hash);
 
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (153, datetime('now'));
+CREATE INDEX IF NOT EXISTS idx_phase_token_usage_created_at ON phase_token_usage(created_at);
+CREATE INDEX IF NOT EXISTS idx_phase_token_usage_model ON phase_token_usage(model_used);
+CREATE INDEX IF NOT EXISTS idx_phase_token_usage_provider ON phase_token_usage(provider_used);
+
+CREATE TABLE IF NOT EXISTS stall_events (
+    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    task_run_id TEXT NOT NULL,
+    iteration INTEGER NOT NULL,
+    pattern_type TEXT NOT NULL,
+    pattern_details TEXT,
+    action_count INTEGER,
+    intervention_action TEXT,
+    intervention_result TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS context_summaries (
+    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    task_run_id TEXT NOT NULL,
+    iterations_summarized TEXT NOT NULL,
+    summary_text TEXT NOT NULL,
+    key_findings TEXT,
+    successful_fixes TEXT,
+    root_causes TEXT,
+    original_token_count INTEGER,
+    summary_token_count INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS decomposition_plans (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    original_goal TEXT NOT NULL,
+    goal_summary TEXT,
+    subtask_count INTEGER NOT NULL,
+    plan_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS decomposition_subtasks (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    subtask_index INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    depends_on TEXT,
+    workflow_id TEXT,
+    task_run_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    output_summary TEXT,
+    error TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    FOREIGN KEY (plan_id) REFERENCES decomposition_plans(id) ON DELETE CASCADE
+);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (157, datetime('now'));

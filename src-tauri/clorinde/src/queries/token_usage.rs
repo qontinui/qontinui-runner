@@ -9,14 +9,14 @@ pub struct CreatePhaseTokenUsageParams<
 > {
     pub task_run_id: T1,
     pub phase: T2,
-    pub stage_index: i32,
-    pub iteration: i32,
-    pub model_used: T3,
-    pub provider_used: T4,
+    pub stage_index: Option<i32>,
+    pub iteration: Option<i32>,
+    pub model_used: Option<T3>,
+    pub provider_used: Option<T4>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cost_cents: i64,
-    pub duration_ms: i64,
+    pub duration_ms: Option<i64>,
 }
 #[derive(Debug)]
 pub struct GetIterationTokenTotalsParams<T1: crate::StringSql> {
@@ -79,8 +79,8 @@ impl<'a> From<PhaseTokenUsageRowBorrowed<'a>> for PhaseTokenUsageRow {
 }
 #[derive(Debug, Clone, PartialEq, Copy, serde::Serialize, serde::Deserialize)]
 pub struct GetIterationTokenTotals {
-    pub total_input: rust_decimal::Decimal,
-    pub total_output: rust_decimal::Decimal,
+    pub total_input: i64,
+    pub total_output: i64,
 }
 use crate::client::async_::GenericClient;
 use futures::{self, StreamExt, TryStreamExt};
@@ -248,14 +248,14 @@ impl CreatePhaseTokenUsageStmt {
         client: &'c C,
         task_run_id: &'a T1,
         phase: &'a T2,
-        stage_index: &'a i32,
-        iteration: &'a i32,
-        model_used: &'a T3,
-        provider_used: &'a T4,
+        stage_index: &'a Option<i32>,
+        iteration: &'a Option<i32>,
+        model_used: &'a Option<T3>,
+        provider_used: &'a Option<T4>,
         input_tokens: &'a i64,
         output_tokens: &'a i64,
         cost_cents: &'a i64,
-        duration_ms: &'a i64,
+        duration_ms: &'a Option<i64>,
     ) -> Result<u64, tokio_postgres::Error> {
         client
             .execute(
@@ -365,7 +365,7 @@ impl GetPhaseTokenUsageStmt {
 pub struct GetIterationTokenTotalsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_iteration_token_totals() -> GetIterationTokenTotalsStmt {
     GetIterationTokenTotalsStmt(
-        "SELECT COALESCE(SUM(input_tokens), 0) as total_input, COALESCE(SUM(output_tokens), 0) as total_output FROM phase_token_usage WHERE task_run_id = $1 AND iteration = $2",
+        "SELECT COALESCE(SUM(input_tokens), 0)::bigint as total_input, COALESCE(SUM(output_tokens), 0)::bigint as total_output FROM phase_token_usage WHERE task_run_id = $1 AND iteration = $2",
         None,
     )
 }
@@ -421,7 +421,7 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>
 pub struct UpdateTaskRunTokenTotalsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn update_task_run_token_totals() -> UpdateTaskRunTokenTotalsStmt {
     UpdateTaskRunTokenTotalsStmt(
-        "UPDATE task_runs SET total_input_tokens = COALESCE((SELECT SUM(input_tokens) FROM phase_token_usage WHERE task_run_id = $1), 0), total_output_tokens = COALESCE((SELECT SUM(output_tokens) FROM phase_token_usage WHERE task_run_id = $1), 0), total_cost_cents = COALESCE((SELECT SUM(cost_cents) FROM phase_token_usage WHERE task_run_id = $1), 0) WHERE id = $1",
+        "UPDATE task_runs SET total_input_tokens = COALESCE((SELECT SUM(input_tokens) FROM phase_token_usage WHERE task_run_id = $1), 0)::bigint, total_output_tokens = COALESCE((SELECT SUM(output_tokens) FROM phase_token_usage WHERE task_run_id = $1), 0)::bigint, total_cost_cents = COALESCE((SELECT SUM(cost_cents) FROM phase_token_usage WHERE task_run_id = $1), 0)::bigint WHERE id = $1",
         None,
     )
 }

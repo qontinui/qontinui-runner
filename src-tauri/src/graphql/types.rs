@@ -330,3 +330,373 @@ pub struct TabConnectionEvent {
     /// Event timestamp (epoch ms).
     pub timestamp: String,
 }
+
+// ==========================================================================
+// Task Run Types
+// ==========================================================================
+
+/// A task run — the single concept for all runs (AI, automation, or mixed).
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlTaskRun {
+    pub id: String,
+    pub task_name: String,
+    pub prompt: Option<String>,
+    pub task_type: String,
+    pub status: String,
+    pub sessions_count: i32,
+    pub max_sessions: Option<i32>,
+    pub auto_continue: bool,
+    pub error_message: Option<String>,
+    pub config_id: Option<String>,
+    pub workflow_name: Option<String>,
+    pub workflow_id: Option<String>,
+    pub summary: Option<String>,
+    pub goal_achieved: Option<bool>,
+    pub remaining_work: Option<String>,
+    pub workflow_type: Option<String>,
+    pub workspace_id: Option<String>,
+    pub triggered_by: Option<String>,
+    pub parent_task_run_id: Option<String>,
+    pub root_task_run_id: Option<String>,
+    pub depth: i32,
+    pub bridge_id: Option<String>,
+    pub result_data: Option<Json<serde_json::Value>>,
+    pub is_reflection: bool,
+    pub reflection_source_task_run_id: Option<String>,
+    pub is_follow_up: bool,
+    pub follow_up_source_task_run_id: Option<String>,
+    pub is_fixer: bool,
+    pub fixer_source_task_run_id: Option<String>,
+    pub is_meta_optimizer: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+impl GqlTaskRun {
+    /// Convert from the database TaskRun struct.
+    pub fn from_db(tr: crate::database::TaskRun) -> Self {
+        let result_data = tr.result_data.as_ref().and_then(|s| {
+            serde_json::from_str::<serde_json::Value>(s).ok().map(Json)
+        });
+        Self {
+            id: tr.id,
+            task_name: tr.task_name,
+            prompt: tr.prompt,
+            task_type: tr.task_type,
+            status: tr.status,
+            sessions_count: tr.sessions_count as i32,
+            max_sessions: tr.max_sessions.map(|v| v as i32),
+            auto_continue: tr.auto_continue,
+            error_message: tr.error_message,
+            config_id: tr.config_id,
+            workflow_name: tr.workflow_name,
+            workflow_id: tr.workflow_id,
+            summary: tr.summary,
+            goal_achieved: tr.goal_achieved,
+            remaining_work: tr.remaining_work,
+            workflow_type: tr.workflow_type,
+            workspace_id: tr.workspace_id,
+            triggered_by: tr.triggered_by,
+            parent_task_run_id: tr.parent_task_run_id,
+            root_task_run_id: tr.root_task_run_id,
+            depth: tr.depth as i32,
+            bridge_id: tr.bridge_id,
+            result_data,
+            is_reflection: tr.is_reflection,
+            reflection_source_task_run_id: tr.reflection_source_task_run_id,
+            is_follow_up: tr.is_follow_up,
+            follow_up_source_task_run_id: tr.follow_up_source_task_run_id,
+            is_fixer: tr.is_fixer,
+            fixer_source_task_run_id: tr.fixer_source_task_run_id,
+            is_meta_optimizer: tr.is_meta_optimizer,
+            created_at: tr.created_at,
+            updated_at: tr.updated_at,
+            completed_at: tr.completed_at,
+        }
+    }
+}
+
+// ==========================================================================
+// Workflow Types
+// ==========================================================================
+
+/// Summary of a unified workflow (lightweight, no step details).
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlWorkflowSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub max_iterations: i32,
+    pub timeout_seconds: Option<i64>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub is_favorite: bool,
+    pub multi_agent_mode: bool,
+    pub workflow_architecture: Option<String>,
+    pub stage_count: i32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Full unified workflow definition including step details as JSON.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlWorkflow {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub setup_steps: Json<serde_json::Value>,
+    pub verification_steps: Json<serde_json::Value>,
+    pub agentic_steps: Json<serde_json::Value>,
+    pub completion_steps: Json<serde_json::Value>,
+    pub max_iterations: i32,
+    pub timeout_seconds: Option<i64>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub is_favorite: bool,
+    pub multi_agent_mode: bool,
+    pub reflection_mode: bool,
+    pub approval_gate: bool,
+    pub stop_on_failure: bool,
+    pub use_worktree: bool,
+    pub strict_cwd: bool,
+    pub enforce_token_budget: bool,
+    pub workflow_architecture: Option<String>,
+    pub stages: Json<serde_json::Value>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+// ==========================================================================
+// Finding Types
+// ==========================================================================
+
+/// Finding category enum for GraphQL.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GqlFindingCategory {
+    CodeBug,
+    Security,
+    Performance,
+    Todo,
+    Enhancement,
+    ConfigIssue,
+    TestIssue,
+    Documentation,
+    RuntimeIssue,
+    AlreadyFixed,
+    ExpectedBehavior,
+    Warning,
+    DataMigration,
+}
+
+/// Finding severity enum for GraphQL.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GqlFindingSeverity {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Info,
+}
+
+/// Finding lifecycle status.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GqlFindingStatus {
+    Detected,
+    InProgress,
+    NeedsInput,
+    Resolved,
+    WontFix,
+    Deferred,
+}
+
+/// Finding action type.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GqlFindingActionType {
+    AutoFix,
+    NeedsUserInput,
+    Informational,
+}
+
+/// Code context for a finding.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlFindingCodeContext {
+    pub file: Option<String>,
+    pub line: Option<i32>,
+    pub column: Option<i32>,
+    pub snippet: Option<String>,
+}
+
+/// A finding detected by AI analysis.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlFinding {
+    pub id: String,
+    pub task_run_id: String,
+    pub session_num: i32,
+    pub category: GqlFindingCategory,
+    pub severity: GqlFindingSeverity,
+    pub status: GqlFindingStatus,
+    pub action_type: GqlFindingActionType,
+    pub title: String,
+    pub description: String,
+    pub resolution: Option<String>,
+    pub code_context: Option<GqlFindingCodeContext>,
+    pub signature_hash: String,
+    pub user_response: Option<String>,
+    pub detected_at: String,
+    pub resolved_at: Option<String>,
+    pub resolved_in_session: Option<i32>,
+    pub updated_at: String,
+}
+
+impl GqlFinding {
+    /// Convert from the domain Finding struct.
+    pub fn from_domain(f: crate::findings::types::Finding) -> Self {
+        use crate::findings::types::{
+            FindingActionType as FA, FindingCategory as FC, FindingSeverity as FS,
+            FindingStatus as FSt,
+        };
+        Self {
+            id: f.id,
+            task_run_id: f.task_run_id,
+            session_num: f.session_num as i32,
+            category: match f.category {
+                FC::CodeBug => GqlFindingCategory::CodeBug,
+                FC::Security => GqlFindingCategory::Security,
+                FC::Performance => GqlFindingCategory::Performance,
+                FC::Todo => GqlFindingCategory::Todo,
+                FC::Enhancement => GqlFindingCategory::Enhancement,
+                FC::ConfigIssue => GqlFindingCategory::ConfigIssue,
+                FC::TestIssue => GqlFindingCategory::TestIssue,
+                FC::Documentation => GqlFindingCategory::Documentation,
+                FC::RuntimeIssue => GqlFindingCategory::RuntimeIssue,
+                FC::AlreadyFixed => GqlFindingCategory::AlreadyFixed,
+                FC::ExpectedBehavior => GqlFindingCategory::ExpectedBehavior,
+                FC::Warning => GqlFindingCategory::Warning,
+                FC::DataMigration => GqlFindingCategory::DataMigration,
+            },
+            severity: match f.severity {
+                FS::Critical => GqlFindingSeverity::Critical,
+                FS::High => GqlFindingSeverity::High,
+                FS::Medium => GqlFindingSeverity::Medium,
+                FS::Low => GqlFindingSeverity::Low,
+                FS::Info => GqlFindingSeverity::Info,
+            },
+            status: match f.status {
+                FSt::Detected => GqlFindingStatus::Detected,
+                FSt::InProgress => GqlFindingStatus::InProgress,
+                FSt::NeedsInput => GqlFindingStatus::NeedsInput,
+                FSt::Resolved => GqlFindingStatus::Resolved,
+                FSt::WontFix => GqlFindingStatus::WontFix,
+                FSt::Deferred => GqlFindingStatus::Deferred,
+            },
+            action_type: match f.action_type {
+                FA::AutoFix => GqlFindingActionType::AutoFix,
+                FA::NeedsUserInput => GqlFindingActionType::NeedsUserInput,
+                FA::Informational => GqlFindingActionType::Informational,
+            },
+            title: f.title,
+            description: f.description,
+            resolution: f.resolution,
+            code_context: f.code_context.map(|ctx| GqlFindingCodeContext {
+                file: ctx.file,
+                line: ctx.line.map(|v| v as i32),
+                column: ctx.column.map(|v| v as i32),
+                snippet: ctx.snippet,
+            }),
+            signature_hash: f.signature_hash,
+            user_response: f.user_response,
+            detected_at: f.detected_at,
+            resolved_at: f.resolved_at,
+            resolved_in_session: f.resolved_in_session.map(|v| v as i32),
+            updated_at: f.updated_at,
+        }
+    }
+}
+
+/// Summary statistics for findings in a task run.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlFindingSummary {
+    pub task_run_id: String,
+    pub total: i32,
+    pub by_category: Json<serde_json::Value>,
+    pub by_severity: Json<serde_json::Value>,
+    pub by_status: Json<serde_json::Value>,
+    pub needs_input_count: i32,
+    pub resolved_count: i32,
+    pub outstanding_count: i32,
+}
+
+// ==========================================================================
+// Runner Status Types
+// ==========================================================================
+
+/// Overall runner status.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlRunnerStatus {
+    pub instance_name: Option<String>,
+    pub api_port: i32,
+    pub executor_running: bool,
+    pub executor_state: String,
+    pub config_loaded: bool,
+    pub config_path: Option<String>,
+    pub ai_analysis_running: bool,
+}
+
+/// Orchestration loop status.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlOrchestrationLoopStatus {
+    pub running: bool,
+    pub phase: String,
+    pub current_iteration: i32,
+    pub started_at: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Workflow queue item.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlQueueItem {
+    pub id: String,
+    pub workflow_id: String,
+    pub workflow_name: String,
+    pub status: String,
+    pub queued_at: String,
+}
+
+/// Workflow queue status.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlQueueStatus {
+    pub queue_length: i32,
+    pub items: Vec<GqlQueueItem>,
+}
+
+// ==========================================================================
+// Input Types
+// ==========================================================================
+
+/// Input for creating a new task run.
+#[derive(InputObject, Debug)]
+pub struct CreateTaskRunInput {
+    pub task_name: String,
+    pub prompt: Option<String>,
+    #[graphql(default_with = "\"task\".to_string()")]
+    pub task_type: String,
+    pub config_id: Option<String>,
+    pub workflow_name: Option<String>,
+    pub workflow_id: Option<String>,
+    pub max_sessions: Option<i32>,
+    #[graphql(default = true)]
+    pub auto_continue: bool,
+}
+
+/// Input for updating a finding's status.
+#[derive(InputObject, Debug)]
+pub struct UpdateFindingStatusInput {
+    pub finding_id: String,
+    pub status: GqlFindingStatus,
+    pub resolution: Option<String>,
+}

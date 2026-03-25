@@ -187,10 +187,11 @@ fn parse_single_metric_response(
             }
         }
         Err(e) => {
+            let truncated: String = response.chars().take(200).collect();
             warn!(
                 "Failed to parse LLM judge response: {}. Raw: {}",
                 e,
-                &response[..response.len().min(200)]
+                truncated
             );
             JudgeResult {
                 score: 0.5,

@@ -5609,18 +5609,20 @@ impl CheckpointDb {
                 CREATE TABLE IF NOT EXISTS queued_workflows (
                     id TEXT PRIMARY KEY,
                     workflow_id TEXT NOT NULL,
-                    priority INTEGER DEFAULT 0,
+                    workflow_name TEXT NOT NULL,
+                    queued_at TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'pending',
-                    payload_json TEXT,
-                    enqueued_at TEXT NOT NULL,
                     started_at TEXT,
                     completed_at TEXT,
-                    error TEXT,
-                    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    error_message TEXT,
+                    task_run_id TEXT,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    max_retries INTEGER NOT NULL DEFAULT 3
                 );
                 CREATE INDEX IF NOT EXISTS idx_queued_workflows_status ON queued_workflows(status);
-                CREATE INDEX IF NOT EXISTS idx_queued_workflows_workflow ON queued_workflows(workflow_id);
-                CREATE INDEX IF NOT EXISTS idx_queued_workflows_priority ON queued_workflows(priority DESC, enqueued_at ASC);
+                CREATE INDEX IF NOT EXISTS idx_queued_workflows_priority ON queued_workflows(priority DESC, queued_at ASC);
                 "#,
             )
             .map_err(|e| format!("Failed to create queued_workflows table: {}", e))?;
@@ -5818,6 +5820,128 @@ impl CheckpointDb {
             .map_err(|e| format!("Failed to migrate to version 153: {}", e))?;
 
             info!("Successfully migrated to version 153 (pipeline events, rule influence, cross-run patterns)");
+        }
+
+        if current_version < 154 {
+            info!("Migrating to version 154 (token analytics indexes)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE INDEX IF NOT EXISTS idx_phase_token_usage_created_at ON phase_token_usage(created_at);
+                CREATE INDEX IF NOT EXISTS idx_phase_token_usage_model ON phase_token_usage(model_used);
+                CREATE INDEX IF NOT EXISTS idx_phase_token_usage_provider ON phase_token_usage(provider_used);
+                "#,
+            )
+            .map_err(|e| format!("Failed to create token analytics indexes: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (154, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 154: {}", e))?;
+
+            info!("Successfully migrated to version 154 (token analytics indexes)");
+        }
+
+        if current_version < 155 {
+            info!("Migrating to version 155 (stall_events table)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS stall_events (
+                    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+                    task_run_id TEXT NOT NULL,
+                    iteration INTEGER NOT NULL,
+                    pattern_type TEXT NOT NULL,
+                    pattern_details TEXT,
+                    action_count INTEGER,
+                    intervention_action TEXT,
+                    intervention_result TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                "#,
+            )
+            .map_err(|e| format!("Failed to create stall_events table: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (155, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 155: {}", e))?;
+
+            info!("Successfully migrated to version 155 (stall_events table)");
+        }
+
+        if current_version < 156 {
+            info!("Migrating to version 156 (context_summaries table)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS context_summaries (
+                    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+                    task_run_id TEXT NOT NULL,
+                    iterations_summarized TEXT NOT NULL,
+                    summary_text TEXT NOT NULL,
+                    key_findings TEXT,
+                    successful_fixes TEXT,
+                    root_causes TEXT,
+                    original_token_count INTEGER,
+                    summary_token_count INTEGER,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                "#,
+            )
+            .map_err(|e| format!("Failed to create context_summaries table: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (156, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 156: {}", e))?;
+
+            info!("Successfully migrated to version 156 (context_summaries table)");
+        }
+
+        if current_version < 157 {
+            info!("Migrating to version 157 (decomposition tables)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS decomposition_plans (
+                    id TEXT PRIMARY KEY,
+                    task_run_id TEXT NOT NULL,
+                    original_goal TEXT NOT NULL,
+                    goal_summary TEXT,
+                    subtask_count INTEGER NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    completed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS decomposition_subtasks (
+                    id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL,
+                    subtask_index INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    depends_on TEXT,
+                    workflow_id TEXT,
+                    task_run_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    output_summary TEXT,
+                    error TEXT,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    FOREIGN KEY (plan_id) REFERENCES decomposition_plans(id) ON DELETE CASCADE
+                );
+                "#,
+            )
+            .map_err(|e| format!("Failed to create decomposition tables: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (157, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 157: {}", e))?;
+
+            info!("Successfully migrated to version 157 (decomposition tables)");
         }
 
         // Repair migration: is_favorite column may be missing on databases created from

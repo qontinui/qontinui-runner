@@ -8,16 +8,16 @@ pub struct GetTaskRunCostsParams {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetDailyCost {
     pub day: String,
-    pub total_cost_cents: rust_decimal::Decimal,
-    pub total_input_tokens: rust_decimal::Decimal,
-    pub total_output_tokens: rust_decimal::Decimal,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
     pub call_count: i64,
 }
 pub struct GetDailyCostBorrowed<'a> {
     pub day: &'a str,
-    pub total_cost_cents: rust_decimal::Decimal,
-    pub total_input_tokens: rust_decimal::Decimal,
-    pub total_output_tokens: rust_decimal::Decimal,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
     pub call_count: i64,
 }
 impl<'a> From<GetDailyCostBorrowed<'a>> for GetDailyCost {
@@ -42,17 +42,17 @@ impl<'a> From<GetDailyCostBorrowed<'a>> for GetDailyCost {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetCostByModel {
     pub model_used: String,
-    pub total_cost_cents: rust_decimal::Decimal,
-    pub total_input_tokens: rust_decimal::Decimal,
-    pub total_output_tokens: rust_decimal::Decimal,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
     pub call_count: i64,
     pub avg_duration_ms: i64,
 }
 pub struct GetCostByModelBorrowed<'a> {
     pub model_used: &'a str,
-    pub total_cost_cents: rust_decimal::Decimal,
-    pub total_input_tokens: rust_decimal::Decimal,
-    pub total_output_tokens: rust_decimal::Decimal,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
     pub call_count: i64,
     pub avg_duration_ms: i64,
 }
@@ -80,15 +80,15 @@ impl<'a> From<GetCostByModelBorrowed<'a>> for GetCostByModel {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetCostByPhase {
     pub phase: String,
-    pub total_cost_cents: rust_decimal::Decimal,
-    pub total_input_tokens: rust_decimal::Decimal,
-    pub total_output_tokens: rust_decimal::Decimal,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
 }
 pub struct GetCostByPhaseBorrowed<'a> {
     pub phase: &'a str,
-    pub total_cost_cents: rust_decimal::Decimal,
-    pub total_input_tokens: rust_decimal::Decimal,
-    pub total_output_tokens: rust_decimal::Decimal,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
 }
 impl<'a> From<GetCostByPhaseBorrowed<'a>> for GetCostByPhase {
     fn from(
@@ -144,17 +144,17 @@ impl<'a> From<GetProviderLatencyBorrowed<'a>> for GetProviderLatency {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetTaskRunCosts {
     pub task_run_id: String,
-    pub total_cost_cents: rust_decimal::Decimal,
-    pub total_input_tokens: rust_decimal::Decimal,
-    pub total_output_tokens: rust_decimal::Decimal,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
     pub call_count: i64,
     pub started_at: String,
 }
 pub struct GetTaskRunCostsBorrowed<'a> {
     pub task_run_id: &'a str,
-    pub total_cost_cents: rust_decimal::Decimal,
-    pub total_input_tokens: rust_decimal::Decimal,
-    pub total_output_tokens: rust_decimal::Decimal,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
     pub call_count: i64,
     pub started_at: &'a str,
 }
@@ -181,11 +181,11 @@ impl<'a> From<GetTaskRunCostsBorrowed<'a>> for GetTaskRunCosts {
 }
 #[derive(Debug, Clone, PartialEq, Copy, serde::Serialize, serde::Deserialize)]
 pub struct GetTokenUsageTotals {
-    pub total_cost_cents: rust_decimal::Decimal,
-    pub total_input_tokens: rust_decimal::Decimal,
-    pub total_output_tokens: rust_decimal::Decimal,
+    pub total_cost_cents: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
     pub total_calls: i64,
-    pub avg_duration_ms: rust_decimal::Decimal,
+    pub avg_duration_ms: i64,
 }
 use crate::client::async_::GenericClient;
 use futures::{self, StreamExt, TryStreamExt};
@@ -659,7 +659,7 @@ where
 pub struct GetDailyCostStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_daily_cost() -> GetDailyCostStmt {
     GetDailyCostStmt(
-        "SELECT date(created_at)::text as day, COALESCE(SUM(cost_cents), 0) as total_cost_cents, COALESCE(SUM(input_tokens), 0) as total_input_tokens, COALESCE(SUM(output_tokens), 0) as total_output_tokens, COUNT(*) as call_count FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) GROUP BY date(created_at) ORDER BY day ASC",
+        "SELECT date(created_at)::text as day, COALESCE(SUM(cost_cents), 0)::bigint as total_cost_cents, COALESCE(SUM(input_tokens), 0)::bigint as total_input_tokens, COALESCE(SUM(output_tokens), 0)::bigint as total_output_tokens, COUNT(*)::bigint as call_count FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) GROUP BY date(created_at) ORDER BY day ASC",
         None,
     )
 }
@@ -698,7 +698,7 @@ impl GetDailyCostStmt {
 pub struct GetCostByModelStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_cost_by_model() -> GetCostByModelStmt {
     GetCostByModelStmt(
-        "SELECT model_used, COALESCE(SUM(cost_cents), 0) as total_cost_cents, COALESCE(SUM(input_tokens), 0) as total_input_tokens, COALESCE(SUM(output_tokens), 0) as total_output_tokens, COUNT(*) as call_count, AVG(duration_ms)::bigint as avg_duration_ms FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) AND model_used IS NOT NULL GROUP BY model_used ORDER BY SUM(cost_cents) DESC",
+        "SELECT model_used, COALESCE(SUM(cost_cents), 0)::bigint as total_cost_cents, COALESCE(SUM(input_tokens), 0)::bigint as total_input_tokens, COALESCE(SUM(output_tokens), 0)::bigint as total_output_tokens, COUNT(*)::bigint as call_count, COALESCE(AVG(duration_ms), 0)::bigint as avg_duration_ms FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) AND model_used IS NOT NULL GROUP BY model_used ORDER BY SUM(cost_cents) DESC",
         None,
     )
 }
@@ -739,7 +739,7 @@ impl GetCostByModelStmt {
 pub struct GetCostByPhaseStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_cost_by_phase() -> GetCostByPhaseStmt {
     GetCostByPhaseStmt(
-        "SELECT phase, COALESCE(SUM(cost_cents), 0) as total_cost_cents, COALESCE(SUM(input_tokens), 0) as total_input_tokens, COALESCE(SUM(output_tokens), 0) as total_output_tokens FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) GROUP BY phase ORDER BY SUM(cost_cents) DESC",
+        "SELECT phase, COALESCE(SUM(cost_cents), 0)::bigint as total_cost_cents, COALESCE(SUM(input_tokens), 0)::bigint as total_input_tokens, COALESCE(SUM(output_tokens), 0)::bigint as total_output_tokens FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) GROUP BY phase ORDER BY SUM(cost_cents) DESC",
         None,
     )
 }
@@ -778,7 +778,7 @@ impl GetCostByPhaseStmt {
 pub struct GetProviderLatencyStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_provider_latency() -> GetProviderLatencyStmt {
     GetProviderLatencyStmt(
-        "SELECT provider_used, AVG(duration_ms)::bigint as avg_duration_ms, MIN(duration_ms) as min_duration_ms, MAX(duration_ms) as max_duration_ms, COUNT(*) as call_count FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) AND provider_used IS NOT NULL AND duration_ms IS NOT NULL GROUP BY provider_used",
+        "SELECT provider_used, COALESCE(AVG(duration_ms), 0)::bigint as avg_duration_ms, MIN(duration_ms) as min_duration_ms, MAX(duration_ms) as max_duration_ms, COUNT(*)::bigint as call_count FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) AND provider_used IS NOT NULL AND duration_ms IS NOT NULL GROUP BY provider_used",
         None,
     )
 }
@@ -818,7 +818,7 @@ impl GetProviderLatencyStmt {
 pub struct GetTaskRunCostsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_costs() -> GetTaskRunCostsStmt {
     GetTaskRunCostsStmt(
-        "SELECT task_run_id, COALESCE(SUM(cost_cents), 0) as total_cost_cents, COALESCE(SUM(input_tokens), 0) as total_input_tokens, COALESCE(SUM(output_tokens), 0) as total_output_tokens, COUNT(*) as call_count, MIN(created_at)::text as started_at FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) GROUP BY task_run_id ORDER BY SUM(cost_cents) DESC LIMIT $2",
+        "SELECT task_run_id, COALESCE(SUM(cost_cents), 0)::bigint as total_cost_cents, COALESCE(SUM(input_tokens), 0)::bigint as total_input_tokens, COALESCE(SUM(output_tokens), 0)::bigint as total_output_tokens, COUNT(*)::bigint as call_count, MIN(created_at)::text as started_at FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) GROUP BY task_run_id ORDER BY SUM(cost_cents) DESC LIMIT $2",
         None,
     )
 }
@@ -878,7 +878,7 @@ impl<'c, 'a, 's, C: GenericClient>
 pub struct GetTokenUsageTotalsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_token_usage_totals() -> GetTokenUsageTotalsStmt {
     GetTokenUsageTotalsStmt(
-        "SELECT COALESCE(SUM(cost_cents), 0) as total_cost_cents, COALESCE(SUM(input_tokens), 0) as total_input_tokens, COALESCE(SUM(output_tokens), 0) as total_output_tokens, COUNT(*) as total_calls, AVG(duration_ms) as avg_duration_ms FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1)",
+        "SELECT COALESCE(SUM(cost_cents), 0)::bigint as total_cost_cents, COALESCE(SUM(input_tokens), 0)::bigint as total_input_tokens, COALESCE(SUM(output_tokens), 0)::bigint as total_output_tokens, COUNT(*)::bigint as total_calls, COALESCE(AVG(duration_ms), 0)::bigint as avg_duration_ms FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1)",
         None,
     )
 }
@@ -917,7 +917,7 @@ impl GetTokenUsageTotalsStmt {
 pub struct GetUniqueModelsCountStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_unique_models_count() -> GetUniqueModelsCountStmt {
     GetUniqueModelsCountStmt(
-        "SELECT COUNT(DISTINCT model_used) as count FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) AND model_used IS NOT NULL",
+        "SELECT COUNT(DISTINCT model_used)::bigint as count FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) AND model_used IS NOT NULL",
         None,
     )
 }
@@ -947,7 +947,7 @@ impl GetUniqueModelsCountStmt {
 pub struct GetUniqueProvidersCountStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_unique_providers_count() -> GetUniqueProvidersCountStmt {
     GetUniqueProvidersCountStmt(
-        "SELECT COUNT(DISTINCT provider_used) as count FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) AND provider_used IS NOT NULL",
+        "SELECT COUNT(DISTINCT provider_used)::bigint as count FROM phase_token_usage WHERE created_at >= NOW() - make_interval(days => $1) AND provider_used IS NOT NULL",
         None,
     )
 }

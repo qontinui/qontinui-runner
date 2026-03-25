@@ -419,6 +419,7 @@ async function captureFallbackScreenshot(
       tracedFetch(`${getApiBase()}/ui-bridge/sdk/screenshot?runner=true`),
       tracedFetch(`${getApiBase()}/ui-bridge/sdk/snapshot?recency=current`).catch(() => null),
     ]);
+    if (!ssResp.ok) return;
     const ssJson = await ssResp.json();
     if (!ssJson.success || !ssJson.data?.screenshot) return;
 

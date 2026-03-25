@@ -4,6 +4,49 @@ use serde::{Deserialize, Serialize};
 
 // --- Configuration ---
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StallDetectorConfig {
+    pub max_repeated_actions: u32,
+    pub max_total_steps: u32,
+    pub stall_timeout_secs: u64,
+    pub oscillation_window: u32,
+}
+
+impl Default for StallDetectorConfig {
+    fn default() -> Self {
+        Self { max_repeated_actions: 5, max_total_steps: 100, stall_timeout_secs: 300, oscillation_window: 10 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummarizationConfig {
+    pub enabled: bool,
+    pub token_threshold_pct: f32,
+    pub max_tokens_budget: usize,
+    pub preserve_last_n_iterations: u32,
+    pub summary_max_tokens: usize,
+}
+
+impl Default for SummarizationConfig {
+    fn default() -> Self {
+        Self { enabled: true, token_threshold_pct: 0.75, max_tokens_budget: 80000, preserve_last_n_iterations: 2, summary_max_tokens: 2000 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecomposerConfig {
+    pub enabled: bool,
+    pub min_subtasks: u32,
+    pub max_subtasks: u32,
+    pub model_override: Option<String>,
+}
+
+impl Default for DecomposerConfig {
+    fn default() -> Self {
+        Self { enabled: true, min_subtasks: 3, max_subtasks: 7, model_override: None }
+    }
+}
+
 /// Configuration for an orchestration loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestrationLoopConfig {
@@ -48,6 +91,13 @@ pub struct OrchestrationLoopConfig {
 
     /// Pipeline mode configuration. When present, enables build/reflect/fix phases.
     pub pipeline: Option<PipelineConfig>,
+
+    #[serde(default)]
+    pub stall_detection: Option<StallDetectorConfig>,
+    #[serde(default)]
+    pub summarization: Option<SummarizationConfig>,
+    #[serde(default)]
+    pub decomposition: Option<DecomposerConfig>,
 }
 
 /// Pipeline mode configuration for build → execute → reflect → fix cycle.
@@ -143,6 +193,8 @@ pub enum LoopPhase {
     WaitingForFixer,
     BetweenIterations,
     WaitingForRunner,
+    StallDetecting,
+    Planning,
     Complete,
     Stopped,
     Error,
@@ -183,6 +235,10 @@ pub struct IterationResult {
     /// Pipeline mode: whether a rebuild was triggered for the next iteration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rebuild_triggered: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stall_detected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_summarized: Option<bool>,
 }
 
 /// Result of evaluating whether the loop should exit.

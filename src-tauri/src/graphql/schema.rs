@@ -26,8 +26,8 @@ pub type QontinuiSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 pub fn build_schema(api_state: Arc<ApiState>) -> QontinuiSchema {
     Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
         .data(api_state)
-        .limit_depth(10)
-        .limit_complexity(200)
+        .limit_depth(12)
+        .limit_complexity(500)
         .finish()
 }
 

@@ -71,6 +71,7 @@ export type MainTabId =
   | "orchestration-loop"
   | "image-quality-tests"
   | "terminal"
+  | "llm-analytics"
   | "help";
 
 const VALID_TAB_IDS: MainTabId[] = [
@@ -144,6 +145,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "orchestration-loop",
   "image-quality-tests",
   "terminal",
+  "llm-analytics",
   "help",
 ];
 

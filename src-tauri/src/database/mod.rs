@@ -74,6 +74,7 @@ pub mod worktree_ops;
 // Graph-based workflow improvement
 pub mod cross_run_ops;
 pub mod graph_ops;
+pub mod token_analytics;
 
 // Re-export all types for backward compatibility
 pub use types::*;

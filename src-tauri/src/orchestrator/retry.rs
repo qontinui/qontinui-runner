@@ -420,16 +420,8 @@ impl RetryService {
 
 /// Generate a random factor between 0 and 1 for jitter.
 fn rand_factor() -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Simple pseudo-random based on time
-    // In production, use a proper RNG
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-
-    nanos as f64 / u32::MAX as f64
+    use rand::Rng;
+    rand::rng().random::<f64>()
 }
 
 /// Truncate an error message to a maximum length.
@@ -457,7 +449,7 @@ const NON_RETRIABLE_PATTERNS: &[&str] = &[
     "invalid configuration",
     "authentication failed",
     "permission denied",
-    "not found",
+    "resource not found",
     "schema validation",
     "missing required field",
 ];

@@ -7,7 +7,11 @@ use tracing::info;
 
 use super::eval_spec::{
     AssertionResult, EvalAggregateMetrics, EvalAssertion, EvalComparison, EvalResult, EvalSpec,
-    TestCaseResult,
+    EvalTestCase, TestCaseResult,
+};
+use super::llm_judge_metrics::{
+    evaluate_answer_relevance, evaluate_content_safety, evaluate_factuality,
+    evaluate_hallucination, JudgeInput, JudgeResult,
 };
 use crate::database::CheckpointDb;
 
@@ -423,6 +427,80 @@ fn evaluate_assertion(
             message: "Skipped in offline evaluation (no per-run I/O available)".to_string(),
         },
     }
+}
+
+// =============================================================================
+// Live evaluation with I/O context (for LLM-as-judge assertions)
+// =============================================================================
+
+/// Convert an LLM judge result into an assertion result.
+fn judge_result_to_assertion(result: &JudgeResult, assertion_type: &str) -> AssertionResult {
+    AssertionResult {
+        assertion_type: assertion_type.to_string(),
+        passed: result.passed,
+        actual_value: result.score,
+        threshold_value: 0.0,
+        message: result.reason.clone(),
+    }
+}
+
+/// Evaluate a single assertion using live I/O data.
+///
+/// For LLM-as-judge assertions, this calls the actual judge functions
+/// from `llm_judge_metrics`. For all other assertion types, it delegates
+/// to the aggregate-based `evaluate_assertion`.
+pub fn evaluate_assertion_with_io(
+    assertion: &EvalAssertion,
+    input: &str,
+    output: &str,
+    context: Option<&str>,
+    metrics: &EvalAggregateMetrics,
+) -> AssertionResult {
+    let judge_input = JudgeInput {
+        input: input.to_string(),
+        output: output.to_string(),
+        context: context.map(|c| c.to_string()),
+    };
+
+    match assertion {
+        EvalAssertion::HallucinationCheck {
+            max_hallucination_rate,
+        } => {
+            let result = evaluate_hallucination(&judge_input, *max_hallucination_rate);
+            judge_result_to_assertion(&result, "hallucination_check")
+        }
+        EvalAssertion::AnswerRelevance { min_relevance } => {
+            let result = evaluate_answer_relevance(&judge_input, *min_relevance);
+            judge_result_to_assertion(&result, "answer_relevance")
+        }
+        EvalAssertion::Factuality { min_factuality } => {
+            let result = evaluate_factuality(&judge_input, *min_factuality);
+            judge_result_to_assertion(&result, "factuality")
+        }
+        EvalAssertion::ContentSafety {
+            blocked_categories,
+        } => {
+            let result = evaluate_content_safety(&judge_input, blocked_categories);
+            judge_result_to_assertion(&result, "content_safety")
+        }
+        // Non-judge assertions delegate to the aggregate-based evaluator
+        other => evaluate_assertion(other, Some(metrics), &None),
+    }
+}
+
+/// Evaluate all assertions in a test case using live I/O data.
+pub fn evaluate_test_case_with_io(
+    test_case: &EvalTestCase,
+    input: &str,
+    output: &str,
+    context: Option<&str>,
+    metrics: &EvalAggregateMetrics,
+) -> Vec<AssertionResult> {
+    test_case
+        .assertions
+        .iter()
+        .map(|a| evaluate_assertion_with_io(a, input, output, context, metrics))
+        .collect()
 }
 
 #[cfg(test)]

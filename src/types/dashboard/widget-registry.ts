@@ -46,17 +46,6 @@ export interface TaskActivityInfo {
 export type SummaryWidthTier = "narrow" | "medium" | "wide" | "full";
 
 /**
- * Minimum width (CSS value) for each summary width tier.
- * Used by the grid layout to determine how many widgets fit per row.
- */
-export const SUMMARY_WIDTH_MIN: Record<SummaryWidthTier, string> = {
-  narrow: "160px",
-  medium: "240px",
-  wide: "360px",
-  full: "100%",
-};
-
-/**
  * Configuration for a widget type.
  *
  * @template TData The type of data the widget receives

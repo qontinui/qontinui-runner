@@ -2,6 +2,13 @@
 //!
 //! Subscriptions provide typed, real-time event streams over WebSocket,
 //! replacing the untyped broadcast channel + SSE/WS pattern.
+//!
+//! Available subscriptions:
+//! - `uiBridgeHealthStream` — periodic health snapshots (replaces polling GET /health)
+//! - `runnerEvents` — all runner events with optional type filter
+//! - `taskRunProgress` — events for a specific task run
+//! - `findingUpdates` — finding changes for a specific task run (polled from DB)
+//! - `orchestrationLoopStatus` — periodic orchestration loop state
 
 use async_graphql::*;
 use futures_util::StreamExt;
@@ -93,6 +100,87 @@ impl SubscriptionRoot {
                 }
             }
         }))
+    }
+
+    /// Finding updates stream — polls DB for finding changes on a task run.
+    /// Emits the full findings list whenever the count or statuses change.
+    async fn finding_updates(
+        &self,
+        ctx: &Context<'_>,
+        task_run_id: String,
+        #[graphql(default = 2000)] interval_ms: i32,
+    ) -> Result<impl futures_util::Stream<Item = Vec<GqlFinding>>> {
+        let state = ctx.data::<Arc<ApiState>>()?.clone();
+        let interval = std::time::Duration::from_millis(interval_ms.max(500) as u64);
+
+        Ok(async_stream::stream! {
+            let mut ticker = tokio::time::interval(interval);
+            let mut last_hash: u64 = 0;
+
+            loop {
+                ticker.tick().await;
+                let db = state.app_state.checkpoint_db.clone();
+                let trid = task_run_id.clone();
+
+                let findings = match tokio::task::spawn_blocking(move || {
+                    db.get_findings_for_task(&trid)
+                }).await {
+                    Ok(Ok(f)) => f,
+                    _ => continue,
+                };
+
+                // Compute a simple change hash (count + status string)
+                let hash = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    findings.len().hash(&mut hasher);
+                    for f in &findings {
+                        f.id.hash(&mut hasher);
+                        f.status.as_str().hash(&mut hasher);
+                        f.updated_at.hash(&mut hasher);
+                    }
+                    hasher.finish()
+                };
+
+                if hash != last_hash {
+                    last_hash = hash;
+                    yield findings.into_iter().map(GqlFinding::from_domain).collect();
+                }
+            }
+        })
+    }
+
+    /// Orchestration loop status stream — pushes loop state at a configurable interval.
+    async fn orchestration_loop_status_stream(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 2000)] interval_ms: i32,
+    ) -> Result<impl futures_util::Stream<Item = GqlOrchestrationLoopStatus>> {
+        let state = ctx.data::<Arc<ApiState>>()?.clone();
+        let interval = std::time::Duration::from_millis(interval_ms.max(500) as u64);
+
+        Ok(async_stream::stream! {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let loop_state = state
+                    .app_state
+                    .orchestration_loop
+                    .lock()
+                    .await;
+
+                yield GqlOrchestrationLoopStatus {
+                    running: loop_state.running,
+                    phase: format!("{:?}", loop_state.phase),
+                    current_iteration: loop_state.current_iteration as i32,
+                    started_at: loop_state
+                        .started_at
+                        .map(|t: chrono::DateTime<chrono::Utc>| t.to_rfc3339()),
+                    error: loop_state.error.clone(),
+                };
+            }
+        })
     }
 }
 

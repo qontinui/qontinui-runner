@@ -5,7 +5,7 @@
  * phase costs, provider latency, and per-task-run cost details.
  */
 
-export { LlmObservabilityDashboard } from "./LlmObservabilityDashboard";
+export { default as LlmObservabilityDashboard } from "./LlmObservabilityDashboard";
 export { SummaryCards } from "./SummaryCards";
 export { CostOverTimeChart } from "./CostOverTimeChart";
 export { CostByModelChart } from "./CostByModelChart";

@@ -21,7 +21,12 @@
 //! This cleanly separates the orchestrator from the execution target.
 
 pub mod commands;
+pub mod context_summarizer;
 pub mod fix_agent;
+pub mod intervention;
 pub mod loop_engine;
 pub mod remote_client;
+pub mod stall_detector;
+pub mod subtask_executor;
+pub mod task_decomposer;
 pub mod types;

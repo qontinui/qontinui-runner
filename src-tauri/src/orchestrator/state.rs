@@ -537,10 +537,17 @@ impl TaskOrchestrator {
     pub fn check_timeout(&self) -> Option<u64> {
         let timeout_ms = self.phase_timeouts.timeout_for_state(&self.state)?;
         let entered_at = self.state_entered_at.as_ref()?;
-        let entered: chrono::DateTime<chrono::Utc> = entered_at.parse().ok()?;
+        let entered: chrono::DateTime<chrono::Utc> = match entered_at.parse() {
+            Ok(dt) => dt,
+            Err(e) => {
+                tracing::warn!("Failed to parse state_entered_at '{}': {}", entered_at, e);
+                return None;
+            }
+        };
         let elapsed_ms = chrono::Utc::now()
             .signed_duration_since(entered)
-            .num_milliseconds() as u64;
+            .num_milliseconds()
+            .max(0) as u64;
         if elapsed_ms > timeout_ms {
             Some(elapsed_ms)
         } else {

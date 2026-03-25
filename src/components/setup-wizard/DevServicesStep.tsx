@@ -86,7 +86,7 @@ export function DevServicesStep({ alreadySelectedConfigs, onNext, onBack }: DevS
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [alreadySelectedConfigs]);
 
   const toggleService = useCallback((id: string) => {
     setSelectedIds((prev) => {

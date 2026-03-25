@@ -27,7 +27,7 @@ pub async fn get_event_history(
     Query(query): Query<EventHistoryQuery>,
 ) -> Json<ApiResponse<Vec<crate::workflow_event_bus::WorkflowEvent>>> {
     let bus = crate::workflow_event_bus::get_workflow_event_bus();
-    let limit = query.limit.unwrap_or(50);
+    let limit = query.limit.unwrap_or(50).min(500);
     let history = bus.history(limit).await;
     Json(ApiResponse::success(history))
 }

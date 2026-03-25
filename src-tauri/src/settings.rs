@@ -813,6 +813,8 @@ pub struct Settings {
     /// Note: OTel cannot be hot-reloaded; changes require a runner restart.
     #[serde(default)]
     pub otel: crate::otel::OtelConfig,
+    #[serde(default)]
+    pub container: crate::container::container_config::ContainerConfig,
 }
 
 // ============================================================================
@@ -900,6 +902,17 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
     fs::write(&path, contents).map_err(|e| format!("Failed to write settings file: {}", e))?;
 
     Ok(())
+}
+
+pub fn get_container_settings() -> crate::container::container_config::ContainerConfig {
+    let settings = load_settings();
+    settings.container
+}
+
+pub fn save_container_settings(config: crate::container::container_config::ContainerConfig) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.container = config;
+    save_settings(&settings)
 }
 
 /// Save the last loaded config path

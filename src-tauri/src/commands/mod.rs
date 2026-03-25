@@ -60,6 +60,7 @@ pub mod checkpoints;
 pub mod checks; // Code quality checks (linting, formatting, type checking)
 pub mod comparison; // Side-by-side architecture comparison runs
 pub mod config;
+pub mod container_settings;
 pub mod context;
 pub mod database; // Database maintenance and optimization
 pub mod dataset;
@@ -108,6 +109,7 @@ pub mod terminal_analysis; // Terminal session analysis (session summary, archit
 pub mod test_orchestrator; // AI-driven multi-step API test orchestration
 pub mod testing;
 pub mod tiered_info;
+pub mod token_analytics;
 pub mod transcript; // Claude Code transcript import and standalone workflow generation
 pub mod ui_bridge; // UI Bridge for AI-driven UI automation
 pub mod verification;

@@ -78,11 +78,11 @@ pub(super) fn build_llm_metrics(
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
 ) -> Option<LLMMetrics> {
-    let input = input_tokens.unwrap_or(0) as i64;
-    let output = output_tokens.unwrap_or(0) as i64;
-    if input == 0 && output == 0 {
+    if input_tokens.is_none() && output_tokens.is_none() {
         return None;
     }
+    let input = input_tokens.unwrap_or(0) as i64;
+    let output = output_tokens.unwrap_or(0) as i64;
     Some(LLMMetrics {
         model: model.map(|s| s.to_string()),
         provider: provider.map(|s| s.to_string()),
