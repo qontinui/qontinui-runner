@@ -17,6 +17,7 @@ import { CostByModelChart } from "./CostByModelChart";
 import { CostByPhaseChart } from "./CostByPhaseChart";
 import { ProviderLatencyChart } from "./ProviderLatencyChart";
 import { TaskRunCostTable } from "./TaskRunCostTable";
+import { CostByTargetAppChart } from "./CostByTargetAppChart";
 
 const TIME_RANGE_OPTIONS: LlmTimeRange[] = ["1d", "7d", "30d", "all"];
 
@@ -29,6 +30,7 @@ export default function LlmObservabilityDashboard() {
     costByPhase,
     providerLatency,
     taskRunCosts,
+    costByTargetApp,
     loading,
     error,
     refresh,
@@ -92,6 +94,7 @@ export default function LlmObservabilityDashboard() {
             <select
               value={timeRange}
               onChange={(e) => setTimeRange(e.target.value as LlmTimeRange)}
+              aria-label="Select time range"
               className="bg-muted border border-border rounded-md px-3 py-1.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
             >
               {TIME_RANGE_OPTIONS.map((option) => (
@@ -105,6 +108,7 @@ export default function LlmObservabilityDashboard() {
             onClick={refresh}
             className="p-2 rounded-md hover:bg-muted transition-colors"
             title="Refresh analytics"
+            aria-label="Refresh analytics"
           >
             <RefreshCw className="w-4 h-4" />
           </button>
@@ -125,6 +129,11 @@ export default function LlmObservabilityDashboard() {
         <CostByPhaseChart data={costByPhase} />
         <ProviderLatencyChart data={providerLatency} />
       </div>
+
+      {/* UI Bridge Cost Attribution */}
+      {costByTargetApp.length > 0 && (
+        <CostByTargetAppChart data={costByTargetApp} />
+      )}
 
       {/* Task Run Cost Table */}
       <TaskRunCostTable data={taskRunCosts} />

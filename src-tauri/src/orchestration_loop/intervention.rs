@@ -15,6 +15,12 @@ pub enum InterventionAction {
     SkipCurrentStep,
     ResetToCheckpoint(String),
     StopWithDiagnosis(String),
+    /// Navigate back to escape a stuck page
+    NavigateBack,
+    /// Hard refresh the current page
+    RefreshPage,
+    /// Wait with exponential backoff (ms) before retrying
+    WaitAndRetry(u64),
 }
 
 /// A stall intervention containing the detected pattern and suggested action.
@@ -84,6 +90,59 @@ pub fn parse_intervention_response(
                 pattern, response
             )),
         }
+    }
+}
+
+/// Generate a default intervention for a UIStuck pattern without needing AI.
+///
+/// Uses a simple escalation strategy based on the number of consecutive stuck detections:
+/// 1st: Wait 2s and retry
+/// 2nd: Wait 5s and retry
+/// 3rd: Navigate back
+/// 4th: Hard refresh
+/// 5th+: Stop with diagnosis
+pub fn default_ui_stuck_intervention(
+    pattern: &StallPattern,
+    consecutive_stuck_count: u32,
+) -> StallIntervention {
+    let (strategy, action) = match consecutive_stuck_count {
+        0 | 1 => (
+            "Page appears stuck — waiting briefly before retrying".to_string(),
+            InterventionAction::WaitAndRetry(2000),
+        ),
+        2 => (
+            "Page still stuck — waiting longer before retrying".to_string(),
+            InterventionAction::WaitAndRetry(5000),
+        ),
+        3 => (
+            "Page remains stuck — navigating back to escape".to_string(),
+            InterventionAction::NavigateBack,
+        ),
+        4 => (
+            "Page stuck after navigate-back — attempting hard refresh".to_string(),
+            InterventionAction::RefreshPage,
+        ),
+        _ => (
+            format!(
+                "Page stuck {} consecutive times — stopping with diagnosis",
+                consecutive_stuck_count
+            ),
+            InterventionAction::StopWithDiagnosis(format!(
+                "UI stuck {} consecutive times: {}",
+                consecutive_stuck_count, pattern
+            )),
+        ),
+    };
+
+    info!(
+        "UI stuck intervention (attempt {}): {}",
+        consecutive_stuck_count, strategy
+    );
+
+    StallIntervention {
+        pattern: pattern.to_string(),
+        alternative_strategy: strategy,
+        suggested_action: action,
     }
 }
 

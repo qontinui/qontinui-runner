@@ -8,6 +8,60 @@ use crate::terminal::transcript;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Collect workspace project paths for scanning (root + immediate child directories).
+fn collect_workspace_project_paths() -> Vec<String> {
+    let workspace_root = crate::mcp::shared::get_workspace_paths_internal()
+        .map(|(root, _, _)| root.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let mut paths = vec![workspace_root.clone()];
+    if !workspace_root.is_empty() {
+        if let Ok(entries) = std::fs::read_dir(&workspace_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    if !name.starts_with('.') && name != "node_modules" {
+                        paths.push(path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+    paths
+}
+
+/// Collect all transcript sessions across all project paths and config dirs, deduplicated.
+fn collect_all_sessions(
+    project_paths: &[String],
+    config_dirs: &[std::path::PathBuf],
+) -> Vec<transcript::TranscriptSession> {
+    let mut all_sessions = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+
+    for project in project_paths {
+        for dir in config_dirs {
+            match transcript::list_sessions(dir, project) {
+                Ok(sessions) => {
+                    for session in sessions {
+                        if seen_ids.insert(session.session_id.clone()) {
+                            all_sessions.push(session);
+                        }
+                    }
+                }
+                Err(e) => warn!("Failed to list sessions in {:?}: {}", dir, e),
+            }
+        }
+    }
+
+    all_sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    all_sessions
+}
+
 /// List Claude Code transcript sessions.
 ///
 /// When `all_projects` is true, scans the workspace root **and** all immediate
@@ -18,35 +72,14 @@ pub async fn transcript_list_sessions(
     project_path: Option<String>,
     all_projects: Option<bool>,
 ) -> Result<CommandResponse, String> {
-    let workspace_root = crate::mcp::shared::get_workspace_paths_internal()
-        .map(|(root, _, _)| root.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    // Build the list of project paths to scan
     let project_paths: Vec<String> = if all_projects.unwrap_or(true) {
-        let mut paths = vec![workspace_root.clone()];
-        // Add immediate child directories (each repo in the monorepo)
-        if !workspace_root.is_empty() {
-            if let Ok(entries) = std::fs::read_dir(&workspace_root) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let name = path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
-                        // Skip hidden dirs and common non-project dirs
-                        if !name.starts_with('.') && name != "node_modules" {
-                            paths.push(path.to_string_lossy().to_string());
-                        }
-                    }
-                }
-            }
-        }
-        paths
+        collect_workspace_project_paths()
     } else {
-        let project = project_path.unwrap_or(workspace_root);
+        let project = project_path.unwrap_or_else(|| {
+            crate::mcp::shared::get_workspace_paths_internal()
+                .map(|(root, _, _)| root.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
         if project.is_empty() {
             return Ok(CommandResponse {
                 success: false,
@@ -72,27 +105,7 @@ pub async fn transcript_list_sessions(
         });
     }
 
-    let mut all_sessions = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
-
-    for project in &project_paths {
-        for dir in &config_dirs {
-            match transcript::list_sessions(dir, project) {
-                Ok(sessions) => {
-                    for session in sessions {
-                        // Deduplicate by session_id (same session won't appear twice)
-                        if seen_ids.insert(session.session_id.clone()) {
-                            all_sessions.push(session);
-                        }
-                    }
-                }
-                Err(e) => warn!("Failed to list sessions in {:?}: {}", dir, e),
-            }
-        }
-    }
-
-    // Sort all sessions by last_modified descending
-    all_sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    let all_sessions = collect_all_sessions(&project_paths, &config_dirs);
 
     info!(
         "transcript_list_sessions: found {} total sessions",
@@ -177,6 +190,67 @@ pub async fn transcript_get_latest(
         success: true,
         message: Some("No sessions found".to_string()),
         data: None,
+    })
+}
+
+/// Compute lightweight digests for recent sessions (frozen detection + work summary hints).
+///
+/// Takes the most recent N sessions (default 50) and returns a digest for each,
+/// reading only the tail of each JSONL file for efficiency.
+#[tauri::command]
+pub async fn transcript_session_digests(
+    max_sessions: Option<usize>,
+) -> Result<CommandResponse, String> {
+    let project_paths = collect_workspace_project_paths();
+    let config_dirs = transcript::find_claude_config_dirs();
+    if config_dirs.is_empty() {
+        return Ok(CommandResponse {
+            success: true,
+            message: Some("No config directories found".to_string()),
+            data: Some(serde_json::json!([])),
+        });
+    }
+
+    let mut all_sessions = collect_all_sessions(&project_paths, &config_dirs);
+    let limit = max_sessions.unwrap_or(50).min(100);
+    all_sessions.truncate(limit);
+
+    // Compute digests
+    let digests = transcript::session_digests_batch(&all_sessions);
+
+    info!(
+        "transcript_session_digests: computed {} digests",
+        digests.len()
+    );
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!("Computed {} session digests", digests.len())),
+        data: Some(serde_json::to_value(&digests).unwrap_or_default()),
+    })
+}
+
+/// Detect Claude Code processes running outside this Runner instance.
+///
+/// Returns a list of PIDs and optional working directories for Claude processes
+/// that are NOT managed by this Runner's PTY or session system.
+#[tauri::command]
+pub async fn transcript_find_external_processes(
+    app_state: tauri::State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    // Collect PIDs managed by this runner
+    let managed_pids = app_state
+        .ai_pid_tracker
+        .lock()
+        .map_err(|e| format!("Failed to lock ai_pid_tracker: {e}"))?
+        .clone();
+
+    let external = transcript::find_external_claude_processes(&managed_pids);
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!("Found {} external Claude processes", external.len())),
+        data: Some(serde_json::to_value(&external).unwrap_or_default()),
     })
 }
 

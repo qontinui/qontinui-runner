@@ -60,6 +60,7 @@ impl KnowledgeGraph {
         kg.load_patterns(conn, workflow_name)?;
         kg.load_knowledge(conn, workflow_name)?;
         kg.load_step_defs(conn, workflow_name)?;
+        kg.load_ui_elements(conn, workflow_name)?;
 
         // --- Edges ---
         kg.link_task_runs_to_workflows(conn, workflow_name)?;
@@ -72,6 +73,7 @@ impl KnowledgeGraph {
         kg.link_rule_influence(conn, workflow_name)?;
         kg.link_component_relationships(conn, workflow_name)?;
         kg.link_fix_applications(conn, workflow_name)?;
+        kg.link_ui_interactions(conn, workflow_name)?;
 
         Ok(kg)
     }
@@ -808,6 +810,97 @@ impl KnowledgeGraph {
                 GraphNode::new(GraphNodeKind::PipelineAgent, &agent, &agent);
             self.get_or_insert_node(agent_node);
         }
+        Ok(())
+    }
+
+    /// Load UI Bridge elements that were interacted with during automation.
+    /// Capped at 100 elements per workflow to respect memory budgets.
+    fn load_ui_elements(
+        &mut self,
+        conn: &Connection,
+        _workflow_name: Option<&str>,
+    ) -> Result<(), String> {
+        // Get distinct element IDs with interaction counts, capped at 100
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT element_id, COUNT(*) as interaction_count,
+                          CAST(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS REAL) / COUNT(*) as success_rate
+                   FROM ui_bridge_events
+                   WHERE element_id IS NOT NULL AND event_type = 'action_executed'
+                   GROUP BY element_id
+                   ORDER BY interaction_count DESC
+                   LIMIT 100"#,
+            )
+            .map_err(|e| format!("Failed to prepare ui_elements query: {}", e))?;
+
+        let rows: Vec<(String, i64, f64)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })
+            .map_err(|e| format!("Failed to query ui_elements: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (element_id, count, rate) in rows {
+            let node = GraphNode::new(GraphNodeKind::UIElement, &element_id, &element_id)
+                .with_weight(count as f64)
+                .with_property("interaction_count", serde_json::json!(count))
+                .with_property("success_rate", serde_json::json!(rate))
+                .with_property("flaky", serde_json::json!(rate < 0.95));
+            self.get_or_insert_node(node);
+        }
+
+        Ok(())
+    }
+
+    /// Link task runs to UI elements via InteractedWith edges.
+    fn link_ui_interactions(
+        &mut self,
+        conn: &Connection,
+        _workflow_name: Option<&str>,
+    ) -> Result<(), String> {
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT DISTINCT
+                     CAST(task_run_id AS TEXT) as tr_id,
+                     element_id,
+                     COUNT(*) as count,
+                     CAST(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS REAL) / COUNT(*) as rate
+                   FROM ui_bridge_events
+                   WHERE element_id IS NOT NULL
+                     AND task_run_id IS NOT NULL
+                     AND event_type = 'action_executed'
+                   GROUP BY task_run_id, element_id
+                   LIMIT 500"#,
+            )
+            .map_err(|e| format!("Failed to prepare ui_interactions query: {}", e))?;
+
+        let rows: Vec<(String, String, i64, f64)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
+            })
+            .map_err(|e| format!("Failed to query ui_interactions: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (task_run_id, element_id, count, rate) in rows {
+            let from_key = format!("task_run:{}", task_run_id);
+            let to_key = format!("ui_element:{}", element_id);
+            let edge = GraphEdge::new(GraphEdgeKind::InteractedWith)
+                .with_weight(rate * count as f64)
+                .with_label(&format!("{}x ({}% success)", count, (rate * 100.0) as u32));
+            self.add_edge_by_key(&from_key, &to_key, edge);
+        }
+
         Ok(())
     }
 
@@ -2122,4 +2215,591 @@ fn causal_event_to_node_key(event_type: &str, event_id: &str) -> String {
         _ => event_type,
     };
     format!("{}:{}", prefix, event_id)
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    // -------------------------------------------------------------------------
+    // Helper: create in-memory DB with all tables the graph engine queries
+    // -------------------------------------------------------------------------
+
+    fn setup_test_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("Failed to open in-memory DB");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE unified_workflows (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                category TEXT,
+                created_at TEXT
+            );
+
+            CREATE TABLE workflow_versions (
+                id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                version_number INTEGER NOT NULL,
+                parent_version_id TEXT,
+                generation_task_run_id TEXT,
+                trigger TEXT NOT NULL DEFAULT 'manual',
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
+            );
+
+            CREATE TABLE task_runs (
+                id TEXT PRIMARY KEY,
+                task_name TEXT NOT NULL,
+                workflow_name TEXT,
+                status TEXT NOT NULL DEFAULT 'completed',
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
+            );
+
+            CREATE TABLE task_run_findings (
+                id TEXT PRIMARY KEY,
+                task_run_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'quality',
+                severity TEXT NOT NULL DEFAULT 'medium',
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
+            );
+
+            CREATE TABLE reflection_fixes (
+                id TEXT PRIMARY KEY,
+                source_task_run_id TEXT NOT NULL,
+                source_finding_id TEXT,
+                fix_type TEXT NOT NULL DEFAULT 'prompt',
+                fix_description TEXT NOT NULL DEFAULT '',
+                effectiveness TEXT,
+                confidence TEXT NOT NULL DEFAULT 'medium',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
+            );
+
+            CREATE TABLE error_events (
+                id INTEGER PRIMARY KEY,
+                task_run_id TEXT NOT NULL,
+                signature_hash TEXT NOT NULL,
+                error_type TEXT,
+                message TEXT NOT NULL DEFAULT '',
+                severity TEXT NOT NULL DEFAULT 'error',
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                first_seen_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
+            );
+
+            CREATE TABLE architecture_components (
+                id TEXT PRIMARY KEY,
+                workflow_name TEXT,
+                component_path TEXT NOT NULL,
+                component_type TEXT NOT NULL DEFAULT 'file',
+                health_score REAL NOT NULL DEFAULT 1.0,
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
+            );
+
+            CREATE TABLE generation_rules (
+                id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL DEFAULT 'default',
+                section TEXT NOT NULL DEFAULT 'general',
+                title TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'normal',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
+            );
+
+            CREATE TABLE cross_run_patterns (
+                id TEXT PRIMARY KEY,
+                workflow_name TEXT,
+                pattern_type TEXT NOT NULL DEFAULT 'recurring_error',
+                signature_hash TEXT NOT NULL DEFAULT '',
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
+            );
+
+            CREATE TABLE task_knowledge (
+                id TEXT PRIMARY KEY,
+                task_run_id TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'insight',
+                content TEXT NOT NULL DEFAULT '',
+                confidence TEXT,
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
+            );
+
+            CREATE TABLE step_provenance (
+                id INTEGER PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                step_name TEXT NOT NULL,
+                phase TEXT NOT NULL DEFAULT 'setup',
+                generating_agent TEXT NOT NULL DEFAULT 'unknown'
+            );
+
+            CREATE TABLE causal_events (
+                id INTEGER PRIMARY KEY,
+                workflow_name TEXT,
+                cause_event_type TEXT NOT NULL,
+                cause_event_id TEXT NOT NULL,
+                effect_event_type TEXT NOT NULL,
+                effect_event_id TEXT NOT NULL,
+                relationship TEXT NOT NULL DEFAULT 'caused',
+                confidence TEXT NOT NULL DEFAULT 'medium'
+            );
+
+            CREATE TABLE rule_influence_log (
+                id INTEGER PRIMARY KEY,
+                rule_id TEXT NOT NULL,
+                workflow_id TEXT
+            );
+
+            CREATE TABLE component_relationships (
+                id INTEGER PRIMARY KEY,
+                workflow_name TEXT,
+                source_component TEXT NOT NULL,
+                target_component TEXT NOT NULL,
+                relationship_type TEXT NOT NULL DEFAULT 'depends_on',
+                strength INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE fix_applications (
+                id INTEGER PRIMARY KEY,
+                fix_id TEXT NOT NULL,
+                task_run_id TEXT NOT NULL,
+                outcome TEXT
+            );
+
+            CREATE TABLE step_finding_links (
+                id INTEGER PRIMARY KEY,
+                task_run_id TEXT NOT NULL,
+                step_name TEXT NOT NULL,
+                finding_id TEXT NOT NULL
+            );
+            "#,
+        )
+        .expect("Failed to create test tables");
+        conn
+    }
+
+    // =========================================================================
+    // Construction tests
+    // =========================================================================
+
+    #[test]
+    fn test_new_empty_graph() {
+        let kg = KnowledgeGraph::new(None);
+        assert_eq!(kg.graph.node_count(), 0);
+        assert_eq!(kg.graph.edge_count(), 0);
+        assert!(kg.workflow_scope.is_none());
+    }
+
+    #[test]
+    fn test_build_from_empty_db() {
+        let conn = setup_test_db();
+        let kg = KnowledgeGraph::build_from_db(&conn, None).expect("build_from_db failed");
+        assert_eq!(kg.graph.node_count(), 0);
+        assert_eq!(kg.graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn test_build_from_db_with_workflow() {
+        let conn = setup_test_db();
+        conn.execute(
+            "INSERT INTO unified_workflows (id, name, description, category, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["wf-1", "my-workflow", "A test workflow", "testing", "2026-01-01T00:00:00Z"],
+        )
+        .unwrap();
+
+        let kg = KnowledgeGraph::build_from_db(&conn, None).expect("build_from_db failed");
+        assert_eq!(kg.graph.node_count(), 1);
+
+        let summary = kg.summary();
+        assert_eq!(summary.nodes_by_kind.get("workflow"), Some(&1));
+    }
+
+    #[test]
+    fn test_build_from_db_with_task_run() {
+        let conn = setup_test_db();
+        conn.execute(
+            "INSERT INTO unified_workflows (id, name) VALUES (?1, ?2)",
+            params!["wf-1", "my-workflow"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["run-1", "build-task", "my-workflow", "completed", "2026-01-01T00:00:00Z"],
+        )
+        .unwrap();
+
+        let kg = KnowledgeGraph::build_from_db(&conn, None).expect("build_from_db failed");
+
+        let summary = kg.summary();
+        assert_eq!(summary.nodes_by_kind.get("workflow"), Some(&1));
+        assert_eq!(summary.nodes_by_kind.get("task_run"), Some(&1));
+        // BelongsTo edge from task_run -> workflow
+        assert_eq!(summary.edges_by_kind.get("belongs_to"), Some(&1));
+        assert_eq!(summary.total_edges, 1);
+    }
+
+    // =========================================================================
+    // Node management tests
+    // =========================================================================
+
+    #[test]
+    fn test_get_or_insert_node_dedup() {
+        let mut kg = KnowledgeGraph::new(None);
+        let node1 = GraphNode::new(GraphNodeKind::Workflow, "wf-1", "Workflow One");
+        let node2 = GraphNode::new(GraphNodeKind::Workflow, "wf-1", "Workflow One Duplicate");
+
+        let idx1 = kg.get_or_insert_node(node1);
+        let idx2 = kg.get_or_insert_node(node2);
+
+        assert_eq!(idx1, idx2, "Same key should return same NodeIndex");
+        assert_eq!(kg.graph.node_count(), 1, "Should not create duplicate node");
+
+        // The label should be the FIRST insert's label (dedup keeps original)
+        let node = kg.graph.node_weight(idx1).unwrap();
+        assert_eq!(node.label, "Workflow One");
+    }
+
+    #[test]
+    fn test_add_edge_by_key_missing_node() {
+        let mut kg = KnowledgeGraph::new(None);
+        let node = GraphNode::new(GraphNodeKind::Workflow, "wf-1", "Workflow");
+        kg.get_or_insert_node(node);
+
+        // Both missing
+        let result = kg.add_edge_by_key("bogus:1", "bogus:2", GraphEdge::new(GraphEdgeKind::Caused));
+        assert!(!result, "Should return false when both nodes missing");
+
+        // From exists, to missing
+        let result = kg.add_edge_by_key("workflow:wf-1", "bogus:2", GraphEdge::new(GraphEdgeKind::Caused));
+        assert!(!result, "Should return false when target node missing");
+
+        // From missing, to exists
+        let result = kg.add_edge_by_key("bogus:1", "workflow:wf-1", GraphEdge::new(GraphEdgeKind::Caused));
+        assert!(!result, "Should return false when source node missing");
+
+        // Both exist
+        let node2 = GraphNode::new(GraphNodeKind::Fix, "fix-1", "A Fix");
+        kg.get_or_insert_node(node2);
+        let result = kg.add_edge_by_key("workflow:wf-1", "fix:fix-1", GraphEdge::new(GraphEdgeKind::Caused));
+        assert!(result, "Should return true when both nodes exist");
+        assert_eq!(kg.graph.edge_count(), 1);
+    }
+
+    // =========================================================================
+    // Graph query tests
+    // =========================================================================
+
+    #[test]
+    fn test_summary() {
+        let mut kg = KnowledgeGraph::new(None);
+
+        // Insert 2 workflows, 1 fix, 1 finding
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Workflow, "wf-1", "WF1"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Workflow, "wf-2", "WF2"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-1", "Fix1"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "Finding1"));
+
+        // Add 2 edges
+        kg.add_edge_by_key("finding:f-1", "fix:fix-1", GraphEdge::new(GraphEdgeKind::Caused));
+        kg.add_edge_by_key("fix:fix-1", "finding:f-1", GraphEdge::new(GraphEdgeKind::Resolved));
+
+        let summary = kg.summary();
+        assert_eq!(summary.total_nodes, 4);
+        assert_eq!(summary.total_edges, 2);
+        assert_eq!(summary.nodes_by_kind.get("workflow"), Some(&2));
+        assert_eq!(summary.nodes_by_kind.get("fix"), Some(&1));
+        assert_eq!(summary.nodes_by_kind.get("finding"), Some(&1));
+        assert_eq!(summary.edges_by_kind.get("caused"), Some(&1));
+        assert_eq!(summary.edges_by_kind.get("resolved"), Some(&1));
+    }
+
+    #[test]
+    fn test_search_nodes() {
+        let mut kg = KnowledgeGraph::new(None);
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "error in login flow"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-2", "timeout in API call"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-1", "fix for login error"));
+
+        let results = kg.search_nodes("login", 10);
+        assert_eq!(results.len(), 2);
+        // Both the finding and the fix mention "login"
+        let labels: Vec<&str> = results.iter().map(|n| n.label.as_str()).collect();
+        assert!(labels.contains(&"error in login flow"));
+        assert!(labels.contains(&"fix for login error"));
+    }
+
+    #[test]
+    fn test_search_nodes_case_insensitive() {
+        let mut kg = KnowledgeGraph::new(None);
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "error in login flow"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-2", "timeout issue"));
+
+        // Search uppercase "ERROR" should match lowercase "error"
+        let results = kg.search_nodes("ERROR", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].label, "error in login flow");
+    }
+
+    #[test]
+    fn test_find_paths_direct() {
+        let mut kg = KnowledgeGraph::new(None);
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "Finding"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-1", "Fix"));
+        kg.add_edge_by_key("finding:f-1", "fix:fix-1", GraphEdge::new(GraphEdgeKind::Caused));
+
+        let paths = kg.find_paths("finding:f-1", "fix:fix-1", 5);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].len(), 1, "Path should have 1 edge");
+        assert_eq!(paths[0].nodes.len(), 2, "Path should have 2 nodes");
+        assert_eq!(paths[0].edges[0].kind, GraphEdgeKind::Caused);
+    }
+
+    #[test]
+    fn test_find_paths_no_path() {
+        let mut kg = KnowledgeGraph::new(None);
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "Finding"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-1", "Fix"));
+        // No edge between them
+
+        let paths = kg.find_paths("finding:f-1", "fix:fix-1", 5);
+        assert!(paths.is_empty(), "Disconnected nodes should yield no paths");
+    }
+
+    #[test]
+    fn test_find_paths_bounded_depth() {
+        // Build chain: A -> B -> C -> D -> E -> F (depth 5)
+        let mut kg = KnowledgeGraph::new(None);
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "a", "A"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "b", "B"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "c", "C"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "d", "D"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "e", "E"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "f", "F"));
+
+        kg.add_edge_by_key("finding:a", "finding:b", GraphEdge::new(GraphEdgeKind::Caused));
+        kg.add_edge_by_key("finding:b", "finding:c", GraphEdge::new(GraphEdgeKind::Caused));
+        kg.add_edge_by_key("finding:c", "finding:d", GraphEdge::new(GraphEdgeKind::Caused));
+        kg.add_edge_by_key("finding:d", "finding:e", GraphEdge::new(GraphEdgeKind::Caused));
+        kg.add_edge_by_key("finding:e", "fix:f", GraphEdge::new(GraphEdgeKind::Caused));
+
+        // Path exists at depth 5 but we limit to 3 — the BFS expands up to
+        // max_depth+1 nodes in the path before checking the target, so
+        // max_depth=3 can reach at most 4 edges. 5 edges should be unreachable.
+        let paths = kg.find_paths("finding:a", "fix:f", 3);
+        assert!(paths.is_empty(), "Path at depth 5 should not be found with max_depth=3");
+
+        // With depth 5, it should be found
+        let paths = kg.find_paths("finding:a", "fix:f", 5);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].len(), 5);
+    }
+
+    #[test]
+    fn test_neighborhood() {
+        let mut kg = KnowledgeGraph::new(None);
+        let center = GraphNode::new(GraphNodeKind::Fix, "fix-1", "Center Fix");
+        let n1 = GraphNode::new(GraphNodeKind::Finding, "f-1", "Finding 1");
+        let n2 = GraphNode::new(GraphNodeKind::Finding, "f-2", "Finding 2");
+        let n3 = GraphNode::new(GraphNodeKind::TaskRun, "run-1", "Run 1");
+
+        kg.get_or_insert_node(center);
+        kg.get_or_insert_node(n1);
+        kg.get_or_insert_node(n2);
+        kg.get_or_insert_node(n3);
+
+        // Outgoing from center
+        kg.add_edge_by_key("fix:fix-1", "finding:f-1", GraphEdge::new(GraphEdgeKind::Resolved));
+        kg.add_edge_by_key("fix:fix-1", "finding:f-2", GraphEdge::new(GraphEdgeKind::Resolved));
+        // Incoming to center
+        kg.add_edge_by_key("task_run:run-1", "fix:fix-1", GraphEdge::new(GraphEdgeKind::AppliedIn));
+
+        let hood = kg.neighborhood("fix:fix-1", 1).expect("Should find neighborhood");
+        assert_eq!(hood.center.entity_id, "fix-1");
+        assert_eq!(hood.neighbors.len(), 3, "Should have 3 neighbors at depth 1");
+
+        let neighbor_ids: HashSet<String> = hood
+            .neighbors
+            .iter()
+            .map(|n| n.node.entity_id.clone())
+            .collect();
+        assert!(neighbor_ids.contains("f-1"));
+        assert!(neighbor_ids.contains("f-2"));
+        assert!(neighbor_ids.contains("run-1"));
+    }
+
+    #[test]
+    fn test_neighborhood_depth_2() {
+        // Chain: A -> B -> C
+        let mut kg = KnowledgeGraph::new(None);
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "a", "A"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "b", "B"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "c", "C"));
+
+        kg.add_edge_by_key("finding:a", "finding:b", GraphEdge::new(GraphEdgeKind::Caused));
+        kg.add_edge_by_key("finding:b", "finding:c", GraphEdge::new(GraphEdgeKind::Caused));
+
+        // depth=1 from A should only reach B
+        let hood1 = kg.neighborhood("finding:a", 1).unwrap();
+        assert_eq!(hood1.neighbors.len(), 1);
+        assert_eq!(hood1.neighbors[0].node.entity_id, "b");
+        assert_eq!(hood1.neighbors[0].distance, 1);
+
+        // depth=2 from A should reach both B and C
+        let hood2 = kg.neighborhood("finding:a", 2).unwrap();
+        assert_eq!(hood2.neighbors.len(), 2);
+
+        let neighbor_ids: HashSet<String> = hood2
+            .neighbors
+            .iter()
+            .map(|n| n.node.entity_id.clone())
+            .collect();
+        assert!(neighbor_ids.contains("b"));
+        assert!(neighbor_ids.contains("c"));
+
+        // Verify distances
+        let c_entry = hood2
+            .neighbors
+            .iter()
+            .find(|n| n.node.entity_id == "c")
+            .unwrap();
+        assert_eq!(c_entry.distance, 2);
+    }
+
+    // =========================================================================
+    // Traversal tests
+    // =========================================================================
+
+    #[test]
+    fn test_trace_root_causes() {
+        // Chain: error -[Caused]-> finding -[Caused]-> fix
+        // Tracing root causes from fix should find error at the root.
+        let mut kg = KnowledgeGraph::new(None);
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Error, "err-1", "Root Error"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "Intermediate Finding"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-1", "Leaf Fix"));
+
+        // error caused finding, finding caused fix
+        kg.add_edge_by_key("error:err-1", "finding:f-1", GraphEdge::new(GraphEdgeKind::Caused));
+        kg.add_edge_by_key("finding:f-1", "fix:fix-1", GraphEdge::new(GraphEdgeKind::Caused));
+
+        let traces = kg.trace_root_causes("fix:fix-1", 5);
+        assert!(!traces.is_empty(), "Should find at least one root cause path");
+
+        // The path should go from root (error) to the fix
+        let first = &traces[0];
+        assert_eq!(first.nodes.first().unwrap().entity_id, "err-1");
+        assert_eq!(first.nodes.last().unwrap().entity_id, "fix-1");
+    }
+
+    #[test]
+    fn test_trace_impact() {
+        // Chain: fix -[Resolved]-> finding
+        // Tracing impact from fix should find finding.
+        let mut kg = KnowledgeGraph::new(None);
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-1", "Applied Fix"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "Resolved Finding"));
+
+        kg.add_edge_by_key("fix:fix-1", "finding:f-1", GraphEdge::new(GraphEdgeKind::Resolved));
+
+        let traces = kg.trace_impact("fix:fix-1", 5);
+        assert_eq!(traces.len(), 1);
+
+        let path = &traces[0];
+        assert_eq!(path.nodes.first().unwrap().entity_id, "fix-1");
+        assert_eq!(path.nodes.last().unwrap().entity_id, "f-1");
+        assert_eq!(path.edges[0].kind, GraphEdgeKind::Resolved);
+    }
+
+    #[test]
+    fn test_rank_effectiveness() {
+        let mut kg = KnowledgeGraph::new(None);
+
+        // fix-good: 2 Resolved edges, no regressions
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-good", "Good Fix"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "F1"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-2", "F2"));
+        kg.add_edge_by_key("fix:fix-good", "finding:f-1", GraphEdge::new(GraphEdgeKind::Resolved));
+        kg.add_edge_by_key("fix:fix-good", "finding:f-2", GraphEdge::new(GraphEdgeKind::Resolved));
+
+        // fix-bad: 0 Resolved edges, just 1 BelongsTo (non-scoring)
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-bad", "Bad Fix"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::TaskRun, "run-1", "Run"));
+        kg.add_edge_by_key("fix:fix-bad", "task_run:run-1", GraphEdge::new(GraphEdgeKind::AppliedIn));
+
+        let rankings = kg.rank_effectiveness("fix");
+        assert_eq!(rankings.len(), 2);
+
+        // fix-good should be ranked first (score = 2*2/2 = 2.0)
+        assert_eq!(rankings[0].0, "fix:fix-good");
+        assert!(
+            rankings[0].1 > rankings[1].1,
+            "Good fix should rank higher than bad fix: {} vs {}",
+            rankings[0].1,
+            rankings[1].1
+        );
+    }
+
+    // =========================================================================
+    // Similarity tests
+    // =========================================================================
+
+    #[test]
+    fn test_find_similar_fixes() {
+        let mut kg = KnowledgeGraph::new(None);
+
+        // Shared neighbors
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-shared-1", "Shared1"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-shared-2", "Shared2"));
+        // Unique neighbor
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-unique", "Unique"));
+
+        // fix-a connects to shared-1, shared-2, unique (3 neighbors)
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-a", "Fix A"));
+        kg.add_edge_by_key("fix:fix-a", "finding:f-shared-1", GraphEdge::new(GraphEdgeKind::Resolved));
+        kg.add_edge_by_key("fix:fix-a", "finding:f-shared-2", GraphEdge::new(GraphEdgeKind::Resolved));
+        kg.add_edge_by_key("fix:fix-a", "finding:f-unique", GraphEdge::new(GraphEdgeKind::Resolved));
+
+        // fix-b connects to shared-1, shared-2 (2 neighbors, both shared)
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-b", "Fix B"));
+        kg.add_edge_by_key("fix:fix-b", "finding:f-shared-1", GraphEdge::new(GraphEdgeKind::Resolved));
+        kg.add_edge_by_key("fix:fix-b", "finding:f-shared-2", GraphEdge::new(GraphEdgeKind::Resolved));
+
+        // Jaccard(fix-a, fix-b) = |{shared1, shared2}| / |{shared1, shared2, unique}| = 2/3 ≈ 0.667
+        let similar = kg.find_similar_fixes("fix:fix-a", 0.5);
+        assert_eq!(similar.len(), 1);
+        assert_eq!(similar[0].0, "fix:fix-b");
+        assert!(
+            similar[0].1 > 0.5 && similar[0].1 < 0.8,
+            "Jaccard should be ~0.667, got {}",
+            similar[0].1
+        );
+    }
+
+    #[test]
+    fn test_find_similar_fixes_no_match() {
+        let mut kg = KnowledgeGraph::new(None);
+
+        // fix-a has its own neighbors
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-a", "Fix A"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "Finding 1"));
+        kg.add_edge_by_key("fix:fix-a", "finding:f-1", GraphEdge::new(GraphEdgeKind::Resolved));
+
+        // fix-b has completely different neighbors
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-b", "Fix B"));
+        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-2", "Finding 2"));
+        kg.add_edge_by_key("fix:fix-b", "finding:f-2", GraphEdge::new(GraphEdgeKind::Resolved));
+
+        // Jaccard = 0/2 = 0.0, so nothing should meet min_similarity 0.1
+        let similar = kg.find_similar_fixes("fix:fix-a", 0.1);
+        assert!(
+            similar.is_empty(),
+            "Disjoint neighbor sets should produce no similar fixes"
+        );
+    }
 }

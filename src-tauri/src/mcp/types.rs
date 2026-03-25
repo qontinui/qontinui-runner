@@ -86,6 +86,8 @@ pub struct ApiState {
     pub doctor_handle: Option<DoctorHandle>,
     /// Instance manager for spawning/stopping secondary runner processes.
     pub instance_manager: Arc<crate::instance_manager::InstanceManager>,
+    /// UI Bridge event sequence counter (monotonically increasing per runner lifetime)
+    pub ui_bridge_event_sequence: std::sync::atomic::AtomicI64,
 }
 
 /// Response for API endpoints

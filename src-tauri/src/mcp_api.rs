@@ -179,6 +179,7 @@ pub fn create_router(
         doctor_handle: None, // Doctor handle accessed via app_state.doctor_handle when needed
         started_at: std::time::Instant::now(),
         instance_manager,
+        ui_bridge_event_sequence: std::sync::atomic::AtomicI64::new(0),
     });
 
     // Set up UI Bridge response listener
@@ -411,7 +412,7 @@ pub fn create_router(
 
     Router::new()
         // GraphQL endpoints (typed API alongside REST)
-        .route("/graphql", post(crate::graphql::schema::graphql_handler))
+        .route("/graphql", get(crate::graphql::schema::graphiql_handler).post(crate::graphql::schema::graphql_handler))
         .route_service(
             "/graphql/ws",
             GraphQLSubscription::new(graphql_schema.clone()),
@@ -494,6 +495,7 @@ pub fn create_router(
         .merge(crate::mcp::token_analytics::routes())
         .merge(crate::mcp::otel_status::routes())
         .merge(crate::mcp::container_status::routes())
+        .merge(crate::mcp::knowledge_acquisition_api::routes())
         .route("/cloud-relay/start", post(cloud_relay_start))
         .route("/cloud-relay/status", get(cloud_relay_status))
         .layer(axum::middleware::from_fn(

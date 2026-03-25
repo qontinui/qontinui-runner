@@ -2,7 +2,7 @@
 //!
 //! Provides HTTP endpoints for the LLM Observability dashboard,
 //! exposing aggregated cost, token, and latency analytics from the
-//! `phase_token_usage` table.
+//! `phase_token_usage` table. Uses PostgreSQL when available, falls back to SQLite.
 
 use axum::{
     extract::{Query, State},
@@ -31,26 +31,29 @@ pub struct TimeRangeParams {
 }
 
 // ============================================================================
-// Handler functions
+// Handler functions (PG-primary, SQLite fallback via spawn_blocking)
 // ============================================================================
 
 /// GET /analytics/token-usage/summary
-///
-/// Returns an aggregate summary of token usage for the given time range.
 pub async fn get_token_usage_summary(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<TimeRangeParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let summary = state
-        .app_state
-        .checkpoint_db
-        .get_token_usage_summary(days)
-        .map_err(|e| {
-            error!("Failed to get token usage summary: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e)
-        })?;
+    let summary = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_token_usage_summary(days).await
+    } else {
+        let db = state.app_state.checkpoint_db.clone();
+        tokio::task::spawn_blocking(move || db.get_token_usage_summary(days))
+            .await
+            .map_err(|e| format!("spawn_blocking error: {}", e))
+            .and_then(|r| r)
+    }
+    .map_err(|e| {
+        error!("Failed to get token usage summary: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -60,22 +63,25 @@ pub async fn get_token_usage_summary(
 }
 
 /// GET /analytics/token-usage/daily
-///
-/// Returns daily cost breakdown for the given time range.
 pub async fn get_daily_cost(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<TimeRangeParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = state
-        .app_state
-        .checkpoint_db
-        .get_daily_cost(days)
-        .map_err(|e| {
-            error!("Failed to get daily cost: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e)
-        })?;
+    let rows = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_daily_cost(days).await
+    } else {
+        let db = state.app_state.checkpoint_db.clone();
+        tokio::task::spawn_blocking(move || db.get_daily_cost(days))
+            .await
+            .map_err(|e| format!("spawn_blocking error: {}", e))
+            .and_then(|r| r)
+    }
+    .map_err(|e| {
+        error!("Failed to get daily cost: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -86,22 +92,25 @@ pub async fn get_daily_cost(
 }
 
 /// GET /analytics/token-usage/by-model
-///
-/// Returns cost breakdown by AI model for the given time range.
 pub async fn get_cost_by_model(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<TimeRangeParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = state
-        .app_state
-        .checkpoint_db
-        .get_cost_by_model(days)
-        .map_err(|e| {
-            error!("Failed to get cost by model: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e)
-        })?;
+    let rows = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_cost_by_model(days).await
+    } else {
+        let db = state.app_state.checkpoint_db.clone();
+        tokio::task::spawn_blocking(move || db.get_cost_by_model(days))
+            .await
+            .map_err(|e| format!("spawn_blocking error: {}", e))
+            .and_then(|r| r)
+    }
+    .map_err(|e| {
+        error!("Failed to get cost by model: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -112,22 +121,25 @@ pub async fn get_cost_by_model(
 }
 
 /// GET /analytics/token-usage/by-phase
-///
-/// Returns cost breakdown by workflow phase for the given time range.
 pub async fn get_cost_by_phase(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<TimeRangeParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = state
-        .app_state
-        .checkpoint_db
-        .get_cost_by_phase(days)
-        .map_err(|e| {
-            error!("Failed to get cost by phase: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e)
-        })?;
+    let rows = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_cost_by_phase(days).await
+    } else {
+        let db = state.app_state.checkpoint_db.clone();
+        tokio::task::spawn_blocking(move || db.get_cost_by_phase(days))
+            .await
+            .map_err(|e| format!("spawn_blocking error: {}", e))
+            .and_then(|r| r)
+    }
+    .map_err(|e| {
+        error!("Failed to get cost by phase: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -138,22 +150,25 @@ pub async fn get_cost_by_phase(
 }
 
 /// GET /analytics/token-usage/by-provider
-///
-/// Returns latency statistics by AI provider for the given time range.
 pub async fn get_provider_latency(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<TimeRangeParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = state
-        .app_state
-        .checkpoint_db
-        .get_provider_latency(days)
-        .map_err(|e| {
-            error!("Failed to get provider latency: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e)
-        })?;
+    let rows = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_provider_latency(days).await
+    } else {
+        let db = state.app_state.checkpoint_db.clone();
+        tokio::task::spawn_blocking(move || db.get_provider_latency(days))
+            .await
+            .map_err(|e| format!("spawn_blocking error: {}", e))
+            .and_then(|r| r)
+    }
+    .map_err(|e| {
+        error!("Failed to get provider latency: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -164,8 +179,6 @@ pub async fn get_provider_latency(
 }
 
 /// GET /analytics/token-usage/task-runs
-///
-/// Returns per-task-run cost breakdown, ordered by total cost descending.
 pub async fn get_task_run_costs(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<TimeRangeParams>,
@@ -173,14 +186,19 @@ pub async fn get_task_run_costs(
     let days = params.days.unwrap_or(7);
     let limit = params.limit.unwrap_or(50);
 
-    let rows = state
-        .app_state
-        .checkpoint_db
-        .get_task_run_costs(days, limit)
-        .map_err(|e| {
-            error!("Failed to get task run costs: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e)
-        })?;
+    let rows = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_task_run_costs(days, limit).await
+    } else {
+        let db = state.app_state.checkpoint_db.clone();
+        tokio::task::spawn_blocking(move || db.get_task_run_costs(days, limit))
+            .await
+            .map_err(|e| format!("spawn_blocking error: {}", e))
+            .and_then(|r| r)
+    }
+    .map_err(|e| {
+        error!("Failed to get task run costs: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -194,6 +212,64 @@ pub async fn get_task_run_costs(
 // ============================================================================
 // Route registration
 // ============================================================================
+
+/// GET /analytics/token-usage/by-target-app
+pub async fn get_cost_by_target_app(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<TimeRangeParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let days = params.days.unwrap_or(7);
+
+    let rows = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_cost_by_target_app(days).await
+    } else {
+        let db = state.app_state.checkpoint_db.clone();
+        tokio::task::spawn_blocking(move || db.get_cost_by_target_app(days))
+            .await
+            .map_err(|e| format!("spawn_blocking error: {}", e))
+            .and_then(|r| r)
+    }
+    .map_err(|e| {
+        error!("Failed to get cost by target app: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": rows,
+        "days": days,
+        "count": rows.len(),
+    })))
+}
+
+/// GET /analytics/token-usage/by-page
+pub async fn get_cost_by_target_page(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<TimeRangeParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let days = params.days.unwrap_or(7);
+
+    let rows = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_cost_by_target_page(days).await
+    } else {
+        let db = state.app_state.checkpoint_db.clone();
+        tokio::task::spawn_blocking(move || db.get_cost_by_target_page(days))
+            .await
+            .map_err(|e| format!("spawn_blocking error: {}", e))
+            .and_then(|r| r)
+    }
+    .map_err(|e| {
+        error!("Failed to get cost by target page: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": rows,
+        "days": days,
+        "count": rows.len(),
+    })))
+}
 
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
@@ -211,5 +287,13 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/analytics/token-usage/task-runs",
             get(get_task_run_costs),
+        )
+        .route(
+            "/analytics/token-usage/by-target-app",
+            get(get_cost_by_target_app),
+        )
+        .route(
+            "/analytics/token-usage/by-page",
+            get(get_cost_by_target_page),
         )
 }

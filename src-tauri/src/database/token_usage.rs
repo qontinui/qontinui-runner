@@ -26,12 +26,34 @@ impl CheckpointDb {
         cost_cents: u64,
         duration_ms: Option<u64>,
     ) -> Result<(), String> {
+        self.create_phase_token_usage_with_target(
+            task_run_id, phase, stage_index, iteration, model_used, provider_used,
+            input_tokens, output_tokens, cost_cents, duration_ms, None, None,
+        )
+    }
+
+    /// Record token usage with optional UI Bridge target app attribution.
+    pub fn create_phase_token_usage_with_target(
+        &self,
+        task_run_id: &str,
+        phase: &str,
+        stage_index: Option<u32>,
+        iteration: Option<u32>,
+        model_used: Option<&str>,
+        provider_used: Option<&str>,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_cents: u64,
+        duration_ms: Option<u64>,
+        target_app: Option<&str>,
+        target_page_url: Option<&str>,
+    ) -> Result<(), String> {
         let conn = self.get_conn()?;
         conn.execute(
             r#"INSERT INTO phase_token_usage
                 (task_run_id, phase, stage_index, iteration, model_used, provider_used,
-                 input_tokens, output_tokens, cost_cents, duration_ms)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+                 input_tokens, output_tokens, cost_cents, duration_ms, target_app, target_page_url)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
             params![
                 task_run_id,
                 phase,
@@ -43,6 +65,8 @@ impl CheckpointDb {
                 output_tokens as i64,
                 cost_cents as i64,
                 duration_ms.map(|v| v as i64),
+                target_app,
+                target_page_url,
             ],
         )
         .map_err(|e| format!("Failed to insert phase token usage: {}", e))?;
@@ -122,4 +146,55 @@ impl CheckpointDb {
         .map_err(|e| format!("Failed to update task run token totals: {}", e))?;
         Ok(())
     }
+
+    /// Read all phase_token_usage rows for one-time migration to PostgreSQL.
+    pub fn get_all_phase_token_usage_for_migration(
+        &self,
+    ) -> Result<Vec<MigrationTokenUsageRow>, String> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT task_run_id, phase, stage_index, iteration, model_used, provider_used,
+                       input_tokens, output_tokens, cost_cents, duration_ms, created_at
+                FROM phase_token_usage
+                ORDER BY created_at ASC"#,
+            )
+            .map_err(|e| format!("Failed to prepare migration query: {}", e))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(MigrationTokenUsageRow {
+                    task_run_id: row.get(0)?,
+                    phase: row.get(1)?,
+                    stage_index: row.get::<_, Option<i64>>(2)?.map(|v| v as u32),
+                    iteration: row.get::<_, Option<i64>>(3)?.map(|v| v as u32),
+                    model_used: row.get(4)?,
+                    provider_used: row.get(5)?,
+                    input_tokens: row.get::<_, i64>(6)? as u64,
+                    output_tokens: row.get::<_, i64>(7)? as u64,
+                    cost_cents: row.get::<_, i64>(8)? as u64,
+                    duration_ms: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+                    created_at: row.get(10)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query migration data: {}", e))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect migration rows: {}", e))
+    }
+}
+
+/// Row type for one-time SQLite → PG data migration.
+pub struct MigrationTokenUsageRow {
+    pub task_run_id: String,
+    pub phase: String,
+    pub stage_index: Option<u32>,
+    pub iteration: Option<u32>,
+    pub model_used: Option<String>,
+    pub provider_used: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_cents: u64,
+    pub duration_ms: Option<u64>,
+    pub created_at: String,
 }

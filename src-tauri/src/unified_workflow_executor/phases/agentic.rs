@@ -17,9 +17,10 @@ use crate::AppState;
 use super::super::output_parser;
 use super::super::types::{get_parent_task_id, AgenticOutcome, LoopConfig};
 use super::{
-    build_compressed_iteration_history, build_execution_timing_context,
+    build_compressed_iteration_history, build_execution_timing_context, build_llm_metrics,
     execute_prompt_response_mode, extract_and_preread_failure_files,
-    preread_previously_edited_files, record_phase_token_usage, REFLECTION_MODE_PREAMBLE,
+    get_active_sdk_app_name, preread_previously_edited_files, record_phase_token_usage,
+    record_phase_token_usage_with_target, REFLECTION_MODE_PREAMBLE,
 };
 
 // =============================================================================
@@ -252,17 +253,29 @@ impl AgenticExecutor {
                 {
                     Ok(resp) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
-                        record_phase_token_usage(
-                            &self.checkpoint_db,
-                            &config.execution_id,
-                            "agentic",
-                            config.stage_index,
-                            Some(iteration),
+                        {
+                            let target_app = get_active_sdk_app_name(&self.app_state);
+                            record_phase_token_usage_with_target(
+                                &self.checkpoint_db,
+                                self.app_state.pg_db.as_ref(),
+                                &config.execution_id,
+                                "agentic",
+                                config.stage_index,
+                                Some(iteration),
+                                step_model.as_deref(),
+                                step_provider.as_deref(),
+                                resp.input_tokens,
+                                resp.output_tokens,
+                                Some(duration_ms),
+                                target_app.as_deref(),
+                                None,
+                            );
+                        }
+                        let resp_llm_metrics = build_llm_metrics(
                             step_model.as_deref(),
                             step_provider.as_deref(),
                             resp.input_tokens,
                             resp.output_tokens,
-                            Some(duration_ms),
                         );
                         let output = resp.output;
                         info!(
@@ -304,6 +317,7 @@ impl AgenticExecutor {
                                     "phase": "agentic",
                                     "iteration": iteration,
                                     "success": true,
+                                    "llm_metrics": resp_llm_metrics,
                                 }))
                                 .unwrap_or_default(),
                             ),
@@ -930,6 +944,37 @@ impl AgenticExecutor {
             warn!("Failed to save agentic step completion checkpoint: {}", e);
         }
 
+        // Record token usage for the main AI session and build LLM metrics
+        let (session_input_tokens, session_output_tokens) = outcome.token_usage();
+        let session_model = config
+            .resolve_model_for_phase("agentic");
+        let session_provider = config
+            .resolve_provider_for_phase("agentic");
+        {
+            let target_app = get_active_sdk_app_name(&self.app_state);
+            record_phase_token_usage_with_target(
+                &self.checkpoint_db,
+                self.app_state.pg_db.as_ref(),
+                &config.execution_id,
+                "agentic",
+                config.stage_index,
+                Some(iteration),
+                session_model.as_deref(),
+                session_provider.as_deref(),
+                session_input_tokens,
+                session_output_tokens,
+                Some(duration_ms.max(0) as u64),
+                target_app.as_deref(),
+                None,
+            );
+        }
+        let session_llm_metrics = build_llm_metrics(
+            session_model.as_deref(),
+            session_provider.as_deref(),
+            session_input_tokens,
+            session_output_tokens,
+        );
+
         // Mark the workflow AI session as completed/failed and clean up partial output
         {
             let session_status = match &outcome {
@@ -997,6 +1042,7 @@ impl AgenticExecutor {
                     "phase": "agentic",
                     "iteration": iteration,
                     "success": matches!(&outcome, AgenticOutcome::Success { .. }),
+                    "llm_metrics": session_llm_metrics,
                 }))
                 .unwrap_or_default(),
             ),

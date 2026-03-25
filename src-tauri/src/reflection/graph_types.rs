@@ -27,6 +27,8 @@ pub enum GraphNodeKind {
     Knowledge,
     StepDef,
     PipelineAgent,
+    /// A UI Bridge element that was interacted with during automation
+    UIElement,
 }
 
 impl GraphNodeKind {
@@ -44,6 +46,7 @@ impl GraphNodeKind {
             Self::Knowledge => "knowledge",
             Self::StepDef => "step_def",
             Self::PipelineAgent => "pipeline_agent",
+            Self::UIElement => "ui_element",
         }
     }
 }
@@ -121,6 +124,8 @@ pub enum GraphEdgeKind {
     BuiltBy,
     /// Step touches a component (file/module)
     TouchesComponent,
+    /// Task run interacted with a UI Bridge element
+    InteractedWith,
 }
 
 impl GraphEdgeKind {
@@ -140,6 +145,7 @@ impl GraphEdgeKind {
             Self::GeneratedBy => "generated_by",
             Self::BuiltBy => "built_by",
             Self::TouchesComponent => "touches_component",
+            Self::InteractedWith => "interacted_with",
         }
     }
 }

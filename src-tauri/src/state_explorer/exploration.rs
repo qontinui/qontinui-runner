@@ -27,6 +27,8 @@ pub enum ExplorationStrategy {
     RandomWalk,
     /// Explore only specific states/transitions provided in config
     Targeted,
+    /// Pre-seeded exploration: skip known states, flag flaky element transitions
+    Seeded,
 }
 
 impl ExplorationStrategy {
@@ -38,6 +40,7 @@ impl ExplorationStrategy {
             "regression" => Self::Regression,
             "random_walk" | "randomwalk" | "random" => Self::RandomWalk,
             "targeted" => Self::Targeted,
+            "seeded" => Self::Seeded,
             _ => Self::Exhaustive,
         }
     }
@@ -324,6 +327,8 @@ pub struct StateExplorer {
     target_transitions: HashSet<String>,
     rng: Option<StdRng>,
     failure_history: HashSet<String>, // States that previously failed
+    known_states: HashSet<String>,    // States discovered in prior runs (for Seeded strategy)
+    flaky_elements: HashSet<String>,  // Element IDs with high failure rates
 }
 
 impl StateExplorer {
@@ -337,6 +342,8 @@ impl StateExplorer {
             target_transitions: HashSet::new(),
             rng: None,
             failure_history: HashSet::new(),
+            known_states: HashSet::new(),
+            flaky_elements: HashSet::new(),
         }
     }
 
@@ -365,6 +372,20 @@ impl StateExplorer {
         self
     }
 
+    /// Set known states from prior runs (for Seeded strategy).
+    /// Known states are skipped during exploration, reducing time.
+    pub fn with_known_states(mut self, states: HashSet<String>) -> Self {
+        self.known_states = states;
+        self
+    }
+
+    /// Set flaky element IDs (for Seeded strategy).
+    /// Transitions involving flaky elements get higher path costs.
+    pub fn with_flaky_elements(mut self, elements: HashSet<String>) -> Self {
+        self.flaky_elements = elements;
+        self
+    }
+
     /// Generate an exploration path based on the strategy
     pub fn generate_path(&mut self) -> ExplorationPath {
         match self.strategy {
@@ -373,6 +394,7 @@ impl StateExplorer {
             ExplorationStrategy::Regression => self.regression_path(),
             ExplorationStrategy::RandomWalk => self.random_walk_path(),
             ExplorationStrategy::Targeted => self.targeted_path(),
+            ExplorationStrategy::Seeded => self.seeded_path(),
         }
     }
 
@@ -671,6 +693,101 @@ impl StateExplorer {
         }
 
         path.estimated_cost = (path.states.len() + path.transitions.len()) as f64;
+        path
+    }
+
+    /// Seeded exploration: like Exhaustive but skips known states and penalizes
+    /// transitions involving flaky elements. This reduces re-discovery time on
+    /// subsequent runs while still discovering new states.
+    fn seeded_path(&self) -> ExplorationPath {
+        let mut path = ExplorationPath {
+            states: Vec::new(),
+            transitions: Vec::new(),
+            estimated_cost: 0.0,
+            strategy: ExplorationStrategy::Seeded,
+        };
+
+        let mut visited = HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        let mut sequence = 0u32;
+
+        // Start with initial states (never skip those)
+        for (state_id, state_info) in &self.graph.states {
+            if state_info.is_initial {
+                visited.insert(state_id.clone());
+                path.states.push(StateVisit {
+                    state_id: state_id.clone(),
+                    state_name: state_info.name.clone(),
+                    arrived_via: Some("initial".to_string()),
+                    depth: 0,
+                    sequence_index: sequence,
+                    is_critical: state_info.is_critical,
+                    priority: state_info.priority,
+                });
+                sequence += 1;
+                queue.push_back((state_id.clone(), 0u32));
+            }
+        }
+
+        // BFS, but skip known states from prior runs
+        let mut transition_sequence = 0u32;
+        while let Some((current_state, depth)) = queue.pop_front() {
+            if self.max_states > 0 && path.states.len() as u32 >= self.max_states {
+                break;
+            }
+
+            for (transition_id, transition) in &self.graph.transitions {
+                if transition.from_state_id != current_state {
+                    continue;
+                }
+                let next = &transition.to_state_id;
+                if visited.contains(next) {
+                    continue;
+                }
+                visited.insert(next.clone());
+
+                // Skip states we already know from prior runs
+                if self.known_states.contains(next) {
+                    continue;
+                }
+
+                // Calculate cost — higher for transitions with flaky elements
+                let flaky_penalty = if self.flaky_elements.iter().any(|e| {
+                    transition.from_state_id.contains(e)
+                        || transition.to_state_id.contains(e)
+                }) {
+                    3.0 // Triple cost for flaky paths
+                } else {
+                    1.0
+                };
+
+                if let Some(state_info) = self.graph.states.get(next) {
+                    path.states.push(StateVisit {
+                        state_id: next.clone(),
+                        state_name: state_info.name.clone(),
+                        arrived_via: Some(transition_id.clone()),
+                        depth: depth + 1,
+                        sequence_index: sequence,
+                        is_critical: state_info.is_critical,
+                        priority: state_info.priority,
+                    });
+                    sequence += 1;
+                }
+
+                path.transitions.push(TransitionStep {
+                    transition_id: transition_id.clone(),
+                    from_state_id: transition.from_state_id.clone(),
+                    to_state_id: transition.to_state_id.clone(),
+                    sequence_index: transition_sequence,
+                    verify: true,
+                });
+                transition_sequence += 1;
+                path.estimated_cost += flaky_penalty;
+
+                queue.push_back((next.clone(), depth + 1));
+            }
+        }
+
         path
     }
 }

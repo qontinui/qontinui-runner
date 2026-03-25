@@ -529,6 +529,16 @@ impl UiBridgeCircuitBreaker {
         let cutoff = now.saturating_sub(self.window_ms);
         timestamps.iter().filter(|&&ts| ts >= cutoff).count() as u32
     }
+
+    /// Get the configured failure threshold.
+    pub fn get_threshold(&self) -> u32 {
+        self.threshold
+    }
+
+    /// Get the configured cooldown period in milliseconds.
+    pub fn get_cooldown_ms(&self) -> u64 {
+        self.cooldown_ms
+    }
 }
 
 /// Send a UI Bridge request and wait for the response synchronously.
@@ -835,15 +845,28 @@ pub async fn ui_bridge_get_element_handler(
 }
 
 /// Execute an action on an element.
+/// Optional query parameters for action execution (e.g., task_run_id for persistence).
+#[derive(Debug, Deserialize, Default)]
+pub struct ActionQueryParams {
+    /// When provided, the action event is persisted to ui_bridge_events for cross-run analysis.
+    #[serde(default)]
+    pub task_run_id: Option<i64>,
+}
+
 pub async fn ui_bridge_execute_action_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
+    Query(query): Query<ActionQueryParams>,
     Json(request): Json<UIBridgeActionRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!(
         "UI Bridge API: Executing action {} on element {}",
         request.action, id
     );
+
+    let action_name = request.action.clone();
+    let task_run_id = query.task_run_id;
+    let start = Instant::now();
 
     // Merge flat top-level fields into params so actions like drag work with
     // both {"action":"drag","params":{"targetPosition":{...}}} and
@@ -864,13 +887,72 @@ pub async fn ui_bridge_execute_action_handler(
     let payload = serde_json::json!({
         "elementId": id,
         "action": {
-            "action": request.action,
+            "action": action_name,
             "params": merged_params,
             "waitOptions": request.wait_options
         }
     });
 
-    wrap_ipc_result(ui_bridge_request_sync(&state, "execute_action", payload).await)
+    let result = wrap_ipc_result(ui_bridge_request_sync(&state, "execute_action", payload).await);
+
+    // Persist the action event when task_run_id is provided (non-blocking)
+    if let Some(tr_id) = task_run_id {
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let seq = state
+            .ui_bridge_event_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let (success, error_msg, result_json) = match &result {
+            Ok(json_resp) => {
+                let s = json_resp.success;
+                let err = json_resp.error.clone();
+                // Truncate result to 1KB to respect memory budgets
+                let res = json_resp
+                    .data
+                    .as_ref()
+                    .map(|d| {
+                        let s = d.to_string();
+                        if s.len() > 1024 {
+                            format!("{}...", &s[..1024])
+                        } else {
+                            s
+                        }
+                    });
+                (s, err, res)
+            }
+            Err(_) => (false, Some("transport error".to_string()), None),
+        };
+
+        let db = state.app_state.checkpoint_db.clone();
+        let element_id = id.clone();
+        let action_for_db = action_name.clone();
+
+        // Spawn blocking DB write — fire-and-forget, never blocks the response
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = db.with_conn(|conn| {
+                crate::database::ui_bridge_ops::insert_ui_bridge_event(
+                    conn,
+                    Some(tr_id),
+                    seq,
+                    "action_executed",
+                    Some(&element_id),
+                    None,
+                    None,
+                    Some(&action_for_db),
+                    None,
+                    result_json.as_deref(),
+                    Some(duration_ms),
+                    success,
+                    error_msg.as_deref(),
+                    None,
+                )
+            }) {
+                warn!("Failed to persist UI Bridge event: {}", e);
+            }
+        });
+    }
+
+    result
 }
 
 /// Get all registered components.
@@ -5160,6 +5242,212 @@ async fn ui_bridge_batch_handler(
 }
 
 /// Create routes for this module.
+// ============================================================================
+// Health signals endpoint (combined idle + stuck screen diagnosis)
+// ============================================================================
+
+/// Combined UI Bridge health signals for stall detection integration.
+#[derive(Debug, Serialize)]
+pub struct UiBridgeHealthSignals {
+    pub idle: serde_json::Value,
+    pub stuck_screen: serde_json::Value,
+}
+
+/// Get combined health signals from the UI Bridge SDK.
+///
+/// Combines idle status and stuck screen diagnosis into a single response
+/// for use by the stall detection system.
+pub async fn ui_bridge_health_signals_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<UiBridgeHealthSignals>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Fetch idle status and stuck screen diagnosis in parallel
+    let idle_future = ui_bridge_request_sync(&state, "get_idle_status", serde_json::json!({}));
+    let stuck_future = ui_bridge_request_sync(
+        &state,
+        "diagnose_stuck_screen",
+        serde_json::json!({"observationWindowMs": 2000}),
+    );
+
+    let (idle_result, stuck_result) = tokio::join!(idle_future, stuck_future);
+
+    let idle = idle_result.unwrap_or_else(|e| {
+        warn!("Failed to get idle status: {}", e);
+        serde_json::json!({"error": e})
+    });
+
+    let stuck_screen = stuck_result.unwrap_or_else(|e| {
+        warn!("Failed to diagnose stuck screen: {}", e);
+        serde_json::json!({"error": e})
+    });
+
+    Ok(Json(ApiResponse::success(UiBridgeHealthSignals {
+        idle,
+        stuck_screen,
+    })))
+}
+
+// ============================================================================
+// Element interaction history endpoints (persisted cross-run data)
+// ============================================================================
+
+/// Query parameters for element interaction history.
+#[derive(Debug, Deserialize)]
+pub struct HistoryElementsQuery {
+    pub task_run_id: i64,
+}
+
+/// Get all UI Bridge events for a specific task run.
+pub async fn ui_bridge_history_elements_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<HistoryElementsQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::UiBridgeEvent>>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    let db = state.app_state.checkpoint_db.clone();
+    let task_run_id = query.task_run_id;
+
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            crate::database::ui_bridge_ops::get_element_interactions(conn, task_run_id)
+        })
+    })
+    .await
+    {
+        Ok(Ok(events)) => Ok(Json(ApiResponse::success(events))),
+        Ok(Err(e)) => {
+            error!("UI Bridge history: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+        Err(e) => {
+            let msg = format!("UI Bridge history task failed: {}", e);
+            error!("{}", msg);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg))))
+        }
+    }
+}
+
+/// Query parameters for single element history.
+#[derive(Debug, Deserialize)]
+pub struct HistoryElementQuery {
+    #[serde(default = "default_history_limit")]
+    pub limit: i64,
+}
+
+fn default_history_limit() -> i64 {
+    50
+}
+
+/// Get cross-run interaction history for a single element.
+pub async fn ui_bridge_history_element_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(query): Query<HistoryElementQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::UiBridgeEvent>>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    let db = state.app_state.checkpoint_db.clone();
+    let limit = query.limit;
+
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::database::ui_bridge_ops::get_element_history(conn, &id, limit))
+    })
+    .await
+    {
+        Ok(Ok(events)) => Ok(Json(ApiResponse::success(events))),
+        Ok(Err(e)) => {
+            error!("UI Bridge element history: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+        Err(e) => {
+            let msg = format!("UI Bridge element history task failed: {}", e);
+            error!("{}", msg);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg))))
+        }
+    }
+}
+
+/// Query parameters for flaky element detection.
+#[derive(Debug, Deserialize)]
+pub struct FlakyElementsQuery {
+    #[serde(default = "default_min_interactions")]
+    pub min_interactions: i64,
+    #[serde(default = "default_max_success_rate")]
+    pub max_success_rate: f64,
+}
+
+fn default_min_interactions() -> i64 {
+    10
+}
+
+fn default_max_success_rate() -> f64 {
+    0.8
+}
+
+/// Get elements with high failure rates across runs.
+pub async fn ui_bridge_history_flaky_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<FlakyElementsQuery>,
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::ui_bridge_ops::ElementReliability>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let db = state.app_state.checkpoint_db.clone();
+    let min = query.min_interactions;
+    let max_rate = query.max_success_rate;
+
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::database::ui_bridge_ops::get_flaky_elements(conn, min, max_rate))
+    })
+    .await
+    {
+        Ok(Ok(elements)) => Ok(Json(ApiResponse::success(elements))),
+        Ok(Err(e)) => {
+            error!("UI Bridge flaky elements: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+        Err(e) => {
+            let msg = format!("UI Bridge flaky elements task failed: {}", e);
+            error!("{}", msg);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg))))
+        }
+    }
+}
+
+/// Query parameters for element reliability.
+#[derive(Debug, Deserialize)]
+pub struct ElementReliabilityQuery {
+    pub element_id: String,
+}
+
+/// Get reliability data for a single element across all runs.
+pub async fn ui_bridge_element_reliability_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ElementReliabilityQuery>,
+) -> Result<
+    Json<ApiResponse<Option<crate::database::ui_bridge_ops::ElementReliability>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let db = state.app_state.checkpoint_db.clone();
+    let element_id = query.element_id;
+
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            crate::database::ui_bridge_ops::get_element_reliability(conn, &element_id)
+        })
+    })
+    .await
+    {
+        Ok(Ok(reliability)) => Ok(Json(ApiResponse::success(reliability))),
+        Ok(Err(e)) => {
+            error!("UI Bridge element reliability: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+        Err(e) => {
+            let msg = format!("UI Bridge element reliability task failed: {}", e);
+            error!("{}", msg);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg))))
+        }
+    }
+}
+
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
     axum::Router::new()
@@ -5805,5 +6093,27 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/debug/highlight/{id}",
             post(ui_bridge_highlight_element_handler),
+        )
+        // Combined health signals for stall detection
+        .route(
+            "/ui-bridge/control/health-signals",
+            get(ui_bridge_health_signals_handler),
+        )
+        // Persisted interaction history (cross-run analysis)
+        .route(
+            "/ui-bridge/history/elements",
+            get(ui_bridge_history_elements_handler),
+        )
+        .route(
+            "/ui-bridge/history/element/{id}",
+            get(ui_bridge_history_element_handler),
+        )
+        .route(
+            "/ui-bridge/history/flaky",
+            get(ui_bridge_history_flaky_handler),
+        )
+        .route(
+            "/ui-bridge/graph/element-reliability",
+            get(ui_bridge_element_reliability_handler),
         )
 }

@@ -53,6 +53,15 @@ pub fn get_task_run_costs(
         .get_task_run_costs(days.unwrap_or(7), limit.unwrap_or(50))
 }
 
+/// Get cost breakdown by target application for the last N days (default: 7).
+#[tauri::command]
+pub fn get_cost_by_target_app(
+    state: State<'_, Arc<AppState>>,
+    days: Option<u32>,
+) -> Result<Vec<TargetAppCostRow>, String> {
+    state.checkpoint_db.get_cost_by_target_app(days.unwrap_or(7))
+}
+
 /// Get aggregate token usage summary for the last N days (default: 7).
 #[tauri::command]
 pub fn get_token_usage_summary(

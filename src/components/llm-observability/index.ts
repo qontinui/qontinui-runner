@@ -12,3 +12,4 @@ export { CostByModelChart } from "./CostByModelChart";
 export { CostByPhaseChart } from "./CostByPhaseChart";
 export { ProviderLatencyChart } from "./ProviderLatencyChart";
 export { TaskRunCostTable } from "./TaskRunCostTable";
+export { CostByTargetAppChart } from "./CostByTargetAppChart";

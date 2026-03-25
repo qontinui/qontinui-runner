@@ -5944,6 +5944,72 @@ impl CheckpointDb {
             info!("Successfully migrated to version 157 (decomposition tables)");
         }
 
+        if current_version < 158 {
+            info!("Migrating to version 158 (step_provenance ui_bridge_event_ids)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE step_provenance ADD COLUMN ui_bridge_event_ids TEXT;
+                "#,
+            )
+            .map_err(|e| format!("Failed to add ui_bridge_event_ids column: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (158, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 158: {}", e))?;
+
+            info!("Successfully migrated to version 158 (step_provenance ui_bridge_event_ids)");
+        }
+
+        if current_version < 159 {
+            info!("Migrating to version 159 (phase_token_usage target_app columns)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE phase_token_usage ADD COLUMN target_app TEXT;
+                ALTER TABLE phase_token_usage ADD COLUMN target_page_url TEXT;
+                CREATE INDEX IF NOT EXISTS idx_phase_token_usage_target_app ON phase_token_usage(target_app);
+                "#,
+            )
+            .map_err(|e| format!("Failed to add target_app columns: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (159, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to migrate to version 159: {}", e))?;
+
+            info!("Successfully migrated to version 159 (phase_token_usage target_app columns)");
+        }
+
+        if current_version < 160 {
+            info!("Migrating to version 160 (prompt_template_canaries table)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS prompt_template_canaries (
+                    id TEXT PRIMARY KEY,
+                    template_id TEXT NOT NULL,
+                    baseline_version INTEGER NOT NULL,
+                    candidate_version INTEGER NOT NULL,
+                    traffic_percentage REAL NOT NULL DEFAULT 0.1,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    baseline_metrics_json TEXT NOT NULL DEFAULT '{}',
+                    candidate_metrics_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    ended_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_ptc_template ON prompt_template_canaries(template_id);
+                CREATE INDEX IF NOT EXISTS idx_ptc_status ON prompt_template_canaries(status);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (160, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to create prompt_template_canaries table: {}", e))?;
+
+            info!("Successfully migrated to version 160 (prompt_template_canaries)");
+        }
+
         // Repair migration: is_favorite column may be missing on databases created from
         // schema.sql (which set version >= 94, skipping migration 92 that adds the column).
         // This is idempotent — ALTER TABLE ADD COLUMN fails if the column already exists,

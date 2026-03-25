@@ -63,6 +63,27 @@ pub struct TaskRunCostRow {
     pub started_at: String,
 }
 
+/// Cost aggregation by target app (UI Bridge automation target).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetAppCostRow {
+    pub target_app: String,
+    pub total_cost_cents: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub call_count: u64,
+    pub avg_duration_ms: Option<u64>,
+}
+
+/// Cost aggregation by target page URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetPageCostRow {
+    pub target_page_url: String,
+    pub total_cost_cents: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub call_count: u64,
+}
+
 /// Overall token usage summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsageSummary {
@@ -325,6 +346,79 @@ impl CheckpointDb {
             avg_cost_per_call_cents: avg_cost_per_call,
             avg_duration_ms: avg_duration,
         })
+    }
+
+    /// Get cost breakdown by target app (UI Bridge automation target).
+    pub fn get_cost_by_target_app(&self, days: u32) -> Result<Vec<TargetAppCostRow>, String> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT COALESCE(target_app, '(no app)'),
+                       COALESCE(SUM(cost_cents), 0),
+                       COALESCE(SUM(input_tokens), 0),
+                       COALESCE(SUM(output_tokens), 0),
+                       COUNT(*),
+                       AVG(duration_ms)
+                FROM phase_token_usage
+                WHERE created_at >= datetime('now', ?1)
+                  AND target_app IS NOT NULL
+                GROUP BY target_app
+                ORDER BY SUM(cost_cents) DESC"#,
+            )
+            .map_err(|e| format!("Failed to prepare cost by target app query: {}", e))?;
+
+        let days_param = format!("-{} days", days);
+        let rows = stmt
+            .query_map(params![days_param], |row| {
+                Ok(TargetAppCostRow {
+                    target_app: row.get(0)?,
+                    total_cost_cents: row.get::<_, i64>(1)? as u64,
+                    total_input_tokens: row.get::<_, i64>(2)? as u64,
+                    total_output_tokens: row.get::<_, i64>(3)? as u64,
+                    call_count: row.get::<_, i64>(4)? as u64,
+                    avg_duration_ms: row.get::<_, Option<f64>>(5)?.map(|v| v as u64),
+                })
+            })
+            .map_err(|e| format!("Failed to query cost by target app: {}", e))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect target app cost rows: {}", e))
+    }
+
+    /// Get cost breakdown by target page URL.
+    pub fn get_cost_by_target_page(&self, days: u32) -> Result<Vec<TargetPageCostRow>, String> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT COALESCE(target_page_url, '(no page)'),
+                       COALESCE(SUM(cost_cents), 0),
+                       COALESCE(SUM(input_tokens), 0),
+                       COALESCE(SUM(output_tokens), 0),
+                       COUNT(*)
+                FROM phase_token_usage
+                WHERE created_at >= datetime('now', ?1)
+                  AND target_page_url IS NOT NULL
+                GROUP BY target_page_url
+                ORDER BY SUM(cost_cents) DESC
+                LIMIT 50"#,
+            )
+            .map_err(|e| format!("Failed to prepare cost by target page query: {}", e))?;
+
+        let days_param = format!("-{} days", days);
+        let rows = stmt
+            .query_map(params![days_param], |row| {
+                Ok(TargetPageCostRow {
+                    target_page_url: row.get(0)?,
+                    total_cost_cents: row.get::<_, i64>(1)? as u64,
+                    total_input_tokens: row.get::<_, i64>(2)? as u64,
+                    total_output_tokens: row.get::<_, i64>(3)? as u64,
+                    call_count: row.get::<_, i64>(4)? as u64,
+                })
+            })
+            .map_err(|e| format!("Failed to query cost by target page: {}", e))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect target page cost rows: {}", e))
     }
 }
 

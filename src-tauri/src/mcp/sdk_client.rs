@@ -353,7 +353,14 @@ async fn handle_connect(
     )
     .await
     {
-        Ok(response) => Json(ApiResponse::success(response)),
+        Ok(response) => {
+            // Fire-and-forget: push element reliability data for CTR seeding
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                push_ctr_reliability_to_sdk(&state_clone).await;
+            });
+            Json(ApiResponse::success(response))
+        }
         Err(e) => Json(ApiResponse::error(e)),
     }
 }
@@ -461,6 +468,51 @@ pub async fn connect_sdk_app(
 
     info!("Connected to SDK app: {}", response.app.app_name);
     Ok(response)
+}
+
+/// Push element reliability data to a connected SDK app for CTR confidence seeding.
+/// Fire-and-forget: errors are logged but never fail the caller.
+async fn push_ctr_reliability_to_sdk(state: &Arc<ApiState>) {
+    let db = state.app_state.checkpoint_db.clone();
+    let sdk_conn = state.sdk_connection.clone();
+
+    // Fetch all elements with interaction history from our DB
+    let reliability_data = match tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::database::ui_bridge_ops::get_flaky_elements(conn, 3, 1.0))
+    })
+    .await
+    {
+        Ok(Ok(data)) if !data.is_empty() => data,
+        _ => return, // No data or error — silently skip
+    };
+
+    let mgr = sdk_conn.lock().await;
+    if let Some(conn) = mgr.active_connection() {
+        let url = format!(
+            "{}{}/ctr/seed-reliability",
+            conn.app_url, conn.base_path
+        );
+        let count = reliability_data.len();
+        let payload = serde_json::json!({ "reliabilityData": reliability_data });
+        match conn
+            .client
+            .post(&url)
+            .json(&payload)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                info!("Pushed {} element reliability records to SDK for CTR seeding", count);
+            }
+            Ok(resp) => {
+                debug!("SDK app did not accept CTR reliability data (HTTP {})", resp.status());
+            }
+            Err(e) => {
+                debug!("Failed to push CTR reliability data: {}", e);
+            }
+        }
+    }
 }
 
 /// Try health check on an SDK app, returning (base_path, health_json)
@@ -826,23 +878,37 @@ async fn handle_element(
     }
 }
 
+/// Optional query parameters for SDK action execution (task_run_id for persistence).
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct SdkActionQueryParams {
+    #[serde(default)]
+    pub task_run_id: Option<i64>,
+}
+
 /// POST /ui-bridge/sdk/element/:id/action — Execute an action on an element
 async fn handle_element_action(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<SdkActionQueryParams>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let id = id.trim().to_string();
+    let action_name = body
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("click")
+        .to_string();
+    let start = std::time::Instant::now();
+
     let path = format!("/control/element/{}/action", id);
-    match sdk_request(&state, Method::POST, &path, Some(body.clone())).await {
-        Ok(data) => Json(data),
+    let result = match sdk_request(&state, Method::POST, &path, Some(body.clone())).await {
+        Ok(data) => {
+            let success = data.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+            (Json(data), success, None)
+        }
         Err(_) => {
             // Fall back to IPC — wrap action in an object to match the format
             // expected by the TypeScript handler (action.action, action.params, etc.)
-            let action_name = body
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("click");
             let params = body
                 .get("params")
                 .cloned()
@@ -861,18 +927,59 @@ async fn handle_element_action(
             });
             match ui_bridge_request_sync(&state, "execute_action", payload).await {
                 Ok(data) => {
-                    // If the inner response already indicates failure, return it directly
-                    // instead of wrapping in { success: true, data } which masks the error
                     if data.get("success") == Some(&serde_json::json!(false)) {
-                        Json(data)
+                        let err = data.get("error").and_then(|v| v.as_str()).map(String::from);
+                        (Json(data), false, err)
                     } else {
-                        Json(serde_json::json!({ "success": true, "data": data }))
+                        (Json(serde_json::json!({ "success": true, "data": data })), true, None)
                     }
                 }
-                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+                Err(e) => (
+                    Json(serde_json::json!({ "success": false, "error": e })),
+                    false,
+                    Some(e),
+                ),
             }
         }
+    };
+
+    // Persist the action event when task_run_id is provided (fire-and-forget)
+    if let Some(tr_id) = query.task_run_id {
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let seq = state
+            .ui_bridge_event_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let success = result.1;
+        let error_msg = result.2.clone();
+        let db = state.app_state.checkpoint_db.clone();
+        let element_id = id.clone();
+        let action_for_db = action_name.clone();
+
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = db.with_conn(|conn| {
+                crate::database::ui_bridge_ops::insert_ui_bridge_event(
+                    conn,
+                    Some(tr_id),
+                    seq,
+                    "action_executed",
+                    Some(&element_id),
+                    None,
+                    None,
+                    Some(&action_for_db),
+                    None,
+                    None,
+                    Some(duration_ms),
+                    success,
+                    error_msg.as_deref(),
+                    None,
+                )
+            }) {
+                tracing::warn!("Failed to persist SDK UI Bridge event: {}", e);
+            }
+        });
     }
+
+    result.0
 }
 
 /// GET /ui-bridge/sdk/snapshot — Full UI snapshot

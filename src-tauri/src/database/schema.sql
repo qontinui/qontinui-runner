@@ -313,11 +313,14 @@ CREATE TABLE IF NOT EXISTS phase_token_usage (
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cost_cents INTEGER NOT NULL DEFAULT 0,  -- estimated cost in hundredths of cents (microdollars * 100)
     duration_ms INTEGER,           -- AI call wall-clock time
+    target_app TEXT,               -- UI Bridge target app name (when step involves UI automation)
+    target_page_url TEXT,          -- URL of the page being automated
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_phase_token_usage_task_run ON phase_token_usage(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_phase_token_usage_target_app ON phase_token_usage(target_app);
 
 -- Task Run Output Chunks (for efficient O(1) appending)
 -- Instead of concatenating to output_log column (O(n)), we insert chunks (O(1))
@@ -3551,6 +3554,7 @@ CREATE TABLE IF NOT EXISTS step_provenance (
     generation_iteration INTEGER,
     original_step_json TEXT,
     final_step_json TEXT,
+    ui_bridge_event_ids TEXT,  -- JSON array of ui_bridge_events IDs linked to this step
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE,
     FOREIGN KEY (workflow_version_id) REFERENCES workflow_versions(id) ON DELETE SET NULL
@@ -3680,3 +3684,27 @@ CREATE TABLE IF NOT EXISTS decomposition_subtasks (
 );
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (157, datetime('now'));
+
+-- Version 158: Add ui_bridge_event_ids to step_provenance for linking UI interactions to steps
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (158, datetime('now'));
+
+-- Version 159: Add target_app and target_page_url to phase_token_usage for UI Bridge cost attribution
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (159, datetime('now'));
+
+-- Version 160: Prompt template A/B testing canaries
+CREATE TABLE IF NOT EXISTS prompt_template_canaries (
+    id TEXT PRIMARY KEY,
+    template_id TEXT NOT NULL,
+    baseline_version INTEGER NOT NULL,
+    candidate_version INTEGER NOT NULL,
+    traffic_percentage REAL NOT NULL DEFAULT 0.1,
+    status TEXT NOT NULL DEFAULT 'active',
+    baseline_metrics_json TEXT NOT NULL DEFAULT '{}',
+    candidate_metrics_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    ended_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ptc_template ON prompt_template_canaries(template_id);
+CREATE INDEX IF NOT EXISTS idx_ptc_status ON prompt_template_canaries(status);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (160, datetime('now'));

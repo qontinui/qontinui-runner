@@ -31,8 +31,9 @@ use crate::database::CheckpointDb;
 // Token tracking, UI Bridge, environment readiness, response mode, and token
 // estimation extracted to phase_helpers module.
 pub(super) use super::phase_helpers::{
-    check_environment_readiness, compute_embedding_sync, estimate_tokens,
-    execute_prompt_response_mode, record_phase_token_usage, try_auto_connect_sdk_for_ui_workflow,
+    build_llm_metrics, check_environment_readiness, compute_embedding_sync, estimate_tokens,
+    execute_prompt_response_mode, get_active_sdk_app_name, record_phase_token_usage,
+    record_phase_token_usage_with_target, try_auto_connect_sdk_for_ui_workflow,
     REFLECTION_MODE_PREAMBLE,
 };
 

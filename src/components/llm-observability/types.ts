@@ -57,6 +57,15 @@ export interface TaskRunCostRow {
   started_at: string;
 }
 
+export interface TargetAppCostRow {
+  target_app: string;
+  total_cost_cents: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  call_count: number;
+  avg_duration_ms: number | null;
+}
+
 /** Time range options for the LLM analytics dashboard */
 export type LlmTimeRange = "1d" | "7d" | "30d" | "all";
 

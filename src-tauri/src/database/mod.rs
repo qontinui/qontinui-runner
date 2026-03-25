@@ -76,6 +76,9 @@ pub mod cross_run_ops;
 pub mod graph_ops;
 pub mod token_analytics;
 
+// UI Bridge persistence
+pub mod ui_bridge_ops;
+
 // Re-export all types for backward compatibility
 pub use types::*;
 

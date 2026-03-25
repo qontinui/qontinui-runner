@@ -45,6 +45,9 @@ pub fn unified_search(
     // 6. Search unified_workflows
     search_workflows(conn, &query_pattern, &mut results);
 
+    // 7. Search ui_bridge_elements (element interactions)
+    search_ui_elements(conn, &query_pattern, &mut results);
+
     // Sort by relevance DESC, truncate
     results.sort_by(|a, b| {
         b.relevance_score
@@ -334,6 +337,67 @@ fn search_workflows(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedS
     match outcome {
         Ok(items) => results.extend(items),
         Err(e) => warn!("Unified search: workflows query failed: {}", e),
+    }
+}
+
+fn search_ui_elements(
+    conn: &Connection,
+    pattern: &str,
+    results: &mut Vec<UnifiedSearchResult>,
+) {
+    let query = r#"SELECT DISTINCT element_id, element_type, label, text_content
+                   FROM ui_bridge_elements
+                   WHERE element_id LIKE ?1 OR label LIKE ?1 OR text_content LIKE ?1
+                   LIMIT 20"#;
+
+    let outcome = conn.prepare(query).and_then(|mut stmt| {
+        let rows = stmt.query_map(params![pattern], |row| {
+            let element_id: String = row.get(0)?;
+            let element_type: Option<String> = row.get(1)?;
+            let label: Option<String> = row.get(2)?;
+            let text_content: Option<String> = row.get(3)?;
+            Ok((element_id, element_type, label, text_content))
+        })?;
+
+        let mut collected = Vec::new();
+        for row in rows {
+            if let Ok((element_id, element_type, label, text_content)) = row {
+                let clean_pattern = pattern
+                    .trim_start_matches('%')
+                    .trim_end_matches('%')
+                    .to_lowercase();
+                let id_matches = element_id.to_lowercase().contains(&clean_pattern);
+                let label_matches = label
+                    .as_deref()
+                    .map_or(false, |l| l.to_lowercase().contains(&clean_pattern));
+                let score = if id_matches { 1.0 } else if label_matches { 0.8 } else { 0.6 };
+
+                let title = label.unwrap_or_else(|| element_id.clone());
+                let snippet = format!(
+                    "[{}] {}",
+                    element_type.as_deref().unwrap_or("unknown"),
+                    text_content
+                        .as_deref()
+                        .map(|t| truncate_str(t, 120))
+                        .unwrap_or_default()
+                );
+
+                collected.push(UnifiedSearchResult {
+                    entity_type: "ui_element".to_string(),
+                    entity_id: element_id,
+                    title,
+                    snippet,
+                    relevance_score: score,
+                    source_table: "ui_bridge_elements".to_string(),
+                });
+            }
+        }
+        Ok(collected)
+    });
+
+    match outcome {
+        Ok(items) => results.extend(items),
+        Err(e) => warn!("Unified search: ui_bridge_elements query failed: {}", e),
     }
 }
 

@@ -351,6 +351,103 @@ pub async fn get_exploration_prompt(
 // Saved API request handler functions removed — see crate::mcp::saved_api_requests
 
 /// Create routes for this module.
+// ============================================================================
+// Cross-Run State Diff
+// ============================================================================
+
+/// Query parameters for cross-run state diff.
+#[derive(Debug, Deserialize)]
+pub struct CrossRunDiffQuery {
+    /// Workflow name to compare across runs.
+    pub workflow_name: Option<String>,
+}
+
+/// Cross-run state diff result.
+#[derive(Debug, serde::Serialize)]
+pub struct CrossRunStateDiff {
+    /// States present in latest run but not in prior runs
+    pub new_states: Vec<String>,
+    /// States present in prior runs but not in latest
+    pub missing_states: Vec<String>,
+    /// States present in both
+    pub consistent_states: Vec<String>,
+    /// Total runs compared
+    pub runs_compared: usize,
+}
+
+/// GET /state-explorer/cross-run-diff — compare states discovered across runs.
+pub async fn get_cross_run_state_diff(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(query): axum::extract::Query<CrossRunDiffQuery>,
+) -> Result<Json<ApiResponse<CrossRunStateDiff>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.app_state.checkpoint_db.clone();
+
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            // Get distinct states from ui_bridge_states per task run
+            let mut stmt = conn
+                .prepare(
+                    r#"SELECT DISTINCT state_id FROM ui_bridge_states ORDER BY created_at DESC"#,
+                )
+                .map_err(|e| format!("Failed to prepare cross-run diff query: {e}"))?;
+
+            let all_states: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("Failed to query states: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            // Get states from most recent exploration (via ui_bridge_events with state_id)
+            let mut recent_stmt = conn
+                .prepare(
+                    r#"SELECT DISTINCT state_id FROM ui_bridge_events
+                       WHERE state_id IS NOT NULL
+                       AND task_run_id = (
+                         SELECT task_run_id FROM ui_bridge_events
+                         WHERE state_id IS NOT NULL
+                         ORDER BY timestamp DESC LIMIT 1
+                       )"#,
+                )
+                .map_err(|e| format!("Failed to prepare recent states query: {e}"))?;
+
+            let recent_states: std::collections::HashSet<String> = recent_stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("Failed to query recent states: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let all_set: std::collections::HashSet<String> = all_states.into_iter().collect();
+
+            let new_states: Vec<String> = recent_states.difference(&all_set).cloned().collect();
+            let missing_states: Vec<String> = all_set.difference(&recent_states).cloned().collect();
+            let consistent_states: Vec<String> =
+                recent_states.intersection(&all_set).cloned().collect();
+
+            let _ = query; // workflow_name filtering is future work
+
+            Ok(CrossRunStateDiff {
+                new_states,
+                missing_states,
+                consistent_states,
+                runs_compared: 2, // latest vs all prior
+            })
+        })
+    })
+    .await
+    {
+        Ok(Ok(diff)) => Ok(Json(ApiResponse::success(diff))),
+        Ok(Err(e)) => {
+            error!("Cross-run state diff: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+        Err(e) => {
+            let msg = format!("Cross-run state diff task failed: {}", e);
+            error!("{}", msg);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg))))
+        }
+    }
+}
+
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
     axum::Router::new()
@@ -365,5 +462,9 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/state-explorer/{run_id}/prompt",
             get(get_exploration_prompt),
+        )
+        .route(
+            "/state-explorer/cross-run-diff",
+            get(get_cross_run_state_diff),
         )
 }

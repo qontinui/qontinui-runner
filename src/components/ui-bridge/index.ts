@@ -27,3 +27,4 @@ export { ActionExecutorView } from "./ActionExecutorView";
 export { LazyThumbnail } from "./LazyThumbnail";
 export { SdkAppConnector } from "./SdkAppConnector";
 export type { SdkAppConnectorProps, SdkAppConnection } from "./SdkAppConnector";
+export { ElementInteractionHeatmap } from "./ElementInteractionHeatmap";

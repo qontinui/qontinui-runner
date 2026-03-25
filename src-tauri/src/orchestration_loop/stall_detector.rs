@@ -30,6 +30,13 @@ pub enum StallPattern {
     NoProgressDetected {
         iterations_without_change: u32,
     },
+    /// UI Bridge reports the page is stuck (loading spinner, no DOM changes, etc.)
+    UIStuck {
+        verdict: String,
+        loading_indicators: u32,
+        dom_changed: bool,
+        observation_window_ms: u64,
+    },
 }
 
 impl std::fmt::Display for StallPattern {
@@ -61,8 +68,38 @@ impl std::fmt::Display for StallPattern {
                 "No progress for {} iterations",
                 iterations_without_change
             ),
+            Self::UIStuck {
+                verdict,
+                loading_indicators,
+                ..
+            } => write!(
+                f,
+                "UI stuck: {} ({} loading indicators)",
+                verdict, loading_indicators
+            ),
         }
     }
+}
+
+/// UI Bridge health signals from idle detection and stuck screen diagnosis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiHealthSignals {
+    /// Composite idle score (0.0 = busy, 1.0 = fully idle)
+    pub idle_score: f64,
+    /// Whether the network is idle
+    pub network_idle: bool,
+    /// Whether the DOM is idle (no mutations)
+    pub dom_idle: bool,
+    /// Whether loading indicators are present
+    pub loading: bool,
+    /// Stuck screen verdict from diagnosis
+    pub stuck_verdict: String,
+    /// Number of detected loading indicators (spinners, progress bars, etc.)
+    pub loading_indicator_count: u32,
+    /// Whether the DOM has changed since last check
+    pub dom_changed: bool,
+    /// How long the observation window was (ms)
+    pub observation_window_ms: u64,
 }
 
 /// A record of a single action performed in the loop.
@@ -241,6 +278,37 @@ impl StallDetector {
         }
     }
 
+    /// Check UI Bridge health signals for stuck page detection.
+    ///
+    /// Returns `Some(UIStuck)` when the page appears stuck based on
+    /// idle detection and stuck screen diagnosis from the UI Bridge SDK.
+    pub fn check_ui_health(&self, signals: &UiHealthSignals) -> Option<StallPattern> {
+        // Only fire if the verdict is "stuck" or if we have loading indicators
+        // combined with no DOM changes (strong signal of a hung page)
+        let is_stuck = signals.stuck_verdict == "stuck"
+            || (signals.loading_indicator_count > 0
+                && !signals.dom_changed
+                && signals.idle_score < 0.3);
+
+        if is_stuck {
+            info!(
+                "UI stuck detected: verdict={}, loading_indicators={}, dom_changed={}, idle_score={}",
+                signals.stuck_verdict,
+                signals.loading_indicator_count,
+                signals.dom_changed,
+                signals.idle_score
+            );
+            Some(StallPattern::UIStuck {
+                verdict: signals.stuck_verdict.clone(),
+                loading_indicators: signals.loading_indicator_count,
+                dom_changed: signals.dom_changed,
+                observation_window_ms: signals.observation_window_ms,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Get the total number of recorded actions.
     pub fn action_count(&self) -> usize {
         self.action_history.len()
@@ -314,12 +382,12 @@ mod tests {
     fn detect_oscillation_pattern() {
         let config = StallDetectorConfig {
             max_repeated_actions: 10, // high so repeated doesn't trigger first
-            oscillation_window: 10,
+            oscillation_window: 6,    // must be <= number of actions for detection
             max_total_steps: 100,
             stall_timeout_secs: 300,
         };
         let mut detector = StallDetector::new(config);
-        // A-B-A-B-A-B pattern (6 actions, 2 unique, within window of 10)
+        // A-B-A-B-A-B pattern (6 actions, 2 unique, within window of 6)
         for i in 0..6 {
             let sig = if i % 2 == 0 { "action_A" } else { "action_B" };
             detector.record_action(

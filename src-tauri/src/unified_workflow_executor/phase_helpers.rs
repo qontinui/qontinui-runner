@@ -14,6 +14,7 @@
 use tracing::{info, warn};
 
 use crate::ai_router::TaskContext;
+use crate::database::pg::PgDb;
 use crate::database::CheckpointDb;
 use crate::doctor::DoctorHandle;
 use crate::findings::storage as finding_storage;
@@ -26,10 +27,25 @@ use crate::step_executor::ExecutionStepConfig;
 // Token Usage Tracking
 // =============================================================================
 
+/// Extract the active SDK app name from AppState without blocking.
+/// Returns None if the connection manager lock is contended or no app is connected.
+pub(super) fn get_active_sdk_app_name(app_state: &crate::commands::AppState) -> Option<String> {
+    app_state
+        .sdk_connection
+        .try_lock()
+        .ok()
+        .and_then(|mgr| {
+            mgr.active_connection()
+                .map(|conn| conn.app_info.app_name.clone())
+        })
+}
+
 /// Record token usage for a phase to the database.
+/// Uses PostgreSQL when available (non-blocking async write), falls back to SQLite.
 /// Silently ignores errors (best-effort tracking).
 pub(super) fn record_phase_token_usage(
     db: &CheckpointDb,
+    pg_db: Option<&std::sync::Arc<PgDb>>,
     task_run_id: &str,
     phase: &str,
     stage_index: Option<u32>,
@@ -39,6 +55,29 @@ pub(super) fn record_phase_token_usage(
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     duration_ms: Option<u64>,
+) {
+    record_phase_token_usage_with_target(
+        db, pg_db, task_run_id, phase, stage_index, iteration,
+        model_used, provider_used, input_tokens, output_tokens,
+        duration_ms, None, None,
+    );
+}
+
+/// Record phase token usage with optional UI Bridge target app attribution.
+pub(super) fn record_phase_token_usage_with_target(
+    db: &CheckpointDb,
+    pg_db: Option<&std::sync::Arc<PgDb>>,
+    task_run_id: &str,
+    phase: &str,
+    stage_index: Option<u32>,
+    iteration: Option<u32>,
+    model_used: Option<&str>,
+    provider_used: Option<&str>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    duration_ms: Option<u64>,
+    target_app: Option<&str>,
+    target_page_url: Option<&str>,
 ) {
     let input = input_tokens.unwrap_or(0);
     let output = output_tokens.unwrap_or(0);
@@ -50,10 +89,45 @@ pub(super) fn record_phase_token_usage(
     // This is approximate — actual cost depends on model
     let cost_cents = 0u64; // Cost calculation deferred to a pricing table
     info!(
-        "Recording phase token usage: task={}, phase={}, input={}, output={}",
-        task_run_id, phase, input, output
+        "Recording phase token usage: task={}, phase={}, input={}, output={}{}",
+        task_run_id, phase, input, output,
+        target_app.map(|a| format!(", app={}", a)).unwrap_or_default()
     );
-    if let Err(e) = db.create_phase_token_usage(
+
+    // PG-primary: fire-and-forget async write to PostgreSQL
+    if let Some(pg) = pg_db {
+        let pg = pg.clone();
+        let task_run_id = task_run_id.to_string();
+        let phase = phase.to_string();
+        let model_used = model_used.map(|s| s.to_string());
+        let provider_used = provider_used.map(|s| s.to_string());
+        let target_app_owned = target_app.map(|s| s.to_string());
+        let target_page_owned = target_page_url.map(|s| s.to_string());
+        tokio::spawn(async move {
+            if let Err(e) = pg
+                .create_phase_token_usage_with_target(
+                    &task_run_id,
+                    &phase,
+                    stage_index,
+                    iteration,
+                    model_used.as_deref(),
+                    provider_used.as_deref(),
+                    input,
+                    output,
+                    cost_cents,
+                    duration_ms,
+                    target_app_owned.as_deref(),
+                    target_page_owned.as_deref(),
+                )
+                .await
+            {
+                warn!("PG token usage write failed: {}", e);
+            }
+        });
+    }
+
+    // Always write to SQLite (source of truth during migration)
+    if let Err(e) = db.create_phase_token_usage_with_target(
         task_run_id,
         phase,
         stage_index,
@@ -64,6 +138,8 @@ pub(super) fn record_phase_token_usage(
         output,
         cost_cents,
         duration_ms,
+        target_app,
+        target_page_url,
     ) {
         warn!("Failed to record phase token usage: {}", e);
     }
