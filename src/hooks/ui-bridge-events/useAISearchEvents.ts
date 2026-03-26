@@ -173,7 +173,8 @@ export function useAISearchEvents(
         case "ai_snapshot": {
           const { SemanticSnapshotManager } = await import("ui-bridge/ai");
           const controlSnapshot = await currentBridge.createSnapshotAsync();
-          const manager = new SemanticSnapshotManager();
+          const maxTokens = typeof payload?.maxTokens === "number" ? payload.maxTokens : 0;
+          const manager = new SemanticSnapshotManager({ maxTokens });
           const snapshot = manager.createSnapshot(controlSnapshot as never, {
             url: window.location.href,
             title: document.title,

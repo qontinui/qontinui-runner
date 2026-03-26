@@ -219,6 +219,8 @@ export interface UIBridgeRequestPayload {
     types?: string[];
     selector?: string;
   };
+  /** Maximum token budget for AI snapshot pruning (0 = unlimited) */
+  maxTokens?: number;
 }
 
 /**

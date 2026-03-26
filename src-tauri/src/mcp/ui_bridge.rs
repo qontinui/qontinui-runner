@@ -5518,11 +5518,10 @@ async fn resolve_action_plan_target(
         return Ok(id.clone());
     }
 
-    // 2. Find by data-testid attribute (via CSS selector — find handler
-    //    doesn't support testId field directly)
+    // 2. Find by data-testid attribute
     if let Some(ref test_id) = target.test_id {
         let find_payload = serde_json::json!({
-            "selector": format!("[data-testid=\"{}\"]", test_id)
+            "testId": test_id
         });
         if let Ok(data) = ui_bridge_request_sync(state, "find", find_payload).await {
             if let Some(id) = extract_first_element_id(&data) {

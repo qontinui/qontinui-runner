@@ -11,6 +11,7 @@ use super::relevance_filter::filter_relevant_step_types;
 use super::rules;
 use super::step_type_knowledge;
 use super::step_type_metadata::{get_all_step_type_metadata, StepTypeMetadata};
+use crate::skills::playbook_parser;
 use crate::skills::SkillRegistry;
 
 /// Build the complete schema context prompt for AI workflow generation.
@@ -212,6 +213,9 @@ fn assemble_prompt(
     // Build rules from DB if available, otherwise use hardcoded fallback
     let rules_section = build_rules_section(conn);
 
+    // Load and format playbooks from the default directory
+    let playbooks_section = load_and_format_playbooks();
+
     let knowledge_section = if knowledge.is_empty() {
         String::new()
     } else {
@@ -335,6 +339,7 @@ Steps can pass data to each other using `inputs` and `extract`:
 {gotchas_section}
 {rules_section}
 {confidence_section}
+{playbooks_section}
 ## Environment Aliases
 When the user mentions these terms, map them to the correct endpoints:
 - "runner" / "desktop app" → Qontinui Runner at http://localhost:1420 (UI) / http://localhost:9876 (API)
@@ -702,6 +707,83 @@ fn build_generation_confidence(conn: &Connection) -> String {
     }
 
     String::new()
+}
+
+/// Load playbooks from the default directory and format for prompt injection.
+///
+/// Returns an empty string if no playbooks are found or the directory doesn't exist.
+fn load_and_format_playbooks() -> String {
+    let playbook_dir = dirs::home_dir()
+        .map(|h| h.join(".qontinui").join("playbooks"))
+        .unwrap_or_default();
+
+    let playbooks = playbook_parser::load_playbooks_from_dir(&playbook_dir);
+    if playbooks.is_empty() {
+        return String::new();
+    }
+
+    let mut section = String::from("## Domain Playbooks\n\n");
+    section.push_str("The following playbooks provide domain-specific knowledge for automation targets.\n\n");
+
+    for skill in &playbooks {
+        if let crate::skills::SkillTemplate::Playbook { content, .. } = &skill.template {
+            section.push_str(&format!("### {}\n", skill.name));
+            if !skill.description.is_empty() {
+                section.push_str(&format!("_{}_\n\n", skill.description));
+            }
+            // Truncate very long playbooks to avoid prompt bloat
+            if content.len() > 2000 {
+                let truncated: String = content.chars().take(2000).collect();
+                section.push_str(&truncated);
+                section.push_str("\n...(truncated)\n\n");
+            } else {
+                section.push_str(content);
+                section.push_str("\n\n");
+            }
+        }
+    }
+
+    section
+}
+
+/// Format playbooks matching the given context for injection into prompts.
+///
+/// Used by the Brain agent to include relevant domain knowledge.
+pub fn format_playbooks_for_context(
+    app_name: Option<&str>,
+    url: Option<&str>,
+    tags: &[String],
+) -> String {
+    let playbook_dir = dirs::home_dir()
+        .map(|h| h.join(".qontinui").join("playbooks"))
+        .unwrap_or_default();
+
+    let all_playbooks = playbook_parser::load_playbooks_from_dir(&playbook_dir);
+    if all_playbooks.is_empty() {
+        return String::new();
+    }
+
+    let matched = playbook_parser::playbooks_for_context(&all_playbooks, app_name, url, tags);
+    if matched.is_empty() {
+        return String::new();
+    }
+
+    let mut section = String::from("## Relevant Domain Knowledge\n\n");
+    for skill in matched {
+        if let crate::skills::SkillTemplate::Playbook { content, .. } = &skill.template {
+            section.push_str(&format!("### {}\n", skill.name));
+            // Truncate for prompt budget
+            if content.len() > 1500 {
+                let truncated: String = content.chars().take(1500).collect();
+                section.push_str(&truncated);
+                section.push_str("\n...(truncated)\n\n");
+            } else {
+                section.push_str(content);
+                section.push_str("\n\n");
+            }
+        }
+    }
+    section
 }
 
 /// Build a compact CRITICAL GOTCHAS section that highlights the most common
