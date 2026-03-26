@@ -1,24 +1,24 @@
 {
   "version": "1.0.0",
-  "description": "TuriX-CUA Multimodal Vision Pipeline — specifies the end-to-end visual AI system that sends annotated screenshots to LLMs via native content block APIs. Covers multimodal prompt construction (Claude content arrays, Gemini inline_data), screenshot annotation with numbered element markers, normalized coordinate system, and the Brain/Actor two-phase LLM orchestration pattern. This spec validates the UI surfaces where these backend capabilities are configured, visualized, and their results displayed.",
+  "description": "The TuriX-CUA Multimodal Vision Pipeline adds visual AI capabilities to qontinui's agentic verification loop. When users run workflows with agentic verification architecture, the system can capture screenshots, annotate them with numbered element markers, and send annotated images to vision-capable LLMs (Claude API, Gemini API) for screen analysis. A two-phase Brain/Actor pattern splits expensive vision reasoning from cheap action execution. This spec covers the pages where these capabilities are configured (Settings > AI, Run Options Dialog), where results are displayed (Run Summary, Active Dashboard, AI Output), and where supporting features surface (Skills page for playbooks, action executor for click highlights). Data flows from the Rust backend through Tauri IPC commands to the React frontend.",
   "groups": [
     {
-      "id": "multimodal-ai-config",
-      "name": "Multimodal AI Provider Configuration",
-      "description": "Users configure AI providers that support multimodal (vision) prompts. The system sends annotated screenshots as native image content blocks to Claude API and Gemini API. CLI providers automatically fall back to text-only with a warning. The Settings > AI page must surface which providers support multimodal and indicate when fallback is active.",
-      "category": "semantic",
+      "id": "nav-vision-pages",
+      "name": "Vision Feature Page Reachability",
+      "description": "Users access vision pipeline configuration and results across several existing pages. The AI provider settings page is where multimodal support is configured. The Run Options Dialog is where agentic verification architecture (including Brain/Actor) is selected before running a workflow. Run detail pages show the results. These are all existing pages that now carry additional data from the vision pipeline.",
+      "category": "navigation",
       "assertions": [
         {
-          "id": "multimodal-provider-selection",
-          "description": "The AI settings page allows users to select from providers that support multimodal prompts (Claude API, Gemini API) and text-only providers (Claude CLI, Gemini CLI), with clear indication of which support vision capabilities",
-          "category": "semantic",
+          "id": "nav-settings-ai-reachable",
+          "description": "The Settings > AI page is reachable from the sidebar navigation. Users navigate here to configure which AI provider is active (Claude CLI, Claude API, Gemini CLI, Gemini API). Only API providers (Claude API, Gemini API) support multimodal vision prompts",
+          "category": "navigation",
           "severity": "critical",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "Provider|Claude|Gemini"
+              "textContent": "AI Provider"
             },
-            "label": "AI provider selector"
+            "label": "AI Provider settings heading"
           },
           "assertionType": "exists",
           "source": "manual",
@@ -26,16 +26,61 @@
           "enabled": true
         },
         {
-          "id": "multimodal-api-key-config",
-          "description": "Users can configure API keys for Claude API and Gemini API providers, which are required for multimodal (vision) prompt support. API keys are stored securely via the keychain and validated on save",
-          "category": "semantic",
+          "id": "nav-run-options-reachable",
+          "description": "The Run Options Dialog is reachable when launching a workflow from the workflow list. Users can select the workflow architecture (Traditional, Agentic Verification, Multi-Agent Pipeline) which determines whether the Brain/Actor vision pipeline is available",
+          "category": "navigation",
           "severity": "critical",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "API Key|api_key"
+              "textContent": "Agentic Verification"
             },
-            "label": "API key configuration"
+            "label": "Architecture selector in run options"
+          },
+          "assertionType": "exists",
+          "precondition": "A workflow exists in the workflow list and the user has opened the Run Options Dialog for it",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "nav-run-summary-reachable",
+          "description": "The Run Summary page is reachable from the History/Runs list by clicking a completed run. This is where Brain/Actor iteration results, annotated screenshots, and verification verdicts are displayed after a workflow completes",
+          "category": "navigation",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Summary|complete|failed"
+            },
+            "label": "Run summary page"
+          },
+          "assertionType": "exists",
+          "precondition": "At least one workflow run has completed",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "presence-ai-settings",
+      "name": "AI Provider Settings Elements",
+      "description": "The Settings > AI page contains controls for selecting the AI provider and configuring API keys. The provider choice determines whether multimodal (vision) prompts are supported. Data is read and written via Tauri IPC commands (get_ai_settings, save_ai_settings) backed by settings.rs in the Rust backend. API keys are stored in the OS keychain via the keyring crate.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "presence-provider-radio-group",
+          "description": "The page shows a provider selection control with four options: Claude CLI, Claude API, Gemini CLI, and Gemini API. Each option has a label and a radio button or equivalent selector",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Claude CLI"
+            },
+            "label": "Claude CLI provider option"
           },
           "assertionType": "exists",
           "source": "manual",
@@ -43,9 +88,45 @@
           "enabled": true
         },
         {
-          "id": "multimodal-model-selection",
-          "description": "Users can select AI models per provider. Vision-capable models (claude-opus-4-6, claude-sonnet-4-6, gemini-2.5-pro) support multimodal content blocks. The model selector should indicate vision capability",
-          "category": "semantic",
+          "id": "presence-claude-api-option",
+          "description": "The Claude API provider option is present. When selected, this provider sends multimodal content blocks (text + image) to the Claude Messages API at https://api.anthropic.com/v1/messages",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Claude API"
+            },
+            "label": "Claude API provider option"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "presence-api-key-input",
+          "description": "When an API provider (Claude API or Gemini API) is selected, the page shows an API key input field. The field masks the key value and has a save button",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox",
+              "textContent": "API Key|key"
+            },
+            "label": "API key input field"
+          },
+          "assertionType": "exists",
+          "precondition": "An API provider (Claude API or Gemini API) is selected as the active provider",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "presence-model-selector",
+          "description": "The page shows a model selector or text input for the AI model ID. For Claude API this accepts model IDs like claude-opus-4-6, claude-sonnet-4-6. For Gemini API this accepts IDs like gemini-2.5-pro",
+          "category": "element-presence",
           "severity": "major",
           "target": {
             "type": "search",
@@ -58,61 +139,19 @@
           "source": "manual",
           "reviewed": true,
           "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "brain-actor-config",
-      "name": "Brain/Actor Mode Configuration",
-      "description": "The Brain/Actor two-phase LLM pattern splits visual reasoning (Brain — expensive vision model) from action execution (Actor — cheap text model). This saves cost by keeping images out of the Actor call. Users enable this via the agentic verification config. The Brain receives annotated screenshots with numbered element markers; the Actor receives only the Brain's text plan + element index.",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "brain-actor-toggle",
-          "description": "The agentic settings page exposes a toggle to enable Brain/Actor mode for agentic verification workflows. When enabled, the system uses a two-phase LLM invocation: Brain (vision model, ModelTier::Complex) analyzes annotated screenshots, then Actor (text model, ModelTier::Simple) executes the plan. Default is disabled (opt-in).",
-          "category": "behavior",
-          "severity": "critical",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "Brain|Actor|brain_actor"
-            },
-            "label": "Brain/Actor mode toggle"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
         },
         {
-          "id": "brain-actor-model-tiers",
-          "description": "When Brain/Actor mode is enabled, the system routes Brain invocations to Complex-tier models (Opus, GPT-4V, Gemini Pro) and Actor invocations to Simple-tier models (Haiku, Sonnet, Flash). This model tier routing integrates with the existing AI provider routing system and meta-optimizer model profiles",
-          "category": "behavior",
+          "id": "presence-connection-test",
+          "description": "The page shows a test/verify button that validates the API key and model configuration by making a test call to the provider",
+          "category": "element-presence",
           "severity": "major",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "Model|tier|routing"
+              "role": "button",
+              "textContent": "Test|Verify|Check"
             },
-            "label": "Model tier routing display"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "brain-actor-agentic-settings",
-          "description": "The agentic verification configuration includes brain_actor_enabled (boolean), confidence_threshold, max_iterations, verify_first, and required_consecutive_passes. These control the verification loop behavior when Brain/Actor mode is active",
-          "category": "semantic",
-          "severity": "critical",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "Agentic|Verification|Configuration"
-            },
-            "label": "Agentic verification config section"
+            "label": "Connection test button"
           },
           "assertionType": "exists",
           "source": "manual",
@@ -123,58 +162,65 @@
       "source": "manual"
     },
     {
-      "id": "screenshot-annotation",
-      "name": "Screenshot Annotation Engine",
-      "description": "The annotation engine draws numbered colored rectangles on screenshots to identify interactive UI elements for LLM consumption. Elements are color-coded by type (green=button, blue=input, orange=link, purple=select, teal=checkbox, gray=other). Each element gets a sequential number rendered via pixel-font (no external font dependency). Screenshots are resized to max 1024px width to reduce token cost (~75% savings vs 1920px). The annotated image is sent as a base64 PNG content block alongside a text element index.",
-      "category": "semantic",
+      "id": "interaction-ai-settings",
+      "name": "AI Provider Settings Interactions",
+      "description": "Users interact with the AI settings to configure which provider powers their automation. Switching providers affects whether multimodal vision features work (API providers support images, CLI providers fall back to text-only).",
+      "category": "interaction",
       "assertions": [
         {
-          "id": "annotation-run-screenshot",
-          "description": "When viewing a task run that used Brain/Actor mode, annotated screenshots appear in the run detail view showing numbered element markers overlaid on the captured screen state. Each marker is color-coded by element type and displays a sequential index number",
-          "category": "semantic",
+          "id": "interaction-switch-provider",
+          "description": "Users can switch the active AI provider by clicking a different provider option. The page updates to show provider-specific configuration fields (API key fields for API providers, CLI path fields for CLI providers)",
+          "category": "interaction",
           "severity": "critical",
+          "expected": "Clicking a provider option selects it and reveals its configuration section. Previously shown sections for other providers collapse or hide. The selected state persists after navigating away and returning",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "Screenshot|screenshot|annotated"
+              "textContent": "Claude API|Gemini API"
             },
-            "label": "Annotated screenshot display"
+            "label": "Provider option"
           },
-          "assertionType": "exists",
+          "assertionType": "enabled",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "annotation-element-index",
-          "description": "Alongside each annotated screenshot, a text element index is displayed listing all detected elements in the format: [N] \"Label\" type at (x, y) size (w, h). This index uses normalized 0.0-1.0 coordinates that are resolution-independent",
-          "category": "semantic",
-          "severity": "major",
+          "id": "interaction-save-api-key",
+          "description": "Users can enter an API key and save it. The key is stored in the OS keychain via the keyring crate, not in plaintext config files",
+          "category": "interaction",
+          "severity": "critical",
+          "expected": "After entering a key and clicking Save, a success indicator appears (toast, checkmark, or status text). The key field shows a masked value on subsequent page loads",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "Element|element|index"
+              "role": "button",
+              "textContent": "Save"
             },
-            "label": "Element index text"
+            "label": "Save API key button"
           },
-          "assertionType": "exists",
+          "assertionType": "enabled",
+          "precondition": "An API provider is selected",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "annotation-element-sources",
-          "description": "Elements for annotation are collected from two sources depending on the automation context: (1) UI Bridge apps (white-box): elements from the SDK semantic snapshot with normalizedRect coordinates, filtered to interactive types (button, input, select, textarea, link, checkbox, radio), capped at 50. (2) Black-box apps: elements from cascade detection (DetectedElement) with normalized bounding boxes from the CascadeDetector auto-normalization",
-          "category": "behavior",
+          "id": "interaction-test-connection",
+          "description": "Users can test the AI provider connection to verify their API key and model configuration work",
+          "category": "interaction",
           "severity": "major",
+          "expected": "Clicking the test button shows a loading state, then either a success message with the model's response or an error message explaining what failed (invalid key, unreachable endpoint, invalid model ID)",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "UI Bridge|element|detection"
+              "role": "button",
+              "textContent": "Test|Verify"
             },
-            "label": "Element source indicator"
+            "label": "Test connection button"
           },
-          "assertionType": "exists",
+          "assertionType": "enabled",
+          "precondition": "An API provider is selected and an API key has been saved",
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -183,41 +229,43 @@
       "source": "manual"
     },
     {
-      "id": "normalized-coordinates",
-      "name": "Normalized Coordinate System",
-      "description": "All element positions use a 0.0-1.0 normalized coordinate space relative to screen/viewport dimensions. This makes element references resolution-independent and portable across machines. UI Bridge apps already provide normalizedRect on ElementState. Black-box apps get normalization via DetectionResult.normalize(screen_width, screen_height) called automatically by the CascadeDetector after detection. The shared NormalizedRect type (vision::types) is used by both the annotation engine and DetectedElement step outputs.",
-      "category": "semantic",
+      "id": "presence-run-options-architecture",
+      "name": "Workflow Architecture Selection",
+      "description": "When launching a workflow, users choose the execution architecture from the Run Options Dialog. The 'Agentic Verification' architecture enables the verification-agent/worker-agent loop where the Brain/Actor vision pipeline operates. The architecture choice is stored in the workflow's LoopConfig and sent to the Rust backend via the /run Tauri command.",
+      "category": "element-presence",
       "assertions": [
         {
-          "id": "normalized-coords-display",
-          "description": "Element positions displayed in run results and element indices use normalized 0.0-1.0 coordinates rather than absolute pixel values, ensuring portability across screen resolutions",
-          "category": "behavior",
-          "severity": "major",
+          "id": "presence-architecture-options",
+          "description": "The Run Options Dialog shows three architecture choices: Traditional (deterministic verification loop), Agentic Verification (AI verifier + AI worker loop), and Multi-Agent Pipeline (DAG-structured specialized agents)",
+          "category": "element-presence",
+          "severity": "critical",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "0\\."
+              "textContent": "Traditional|Agentic Verification|Multi-Agent Pipeline"
             },
-            "label": "Normalized coordinate display"
+            "label": "Architecture radio options"
           },
           "assertionType": "exists",
+          "precondition": "The Run Options Dialog is open for a workflow",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "normalized-coords-cascade",
-          "description": "The CascadeDetector automatically normalizes detection results using the haystack (screenshot) dimensions. PIL Images use .size, numpy arrays use .shape[:2]. Results that are already normalized (from UI Bridge) are not double-normalized. Zero-dimension haystacks return un-normalized results gracefully",
-          "category": "behavior",
+          "id": "presence-agentic-description",
+          "description": "The Agentic Verification option has a description explaining it uses an AI verifier + AI worker reasoning loop. This is the architecture where Brain/Actor mode, annotated screenshots, and progressive memory compression are active",
+          "category": "element-presence",
           "severity": "major",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "detection|cascade|confidence"
+              "textContent": "AI verifier"
             },
-            "label": "Cascade detection results"
+            "label": "Agentic verification description"
           },
           "assertionType": "exists",
+          "precondition": "The Run Options Dialog is open for a workflow",
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -226,325 +274,121 @@
       "source": "manual"
     },
     {
-      "id": "brain-actor-execution",
-      "name": "Brain/Actor Execution in Agentic Loop",
-      "description": "During agentic verification, when Brain/Actor mode is enabled, each iteration follows this flow: (1) Brain is invoked with a multimodal prompt containing the annotated screenshot + element index + UI state text + record store contents. (2) Brain responds with JSON: screen_analysis, suggested_plan (ordered steps), context_notes. (3) Actor receives Brain's plan as text-only context injected into the worker prompt under '## Visual Analysis (Brain Agent)'. (4) Actor executes through the standard agentic executor. (5) After Actor completes, structured signals are parsed: RequestContext triggers Brain re-invocation, RecordStore persists key-value data. Brain output is cached for brain_cache_ttl_iterations (default 1). Max brain_reinvocations per iteration is 2.",
-      "category": "semantic",
+      "id": "data-display-run-results",
+      "name": "Agentic Verification Run Results Display",
+      "description": "After an agentic verification workflow completes, the Run Summary page displays per-iteration results. Each iteration shows the verification verdict (Pass/Fail/Partial with confidence percentage), worker summary, and timing. When Brain/Actor mode was active, iterations additionally show the Brain's screen analysis and action plan injected into the worker context. Data is fetched via Tauri IPC commands (get_task_run, get_task_run_events) reading from the PostgreSQL task_runs and task_run_events tables.",
+      "category": "data-display",
       "assertions": [
         {
-          "id": "brain-actor-iteration-display",
-          "description": "The run detail or active dashboard shows Brain/Actor iteration results: which iterations invoked the Brain (multimodal), what screen analysis was produced, what action plan was suggested, and whether the Actor requested re-analysis via RequestContext",
-          "category": "semantic",
+          "id": "data-run-outcome-status",
+          "description": "The page shows the overall run outcome prominently: goal_achieved (true/false), iterations_run count, and whether the run was stopped by the user or hit max_iterations",
+          "category": "data-display",
           "severity": "critical",
+          "expected": "A status banner or indicator at the top of the page shows one of: 'Goal Achieved' (green), 'Failed' (red), 'Stopped' (yellow), 'Max Iterations Reached' (orange). The iterations_run count appears as a number",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "Brain|Actor|iteration|Verification"
+              "textContent": "complete|failed|stopped|achieved"
             },
-            "label": "Brain/Actor iteration details"
+            "label": "Run outcome status"
           },
           "assertionType": "exists",
+          "precondition": "At least one agentic verification workflow run has completed",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "brain-actor-screen-analysis",
-          "description": "The Brain's screen analysis output is displayed for each iteration where the Brain was invoked, showing what the vision model observed about the current screen state and how it assessed progress toward the goal",
-          "category": "semantic",
+          "id": "data-iteration-verdict",
+          "description": "Each iteration in the run shows the verification verdict with status and confidence. The confidence is displayed as a percentage derived from the verifier's 0.0-1.0 confidence score",
+          "category": "data-display",
+          "severity": "critical",
+          "expected": "Each iteration row shows status text (Pass, Fail, Partial, or Unreachable) and a confidence percentage (e.g., '85%'). Pass verdicts at or above the confidence_threshold are highlighted positively",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Pass|Fail|Partial|%"
+            },
+            "label": "Iteration verdict display"
+          },
+          "assertionType": "exists",
+          "precondition": "An agentic verification run with at least 2 iterations has completed",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "data-worker-summary",
+          "description": "Each iteration that ran a worker agent shows a summary of what the worker did, truncated to approximately 500 characters. This is the approach the AI took to address verification failures",
+          "category": "data-display",
           "severity": "major",
+          "expected": "A text block under each iteration showing the worker's approach. Long summaries end with '...' indicating truncation",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "analysis|screen|observed"
+              "textContent": "worker|Worker|action"
             },
-            "label": "Brain screen analysis"
+            "label": "Worker summary text"
           },
           "assertionType": "exists",
+          "precondition": "An agentic verification run with at least 1 worker iteration has completed",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "brain-actor-action-plan",
-          "description": "The Brain's suggested action plan is displayed as an ordered list of steps that the Actor will execute. Each step references elements by their index number from the annotated screenshot",
-          "category": "semantic",
+          "id": "data-brain-analysis-in-output",
+          "description": "When Brain/Actor mode was active during a run, the AI Output tab shows the Brain's visual analysis section within the worker context. This appears as a '## Visual Analysis (Brain Agent)' heading followed by the Brain's screen analysis, action plan, and element index",
+          "category": "data-display",
           "severity": "major",
+          "expected": "The AI output for worker iterations contains a 'Visual Analysis (Brain Agent)' section with: a screen analysis paragraph, a numbered action plan, and an element index listing interactive elements with normalized coordinates",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "plan|steps|action"
+              "textContent": "Visual Analysis|Brain Agent|Brain Analysis"
             },
-            "label": "Brain action plan"
+            "label": "Brain analysis section in AI output"
           },
           "assertionType": "exists",
+          "precondition": "An agentic verification run with brain_actor_enabled:true has completed at least 1 iteration",
           "source": "manual",
           "reviewed": true,
-          "enabled": true
+          "enabled": false
         },
         {
-          "id": "brain-actor-record-store",
-          "description": "Named records stored via RecordStore signals are displayed and persist across iterations. Both Brain and Actor can save key-value data that is included in subsequent Brain invocations",
-          "category": "behavior",
+          "id": "data-element-index-format",
+          "description": "The element index displayed in Brain/Actor run results lists detected interactive elements in the format: [N] \"Label\" type at (x, y) size (w, h) where coordinates are normalized 0.0-1.0 values",
+          "category": "data-display",
+          "severity": "major",
+          "expected": "A formatted list where each line starts with a bracketed number like [1], [2], etc., followed by a quoted label, element type, and normalized coordinate values between 0 and 1",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "\\[1\\]|\\[2\\]|Screen Elements"
+            },
+            "label": "Element index list"
+          },
+          "assertionType": "exists",
+          "precondition": "An agentic verification run with brain_actor_enabled:true has completed and the UI Bridge SDK was connected during execution",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": false
+        },
+        {
+          "id": "data-token-usage-per-phase",
+          "description": "The run statistics or token usage section shows token counts broken down by phase. When Brain/Actor mode is active, Brain (multimodal) calls show higher input token counts due to image encoding compared to Actor (text-only) calls",
+          "category": "data-display",
           "severity": "minor",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "record|stored|context"
-            },
-            "label": "Record store display"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "playbook-skills",
-      "name": "Markdown Playbook Skills",
-      "description": "Domain knowledge playbooks are human-editable markdown files with YAML frontmatter stored in ~/.qontinui/playbooks/. Each playbook has: name, description, category, tags, and triggers (app_name, url_pattern, tag). Playbooks extend the existing SkillTemplate system with a new 'playbook' variant. They are loaded by the playbook_parser, matched against current context via triggers, and injected into: (1) workflow generation prompts (schema_context.rs assemble_prompt under '## Domain Playbooks'), (2) Brain agent system prompts (format_playbooks_for_context). Content is truncated to 2000 chars in generation and 1500 chars in Brain prompts to manage token budgets.",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "playbook-management",
-          "description": "Users can view loaded playbooks in the skills or settings interface. Playbooks are identified by their name, description, category, tags, and trigger conditions. The system shows how many playbooks are loaded from the ~/.qontinui/playbooks/ directory",
-          "category": "semantic",
-          "severity": "major",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "Playbook|playbook|domain"
-            },
-            "label": "Playbook management section"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "playbook-trigger-matching",
-          "description": "Playbooks are automatically matched and included based on trigger conditions: app_name (case-insensitive contains match), url_pattern (segment-based glob with prefix/suffix/infix matching), and tag (exact match). Playbooks with no triggers are always included",
-          "category": "behavior",
-          "severity": "major",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "trigger|match|pattern"
-            },
-            "label": "Trigger matching display"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "playbook-yaml-frontmatter",
-          "description": "Playbooks use YAML frontmatter format: --- delimited header with name (required), description, category (default: domain-knowledge), tags array, and triggers array. The markdown body after the frontmatter contains the domain knowledge content",
-          "category": "behavior",
-          "severity": "minor",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "YAML|frontmatter|markdown"
-            },
-            "label": "Playbook format documentation"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "click-highlighting",
-      "name": "Visual Click Highlighting",
-      "description": "Visual click feedback during automation provides observability of what the system is doing. Two implementations cover both automation contexts: (1) UI Bridge apps (white-box): CSS overlay injection via showClickHighlight() — creates a temporary position:fixed div with a pulsing circle animation at the element's center. Color-coded by action type (green=click, blue=type, orange=scroll, purple=select, teal=focus). Wired into ActionExecutor.executeAction() via dynamic import after performAction succeeds. Duration 600ms, non-fatal on failure. (2) Black-box apps: Tauri transparent overlay window (click_overlay.rs) — always-on-top, click-through webview that renders CSS animations at screen coordinates via JS eval. Initialized once at app startup.",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "click-highlight-visible",
-          "description": "During automation execution, a brief visual highlight appears at each action location (click, type, scroll targets), giving users real-time feedback of what the system is interacting with. The highlight is a colored pulsing circle that fades out after ~600ms",
-          "category": "behavior",
-          "severity": "major",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "presentation",
-              "textContent": ""
-            },
-            "label": "Click highlight overlay"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "click-highlight-color-coded",
-          "description": "Highlights are color-coded by action type: green (#00c800) for click, blue (#0064ff) for type/sendKeys, orange (#ff8c00) for scroll, purple (#b400b4) for select, teal (#00b4b4) for focus. This helps users distinguish different action types visually during execution",
-          "category": "design",
-          "severity": "minor",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "presentation"
-            },
-            "label": "Color-coded highlight"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "click-highlight-non-interfering",
-          "description": "Click highlights use pointer-events:none and z-index:999999 so they do not interfere with user interaction or automation. The overlay is purely visual feedback and auto-removes after the animation duration",
-          "category": "behavior",
-          "severity": "critical",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "presentation"
-            },
-            "label": "Non-interfering overlay"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "progressive-compression",
-      "name": "Progressive Memory Compression",
-      "description": "The agentic verification loop compresses iteration history to prevent context bloat while preserving key information about what was tried. Two compression modes: (1) CharBased (default): merges oldest two entries by concatenating approach/result and truncating to 100 chars. Preserves at least 3 entries. (2) LlmSummarized: sends oldest entries to a Simple-tier model (Haiku) for summarization, replaces with a single summary entry. Falls back to CharBased if LLM fails. Budget is max_total_chars=4000. The summarize_iterations_with_llm function uses temperature=0.3 for factual summarization. All string truncation is UTF-8 safe (chars().take(N), not byte slicing).",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "compression-iteration-history",
-          "description": "The run detail view shows iteration history for agentic verification runs, including compressed summaries of past iterations. Users can see what was tried in each iteration and how the approach evolved, with older iterations progressively summarized to save space",
-          "category": "semantic",
-          "severity": "major",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "iteration|attempt|history"
-            },
-            "label": "Iteration history display"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "compression-token-efficiency",
-          "description": "Iteration history stays under 4000 characters regardless of how many iterations ran, achieved through progressive compression. LLM-summarized mode produces more informative summaries than char-based truncation while maintaining the same budget",
-          "category": "behavior",
-          "severity": "major",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "previous|attempt|tried"
-            },
-            "label": "Compressed history in context"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "dual-context-architecture",
-      "name": "Dual Automation Context Architecture",
-      "description": "The TuriX-CUA features operate in two distinct automation contexts with different data sources and capabilities. UI Bridge apps (white-box): JS/TS web apps with the UI Bridge SDK integrated — provides 50+ element properties, semantic snapshots, ARIA, computed styles, form validation, change tracking, normalizedRect coordinates. The UI Bridge data is always preferred when available. Black-box visual GUI automation: native desktop apps that are opaque to the system — uses screenshots, OCR (EasyOCR/Tesseract/cloud), template matching (12 CascadeDetector backends), UIA/AT-SPI accessibility trees. The element collector tries UI Bridge first, falls back to DetectedElement from step outputs.",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "dual-context-ui-bridge-priority",
-          "description": "When a UI Bridge SDK app is connected, the system uses UI Bridge element data (semantic snapshots, normalizedRect, ARIA roles) for annotation and Brain analysis rather than screenshot-based detection. UI Bridge data is always preferred as it provides richer, more accurate element information",
-          "category": "behavior",
-          "severity": "critical",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "UI Bridge|SDK|connected"
-            },
-            "label": "UI Bridge priority indicator"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "dual-context-black-box-fallback",
-          "description": "For black-box desktop apps without UI Bridge integration, the system falls back to screenshot-based element detection via the CascadeDetector (12 backends ordered by cost), accessibility tree queries (UIA on Windows, AT-SPI on Linux), and OCR text extraction. Normalized coordinates are computed from screenshot dimensions",
-          "category": "behavior",
-          "severity": "major",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "detection|cascade|accessibility"
-            },
-            "label": "Black-box detection fallback"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "multimodal-api-format",
-      "name": "Multimodal API Content Block Format",
-      "description": "The multimodal prompt system constructs provider-native content block arrays. Claude API: {\"messages\": [{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"...\"}, {\"type\": \"image\", \"source\": {\"type\": \"base64\", \"media_type\": \"image/png\", \"data\": \"...\"}}]}]}. Includes top-level \"system\" field when system prompt is set. Gemini API: {\"contents\": [{\"parts\": [{\"text\": \"...\"}, {\"inline_data\": {\"mime_type\": \"image/png\", \"data\": \"...\"}}]}], \"systemInstruction\": {\"parts\": [{\"text\": \"...\"}]}}. CLI providers (Claude CLI, Gemini CLI) receive text-only fallback with a warning log. The routing layer auto-switches from CLI to API when multimodal content is detected (run_prompt_with_model_override_multimodal).",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "multimodal-api-token-usage",
-          "description": "Token usage and cost for multimodal (vision) calls are tracked and displayed in the LLM analytics page. Vision calls have higher input token costs due to image encoding (~1600 tokens per 1024px image tile). The system tracks input_tokens and output_tokens per API call",
-          "category": "semantic",
-          "severity": "major",
+          "expected": "Token usage is displayed with input_tokens and output_tokens counts. Total cost in USD is shown based on model pricing",
           "target": {
             "type": "search",
             "criteria": {
               "textContent": "token|cost|usage"
             },
-            "label": "Multimodal token tracking"
+            "label": "Token usage display"
           },
           "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "multimodal-cli-fallback",
-          "description": "When the configured AI provider is a CLI provider (Claude CLI, Gemini CLI), multimodal prompts automatically fall back to text-only by extracting all text content blocks and dropping images. A warning is logged. For Brain/Actor mode with multimodal, the routing layer auto-switches to the API variant of the same provider",
-          "category": "behavior",
-          "severity": "major",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "CLI|fallback|text-only"
-            },
-            "label": "CLI fallback indicator"
-          },
-          "assertionType": "exists",
+          "precondition": "At least one workflow run has completed with an API provider configured",
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -553,95 +397,169 @@
       "source": "manual"
     },
     {
-      "id": "element-presence-vision-ui",
-      "name": "Vision Pipeline Element Presence",
-      "description": "Core UI elements that must be present on pages where TuriX-CUA features are configured, displayed, or monitored. These assertions verify the structural presence of key controls and display areas.",
-      "category": "element-presence",
+      "id": "behavior-agentic-loop",
+      "name": "Agentic Verification Loop Behavior",
+      "description": "The agentic verification loop runs iterations of verification-agent followed by worker-agent until the goal is achieved or max_iterations is reached. Key automatic behaviors include: progressive iteration history compression (keeps context under 4000 chars), consecutive pass tracking (requires N passes before declaring success), and stop-signal responsiveness. When Brain/Actor mode is enabled, the Brain is invoked with multimodal prompts when should_invoke_brain() returns true (first iteration, cache expired, or RequestContext signal). The loop is orchestrated by LoopController in unified_workflow_executor/agentic_verification_loop.rs.",
+      "category": "behavior",
       "assertions": [
         {
-          "id": "presence-ai-provider-selector",
-          "description": "The AI settings page contains a provider selection control (radio group, dropdown, or segmented control) listing Claude CLI, Claude API, Gemini CLI, and Gemini API options",
-          "category": "element-presence",
+          "id": "behavior-iteration-progression",
+          "description": "The active dashboard shows iterations progressing in real time during an agentic verification run. Each iteration transitions through: verification agent running → verdict displayed → worker agent running → worker output displayed",
+          "category": "behavior",
           "severity": "critical",
+          "expected": "The iteration count increments as each iteration completes. The current phase (verifying/working) is indicated. New iterations appear without page refresh",
           "target": {
             "type": "search",
             "criteria": {
-              "role": "radiogroup|listbox|combobox",
-              "textContent": "Claude|Gemini"
+              "textContent": "iteration|Iteration|verif"
             },
-            "label": "Provider selector control"
+            "label": "Live iteration progress"
           },
           "assertionType": "exists",
+          "precondition": "An agentic verification workflow is currently running",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "presence-brain-actor-toggle",
-          "description": "The agentic settings page contains a toggle or checkbox control for enabling Brain/Actor mode, labeled with brain_actor or similar identifier",
-          "category": "element-presence",
+          "id": "behavior-stop-signal",
+          "description": "Users can stop a running agentic verification workflow. The stop signal is checked at the start of each iteration. When stopped, the run result shows was_stopped:true and the iterations completed so far are preserved",
+          "category": "behavior",
           "severity": "critical",
+          "expected": "After clicking stop, the run transitions to a stopped state within one iteration. The run summary shows the iterations that completed before the stop",
           "target": {
             "type": "search",
             "criteria": {
-              "role": "switch|checkbox",
-              "textContent": "Brain|brain_actor|Vision"
+              "role": "button",
+              "textContent": "Stop|stop"
             },
-            "label": "Brain/Actor enable toggle"
+            "label": "Stop button"
           },
           "assertionType": "exists",
+          "precondition": "An agentic verification workflow is currently running",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "presence-run-screenshot-container",
-          "description": "The run detail view contains an image container element capable of displaying annotated screenshots. This container renders base64 PNG data from the annotation engine",
-          "category": "element-presence",
+          "id": "behavior-goal-achieved-exit",
+          "description": "When the verification agent reports Pass with confidence above the threshold for the required number of consecutive passes, the loop exits with goal_achieved:true. The UI reflects this as a successful outcome",
+          "category": "behavior",
           "severity": "critical",
+          "expected": "The run transitions to complete status with a success indicator. The final verdict shows Pass with the confidence percentage. The consecutive pass count matches required_consecutive_passes from the config",
           "target": {
             "type": "search",
             "criteria": {
-              "role": "img",
-              "textContent": "screenshot|Screenshot"
+              "textContent": "achieved|complete|Pass"
             },
-            "label": "Screenshot image container"
+            "label": "Goal achieved indicator"
           },
           "assertionType": "exists",
+          "precondition": "An agentic verification run has completed successfully (goal achieved)",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "presence-iteration-panel",
-          "description": "The active dashboard and run recap contain an iteration panel showing per-iteration results with expandable details for verification verdicts and worker summaries",
-          "category": "element-presence",
+          "id": "behavior-max-iterations-exit",
+          "description": "When the loop reaches max_iterations without achieving the goal, it exits with max_iterations_reached:true. The UI shows this as a non-success outcome distinct from errors",
+          "category": "behavior",
           "severity": "major",
+          "expected": "The run shows 'Max iterations reached' or similar status. The iterations_run count equals max_iterations. The final verdict is the last iteration's verdict (typically Fail or Partial)",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "Iteration|iteration"
+              "textContent": "max iterations|Max Iterations|iterations reached"
             },
-            "label": "Iteration result panel"
+            "label": "Max iterations indicator"
           },
           "assertionType": "exists",
+          "precondition": "An agentic verification run has completed by hitting max_iterations",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": false
+        },
+        {
+          "id": "behavior-cli-fallback-warning",
+          "description": "When the active AI provider is a CLI variant (Claude CLI, Gemini CLI), multimodal vision features are unavailable. If Brain/Actor mode is enabled, the system falls back to text-only Brain invocations and logs a warning",
+          "category": "behavior",
+          "severity": "major",
+          "expected": "No annotated screenshots appear in Brain/Actor iteration results. The runner logs contain a warning: 'does not support image content blocks; falling back to text-only'",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "CLI|text-only|fallback"
+            },
+            "label": "CLI fallback warning"
+          },
+          "assertionType": "exists",
+          "precondition": "A CLI provider is configured and an agentic verification run with brain_actor_enabled:true has completed",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": false
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "state-consistency-config-execution",
+      "name": "Configuration-to-Execution State Consistency",
+      "description": "The UI must accurately reflect the relationship between configuration state (which provider is active, whether Brain/Actor is enabled) and execution results (whether multimodal was used, whether Brain analysis appears). Mismatches indicate bugs in the config propagation through the Tauri IPC layer.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "state-provider-matches-results",
+          "description": "The AI provider shown on the Settings > AI page matches the provider recorded in task run token usage. If Claude API is selected, run results show Claude API token usage; if Gemini CLI is selected, run results show Gemini CLI",
+          "category": "state-consistency",
+          "severity": "critical",
+          "expected": "The provider name in run statistics matches the provider name on the settings page. Changing the provider and running a new workflow produces results with the new provider's name",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Claude|Gemini|provider"
+            },
+            "label": "Provider name in run results"
+          },
+          "assertionType": "semantic",
+          "precondition": "At least one workflow run has completed with the current provider configuration",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "presence-confidence-indicator",
-          "description": "Verification results display a confidence percentage (0-100%) derived from the verification agent's confidence score (0.0-1.0). This indicator shows the verifier's certainty about goal achievement",
-          "category": "element-presence",
-          "severity": "major",
+          "id": "state-architecture-matches-loop-type",
+          "description": "The workflow architecture selected in the Run Options Dialog determines the loop type shown in run results. 'Agentic Verification' produces iterations with verification verdicts and worker summaries. 'Traditional' produces setup/verification/agentic phase results without verdict confidence scores",
+          "category": "state-consistency",
+          "severity": "critical",
+          "expected": "Runs started with 'Agentic Verification' show per-iteration verdicts with confidence percentages. Runs started with 'Traditional' show phase-based results without AI verdicts",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "%|confidence|Confidence"
+              "textContent": "Agentic|Traditional|verdict|confidence"
             },
-            "label": "Confidence indicator"
+            "label": "Architecture-loop consistency"
           },
-          "assertionType": "exists",
+          "assertionType": "semantic",
+          "precondition": "At least one run of each architecture type has completed",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": false
+        },
+        {
+          "id": "state-iteration-count-matches-display",
+          "description": "The number of iteration panels or rows displayed in the run detail matches the iterations_run count reported in the run summary header",
+          "category": "state-consistency",
+          "severity": "major",
+          "expected": "If the summary says '5 iterations', exactly 5 iteration rows or panels are visible (possibly with pagination). No phantom or missing iterations",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "iteration|Iteration"
+            },
+            "label": "Iteration count display"
+          },
+          "assertionType": "semantic",
+          "precondition": "An agentic verification run with 2+ iterations has completed",
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -650,88 +568,37 @@
       "source": "manual"
     },
     {
-      "id": "interaction-vision-controls",
-      "name": "Vision Pipeline User Interactions",
-      "description": "Interactive controls and workflows that users perform to configure, trigger, and inspect the TuriX-CUA vision pipeline features.",
+      "id": "interaction-run-detail",
+      "name": "Run Detail Interactions",
+      "description": "Users interact with run detail pages to inspect iteration results, view AI output, and continue failed runs. The Run Summary page uses tabs (Timeline, Verification, Knowledge, Context, Canvas, Errors) for deep dives. Data is fetched from the Rust backend via get_task_run and get_task_run_events Tauri commands.",
       "category": "interaction",
       "assertions": [
         {
-          "id": "interaction-enable-brain-actor",
-          "description": "Users can toggle Brain/Actor mode on/off in the agentic settings. Toggling on enables the two-phase LLM pattern for all subsequent agentic verification runs. Toggling off reverts to single-agent behavior. The toggle state persists across app restarts",
+          "id": "interaction-tab-switching",
+          "description": "Users can switch between the tabbed sections of the Run Summary to access different views of the run data. The Timeline tab shows chronological events, the Verification tab shows verification plans and results",
           "category": "interaction",
           "severity": "critical",
+          "expected": "Clicking a tab label switches the visible content panel. The selected tab is visually highlighted. Tab content loads without a full page refresh",
           "target": {
             "type": "search",
             "criteria": {
-              "role": "switch|checkbox",
-              "textContent": "Brain|Actor|Vision"
+              "role": "tab|tablist",
+              "textContent": "Timeline|Verification|Knowledge"
             },
-            "label": "Brain/Actor toggle interaction"
+            "label": "Run detail tabs"
           },
           "assertionType": "enabled",
+          "precondition": "A completed run's summary page is open",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "interaction-select-provider",
-          "description": "Users can switch between AI providers. Selecting Claude API or Gemini API enables multimodal vision support. Selecting CLI variants shows a note that vision features will use text-only fallback",
-          "category": "interaction",
-          "severity": "critical",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "radiogroup|listbox|combobox",
-              "textContent": "Provider"
-            },
-            "label": "Provider selection interaction"
-          },
-          "assertionType": "enabled",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "interaction-expand-iteration",
-          "description": "Users can click on an iteration row in the run detail view to expand it and see the full Brain analysis, action plan, worker output, and verification verdict for that iteration",
+          "id": "interaction-continue-run",
+          "description": "Users can continue a finished (complete, failed, or stopped) agentic verification run by adding more sessions. This preserves the iteration history and context from previous iterations",
           "category": "interaction",
           "severity": "major",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "button|disclosure",
-              "textContent": "Iteration|expand|details"
-            },
-            "label": "Iteration expand control"
-          },
-          "assertionType": "enabled",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "interaction-view-annotated-screenshot",
-          "description": "Users can click on a screenshot thumbnail in the run detail or active dashboard to view the full annotated screenshot with numbered element markers overlaid. The expanded view shows both the annotated image and the text element index side by side",
-          "category": "interaction",
-          "severity": "major",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "img|button",
-              "textContent": "screenshot|Screenshot"
-            },
-            "label": "Screenshot expand interaction"
-          },
-          "assertionType": "enabled",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "interaction-continue-run-with-brain",
-          "description": "When continuing a stopped or failed agentic verification run, the Brain/Actor mode setting from the original run is preserved. Users can also override it before continuing",
-          "category": "interaction",
-          "severity": "minor",
+          "expected": "A 'Continue' button is visible on the run summary. Clicking it opens a dialog to specify additional sessions. After confirming, the run resumes from where it left off",
           "target": {
             "type": "search",
             "criteria": {
@@ -741,6 +608,26 @@
             "label": "Continue run button"
           },
           "assertionType": "enabled",
+          "precondition": "A completed or stopped run's summary page is open",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "interaction-view-ai-output",
+          "description": "Users can view the full AI output for each iteration by navigating to the AI Output tab or expanding an iteration detail. This shows the complete prompt and response including any Brain/Actor visual analysis sections",
+          "category": "interaction",
+          "severity": "major",
+          "expected": "The AI Output section shows per-iteration conversation logs with the full prompt text (including injected context) and the AI's response. For Brain/Actor runs, the '## Visual Analysis (Brain Agent)' section is visible in the prompt",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "AI Output|AI Data|output"
+            },
+            "label": "AI output viewer"
+          },
+          "assertionType": "exists",
+          "precondition": "A completed run's summary page is open and the run had at least 1 agentic iteration",
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -749,22 +636,22 @@
       "source": "manual"
     },
     {
-      "id": "data-display-vision-results",
-      "name": "Vision Pipeline Data Display",
-      "description": "How the TuriX-CUA pipeline results are displayed to users: annotated screenshots, element indices, Brain analysis, action plans, token costs, and iteration history.",
-      "category": "data-display",
+      "id": "semantic-vision-pipeline",
+      "name": "Vision Pipeline Purpose and Mental Model",
+      "description": "The vision pipeline serves two user needs: (1) for developers automating their own web apps (UI Bridge white-box), it provides rich element data for intelligent verification without fragile selectors; (2) for automating third-party desktop apps (visual GUI black-box), it provides screenshot-based element detection with LLM vision reasoning. Users should understand which mode is active and why the system chose it.",
+      "category": "semantic",
       "assertions": [
         {
-          "id": "data-annotated-screenshot-rendered",
-          "description": "Annotated screenshots are rendered as inline images (not raw base64 text). The image shows the original screenshot with colored numbered rectangles overlaid on interactive elements. Green=button, blue=input, orange=link, purple=select, teal=checkbox, gray=other",
-          "category": "data-display",
+          "id": "semantic-agentic-verification-purpose",
+          "description": "The Agentic Verification architecture option communicates that it uses AI reasoning to assess goal achievement rather than hard-coded checks. Users understand this is for goals that are hard to verify deterministically (e.g., 'the page looks correct' vs 'HTTP status is 200')",
+          "category": "semantic",
           "severity": "critical",
           "target": {
             "type": "search",
             "criteria": {
-              "role": "img"
+              "textContent": "Agentic Verification"
             },
-            "label": "Rendered annotated screenshot"
+            "label": "Agentic verification description"
           },
           "assertionType": "exists",
           "source": "manual",
@@ -772,84 +659,34 @@
           "enabled": true
         },
         {
-          "id": "data-element-index-formatted",
-          "description": "The text element index is displayed in a formatted list or code block showing each element as: [N] \"Label\" type at (x, y) size (w, h). Coordinates are normalized 0.0-1.0 values. The index is displayed alongside or below its corresponding annotated screenshot",
-          "category": "data-display",
+          "id": "semantic-iteration-history-purpose",
+          "description": "The iteration history shown in run results communicates the progressive problem-solving approach: what was tried, what failed, and how the approach evolved. Users understand that older iterations are compressed to prevent context bloat while preserving key learnings",
+          "category": "semantic",
           "severity": "major",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "Screen Elements|\\[1\\]|\\[2\\]"
+              "textContent": "Previous Attempts|iteration|approach"
             },
-            "label": "Formatted element index"
+            "label": "Iteration history context"
           },
           "assertionType": "exists",
+          "precondition": "An agentic verification run with 3+ iterations has completed",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "data-brain-analysis-markdown",
-          "description": "The Brain's screen_analysis output is displayed as formatted text (markdown rendering supported) describing what the vision model observed about the current screen state. This appears in the iteration detail when Brain/Actor mode is active",
-          "category": "data-display",
-          "severity": "major",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "Brain|analysis|Visual Analysis"
-            },
-            "label": "Brain analysis display"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "data-action-plan-ordered-list",
-          "description": "The Brain's suggested_plan is displayed as a numbered list of action steps. Each step references elements by their index number (e.g., 'Click element [3]'). The Actor receives this plan as its primary instruction context",
-          "category": "data-display",
-          "severity": "major",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "1\\.|step|plan"
-            },
-            "label": "Action plan list"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "data-multimodal-token-cost",
-          "description": "Token usage for Brain (multimodal, vision) and Actor (text-only) calls are displayed separately in the run statistics or LLM analytics, showing the cost savings from the two-phase pattern. Brain calls show higher input tokens due to image encoding",
-          "category": "data-display",
+          "id": "semantic-playbook-domain-knowledge",
+          "description": "The Skills page communicates that playbooks provide domain-specific knowledge for automating particular applications. Users understand that playbooks are human-editable markdown files stored in ~/.qontinui/playbooks/ that the system automatically includes when triggers match the current automation target",
+          "category": "semantic",
           "severity": "minor",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "token|cost|input|output"
+              "textContent": "Skill|skill|playbook|Playbook"
             },
-            "label": "Token cost breakdown"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "data-verification-verdict",
-          "description": "Each agentic verification iteration displays the verdict: status (Pass/Fail/Partial/Unreachable), confidence percentage, observations text, and next_priority suggestion. For consecutive pass tracking, the number of consecutive passes is shown",
-          "category": "data-display",
-          "severity": "critical",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "Pass|Fail|Partial|confidence"
-            },
-            "label": "Verification verdict display"
+            "label": "Skills/playbook section"
           },
           "assertionType": "exists",
           "source": "manual",
@@ -860,192 +697,48 @@
       "source": "manual"
     },
     {
-      "id": "state-consistency-vision",
-      "name": "Vision Pipeline State Consistency",
-      "description": "State consistency invariants that must hold across the vision pipeline: configuration state matches runtime behavior, Brain/Actor mode toggles propagate correctly, and iteration results are consistent with the execution flow.",
-      "category": "state-consistency",
+      "id": "design-click-highlights",
+      "name": "Click Highlight Visual Design",
+      "description": "During automation execution, brief visual highlights appear at action locations (click, type, scroll targets). For UI Bridge apps, this is a CSS overlay injected by showClickHighlight() in debug/click-highlight.ts, called from action-executor.ts after each performAction() succeeds. Highlights use position:fixed, pointer-events:none, z-index:999999 to avoid interfering with the page. The animation is a pulsing circle that scales from 0.5 to 1.2 and fades from opacity 1 to 0 over 600ms.",
+      "category": "design",
       "assertions": [
         {
-          "id": "state-brain-actor-config-matches-execution",
-          "description": "When brain_actor_enabled is true in the workflow config, the run detail shows Brain/Actor iteration results with Brain analysis sections. When false, iterations show only worker output without Brain analysis. The UI state must match the config state",
-          "category": "state-consistency",
-          "severity": "critical",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "Brain|Visual Analysis"
-            },
-            "label": "Brain/Actor state consistency"
-          },
-          "assertionType": "semantic",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "state-provider-multimodal-consistency",
-          "description": "When an API provider (Claude API, Gemini API) is selected, multimodal features (annotated screenshots in Brain calls) are active and the UI reflects this. When a CLI provider is selected, the UI indicates text-only mode and no annotated screenshots appear in Brain analysis",
-          "category": "state-consistency",
-          "severity": "critical",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "Provider|API|CLI"
-            },
-            "label": "Provider-multimodal consistency"
-          },
-          "assertionType": "semantic",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "state-iteration-count-matches-results",
-          "description": "The number of iteration panels displayed matches the iterations_run count in the run result. Each iteration has exactly one verdict and optionally one worker summary. Goal-achieved runs show the final passing iteration; max-iterations runs show the full count",
-          "category": "state-consistency",
-          "severity": "major",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "iteration|Iteration"
-            },
-            "label": "Iteration count consistency"
-          },
-          "assertionType": "semantic",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "state-element-index-matches-screenshot",
-          "description": "The text element index and the annotated screenshot for a given iteration are always in sync: the numbered markers on the screenshot correspond 1:1 with the entries in the text index. Element [1] in the index is element [1] on the screenshot",
-          "category": "state-consistency",
-          "severity": "critical",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "\\[1\\]|\\[2\\]|element"
-            },
-            "label": "Screenshot-index sync"
-          },
-          "assertionType": "semantic",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "state-record-store-persistence",
-          "description": "Records stored via RecordStore signals in one iteration appear in the Brain context of subsequent iterations. The record store display shows all accumulated records, and removing a record is reflected in the next Brain invocation",
-          "category": "state-consistency",
+          "id": "design-highlight-color-by-action",
+          "description": "Click highlights are color-coded by action type so users can distinguish what kind of action was performed at each location",
+          "category": "design",
           "severity": "minor",
+          "expected": "Click actions show green (#00c800) highlights, type/sendKeys actions show blue (#0064ff), scroll actions show orange (#ff8c00), select actions show purple (#b400b4), focus actions show teal (#00b4b4)",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "record|stored"
+              "role": "presentation"
             },
-            "label": "Record store persistence"
+            "label": "Highlight element"
           },
-          "assertionType": "semantic",
+          "assertionType": "exists",
+          "precondition": "An action (click, type, etc.) has been executed via the UI Bridge action executor within the last 600ms",
           "source": "manual",
           "reviewed": true,
-          "enabled": true
-        }
-      ],
-      "source": "manual"
-    },
-    {
-      "id": "navigation-vision-pages",
-      "name": "Vision Feature Navigation",
-      "description": "Navigation paths to access TuriX-CUA configuration and results across the runner application. Users need clear paths from settings configuration to workflow execution to result inspection.",
-      "category": "navigation",
-      "assertions": [
+          "enabled": false
+        },
         {
-          "id": "nav-settings-to-ai",
-          "description": "Users can navigate from the main Settings page to the AI Provider sub-page where multimodal provider configuration is available. The navigation path is: sidebar Settings > AI Provider section",
-          "category": "navigation",
+          "id": "design-highlight-non-interfering",
+          "description": "Click highlight overlays do not capture mouse events or block interaction with underlying elements. They exist purely as visual feedback",
+          "category": "design",
           "severity": "critical",
+          "expected": "The highlight div has CSS pointer-events:none. Clicking through the highlight area reaches the element underneath. The highlight is removed from the DOM after 600ms",
           "target": {
             "type": "search",
             "criteria": {
-              "role": "link|tab|button",
-              "textContent": "AI|Provider"
+              "role": "presentation"
             },
-            "label": "AI settings navigation"
+            "label": "Non-interfering highlight"
           },
           "assertionType": "exists",
+          "precondition": "An action has been executed via the UI Bridge action executor within the last 600ms",
           "source": "manual",
           "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "nav-settings-to-agentic",
-          "description": "Users can navigate from the main Settings page to the Agentic sub-page where Brain/Actor mode toggle and agentic verification configuration are available. The navigation path is: sidebar Settings > Agentic section",
-          "category": "navigation",
-          "severity": "critical",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "link|tab|button",
-              "textContent": "Agentic"
-            },
-            "label": "Agentic settings navigation"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "nav-run-to-iteration-detail",
-          "description": "From the run list (History/Runs page), users can click a run to open the Run Recap/Summary, then navigate to specific iterations that show Brain/Actor results, annotated screenshots, and verification verdicts",
-          "category": "navigation",
-          "severity": "critical",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "role": "link|button|row",
-              "textContent": "run|Run"
-            },
-            "label": "Run to detail navigation"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "nav-active-to-live-brain",
-          "description": "During a running agentic verification workflow, users can view live Brain/Actor iteration results on the Active Dashboard, including real-time Brain analysis output and action plans as they are produced",
-          "category": "navigation",
-          "severity": "major",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "Active|active|live"
-            },
-            "label": "Active dashboard live view"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
-        },
-        {
-          "id": "nav-skills-to-playbooks",
-          "description": "Users can navigate to the Skills page to see loaded playbooks alongside other skill types. Playbooks are distinguishable from step-template skills by their 'playbook' category and book icon",
-          "category": "navigation",
-          "severity": "minor",
-          "target": {
-            "type": "search",
-            "criteria": {
-              "textContent": "Skills|Playbook|skill"
-            },
-            "label": "Skills/playbook navigation"
-          },
-          "assertionType": "exists",
-          "source": "manual",
-          "reviewed": true,
-          "enabled": true
+          "enabled": false
         }
       ],
       "source": "manual"
@@ -1053,10 +746,41 @@
   ],
   "metadata": {
     "component": "TuriXCUAMultimodalPipeline",
-    "pageUrl": "/settings-ai, /settings-agentic, /run-recap, /active, /orchestration-loop, /skills",
-    "tags": ["turix-cua", "multimodal", "vision", "brain-actor", "annotation", "playbook", "click-highlight", "compression", "normalized-coordinates"],
-    "architecture": "Rust backend (ai_provider/multimodal.rs, vision/annotator.rs, vision/element_collector.rs, orchestrator/brain_actor.rs, skills/playbook_parser.rs, click_overlay.rs) + Python cascade (find/backends/base.py, cascade.py) + TypeScript UI Bridge (debug/click-highlight.ts, control/action-executor.ts)",
-    "dataFlow": "UI Bridge snapshot OR CascadeDetector -> element_collector -> annotator -> MultimodalPrompt -> Claude/Gemini API -> BrainOutput -> Actor prompt -> WorkerOutput -> signal processing",
-    "inspiration": "TurixAI/TuriX-CUA (github.com/TurixAI/TuriX-CUA) — Brain/Actor separation, Set-of-Mark annotation, normalized coordinates, skills-as-markdown, progressive memory compression, visual click highlighting"
+    "pageUrl": "/settings-ai",
+    "tags": ["turix-cua", "multimodal", "vision", "brain-actor", "annotation", "playbook", "click-highlight", "compression", "agentic-verification"],
+    "backendFiles": [
+      "src-tauri/src/ai_provider/multimodal.rs",
+      "src-tauri/src/ai_provider/claude_api.rs",
+      "src-tauri/src/ai_provider/gemini_api.rs",
+      "src-tauri/src/ai_provider/routing.rs",
+      "src-tauri/src/vision/annotator.rs",
+      "src-tauri/src/vision/element_collector.rs",
+      "src-tauri/src/vision/types.rs",
+      "src-tauri/src/orchestrator/brain_actor.rs",
+      "src-tauri/src/orchestrator/structured_output.rs",
+      "src-tauri/src/orchestrator/compression.rs",
+      "src-tauri/src/orchestrator/verification.rs",
+      "src-tauri/src/orchestrator/agent_roles.rs",
+      "src-tauri/src/skills/playbook_parser.rs",
+      "src-tauri/src/skills/mod.rs",
+      "src-tauri/src/click_overlay.rs",
+      "src-tauri/src/unified_workflow_executor/agentic_verification_loop.rs",
+      "src-tauri/src/unified_workflow_executor/health_monitor.rs",
+      "src-tauri/src/workflow_generation/schema_context.rs",
+      "src-tauri/src/autoresearch/agentic_verification.rs",
+      "src-tauri/src/commands/step_outputs.rs",
+      "src-tauri/src/settings.rs"
+    ],
+    "apiEndpoints": [
+      "Tauri IPC: get_ai_settings, save_ai_settings",
+      "Tauri IPC: get_task_run, get_task_run_events, get_task_run_output",
+      "HTTP: GET /ui-bridge/sdk/control/snapshot (element collection for annotation)",
+      "HTTP: GET /ui-bridge/sdk/control/screenshot (screenshot capture for Brain)",
+      "HTTP: GET /ui-bridge/sdk/health (app health for verifier context)",
+      "HTTP: GET /ui-bridge/sdk/console-errors (console errors for verifier context)",
+      "HTTP: POST https://api.anthropic.com/v1/messages (Claude multimodal API)",
+      "HTTP: POST https://generativelanguage.googleapis.com/v1beta/models/:model:generateContent (Gemini multimodal API)"
+    ],
+    "inspiration": "TurixAI/TuriX-CUA — Brain/Actor separation, Set-of-Mark annotation, normalized coordinates, skills-as-markdown, progressive memory compression, visual click highlighting"
   }
 }
