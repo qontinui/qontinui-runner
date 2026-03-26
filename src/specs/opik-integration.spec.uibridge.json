@@ -1,0 +1,1037 @@
+{
+  "version": "1.0.0",
+  "description": "Opik LLM Observability Integration — embeds Opik's tracing, evaluation, and feedback capabilities into the qontinui-runner. The integration provides a dedicated dashboard for viewing Opik traces/spans, maps existing execution_spans and phase_token_usage data to Opik's data model, syncs observations as feedback scores, and offers evaluation management against datasets. Opik runs as a self-hosted Docker service alongside PostgreSQL, orchestrated by the supervisor. The runner communicates with Opik via its REST API (Java backend on port 5173/api) and optionally via the Python SDK for evaluation tasks. This spec covers the frontend Opik Dashboard page accessible from the OBSERVE sidebar group, plus the backend Rust integration layer and MCP tools.",
+  "preconditions": [
+    "Opik Docker services are running (backend, frontend, ClickHouse, MySQL, Redis)",
+    "Runner has OPIK_BASE_URL configured (default: http://localhost:5173/api)",
+    "PostgreSQL is available for the runner's own observation/span storage",
+    "The runner sidebar shows the 'LLM Traces' navigation item in the OBSERVE group"
+  ],
+  "groups": [
+    {
+      "id": "opik-semantic",
+      "name": "Semantic — Purpose & Communication",
+      "description": "What the Opik integration communicates to users and why it exists. The dashboard provides visibility into every LLM call made during automation workflows — tracing the full chain from workflow phase to individual API calls, with cost attribution, latency breakdowns, and quality feedback scores. It answers: What did the AI do? How much did it cost? Was it effective?",
+      "category": "semantic",
+      "source": "manual",
+      "assertions": [
+        {
+          "id": "opik-sem-01",
+          "description": "The page title communicates 'LLM Traces' and the subtitle explains it shows AI call traces with cost and quality metrics",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "visible",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "LLM Traces", "role": "heading" },
+            "label": "Page heading"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-sem-02",
+          "description": "The Opik connection status badge shows whether the Opik backend is reachable (Connected/Disconnected) so users know if trace data is flowing",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-connection-status']" },
+            "label": "Opik connection status badge"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-sem-03",
+          "description": "Each trace row shows the workflow name, total cost, token count, duration, and pass/fail status so users can assess AI effectiveness at a glance",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='trace-row']" },
+            "label": "Trace list row"
+          },
+          "notes": "Each row must show: workflow name, cost ($X.XX), tokens (in/out), duration (Xs), and a pass/fail indicator derived from feedback scores",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-sem-04",
+          "description": "The trace detail panel communicates a hierarchical span tree showing the full execution chain: workflow phase → AI session → LLM call → tool use",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='span-tree']" },
+            "label": "Span tree in trace detail"
+          },
+          "precondition": "A trace row has been clicked to open the detail panel",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-sem-05",
+          "description": "Feedback scores are displayed as color-coded badges (green ≥0.7, yellow ≥0.4, red <0.4) with the score name and value, so users can instantly assess quality",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='feedback-score-badge']" },
+            "label": "Feedback score badge"
+          },
+          "precondition": "At least one trace has feedback scores attached",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-sem-06",
+          "description": "The cost summary cards at the top show total cost, average cost per trace, total tokens, and trace count for the selected time range, giving users a financial overview of AI usage",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-cost-summary']" },
+            "label": "Cost summary cards section"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "opik-architecture",
+      "name": "Architecture — Page Structure & Data Flow",
+      "description": "How the Opik integration is structured across frontend, Rust backend, and external Opik services. Data flows: (1) Runner Rust backend records execution_spans and phase_token_usage during workflow execution, (2) A background sync service pushes spans to Opik as traces/spans via POST /v1/private/traces/batch and /v1/private/spans/batch, (3) Observations are synced as feedback scores via PUT /v1/private/traces/{id}/feedback-scores, (4) The frontend queries Opik's API directly for the trace viewer, and falls back to the runner's own /analytics endpoints when Opik is unavailable.",
+      "category": "architecture",
+      "source": "manual",
+      "assertions": [
+        {
+          "id": "opik-arch-01",
+          "description": "The page layout has three zones: (1) top summary cards with cost/token/trace counts, (2) middle trace list with filtering/sorting, (3) right/bottom detail panel for the selected trace's span tree and metadata",
+          "category": "architecture",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-dashboard']" },
+            "label": "Opik dashboard root container"
+          },
+          "notes": "Layout: summary cards (fixed top), trace list (scrollable left/center, ~60% width), trace detail (right panel or bottom drawer, ~40% width). On narrow screens, detail panel should be a bottom drawer.",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-arch-02",
+          "description": "The Rust backend exposes a new OpikSyncService that runs as a background tokio task, batching execution_spans into Opik traces every 10 seconds or when batch size reaches 50",
+          "category": "architecture",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-sync-status']" },
+            "label": "Sync status indicator"
+          },
+          "expected": "The sync status shows 'Syncing' during active push and 'Synced' when idle, with a count of pending/synced traces",
+          "notes": "Backend implementation: src-tauri/src/opik/sync_service.rs. Uses OpikClient (httpx/reqwest) to POST batches to /v1/private/traces/batch. Maps execution_spans.trace_id → Opik trace ID, execution_spans.span_id → Opik span ID, preserving the parent_span_id hierarchy. Phase token usage is attached as span metadata (model, provider, tokens, cost).",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-arch-03",
+          "description": "The Rust backend maps runner data to Opik's data model: task_run → Opik project, execution_spans → Opik traces+spans, phase_token_usage → span usage metadata, observations → feedback scores, agentic_metric_scores → feedback scores",
+          "category": "architecture",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-dashboard']" },
+            "label": "Dashboard reflecting synced data"
+          },
+          "notes": "Data mapping:\n- task_run_id → Opik trace.id (UUIDv7)\n- execution_spans with parent_span_id=NULL → Opik root trace\n- execution_spans with parent_span_id → Opik child spans\n- span.name → Opik span.name\n- span.attributes JSON → Opik span.metadata\n- phase_token_usage.model_used → Opik span.model\n- phase_token_usage.provider_used → Opik span.provider\n- phase_token_usage.{input_tokens,output_tokens} → Opik span.usage\n- phase_token_usage.cost_cents → Opik span.total_estimated_cost (convert cents to dollars)\n- observations.title + observations.content → Opik feedback_score (name=observation_type, value=1.0 for 'learning'/0.0 for 'bugfix', reason=content)\n- agentic_metric_scores.metric_type → Opik feedback_score.name, agentic_metric_scores.score → feedback_score.value, rationale → reason",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-arch-04",
+          "description": "The frontend queries the Opik REST API at /v1/private/traces for the trace list and /v1/private/spans for span details, using the runner's configured OPIK_BASE_URL. When Opik is unreachable, it falls back to the runner's own /analytics/token-usage endpoints",
+          "category": "architecture",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-dashboard']" },
+            "label": "Dashboard with data"
+          },
+          "notes": "Frontend service: src/services/opik-service.ts. Uses tracedFetch with base URL from runner settings. Falls back gracefully: if Opik returns 5xx or network error, show a yellow banner 'Opik unavailable — showing local data only' and render from the existing LLM observability data.",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-arch-05",
+          "description": "Opik Docker services are managed by the supervisor alongside PostgreSQL. The supervisor's docker-compose includes opik-backend, opik-frontend, clickhouse, mysql, redis, and minio containers",
+          "category": "architecture",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-connection-status']" },
+            "label": "Connection status reflects Docker health"
+          },
+          "notes": "Supervisor integration: Add Opik profile to docker-compose.yml. Containers: opik-backend (ghcr.io/comet-ml/opik/opik-backend, port 8080), opik-frontend (port 5173), clickhouse (port 8123/9000), mysql:8.4 (port 3306), redis (port 6379), minio (port 9000). Health check: GET /health-check on opik-backend. Startup order: mysql → clickhouse → redis → backend → frontend.",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-arch-06",
+          "description": "MCP tools expose Opik functionality to AI agents: opik_traces (list/search traces), opik_trace_detail (get trace with spans), opik_feedback (set feedback score), opik_evaluate (run evaluation against dataset), opik_sync_status (check sync health)",
+          "category": "architecture",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-dashboard']" },
+            "label": "MCP-accessible trace data"
+          },
+          "notes": "MCP tools in qontinui-mcp/server.py: opik_traces → GET /v1/private/traces, opik_trace_detail → GET /v1/private/traces/{id} + GET /v1/private/spans?trace_id={id}, opik_feedback → PUT /v1/private/traces/{id}/feedback-scores, opik_evaluate → triggers Python SDK evaluate() via runner HTTP proxy, opik_sync_status → GET /opik/sync-status (runner endpoint). Permissions: opik_traces=READ_ONLY, opik_trace_detail=READ_ONLY, opik_feedback=MODIFY, opik_evaluate=EXECUTE, opik_sync_status=READ_ONLY.",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "opik-element-presence",
+      "name": "Element Presence — Required UI Elements",
+      "description": "All interactive and content elements that must exist on the Opik LLM Traces page for it to be functional and testable via UI Bridge.",
+      "category": "element-presence",
+      "source": "manual",
+      "assertions": [
+        {
+          "id": "opik-ep-01",
+          "description": "Page heading 'LLM Traces' exists",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-heading']", "textContains": "LLM Traces" },
+            "label": "Page heading"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-ep-02",
+          "description": "Connection status badge exists showing Connected or Disconnected",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-connection-status']" },
+            "label": "Connection status"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-ep-03",
+          "description": "Time range selector exists with options: 1h, 6h, 24h, 7d, 30d",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-time-range']" },
+            "label": "Time range selector"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-ep-04",
+          "description": "Summary cards exist for: Total Cost, Avg Cost/Trace, Total Tokens, Trace Count",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-cost-summary']" },
+            "label": "Cost summary section"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-ep-05",
+          "description": "Search input exists for filtering traces by name, workflow, model, or tags",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-trace-search']", "role": "searchbox" },
+            "label": "Trace search input"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-ep-06",
+          "description": "Filter dropdowns exist for: Model, Provider, Status (success/error), Feedback Score range",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-trace-filters']" },
+            "label": "Trace filter controls"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-ep-07",
+          "description": "Trace list table exists with sortable columns: Name, Status, Cost, Tokens, Duration, Feedback, Created",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-trace-list']" },
+            "label": "Trace list table"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-ep-08",
+          "description": "Trace detail panel exists with tabs: Spans, Input/Output, Metadata, Feedback",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-trace-detail']" },
+            "label": "Trace detail panel"
+          },
+          "precondition": "A trace row has been selected",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-ep-09",
+          "description": "Span tree visualization exists showing hierarchical parent-child span relationships with expand/collapse",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='span-tree']" },
+            "label": "Span tree"
+          },
+          "precondition": "Trace detail panel is open and Spans tab is active",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-ep-10",
+          "description": "Add Feedback button exists on the trace detail panel for manually scoring traces",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-add-feedback-btn']", "role": "button" },
+            "label": "Add Feedback button"
+          },
+          "precondition": "Trace detail panel is open",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-ep-11",
+          "description": "Sync status indicator exists showing pending/synced trace counts and last sync time",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-sync-status']" },
+            "label": "Sync status"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-ep-12",
+          "description": "Open in Opik button exists to open the full Opik web UI for the current trace",
+          "category": "element-presence",
+          "severity": "minor",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-open-external-btn']", "role": "button" },
+            "label": "Open in Opik button"
+          },
+          "precondition": "Trace detail panel is open and Opik is connected",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "opik-interaction",
+      "name": "Interaction — User Actions & Responses",
+      "description": "How users interact with the Opik dashboard — searching, filtering, selecting traces, viewing span details, adding feedback scores, and navigating between the runner and Opik web UI.",
+      "category": "interaction",
+      "source": "manual",
+      "assertions": [
+        {
+          "id": "opik-int-01",
+          "description": "Users can type in the search input and press Enter to filter traces by name. The trace list updates within 2 seconds showing only matching traces",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-trace-search']" },
+            "label": "Trace search"
+          },
+          "expected": "Trace list filters to show only traces matching the search query",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-int-02",
+          "description": "Users can click a trace row to open the detail panel. The span tree loads and shows the hierarchical breakdown of the workflow execution",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "stateChange",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='trace-row']" },
+            "label": "Trace row click"
+          },
+          "expected": "Detail panel opens with span tree, input/output, and metadata tabs",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-int-03",
+          "description": "Users can click a span in the tree to view its details: input JSON, output JSON, model used, token counts, cost, duration, and any error information",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "stateChange",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='span-tree'] [data-ui-element='span-row']" },
+            "label": "Span row click"
+          },
+          "expected": "Span detail section updates to show the selected span's input, output, metadata, model, tokens, cost, and duration",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-int-04",
+          "description": "Users can change the time range selector to filter traces by recency. The summary cards, trace list, and any charts update accordingly",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "stateChange",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-time-range']" },
+            "label": "Time range change"
+          },
+          "expected": "All data on the page refreshes to show only traces within the selected time window",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-int-05",
+          "description": "Users can click the Add Feedback button, select a score name from a dropdown (relevance, accuracy, helpfulness, or custom), enter a numeric value (0-1) and optional reason, then submit. The feedback score appears on the trace as a badge",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "sequence",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-add-feedback-btn']" },
+            "label": "Add feedback flow"
+          },
+          "expected": "After submission, a new feedback score badge appears on the trace row and in the detail panel",
+          "notes": "Backend: PUT /v1/private/traces/{id}/feedback-scores with body [{name, value, reason, source: 'ui'}]. Also saves to local observations table as type='learning' with topic_key='feedback/{trace_id}/{score_name}'.",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-int-06",
+          "description": "Users can click column headers in the trace list to sort by Cost, Duration, Tokens, or Created date. An arrow indicator shows sort direction",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "stateChange",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-trace-list'] th" },
+            "label": "Sortable column header"
+          },
+          "expected": "Trace list reorders according to the clicked column, toggling between ascending and descending",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-int-07",
+          "description": "Users can click 'Open in Opik' to open the full Opik web UI in the system browser, navigated to the specific trace's detail page",
+          "category": "interaction",
+          "severity": "minor",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-open-external-btn']" },
+            "label": "Open in Opik button"
+          },
+          "expected": "System browser opens http://localhost:5173/{workspace}/projects/{project_id}/traces/{trace_id}",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-int-08",
+          "description": "Users can expand/collapse span tree nodes by clicking the chevron. Expanded nodes show child spans indented. Collapsed nodes show a child count badge",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "stateChange",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='span-tree'] [data-ui-element='span-toggle']" },
+            "label": "Span tree expand/collapse"
+          },
+          "expected": "Child spans toggle visibility. Collapsed parent shows '(N spans)' badge",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "opik-data-display",
+      "name": "Data Display — Information Presentation",
+      "description": "How trace, span, cost, and feedback data is formatted and presented to users. Covers number formatting, JSON rendering, duration display, and cost attribution.",
+      "category": "data-display",
+      "source": "manual",
+      "assertions": [
+        {
+          "id": "opik-dd-01",
+          "description": "Cost values are displayed as dollar amounts with 4 decimal places (e.g., '$0.0042') for individual traces and 2 decimal places (e.g., '$1.23') for summary totals",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "format",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-cost-summary']" },
+            "label": "Cost display format"
+          },
+          "expected": "Dollar sign prefix, decimal format matching the precision described",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-dd-02",
+          "description": "Token counts are displayed with thousand separators (e.g., '12,450 in / 3,200 out') to distinguish input from output tokens",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "format",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='trace-row']" },
+            "label": "Token count format in trace row"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-dd-03",
+          "description": "Duration is displayed in human-readable format: <1s as 'Xms', 1-60s as 'X.Xs', 1-60m as 'Xm Ys', >1h as 'Xh Ym'",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "format",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='trace-row']" },
+            "label": "Duration format"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-dd-04",
+          "description": "Input/Output JSON is displayed in a syntax-highlighted, collapsible code block with copy-to-clipboard button. Large JSON (>500 chars) is collapsed by default",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-json-viewer']" },
+            "label": "JSON viewer in span detail"
+          },
+          "precondition": "A span is selected in the span tree",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-dd-05",
+          "description": "The span tree shows a Gantt-style timeline bar for each span, proportional to its duration relative to the trace total. LLM spans are colored blue, tool spans green, general spans gray",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "visual",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='span-tree']" },
+            "label": "Span timeline bars"
+          },
+          "notes": "Each span row should have a horizontal bar showing: start offset from trace start, duration proportional to trace total, color by span type (llm=blue, tool=green, general=gray, guardrail=orange)",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-dd-06",
+          "description": "Model and provider names are displayed as badges with provider-specific colors (OpenAI=green, Anthropic=amber, Google=blue, local=gray)",
+          "category": "data-display",
+          "severity": "minor",
+          "assertionType": "visual",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='trace-row']" },
+            "label": "Model/provider badges"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-dd-07",
+          "description": "Error traces are highlighted with a red left border and show the error message truncated to one line in the trace list, with full traceback available in the detail panel",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "visual",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='trace-row'][data-status='error']" },
+            "label": "Error trace visual treatment"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "opik-state-consistency",
+      "name": "State Consistency — Data Integrity & Sync",
+      "description": "Ensuring data consistency between the runner's local storage (PostgreSQL), the Opik backend (ClickHouse), and the frontend display. The sync service must handle edge cases gracefully.",
+      "category": "state-consistency",
+      "source": "manual",
+      "assertions": [
+        {
+          "id": "opik-sc-01",
+          "description": "When Opik is unavailable, the dashboard falls back to local data from the runner's /analytics endpoints without error. A yellow banner indicates 'Showing local data — Opik unavailable'",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "conditional",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-fallback-banner']" },
+            "label": "Fallback banner"
+          },
+          "precondition": "Opik Docker services are stopped",
+          "expected": "Dashboard renders with local data, yellow banner visible, no errors in console",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-sc-02",
+          "description": "When the runner restarts, the sync service resumes from the last synced timestamp. No duplicate traces are created in Opik (idempotent sync via trace_id matching)",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-sync-status']" },
+            "label": "Sync resume after restart"
+          },
+          "notes": "Implementation: Store last_synced_at timestamp in runner settings. On startup, query execution_spans WHERE created_at > last_synced_at. Opik's batch endpoint handles duplicates via trace_id (UUIDv7 = idempotent). After successful push, update last_synced_at.",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-sc-03",
+          "description": "Feedback scores added in the runner UI are immediately visible in the Opik web UI, and vice versa. Bidirectional sync occurs within 10 seconds",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='feedback-score-badge']" },
+            "label": "Feedback score bidirectional sync"
+          },
+          "notes": "Runner → Opik: immediate PUT on feedback creation. Opik → Runner: poll /v1/private/traces/{id}/feedback-scores every 10s for active traces, or use webhook if Opik supports it. Store in local observations table with topic_key='opik-feedback/{trace_id}/{name}' for persistence.",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-sc-04",
+          "description": "The trace count and cost totals in the summary cards match the actual data in the trace list (no off-by-one or stale cache)",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "consistency",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-cost-summary']" },
+            "label": "Summary consistency with list"
+          },
+          "expected": "Summary card 'Trace Count' equals the number of rows in the trace list (accounting for pagination). Total Cost equals the sum of individual trace costs",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-sc-05",
+          "description": "When a workflow execution completes, its trace appears in the dashboard within 15 seconds (sync batch interval + processing time)",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-trace-list']" },
+            "label": "New trace appears after execution"
+          },
+          "expected": "The most recent trace in the list matches the just-completed workflow execution",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "opik-navigation",
+      "name": "Navigation — Routes & Tab Access",
+      "description": "How users reach the Opik dashboard and navigate within it.",
+      "category": "navigation",
+      "source": "manual",
+      "assertions": [
+        {
+          "id": "opik-nav-01",
+          "description": "The 'LLM Traces' tab exists in the OBSERVE group of the sidebar, with a Zap or Activity icon, accessible by clicking",
+          "category": "navigation",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "LLM Traces" },
+            "label": "Sidebar tab"
+          },
+          "notes": "Navigation registration: qontinui-navigation/src/groups.ts OBSERVE_ITEMS, id='llm-traces'. Tab type: tab-types.ts MainTabId union + VALID_TAB_IDS array. TabContent.tsx case 'llm-traces' renders <Suspense><OpikDashboard /></Suspense>.",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-nav-02",
+          "description": "Clicking a trace row navigates to the detail view without a full page reload. The back button or clicking outside the detail panel returns to the list view",
+          "category": "navigation",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='trace-row']" },
+            "label": "Trace detail navigation"
+          },
+          "expected": "Detail panel slides in from right. Clicking another trace switches detail. Pressing Escape or clicking the close button dismisses detail.",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-nav-03",
+          "description": "The trace detail panel has tabs: Spans, Input/Output, Metadata, Feedback. Clicking each tab switches content without losing the selected trace context",
+          "category": "navigation",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-trace-detail'] [role='tablist']" },
+            "label": "Detail panel tabs"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-nav-04",
+          "description": "From the Run Recap page, clicking an LLM trace link navigates to the LLM Traces tab with the corresponding trace pre-selected",
+          "category": "navigation",
+          "severity": "minor",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-trace-detail']" },
+            "label": "Cross-page navigation to specific trace"
+          },
+          "precondition": "User clicked an 'LLM Trace' link from the Run Recap page",
+          "notes": "Implementation: setActiveTab('llm-traces') with URL hash or state param containing trace_id. OpikDashboard reads the param and auto-selects the trace on mount.",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "opik-style",
+      "name": "Style — Visual Design & Theming",
+      "description": "Visual design specifications ensuring the Opik dashboard matches the runner's existing design system (dark theme, design tokens, accent colors).",
+      "category": "style",
+      "source": "manual",
+      "assertions": [
+        {
+          "id": "opik-sty-01",
+          "description": "The dashboard uses the runner's dark theme with bg-background, text-foreground, and border-border tokens. No Opik-branded colors leak through",
+          "category": "style",
+          "severity": "critical",
+          "assertionType": "style",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-dashboard']" },
+            "label": "Dashboard theming"
+          },
+          "expected": "Background matches runner's dark theme. No white backgrounds or Opik purple branding",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-sty-02",
+          "description": "Summary cards use the runner's card pattern: border-border, rounded-lg, p-4, with muted labels and prominent values",
+          "category": "style",
+          "severity": "warning",
+          "assertionType": "style",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-cost-summary']" },
+            "label": "Summary card styling"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-sty-03",
+          "description": "Span type badges use the runner's accent color system: getAccentColors('blue') for LLM spans, getAccentColors('green') for tool spans, getAccentColors('zinc') for general spans, getAccentColors('amber') for guardrail spans",
+          "category": "style",
+          "severity": "warning",
+          "assertionType": "visual",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='span-tree']" },
+            "label": "Span type color coding"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-sty-04",
+          "description": "The trace list uses alternating row backgrounds (even: transparent, odd: muted/10) with hover:bg-muted/50 for interactive feedback",
+          "category": "style",
+          "severity": "minor",
+          "assertionType": "style",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-trace-list']" },
+            "label": "Trace list row styling"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-sty-05",
+          "description": "The connection status badge uses getStatusColors: 'success' (green) for Connected, 'error' (red) for Disconnected, 'warning' (yellow) for Syncing",
+          "category": "style",
+          "severity": "minor",
+          "assertionType": "visual",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-connection-status']" },
+            "label": "Connection status colors"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "opik-behavior",
+      "name": "Behavior — Background Processes & Edge Cases",
+      "description": "Background sync behavior, error handling, and edge cases that the integration must handle correctly.",
+      "category": "behavior",
+      "source": "manual",
+      "assertions": [
+        {
+          "id": "opik-beh-01",
+          "description": "The OpikSyncService starts automatically when the runner boots (if OPIK_BASE_URL is configured) and stops gracefully on shutdown. It does not block the runner's startup",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-sync-status']" },
+            "label": "Sync service lifecycle"
+          },
+          "notes": "Implementation: In main.rs, spawn OpikSyncService::start() as a background tokio task after PgDb is initialized. The service should be optional — if OPIK_BASE_URL is not set, skip initialization entirely. Use a cancellation token for graceful shutdown.",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-beh-02",
+          "description": "When the Opik backend becomes unreachable during sync, the service retries with exponential backoff (1s, 2s, 4s, 8s, max 60s) and does not lose any traces. Unsent traces are queued in memory (max 10,000) and PostgreSQL (unlimited)",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-sync-status']" },
+            "label": "Sync retry behavior"
+          },
+          "expected": "Sync status shows 'Retrying (attempt N)' during backoff, 'Queued: X traces' for pending traces",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-beh-03",
+          "description": "The dashboard auto-refreshes every 30 seconds when visible (tab is active). Refresh pauses when the tab is backgrounded to save resources",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-dashboard']" },
+            "label": "Auto-refresh behavior"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-beh-04",
+          "description": "The trace list supports pagination. When there are more than 50 traces, a 'Load more' button or infinite scroll loads the next page",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='opik-trace-list']" },
+            "label": "Trace list pagination"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-beh-05",
+          "description": "When the dashboard loads with no traces (first use), it shows an empty state with setup instructions: 'No traces yet — traces will appear here after running a workflow'",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "conditionalExists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No traces yet" },
+            "label": "Empty state message"
+          },
+          "precondition": "No workflows have been executed yet or Opik has no data",
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "opik-beh-06",
+          "description": "Feedback scores added via MCP tools (opik_feedback) appear in the dashboard within 30 seconds without manual refresh",
+          "category": "behavior",
+          "severity": "minor",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "[data-ui-element='feedback-score-badge']" },
+            "label": "MCP feedback appears in UI"
+          },
+          "source": "manual",
+          "reviewed": false,
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "component": "OpikDashboard",
+    "author": "Claude Opus 4.6",
+    "createdAt": "2026-03-26T20:00:00.000Z",
+    "updatedAt": "2026-03-26T20:00:00.000Z",
+    "pageUrl": "/observe/llm-traces",
+    "elementSource": "manual",
+    "tags": [
+      "opik",
+      "llm-observability",
+      "tracing",
+      "evaluation",
+      "feedback",
+      "cost-tracking",
+      "spans",
+      "opentelemetry",
+      "integration"
+    ]
+  }
+}
