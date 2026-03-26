@@ -121,9 +121,10 @@ pub fn extract_elements_from_snapshot(snapshot: &serde_json::Value) -> Vec<Annot
             .unwrap_or("(unlabeled)")
             .to_string();
 
-        // Truncate long labels
-        let label = if label.len() > 40 {
-            format!("{}...", &label[..37])
+        // Truncate long labels (char-safe for multi-byte UTF-8)
+        let label = if label.chars().count() > 40 {
+            let truncated: String = label.chars().take(37).collect();
+            format!("{}...", truncated)
         } else {
             label
         };
