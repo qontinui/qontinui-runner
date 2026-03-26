@@ -1,0 +1,130 @@
+{
+  "version": "1.0.0",
+  "description": "LLM Analytics — UI Bridge Cost Attribution extensions. Adds Cost by Target App chart, Cost per Interaction chart, Page Complexity table, and Model x Action Success Matrix to the existing LLM Observability Dashboard. These components surface which apps and pages cost most to automate, and which model/action combinations are most effective. Data flows from phase_token_usage.target_app (set via get_active_sdk_app_name() during agentic phase execution) and joins with ui_bridge_events for per-interaction cost analysis.",
+  "groups": [
+    {
+      "id": "cost-by-target-app",
+      "name": "Cost by Target App",
+      "description": "Horizontal bar chart showing automation cost breakdown by SDK-connected application. Only appears when target_app data exists in phase_token_usage. Uses hsl(var(--chart-3)) fill. Custom tooltip shows cost, calls, input/output tokens, and avg duration per app. Backed by GET /analytics/token-usage/by-target-app.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "target-app-heading",
+          "description": "The cost by target app chart shows its heading when data exists",
+          "severity": "warning",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cost by Target App" },
+            "label": "Target app chart heading with Globe icon"
+          },
+          "condition": {
+            "type": "exists",
+            "target": {
+              "type": "search",
+              "criteria": { "textContains": "Cost by Target App" }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "cost-per-interaction",
+      "name": "Cost per Successful Interaction",
+      "description": "Vertical bar chart showing cost per successful UI Bridge interaction per task run. Joins phase_token_usage.cost_cents with COUNT of successful ui_bridge_events per task_run_id. Shows first 8 chars of task_run_id on x-axis, cost on y-axis formatted as $X.XX. Backed by GET /analytics/token-usage/cost-per-interaction.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "cost-interaction-heading",
+          "description": "The cost per interaction chart is identifiable",
+          "severity": "warning",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cost per Successful Interaction" },
+            "label": "Cost per interaction heading with DollarSign icon"
+          }
+        }
+      ]
+    },
+    {
+      "id": "page-complexity",
+      "name": "Page Complexity Scoring",
+      "description": "Ranked table of pages by automation cost. Columns: Page URL (monospace, truncated), Calls, Total Cost ($X.XX), Avg/Call ($X.XXX). Sorted by avg cost per call descending — most expensive pages to automate appear first. Sticky header with vertical scroll (max-h-64). Backed by GET /analytics/token-usage/page-complexity.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "page-complexity-heading",
+          "description": "The page complexity table is identifiable",
+          "severity": "warning",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Page Complexity" },
+            "label": "Page complexity heading with FileText icon"
+          }
+        },
+        {
+          "id": "page-complexity-avg-column",
+          "description": "The table shows average cost per call for each page",
+          "severity": "warning",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Avg/Call" },
+            "label": "Average cost per call column header"
+          }
+        }
+      ]
+    },
+    {
+      "id": "model-action-matrix",
+      "name": "Model x Action Success Matrix",
+      "description": "Heatmap-style matrix with models as rows, action types as columns. Each cell shows success rate (bold %) and attempt count (muted Nx). Color-coded: green >= 95%, yellow >= 80%, orange >= 50%, red < 50%. Empty cells show '-'. Identifies which models work best for which UI Bridge actions (e.g., Haiku for clicks, Sonnet for form fills). Requires >= 3 attempts per cell. Backed by GET /analytics/token-usage/model-action-matrix.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "matrix-heading",
+          "description": "The model-action matrix is identifiable",
+          "severity": "warning",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Model x Action Success Matrix" },
+            "label": "Matrix heading with Grid3X3 icon"
+          }
+        },
+        {
+          "id": "matrix-color-semantics",
+          "description": "The heatmap uses green for high success rates (>= 95%), yellow for acceptable (>= 80%), orange for marginal (>= 50%), and red for poor (< 50%). This lets users quickly identify which model/action combinations need attention.",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Model x Action" },
+            "label": "Color-coded success rate cells"
+          }
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "component": "LlmObservabilityDashboard",
+    "pageUrl": "/llm-analytics",
+    "tags": [
+      "llm-analytics",
+      "cost-attribution",
+      "ui-bridge",
+      "target-app",
+      "page-complexity",
+      "model-action-matrix",
+      "cost-per-interaction"
+    ]
+  }
+}
