@@ -80,7 +80,8 @@ export type MainTabId =
   | "unified-search"
   | "workflow-versions"
   | "skills"
-  | "help";
+  | "help"
+  | "automation-health";
 
 const VALID_TAB_IDS: MainTabId[] = [
   "gui-automation",
@@ -91,6 +92,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "error-monitor",
   "processes",
   "reflection",
+  "observations",
   "architecture",
   "generator-eval",
   "autoresearch",
@@ -162,6 +164,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "workflow-versions",
   "skills",
   "help",
+  "automation-health",
 ];
 
 export const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";

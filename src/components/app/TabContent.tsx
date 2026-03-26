@@ -83,6 +83,7 @@ const RuleInfluencePanel = lazy(() => import("../rule-influence/RuleInfluencePan
 const UnifiedSearchPanel = lazy(() => import("../unified-search/UnifiedSearchPanel"));
 const WorkflowVersionLineage = lazy(() => import("../workflow-versions/WorkflowVersionLineage").then(m => ({ default: m.WorkflowVersionLineage })));
 const SkillApprovalPanel = lazy(() => import("../skills/SkillApprovalPanel").then(m => ({ default: m.SkillApprovalPanel })));
+const AutomationHealthDashboard = lazy(() => import("../ui-bridge/AutomationHealthDashboard").then(m => ({ default: m.AutomationHealthDashboard })));
 
 interface ActionLogViewData {
   actions: ActionLogEntry[];
@@ -740,6 +741,13 @@ export function TabContent({
       return (
         <div className="h-full overflow-hidden">
           <ElementReliabilityDashboard />
+        </div>
+      );
+
+    case "automation-health":
+      return (
+        <div className="h-full overflow-auto p-4">
+          <AutomationHealthDashboard />
         </div>
       );
 
