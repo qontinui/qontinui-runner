@@ -6,7 +6,16 @@
     "component": "CrossRunPatternsPanel, StepProvenanceTimeline, SelectorDecayChart, FailureChainViewer",
     "pageId": "reflection",
     "pageUrl": "/reflection",
-    "tags": ["cross-run-patterns", "step-provenance", "selector-decay", "failure-chain", "knowledge-graph", "pipeline-agents", "ui-bridge", "analytics"]
+    "tags": [
+      "cross-run-patterns",
+      "step-provenance",
+      "selector-decay",
+      "failure-chain",
+      "knowledge-graph",
+      "pipeline-agents",
+      "ui-bridge",
+      "analytics"
+    ]
   },
   "groups": [
     {
@@ -24,7 +33,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Cross-Run Patterns" },
+            "criteria": {
+              "textContains": "Cross-Run Patterns"
+            },
             "label": "Patterns heading"
           }
         },
@@ -37,7 +48,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "No cross-run patterns detected" },
+            "criteria": {
+              "textContains": "No cross-run patterns detected"
+            },
             "label": "Empty state message"
           }
         }
@@ -58,9 +71,12 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Recurring Finding|Fix Oscillation" },
+            "criteria": {
+              "textContains": "Recurring Finding|Fix Oscillation"
+            },
             "label": "Pattern type badges"
-          }
+          },
+          "precondition": "At least one cross-run pattern exists in cross_run_patterns table"
         },
         {
           "id": "crossrun-occurrence-count",
@@ -71,7 +87,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Cross-Run Patterns" },
+            "criteria": {
+              "textContains": "Cross-Run Patterns"
+            },
             "label": "Occurrence count display"
           }
         }
@@ -92,9 +110,12 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "active" },
+            "criteria": {
+              "textContains": "active"
+            },
             "label": "Red badge for active patterns"
-          }
+          },
+          "precondition": "At least one active pattern exists"
         },
         {
           "id": "crossrun-status-resolved",
@@ -105,7 +126,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "resolved" },
+            "criteria": {
+              "textContains": "resolved"
+            },
             "label": "Green badge for resolved patterns"
           }
         }
@@ -126,7 +149,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Step Provenance Timeline" },
+            "criteria": {
+              "textContains": "Step Provenance Timeline"
+            },
             "label": "Provenance heading"
           }
         },
@@ -139,7 +164,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "No step provenance data" },
+            "criteria": {
+              "textContains": "No step provenance data"
+            },
             "label": "Empty state for provenance"
           }
         }
@@ -160,9 +187,12 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "discovery" },
+            "criteria": {
+              "textContains": "discovery"
+            },
             "label": "Agent color legend with all 5 types"
-          }
+          },
+          "precondition": "A workflow is selected and has step_provenance records"
         },
         {
           "id": "provenance-ui-interaction-badge",
@@ -173,9 +203,12 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "UI interaction" },
+            "criteria": {
+              "textContains": "UI interaction"
+            },
             "label": "UI interaction count badge"
-          }
+          },
+          "precondition": "A step has non-null ui_bridge_event_ids in step_provenance"
         }
       ]
     },
@@ -194,7 +227,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Loading provenance" },
+            "criteria": {
+              "textContains": "Loading provenance"
+            },
             "label": "Loading state text"
           }
         }
@@ -215,9 +250,12 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Selector Decay" },
+            "criteria": {
+              "textContains": "Selector Decay"
+            },
             "label": "Decay chart heading with element ID"
-          }
+          },
+          "precondition": "An element ID is provided and has interaction history in ui_bridge_events"
         }
       ]
     },
@@ -236,7 +274,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Selector Decay" },
+            "criteria": {
+              "textContains": "Selector Decay"
+            },
             "label": "95% reliability threshold reference line"
           }
         }
@@ -257,7 +297,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Failure Chain" },
+            "criteria": {
+              "textContains": "Failure Chain"
+            },
             "label": "Failure chain heading with element ID"
           }
         },
@@ -270,7 +312,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "No failure chains found" },
+            "criteria": {
+              "textContains": "No failure chains found"
+            },
             "label": "Empty state for failure chains"
           }
         }
@@ -291,9 +335,12 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "ui_element" },
+            "criteria": {
+              "textContains": "ui_element"
+            },
             "label": "Node type legend with all 7 types"
-          }
+          },
+          "precondition": "At least one failure chain path was found for the given element"
         },
         {
           "id": "chain-traversal-direction",
@@ -304,7 +351,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Failure Chain" },
+            "criteria": {
+              "textContains": "Failure Chain"
+            },
             "label": "Left-to-right causal path visualization"
           }
         }
@@ -325,10 +374,13 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Cross-Run Patterns" },
+            "criteria": {
+              "textContains": "Cross-Run Patterns"
+            },
             "label": "Workflow name filtering for patterns"
           },
-          "expected": "Providing a workflowName prop should filter the displayed patterns to only those matching that workflow. Removing the filter should show all patterns."
+          "expected": "Providing a workflowName prop should filter the displayed patterns to only those matching that workflow. Removing the filter should show all patterns.",
+          "precondition": "Multiple patterns exist, some associated with different workflows"
         },
         {
           "id": "crossrun-auto-refresh",
@@ -339,7 +391,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Cross-Run Patterns" },
+            "criteria": {
+              "textContains": "Cross-Run Patterns"
+            },
             "label": "Auto-refresh on 60s interval"
           }
         }

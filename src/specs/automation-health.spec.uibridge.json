@@ -1,12 +1,23 @@
 {
   "version": "1.0.0",
   "id": "runner:automation-health",
-  "description": "Automation Health Dashboard — composite view of UI Bridge automation quality. Shows health score gauge, improvement recommendations, element reliability heatmap, action performance baselines, failure taxonomy, automation regressions, stall frequency, intervention effectiveness, and annotation gaps. Powered by cross-run analytics from ui_bridge_events (element interactions persisted per action with duration, success, error). Data flows: action handler → insert_ui_bridge_event → SQLite → 17 analytics SQL queries → 13 MCP endpoints → React hooks → dashboard panels. Health score is a weighted composite: 0.30 * element_success_rate + 0.25 * (1 - regression_rate) + 0.25 * (1 - stall_frequency) + 0.20 base. Recommendations are rule-based: flaky elements → add data-testid, stalls → increase settle_delay, unannotated → add annotations, high failure rate → review taxonomy.",
+  "description": "Automation Health Dashboard â€” composite view of UI Bridge automation quality. Shows health score gauge, improvement recommendations, element reliability heatmap, action performance baselines, failure taxonomy, automation regressions, stall frequency, intervention effectiveness, and annotation gaps. Powered by cross-run analytics from ui_bridge_events (element interactions persisted per action with duration, success, error). Data flows: action handler â†’ insert_ui_bridge_event â†’ SQLite â†’ 17 analytics SQL queries â†’ 13 MCP endpoints â†’ React hooks â†’ dashboard panels. Health score is a weighted composite: 0.30 * element_success_rate + 0.25 * (1 - regression_rate) + 0.25 * (1 - stall_frequency) + 0.20 base. Recommendations are rule-based: flaky elements â†’ add data-testid, stalls â†’ increase settle_delay, unannotated â†’ add annotations, high failure rate â†’ review taxonomy.",
   "metadata": {
     "component": "AutomationHealthDashboard",
     "pageId": "automation-health",
     "pageUrl": "/automation-health",
-    "tags": ["automation-health", "analytics", "ui-bridge", "element-reliability", "stall-detection", "recommendations", "cross-run-patterns", "selector-decay", "failure-taxonomy", "dev-only"]
+    "tags": [
+      "automation-health",
+      "analytics",
+      "ui-bridge",
+      "element-reliability",
+      "stall-detection",
+      "recommendations",
+      "cross-run-patterns",
+      "selector-decay",
+      "failure-taxonomy",
+      "dev-only"
+    ]
   },
   "groups": [
     {
@@ -24,7 +35,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "UI Bridge Automation Health" },
+            "criteria": {
+              "textContains": "UI Bridge Automation Health"
+            },
             "label": "Dashboard title heading"
           }
         },
@@ -37,7 +50,10 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContent": "24h", "role": "button" },
+            "criteria": {
+              "textContent": "24h",
+              "role": "button"
+            },
             "label": "24-hour time range button"
           }
         },
@@ -50,7 +66,10 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContent": "7d", "role": "button" },
+            "criteria": {
+              "textContent": "7d",
+              "role": "button"
+            },
             "label": "7-day time range button"
           }
         },
@@ -63,7 +82,10 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContent": "30d", "role": "button" },
+            "criteria": {
+              "textContent": "30d",
+              "role": "button"
+            },
             "label": "30-day time range button"
           }
         },
@@ -76,7 +98,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Automation Health" },
+            "criteria": {
+              "textContains": "Automation Health"
+            },
             "label": "Dashboard with all 9 panels visible"
           }
         }
@@ -97,7 +121,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Automation Health" },
+            "criteria": {
+              "textContains": "Automation Health"
+            },
             "label": "Sidebar navigation item"
           }
         }
@@ -118,7 +144,10 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContent": "24h", "role": "button" },
+            "criteria": {
+              "textContent": "24h",
+              "role": "button"
+            },
             "label": "Time range toggle triggers data refresh"
           },
           "expected": "After clicking '24h', the button should gain bg-primary styling while '7d' loses it. All panels should briefly show loading state, then display data filtered to the last 24 hours."
@@ -132,7 +161,10 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "accessibleName": "Refresh" },
+            "criteria": {
+              "role": "button",
+              "accessibleName": "Refresh"
+            },
             "label": "Refresh button invalidates cache"
           },
           "expected": "Clicking refresh causes React Query to invalidate the 'graph-analytics' query key, triggering re-fetch of all panels. The RefreshCw icon should be present."
@@ -154,7 +186,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Automation Health" },
+            "criteria": {
+              "textContains": "Automation Health"
+            },
             "label": "Health score card heading"
           }
         },
@@ -167,7 +201,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "window" },
+            "criteria": {
+              "textContains": "window"
+            },
             "label": "Time window label on health score card"
           }
         },
@@ -180,7 +216,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Element Success Rate" },
+            "criteria": {
+              "textContains": "Element Success Rate"
+            },
             "label": "Element success rate metric row"
           }
         },
@@ -193,7 +231,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Regression Rate" },
+            "criteria": {
+              "textContains": "Regression Rate"
+            },
             "label": "Regression rate metric row"
           }
         },
@@ -206,7 +246,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Total Interactions" },
+            "criteria": {
+              "textContains": "Total Interactions"
+            },
             "label": "Total interactions count"
           }
         }
@@ -227,7 +269,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Automation Health" },
+            "criteria": {
+              "textContains": "Automation Health"
+            },
             "label": "Green score with Excellent label for >= 90"
           }
         },
@@ -240,16 +284,19 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Automation Health" },
+            "criteria": {
+              "textContains": "Automation Health"
+            },
             "label": "Score matches weighted composite formula"
-          }
+          },
+          "precondition": "At least one UI Bridge action has been recorded with task_run_id parameter"
         }
       ]
     },
     {
       "id": "health-recommendations",
       "name": "Improvement Recommendations",
-      "description": "Prioritized list of actionable recommendations. Each has a numbered priority circle (1, 2, 3...), color-coded category tag (selectors=blue, performance=orange, annotations=purple, reliability=red), a message describing what to do, and an impact statement explaining why. Categories map to: flaky_element_count > 3 → selectors, stall_count > 2 → performance, unannotated > 5 → annotations, failure_rate > 10% → reliability. Backed by GET /ui-bridge/analytics/recommendations.",
+      "description": "Prioritized list of actionable recommendations. Each has a numbered priority circle (1, 2, 3...), color-coded category tag (selectors=blue, performance=orange, annotations=purple, reliability=red), a message describing what to do, and an impact statement explaining why. Categories map to: flaky_element_count > 3 â†’ selectors, stall_count > 2 â†’ performance, unannotated > 5 â†’ annotations, failure_rate > 10% â†’ reliability. Backed by GET /ui-bridge/analytics/recommendations.",
       "category": "semantic",
       "assertions": [
         {
@@ -261,7 +308,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Improvement Recommendations" },
+            "criteria": {
+              "textContains": "Improvement Recommendations"
+            },
             "label": "Recommendations heading"
           }
         },
@@ -274,9 +323,12 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Improvement Recommendations" },
+            "criteria": {
+              "textContains": "Improvement Recommendations"
+            },
             "label": "Category badges on recommendation items"
-          }
+          },
+          "precondition": "At least one recommendation has been generated (requires flaky elements, stalls, or high failure rate)"
         },
         {
           "id": "rec-priority-ordering",
@@ -287,7 +339,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Improvement Recommendations" },
+            "criteria": {
+              "textContains": "Improvement Recommendations"
+            },
             "label": "Numbered priority badges in descending importance"
           }
         }
@@ -296,7 +350,7 @@
     {
       "id": "health-state-consistency",
       "name": "Loading, Empty, and Error States",
-      "description": "All 9 panels handle three states consistently: loading (centered muted text), empty (reassuring message specific to each panel), and error (destructive red text with error string). When no interaction data exists, the health score shows 100% (1.0) with 0 interactions. Recommendations show 'No recommendations — automation is running well'. Element reliability shows 'No flaky elements detected (all elements have >90% success rate)'. Regressions show 'No regressions detected'.",
+      "description": "All 9 panels handle three states consistently: loading (centered muted text), empty (reassuring message specific to each panel), and error (destructive red text with error string). When no interaction data exists, the health score shows 100% (1.0) with 0 interactions. Recommendations show 'No recommendations â€” automation is running well'. Element reliability shows 'No flaky elements detected (all elements have >90% success rate)'. Regressions show 'No regressions detected'.",
       "category": "state-consistency",
       "assertions": [
         {
@@ -308,9 +362,12 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Total Interactions" },
+            "criteria": {
+              "textContains": "Total Interactions"
+            },
             "label": "Health score with zero interactions shows 100% but 0 count"
-          }
+          },
+          "precondition": "No UI Bridge actions have been recorded (ui_bridge_events table is empty)"
         },
         {
           "id": "state-empty-recommendations",
@@ -321,7 +378,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "automation is running well" },
+            "criteria": {
+              "textContains": "automation is running well"
+            },
             "label": "Empty state for recommendations when no issues"
           }
         },
@@ -334,7 +393,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "No regressions detected" },
+            "criteria": {
+              "textContains": "No regressions detected"
+            },
             "label": "Empty state for regressions panel"
           }
         },
@@ -347,7 +408,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "No failures recorded" },
+            "criteria": {
+              "textContains": "No failures recorded"
+            },
             "label": "Empty state for failure taxonomy"
           }
         },
@@ -360,7 +423,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "No stall events recorded" },
+            "criteria": {
+              "textContains": "No stall events recorded"
+            },
             "label": "Empty state for stall frequency"
           }
         },
@@ -373,7 +438,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "All high-interaction elements have annotations" },
+            "criteria": {
+              "textContains": "All high-interaction elements have annotations"
+            },
             "label": "Empty state for annotation gaps"
           }
         }
@@ -394,7 +461,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Action Performance Baselines" },
+            "criteria": {
+              "textContains": "Action Performance Baselines"
+            },
             "label": "Action baselines heading"
           }
         },
@@ -407,7 +476,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Avg (ms)" },
+            "criteria": {
+              "textContains": "Avg (ms)"
+            },
             "label": "Average duration column header"
           }
         },
@@ -420,7 +491,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Element Reliability" },
+            "criteria": {
+              "textContains": "Element Reliability"
+            },
             "label": "Element reliability heading"
           }
         },
@@ -433,7 +506,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Annotation Gaps" },
+            "criteria": {
+              "textContains": "Annotation Gaps"
+            },
             "label": "Annotation gaps heading"
           }
         }
@@ -454,7 +529,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Failure Taxonomy" },
+            "criteria": {
+              "textContains": "Failure Taxonomy"
+            },
             "label": "Failure taxonomy heading"
           }
         },
@@ -467,7 +544,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Automation Regressions" },
+            "criteria": {
+              "textContains": "Automation Regressions"
+            },
             "label": "Regression heading with red arrow"
           }
         },
@@ -480,7 +559,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Delta" },
+            "criteria": {
+              "textContains": "Delta"
+            },
             "label": "Delta column header"
           }
         },
@@ -493,7 +574,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Stall Frequency by Type" },
+            "criteria": {
+              "textContains": "Stall Frequency by Type"
+            },
             "label": "Stall frequency heading"
           }
         },
@@ -506,9 +589,12 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Intervention Effectiveness" },
+            "criteria": {
+              "textContains": "Intervention Effectiveness"
+            },
             "label": "Intervention effectiveness heading"
-          }
+          },
+          "precondition": "At least one stall event with an intervention has been recorded"
         }
       ]
     },
@@ -527,7 +613,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Action Performance Baselines" },
+            "criteria": {
+              "textContains": "Action Performance Baselines"
+            },
             "label": "Green success rate for reliable actions"
           }
         },
@@ -540,7 +628,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Element Reliability" },
+            "criteria": {
+              "textContains": "Element Reliability"
+            },
             "label": "Red success rate for unreliable elements"
           }
         },
@@ -553,7 +643,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Element Reliability" },
+            "criteria": {
+              "textContains": "Element Reliability"
+            },
             "label": "Red flaky badge on unreliable elements"
           }
         }
@@ -574,10 +666,13 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Total Interactions" },
+            "criteria": {
+              "textContains": "Total Interactions"
+            },
             "label": "Interaction count reflects recent actions"
           },
-          "expected": "After executing actions via /ui-bridge/control/element/{id}/action?task_run_id=1, refreshing the dashboard should show Total Interactions > 0 and the action baselines table should list 'click' with duration data."
+          "expected": "After executing actions via /ui-bridge/control/element/{id}/action?task_run_id=1, refreshing the dashboard should show Total Interactions > 0 and the action baselines table should list 'click' with duration data.",
+          "precondition": "UI Bridge actions were executed with ?task_run_id= query parameter on /ui-bridge/control/element/{id}/action endpoint"
         },
         {
           "id": "behavior-failures-lower-score",
@@ -588,10 +683,13 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Automation Health" },
+            "criteria": {
+              "textContains": "Automation Health"
+            },
             "label": "Health score decreases with failures"
           },
-          "expected": "After actions with success=false are recorded, the health score should be < 100, the failure taxonomy should show error clusters, and recommendations should appear with actionable guidance."
+          "expected": "After actions with success=false are recorded, the health score should be < 100, the failure taxonomy should show error clusters, and recommendations should appear with actionable guidance.",
+          "precondition": "At least one failed UI Bridge action exists in ui_bridge_events (success=0)"
         },
         {
           "id": "behavior-time-range-filter",
@@ -602,7 +700,10 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContent": "24h", "role": "button" },
+            "criteria": {
+              "textContent": "24h",
+              "role": "button"
+            },
             "label": "Time range filters analytics data"
           },
           "expected": "Clicking '24h' should show only actions from the last 24 hours. If all actions were performed today, counts should match. If older actions exist, counts should decrease."
@@ -624,7 +725,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Automation Health" },
+            "criteria": {
+              "textContains": "Automation Health"
+            },
             "label": "All analytics endpoints return valid responses"
           }
         }
@@ -645,7 +748,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Automation Health" },
+            "criteria": {
+              "textContains": "Automation Health"
+            },
             "label": "Consistent card container styling"
           }
         },
@@ -658,7 +763,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Automation Health" },
+            "criteria": {
+              "textContains": "Automation Health"
+            },
             "label": "Responsive 2-column to 1-column grid"
           }
         }

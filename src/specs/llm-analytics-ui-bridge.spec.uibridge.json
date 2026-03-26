@@ -6,7 +6,15 @@
     "component": "LlmObservabilityDashboard",
     "pageId": "llm-analytics",
     "pageUrl": "/llm-analytics",
-    "tags": ["llm-analytics", "cost-attribution", "ui-bridge", "target-app", "page-complexity", "model-action-matrix", "cost-per-interaction"]
+    "tags": [
+      "llm-analytics",
+      "cost-attribution",
+      "ui-bridge",
+      "target-app",
+      "page-complexity",
+      "model-action-matrix",
+      "cost-per-interaction"
+    ]
   },
   "groups": [
     {
@@ -24,13 +32,21 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Cost by Target App" },
+            "criteria": {
+              "textContains": "Cost by Target App"
+            },
             "label": "Target app chart with Globe icon"
           },
           "condition": {
             "type": "exists",
-            "target": { "type": "search", "criteria": { "textContains": "Cost by Target App" } }
-          }
+            "target": {
+              "type": "search",
+              "criteria": {
+                "textContains": "Cost by Target App"
+              }
+            }
+          },
+          "precondition": "phase_token_usage has rows with non-null target_app (set during agentic phase with SDK-connected app)"
         },
         {
           "id": "llm-cost-per-interaction-chart",
@@ -41,7 +57,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Cost per Successful Interaction" },
+            "criteria": {
+              "textContains": "Cost per Successful Interaction"
+            },
             "label": "Cost per interaction chart with DollarSign icon"
           }
         },
@@ -54,7 +72,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Page Complexity" },
+            "criteria": {
+              "textContains": "Page Complexity"
+            },
             "label": "Page complexity table with FileText icon"
           }
         },
@@ -67,7 +87,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Model x Action Success Matrix" },
+            "criteria": {
+              "textContains": "Model x Action Success Matrix"
+            },
             "label": "Model-action matrix with Grid3X3 icon"
           }
         }
@@ -88,7 +110,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Cost by Target App" },
+            "criteria": {
+              "textContains": "Cost by Target App"
+            },
             "label": "Tooltip with detailed cost metrics per app"
           }
         },
@@ -101,7 +125,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Avg/Call" },
+            "criteria": {
+              "textContains": "Avg/Call"
+            },
             "label": "Average cost per call column"
           }
         }
@@ -122,7 +148,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Model x Action" },
+            "criteria": {
+              "textContains": "Model x Action"
+            },
             "label": "Color-coded success rates in matrix cells"
           }
         },
@@ -135,9 +163,12 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Model x Action" },
+            "criteria": {
+              "textContains": "Model x Action"
+            },
             "label": "Matrix filters out statistically insignificant cells"
-          }
+          },
+          "precondition": "phase_token_usage and ui_bridge_events have data for the same task_run_ids"
         }
       ]
     },
@@ -156,9 +187,12 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "LLM Analytics" },
+            "criteria": {
+              "textContains": "LLM Analytics"
+            },
             "label": "Target app chart conditionally hidden when no data"
-          }
+          },
+          "precondition": "No phase_token_usage rows have target_app set"
         },
         {
           "id": "llm-empty-matrix",
@@ -169,7 +203,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "No model-action data" },
+            "criteria": {
+              "textContains": "No model-action data"
+            },
             "label": "Empty state for model-action matrix"
           }
         }
@@ -190,7 +226,9 @@
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "LLM Analytics" },
+            "criteria": {
+              "textContains": "LLM Analytics"
+            },
             "label": "Time range selector refreshes new cost charts"
           },
           "expected": "Selecting '30d' from the time range dropdown should cause all four new charts to re-fetch with days=30, potentially showing more historical data."
@@ -205,16 +243,19 @@
       "assertions": [
         {
           "id": "llm-cost-requires-sdk",
-          "description": "Cost by Target App data only appears when workflows are run against SDK-connected apps — workflows that don't use the UI Bridge will not have target_app attribution",
+          "description": "Cost by Target App data only appears when workflows are run against SDK-connected apps â€” workflows that don't use the UI Bridge will not have target_app attribution",
           "category": "behavior",
           "severity": "info",
           "assertionType": "semantic",
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "LLM Analytics" },
+            "criteria": {
+              "textContains": "LLM Analytics"
+            },
             "label": "Target app data requires SDK connection during workflow"
-          }
+          },
+          "precondition": "At least one workflow was run against an SDK-connected app during its agentic phase"
         }
       ]
     }
