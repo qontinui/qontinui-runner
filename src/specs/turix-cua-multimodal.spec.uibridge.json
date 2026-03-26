@@ -353,7 +353,7 @@
           "precondition": "An agentic verification run with brain_actor_enabled:true has completed at least 1 iteration",
           "source": "manual",
           "reviewed": true,
-          "enabled": false
+          "enabled": true
         },
         {
           "id": "data-element-index-format",
@@ -372,7 +372,7 @@
           "precondition": "An agentic verification run with brain_actor_enabled:true has completed and the UI Bridge SDK was connected during execution",
           "source": "manual",
           "reviewed": true,
-          "enabled": false
+          "enabled": true
         },
         {
           "id": "data-token-usage-per-phase",
@@ -477,7 +477,7 @@
           "precondition": "An agentic verification run has completed by hitting max_iterations",
           "source": "manual",
           "reviewed": true,
-          "enabled": false
+          "enabled": true
         },
         {
           "id": "behavior-cli-fallback-warning",
@@ -496,7 +496,7 @@
           "precondition": "A CLI provider is configured and an agentic verification run with brain_actor_enabled:true has completed",
           "source": "manual",
           "reviewed": true,
-          "enabled": false
+          "enabled": true
         }
       ],
       "source": "manual"
@@ -543,7 +543,7 @@
           "precondition": "At least one run of each architecture type has completed",
           "source": "manual",
           "reviewed": true,
-          "enabled": false
+          "enabled": true
         },
         {
           "id": "state-iteration-count-matches-display",
@@ -719,7 +719,7 @@
           "precondition": "An action (click, type, etc.) has been executed via the UI Bridge action executor within the last 600ms",
           "source": "manual",
           "reviewed": true,
-          "enabled": false
+          "enabled": true
         },
         {
           "id": "design-highlight-non-interfering",
@@ -738,7 +738,7 @@
           "precondition": "An action has been executed via the UI Bridge action executor within the last 600ms",
           "source": "manual",
           "reviewed": true,
-          "enabled": false
+          "enabled": true
         }
       ],
       "source": "manual"
