@@ -63,7 +63,6 @@ import { HooksManagerPanel } from "@/components/hooks";
 import { ErrorMonitorTab } from "@/components/error-monitor";
 import { ProcessManagerTab } from "@/components/process-manager";
 import { ReflectionDashboard } from "@/components/reflection-dashboard/ReflectionDashboard";
-import { ObservationBrowser } from "@/components/observations";
 import { ArchitectureView } from "@/components/architecture-view/ArchitectureView";
 import { GeneratorEvalPage } from "@/pages/GeneratorEvalPage";
 import { OrchestrationLoopPanel } from "@/components/orchestration-loop/OrchestrationLoopPanel";
@@ -84,6 +83,7 @@ const UnifiedSearchPanel = lazy(() => import("../unified-search/UnifiedSearchPan
 const WorkflowVersionLineage = lazy(() => import("../workflow-versions/WorkflowVersionLineage").then(m => ({ default: m.WorkflowVersionLineage })));
 const SkillApprovalPanel = lazy(() => import("../skills/SkillApprovalPanel").then(m => ({ default: m.SkillApprovalPanel })));
 const AutomationHealthDashboard = lazy(() => import("../ui-bridge/AutomationHealthDashboard").then(m => ({ default: m.AutomationHealthDashboard })));
+const ObservationBrowser = lazy(() => import("../observations/ObservationBrowser").then(m => ({ default: m.ObservationBrowser })));
 
 interface ActionLogViewData {
   actions: ActionLogEntry[];

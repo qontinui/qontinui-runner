@@ -82,12 +82,7 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
 
   const { results, loading: searchLoading, search } = useObservationSearch();
 
-  // Auto-load stats on mount
-  useEffect(() => {
-    loadStats();
-  }, [loadStats]);
-
-  // Load stats on mount
+  // Load stats callback (must be declared before useEffect that references it)
   const loadStats = useCallback(async () => {
     setStatsLoading(true);
     try {
@@ -102,6 +97,11 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
       setStatsLoading(false);
     }
   }, []);
+
+  // Auto-load stats on mount
+  useEffect(() => {
+    loadStats();
+  }, [loadStats]);
 
   // Create handler
   const handleCreate = useCallback(async () => {
