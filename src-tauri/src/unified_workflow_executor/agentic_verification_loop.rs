@@ -3,8 +3,10 @@
 //! Runs a Verification Agent → Worker Agent loop where verification is performed
 //! by an AI agent rather than deterministic steps.
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use crate::orchestrator::brain_actor::{BrainActorConfig, BrainActorOrchestrator, BrainOutput};
+use crate::orchestrator::structured_output::StructuredSignal;
 use crate::step_executor::ExecutionStepConfig;
 use crate::step_registry::StepEventLogger;
 
@@ -119,6 +121,7 @@ struct IterationSummary {
 struct IterationHistory {
     entries: Vec<IterationSummary>,
     max_total_chars: usize,
+    compression_mode: crate::orchestrator::compression::IterationCompressionMode,
 }
 
 impl IterationHistory {
@@ -126,7 +129,16 @@ impl IterationHistory {
         Self {
             entries: Vec::new(),
             max_total_chars: 4000,
+            compression_mode: crate::orchestrator::compression::IterationCompressionMode::CharBased,
         }
+    }
+
+    fn with_compression_mode(
+        mut self,
+        mode: crate::orchestrator::compression::IterationCompressionMode,
+    ) -> Self {
+        self.compression_mode = mode;
+        self
     }
 
     fn add(&mut self, summary: IterationSummary) {
@@ -148,30 +160,87 @@ impl IterationHistory {
             .sum()
     }
 
-    /// Merge oldest two entries into one when over budget, preserving at least 3 entries.
+    /// Compress entries when over budget, preserving at least 3 entries.
+    ///
+    /// In CharBased mode: merges oldest two entries by concatenating + truncating.
+    /// In LlmSummarized mode: sends oldest entries to an LLM for summarization,
+    /// falling back to char-based if the LLM call fails.
     fn compress_if_needed(&mut self) {
+        if self.total_chars() <= self.max_total_chars || self.entries.len() <= 3 {
+            return;
+        }
+
+        // Try LLM summarization first if configured
+        if self.compression_mode
+            == crate::orchestrator::compression::IterationCompressionMode::LlmSummarized
+            && self.entries.len() > 4
+        {
+            // Collect the oldest entries (all except the last 3)
+            let keep_count = 3;
+            let entries_to_summarize = self.entries.len() - keep_count;
+            let old_entries: Vec<String> = self.entries[..entries_to_summarize]
+                .iter()
+                .map(|e| format!("Iter {}: {} → {}", e.iteration, e.approach, e.result))
+                .collect();
+
+            let summary = crate::orchestrator::compression::summarize_iterations(
+                &old_entries,
+                self.max_total_chars / 3, // budget ~1/3 of total for compressed history
+                self.compression_mode,
+            );
+
+            if !summary.is_empty() {
+                // Replace all old entries with a single summary entry
+                let merged_label = format!(
+                    "{}-{}",
+                    self.entries[0].iteration,
+                    self.entries[entries_to_summarize - 1].iteration
+                );
+                let merged_files: Vec<String> = self.entries[..entries_to_summarize]
+                    .iter()
+                    .flat_map(|e| e.files_touched.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                let merged_delta: f64 = self.entries[..entries_to_summarize]
+                    .iter()
+                    .map(|e| e.confidence_delta)
+                    .sum();
+
+                let summary_entry = IterationSummary {
+                    iteration: merged_label,
+                    approach: summary,
+                    result: "(LLM summary)".to_string(),
+                    files_touched: merged_files,
+                    confidence_delta: merged_delta,
+                };
+
+                // Remove old entries and insert summary at front
+                self.entries.drain(..entries_to_summarize);
+                self.entries.insert(0, summary_entry);
+                return;
+            }
+            // If LLM summary returned empty, fall through to char-based
+        }
+
+        // Char-based compression: merge oldest two entries
         while self.total_chars() > self.max_total_chars && self.entries.len() > 3 {
             let second = self.entries.remove(1);
             let first = &mut self.entries[0];
 
-            // Merge iteration labels
             let merged_label = if first.iteration.contains('-') {
-                // Already a range like "1-2", extend it
                 let prefix = first.iteration.split('-').next().unwrap_or("?");
                 format!("{}-{}", prefix, second.iteration)
             } else {
                 format!("{}-{}", first.iteration, second.iteration)
             };
 
-            // Merge approaches (truncate combined to ~100 chars)
             let merged_approach = format!("{} | {}", first.approach, second.approach);
             let merged_approach = truncate_with_ellipsis(&merged_approach, 100);
 
-            // Merge results
             let merged_result = format!("{} | {}", first.result, second.result);
             let merged_result = truncate_with_ellipsis(&merged_result, 100);
 
-            // Merge files (deduplicated)
             let mut merged_files = first.files_touched.clone();
             for f in &second.files_touched {
                 if !merged_files.contains(f) {
@@ -335,6 +404,13 @@ impl LoopController {
         let mut iteration_history = IterationHistory::new();
         let mut prev_confidence: f64 = 0.0;
 
+        // Brain/Actor orchestrator (opt-in: enabled via agentic_verification_config)
+        let brain_actor_config = BrainActorConfig {
+            enabled: av_config.brain_actor_enabled.unwrap_or(false),
+            ..Default::default()
+        };
+        let mut brain_actor = BrainActorOrchestrator::new(brain_actor_config);
+
         // Save original model/provider overrides so we can restore after each iteration
         let original_model_override = config.model_override.clone();
         let original_provider_override = config.provider_override.clone();
@@ -447,7 +523,7 @@ impl LoopController {
                 )
                 .await;
                 if !ui_context.is_empty() {
-                    verifier_context.push_str(&ui_context);
+                    verifier_context.push_str(&ui_context.text);
                 }
 
                 // Apply verifier model/provider overrides
@@ -718,6 +794,114 @@ impl LoopController {
                 ));
             }
 
+            // ── Brain/Actor enrichment (when enabled) ──
+            // If Brain/Actor mode is active, invoke the Brain for visual analysis
+            // and inject its action plan into the worker context.
+            if brain_actor.is_enabled() {
+                brain_actor.start_iteration();
+
+                if brain_actor.should_invoke_brain(iteration) {
+                    // Fetch UI context with elements for the Brain
+                    let brain_ui = fetch_verifier_ui_context(true, true, true).await;
+
+                    if !brain_ui.elements.is_empty() {
+                        // Build element index text
+                        let element_index: String = brain_ui.elements
+                            .iter()
+                            .map(|e| format!(
+                                "[{}] \"{}\" {} at ({:.3}, {:.3})",
+                                e.index, e.label, e.element_type,
+                                e.normalized_rect.x, e.normalized_rect.y,
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+
+                        // Try to capture and annotate a screenshot for multimodal Brain call
+                        let brain_screenshot = self.try_capture_annotated_screenshot(&brain_ui.elements).await;
+
+                        // Build Brain prompt
+                        let brain_system = format!(
+                            "You are a Visual Analysis Brain agent. Analyze the current screen state \
+                             and produce an action plan.\n\n\
+                             ## Goal\n{}\n\n\
+                             ## Element Index\n{}\n\n\
+                             ## Current UI State\n{}\n\n\
+                             {}\n\n\
+                             Respond with JSON:\n\
+                             ```json\n{{\n\
+                               \"screen_analysis\": \"what you observe on screen\",\n\
+                               \"suggested_plan\": [\"step 1\", \"step 2\", ...],\n\
+                               \"context_notes\": \"any observations for the Actor\"\n\
+                             }}\n```",
+                            goal,
+                            element_index,
+                            brain_ui.text,
+                            brain_actor.records_context(),
+                        );
+
+                        // Send to Brain model — multimodal if screenshot available, text-only otherwise
+                        let brain_response = if let Some(ref screenshot_b64) = brain_screenshot {
+                            let prompt = crate::ai_provider::MultimodalPrompt::with_screenshot(
+                                &brain_system,
+                                screenshot_b64,
+                            );
+                            crate::ai_provider::run_prompt_with_routing_multimodal(
+                                &prompt,
+                                &crate::ai_router::TaskContext::from_prompt(&brain_system),
+                                self.doctor_handle.as_ref(),
+                            )
+                        } else {
+                            crate::ai_provider::run_prompt_with_routing(
+                                &brain_system,
+                                &crate::ai_router::TaskContext::from_prompt(&brain_system),
+                                self.doctor_handle.as_ref(),
+                            )
+                        };
+
+                        // Parse Brain response into BrainOutput
+                        let brain_output = if brain_response.success {
+                            Self::parse_brain_response(
+                                &brain_response.output,
+                                &element_index,
+                                &brain_ui.text,
+                                iteration,
+                                &brain_actor,
+                            )
+                        } else {
+                            // Fallback: use raw UI context as analysis
+                            warn!(
+                                "AGENTIC-VERIFICATION: Brain LLM call failed ({}), using UI context fallback",
+                                brain_response.error.as_deref().unwrap_or("unknown")
+                            );
+                            BrainOutput {
+                                screen_analysis: brain_ui.text.clone(),
+                                element_index: element_index.clone(),
+                                suggested_plan: vec![],
+                                context_notes: brain_actor.records_context(),
+                                iteration_produced: iteration,
+                            }
+                        };
+
+                        brain_actor.set_brain_output(brain_output);
+
+                        debug!(
+                            "AGENTIC-VERIFICATION: Brain analyzed {} elements for iteration {} (multimodal: {})",
+                            brain_ui.elements.len(),
+                            iteration,
+                            brain_screenshot.is_some(),
+                        );
+                    }
+                }
+
+                // Inject Brain context into worker prompt if available
+                if let Some(actor_prompt) = brain_actor.build_actor_prompt(&goal) {
+                    worker_failure_context.push_str(&format!(
+                        "\n\n## Visual Analysis (Brain Agent)\n{}",
+                        actor_prompt
+                    ));
+                }
+            }
+
             let (worker_outcome, _injected_steps) = self
                 .agentic_executor
                 .run_agentic(
@@ -749,6 +933,18 @@ impl LoopController {
                 "AGENTIC-VERIFICATION: Worker completed in {}ms",
                 worker_duration
             );
+
+            // ── Brain/Actor signal processing ──
+            // If Brain/Actor is enabled, process any RequestContext or RecordStore
+            // signals from the worker output for the next iteration.
+            if brain_actor.is_enabled() {
+                if let Some(ref summary) = worker_summary {
+                    let parsed =
+                        crate::orchestrator::structured_output::parse_worker_output(summary);
+                    let output = parsed.get_output(iteration);
+                    brain_actor.process_signals(&output.signals);
+                }
+            }
 
             // ── Record iteration result ─────────────────────────────────
             let iter_result = AgenticVerificationIterationResult {
@@ -811,6 +1007,125 @@ impl LoopController {
             ) {
                 warn!("Failed to increment session count: {}", e);
             }
+        }
+    }
+
+    /// Try to capture a screenshot and annotate it with element markers.
+    ///
+    /// Returns the annotated screenshot as base64, or None if capture/annotation fails.
+    /// Uses the annotation engine to draw numbered boxes on detected elements.
+    async fn try_capture_annotated_screenshot(
+        &self,
+        elements: &[crate::vision::annotator::AnnotatedElement],
+    ) -> Option<String> {
+        if elements.is_empty() {
+            return None;
+        }
+
+        // Try to get a screenshot from the UI Bridge
+        let port = crate::mcp::types::get_mcp_api_port();
+        let url = format!(
+            "http://127.0.0.1:{}/ui-bridge/sdk/control/screenshot",
+            port
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()?;
+
+        let resp = client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let body: serde_json::Value = resp.json().await.ok()?;
+        let screenshot_b64 = body
+            .get("data")
+            .and_then(|d| d.get("screenshot"))
+            .or_else(|| body.get("screenshot"))
+            .and_then(|v| v.as_str())?;
+
+        // Annotate the screenshot
+        let max_width = self
+            .app_state
+            .pg_db
+            .as_ref()
+            .map(|_| 1024_u32) // Default resize for token efficiency
+            .unwrap_or(1024);
+
+        match crate::vision::annotator::annotate_screenshot(screenshot_b64, elements, max_width) {
+            Ok(result) => {
+                debug!(
+                    "Annotated screenshot with {} elements (base64: {} bytes)",
+                    result.element_count,
+                    result.annotated_base64.len()
+                );
+                Some(result.annotated_base64)
+            }
+            Err(e) => {
+                debug!("Screenshot annotation failed: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Parse the Brain LLM response into a BrainOutput struct.
+    ///
+    /// Tries to extract JSON from the response, falls back to using the raw
+    /// response as screen_analysis.
+    fn parse_brain_response(
+        output: &str,
+        element_index: &str,
+        ui_text: &str,
+        iteration: u32,
+        brain_actor: &BrainActorOrchestrator,
+    ) -> BrainOutput {
+        // Try to extract JSON block from the response
+        if let Some(json_start) = output.find('{') {
+            if let Some(json_end) = output.rfind('}') {
+                let json_str = &output[json_start..=json_end];
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    let screen_analysis = parsed
+                        .get("screen_analysis")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(ui_text)
+                        .to_string();
+
+                    let suggested_plan = parsed
+                        .get("suggested_plan")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    let context_notes = parsed
+                        .get("context_notes")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    return BrainOutput {
+                        screen_analysis,
+                        element_index: element_index.to_string(),
+                        suggested_plan,
+                        context_notes,
+                        iteration_produced: iteration,
+                    };
+                }
+            }
+        }
+
+        // Fallback: use the raw output as screen analysis
+        BrainOutput {
+            screen_analysis: output.to_string(),
+            element_index: element_index.to_string(),
+            suggested_plan: vec![],
+            context_notes: brain_actor.records_context(),
+            iteration_produced: iteration,
         }
     }
 

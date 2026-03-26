@@ -233,9 +233,35 @@ pub fn playbooks_for_context<'a>(
                         }
                         "url_pattern" => {
                             url.map_or(false, |u| {
-                                // Simple glob: * matches any characters
-                                let pattern = trigger.value.replace('*', "");
-                                u.contains(&pattern)
+                                // Simple glob matching: split on * and check segments
+                                // appear in order within the URL.
+                                // e.g., "*.salesforce.com/*" splits to ["", ".salesforce.com/", ""]
+                                let segments: Vec<&str> = trigger.value.split('*').collect();
+                                let mut remaining = u;
+                                for (i, seg) in segments.iter().enumerate() {
+                                    if seg.is_empty() {
+                                        continue;
+                                    }
+                                    if i == 0 {
+                                        // First segment must be a prefix
+                                        if !remaining.starts_with(seg) {
+                                            return false;
+                                        }
+                                        remaining = &remaining[seg.len()..];
+                                    } else if i == segments.len() - 1 {
+                                        // Last segment must be a suffix
+                                        if !remaining.ends_with(seg) {
+                                            return false;
+                                        }
+                                    } else {
+                                        // Middle segments must appear in order
+                                        match remaining.find(seg) {
+                                            Some(pos) => remaining = &remaining[pos + seg.len()..],
+                                            None => return false,
+                                        }
+                                    }
+                                }
+                                true
                             })
                         }
                         "tag" => {

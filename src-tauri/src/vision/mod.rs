@@ -5,3 +5,5 @@
 //! automation contexts.
 
 pub mod annotator;
+pub mod element_collector;
+pub mod types;

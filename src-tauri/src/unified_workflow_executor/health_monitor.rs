@@ -10,23 +10,57 @@ use tracing::info;
 use crate::database::CheckpointDb;
 use crate::mcp::types::MCP_API_PORT;
 use crate::str_utils::truncate_str;
+use crate::vision::annotator::{AnnotatedElement, AnnotationResult};
+use crate::vision::element_collector;
 
 // =============================================================================
-// Verifier UI Context (Snapshot, Console Errors, App Health)
+// Verifier UI Context (Snapshot, Console Errors, App Health, Annotations)
 // =============================================================================
+
+/// Rich UI context returned by `fetch_verifier_ui_context`.
+///
+/// Contains both text-based context (for text-only prompts) and optional
+/// annotation data (for multimodal prompts with annotated screenshots).
+pub struct VerifierUiContext {
+    /// Markdown-formatted text context (snapshot summary, console errors, health).
+    pub text: String,
+    /// Annotated elements extracted from the UI Bridge snapshot.
+    /// Empty if no elements were found or UI Bridge is not connected.
+    pub elements: Vec<AnnotatedElement>,
+    /// Screenshot annotation result (annotated image + text index).
+    /// None if no screenshot was captured or annotation failed.
+    pub annotation: Option<AnnotationResult>,
+}
+
+impl VerifierUiContext {
+    /// Empty context (no UI Bridge connected).
+    pub fn empty() -> Self {
+        Self {
+            text: String::new(),
+            elements: Vec::new(),
+            annotation: None,
+        }
+    }
+
+    /// Check if this context has any useful data.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.elements.is_empty()
+    }
+}
 
 /// Fetch live UI Bridge data for the agentic verification loop's verifier.
 ///
 /// Concurrently fetches the UI snapshot, console errors, and app health status.
+/// Also extracts interactive elements for screenshot annotation.
 /// Each fetch is gated by its corresponding config flag and is best-effort:
 /// failures are silently ignored (the SDK app may not be connected).
 pub async fn fetch_verifier_ui_context(
     use_screenshots: bool,
     include_console_errors: bool,
     include_app_health: bool,
-) -> String {
+) -> VerifierUiContext {
     if !use_screenshots && !include_console_errors && !include_app_health {
-        return String::new();
+        return VerifierUiContext::empty();
     }
 
     let port = MCP_API_PORT;
@@ -105,6 +139,13 @@ pub async fn fetch_verifier_ui_context(
 
     // Fetch all concurrently
     let (snapshot, console_errors, health) = tokio::join!(snapshot_fut, console_fut, health_fut);
+
+    // Extract elements for annotation from the snapshot
+    let elements = if let Some(ref snap) = snapshot {
+        element_collector::extract_elements_from_snapshot(snap)
+    } else {
+        Vec::new()
+    };
 
     let mut sections = String::new();
 
@@ -307,7 +348,29 @@ pub async fn fetch_verifier_ui_context(
         }
     }
 
-    sections
+    // Include element index text in the sections if we have elements
+    if !elements.is_empty() {
+        sections.push_str(&format!(
+            "\n\n## Screen Elements ({} interactive)\n",
+            elements.len()
+        ));
+        for el in &elements {
+            sections.push_str(&format!(
+                "[{}] \"{}\" {} at ({:.3}, {:.3})\n",
+                el.index,
+                el.label,
+                el.element_type,
+                el.normalized_rect.x,
+                el.normalized_rect.y,
+            ));
+        }
+    }
+
+    VerifierUiContext {
+        text: sections,
+        elements,
+        annotation: None, // Annotation produced by caller when screenshot is available
+    }
 }
 
 // =============================================================================

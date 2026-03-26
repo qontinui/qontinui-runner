@@ -268,13 +268,19 @@ pub(super) fn run_gemini_api_multimodal(
         model, api_key
     );
 
-    let request_body = serde_json::json!({
+    // Build request body with optional system instruction
+    let mut request_body = serde_json::json!({
         "contents": prompt.to_gemini_contents(),
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": max_output_tokens
         }
     });
+
+    // Include system prompt via Gemini's systemInstruction field
+    if let Some(system_instruction) = prompt.to_gemini_system_instruction() {
+        request_body["systemInstruction"] = system_instruction;
+    }
 
     retry_with_backoff("Gemini API (multimodal)", || {
         let response = client

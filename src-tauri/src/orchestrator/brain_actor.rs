@@ -19,11 +19,7 @@
 //! 5. If Actor signals `RequestContext`, Brain is re-invoked next iteration.
 //! 6. Both agents can use `RecordStore` to persist/retrieve named data.
 
-#![allow(dead_code)]
-
-use crate::ai_provider::multimodal::MultimodalPrompt;
-use crate::ai_provider::AiResponse;
-use crate::orchestrator::agent_roles::{AgentRole, ModelTier};
+use crate::orchestrator::agent_roles::ModelTier;
 use crate::orchestrator::structured_output::StructuredSignal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

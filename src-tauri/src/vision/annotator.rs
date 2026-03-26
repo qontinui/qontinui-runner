@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use tracing::debug;
 
+pub use super::types::NormalizedRect;
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -30,15 +32,6 @@ pub struct AnnotatedElement {
     pub element_type: String,
     /// Bounding box in normalized 0.0-1.0 coordinates.
     pub normalized_rect: NormalizedRect,
-}
-
-/// Bounding box in normalized 0.0-1.0 coordinate space.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NormalizedRect {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
 }
 
 /// Result of annotating a screenshot.
@@ -170,11 +163,8 @@ fn draw_number(img: &mut RgbaImage, number: u32, x: i32, y: i32, color: Rgba<u8>
 
 /// Calculate the width in pixels of a number label at the given scale.
 fn number_label_width(number: u32, scale: u32) -> i32 {
-    let digit_count = if number == 0 {
-        1
-    } else {
-        (number as f64).log10().floor() as i32 + 1
-    };
+    // Use string length for robust digit counting (avoids f64 log10 edge cases)
+    let digit_count = number.to_string().len() as i32;
     digit_count * 6 * scale as i32 - scale as i32 // subtract trailing gap
 }
 

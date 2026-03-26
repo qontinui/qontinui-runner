@@ -592,8 +592,9 @@ pub fn summarize_iterations_with_llm(
 
     if response.success {
         let summary = response.output.trim().to_string();
-        let summary = if summary.len() > max_output_chars {
-            summary[..max_output_chars].to_string()
+        // Truncate at char boundary (not byte boundary) to avoid UTF-8 panics
+        let summary = if summary.chars().count() > max_output_chars {
+            summary.chars().take(max_output_chars).collect::<String>()
         } else {
             summary
         };
@@ -619,10 +620,12 @@ pub fn summarize_iterations_char_based(
     max_chars: usize,
 ) -> String {
     let combined = entries.join(" | ");
-    if combined.len() <= max_chars {
+    if combined.chars().count() <= max_chars {
         combined
     } else {
-        format!("{}...", &combined[..max_chars.saturating_sub(3)])
+        // Truncate at char boundary to avoid UTF-8 panics
+        let truncated: String = combined.chars().take(max_chars.saturating_sub(3)).collect();
+        format!("{}...", truncated)
     }
 }
 

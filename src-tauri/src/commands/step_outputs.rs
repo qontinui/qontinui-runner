@@ -229,17 +229,8 @@ pub struct Dimensions {
     pub height: i32,
 }
 
-/// Bounding box in normalized 0.0-1.0 coordinate space (screen-relative).
-///
-/// Resolution-independent representation used for portable element references
-/// and LLM-friendly coordinate output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NormalizedBoundingBox {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-}
+/// Type alias for backward compatibility — use `vision::types::NormalizedRect` directly.
+pub type NormalizedBoundingBox = crate::vision::types::NormalizedRect;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedElement {

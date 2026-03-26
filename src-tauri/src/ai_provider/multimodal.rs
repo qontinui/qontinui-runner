@@ -174,6 +174,19 @@ impl MultimodalPrompt {
 
         serde_json::json!([{"parts": parts}])
     }
+
+    /// Build the Gemini API `systemInstruction` field as a JSON value.
+    ///
+    /// Returns `None` if no system prompt is set. Gemini supports system
+    /// instructions via a top-level `systemInstruction` field alongside
+    /// `contents`.
+    pub fn to_gemini_system_instruction(&self) -> Option<serde_json::Value> {
+        self.system.as_ref().map(|sys| {
+            serde_json::json!({
+                "parts": [{"text": sys}]
+            })
+        })
+    }
 }
 
 // =============================================================================

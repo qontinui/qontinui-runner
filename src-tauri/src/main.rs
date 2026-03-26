@@ -22,6 +22,7 @@ mod check_executor;
 mod check_generation;
 mod claude_protocol;
 mod claude_session;
+mod click_overlay;
 mod commands;
 mod comparison;
 mod config;

@@ -197,6 +197,14 @@ pub struct AgenticVerificationConfig {
     /// Setting this > 1 reduces false-positive exits at the cost of extra iterations.
     #[serde(default = "default_consecutive_passes")]
     pub required_consecutive_passes: u32,
+
+    /// Enable the Brain/Actor two-phase LLM pattern (TuriX-CUA inspired).
+    ///
+    /// When enabled, the worker phase uses a Brain (expensive vision model) to analyze
+    /// annotated screenshots and produce an action plan, then an Actor (cheap text model)
+    /// to execute the plan. This saves cost by keeping images out of the Actor call.
+    #[serde(default)]
+    pub brain_actor_enabled: Option<bool>,
 }
 
 fn default_max_iterations() -> u32 {
@@ -221,6 +229,7 @@ impl Default for AgenticVerificationConfig {
             verify_first: true,
             confidence_threshold: default_confidence_threshold(),
             required_consecutive_passes: default_consecutive_passes(),
+            brain_actor_enabled: None,
         }
     }
 }
