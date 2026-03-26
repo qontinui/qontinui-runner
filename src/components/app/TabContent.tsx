@@ -40,6 +40,7 @@ import {
 } from "@/components/library";
 import { StepBuildersPage } from "@/components/StepBuildersPage";
 import { HelpTab } from "@/components/HelpTab";
+import { KnowledgeExplorerPage } from "@/components/knowledge-acquisition";
 import { SchedulerTab } from "@/components/scheduler";
 import { TriggersTab } from "@/components/triggers";
 import { WorkflowBuilderTab } from "@/components/workflow-builder";
@@ -72,7 +73,8 @@ import { SpecsPage } from "@/pages/specs/SpecsPage";
 import { UIBridgeIntegrationPage } from "@/pages/ui-bridge-integration/UIBridgeIntegrationPage";
 import { UIBridgeStateMachinePage } from "@/pages/state-machine";
 import { ImageQualityTestsPage } from "@/pages/ImageQualityTestsPage";
-import { lazy } from "react";
+import { lazy, Suspense } from "react";
+import { Loader2 } from "lucide-react";
 
 const LlmObservabilityDashboard = lazy(() => import("../llm-observability/LlmObservabilityDashboard"));
 const EvaluationDashboard = lazy(() => import("../evaluation/EvaluationDashboard"));
@@ -84,6 +86,18 @@ const WorkflowVersionLineage = lazy(() => import("../workflow-versions/WorkflowV
 const SkillApprovalPanel = lazy(() => import("../skills/SkillApprovalPanel").then(m => ({ default: m.SkillApprovalPanel })));
 const AutomationHealthDashboard = lazy(() => import("../ui-bridge/AutomationHealthDashboard").then(m => ({ default: m.AutomationHealthDashboard })));
 const ObservationBrowser = lazy(() => import("../observations/ObservationBrowser").then(m => ({ default: m.ObservationBrowser })));
+const ActivityTimelinePanel = lazy(() => import("../activity-timeline/ActivityTimelinePanel").then(m => ({ default: m.ActivityTimelinePanel })));
+const WatcherManagementPanel = lazy(() => import("../activity-timeline/WatcherManagementPanel").then(m => ({ default: m.WatcherManagementPanel })));
+
+/** Suspense fallback for lazy-loaded tab panels */
+function LazyFallback() {
+  return (
+    <div className="flex items-center justify-center h-full gap-2 text-muted-foreground">
+      <Loader2 className="w-5 h-5 animate-spin" />
+      <span className="text-sm">Loading...</span>
+    </div>
+  );
+}
 
 interface ActionLogViewData {
   actions: ActionLogEntry[];
@@ -240,7 +254,27 @@ export function TabContent({
     case "observations":
       return (
         <div className="h-full overflow-hidden">
-          <ObservationBrowser projectId={projectSelection.selectedProjectId} />
+          <Suspense fallback={<LazyFallback />}>
+            <ObservationBrowser projectId={projectSelection.selectedProjectId} />
+          </Suspense>
+        </div>
+      );
+
+    case "activity-timeline":
+      return (
+        <div className="h-full overflow-hidden">
+          <Suspense fallback={<LazyFallback />}>
+            <ActivityTimelinePanel />
+          </Suspense>
+        </div>
+      );
+
+    case "watchers":
+      return (
+        <div className="h-full overflow-hidden">
+          <Suspense fallback={<LazyFallback />}>
+            <WatcherManagementPanel />
+          </Suspense>
         </div>
       );
 
@@ -275,7 +309,9 @@ export function TabContent({
     case "skills":
       return (
         <div className="h-full overflow-hidden">
-          <SkillApprovalPanel />
+          <Suspense fallback={<LazyFallback />}>
+            <SkillApprovalPanel />
+          </Suspense>
         </div>
       );
 
@@ -723,14 +759,18 @@ export function TabContent({
     case "llm-analytics":
       return (
         <div className="h-full overflow-hidden">
-          <LlmObservabilityDashboard />
+          <Suspense fallback={<LazyFallback />}>
+            <LlmObservabilityDashboard />
+          </Suspense>
         </div>
       );
 
     case "evaluation":
       return (
         <div className="h-full overflow-hidden">
-          <EvaluationDashboard />
+          <Suspense fallback={<LazyFallback />}>
+            <EvaluationDashboard />
+          </Suspense>
         </div>
       );
 
@@ -740,42 +780,61 @@ export function TabContent({
     case "element-reliability":
       return (
         <div className="h-full overflow-hidden">
-          <ElementReliabilityDashboard />
+          <Suspense fallback={<LazyFallback />}>
+            <ElementReliabilityDashboard />
+          </Suspense>
         </div>
       );
 
     case "automation-health":
       return (
         <div className="h-full overflow-auto p-4">
-          <AutomationHealthDashboard />
+          <Suspense fallback={<LazyFallback />}>
+            <AutomationHealthDashboard />
+          </Suspense>
         </div>
       );
 
     case "pipeline-events":
       return (
         <div className="h-full overflow-hidden">
-          <PipelineEventsTimeline />
+          <Suspense fallback={<LazyFallback />}>
+            <PipelineEventsTimeline />
+          </Suspense>
         </div>
       );
 
     case "rule-influence":
       return (
         <div className="h-full overflow-hidden">
-          <RuleInfluencePanel />
+          <Suspense fallback={<LazyFallback />}>
+            <RuleInfluencePanel />
+          </Suspense>
         </div>
       );
 
     case "unified-search":
       return (
         <div className="h-full overflow-hidden">
-          <UnifiedSearchPanel onSearch={() => {}} />
+          <Suspense fallback={<LazyFallback />}>
+            <UnifiedSearchPanel onSearch={() => {}} />
+          </Suspense>
         </div>
       );
 
     case "workflow-versions":
       return (
         <div className="h-full overflow-hidden">
-          <WorkflowVersionLineage />
+          <Suspense fallback={<LazyFallback />}>
+            <WorkflowVersionLineage />
+          </Suspense>
+        </div>
+      );
+
+    case "knowledge-explorer":
+      return (
+        <div className="h-full overflow-hidden">
+          <KnowledgeExplorerPage />
         </div>
       );
 

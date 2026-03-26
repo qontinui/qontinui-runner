@@ -194,19 +194,20 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
   const totalCount = stats.reduce((sum, s) => sum + s.count, 0);
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full" data-ui-element="observation-browser">
       {/* Header */}
       <div className="flex items-center gap-3 p-4 border-b border-border">
         <Brain className="w-5 h-5 text-primary" />
         <div className="flex-1">
-          <h2 className="font-semibold text-sm">Observation Memory</h2>
-          <p className="text-xs text-muted-foreground">
+          <h2 className="font-semibold text-sm" data-ui-element="observation-heading">Observation Memory</h2>
+          <p className="text-xs text-muted-foreground" data-ui-element="observation-subtitle">
             Cross-session knowledge from past runs
           </p>
         </div>
         <button
           onClick={() => setShowCreateForm(!showCreateForm)}
           className="px-2 py-1 text-xs bg-primary text-primary-foreground rounded-md"
+          data-ui-element="new-observation-btn"
         >
           + New
         </button>
@@ -215,6 +216,7 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
           disabled={statsLoading}
           className="p-1.5 hover:bg-muted rounded-md"
           title="Refresh stats"
+          data-ui-element="refresh-stats-btn"
         >
           {statsLoading ? (
             <Loader2 className="w-4 h-4 animate-spin" />
@@ -233,6 +235,7 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
             onChange={(e) => setCreateTitle(e.target.value)}
             placeholder="Observation title..."
             className="w-full px-3 py-1.5 text-sm bg-background border border-border rounded-md outline-none focus:ring-1 focus:ring-primary"
+            data-ui-element="create-observation-title"
           />
           <textarea
             value={createContent}
@@ -240,6 +243,7 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
             placeholder="Content (markdown supported)..."
             rows={3}
             className="w-full px-3 py-1.5 text-sm bg-background border border-border rounded-md outline-none focus:ring-1 focus:ring-primary resize-y"
+            data-ui-element="create-observation-content"
           />
           <div className="flex items-center gap-2">
             <select
@@ -265,6 +269,7 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
               onClick={handleCreate}
               disabled={createLoading || !createTitle.trim() || !createContent.trim()}
               className="px-3 py-1 text-xs bg-primary text-primary-foreground rounded-md disabled:opacity-50"
+              data-ui-element="save-observation-btn"
             >
               {createLoading ? "Saving..." : "Save"}
             </button>
@@ -307,12 +312,14 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
             onKeyDown={(e) => e.key === "Enter" && handleSearch()}
             placeholder="Search observations..."
             className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+            data-ui-element="observation-search-input"
           />
         </div>
         <button
           onClick={handleSearch}
           disabled={searchLoading || !searchQuery.trim()}
           className="px-3 py-1.5 text-sm bg-primary text-primary-foreground rounded-md disabled:opacity-50"
+          data-ui-element="observation-search-btn"
         >
           {searchLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : "Search"}
         </button>
