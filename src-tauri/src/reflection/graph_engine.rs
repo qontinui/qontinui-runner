@@ -61,6 +61,7 @@ impl KnowledgeGraph {
         kg.load_knowledge(conn, workflow_name)?;
         kg.load_step_defs(conn, workflow_name)?;
         kg.load_ui_elements(conn, workflow_name)?;
+        kg.load_skills(conn)?;
 
         // --- Edges ---
         kg.link_task_runs_to_workflows(conn, workflow_name)?;
@@ -74,6 +75,7 @@ impl KnowledgeGraph {
         kg.link_component_relationships(conn, workflow_name)?;
         kg.link_fix_applications(conn, workflow_name)?;
         kg.link_ui_interactions(conn, workflow_name)?;
+        kg.link_skills(conn)?;
 
         Ok(kg)
     }
@@ -857,6 +859,223 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    /// Load skills from user_skills table into the graph as Skill nodes.
+    ///
+    /// Each skill becomes a Skill node with properties for category, source,
+    /// usage_count, version, and approval_status. Skills with source="auto"
+    /// were procedurally generated from cross-run learning.
+    fn load_skills(
+        &mut self,
+        conn: &Connection,
+    ) -> Result<(), String> {
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT id, name, slug, category, source, usage_count,
+                          version, approval_status, forked_from, created_at
+                   FROM user_skills
+                   ORDER BY usage_count DESC
+                   LIMIT 200"#,
+            )
+            .map_err(|e| format!("Failed to prepare skills query: {}", e))?;
+
+        let rows: Vec<(String, String, String, String, String, i64, Option<String>, Option<String>, Option<String>, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "custom".to_string()),
+                    row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "user".to_string()),
+                    row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })
+            .map_err(|e| format!("Failed to query skills: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (id, name, slug, category, source, usage_count, version, approval, forked_from, created_at) in rows {
+            let mut node = GraphNode::new(GraphNodeKind::Skill, &id, &name)
+                .with_weight(usage_count as f64 + 1.0)
+                .with_property("slug", serde_json::json!(slug))
+                .with_property("category", serde_json::json!(category))
+                .with_property("source", serde_json::json!(source))
+                .with_property("usage_count", serde_json::json!(usage_count))
+                .with_created_at(&created_at);
+
+            if let Some(v) = &version {
+                node = node.with_property("version", serde_json::json!(v));
+            }
+            if let Some(a) = &approval {
+                node = node.with_property("approval_status", serde_json::json!(a));
+            }
+            if let Some(f) = &forked_from {
+                node = node.with_property("forked_from", serde_json::json!(f));
+            }
+            self.get_or_insert_node(node);
+
+            // If this skill was forked from another, add Supersedes edge
+            if let Some(ref parent_id) = forked_from {
+                let parent_key = format!("skill:{}", parent_id);
+                let child_key = format!("skill:{}", id);
+                self.add_edge_by_key(
+                    &child_key,
+                    &parent_key,
+                    GraphEdge::new(GraphEdgeKind::Supersedes)
+                        .with_label("forked and improved"),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Link skills to task runs, findings, and components based on skill_origin
+    /// data stored in step provenance and fix applications.
+    fn link_skills(
+        &mut self,
+        conn: &Connection,
+    ) -> Result<(), String> {
+        // Link skills to task runs via step_provenance (skills used as step templates).
+        // Match on skill ID (prefixed with "auto:" or "user:") in step JSON to avoid
+        // false positives from bare slug substring matching.
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT sp.workflow_id, us.id as skill_id
+                   FROM step_provenance sp
+                   INNER JOIN user_skills us ON sp.final_step_json LIKE '%' || us.id || '%'
+                   GROUP BY sp.workflow_id, us.id
+                   LIMIT 500"#,
+            )
+            .map_err(|e| format!("Failed to prepare skill-provenance link query: {}", e))?;
+
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            })
+            .map_err(|e| format!("Failed to query skill-provenance links: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (workflow_id, skill_id) in rows {
+            let skill_key = format!("skill:{}", skill_id);
+            let wf_key = format!("workflow:{}", workflow_id);
+            self.add_edge_by_key(
+                &skill_key,
+                &wf_key,
+                GraphEdge::new(GraphEdgeKind::UsedIn)
+                    .with_label("skill template used in workflow"),
+            );
+        }
+
+        // Link auto-generated skills to their source findings via cross_run_patterns.
+        // Pattern nodes are keyed by cross_run_patterns.id (not signature_hash),
+        // so we must select the id column to construct the correct node key.
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT us.id, crp.id
+                   FROM user_skills us
+                   INNER JOIN cross_run_patterns crp ON us.description LIKE '%' || crp.signature_hash || '%'
+                   WHERE us.source = 'auto'
+                   LIMIT 200"#,
+            )
+            .map_err(|e| format!("Failed to prepare skill-pattern link query: {}", e))?;
+
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            })
+            .map_err(|e| format!("Failed to query skill-pattern links: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (skill_id, pattern_id) in rows {
+            let skill_key = format!("skill:{}", skill_id);
+            let pattern_key = format!("pattern:{}", pattern_id);
+            self.add_edge_by_key(
+                &skill_key,
+                &pattern_key,
+                GraphEdge::new(GraphEdgeKind::DerivedFrom)
+                    .with_label("auto-extracted from recurring pattern"),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Load pre-fetched observations from PostgreSQL into the graph.
+    ///
+    /// Observations live in PG (not SQLite), so callers must fetch them async
+    /// before passing them here. Each observation becomes an Observation node,
+    /// with LearnedFrom edges to any linked task_run and InformedBy edges to
+    /// any linked workflow.
+    pub fn load_observations_from_pg(
+        &mut self,
+        observations: &[crate::database::types::ObservationSearchResult],
+    ) {
+        for obs in observations {
+            let id_str = obs.id.to_string();
+            let mut node = GraphNode::new(GraphNodeKind::Observation, &id_str, &obs.title)
+                .with_property("observation_type", serde_json::json!(obs.observation_type))
+                .with_property("scope", serde_json::json!(obs.scope))
+                .with_property("revision_count", serde_json::json!(obs.revision_count))
+                .with_property("content_preview", serde_json::json!(obs.content_preview));
+
+            if let Some(ref tk) = obs.topic_key {
+                node = node.with_property("topic_key", serde_json::json!(tk));
+            }
+            if let Some(ref pid) = obs.project_id {
+                node = node.with_property("project_id", serde_json::json!(pid));
+            }
+            node = node.with_created_at(&obs.created_at);
+            self.get_or_insert_node(node);
+        }
+    }
+
+    /// Link observations to task runs (LearnedFrom) and workflows (InformedBy).
+    ///
+    /// Must be called after load_observations_from_pg and after task_run/workflow
+    /// nodes have been loaded.
+    pub fn link_observations(
+        &mut self,
+        observations: &[crate::database::types::Observation],
+    ) {
+        for obs in observations {
+            let obs_key = format!("observation:{}", obs.id);
+
+            // LearnedFrom: observation → task_run
+            if let Some(ref tr_id) = obs.task_run_id {
+                let tr_key = format!("task_run:{}", tr_id);
+                self.add_edge_by_key(
+                    &obs_key,
+                    &tr_key,
+                    GraphEdge::new(GraphEdgeKind::LearnedFrom)
+                        .with_label(&obs.observation_type),
+                );
+            }
+
+            // InformedBy: workflow → observation (workflow was informed by this observation)
+            if let Some(ref wf_id) = obs.workflow_id {
+                let wf_key = format!("workflow:{}", wf_id);
+                self.add_edge_by_key(
+                    &wf_key,
+                    &obs_key,
+                    GraphEdge::new(GraphEdgeKind::InformedBy)
+                        .with_label(&obs.observation_type),
+                );
+            }
+        }
+    }
+
     /// Link task runs to UI elements via InteractedWith edges.
     fn link_ui_interactions(
         &mut self,
@@ -902,6 +1121,112 @@ impl KnowledgeGraph {
         }
 
         Ok(())
+    }
+
+    // =========================================================================
+    // UI Bridge failure chain tracing
+    // =========================================================================
+
+    /// Trace the causal chain behind a UI element's failures.
+    ///
+    /// Traverses: UIElement ←InteractedWith← TaskRun →BelongsTo→ Workflow,
+    /// collecting connected findings, fixes, and rules along the way.
+    /// Returns paths showing element → task_run → workflow → related entities.
+    pub fn trace_ui_failure_chain(&self, element_key: &str) -> Vec<GraphPath> {
+        let full_key = if element_key.starts_with("ui_element:") {
+            element_key.to_string()
+        } else {
+            format!("ui_element:{}", element_key)
+        };
+
+        let start_idx = match self.node_index.get(&full_key) {
+            Some(&idx) => idx,
+            None => return vec![],
+        };
+
+        let mut results: Vec<GraphPath> = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(start_idx);
+
+        // Step 1: find all TaskRuns that interacted with this element
+        for edge_ref in self.graph.edges_directed(start_idx, Direction::Incoming) {
+            if !matches!(edge_ref.weight().kind, GraphEdgeKind::InteractedWith) {
+                continue;
+            }
+
+            let task_run_idx = edge_ref.source();
+            if !visited.insert(task_run_idx) {
+                continue;
+            }
+
+            // Step 2: from TaskRun, follow BelongsTo → Workflow
+            for edge2 in self.graph.edges_directed(task_run_idx, Direction::Outgoing) {
+                let target = edge2.target();
+                if !matches!(
+                    edge2.weight().kind,
+                    GraphEdgeKind::BelongsTo
+                        | GraphEdgeKind::DetectedDuring
+                        | GraphEdgeKind::AppliedIn
+                ) {
+                    continue;
+                }
+
+                if results.len() >= 10 {
+                    break;
+                }
+
+                let path_nodes = vec![start_idx, task_run_idx, target];
+                results.push(self.materialize_path(&path_nodes));
+            }
+
+            // Step 3: from TaskRun, find connected findings (DetectedDuring edges incoming)
+            for edge3 in self.graph.edges_directed(task_run_idx, Direction::Incoming) {
+                if matches!(edge3.weight().kind, GraphEdgeKind::DetectedDuring) {
+                    let finding_idx = edge3.source();
+                    if visited.insert(finding_idx) && results.len() < 10 {
+                        let path_nodes = vec![start_idx, task_run_idx, finding_idx];
+                        results.push(self.materialize_path(&path_nodes));
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Score fix effectiveness for UI-related fixes.
+    ///
+    /// For each Fix node connected to UIElement interactions, compute:
+    /// score = (resolved_count * 2 - regression_count * 3) / total_applications
+    pub fn score_ui_fix_effectiveness(&self) -> Vec<(String, f64, u32, u32)> {
+        let mut scores: Vec<(String, f64, u32, u32)> = Vec::new();
+
+        for (key, idx) in self.node_index.iter().filter(|(k, _)| k.starts_with("fix:")) {
+            let _ = key;
+            let mut resolved = 0u32;
+            let mut regressions = 0u32;
+            let mut total = 0u32;
+
+            for edge in self.graph.edges_directed(*idx, Direction::Outgoing) {
+                total += 1;
+                match edge.weight().kind {
+                    GraphEdgeKind::Resolved => resolved += 1,
+                    GraphEdgeKind::Caused => regressions += 1,
+                    _ => {}
+                }
+            }
+
+            if total > 0 {
+                let node = &self.graph[*idx];
+                let score =
+                    (resolved as f64 * 2.0 - regressions as f64 * 3.0) / total as f64;
+                scores.push((node.key.clone(), score, resolved, regressions));
+            }
+        }
+
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores.truncate(20);
+        scores
     }
 
     // =========================================================================
@@ -2336,7 +2661,8 @@ mod tests {
                 workflow_id TEXT NOT NULL,
                 step_name TEXT NOT NULL,
                 phase TEXT NOT NULL DEFAULT 'setup',
-                generating_agent TEXT NOT NULL DEFAULT 'unknown'
+                generating_agent TEXT NOT NULL DEFAULT 'unknown',
+                ui_bridge_event_ids TEXT
             );
 
             CREATE TABLE causal_events (

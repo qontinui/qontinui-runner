@@ -84,6 +84,34 @@ pub struct TargetPageCostRow {
     pub call_count: u64,
 }
 
+/// Cost per successful UI Bridge interaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostPerInteractionRow {
+    pub task_run_id: String,
+    pub total_cost_cents: u64,
+    pub successful_interactions: u64,
+    pub cost_per_interaction_cents: f64,
+}
+
+/// Page complexity: cost breakdown by page URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageComplexityRow {
+    pub target_page_url: String,
+    pub call_count: u64,
+    pub total_cost_cents: u64,
+    pub avg_cost_per_call_cents: f64,
+}
+
+/// Model × action type success rate and cost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelActionRow {
+    pub model: String,
+    pub action: String,
+    pub total: u64,
+    pub success_rate: f64,
+    pub avg_cost_cents: f64,
+}
+
 /// Overall token usage summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsageSummary {
@@ -419,6 +447,125 @@ impl CheckpointDb {
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to collect target page cost rows: {}", e))
+    }
+
+    /// Cost per successful UI Bridge interaction per task run.
+    pub fn get_cost_per_interaction(&self, days: u32) -> Result<Vec<CostPerInteractionRow>, String> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT p.task_run_id,
+                       COALESCE(SUM(p.cost_cents), 0) AS total_cost,
+                       (SELECT COUNT(*) FROM ui_bridge_events e
+                        WHERE CAST(e.task_run_id AS TEXT) = p.task_run_id
+                          AND e.success = 1
+                          AND e.event_type = 'action_executed') AS successes,
+                       CASE WHEN (SELECT COUNT(*) FROM ui_bridge_events e
+                                  WHERE CAST(e.task_run_id AS TEXT) = p.task_run_id
+                                    AND e.success = 1
+                                    AND e.event_type = 'action_executed') > 0
+                            THEN CAST(COALESCE(SUM(p.cost_cents), 0) AS REAL) /
+                                 (SELECT COUNT(*) FROM ui_bridge_events e
+                                  WHERE CAST(e.task_run_id AS TEXT) = p.task_run_id
+                                    AND e.success = 1
+                                    AND e.event_type = 'action_executed')
+                            ELSE 0 END AS cost_per_success
+                FROM phase_token_usage p
+                WHERE p.created_at >= datetime('now', ?1)
+                GROUP BY p.task_run_id
+                HAVING successes > 0
+                ORDER BY cost_per_success DESC
+                LIMIT 50"#,
+            )
+            .map_err(|e| format!("Failed to prepare cost per interaction query: {}", e))?;
+
+        let days_param = format!("-{} days", days);
+        let rows = stmt
+            .query_map(params![days_param], |row| {
+                Ok(CostPerInteractionRow {
+                    task_run_id: row.get(0)?,
+                    total_cost_cents: row.get::<_, i64>(1)? as u64,
+                    successful_interactions: row.get::<_, i64>(2)? as u64,
+                    cost_per_interaction_cents: row.get::<_, f64>(3)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query cost per interaction: {}", e))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect cost per interaction rows: {}", e))
+    }
+
+    /// Page complexity: average cost-per-action grouped by target page URL.
+    pub fn get_page_complexity_scores(&self, days: u32) -> Result<Vec<PageComplexityRow>, String> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT target_page_url,
+                       COUNT(*) AS call_count,
+                       COALESCE(SUM(cost_cents), 0) AS total_cost,
+                       COALESCE(AVG(cost_cents), 0) AS avg_cost_per_call
+                FROM phase_token_usage
+                WHERE created_at >= datetime('now', ?1)
+                  AND target_page_url IS NOT NULL
+                GROUP BY target_page_url
+                ORDER BY avg_cost_per_call DESC
+                LIMIT 50"#,
+            )
+            .map_err(|e| format!("Failed to prepare page complexity query: {}", e))?;
+
+        let days_param = format!("-{} days", days);
+        let rows = stmt
+            .query_map(params![days_param], |row| {
+                Ok(PageComplexityRow {
+                    target_page_url: row.get(0)?,
+                    call_count: row.get::<_, i64>(1)? as u64,
+                    total_cost_cents: row.get::<_, i64>(2)? as u64,
+                    avg_cost_per_call_cents: row.get::<_, f64>(3)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query page complexity: {}", e))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect page complexity rows: {}", e))
+    }
+
+    /// Model × action success rate matrix.
+    pub fn get_model_action_success_rates(&self, days: u32) -> Result<Vec<ModelActionRow>, String> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT p.model_used, e.action,
+                       COUNT(*) AS total,
+                       CAST(SUM(CASE WHEN e.success = 1 THEN 1 ELSE 0 END) AS REAL) / COUNT(*) AS success_rate,
+                       COALESCE(AVG(p.cost_cents), 0) AS avg_cost
+                FROM phase_token_usage p
+                JOIN ui_bridge_events e ON CAST(e.task_run_id AS TEXT) = p.task_run_id
+                WHERE p.created_at >= datetime('now', ?1)
+                  AND p.model_used IS NOT NULL
+                  AND e.event_type = 'action_executed'
+                  AND e.action IS NOT NULL
+                GROUP BY p.model_used, e.action
+                HAVING total >= 3
+                ORDER BY p.model_used, e.action
+                LIMIT 100"#,
+            )
+            .map_err(|e| format!("Failed to prepare model-action matrix query: {}", e))?;
+
+        let days_param = format!("-{} days", days);
+        let rows = stmt
+            .query_map(params![days_param], |row| {
+                Ok(ModelActionRow {
+                    model: row.get(0)?,
+                    action: row.get(1)?,
+                    total: row.get::<_, i64>(2)? as u64,
+                    success_rate: row.get(3)?,
+                    avg_cost_cents: row.get::<_, f64>(4)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query model-action matrix: {}", e))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect model-action rows: {}", e))
     }
 }
 

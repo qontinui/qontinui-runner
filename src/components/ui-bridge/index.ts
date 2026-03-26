@@ -34,3 +34,8 @@ export { FailureTaxonomyPanel } from "./FailureTaxonomyPanel";
 export { AutomationRegressionTable } from "./AutomationRegressionTable";
 export { StallFrequencyChart } from "./StallFrequencyChart";
 export { InterventionEffectivenessChart } from "./InterventionEffectivenessChart";
+export { FailureChainViewer } from "./FailureChainViewer";
+export { AnnotationGapTable } from "./AnnotationGapTable";
+export { HealthScoreCard } from "./HealthScoreCard";
+export { RecommendationsPanel } from "./RecommendationsPanel";
+export { AutomationHealthDashboard } from "./AutomationHealthDashboard";

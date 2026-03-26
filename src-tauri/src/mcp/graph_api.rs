@@ -44,6 +44,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/graph/root-causes", get(root_causes_stub_handler))
         .route("/graph/impact", get(impact_stub_handler))
         .route("/graph/effectiveness", get(effectiveness_stub_handler))
+        .route("/graph/ui-failure-chain", get(ui_failure_chain_handler))
+        .route("/graph/ui-fix-effectiveness", get(ui_fix_effectiveness_handler))
 }
 
 // ============================================================================
@@ -512,4 +514,66 @@ async fn effectiveness_stub_handler(
             .to_string(),
         status: "stub".to_string(),
     })))
+}
+
+// ============================================================================
+// UI Bridge failure chain and fix effectiveness
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct UiFailureChainQuery {
+    element_id: String,
+}
+
+/// GET /graph/ui-failure-chain — trace causal chain behind a UI element's failures.
+async fn ui_failure_chain_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<UiFailureChainQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::reflection::graph_types::GraphPath>>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    let db = state.app_state.checkpoint_db.clone();
+    let element_id = query.element_id;
+
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            let kg = crate::reflection::graph_engine::KnowledgeGraph::build_from_db(conn, None)?;
+            Ok(kg.trace_ui_failure_chain(&element_id))
+        })
+    })
+    .await
+    {
+        Ok(Ok(paths)) => Ok(Json(ApiResponse::success(paths))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UiFixEffectivenessQuery {
+    #[serde(default = "default_effectiveness_limit")]
+    limit: i64,
+}
+
+fn default_effectiveness_limit() -> i64 { 20 }
+
+/// GET /graph/ui-fix-effectiveness — ranked fix effectiveness scores.
+async fn ui_fix_effectiveness_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<UiFixEffectivenessQuery>,
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::cross_run_ops::FixEffectivenessScore>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let db = state.app_state.checkpoint_db.clone();
+    let limit = query.limit;
+
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::database::cross_run_ops::get_fix_effectiveness_scores(conn, limit))
+    })
+    .await
+    {
+        Ok(Ok(scores)) => Ok(Json(ApiResponse::success(scores))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    }
 }

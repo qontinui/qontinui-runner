@@ -271,6 +271,60 @@ pub async fn get_cost_by_target_page(
     })))
 }
 
+/// GET /analytics/token-usage/cost-per-interaction
+pub async fn get_cost_per_interaction(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<TimeRangeParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let days = params.days.unwrap_or(7);
+    let db = state.app_state.checkpoint_db.clone();
+    let rows = tokio::task::spawn_blocking(move || db.get_cost_per_interaction(days))
+        .await
+        .map_err(|e| format!("spawn_blocking error: {}", e))
+        .and_then(|r| r)
+        .map_err(|e| {
+            error!("Failed to get cost per interaction: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
+    Ok(Json(serde_json::json!({ "success": true, "data": rows, "days": days, "count": rows.len() })))
+}
+
+/// GET /analytics/token-usage/page-complexity
+pub async fn get_page_complexity(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<TimeRangeParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let days = params.days.unwrap_or(7);
+    let db = state.app_state.checkpoint_db.clone();
+    let rows = tokio::task::spawn_blocking(move || db.get_page_complexity_scores(days))
+        .await
+        .map_err(|e| format!("spawn_blocking error: {}", e))
+        .and_then(|r| r)
+        .map_err(|e| {
+            error!("Failed to get page complexity: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
+    Ok(Json(serde_json::json!({ "success": true, "data": rows, "days": days, "count": rows.len() })))
+}
+
+/// GET /analytics/token-usage/model-action-matrix
+pub async fn get_model_action_matrix(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<TimeRangeParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let days = params.days.unwrap_or(7);
+    let db = state.app_state.checkpoint_db.clone();
+    let rows = tokio::task::spawn_blocking(move || db.get_model_action_success_rates(days))
+        .await
+        .map_err(|e| format!("spawn_blocking error: {}", e))
+        .and_then(|r| r)
+        .map_err(|e| {
+            error!("Failed to get model-action matrix: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
+    Ok(Json(serde_json::json!({ "success": true, "data": rows, "days": days, "count": rows.len() })))
+}
+
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route(
@@ -295,5 +349,17 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/analytics/token-usage/by-page",
             get(get_cost_by_target_page),
+        )
+        .route(
+            "/analytics/token-usage/cost-per-interaction",
+            get(get_cost_per_interaction),
+        )
+        .route(
+            "/analytics/token-usage/page-complexity",
+            get(get_page_complexity),
+        )
+        .route(
+            "/analytics/token-usage/model-action-matrix",
+            get(get_model_action_matrix),
         )
 }

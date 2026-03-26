@@ -13,3 +13,6 @@ export { CostByPhaseChart } from "./CostByPhaseChart";
 export { ProviderLatencyChart } from "./ProviderLatencyChart";
 export { TaskRunCostTable } from "./TaskRunCostTable";
 export { CostByTargetAppChart } from "./CostByTargetAppChart";
+export { CostPerInteractionChart } from "./CostPerInteractionChart";
+export { PageComplexityTable } from "./PageComplexityTable";
+export { ModelActionMatrix } from "./ModelActionMatrix";

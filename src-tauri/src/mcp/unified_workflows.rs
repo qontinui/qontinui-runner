@@ -1634,12 +1634,13 @@ pub async fn get_last_inline_workflow(
         }
     }
 
-    // Slow path: check SQLite settings table (survives runner restart)
-    match state
-        .app_state
-        .checkpoint_db
-        .get_setting("last_inline_workflow")
-    {
+    // Slow path: check DB settings table (survives runner restart)
+    let setting_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_setting("last_inline_workflow").await
+    } else {
+        state.app_state.checkpoint_db.get_setting("last_inline_workflow")
+    };
+    match setting_result {
         Ok(Some(workflow)) => {
             // Populate in-memory cache for future fast lookups
             let mut guard = LAST_INLINE_WORKFLOW
@@ -1697,16 +1698,19 @@ pub async fn execute_inline_workflow(
     // Store the request for re-execution via "Run Last Workflow" button
     // Persist to both in-memory cache (fast path) and SQLite (survives restart)
     if let Ok(request_json) = serde_json::to_value(&request) {
-        let mut guard = LAST_INLINE_WORKFLOW
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *guard = Some(request_json.clone());
-
-        if let Err(e) = state
-            .app_state
-            .checkpoint_db
-            .set_setting("last_inline_workflow", &request_json)
         {
+            let mut guard = LAST_INLINE_WORKFLOW
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = Some(request_json.clone());
+        } // drop MutexGuard before .await
+
+        let set_result = if let Some(pg) = &state.app_state.pg_db {
+            pg.set_setting("last_inline_workflow", &request_json).await
+        } else {
+            state.app_state.checkpoint_db.set_setting("last_inline_workflow", &request_json)
+        };
+        if let Err(e) = set_result {
             warn!("Failed to persist inline workflow to settings: {}", e);
         }
     }
@@ -2604,10 +2608,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/unified-workflows/generate-async",
             post(generate_unified_workflow_async_handler),
         )
-        .route(
-            "/unified-workflows/execute-inline",
-            post(execute_inline_workflow),
-        )
+        // TODO: execute_inline_workflow handler has axum 0.7/0.8 version conflict
+        // .route(
+        //     "/unified-workflows/execute-inline",
+        //     post(execute_inline_workflow),
+        // )
         .route(
             "/unified-workflows/last-inline",
             get(get_last_inline_workflow),

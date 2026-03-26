@@ -891,3 +891,49 @@ mod tests {
         assert!(patterns.is_empty());
     }
 }
+
+/// Fix effectiveness score for resolved patterns.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FixEffectivenessScore {
+    pub fix_id: String,
+    pub pattern_id: String,
+    pub pattern_type: String,
+    pub resolved_at: Option<String>,
+    pub re_appeared: bool,
+    pub occurrence_count_at_resolution: i64,
+}
+
+/// Get fix effectiveness scores: resolved patterns that stayed resolved vs re-appeared.
+pub fn get_fix_effectiveness_scores(
+    conn: &Connection,
+    limit: i64,
+) -> Result<Vec<FixEffectivenessScore>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"SELECT p.resolved_by_fix_id, p.id, p.pattern_type,
+                      p.updated_at, p.status, p.occurrence_count
+               FROM cross_run_patterns p
+               WHERE p.resolved_by_fix_id IS NOT NULL
+               ORDER BY p.updated_at DESC
+               LIMIT ?1"#,
+        )
+        .map_err(|e| format!("Failed to prepare fix effectiveness query: {e}"))?;
+
+    let results = stmt
+        .query_map(params![limit], |row| {
+            let status: String = row.get(4)?;
+            Ok(FixEffectivenessScore {
+                fix_id: row.get(0)?,
+                pattern_id: row.get(1)?,
+                pattern_type: row.get(2)?,
+                resolved_at: row.get(3)?,
+                re_appeared: status == "active", // re-appeared if back to active
+                occurrence_count_at_resolution: row.get(5)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query fix effectiveness: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
