@@ -400,6 +400,12 @@ pub mod events {
     pub const WORKFLOW_QUEUED: &str = "workflow.queued";
     /// A workflow started executing.
     pub const WORKFLOW_STARTED: &str = "workflow.started";
+    /// A procedural skill was auto-extracted from a successful run.
+    pub const SKILL_CREATED: &str = "skill.created";
+    /// A procedural skill was updated (revision via self-repair).
+    pub const SKILL_UPDATED: &str = "skill.updated";
+    /// A skill-informed iteration failed (triggers self-repair evaluation).
+    pub const SKILL_FAILED: &str = "skill.failed";
 }
 
 // =============================================================================

@@ -154,10 +154,30 @@ pub enum ScheduledTaskType {
         #[serde(default)]
         force_run: bool,
     },
+    /// Execute a watcher (screenpipe-inspired reactive AI agent).
+    /// Queries the activity timeline, reasons with AI, and triggers an action.
+    Watcher {
+        /// ID of the watcher definition in PostgreSQL.
+        watcher_id: String,
+    },
+    /// Continuous background capture (screenpipe-style).
+    /// Periodically captures screen state and stores in activity timeline.
+    BackgroundCapture {
+        #[serde(default)]
+        monitor_index: Option<i32>,
+        #[serde(default = "default_capture_interval")]
+        capture_interval_secs: u64,
+        #[serde(default = "default_true")]
+        capture_on_focus_change: bool,
+    },
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_capture_interval() -> u64 {
+    30
 }
 
 impl Default for ScheduledTaskType {

@@ -460,16 +460,17 @@ pub struct ReflectionSettingsResponse {
 pub async fn get_reflection_settings_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<ReflectionSettingsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let dev_mode = state
-        .app_state
-        .checkpoint_db
-        .get_setting("dev_mode")
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to get setting: {}", e))),
-            )
-        })?;
+    let dev_mode = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_setting("dev_mode").await
+    } else {
+        state.app_state.checkpoint_db.get_setting("dev_mode")
+    }
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get setting: {}", e))),
+        )
+    })?;
 
     let reflection_enabled = dev_mode
         .and_then(|v| v.get("reflection_enabled").cloned())
@@ -489,17 +490,18 @@ pub async fn update_reflection_settings_handler(
     Json(req): Json<ReflectionSettingsResponse>,
 ) -> Result<Json<ApiResponse<ReflectionSettingsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Read current dev_mode setting or start with empty object
-    let mut dev_mode = state
-        .app_state
-        .checkpoint_db
-        .get_setting("dev_mode")
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to get setting: {}", e))),
-            )
-        })?
-        .unwrap_or_else(|| serde_json::json!({}));
+    let mut dev_mode = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_setting("dev_mode").await
+    } else {
+        state.app_state.checkpoint_db.get_setting("dev_mode")
+    }
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get setting: {}", e))),
+        )
+    })?
+    .unwrap_or_else(|| serde_json::json!({}));
 
     // Update the reflection_enabled field
     if let Some(obj) = dev_mode.as_object_mut() {
@@ -510,16 +512,17 @@ pub async fn update_reflection_settings_handler(
     }
 
     // Write back
-    state
-        .app_state
-        .checkpoint_db
-        .set_setting("dev_mode", &dev_mode)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to update setting: {}", e))),
-            )
-        })?;
+    if let Some(pg) = &state.app_state.pg_db {
+        pg.set_setting("dev_mode", &dev_mode).await
+    } else {
+        state.app_state.checkpoint_db.set_setting("dev_mode", &dev_mode)
+    }
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to update setting: {}", e))),
+        )
+    })?;
 
     info!(
         "HTTP: Updated reflection_enabled to {}",

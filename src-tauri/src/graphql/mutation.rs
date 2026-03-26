@@ -407,15 +407,18 @@ impl MutationRoot {
         prompt: Option<String>,
     ) -> Result<GqlTaskRun> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let db = state.app_state.checkpoint_db.clone();
-        let wf_id = workflow_id.clone();
-
         // Fetch workflow to get its name
-        let workflow = tokio::task::spawn_blocking(move || db.get_unified_workflow(&wf_id))
-            .await
-            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-            .map_err(|e| Error::new(e))?
-            .ok_or_else(|| Error::new(format!("Workflow not found: {}", workflow_id)))?;
+        let workflow = if let Some(pg) = &state.app_state.pg_db {
+            pg.get_unified_workflow(&workflow_id).await.map_err(|e| Error::new(e))?
+        } else {
+            let db = state.app_state.checkpoint_db.clone();
+            let wf_id = workflow_id.clone();
+            tokio::task::spawn_blocking(move || db.get_unified_workflow(&wf_id))
+                .await
+                .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+                .map_err(|e| Error::new(e))?
+        }
+        .ok_or_else(|| Error::new(format!("Workflow not found: {}", workflow_id)))?;
 
         // Create a task run for the workflow
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -441,10 +444,11 @@ impl MutationRoot {
             .create_task_run(&input)
             .map_err(|e| Error::new(e))?;
 
-        // Broadcast the new task run event
+        // Broadcast task creation (not "running" — actual execution is
+        // triggered via POST /unified-workflows/{id}/run)
         let broadcaster =
             crate::event_system::EventBroadcaster::new(state.app_handle.clone());
-        broadcaster.task_run_update(&task_id, "running", None, None);
+        broadcaster.task_run_update(&task_id, &run.status, None, None);
 
         Ok(GqlTaskRun::from_db(run))
     }
@@ -456,11 +460,15 @@ impl MutationRoot {
         id: String,
     ) -> Result<bool> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let db = state.app_state.checkpoint_db.clone();
-        tokio::task::spawn_blocking(move || db.delete_unified_workflow(&id))
-            .await
-            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-            .map_err(|e| Error::new(e))
+        if let Some(pg) = &state.app_state.pg_db {
+            pg.delete_unified_workflow(&id).await.map_err(|e| Error::new(e))
+        } else {
+            let db = state.app_state.checkpoint_db.clone();
+            tokio::task::spawn_blocking(move || db.delete_unified_workflow(&id))
+                .await
+                .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+                .map_err(|e| Error::new(e))
+        }
     }
 }
 
@@ -526,6 +534,8 @@ fn classify_error(error_msg: &str) -> super::types::UiBridgeErrorCode {
         UiBridgeErrorCode::ConcurrencyLimitReached
     } else if msg.contains("unresponsive") || msg.contains("not responsive") {
         UiBridgeErrorCode::FrontendUnresponsive
+    } else if msg.contains("not found") && msg.contains("window") {
+        UiBridgeErrorCode::WindowNotFound
     } else if msg.contains("not found") && msg.contains("element") {
         UiBridgeErrorCode::ElementNotFound
     } else if msg.contains("not visible") {
@@ -536,6 +546,10 @@ fn classify_error(error_msg: &str) -> super::types::UiBridgeErrorCode {
         UiBridgeErrorCode::ElementStale
     } else if msg.contains("action failed") {
         UiBridgeErrorCode::ActionFailed
+    } else if msg.contains("assertion") && msg.contains("failed") {
+        UiBridgeErrorCode::AssertionFailed
+    } else if msg.contains("unknown") && msg.contains("assertion") {
+        UiBridgeErrorCode::UnknownAssertionType
     } else {
         UiBridgeErrorCode::InternalError
     }

@@ -381,6 +381,13 @@ impl CheckpointDb {
             return Err("Database integrity check failed".to_string());
         }
 
+        // Clean up stale auto-extracted skills (pending > 30 days, 0 usage)
+        match self.cleanup_stale_auto_skills(30) {
+            Ok(n) if n > 0 => info!("Cleaned up {} stale auto-skills during maintenance", n),
+            Err(e) => tracing::warn!("Stale skill cleanup failed: {}", e),
+            _ => {}
+        }
+
         // Run ANALYZE to update statistics for query planner
         conn.execute_batch("ANALYZE")
             .map_err(|e| format!("Failed to run ANALYZE: {}", e))?;

@@ -37,20 +37,24 @@ pub async fn list_task_runs(
 ) -> Result<Json<ApiResponse<Vec<TaskRun>>>, (StatusCode, String)> {
     let limit = query.limit.unwrap_or(50);
     let workflow_type = query.workflow_type;
-    let db = state.app_state.checkpoint_db.clone();
     let port = state
         .app_state
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    let runs = tokio::task::spawn_blocking(move || {
-        db.get_recent_task_runs_filtered(limit, workflow_type.as_deref(), Some(port))
-    })
-    .await
-    .map_err(|e| {
-        error!("spawn_blocking error in list_task_runs: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?
+    let runs = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_recent_task_runs_filtered(limit, workflow_type.as_deref(), Some(port)).await
+    } else {
+        let db = state.app_state.checkpoint_db.clone();
+        tokio::task::spawn_blocking(move || {
+            db.get_recent_task_runs_filtered(limit, workflow_type.as_deref(), Some(port))
+        })
+        .await
+        .map_err(|e| {
+            error!("spawn_blocking error in list_task_runs: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?
+    }
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(ApiResponse::success(runs)))
@@ -139,12 +143,15 @@ pub async fn create_task_run(
         input = input.with_log_sources_json(lsj);
     }
 
-    state
-        .app_state
-        .checkpoint_db
-        .create_task_run(&input)
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    if let Some(pg) = &state.app_state.pg_db {
+        pg.create_task_run(&input).await
+            .map(Json)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    } else {
+        state.app_state.checkpoint_db.create_task_run(&input)
+            .map(Json)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    }
 }
 
 /// Get a task run by ID.
@@ -152,12 +159,15 @@ pub async fn get_task_run(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Option<TaskRun>>, (StatusCode, String)> {
-    state
-        .app_state
-        .checkpoint_db
-        .get_task_run(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    if let Some(pg) = &state.app_state.pg_db {
+        pg.get_task_run(&id).await
+            .map(Json)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    } else {
+        state.app_state.checkpoint_db.get_task_run(&id)
+            .map(Json)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    }
 }
 
 /// Response for workflow state endpoint.
@@ -168,12 +178,13 @@ pub async fn stop_task_run(
     info!("Stopping task run: {}", id);
 
     // Verify task exists first
-    let task_run = state
-        .app_state
-        .checkpoint_db
-        .get_task_run(&id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+    let task_run = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_task_run(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_task_run(&id)
+    }
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     if task_run.status != "running" {
         return Ok(Json(serde_json::json!({
@@ -215,11 +226,12 @@ pub async fn stop_task_run(
     }
 
     // Mark as stopped in database
-    state
-        .app_state
-        .checkpoint_db
-        .stop_task_run(&id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if let Some(pg) = &state.app_state.pg_db {
+        pg.stop_task_run(&id, "User stopped").await
+    } else {
+        state.app_state.checkpoint_db.stop_task_run(&id)
+    }
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Explicitly release URL locks for this task (don't rely solely on
     // WorkflowDropGuard's sync release, which can fail under contention)
@@ -362,10 +374,12 @@ pub async fn delete_task_run(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    state
-        .app_state
-        .checkpoint_db
-        .delete_task_run(&id)
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.delete_task_run(&id).await
+    } else {
+        state.app_state.checkpoint_db.delete_task_run(&id)
+    };
+    result
         .map(|deleted| {
             Json(serde_json::json!({
                 "success": deleted,

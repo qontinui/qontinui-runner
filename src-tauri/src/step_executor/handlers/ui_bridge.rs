@@ -989,6 +989,21 @@ impl StepHandler for UiBridgeHandler {
                     };
                     client.get(&endpoint).send().await
                 }
+                "action_plan" => {
+                    let plan_json = match &step.ui_bridge_action_plan {
+                        Some(p) => p.clone(),
+                        None => {
+                            return StepHandlerResult::failure(
+                                "UI Bridge action_plan requires 'ui_bridge_action_plan' field with a structured action plan",
+                            );
+                        }
+                    };
+                    let endpoint = format!(
+                        "{}/control/action-plan",
+                        base_url.trim_end_matches('/')
+                    );
+                    client.post(&endpoint).json(&plan_json).send().await
+                }
                 other => {
                     return StepHandlerResult::failure(format!(
                         "Unknown UI Bridge action: {}",

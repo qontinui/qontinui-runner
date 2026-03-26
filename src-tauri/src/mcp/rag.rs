@@ -185,13 +185,14 @@ pub async fn import_rag(
     // Auto-add to ConfigStorage (database)
     let config_name = request.config.metadata.name.clone();
     if let Ok(config_json) = serde_json::to_value(&request.config) {
-        if let Err(e) = state.app_state.checkpoint_db.save_config_with_id(
-            &project_id,
-            config_json,
-            &config_name,
-            "web",
-            None,
-        ) {
+        let save_result = if let Some(pg) = &state.app_state.pg_db {
+            pg.save_config_with_id(&project_id, config_json, &config_name, "web", None).await
+        } else {
+            state.app_state.checkpoint_db.save_config_with_id(
+                &project_id, config_json, &config_name, "web", None,
+            )
+        };
+        if let Err(e) = save_result {
             warn!(
                 "MCP API: Failed to auto-store config in ConfigStorage: {}",
                 e

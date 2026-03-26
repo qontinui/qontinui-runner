@@ -22,8 +22,9 @@ pub type QontinuiSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 /// Build the GraphQL schema with ApiState as context data.
 ///
 /// The schema is configured with:
-/// - Depth limit of 10 to prevent deeply nested queries
-/// - Complexity limit of 200 to prevent expensive queries
+/// - Depth limit of 12 to prevent deeply nested queries
+/// - Complexity limit of 500 to prevent expensive queries
+/// - Introspection disabled in release builds
 /// - ApiState accessible via `ctx.data::<Arc<ApiState>>()`
 pub fn build_schema(api_state: Arc<ApiState>) -> QontinuiSchema {
     let builder = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)

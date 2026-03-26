@@ -44,9 +44,13 @@ async fn llm_summarize(content: &str, query: &str, max_length: usize) -> Result<
         .map_err(|e| format!("Keychain error: {e}"))?
         .ok_or_else(|| "No Claude API key configured".to_string())?;
 
-    // Cap input to avoid sending too much to the API
+    // Cap input to avoid sending too much to the API (safe UTF-8 boundary)
     let input = if content.len() > 50_000 {
-        &content[..50_000]
+        let mut end = 50_000;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        &content[..end]
     } else {
         content
     };

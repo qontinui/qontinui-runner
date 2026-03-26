@@ -111,11 +111,14 @@ export function useTaskRunLive(
     !active || isTerminal,
   );
 
-  // Accumulate progress events
+  // Accumulate progress events (capped at 500 to prevent memory growth)
   useEffect(() => {
     const event = progressData?.taskRunProgress;
     if (event) {
-      setEvents((prev) => [...prev, event]);
+      setEvents((prev) => {
+        const next = [...prev, event];
+        return next.length > 500 ? next.slice(-500) : next;
+      });
     }
   }, [progressData]);
 

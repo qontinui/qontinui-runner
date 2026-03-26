@@ -921,6 +921,19 @@ impl CheckpointDb {
     /// Mark a task run as complete.
     ///
     /// For unified workflows, this should ONLY be called by the LoopController.
+    /// Mark whether a task run passed verification.
+    /// Called from the unified workflow loop when verification completes.
+    /// Used by fixer trigger Guard 7 to skip fixer for successful runs.
+    pub fn set_verification_passed(&self, id: &str, passed: bool) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        conn.execute(
+            "UPDATE task_runs SET verification_passed = ?1 WHERE id = ?2",
+            params![passed as i32, id],
+        )
+        .map_err(|e| format!("Failed to set verification_passed: {}", e))?;
+        Ok(())
+    }
+
     /// Other code paths (TaskMonitor, legacy session code) should check workflow_type
     /// before calling this method. Consider using `complete_task_run_if_allowed` instead.
     pub fn complete_task_run(&self, id: &str) -> Result<(), String> {

@@ -1259,12 +1259,14 @@ async fn run_pipeline_loop(
                         };
 
                         let ka = crate::knowledge_acquisition::KnowledgeAcquisition::new();
+                        let ctx = crate::knowledge_acquisition::SearchContext::system();
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(15),
-                            ka.search(
+                            ka.search_with_context(
                                 query,
                                 crate::knowledge_acquisition::KnowledgeDomain::ErrorResolution,
                                 3,
+                                ctx.as_ref(),
                             ),
                         )
                         .await

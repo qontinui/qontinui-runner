@@ -476,6 +476,7 @@ pub fn create_router(
         .merge(crate::mcp::recordings::routes())
         .merge(crate::mcp::reflection_api::routes())
         .merge(crate::mcp::graph_api::routes())
+        .merge(crate::mcp::observations_api::routes())
         .merge(crate::mcp::saved_api_requests::routes())
         .merge(crate::mcp::scheduler::routes())
         .merge(crate::mcp::sdk_client::routes())

@@ -14,8 +14,9 @@ use tracing::{error, info, warn};
 
 use crate::knowledge_acquisition::providers::osv::OsvEcosystem;
 use crate::knowledge_acquisition::providers::ui_bridge_fetch::SnapshotType;
+use crate::knowledge_acquisition::stats::StatsSnapshot;
 use crate::knowledge_acquisition::{
-    KnowledgeAcquisition, KnowledgeDomain, KnowledgeResult, SearchProvider,
+    KnowledgeAcquisition, KnowledgeDomain, KnowledgeResult, SearchContext, SearchProvider,
 };
 use crate::mcp::types::{ApiResponse, ApiState};
 
@@ -23,6 +24,7 @@ use crate::mcp::types::{ApiResponse, ApiState};
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/knowledge/providers", get(list_providers))
+        .route("/knowledge/stats", get(get_stats))
         .route("/knowledge/search-web", post(search_web))
         .route("/knowledge/research-error", post(research_error))
         .route("/knowledge/fetch-page", post(fetch_page))
@@ -160,7 +162,15 @@ async fn list_providers(
     (StatusCode::OK, Json(ApiResponse::success(providers)))
 }
 
-/// Web search (DuckDuckGo / Tavily)
+/// Get knowledge acquisition stats (hit rates, provider success/failure, cache hits)
+async fn get_stats(
+    State(_state): State<Arc<ApiState>>,
+) -> (StatusCode, Json<ApiResponse<StatsSnapshot>>) {
+    let ka = KnowledgeAcquisition::new();
+    (StatusCode::OK, Json(ApiResponse::success(ka.stats.snapshot())))
+}
+
+/// Web search (DuckDuckGo / Tavily) with knowledge flywheel
 async fn search_web(
     State(_state): State<Arc<ApiState>>,
     Json(req): Json<SearchWebRequest>,
@@ -168,8 +178,14 @@ async fn search_web(
     info!("[knowledge_acquisition] Web search: {}", req.query);
 
     let ka = KnowledgeAcquisition::new();
+    let ctx = make_search_context();
     match ka
-        .search(&req.query, KnowledgeDomain::General, req.max_results)
+        .search_with_context(
+            &req.query,
+            KnowledgeDomain::General,
+            req.max_results,
+            ctx.as_ref(),
+        )
         .await
     {
         Ok(results) => ok_search_response(results),
@@ -206,8 +222,9 @@ async fn research_error(
     );
 
     let ka = KnowledgeAcquisition::new();
+    let ctx = make_search_context();
     match ka
-        .search(&query, KnowledgeDomain::ErrorResolution, 5)
+        .search_with_context(&query, KnowledgeDomain::ErrorResolution, 5, ctx.as_ref())
         .await
     {
         Ok(results) => ok_search_response(results),
@@ -364,6 +381,12 @@ async fn audit_manifest(
 // Helpers
 // ============================================================================
 
+/// Create a SearchContext for API route handlers (Tier 0/3 flywheel).
+/// Returns None if DB is unavailable — search still works, just without local cache.
+fn make_search_context() -> Option<SearchContext> {
+    SearchContext::system()
+}
+
 fn ok_search_response(
     results: Vec<KnowledgeResult>,
 ) -> (StatusCode, Json<ApiResponse<SearchResponse>>) {
@@ -473,9 +496,13 @@ fn parse_package_json(content: &str) -> Result<Vec<(String, OsvEcosystem, String
         if let Some(deps) = json.get(key).and_then(|v| v.as_object()) {
             for (name, version) in deps {
                 if let Some(ver) = version.as_str() {
+                    // Skip workspace references and wildcards
+                    if ver.starts_with("workspace:") || ver == "*" {
+                        continue;
+                    }
                     // Strip semver prefixes (^, ~, >=, etc.)
                     let clean = ver.trim_start_matches(|c: char| !c.is_ascii_digit());
-                    if !clean.is_empty() {
+                    if !clean.is_empty() && clean != "*" {
                         packages.push((name.clone(), OsvEcosystem::Npm, clean.to_string()));
                     }
                 }
@@ -490,6 +517,15 @@ fn parse_package_json(content: &str) -> Result<Vec<(String, OsvEcosystem, String
 fn parse_cargo_toml(content: &str) -> Result<Vec<(String, OsvEcosystem, String)>, String> {
     let toml: toml::Value =
         toml::from_str(content).map_err(|e| format!("Invalid TOML: {e}"))?;
+
+    // Warn if this looks like a workspace root (no [package], has [workspace])
+    if toml.get("workspace").is_some() && toml.get("package").is_none() {
+        return Err(
+            "This appears to be a workspace Cargo.toml (has [workspace] but no [package]). \
+             Use a member crate's Cargo.toml instead."
+                .to_string(),
+        );
+    }
 
     let mut packages = Vec::new();
 

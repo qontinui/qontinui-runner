@@ -519,3 +519,135 @@ mod tests {
         assert_eq!(config.keep_recent_items, 5);
     }
 }
+
+// ============================================================================
+// LLM-Driven Iteration Summarization (TuriX-CUA inspired)
+// ============================================================================
+
+/// Compression mode for iteration history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IterationCompressionMode {
+    /// Character-based truncation/merging (existing behavior, always available).
+    CharBased,
+    /// LLM-driven summarization using a Simple-tier model.
+    /// Falls back to CharBased if the LLM call fails.
+    LlmSummarized,
+}
+
+impl Default for IterationCompressionMode {
+    fn default() -> Self {
+        Self::CharBased
+    }
+}
+
+/// Summarize a list of iteration descriptions using an LLM.
+///
+/// Sends the iteration entries to a Simple-tier model with a summarization
+/// prompt, returning a concise summary. Falls back to character-based
+/// truncation if the LLM call fails.
+///
+/// # Arguments
+/// * `entries` - Iteration descriptions to summarize (approach + result text).
+/// * `max_output_chars` - Target maximum length for the summary.
+///
+/// # Returns
+/// The LLM-generated summary, or an error if the call fails.
+pub fn summarize_iterations_with_llm(
+    entries: &[String],
+    max_output_chars: usize,
+) -> Result<String, String> {
+    if entries.is_empty() {
+        return Ok(String::new());
+    }
+
+    let entries_text = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| format!("Iteration {}: {}", i + 1, e))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let prompt = format!(
+        "Summarize these past automation iterations into a concise paragraph \
+         (max {} characters). Preserve: what was tried, what failed, and key findings. \
+         Do not include preamble or meta-commentary — just the summary.\n\n\
+         ---\n\n{}",
+        max_output_chars, entries_text
+    );
+
+    // Use the Simple-tier model for cost efficiency
+    let context = crate::ai_router::TaskContext::from_prompt(&prompt);
+
+    let response = crate::ai_provider::run_prompt_with_model_override(
+        &prompt,
+        &context,
+        None, // no doctor handle
+        None, // let routing pick the model (will route to simple for short prompt)
+        None, // default provider
+        Some(0.3), // low temperature for factual summarization
+        Some(max_output_chars as u32 / 3), // rough tokens estimate
+        None, // no fallback model
+        None, // no fallback provider
+    );
+
+    if response.success {
+        let summary = response.output.trim().to_string();
+        let summary = if summary.len() > max_output_chars {
+            summary[..max_output_chars].to_string()
+        } else {
+            summary
+        };
+        info!(
+            "LLM summarized {} iterations into {} chars",
+            entries.len(),
+            summary.len()
+        );
+        Ok(summary)
+    } else {
+        let error = response.error.unwrap_or_else(|| "Unknown error".to_string());
+        warn!("LLM summarization failed ({}), falling back to char-based", error);
+        Err(error)
+    }
+}
+
+/// Character-based fallback summarization.
+///
+/// Concatenates entries and truncates to max_chars. Used when LLM summarization
+/// is unavailable or fails.
+pub fn summarize_iterations_char_based(
+    entries: &[String],
+    max_chars: usize,
+) -> String {
+    let combined = entries.join(" | ");
+    if combined.len() <= max_chars {
+        combined
+    } else {
+        format!("{}...", &combined[..max_chars.saturating_sub(3)])
+    }
+}
+
+/// Summarize iterations using the configured mode with automatic fallback.
+///
+/// Tries LLM summarization if mode is `LlmSummarized`, falls back to
+/// `CharBased` on failure.
+pub fn summarize_iterations(
+    entries: &[String],
+    max_chars: usize,
+    mode: IterationCompressionMode,
+) -> String {
+    match mode {
+        IterationCompressionMode::CharBased => {
+            summarize_iterations_char_based(entries, max_chars)
+        }
+        IterationCompressionMode::LlmSummarized => {
+            match summarize_iterations_with_llm(entries, max_chars) {
+                Ok(summary) => summary,
+                Err(_) => {
+                    // Automatic fallback to char-based
+                    summarize_iterations_char_based(entries, max_chars)
+                }
+            }
+        }
+    }
+}
+

@@ -1446,12 +1446,54 @@ impl LoopController {
 
         // Accumulate any newly injected steps for future verification iterations
         let new_injected_count = new_injected_steps.len();
+        let had_ui_bridge_actions = new_injected_steps.iter().any(|s| {
+            s.step_type == "ui_bridge"
+                && matches!(
+                    s.ui_bridge_action.as_deref(),
+                    Some("action_plan") | Some("execute")
+                )
+        });
         if !new_injected_steps.is_empty() {
             info!(
                 "Injected {} dynamic verification step(s) from agentic phase (iteration {})",
                 new_injected_count, ctx.iteration
             );
             ctx.dynamic_steps.extend(new_injected_steps);
+        }
+
+        // Goal verification: after successful agentic iterations that included
+        // UI Bridge actions, inject a snapshot-based verification step so the
+        // next verification phase can confirm the UI state matches the goal.
+        // This catches false-positive completions without requiring workflow
+        // authors to write explicit assertions.
+        if had_ui_bridge_actions && agentic_outcome.is_success() {
+            let goal_desc = agentic_outcome
+                .parsed()
+                .map(|p| p.summary.clone())
+                .unwrap_or_else(|| "Verify UI state after agentic actions".to_string());
+
+            // Remove any previous goal-verification-snapshot to avoid accumulation
+            ctx.dynamic_steps
+                .retain(|s| s.name.as_deref() != Some("goal-verification-snapshot"));
+
+            let verify_step = ExecutionStepConfig {
+                step_type: "ui_bridge".to_string(),
+                name: Some("goal-verification-snapshot".to_string()),
+                ui_bridge_action: Some("snapshot".to_string()),
+                ui_bridge_instruction: Some(truncate_str(&goal_desc, 200).to_string()),
+                // Inherit URL from the first ui_bridge step in dynamic_steps
+                ui_bridge_url: ctx
+                    .dynamic_steps
+                    .iter()
+                    .find(|s| s.step_type == "ui_bridge")
+                    .and_then(|s| s.ui_bridge_url.clone()),
+                ..Default::default()
+            };
+            info!(
+                "GOAL-VERIFY: Injecting post-agentic snapshot step (iteration {})",
+                ctx.iteration
+            );
+            ctx.dynamic_steps.push(verify_step);
         }
 
         // Persist workflow state: AgenticComplete

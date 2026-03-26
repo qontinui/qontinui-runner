@@ -16,6 +16,8 @@
 //! - `playwright` - Playwright TypeScript test
 //! - `pytest` - pytest-playwright test structure
 
+pub mod background_capture;
+pub mod content_filter;
 pub mod script_generator;
 pub mod storage;
 pub mod types;

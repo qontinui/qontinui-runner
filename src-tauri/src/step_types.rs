@@ -131,6 +131,13 @@ pub enum StepType {
     // ========================================================================
     /// Execute a saved macro
     Macro,
+
+    // ========================================================================
+    // Watcher Steps (screenpipe-inspired reactive agents)
+    // ========================================================================
+    /// Scheduled watcher: queries the activity timeline, reasons with AI,
+    /// and triggers a conditional action.
+    Watcher,
 }
 
 impl StepType {
@@ -238,6 +245,9 @@ impl StepType {
 
             // Utility
             StepType::Macro => Some(60_000), // 60 seconds
+
+            // Watcher
+            StepType::Watcher => Some(120_000), // 120 seconds (includes AI reasoning)
         }
     }
 
@@ -303,6 +313,9 @@ impl StepType {
             // Utility
             "macro" => Some(StepType::Macro),
 
+            // Watcher
+            "watcher" => Some(StepType::Watcher),
+
             _ => {
                 warn!(
                     "Unknown step type '{}' (normalized: '{}') - defaulting to automation",
@@ -336,6 +349,7 @@ impl StepType {
             StepType::AwasExtractElements => "awas_extract_elements",
             StepType::SaveWorkflowArtifact => "save_workflow_artifact",
             StepType::Macro => "macro",
+            StepType::Watcher => "watcher",
         }
     }
 }
@@ -493,6 +507,7 @@ mod tests {
             StepType::AwasListActions,
             StepType::AwasExtractElements,
             StepType::Macro,
+            StepType::Watcher,
         ];
 
         for step_type in all_types {

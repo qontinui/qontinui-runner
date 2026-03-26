@@ -188,7 +188,12 @@ pub async fn save_orchestration_plan(
 
     // Store as a setting
     let key = format!("orchestration_plan_{}", plan.id);
-    if let Err(e) = state.checkpoint_db.set_setting(&key, &plan_value) {
+    let save_err = if let Some(pg) = &state.pg_db {
+        pg.set_setting(&key, &plan_value).await.err()
+    } else {
+        state.checkpoint_db.set_setting(&key, &plan_value).err()
+    };
+    if let Some(e) = save_err {
         error!("Failed to save orchestration plan: {}", e);
         return Ok(CommandResponse {
             success: false,
@@ -212,10 +217,12 @@ pub async fn list_orchestration_plans(
     info!("Listing saved orchestration plans");
 
     // Get all settings
-    let all_settings = state
-        .checkpoint_db
-        .get_all_settings()
-        .map_err(|e| format!("Failed to get settings: {}", e))?;
+    let all_settings = if let Some(pg) = &state.pg_db {
+        pg.get_all_settings().await
+    } else {
+        state.checkpoint_db.get_all_settings()
+    }
+    .map_err(|e| format!("Failed to get settings: {}", e))?;
 
     // Filter for orchestration plans
     let plans: Vec<TestOrchestrationPlan> = if let serde_json::Value::Object(map) = all_settings {
@@ -244,10 +251,12 @@ pub async fn delete_orchestration_plan(
 
     // Set the value to null to effectively delete the setting
     let key = format!("orchestration_plan_{}", plan_id);
-    if let Err(e) = state
-        .checkpoint_db
-        .set_setting(&key, &serde_json::Value::Null)
-    {
+    let del_err = if let Some(pg) = &state.pg_db {
+        pg.set_setting(&key, &serde_json::Value::Null).await.err()
+    } else {
+        state.checkpoint_db.set_setting(&key, &serde_json::Value::Null).err()
+    };
+    if let Some(e) = del_err {
         error!("Failed to delete orchestration plan: {}", e);
         return Ok(CommandResponse {
             success: false,

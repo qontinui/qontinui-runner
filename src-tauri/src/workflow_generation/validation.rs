@@ -308,7 +308,7 @@ pub fn allowed_types_for_phase(phase: &str) -> &'static [&'static str] {
         "setup" => &["command", "prompt", "ui_bridge"],
         "verification" => &["command", "ui_bridge", "prompt"],
         "completion" => &["command", "prompt", "ui_bridge"],
-        "agentic" => &["prompt"],
+        "agentic" => &["prompt", "ui_bridge"],
         _ => &[],
     }
 }

@@ -34,6 +34,7 @@ import type {
   ContextScope,
 } from "../../types/context";
 import { useContexts, groupContextsByScope } from "./hooks/useContexts";
+import { useObservationMemory, type ObservationSearchResult } from "@/hooks/useObservationMemory";
 import { getAccentColors, getStatusColors } from "@/design-system";
 
 // ============================================================================
@@ -57,6 +58,9 @@ export interface ContextSelectorProps {
 
   /** Optional class name */
   className?: string;
+
+  /** Project ID for observation memory context */
+  projectId?: string | null;
 }
 
 interface AutoDetectState {
@@ -256,8 +260,10 @@ export function ContextSelector({
   compact = false,
   disabled = false,
   className = "",
+  projectId,
 }: ContextSelectorProps) {
   const { contexts, loading: contextsLoading, error, evaluateAutoInclude } = useContexts();
+  const memoryContext = useObservationMemory(projectId ?? null);
 
   const [isExpanded, setIsExpanded] = useState(!compact);
   const [autoDetectState, setAutoDetectState] = useState<AutoDetectState>({
@@ -538,6 +544,11 @@ export function ContextSelector({
             onToggle={handleToggleContext}
             disabled={disabled}
           />
+
+          {/* Memory context (from past sessions) */}
+          {memoryContext.available && memoryContext.observationCount > 0 && (
+            <MemorySection observations={memoryContext.observations} />
+          )}
         </div>
       )}
 
@@ -549,6 +560,67 @@ export function ContextSelector({
           <p className="text-xs mt-1">
             Create contexts in Settings to provide AI with domain knowledge
           </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// Memory Section (observation-based cross-session context)
+// ============================================================================
+
+function MemorySection({ observations }: { observations: ObservationSearchResult[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const typeCount = new Map<string, number>();
+  for (const obs of observations) {
+    typeCount.set(obs.observationType, (typeCount.get(obs.observationType) || 0) + 1);
+  }
+
+  return (
+    <div className="space-y-1">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-2 w-full text-left px-1 py-1 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
+      >
+        {expanded ? (
+          <ChevronDown className="w-3 h-3" />
+        ) : (
+          <ChevronRight className="w-3 h-3" />
+        )}
+        <BookOpen className="w-3.5 h-3.5" />
+        <span>Memory ({observations.length})</span>
+        <span
+          className={`ml-auto px-1.5 py-0.5 text-xs ${getAccentColors("violet").bg} ${getAccentColors("violet").text} rounded`}
+        >
+          auto
+        </span>
+      </button>
+
+      {expanded && (
+        <div className="space-y-1 pl-6">
+          {observations.slice(0, 10).map((obs) => (
+            <div
+              key={obs.id}
+              className="flex items-start gap-2 p-1.5 rounded text-xs"
+              title={obs.contentPreview}
+            >
+              <span className="shrink-0 px-1 py-0.5 bg-muted rounded text-[10px] font-medium">
+                {obs.observationType}
+              </span>
+              <span className="truncate text-muted-foreground">{obs.title}</span>
+              {obs.revisionCount > 1 && (
+                <span className="shrink-0 text-[10px] text-muted-foreground">
+                  rev {obs.revisionCount}
+                </span>
+              )}
+            </div>
+          ))}
+          {observations.length > 10 && (
+            <div className="text-[10px] text-muted-foreground pl-1">
+              +{observations.length - 10} more
+            </div>
+          )}
         </div>
       )}
     </div>

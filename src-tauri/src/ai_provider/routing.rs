@@ -1,9 +1,12 @@
 #![allow(dead_code)]
 
-use super::claude_api::{run_claude_api, run_claude_api_with_overrides};
+use super::claude_api::{run_claude_api, run_claude_api_multimodal, run_claude_api_with_overrides};
 use super::claude_cli::run_claude_cli;
-use super::gemini_api::{run_gemini_api, run_gemini_api_with_overrides};
+use super::gemini_api::{
+    run_gemini_api, run_gemini_api_multimodal, run_gemini_api_with_overrides,
+};
 use super::gemini_cli::run_gemini_cli;
+use super::multimodal::MultimodalPrompt;
 use super::retry::{retry_with_backoff, retry_with_fallback};
 use super::types::AiResponse;
 use crate::ai_router::{TaskContext, TaskRouter};
@@ -328,4 +331,248 @@ fn run_prompt_with_overrides_inner(
 
     // No explicit override — delegate to routing logic
     run_prompt_with_routing(prompt, context, doctor_handle)
+}
+
+// =============================================================================
+// Multimodal Prompt Functions
+// =============================================================================
+
+/// Run a multimodal AI prompt (text + images) synchronously.
+///
+/// For API providers (Claude API, Gemini API), this sends proper content block
+/// arrays with image data. For CLI providers, falls back to text-only with a
+/// warning since CLIs don't support image content blocks.
+pub fn run_prompt_multimodal(
+    prompt: &MultimodalPrompt,
+    doctor_handle: Option<&DoctorHandle>,
+) -> AiResponse {
+    let ai_settings = settings::get_ai_settings();
+
+    info!(
+        "Running multimodal AI prompt via {:?} (blocks: {}, has_images: {})",
+        ai_settings.provider,
+        prompt.content.len(),
+        prompt.has_images()
+    );
+
+    match ai_settings.provider {
+        AiProvider::ClaudeCli => {
+            if prompt.has_images() {
+                warn!("Claude CLI does not support image content blocks; falling back to text-only");
+            }
+            run_claude_cli(
+                &prompt.text_content(),
+                &ai_settings.claude_cli,
+                None,
+                doctor_handle,
+            )
+        }
+        AiProvider::ClaudeApi => run_claude_api_multimodal(
+            prompt,
+            &ai_settings.claude_api,
+            None,
+            doctor_handle,
+            None,
+            None,
+        ),
+        AiProvider::GeminiCli => {
+            if prompt.has_images() {
+                warn!("Gemini CLI does not support image content blocks; falling back to text-only");
+            }
+            run_gemini_cli(
+                &prompt.text_content(),
+                &ai_settings.gemini_cli,
+                None,
+                doctor_handle,
+            )
+        }
+        AiProvider::GeminiApi => run_gemini_api_multimodal(
+            prompt,
+            &ai_settings.gemini_api,
+            None,
+            doctor_handle,
+            None,
+            None,
+        ),
+    }
+}
+
+/// Run a multimodal AI prompt with intelligent routing based on task complexity.
+///
+/// Like `run_prompt_with_routing` but supports image content blocks.
+/// For CLI providers, falls back to text-only.
+pub fn run_prompt_with_routing_multimodal(
+    prompt: &MultimodalPrompt,
+    context: &TaskContext,
+    doctor_handle: Option<&DoctorHandle>,
+) -> AiResponse {
+    let ai_settings = settings::get_ai_settings();
+    let routing_config = &ai_settings.routing;
+
+    let model_override = if routing_config.enabled {
+        let router = TaskRouter::new(routing_config.clone());
+        let assessment = router.assess_and_route(context);
+        let model = router.route_task(context);
+
+        info!(
+            "Multimodal task routing: complexity={:?}, confidence={:.2}, model={}",
+            assessment.complexity, assessment.confidence, model
+        );
+
+        Some(model)
+    } else {
+        None
+    };
+
+    match ai_settings.provider {
+        AiProvider::ClaudeCli => {
+            if prompt.has_images() {
+                warn!("Claude CLI does not support image content blocks; falling back to text-only");
+            }
+            run_claude_cli(
+                &prompt.text_content(),
+                &ai_settings.claude_cli,
+                model_override.as_deref(),
+                doctor_handle,
+            )
+        }
+        AiProvider::ClaudeApi => run_claude_api_multimodal(
+            prompt,
+            &ai_settings.claude_api,
+            model_override.as_deref(),
+            doctor_handle,
+            None,
+            None,
+        ),
+        AiProvider::GeminiCli => {
+            if prompt.has_images() {
+                warn!("Gemini CLI does not support image content blocks; falling back to text-only");
+            }
+            let effective_model = model_override.as_deref().and_then(|m| {
+                if m.starts_with("claude") {
+                    warn!("Cannot route to Claude model when using Gemini provider");
+                    None
+                } else {
+                    Some(m)
+                }
+            });
+            run_gemini_cli(
+                &prompt.text_content(),
+                &ai_settings.gemini_cli,
+                effective_model,
+                doctor_handle,
+            )
+        }
+        AiProvider::GeminiApi => {
+            let effective_model = model_override.as_deref().and_then(|m| {
+                if m.starts_with("claude") {
+                    warn!("Cannot route to Claude model when using Gemini provider");
+                    None
+                } else {
+                    Some(m)
+                }
+            });
+            run_gemini_api_multimodal(
+                prompt,
+                &ai_settings.gemini_api,
+                effective_model,
+                doctor_handle,
+                None,
+                None,
+            )
+        }
+    }
+}
+
+/// Run a multimodal AI prompt with explicit model/provider overrides.
+///
+/// Like `run_prompt_with_model_override` but supports image content blocks.
+/// For CLI providers, falls back to text-only.
+pub fn run_prompt_with_model_override_multimodal(
+    prompt: &MultimodalPrompt,
+    context: &TaskContext,
+    doctor_handle: Option<&DoctorHandle>,
+    model_override: Option<&str>,
+    provider_override: Option<&str>,
+    temperature_override: Option<f32>,
+    max_tokens_override: Option<u32>,
+) -> AiResponse {
+    let ai_settings = settings::get_ai_settings();
+
+    // Determine the model and provider
+    let effective_model = model_override;
+    let effective_provider = if let Some(prov) = provider_override {
+        match prov {
+            "claude_cli" => AiProvider::ClaudeCli,
+            "claude_api" => AiProvider::ClaudeApi,
+            "gemini_cli" => AiProvider::GeminiCli,
+            "gemini_api" => AiProvider::GeminiApi,
+            _ => ai_settings.provider,
+        }
+    } else {
+        // For multimodal with images, prefer API providers over CLI
+        if prompt.has_images() {
+            match ai_settings.provider {
+                AiProvider::ClaudeCli => {
+                    info!("Auto-switching from Claude CLI to Claude API for multimodal prompt");
+                    AiProvider::ClaudeApi
+                }
+                AiProvider::GeminiCli => {
+                    info!("Auto-switching from Gemini CLI to Gemini API for multimodal prompt");
+                    AiProvider::GeminiApi
+                }
+                other => other,
+            }
+        } else {
+            ai_settings.provider
+        }
+    };
+
+    info!(
+        "Running multimodal prompt with overrides: provider={:?}, model={:?}, has_images={}",
+        effective_provider,
+        effective_model,
+        prompt.has_images()
+    );
+
+    match effective_provider {
+        AiProvider::ClaudeCli => {
+            if prompt.has_images() {
+                warn!("Claude CLI does not support multimodal; using text-only fallback");
+            }
+            run_claude_cli(
+                &prompt.text_content(),
+                &ai_settings.claude_cli,
+                effective_model,
+                doctor_handle,
+            )
+        }
+        AiProvider::ClaudeApi => run_claude_api_multimodal(
+            prompt,
+            &ai_settings.claude_api,
+            effective_model,
+            doctor_handle,
+            temperature_override,
+            max_tokens_override,
+        ),
+        AiProvider::GeminiCli => {
+            if prompt.has_images() {
+                warn!("Gemini CLI does not support multimodal; using text-only fallback");
+            }
+            run_gemini_cli(
+                &prompt.text_content(),
+                &ai_settings.gemini_cli,
+                effective_model,
+                doctor_handle,
+            )
+        }
+        AiProvider::GeminiApi => run_gemini_api_multimodal(
+            prompt,
+            &ai_settings.gemini_api,
+            effective_model,
+            doctor_handle,
+            temperature_override,
+            max_tokens_override,
+        ),
+    }
 }

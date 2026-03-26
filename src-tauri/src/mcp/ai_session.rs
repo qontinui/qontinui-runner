@@ -710,12 +710,59 @@ Execute an action by natural language instruction.
 {"tool": "mcp__qontinui__sdk_ai_execute", "instruction": "click the Submit button"}
 ```
 
+#### sdk_execute_action_plan
+Execute a structured action plan — an ordered sequence of typed UI actions.
+Each action specifies the exact action type, element target, and parameters.
+This is more efficient than sdk_ai_execute for multi-step interactions because
+it skips natural language interpretation and executes actions directly.
+
+First call sdk_snapshot or sdk_elements to get element IDs, then build the plan.
+
+**Action types:** click, doubleClick, rightClick, type, clear, select, check, uncheck,
+toggle, hover, focus, scroll, scrollIntoView, setValue, sendKeys, drag, submit,
+autocomplete (type + select from suggestions), navigate, wait.
+
+**Element targeting** (in priority order): elementId (from snapshot), testId (data-testid),
+selector (CSS), searchText + elementType (fuzzy search).
+
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_execute_action_plan", "goal": "Fill and submit login form", "actions": [
+  {"action": "click", "target": {"testId": "email-input"}, "reasoning": "Focus email field", "confidence": 0.95},
+  {"action": "type", "target": {"testId": "email-input"}, "params": {"text": "user@example.com"}, "reasoning": "Enter email", "confidence": 0.95},
+  {"action": "click", "target": {"searchText": "Submit", "elementType": "button"}, "reasoning": "Submit the form", "confidence": 0.9}
+], "confidenceThreshold": 0.5, "stopOnFailure": true}
+```
+
 #### sdk_ai_assert
 Assert element state using natural language.
 **Usage:**
 ```json
 {"tool": "mcp__qontinui__sdk_ai_assert", "text": "error message", "state": "hidden"}
 ```
+
+### Choosing Between sdk_ai_execute and sdk_execute_action_plan
+
+Use **sdk_ai_execute** for:
+- Single, simple actions ("click the Submit button")
+- When you don't know the element structure and need AI interpretation
+- Exploratory interactions where the page layout is unknown
+
+Use **sdk_execute_action_plan** for:
+- **Multi-step interactions** (2+ actions in sequence): filling forms, navigating menus, multi-field edits
+- When you already have element IDs from a prior sdk_snapshot or sdk_elements call
+- When precision matters: each action specifies exact type, target, and params with no ambiguity
+- Performance-sensitive flows: skips the second LLM interpretation call that sdk_ai_execute requires
+
+**Typical workflow:**
+1. Call `sdk_snapshot` or `sdk_elements` to see current page state and element IDs
+2. Build an action plan using the element IDs/testIds from the snapshot
+3. Execute with `sdk_execute_action_plan`
+4. Verify result with `sdk_ai_assert` or another `sdk_snapshot`
+
+**Action plan caching:** Include `pageUrl` and `elementSnapshot` fields in the request
+to cache successful plans. Subsequent calls with the same page and element fingerprint
+can reuse the plan via GET `/ui-bridge/control/action-plan/cache?url=...&elements=...`.
 
 #### sdk_page_summary
 Get an AI-friendly summary of the current page, including layout, navigation, and key elements.
@@ -990,6 +1037,21 @@ pub async fn run_prompt(
             (enhanced_prompt.clone(), Vec::new())
         };
     enhanced_prompt = prompt_with_contexts;
+
+    // Inject observation memory from past sessions (if PG available).
+    // Use the prompt name (concise) rather than full prompt content (noisy) for search.
+    let memory_query = prompt_name.as_str();
+    if !memory_query.is_empty() {
+        if let Some(memory_section) = context::format_observation_memory_for_prompt(
+            state.app_state.pg_db.as_deref(),
+            None,
+            Some(memory_query),
+        )
+        .await
+        {
+            enhanced_prompt = format!("{}{}", memory_section, enhanced_prompt);
+        }
+    }
 
     // Prepend runner-triggered context and supervisor instructions
     // This tells the AI session how to safely restart the runner if needed

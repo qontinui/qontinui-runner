@@ -21,6 +21,10 @@ pub struct IterationContext {
 }
 
 /// A compressed summary of one or more iterations.
+///
+/// Uses a structured narrative template inspired by hermes-agent's context compression:
+/// Goal / Progress / Decisions / Files Modified / Next Steps
+/// This preserves actionable context better than flat text during long-running workflows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummarizedContext {
     pub summary: String,
@@ -28,6 +32,15 @@ pub struct SummarizedContext {
     pub key_findings: Vec<String>,
     pub successful_fixes: Vec<String>,
     pub root_causes: Vec<String>,
+    /// Files that were modified during the summarized iterations
+    #[serde(default)]
+    pub files_modified: Vec<String>,
+    /// Decisions made and their rationale
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    /// What needs to happen next (unfixed criteria, remaining work)
+    #[serde(default)]
+    pub next_steps: Vec<String>,
     pub original_token_count: usize,
     pub summary_token_count: usize,
 }
@@ -125,20 +138,25 @@ impl ContextSummarizer {
 
         Some(format!(
             "Summarize the following iteration history from an automated workflow loop. \
-            Preserve:\n\
-            1. Key findings and root causes discovered\n\
-            2. Fixes that were successful vs unsuccessful\n\
-            3. Important patterns or recurring issues\n\
-            4. Current state of progress\n\
+            Use a structured narrative format that preserves actionable context.\n\
             \n\
-            Be concise but preserve all actionable information. \
-            Respond with a JSON object:\n\
+            Respond with a JSON object using this template:\n\
             {{\n\
-              \"summary\": \"compressed narrative of iterations\",\n\
+              \"summary\": \"One-paragraph narrative: what was the goal, what progress was made, what's left\",\n\
               \"key_findings\": [\"finding1\", \"finding2\"],\n\
-              \"successful_fixes\": [\"fix1\", \"fix2\"],\n\
-              \"root_causes\": [\"cause1\", \"cause2\"]\n\
+              \"successful_fixes\": [\"fix that worked and why\"],\n\
+              \"root_causes\": [\"underlying cause identified\"],\n\
+              \"files_modified\": [\"path/to/file.ts\", \"path/to/other.rs\"],\n\
+              \"decisions\": [\"chose approach X over Y because Z\"],\n\
+              \"next_steps\": [\"remaining criterion to fix\", \"unresolved issue\"]\n\
             }}\n\
+            \n\
+            Guidelines:\n\
+            - The summary should read as a continuous narrative, not a list\n\
+            - Include file paths mentioned in outputs or fixes\n\
+            - Capture WHY decisions were made, not just what was done\n\
+            - next_steps should reflect failing criteria or unresolved issues\n\
+            - If this is an update to a prior summary, merge new information rather than starting fresh\n\
             \n\
             Iteration history to summarize:\n{}",
             context_text
@@ -165,24 +183,65 @@ impl ContextSummarizer {
     }
 
     /// Build the full context string for the next iteration.
+    ///
+    /// Uses a structured narrative format (Goal/Progress/Decisions/Files/Next Steps)
+    /// inspired by hermes-agent's context compression template. This gives the worker
+    /// agent clear orientation after compression.
     pub fn build_context_for_next_iteration(&self) -> String {
         let mut parts = Vec::new();
 
-        // Include prior summaries
+        // Include prior summaries in structured narrative format
         for summary in &self.prior_summaries {
-            parts.push(format!(
-                "[Summary of iterations {}]\n{}\nKey findings: {}\nSuccessful fixes: {}\nRoot causes: {}",
-                summary
-                    .iterations_summarized
-                    .iter()
-                    .map(|i| i.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                summary.summary,
-                summary.key_findings.join("; "),
-                summary.successful_fixes.join("; "),
-                summary.root_causes.join("; "),
-            ));
+            let iter_range = summary
+                .iterations_summarized
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let mut section = format!(
+                "[Summary of iterations {}]\n\n**Progress:** {}\n",
+                iter_range, summary.summary,
+            );
+
+            if !summary.key_findings.is_empty() {
+                section.push_str(&format!(
+                    "\n**Key findings:** {}\n",
+                    summary.key_findings.join("; ")
+                ));
+            }
+            if !summary.root_causes.is_empty() {
+                section.push_str(&format!(
+                    "\n**Root causes:** {}\n",
+                    summary.root_causes.join("; ")
+                ));
+            }
+            if !summary.successful_fixes.is_empty() {
+                section.push_str(&format!(
+                    "\n**Successful fixes:** {}\n",
+                    summary.successful_fixes.join("; ")
+                ));
+            }
+            if !summary.decisions.is_empty() {
+                section.push_str(&format!(
+                    "\n**Decisions:** {}\n",
+                    summary.decisions.join("; ")
+                ));
+            }
+            if !summary.files_modified.is_empty() {
+                section.push_str(&format!(
+                    "\n**Files modified:** {}\n",
+                    summary.files_modified.join(", ")
+                ));
+            }
+            if !summary.next_steps.is_empty() {
+                section.push_str(&format!(
+                    "\n**Next steps:** {}\n",
+                    summary.next_steps.join("; ")
+                ));
+            }
+
+            parts.push(section);
         }
 
         // Include recent full-detail iterations
@@ -220,7 +279,10 @@ impl ContextSummarizer {
             let key_findings = Self::extract_string_array(&parsed, "key_findings");
             let successful_fixes = Self::extract_string_array(&parsed, "successful_fixes");
             let root_causes = Self::extract_string_array(&parsed, "root_causes");
-            let summary_token_count = estimate_tokens(&summary) + 200; // buffer for structured fields
+            let files_modified = Self::extract_string_array(&parsed, "files_modified");
+            let decisions = Self::extract_string_array(&parsed, "decisions");
+            let next_steps = Self::extract_string_array(&parsed, "next_steps");
+            let summary_token_count = estimate_tokens(&summary) + 300; // buffer for structured fields
 
             SummarizedContext {
                 summary,
@@ -228,6 +290,9 @@ impl ContextSummarizer {
                 key_findings,
                 successful_fixes,
                 root_causes,
+                files_modified,
+                decisions,
+                next_steps,
                 original_token_count,
                 summary_token_count,
             }
@@ -238,6 +303,9 @@ impl ContextSummarizer {
                 key_findings: Vec::new(),
                 successful_fixes: Vec::new(),
                 root_causes: Vec::new(),
+                files_modified: Vec::new(),
+                decisions: Vec::new(),
+                next_steps: Vec::new(),
                 original_token_count,
                 summary_token_count: estimate_tokens(response),
             }
@@ -362,7 +430,10 @@ mod tests {
             "summary": "Iterations showed progress",
             "key_findings": ["found bug A"],
             "successful_fixes": ["fix A applied"],
-            "root_causes": ["misconfigured setting"]
+            "root_causes": ["misconfigured setting"],
+            "files_modified": ["src/main.rs", "tests/test.rs"],
+            "decisions": ["chose rewrite over patch"],
+            "next_steps": ["fix lint errors"]
         }"#;
 
         let result = summarizer.parse_summary_response(response, 800);
@@ -370,6 +441,9 @@ mod tests {
         assert_eq!(result.key_findings, vec!["found bug A"]);
         assert_eq!(result.successful_fixes, vec!["fix A applied"]);
         assert_eq!(result.root_causes, vec!["misconfigured setting"]);
+        assert_eq!(result.files_modified, vec!["src/main.rs", "tests/test.rs"]);
+        assert_eq!(result.decisions, vec!["chose rewrite over patch"]);
+        assert_eq!(result.next_steps, vec!["fix lint errors"]);
         assert_eq!(result.iterations_summarized, vec![1]);
         assert_eq!(result.original_token_count, 800);
     }
@@ -386,6 +460,10 @@ mod tests {
         assert_eq!(result.summary, response);
         assert!(result.key_findings.is_empty());
         assert!(result.successful_fixes.is_empty());
+        assert!(result.root_causes.is_empty());
+        assert!(result.files_modified.is_empty());
+        assert!(result.decisions.is_empty());
+        assert!(result.next_steps.is_empty());
     }
 
     #[test]
@@ -403,6 +481,9 @@ mod tests {
             key_findings: vec!["finding".to_string()],
             successful_fixes: vec![],
             root_causes: vec![],
+            files_modified: vec![],
+            decisions: vec![],
+            next_steps: vec![],
             original_token_count: 600,
             summary_token_count: 100,
         };
@@ -429,6 +510,9 @@ mod tests {
             key_findings: vec!["key_find".to_string()],
             successful_fixes: vec!["good_fix".to_string()],
             root_causes: vec!["root_cause".to_string()],
+            files_modified: vec!["src/main.rs".to_string()],
+            decisions: vec!["chose approach A".to_string()],
+            next_steps: vec!["fix criterion B".to_string()],
             original_token_count: 600,
             summary_token_count: 100,
         };
@@ -439,6 +523,14 @@ mod tests {
         assert!(context.contains("Earlier iterations summary"));
         assert!(context.contains("key_find"));
         assert!(context.contains("Iteration 3 (full detail)"));
+        // Verify structured narrative sections
+        assert!(context.contains("**Progress:**"));
+        assert!(context.contains("**Files modified:**"));
+        assert!(context.contains("src/main.rs"));
+        assert!(context.contains("**Decisions:**"));
+        assert!(context.contains("chose approach A"));
+        assert!(context.contains("**Next steps:**"));
+        assert!(context.contains("fix criterion B"));
     }
 
     #[test]

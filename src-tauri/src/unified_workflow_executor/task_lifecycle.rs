@@ -75,6 +75,15 @@ impl LoopController {
                 });
             });
 
+            // Auto-capture task knowledge as observations (Engram-style cross-session memory)
+            if let Some(pg) = self.app_state.pg_db.clone() {
+                let db = self.checkpoint_db.clone();
+                let exec_id = execution_id.to_string();
+                tokio::spawn(async move {
+                    auto_capture_observations(&db, &pg, &exec_id).await;
+                });
+            }
+
             // Parse meta-optimizer recommendations from completed output
             {
                 let db = self.checkpoint_db.clone();
@@ -432,5 +441,116 @@ impl LoopController {
             warn!("WORKTREE: No project_path set, cannot create worktree.");
             config.use_worktree = false;
         }
+    }
+}
+
+/// Auto-capture significant task findings as persistent observations.
+///
+/// Called on task completion to extract and persist cross-session knowledge:
+/// - Task outcome (success/failure, duration, iteration count)
+/// - Key findings from verification phases
+/// - Error patterns encountered
+async fn auto_capture_observations(
+    db: &crate::database::CheckpointDb,
+    pg: &crate::database::pg::PgDb,
+    execution_id: &str,
+) {
+    let task_run = match db.get_task_run(execution_id) {
+        Ok(Some(tr)) => tr,
+        _ => return,
+    };
+
+    let workflow_name = task_run.workflow_name.as_deref().unwrap_or(&task_run.task_name);
+    let status = &task_run.status;
+    let iterations = task_run.sessions_count;
+
+    // Only capture observations for tasks that ran at least one iteration
+    if iterations == 0 {
+        return;
+    }
+
+    // Build a summary of the task outcome
+    let outcome_type = if status == "completed" {
+        "learning"
+    } else {
+        "bugfix"
+    };
+
+    let title = format!(
+        "Task {}: {} ({} iterations)",
+        if status == "completed" { "succeeded" } else { "failed" },
+        workflow_name,
+        iterations
+    );
+
+    let mut content_lines = vec![
+        format!("## Task Run Outcome"),
+        String::new(),
+        format!("- **Workflow:** {}", workflow_name),
+        format!("- **Status:** {}", status),
+        format!("- **Iterations:** {}", iterations),
+    ];
+
+    // Compute duration from timestamps if available
+    if let Some(ref completed) = task_run.completed_at {
+        if let (Ok(start), Ok(end)) = (
+            chrono::DateTime::parse_from_rfc3339(&task_run.created_at),
+            chrono::DateTime::parse_from_rfc3339(completed),
+        ) {
+            let duration_secs = (end - start).num_seconds();
+            if duration_secs > 0 {
+                content_lines.push(format!("- **Duration:** {}s", duration_secs));
+            }
+        }
+    }
+
+    // Extract findings from task knowledge (if available)
+    let findings = db
+        .with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT category, content FROM task_knowledge \
+                     WHERE task_run_id = ?1 AND category IN ('Finding', 'RootCause', 'Solution') \
+                     ORDER BY created_at DESC LIMIT 10",
+                )
+                .map_err(|e| format!("{}", e))?;
+            let rows: Vec<(String, String)> = stmt
+                .query_map(rusqlite::params![execution_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| format!("{}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        })
+        .unwrap_or_default();
+
+    if !findings.is_empty() {
+        content_lines.push(String::new());
+        content_lines.push("### Key Findings".to_string());
+        content_lines.push(String::new());
+        for (category, content) in &findings {
+            content_lines.push(format!("- **[{}]** {}", category, content));
+        }
+    }
+
+    let content = content_lines.join("\n");
+    let topic_key = format!("task-outcome/{}", workflow_name.to_lowercase().replace(' ', "-"));
+
+    let input = crate::database::types::CreateObservationInput {
+        title,
+        content,
+        observation_type: outcome_type.to_string(),
+        scope: "project".to_string(),
+        topic_key: Some(topic_key),
+        project_id: None,
+        workflow_id: task_run.workflow_id.clone(),
+        task_run_id: Some(execution_id.to_string()),
+        session_id: None,
+    };
+
+    match pg.save_observation(&input).await {
+        Ok(id) => info!("Auto-captured task observation {} for {}", id, execution_id),
+        Err(e) => warn!("Failed to auto-capture observation: {}", e),
     }
 }

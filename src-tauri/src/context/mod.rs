@@ -42,8 +42,8 @@ pub use metadata::{record_context_use, set_context_enabled, set_web_sync_status}
 
 // Re-export resolution and formatting
 pub use resolution::{
-    format_contexts_for_prompt, format_single_context, inject_contexts, record_contexts_used,
-    resolve_contexts,
+    format_contexts_for_prompt, format_observation_memory_for_prompt, format_single_context,
+    inject_contexts, record_contexts_used, resolve_contexts,
 };
 
 // Re-export built-in contexts

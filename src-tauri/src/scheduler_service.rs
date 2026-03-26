@@ -4,6 +4,7 @@
 //! at their scheduled times. Integrates with existing workflow and prompt
 //! execution infrastructure.
 
+use crate::database::pg::PgDb;
 use crate::database::CheckpointDb;
 use crate::scheduler::{
     compute_next_run, ConditionStatus, RepositoryWatch, ScheduledTask, ScheduledTaskStatus,
@@ -23,6 +24,8 @@ use walkdir::WalkDir;
 pub struct SchedulerService {
     /// Database handle for scheduler persistence
     db: Arc<CheckpointDb>,
+    /// PostgreSQL database for activity timeline and watchers (optional)
+    pg_db: Option<Arc<PgDb>>,
     /// Flag to stop the service
     stop_signal: Arc<AtomicBool>,
     /// Currently running task IDs
@@ -33,9 +36,10 @@ pub struct SchedulerService {
 
 impl SchedulerService {
     /// Create a new scheduler service
-    pub fn new(db: Arc<CheckpointDb>) -> Self {
+    pub fn new(db: Arc<CheckpointDb>, pg_db: Option<Arc<PgDb>>) -> Self {
         Self {
             db,
+            pg_db,
             stop_signal: Arc::new(AtomicBool::new(false)),
             running_tasks: Arc::new(RwLock::new(Vec::new())),
             check_interval_secs: 60, // Check every minute
@@ -301,6 +305,23 @@ impl SchedulerService {
                 check_findings,
                 force_run,
             } => self.execute_auto_fix(*check_findings, *force_run).await,
+            ScheduledTaskType::Watcher { watcher_id } => {
+                self.execute_watcher(watcher_id).await
+            }
+            ScheduledTaskType::BackgroundCapture {
+                monitor_index,
+                capture_interval_secs,
+                capture_on_focus_change,
+            } => {
+                // BackgroundCapture is a long-running service, not a one-shot task.
+                // The scheduler creates and starts it; it runs until stopped.
+                warn!(
+                    "Scheduler: BackgroundCapture is a long-running service (interval={}s). \
+                     Use the BackgroundCaptureService API to start/stop.",
+                    capture_interval_secs
+                );
+                Ok((true, None))
+            }
         };
 
         // Update record with result
@@ -655,6 +676,111 @@ After making fixes, run tests if applicable to verify the fixes work."#
     }
 
     // ========================================================================
+    // Watcher Execution
+    // ========================================================================
+
+    /// Execute a watcher: query the activity timeline, format results into an AI prompt,
+    /// and trigger the configured action if the AI determines the condition is met.
+    async fn execute_watcher(
+        &self,
+        watcher_id: &str,
+    ) -> Result<(bool, Option<String>), String> {
+        let pg = self
+            .pg_db
+            .as_ref()
+            .ok_or_else(|| "PostgreSQL not available — watchers require PgDb".to_string())?;
+
+        // 1. Load watcher definition
+        let watcher = pg
+            .get_watcher(watcher_id)
+            .await?
+            .ok_or_else(|| format!("Watcher '{}' not found", watcher_id))?;
+
+        if !watcher.enabled {
+            return Ok((true, None)); // Skip disabled watchers
+        }
+
+        info!(
+            "Executing watcher '{}': query='{}', lookback='{}'",
+            watcher.name, watcher.timeline_query, watcher.lookback_window
+        );
+
+        // 2. Query the activity timeline
+        let results = pg
+            .search_timeline_filtered(
+                &watcher.timeline_query,
+                watcher.app_name_filter.as_deref(),
+                watcher.source_type_filter.as_deref(),
+                None, // no task_run_id filter
+                50,   // max results
+            )
+            .await?;
+
+        // 3. Format the AI reasoning prompt
+        let results_text = if results.is_empty() {
+            "No matching entries found in the activity timeline.".to_string()
+        } else {
+            results
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    format!(
+                        "{}. [{}] {} — {} ({})",
+                        i + 1,
+                        r.source_type,
+                        r.app_name.as_deref().unwrap_or("unknown"),
+                        r.text_preview,
+                        r.created_at
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let prompt = watcher
+            .reasoning_prompt
+            .replace("{{results}}", &results_text)
+            .replace("{{result_count}}", &results.len().to_string())
+            .replace("{{query}}", &watcher.timeline_query);
+
+        // 4. Send to AI for reasoning via the runner's prompt execution API
+        let client = reqwest::Client::new();
+        let base_url = crate::mcp::types::get_self_base_url_from_env();
+
+        let request_body = serde_json::json!({
+            "name": format!("watcher-{}", watcher.name),
+            "content": prompt,
+            "display_prompt": format!("Watcher: {}", watcher.name),
+            "timeout_seconds": 120,
+            "max_sessions": 1
+        });
+
+        let response = client
+            .post(format!("{}/prompts/run", base_url))
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| format!("Watcher AI request failed: {}", e))?;
+
+        let success = response.status().is_success();
+        let result_text = response.text().await.unwrap_or_default();
+
+        // 5. Record execution result
+        pg.record_watcher_run(watcher_id, Some(&result_text))
+            .await
+            .unwrap_or_else(|e| warn!("Failed to record watcher run: {}", e));
+
+        info!(
+            "Watcher '{}' completed (success={}, results={})",
+            watcher.name,
+            success,
+            results.len()
+        );
+
+        Ok((success, None))
+    }
+
+    // ========================================================================
     // Condition Checking
     // ========================================================================
 
@@ -871,7 +997,7 @@ static SCHEDULER_SERVICE: Lazy<Mutex<Option<Arc<SchedulerService>>>> =
     Lazy::new(|| Mutex::new(None));
 
 /// Start the global scheduler service
-pub async fn start_scheduler_service(db: Arc<CheckpointDb>) {
+pub async fn start_scheduler_service(db: Arc<CheckpointDb>, pg_db: Option<Arc<PgDb>>) {
     let mut service_guard = SCHEDULER_SERVICE.lock().await;
 
     if service_guard.is_some() {
@@ -879,7 +1005,7 @@ pub async fn start_scheduler_service(db: Arc<CheckpointDb>) {
         return;
     }
 
-    let service = Arc::new(SchedulerService::new(db));
+    let service = Arc::new(SchedulerService::new(db, pg_db));
     *service_guard = Some(service.clone());
     drop(service_guard);
 

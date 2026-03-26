@@ -36,9 +36,6 @@ impl SearchBudget {
         self.content_bytes_used += content_bytes;
     }
 
-    pub fn remaining_bytes(&self) -> usize {
-        self.max_total_content_bytes.saturating_sub(self.content_bytes_used)
-    }
 }
 
 /// Which search provider produced a result
@@ -137,8 +134,6 @@ pub struct KnowledgeAcquisitionConfig {
     pub max_content_bytes: usize,
     pub per_result_cap_bytes: usize,
     pub timeout_per_call_secs: u64,
-    pub auto_enrich_security_findings: bool,
-    pub dedup_similarity_threshold: f32,
 }
 
 impl Default for KnowledgeAcquisitionConfig {
@@ -151,8 +146,6 @@ impl Default for KnowledgeAcquisitionConfig {
             max_content_bytes: 80_000,
             per_result_cap_bytes: 50_000,
             timeout_per_call_secs: 30,
-            auto_enrich_security_findings: true,
-            dedup_similarity_threshold: 0.85,
         }
     }
 }

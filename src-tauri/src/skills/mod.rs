@@ -9,6 +9,9 @@
 //! - A registry that loads built-in skills from embedded JSON
 //! - Search and lookup functionality
 //! - Skill instantiation (template → concrete step configs)
+//! - Playbook parsing (markdown with YAML frontmatter for domain knowledge)
+
+pub mod playbook_parser;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -81,6 +84,32 @@ pub enum SkillTemplate {
     MultiStep { steps: Vec<HashMap<String, Value>> },
     #[serde(rename = "composition")]
     Composition { skill_refs: Vec<SkillRef> },
+    /// Markdown playbook with domain knowledge (TuriX-CUA inspired).
+    ///
+    /// Playbooks are human-editable markdown files with YAML frontmatter that
+    /// provide LLM context about how to interact with specific applications.
+    /// Unlike other templates that generate workflow steps, playbooks inject
+    /// domain knowledge into AI prompts.
+    #[serde(rename = "playbook")]
+    Playbook {
+        /// Full markdown content (the body after frontmatter).
+        content: String,
+        /// Trigger conditions for when this playbook should be included.
+        #[serde(default)]
+        triggers: Vec<PlaybookTrigger>,
+    },
+}
+
+/// Trigger condition for a playbook.
+///
+/// Determines when a playbook should be automatically included in AI prompts
+/// based on the current automation context (app name, URL pattern, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaybookTrigger {
+    /// Type of trigger: "app_name", "url_pattern", "tag".
+    pub trigger_type: String,
+    /// Value to match against (exact match for app_name, glob for url_pattern).
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -643,6 +672,12 @@ pub fn instantiate_skill(
                 skill.name
             ));
         }
+        SkillTemplate::Playbook { .. } => {
+            return Err(format!(
+                "Skill \"{}\" is a playbook and cannot be directly instantiated as workflow steps",
+                skill.name
+            ));
+        }
     };
 
     let total = template_steps.len();
@@ -772,6 +807,7 @@ fn step_matches_skill(step: &Value, skill: &SkillDefinition) -> bool {
         SkillTemplate::SingleStep { step } => step,
         SkillTemplate::MultiStep { .. } => return false, // skip multi-step skills
         SkillTemplate::Composition { .. } => return false, // skip composition skills
+        SkillTemplate::Playbook { .. } => return false, // skip playbook skills
     };
 
     let step_obj = match step.as_object() {
@@ -817,6 +853,7 @@ fn extract_params_from_step(step: &Value, skill: &SkillDefinition) -> HashMap<St
         SkillTemplate::SingleStep { step } => step,
         SkillTemplate::MultiStep { .. } => return HashMap::new(),
         SkillTemplate::Composition { .. } => return HashMap::new(),
+        SkillTemplate::Playbook { .. } => return HashMap::new(),
     };
 
     let step_obj = match step.as_object() {

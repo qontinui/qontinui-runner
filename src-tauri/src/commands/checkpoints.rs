@@ -132,7 +132,11 @@ pub async fn setting_get(
     app_state: State<'_, Arc<AppState>>,
     key: String,
 ) -> Result<Option<serde_json::Value>, String> {
-    app_state.checkpoint_db.get_setting(&key)
+    if let Some(pg) = &app_state.pg_db {
+        pg.get_setting(&key).await
+    } else {
+        app_state.checkpoint_db.get_setting(&key)
+    }
 }
 
 /// Set a setting value.
@@ -142,7 +146,11 @@ pub async fn setting_set(
     key: String,
     value: serde_json::Value,
 ) -> Result<CommandResponse, String> {
-    app_state.checkpoint_db.set_setting(&key, &value)?;
+    if let Some(pg) = &app_state.pg_db {
+        pg.set_setting(&key, &value).await?;
+    } else {
+        app_state.checkpoint_db.set_setting(&key, &value)?;
+    }
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Setting '{}' saved", key)),
@@ -155,5 +163,9 @@ pub async fn setting_set(
 pub async fn settings_get_all(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    app_state.checkpoint_db.get_all_settings()
+    if let Some(pg) = &app_state.pg_db {
+        pg.get_all_settings().await
+    } else {
+        app_state.checkpoint_db.get_all_settings()
+    }
 }

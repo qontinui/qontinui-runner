@@ -9,6 +9,7 @@ export type MainTabId =
   | "error-monitor"
   | "processes"
   | "reflection"
+  | "observations"
   | "architecture"
   | "generator-eval"
   | "autoresearch"
@@ -78,6 +79,7 @@ export type MainTabId =
   | "rule-influence"
   | "unified-search"
   | "workflow-versions"
+  | "skills"
   | "help";
 
 const VALID_TAB_IDS: MainTabId[] = [
@@ -158,6 +160,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "rule-influence",
   "unified-search",
   "workflow-versions",
+  "skills",
   "help",
 ];
 

@@ -48,6 +48,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 // Command modules organized by domain
 pub mod accessibility;
+pub mod activity_timeline; // Screenpipe-inspired searchable capture history
 pub mod agentic_metrics;
 pub mod ai_data;
 pub mod ai_generation; // AI generation for builder tabs (context, api request, task, exploration)
@@ -114,6 +115,7 @@ pub mod transcript; // Claude Code transcript import and standalone workflow gen
 pub mod ui_bridge; // UI Bridge for AI-driven UI automation
 pub mod verification;
 pub mod video;
+pub mod watchers; // Screenpipe-inspired scheduled reactive AI agents
 pub mod websocket;
 
 // Re-export all command functions for easy access in main.rs

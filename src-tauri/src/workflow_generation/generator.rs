@@ -1653,7 +1653,7 @@ Generate a complete UnifiedWorkflow JSON that accomplishes this task.
 - Step names are descriptive (not "Step 1", "Test", etc.).
 - `working_directory` paths look like real absolute or project-relative paths (no placeholders like "/path/to/project").
 - If the workflow targets a web application (localhost:3001, localhost:1420, or similar), include a setup step to connect via UI Bridge SDK (POST /ui-bridge/sdk/connect). Use SDK endpoints for element inspection and state checking instead of Playwright when possible.
-- Prompt steps that need to inspect or interact with web UI should reference SDK tools (sdk_elements, sdk_snapshot, sdk_ai_execute, sdk_ai_search) rather than Playwright for registered-element interactions.
+- Prompt steps that need to inspect or interact with web UI should reference SDK tools (sdk_elements, sdk_snapshot, sdk_ai_execute, sdk_execute_action_plan, sdk_ai_search) rather than Playwright for registered-element interactions. For multi-step UI interactions, prefer sdk_execute_action_plan over multiple sdk_ai_execute calls.
 - To verify page text content (metrics, statuses, headings), use SDK content discovery (sdk_elements with contentOnly/contentTypes filters, or sdk_snapshot) instead of screenshots. Use sdk_page_refresh/sdk_page_navigate for page navigation.
 - When the task involves a style refactor, UX redesign, or layout improvement, ALL information and functionality from the original page MUST be preserved. Better presentation — not removal of content. If the original has N tabs, M metrics, or a table with K columns, the redesigned version must include all of them.
 
@@ -2118,7 +2118,8 @@ Ensure the app wraps its root with `<UIBridgeProvider>` (usually already done in
 For verification steps that check the frontend, prefer UI Bridge SDK endpoints over Playwright:
 - Use `POST /ui-bridge/sdk/connect` in setup to connect to the target app
 - Use `sdk_elements`, `sdk_snapshot`, `sdk_ai_search` for element discovery
-- Use `sdk_ai_execute` for UI interactions
+- Use `sdk_ai_execute` for single UI interactions by natural language
+- Use `sdk_execute_action_plan` for multi-step structured UI interactions (more efficient, no second LLM call)
 - Use `sdk_page_navigate` / `sdk_page_refresh` for navigation
 
 These instructions enable the runner to discover, inspect, and control the frontend programmatically for automated testing and verification."#;

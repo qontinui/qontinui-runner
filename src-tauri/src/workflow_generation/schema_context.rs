@@ -513,6 +513,7 @@ In agentic/prompt steps, the AI agent has access to SDK MCP tools:
 - `sdk_discover` — Discover elements with content role filters
 - `sdk_ai_search` — AI-powered element search by description. Filters: contentRole, contentTypes
 - `sdk_ai_execute` — AI-powered action execution by description
+- `sdk_execute_action_plan` — Execute a structured sequence of typed UI actions (more efficient for multi-step interactions)
 - `sdk_page_refresh` — Refresh the current page
 - `sdk_page_navigate` — Navigate to a URL
 - `sdk_page_go_back` — Go back in browser history

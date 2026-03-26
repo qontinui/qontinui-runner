@@ -289,6 +289,66 @@ pub fn inject_contexts(
     (enhanced, used_ids)
 }
 
+/// Format observation memory as a prompt section.
+///
+/// Fetches relevant observations from PostgreSQL and formats them as a
+/// markdown section for injection into AI prompts. Returns None if PG
+/// is unavailable or no observations found.
+///
+/// Accepts either a project_id (for project-scoped retrieval) or a
+/// search_query (e.g. workflow name) for relevance-based retrieval.
+/// Uses progressive disclosure: 300-char previews with IDs.
+pub async fn format_observation_memory_for_prompt(
+    pg_db: Option<&crate::database::pg::PgDb>,
+    project_id: Option<&str>,
+    search_query: Option<&str>,
+) -> Option<String> {
+    let pg = pg_db?;
+
+    let observations = if let Some(pid) = project_id.filter(|s| !s.is_empty()) {
+        pg.get_project_context(pid, None, 15)
+            .await
+            .unwrap_or_default()
+    } else if let Some(query) = search_query.filter(|s| !s.is_empty()) {
+        pg.search_observations(query, None, 10)
+            .await
+            .unwrap_or_default()
+    } else {
+        return None;
+    };
+
+    if observations.is_empty() {
+        return None;
+    }
+
+    let mut output = String::new();
+    output.push_str("## Memory Context (from past sessions)\n\n");
+    output.push_str(&format!(
+        "{} relevant observation(s) from previous work.\n\n",
+        observations.len()
+    ));
+
+    for obs in &observations {
+        let rev = if obs.revision_count > 1 {
+            format!(" (rev {})", obs.revision_count)
+        } else {
+            String::new()
+        };
+        let topic = obs
+            .topic_key
+            .as_deref()
+            .map(|k| format!(" [{}]", k))
+            .unwrap_or_default();
+        output.push_str(&format!(
+            "- **{}**{}{} (id: {}, type: {})\n  {}\n\n",
+            obs.title, rev, topic, obs.id, obs.observation_type, obs.content_preview
+        ));
+    }
+
+    output.push_str("---\n\n");
+    Some(output)
+}
+
 /// Record that multiple contexts were used in a task.
 ///
 /// This updates use_count and last_used_at for each context.

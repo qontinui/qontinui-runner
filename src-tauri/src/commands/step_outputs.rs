@@ -229,6 +229,18 @@ pub struct Dimensions {
     pub height: i32,
 }
 
+/// Bounding box in normalized 0.0-1.0 coordinate space (screen-relative).
+///
+/// Resolution-independent representation used for portable element references
+/// and LLM-friendly coordinate output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NormalizedBoundingBox {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedElement {
     pub id: String,
@@ -237,6 +249,8 @@ pub struct DetectedElement {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_content: Option<String>,
     pub bounding_box: BoundingBox,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized_bounding_box: Option<NormalizedBoundingBox>,
     pub confidence: f64,
 }
 

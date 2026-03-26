@@ -665,4 +665,34 @@ impl CheckpointDb {
 
         Ok(count)
     }
+
+    /// Clean up stale auto-extracted skills.
+    ///
+    /// Deletes auto-skills that have been pending for `max_age_days` with 0 usage.
+    /// This prevents table bloat from skills that were never reviewed.
+    /// Returns the number of skills deleted.
+    pub fn cleanup_stale_auto_skills(&self, max_age_days: i64) -> Result<usize, String> {
+        let conn = self.get_conn()?;
+
+        let deleted = conn
+            .execute(
+                r#"DELETE FROM user_skills
+                   WHERE source = 'auto'
+                   AND (approval_status IS NULL OR approval_status = 'pending')
+                   AND (usage_count IS NULL OR usage_count = 0)
+                   AND created_at < datetime('now', ?1)"#,
+                params![format!("-{} days", max_age_days)],
+            )
+            .map_err(|e| format!("Failed to cleanup stale skills: {}", e))?;
+
+        if deleted > 0 {
+            tracing::info!(
+                "Cleaned up {} stale auto-extracted skills (pending > {} days, 0 usage)",
+                deleted,
+                max_age_days
+            );
+        }
+
+        Ok(deleted)
+    }
 }

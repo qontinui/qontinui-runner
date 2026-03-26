@@ -6,7 +6,7 @@
  */
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { aiDataService } from "../services/ai-data-service";
 import {
   useRunnerEvents,
@@ -132,12 +132,12 @@ export function useTaskRuns(limit?: number) {
  */
 export function useTaskRun(taskId: string | null) {
   const queryClient = useQueryClient();
-  const isRunning = useRef(false);
+  const [taskIsRunning, setTaskIsRunning] = useState(false);
 
   // Subscribe to this task's progress when it's running
   const { data: progressData } = useTaskRunProgressForInvalidation(
     taskId ?? "",
-    !taskId || !isRunning.current,
+    !taskId || !taskIsRunning,
   );
 
   // Invalidate cache when subscription delivers a status change
@@ -165,8 +165,9 @@ export function useTaskRun(taskId: string | null) {
     // Relaxed polling — subscription handles real-time updates
     refetchInterval: (query) => {
       const status = query.state.data?.status;
-      isRunning.current = status === "running";
-      return status === "running" ? 10000 : false;
+      const running = status === "running";
+      setTaskIsRunning(running);
+      return running ? 10000 : false;
     },
   });
   return query;

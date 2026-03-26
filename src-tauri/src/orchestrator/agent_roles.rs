@@ -637,6 +637,103 @@ impl AgentRole {
         .with_tag("performance")
         .with_tag("optimization")
     }
+
+    // ========================================================================
+    // Vision Agent Roles (TuriX-CUA inspired Brain/Actor pattern)
+    // ========================================================================
+
+    /// Create a Brain role for visual UI analysis.
+    ///
+    /// The Brain is a vision-capable model that receives annotated screenshots
+    /// and element indices. It analyzes the current screen state, assesses
+    /// progress, and produces an action plan for the Actor.
+    ///
+    /// Typically uses ModelTier::Complex (Opus, GPT-4V, Gemini Pro Vision).
+    pub fn brain() -> Self {
+        Self::new(
+            "brain",
+            "Visual Analysis Brain",
+            "Analyze current screen state, identify interactive elements, assess progress, and produce an action plan",
+        )
+        .with_backstory(
+            "You are a visual UI analysis specialist. You receive annotated screenshots with \
+             numbered element markers and a text index of all interactive elements. Your job \
+             is to understand the current state of the application, assess whether previous \
+             actions succeeded, and produce a clear action plan for the next steps. Reference \
+             elements by their index number (e.g., 'click element [3]'). Be precise about \
+             what you observe and what should happen next.",
+        )
+        .with_tools(vec![
+            ToolSpec::new("analyze_screenshot", "Analyze an annotated screenshot with numbered elements"),
+            ToolSpec::new("read_element_index", "Read the text index of screen elements"),
+            ToolSpec::new("record_info", "Save a finding for later retrieval"),
+        ])
+        .with_constraints(vec![
+            "Always reference elements by their index number".to_string(),
+            "Describe what you observe before suggesting actions".to_string(),
+            "Assess whether the previous action succeeded or failed".to_string(),
+            "Produce a clear, ordered action plan".to_string(),
+        ])
+        .with_style(CommunicationStyle::Detailed)
+        .with_autonomy(AutonomyLevel::Autonomous)
+        .with_model_tier(ModelTier::Complex)
+        .with_tag("vision")
+        .with_tag("analysis")
+        .with_tag("brain")
+    }
+
+    /// Create an Actor role for UI action execution.
+    ///
+    /// The Actor receives the Brain's action plan (text only, no images) and
+    /// translates it into concrete UI actions. It's a lightweight model
+    /// optimized for fast, accurate action translation.
+    ///
+    /// Typically uses ModelTier::Simple (Haiku, Sonnet, Gemini Flash).
+    pub fn actor() -> Self {
+        Self::new(
+            "actor",
+            "UI Action Actor",
+            "Execute the action plan by translating goals into precise UI actions",
+        )
+        .with_backstory(
+            "You are a UI action execution specialist. You receive an action plan from the \
+             Brain agent that describes what needs to happen, along with an element index \
+             listing all interactive elements by number. Your job is to translate each plan \
+             step into concrete UI actions: click, type, scroll, select, etc. Be precise \
+             with element references and action parameters. If you are confused or the plan \
+             seems wrong, signal RequestContext so the Brain can re-analyze.",
+        )
+        .with_tools(vec![
+            ToolSpec::new("click", "Click on a UI element by index number")
+                .mutating()
+                .with_risk(ToolRiskLevel::Low),
+            ToolSpec::new("type_text", "Type text into an input element")
+                .mutating()
+                .with_risk(ToolRiskLevel::Low),
+            ToolSpec::new("scroll", "Scroll in a direction")
+                .mutating()
+                .with_risk(ToolRiskLevel::Low),
+            ToolSpec::new("select", "Select an option from a dropdown")
+                .mutating()
+                .with_risk(ToolRiskLevel::Low),
+            ToolSpec::new("wait", "Wait for a condition before proceeding"),
+            ToolSpec::new("record_info", "Save intermediate information for later retrieval")
+                .mutating()
+                .with_risk(ToolRiskLevel::Low),
+        ])
+        .with_constraints(vec![
+            "Follow the Brain's action plan in order".to_string(),
+            "Reference elements by their index number from the element index".to_string(),
+            "Signal RequestContext if the plan seems wrong or the screen has changed".to_string(),
+            "Do not guess — if uncertain, request re-analysis".to_string(),
+        ])
+        .with_style(CommunicationStyle::Concise)
+        .with_autonomy(AutonomyLevel::Guided)
+        .with_model_tier(ModelTier::Simple)
+        .with_tag("action")
+        .with_tag("execution")
+        .with_tag("actor")
+    }
 }
 
 // ============================================================================
@@ -666,6 +763,8 @@ impl RoleRegistry {
         registry.register(AgentRole::security_analyst());
         registry.register(AgentRole::documentation_writer());
         registry.register(AgentRole::performance_engineer());
+        registry.register(AgentRole::brain());
+        registry.register(AgentRole::actor());
         registry
     }
 

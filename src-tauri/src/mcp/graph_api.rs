@@ -21,6 +21,49 @@ use crate::reflection::{
     graph_types::GraphSummary, unified_search,
 };
 
+use crate::database::types::{Observation, ObservationSearchResult};
+
+// ============================================================================
+// Observation loading helper (async PG fetch for sync graph build)
+// ============================================================================
+
+/// Fetch observations from PostgreSQL for graph enrichment.
+/// Uses a single batch query instead of N+1 individual fetches.
+/// Returns empty vectors if PG is unavailable — graph still builds from SQLite.
+async fn fetch_observations_for_graph(
+    pg_db: Option<&crate::database::pg::PgDb>,
+) -> (Vec<ObservationSearchResult>, Vec<Observation>) {
+    let Some(pg) = pg_db else {
+        return (Vec::new(), Vec::new());
+    };
+
+    // Single batch query for full observations (replaces N+1 pattern)
+    let full = pg
+        .get_all_observations_full(500)
+        .await
+        .unwrap_or_default();
+
+    // Build preview versions for load_observations_from_pg (needs content_preview)
+    let previews: Vec<ObservationSearchResult> = full
+        .iter()
+        .map(|obs| ObservationSearchResult {
+            id: obs.id,
+            title: obs.title.clone(),
+            content_preview: obs.content.chars().take(300).collect(),
+            observation_type: obs.observation_type.clone(),
+            scope: obs.scope.clone(),
+            topic_key: obs.topic_key.clone(),
+            revision_count: obs.revision_count,
+            project_id: obs.project_id.clone(),
+            created_at: obs.created_at.clone(),
+            updated_at: obs.updated_at.clone(),
+            rank: None,
+        })
+        .collect();
+
+    (previews, full)
+}
+
 // ============================================================================
 // Routes
 // ============================================================================
@@ -46,6 +89,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/graph/effectiveness", get(effectiveness_stub_handler))
         .route("/graph/ui-failure-chain", get(ui_failure_chain_handler))
         .route("/graph/ui-fix-effectiveness", get(ui_fix_effectiveness_handler))
+        .route("/graph/skill-metrics", get(skill_metrics_handler))
 }
 
 // ============================================================================
@@ -133,12 +177,24 @@ async fn summary_handler(
     Query(query): Query<SummaryQuery>,
 ) -> Result<Json<ApiResponse<GraphSummary>>, (StatusCode, Json<ApiResponse<()>>)> {
     let workflow_name = query.workflow_name;
+
+    // Pre-fetch observations from PG (async) before the sync graph build
+    let (obs_previews, obs_full) = fetch_observations_for_graph(
+        state.app_state.pg_db.as_deref(),
+    )
+    .await;
+
     let summary = state
         .app_state
         .checkpoint_db
         .with_conn(|conn| {
-            let graph =
+            let mut graph =
                 KnowledgeGraph::build_from_db(conn, workflow_name.as_deref())?;
+            // Enrich with PG observations
+            if !obs_previews.is_empty() {
+                graph.load_observations_from_pg(&obs_previews);
+                graph.link_observations(&obs_full);
+            }
             Ok(graph.summary())
         })
         .map_err(|e| {
@@ -573,6 +629,111 @@ async fn ui_fix_effectiveness_handler(
     .await
     {
         Ok(Ok(scores)) => Ok(Json(ApiResponse::success(scores))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    }
+}
+
+// ============================================================================
+// GET /graph/skill-metrics — Procedural skill system metrics
+// ============================================================================
+
+async fn skill_metrics_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = state.app_state.checkpoint_db.clone();
+
+    match tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            // Counts by approval status
+            let status_counts: Vec<(String, i64)> = conn
+                .prepare(
+                    r#"SELECT COALESCE(approval_status, 'pending') as status, COUNT(*)
+                       FROM user_skills WHERE source = 'auto'
+                       GROUP BY status ORDER BY COUNT(*) DESC"#,
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default();
+
+            let mut pending = 0i64;
+            let mut approved = 0i64;
+            let mut rejected = 0i64;
+            for (status, count) in &status_counts {
+                match status.as_str() {
+                    "pending" => pending = *count,
+                    "approved" => approved = *count,
+                    "rejected" => rejected = *count,
+                    _ => {}
+                }
+            }
+
+            // Total usage across approved skills
+            let total_usage: i64 = conn
+                .query_row(
+                    r#"SELECT COALESCE(SUM(usage_count), 0) FROM user_skills
+                       WHERE source = 'auto' AND approval_status = 'approved'"#,
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
+            // Skill failure events count
+            let failure_events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM task_run_events WHERE event_type = 'skill_failure'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
+            // Auto-disabled count (skills that were approved then reverted to pending)
+            let auto_disabled: i64 = conn
+                .query_row(
+                    r#"SELECT COUNT(DISTINCT event_subtype) FROM task_run_events
+                       WHERE event_type = 'skill_failure'"#,
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
+            // Top skills by usage
+            let top_skills: Vec<(String, String, i64)> = conn
+                .prepare(
+                    r#"SELECT slug, category, usage_count FROM user_skills
+                       WHERE source = 'auto' AND approval_status = 'approved'
+                       ORDER BY usage_count DESC LIMIT 5"#,
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default();
+
+            let top: Vec<serde_json::Value> = top_skills
+                .into_iter()
+                .map(|(slug, cat, usage)| {
+                    serde_json::json!({"slug": slug, "category": cat, "usage_count": usage})
+                })
+                .collect();
+
+            Ok(serde_json::json!({
+                "total_auto_skills": pending + approved + rejected,
+                "pending": pending,
+                "approved": approved,
+                "rejected": rejected,
+                "total_usage": total_usage,
+                "failure_events": failure_events,
+                "unique_skills_failed": auto_disabled,
+                "top_skills": top,
+            }))
+        })
+    })
+    .await
+    {
+        Ok(Ok(metrics)) => Ok(Json(ApiResponse::success(metrics))),
         Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
     }

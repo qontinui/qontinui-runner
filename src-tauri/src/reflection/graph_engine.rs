@@ -974,15 +974,47 @@ impl KnowledgeGraph {
             );
         }
 
-        // Link auto-generated skills to their source findings via cross_run_patterns.
-        // Pattern nodes are keyed by cross_run_patterns.id (not signature_hash),
-        // so we must select the id column to construct the correct node key.
+        // Link auto-generated skills to their source fixes (DerivedFrom edges).
+        // Uses source_fix_id FK when available, falling back to LIKE-based join on description.
         let mut stmt = conn
             .prepare(
-                r#"SELECT us.id, crp.id
+                r#"SELECT us.id as skill_id, trf.id as finding_id
                    FROM user_skills us
-                   INNER JOIN cross_run_patterns crp ON us.description LIKE '%' || crp.signature_hash || '%'
-                   WHERE us.source = 'auto'
+                   INNER JOIN reflection_fixes rf ON us.source_fix_id = rf.id
+                   INNER JOIN task_run_findings trf ON rf.source_finding_id = trf.id
+                   WHERE us.source = 'auto' AND us.source_fix_id IS NOT NULL
+                   LIMIT 200"#,
+            )
+            .map_err(|e| format!("Failed to prepare skill-fix link query: {}", e))?;
+
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            })
+            .map_err(|e| format!("Failed to query skill-fix links: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (skill_id, finding_id) in rows {
+            let skill_key = format!("skill:{}", skill_id);
+            let finding_key = format!("finding:{}", finding_id);
+            self.add_edge_by_key(
+                &skill_key,
+                &finding_key,
+                GraphEdge::new(GraphEdgeKind::DerivedFrom)
+                    .with_label("auto-extracted from effective fix"),
+            );
+        }
+
+        // Also link skills to cross_run_patterns via source_pattern_id FK
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT us.id, us.source_pattern_id
+                   FROM user_skills us
+                   WHERE us.source = 'auto' AND us.source_pattern_id IS NOT NULL
                    LIMIT 200"#,
             )
             .map_err(|e| format!("Failed to prepare skill-pattern link query: {}", e))?;
@@ -1072,6 +1104,21 @@ impl KnowledgeGraph {
                     GraphEdge::new(GraphEdgeKind::InformedBy)
                         .with_label(&obs.observation_type),
                 );
+            }
+
+            // Link skill-mirrored observations to their corresponding Skill node.
+            // Skill observations use topic_key="skill:<slug>" format.
+            if let Some(ref tk) = obs.topic_key {
+                if let Some(slug) = tk.strip_prefix("skill:") {
+                    // Find the skill node by matching the slug in user_skills
+                    let skill_key = format!("skill:auto:{}", slug);
+                    self.add_edge_by_key(
+                        &obs_key,
+                        &skill_key,
+                        GraphEdge::new(GraphEdgeKind::InformedBy)
+                            .with_label("observation mirrors skill"),
+                    );
+                }
             }
         }
     }
@@ -2703,6 +2750,30 @@ mod tests {
                 task_run_id TEXT NOT NULL,
                 step_name TEXT NOT NULL,
                 finding_id TEXT NOT NULL
+            );
+
+            CREATE TABLE ui_bridge_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_run_id TEXT,
+                element_id TEXT,
+                event_type TEXT NOT NULL DEFAULT 'action_executed',
+                success INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE user_skills (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL UNIQUE,
+                description TEXT DEFAULT '',
+                category TEXT DEFAULT 'custom',
+                source TEXT DEFAULT 'user',
+                usage_count INTEGER DEFAULT 0,
+                version TEXT DEFAULT '1.0.0',
+                approval_status TEXT,
+                forked_from TEXT,
+                source_fix_id TEXT,
+                source_pattern_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             "#,
         )

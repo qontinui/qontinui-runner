@@ -278,6 +278,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     iteration_diffs TEXT,                      -- JSON array of IterationDiff objects (structured cross-iteration diff tracking)
     iteration_commits TEXT,                    -- JSON array of IterationCommit objects ({iteration, commit_hash, timestamp})
 
+    -- Fixer guard (v162)
+    verification_passed INTEGER DEFAULT 0,     -- Whether this task run passed verification (prevents fixer launch on success)
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -2577,6 +2580,8 @@ CREATE TABLE IF NOT EXISTS user_skills (
     usage_count INTEGER DEFAULT 0,         -- number of times this skill has been instantiated
     approval_status TEXT DEFAULT NULL,     -- "pending" | "approved" | "rejected" (org context)
     forked_from TEXT DEFAULT NULL,         -- ID of the skill this was forked from
+    source_fix_id TEXT DEFAULT NULL,       -- reflection_fixes.id that generated this auto-skill
+    source_pattern_id TEXT DEFAULT NULL,   -- cross_run_patterns.id this skill was derived from
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -2585,6 +2590,8 @@ CREATE INDEX IF NOT EXISTS idx_user_skills_slug ON user_skills(slug);
 CREATE INDEX IF NOT EXISTS idx_user_skills_category ON user_skills(category);
 CREATE INDEX IF NOT EXISTS idx_user_skills_updated_at ON user_skills(updated_at);
 CREATE INDEX IF NOT EXISTS idx_user_skills_source ON user_skills(source);
+CREATE INDEX IF NOT EXISTS idx_user_skills_source_fix ON user_skills(source_fix_id);
+CREATE INDEX IF NOT EXISTS idx_user_skills_source_pattern ON user_skills(source_pattern_id);
 
 -- UI Bridge integration tracking (projects with source integration)
 CREATE TABLE IF NOT EXISTS ui_bridge_integrations (

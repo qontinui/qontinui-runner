@@ -158,3 +158,35 @@ export type {
   SingleStateGeneratorOptions,
   SingleStateAgenticOptions,
 } from "./WorkflowGeneratorService";
+
+// Knowledge Acquisition Service
+export {
+  listProviders,
+  getStats,
+  searchWeb,
+  researchError,
+  fetchPage,
+  lookupApiDocs,
+  searchVulnerabilities,
+  auditDependencies,
+  auditManifest,
+} from "./knowledge-acquisition-service";
+export type {
+  SearchProvider,
+  KnowledgeDomain,
+  KnowledgeResult,
+  KnowledgeMetadata,
+  ProviderInfo,
+  ProviderStats,
+  StatsSnapshot,
+  SearchResponse,
+  PackageVulns,
+  VulnAuditResponse,
+  SearchWebRequest,
+  ResearchErrorRequest,
+  FetchPageRequest,
+  LookupApiDocsRequest,
+  SearchVulnerabilitiesRequest,
+  AuditDependenciesRequest,
+  AuditManifestRequest,
+} from "./knowledge-acquisition-service";

@@ -123,6 +123,7 @@ mod workflow_event_bus;
 mod workflow_generation;
 mod workflow_queue;
 mod workflow_state;
+mod vision;
 mod worktree;
 mod zombie_sweep;
 
@@ -1369,6 +1370,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::token_analytics::get_provider_latency,
             commands::token_analytics::get_task_run_costs,
             commands::token_analytics::get_cost_by_target_app,
+            // Activity timeline commands (screenpipe-inspired capture history)
+            commands::activity_timeline::insert_activity_entry,
+            commands::activity_timeline::search_activity_timeline,
+            commands::activity_timeline::search_activity_timeline_filtered,
+            commands::activity_timeline::get_activity_timeline_range,
+            commands::activity_timeline::get_activity_timeline_entry,
+            commands::activity_timeline::get_activity_timeline_for_task_run,
+            commands::activity_timeline::delete_activity_timeline_entry,
+            commands::activity_timeline::get_activity_timeline_stats,
+            // Watcher commands (screenpipe-inspired reactive AI agents)
+            commands::watchers::create_watcher,
+            commands::watchers::get_watcher,
+            commands::watchers::list_watchers,
+            commands::watchers::update_watcher,
+            commands::watchers::delete_watcher,
+            commands::watchers::set_watcher_enabled,
             // Container settings commands (Docker isolation)
             commands::container_settings::get_container_settings,
             commands::container_settings::update_container_settings,
@@ -1502,10 +1519,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 info!("Starting scheduler service");
                 let scheduler_db = app.state::<Arc<database::CheckpointDb>>().inner().clone();
+                let scheduler_pg = app.state::<Arc<commands::AppState>>().pg_db.clone();
                 tauri::async_runtime::spawn(async move {
                     // Wait briefly for MCP API server to bind
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    scheduler_service::start_scheduler_service(scheduler_db).await;
+                    scheduler_service::start_scheduler_service(scheduler_db, scheduler_pg).await;
                 });
             }
 

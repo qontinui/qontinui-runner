@@ -63,6 +63,7 @@ import { HooksManagerPanel } from "@/components/hooks";
 import { ErrorMonitorTab } from "@/components/error-monitor";
 import { ProcessManagerTab } from "@/components/process-manager";
 import { ReflectionDashboard } from "@/components/reflection-dashboard/ReflectionDashboard";
+import { ObservationBrowser } from "@/components/observations";
 import { ArchitectureView } from "@/components/architecture-view/ArchitectureView";
 import { GeneratorEvalPage } from "@/pages/GeneratorEvalPage";
 import { OrchestrationLoopPanel } from "@/components/orchestration-loop/OrchestrationLoopPanel";
@@ -81,6 +82,7 @@ const PipelineEventsTimeline = lazy(() => import("../pipeline-events/PipelineEve
 const RuleInfluencePanel = lazy(() => import("../rule-influence/RuleInfluencePanel").then(m => ({ default: m.RuleInfluencePanel })));
 const UnifiedSearchPanel = lazy(() => import("../unified-search/UnifiedSearchPanel"));
 const WorkflowVersionLineage = lazy(() => import("../workflow-versions/WorkflowVersionLineage").then(m => ({ default: m.WorkflowVersionLineage })));
+const SkillApprovalPanel = lazy(() => import("../skills/SkillApprovalPanel").then(m => ({ default: m.SkillApprovalPanel })));
 
 interface ActionLogViewData {
   actions: ActionLogEntry[];
@@ -234,6 +236,13 @@ export function TabContent({
         </div>
       );
 
+    case "observations":
+      return (
+        <div className="h-full overflow-hidden">
+          <ObservationBrowser projectId={projectSelection.selectedProjectId} />
+        </div>
+      );
+
     case "architecture":
       return (
         <div className="h-full overflow-hidden">
@@ -259,6 +268,13 @@ export function TabContent({
       return (
         <div className="h-full overflow-hidden">
           <MetaOptimizerPage />
+        </div>
+      );
+
+    case "skills":
+      return (
+        <div className="h-full overflow-hidden">
+          <SkillApprovalPanel />
         </div>
       );
 

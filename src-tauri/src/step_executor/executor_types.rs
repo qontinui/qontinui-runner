@@ -335,6 +335,12 @@ pub struct ExecutionStepConfig {
     #[serde(alias = "uiBridgeSnapshotTarget", alias = "ui_bridge_snapshot_target")]
     pub ui_bridge_snapshot_target: Option<String>,
 
+    /// UI Bridge: Structured action plan (JSON array of typed actions).
+    /// Used with ui_bridge_action = "action_plan" to execute a sequence of
+    /// pre-planned UI actions without a second LLM interpretation call.
+    #[serde(alias = "uiBridgeActionPlan", alias = "ui_bridge_action_plan")]
+    pub ui_bridge_action_plan: Option<serde_json::Value>,
+
     // ========================================================================
     // Artifact Step Fields
     // ========================================================================

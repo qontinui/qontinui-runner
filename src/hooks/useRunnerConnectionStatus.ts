@@ -8,7 +8,7 @@
  * the uiBridgeHealthStream GraphQL subscription (5s push).
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { useHealthStream } from "@/hooks/graphql";
 
@@ -30,15 +30,18 @@ export function useRunnerConnectionStatus(): ConnectionStatus {
   const { data, error: subError } = useHealthStream(5000);
   const [fallbackStatus, setFallbackStatus] = useState<ConnectionStatus | null>(null);
 
-  // If subscription is delivering data, derive status from it
-  if (data?.uiBridgeHealthStream) {
+  // Derive subscription status (all hooks called unconditionally above)
+  const subscriptionStatus = useMemo<ConnectionStatus | null>(() => {
+    if (!data?.uiBridgeHealthStream) return null;
     const health = data.uiBridgeHealthStream;
     return {
       isConnected: health.responsive,
       latencyMs: parseInt(health.heartbeatAgeMs, 10) || null,
       lastCheckedAt: Date.now(),
     };
-  }
+  }, [data]);
+
+  const hasSubscriptionData = !!subscriptionStatus;
 
   // Fallback: poll REST endpoint if subscription not connected yet
   const checkHealth = useCallback(async () => {
@@ -65,15 +68,16 @@ export function useRunnerConnectionStatus(): ConnectionStatus {
     }
   }, []);
 
-  // Only start fallback polling if subscription has an error or no data yet
+  // Only start fallback polling if subscription has no data yet
   useEffect(() => {
-    if (data?.uiBridgeHealthStream) return; // Subscription is working
+    if (hasSubscriptionData) return; // Subscription is working, skip polling
     checkHealth();
     const interval = setInterval(checkHealth, HEALTH_POLL_INTERVAL);
     return () => clearInterval(interval);
-  }, [checkHealth, data, subError]);
+  }, [checkHealth, hasSubscriptionData, subError]);
 
-  return fallbackStatus ?? {
+  // Return subscription data if available, otherwise fallback
+  return subscriptionStatus ?? fallbackStatus ?? {
     isConnected: !subError, // Optimistic if no data yet
     latencyMs: null,
     lastCheckedAt: null,

@@ -29,6 +29,10 @@ pub enum GraphNodeKind {
     PipelineAgent,
     /// A UI Bridge element that was interacted with during automation
     UIElement,
+    /// A persistent observation (Engram-inspired cross-session memory)
+    Observation,
+    /// A reusable procedural skill (hermes-agent-inspired self-improving memory)
+    Skill,
 }
 
 impl GraphNodeKind {
@@ -47,6 +51,8 @@ impl GraphNodeKind {
             Self::StepDef => "step_def",
             Self::PipelineAgent => "pipeline_agent",
             Self::UIElement => "ui_element",
+            Self::Observation => "observation",
+            Self::Skill => "skill",
         }
     }
 }
@@ -126,6 +132,16 @@ pub enum GraphEdgeKind {
     TouchesComponent,
     /// Task run interacted with a UI Bridge element
     InteractedWith,
+    /// Observation informed a workflow decision or fix
+    InformedBy,
+    /// Observation was learned from a task run
+    LearnedFrom,
+    /// Skill was used in a task run (applied during agentic phase)
+    UsedIn,
+    /// Skill was derived from a fix or finding pattern
+    DerivedFrom,
+    /// Skill supersedes an older, less effective skill
+    Supersedes,
 }
 
 impl GraphEdgeKind {
@@ -146,6 +162,11 @@ impl GraphEdgeKind {
             Self::BuiltBy => "built_by",
             Self::TouchesComponent => "touches_component",
             Self::InteractedWith => "interacted_with",
+            Self::InformedBy => "informed_by",
+            Self::LearnedFrom => "learned_from",
+            Self::UsedIn => "used_in",
+            Self::DerivedFrom => "derived_from",
+            Self::Supersedes => "supersedes",
         }
     }
 }

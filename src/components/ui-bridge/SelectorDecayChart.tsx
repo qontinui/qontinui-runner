@@ -43,7 +43,7 @@ export function SelectorDecayChart({ elementId, windowMs = 86_400_000, windows =
               <XAxis dataKey="window" tick={{ fontSize: 11 }} />
               <YAxis domain={[0, 100]} tick={{ fontSize: 11 }} tickFormatter={(v) => `${v}%`} />
               <ReferenceLine y={95} stroke="hsl(var(--muted-foreground))" strokeDasharray="3 3" />
-              <Tooltip formatter={(v: number) => [`${v}%`, "Success Rate"]} />
+              <Tooltip formatter={(v) => [`${Number(v)}%`, "Success Rate"]} />
               <Line type="monotone" dataKey="rate" stroke="hsl(var(--primary))" strokeWidth={2} dot />
             </LineChart>
           </ResponsiveContainer>

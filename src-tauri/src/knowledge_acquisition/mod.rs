@@ -1,5 +1,6 @@
 pub mod ingestor;
 pub mod providers;
+pub mod stats;
 pub mod summarizer;
 pub mod types;
 pub mod vuln_enrichment;
@@ -17,6 +18,8 @@ use providers::tavily::Tavily;
 use providers::ui_bridge_fetch::{SnapshotType, UiBridgeFetch};
 use providers::AvailableProviders;
 use reqwest::Client;
+use stats::KnowledgeStats;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -26,15 +29,25 @@ static GLOBAL_INSTANCE: OnceLock<Arc<KnowledgeAcquisition>> = OnceLock::new();
 
 /// Optional context for knowledge flywheel (Tier 0 lookup + Tier 3 storage).
 /// When provided, search() will check local knowledge first and store results after.
-pub struct SearchContext<'a> {
-    pub db: &'a crate::database::CheckpointDb,
-    pub task_run_id: &'a str,
+pub struct SearchContext {
+    pub db: Arc<crate::database::CheckpointDb>,
+    pub task_run_id: String,
+}
+
+impl SearchContext {
+    /// Create a system-level context (for API routes without a specific task)
+    pub fn system() -> Option<Self> {
+        let db = crate::database::CheckpointDb::new().ok()?;
+        Some(Self {
+            db: Arc::new(db),
+            task_run_id: "system".to_string(),
+        })
+    }
 }
 
 /// Coordinator for the knowledge acquisition system.
 /// Implements tiered search: local knowledge → UI Bridge → web search → store results.
 pub struct KnowledgeAcquisition {
-    client: Client,
     config: KnowledgeAcquisitionConfig,
     providers: AvailableProviders,
     duckduckgo: DuckDuckGo,
@@ -43,6 +56,7 @@ pub struct KnowledgeAcquisition {
     sploitus: Sploitus,
     osv: Osv,
     ui_bridge: UiBridgeFetch,
+    pub stats: KnowledgeStats,
 }
 
 impl KnowledgeAcquisition {
@@ -78,7 +92,6 @@ impl KnowledgeAcquisition {
             .as_ref()
             .map(|key| Perplexity::new(client.clone(), key.clone()))
             .or_else(|| Perplexity::from_env(client.clone()));
-        // UI Bridge connects to the runner's own MCP API for SDK proxy
         let ui_bridge = UiBridgeFetch::new(client.clone(), "http://127.0.0.1:1420");
 
         Self {
@@ -88,9 +101,9 @@ impl KnowledgeAcquisition {
             sploitus: Sploitus::new(client.clone()),
             osv: Osv::new(client.clone()),
             ui_bridge,
-            client,
             config,
             providers,
+            stats: KnowledgeStats::new(),
         }
     }
 
@@ -99,11 +112,7 @@ impl KnowledgeAcquisition {
         self.providers.list_available()
     }
 
-    /// Full tiered search with knowledge flywheel:
-    ///   Tier 0: Local knowledge (hybrid_search) — if ctx provided
-    ///   Tier 1: UI Bridge (if connected app)
-    ///   Tier 2: Web search (DDG → Tavily → Perplexity)
-    ///   Tier 3: Store results (ingestor) — if ctx provided
+    /// Full tiered search with knowledge flywheel
     pub async fn search(
         &self,
         query: &str,
@@ -120,12 +129,13 @@ impl KnowledgeAcquisition {
         query: &str,
         domain: KnowledgeDomain,
         max_results: usize,
-        ctx: Option<SearchContext<'_>>,
+        ctx: Option<&SearchContext>,
     ) -> Result<Vec<KnowledgeResult>, String> {
         if !self.config.enabled {
             return Ok(Vec::new());
         }
 
+        self.stats.total_searches.fetch_add(1, Ordering::Relaxed);
         let mut budget = self.config.to_budget();
         let mut all_results: Vec<KnowledgeResult> = Vec::new();
 
@@ -133,6 +143,11 @@ impl KnowledgeAcquisition {
         if let Some(ref ctx) = ctx {
             if let Ok(local_results) = self.search_local(query, &mut budget, ctx).await {
                 if !local_results.is_empty() {
+                    let count = local_results.len() as u64;
+                    self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .local_knowledge
+                        .record_success(count, 0);
                     return Ok(local_results);
                 }
             }
@@ -155,10 +170,19 @@ impl KnowledgeAcquisition {
                     Ok(Ok(results)) if !results.is_empty() => {
                         let content_bytes: usize =
                             results.iter().map(|r| r.content.len()).sum();
+                        self.stats
+                            .ui_bridge
+                            .record_success(results.len() as u64, content_bytes as u64);
                         budget.record_action(content_bytes);
                         all_results.extend(results);
                     }
-                    _ => {} // UI Bridge unavailable or failed — fall through to web
+                    Ok(Err(_)) => {
+                        self.stats.ui_bridge.record_failure();
+                    }
+                    Err(_) => {
+                        self.stats.ui_bridge.record_timeout();
+                    }
+                    _ => {}
                 }
             }
         }
@@ -173,13 +197,18 @@ impl KnowledgeAcquisition {
             {
                 Ok(Ok(results)) => {
                     let content_bytes: usize = results.iter().map(|r| r.content.len()).sum();
+                    self.stats
+                        .duckduckgo
+                        .record_success(results.len() as u64, content_bytes as u64);
                     budget.record_action(content_bytes);
                     all_results.extend(results);
                 }
                 Ok(Err(e)) => {
+                    self.stats.duckduckgo.record_failure();
                     eprintln!("[knowledge_acquisition] DuckDuckGo search failed: {e}");
                 }
                 Err(_) => {
+                    self.stats.duckduckgo.record_timeout();
                     eprintln!("[knowledge_acquisition] DuckDuckGo search timed out");
                 }
             }
@@ -205,13 +234,18 @@ impl KnowledgeAcquisition {
                     Ok(Ok(results)) => {
                         let content_bytes: usize =
                             results.iter().map(|r| r.content.len()).sum();
+                        self.stats
+                            .tavily
+                            .record_success(results.len() as u64, content_bytes as u64);
                         budget.record_action(content_bytes);
                         all_results.extend(results);
                     }
                     Ok(Err(e)) => {
+                        self.stats.tavily.record_failure();
                         eprintln!("[knowledge_acquisition] Tavily search failed: {e}");
                     }
                     Err(_) => {
+                        self.stats.tavily.record_timeout();
                         eprintln!("[knowledge_acquisition] Tavily search timed out");
                     }
                 }
@@ -229,13 +263,18 @@ impl KnowledgeAcquisition {
                     Ok(Ok(results)) => {
                         let content_bytes: usize =
                             results.iter().map(|r| r.content.len()).sum();
+                        self.stats
+                            .perplexity
+                            .record_success(results.len() as u64, content_bytes as u64);
                         budget.record_action(content_bytes);
                         all_results.extend(results);
                     }
                     Ok(Err(e)) => {
+                        self.stats.perplexity.record_failure();
                         eprintln!("[knowledge_acquisition] Perplexity search failed: {e}");
                     }
                     Err(_) => {
+                        self.stats.perplexity.record_timeout();
                         eprintln!("[knowledge_acquisition] Perplexity search timed out");
                     }
                 }
@@ -264,14 +303,31 @@ impl KnowledgeAcquisition {
         if !all_results.is_empty() {
             if let Some(ctx) = ctx {
                 let outcomes =
-                    ingestor::ingest_results(&all_results, ctx.task_run_id, ctx.db).await;
+                    ingestor::ingest_results(&all_results, &ctx.task_run_id, &ctx.db).await;
                 let stored = outcomes
                     .iter()
                     .filter(|o| matches!(o, ingestor::IngestOutcome::Stored { .. }))
                     .count();
+                let deduped = outcomes
+                    .iter()
+                    .filter(|o| matches!(o, ingestor::IngestOutcome::Duplicate { .. }))
+                    .count();
+                let injections = outcomes
+                    .iter()
+                    .filter(|o| matches!(o, ingestor::IngestOutcome::Stored { injection_flagged: true, .. }))
+                    .count();
+                self.stats
+                    .results_ingested
+                    .fetch_add(stored as u64, Ordering::Relaxed);
+                self.stats
+                    .dedup_skipped
+                    .fetch_add(deduped as u64, Ordering::Relaxed);
+                self.stats
+                    .injection_detections
+                    .fetch_add(injections as u64, Ordering::Relaxed);
                 if stored > 0 {
                     eprintln!(
-                        "[knowledge_acquisition] Stored {stored}/{} results in task_knowledge",
+                        "[knowledge_acquisition] Stored {stored}/{} results in task_knowledge ({deduped} deduped)",
                         all_results.len()
                     );
                 }
@@ -286,7 +342,7 @@ impl KnowledgeAcquisition {
         &self,
         query: &str,
         budget: &mut SearchBudget,
-        ctx: &SearchContext<'_>,
+        ctx: &SearchContext,
     ) -> Result<Vec<KnowledgeResult>, String> {
         use crate::database::embedding_client::EmbeddingClient;
         use crate::database::hybrid_search::{hybrid_search_knowledge, HybridSearchConfig};
@@ -320,7 +376,7 @@ impl KnowledgeAcquisition {
             return Ok(Vec::new());
         }
 
-        budget.record_action(0); // Tier 0 doesn't count against content budget
+        budget.record_action(0);
 
         Ok(results
             .into_iter()
@@ -336,7 +392,7 @@ impl KnowledgeAcquisition {
             .collect())
     }
 
-    /// Vulnerability-specific search — queries Sploitus (and OSV for CVE IDs)
+    /// Vulnerability-specific search — queries Sploitus (and logs CVE IDs for OSV)
     pub async fn search_vulnerabilities(
         &self,
         query: &str,
@@ -348,7 +404,6 @@ impl KnowledgeAcquisition {
         let mut budget = self.config.to_budget();
         let mut all_results: Vec<KnowledgeResult> = Vec::new();
 
-        // Query Sploitus for exploits
         if budget.can_search() && self.providers.is_available(SearchProvider::Sploitus) {
             match tokio::time::timeout(
                 budget.timeout_per_call,
@@ -359,19 +414,23 @@ impl KnowledgeAcquisition {
             {
                 Ok(Ok(results)) => {
                     let content_bytes: usize = results.iter().map(|r| r.content.len()).sum();
+                    self.stats
+                        .sploitus
+                        .record_success(results.len() as u64, content_bytes as u64);
                     budget.record_action(content_bytes);
                     all_results.extend(results);
                 }
                 Ok(Err(e)) => {
+                    self.stats.sploitus.record_failure();
                     eprintln!("[knowledge_acquisition] Sploitus search failed: {e}");
                 }
                 Err(_) => {
+                    self.stats.sploitus.record_timeout();
                     eprintln!("[knowledge_acquisition] Sploitus search timed out");
                 }
             }
         }
 
-        // Also try OSV if query looks like a CVE ID
         if budget.can_search() && self.providers.is_available(SearchProvider::OsvDev) {
             let cve_ids = vuln_enrichment::extract_cve_ids(query);
             if !cve_ids.is_empty() {
@@ -407,7 +466,6 @@ impl KnowledgeAcquisition {
         if let Some(ref tavily) = self.tavily {
             tavily.search(query, max_results, "advanced").await
         } else {
-            // Fall back to DuckDuckGo
             self.duckduckgo.search(query, max_results).await
         }
     }
@@ -470,5 +528,14 @@ mod tests {
             budget.record_action(100);
         }
         assert!(!budget.can_search());
+    }
+
+    #[test]
+    fn test_stats_initialized() {
+        let ka = KnowledgeAcquisition::with_config(KnowledgeAcquisitionConfig::default());
+        let snap = ka.stats.snapshot();
+        assert_eq!(snap.total_searches, 0);
+        assert_eq!(snap.cache_hits, 0);
+        assert_eq!(snap.providers.duckduckgo.queries, 0);
     }
 }

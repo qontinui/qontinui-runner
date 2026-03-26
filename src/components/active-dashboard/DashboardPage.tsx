@@ -28,6 +28,7 @@ import type { DashboardStatus } from "../../hooks/dashboard/useDashboardState";
 import type { StepStats } from "@/components/widgets/shared/types";
 import type { CommandResponse } from "../../types/displayProfile";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { useTaskRunControls } from "@/hooks/graphql";
 import { createLogger } from "@/lib/logger";
 
 const log = createLogger("Dashboard");
@@ -117,6 +118,9 @@ export function DashboardPage({
 
   // Widget pin/hide preferences
   const widgetPreferences = useWidgetPreferences();
+
+  // GraphQL mutations for task run lifecycle (stop, pause, unpause)
+  const taskControls = useTaskRunControls();
 
   // Get flow execution data for flow-specific controls
   const flowExecutionData = useFlowExecutionData();
@@ -245,20 +249,14 @@ export function DashboardPage({
       }
     }
 
-    // 2. Stop unified workflow (AI task) via HTTP API if we have a task ID
+    // 2. Stop unified workflow (AI task) via GraphQL mutation
     if (taskId) {
       try {
         log.debug(`Stopping unified workflow: ${taskId}`);
-        const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/stop`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-        });
-        if (response.ok) {
-          const data = await response.json();
-          if (data.success) {
-            log.debug("Unified workflow stopped successfully");
-            stopped = true;
-          }
+        const success = await taskControls.stop(taskId);
+        if (success) {
+          log.debug("Unified workflow stopped successfully via GraphQL");
+          stopped = true;
         }
       } catch (error) {
         console.error("[Dashboard] Failed to stop unified workflow:", error);
@@ -328,31 +326,19 @@ export function DashboardPage({
 
           if (taskIsPaused) {
             log.debug(`Unpausing unified workflow: ${taskId}`);
-            const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/unpause`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-            });
-            if (response.ok) {
-              const data = await response.json();
-              if (data.success) {
-                log.debug("Unified workflow resumed successfully");
-                setIsPaused(false);
-                return;
-              }
+            const success = await taskControls.unpause(taskId);
+            if (success) {
+              log.debug("Unified workflow resumed successfully via GraphQL");
+              setIsPaused(false);
+              return;
             }
           } else {
             log.debug(`Pausing unified workflow: ${taskId}`);
-            const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/pause`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-            });
-            if (response.ok) {
-              const data = await response.json();
-              if (data.success) {
-                log.debug("Unified workflow paused successfully");
-                setIsPaused(true);
-                return;
-              }
+            const success = await taskControls.pause(taskId);
+            if (success) {
+              log.debug("Unified workflow paused successfully via GraphQL");
+              setIsPaused(true);
+              return;
             }
           }
         }

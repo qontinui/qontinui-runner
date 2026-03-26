@@ -56,6 +56,7 @@
 
 pub mod agent_roles;
 pub mod agent_tool;
+pub mod brain_actor;
 pub mod role_specializations;
 pub mod tool_guard;
 pub mod checkpoint;

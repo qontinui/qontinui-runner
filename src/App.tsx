@@ -36,6 +36,7 @@ import {
 import { useGlobalLogSources } from "./hooks/useGlobalLogSources";
 import { useCanaryAlerts } from "./hooks/useCanaryAlerts";
 import { useGraphDataRefresh } from "./hooks/useGraphDataRefresh";
+import { useObservationServices } from "./hooks/useObservationServices";
 
 import StatusIndicator from "./components/StatusIndicator";
 import ActionDetailModal from "./components/ActionDetailModal";
@@ -171,6 +172,9 @@ function AppContent() {
   // Subscribe to runner events and auto-invalidate graph analytics queries
   // when tasks complete, findings change, or workflows are generated.
   useGraphDataRefresh();
+
+  // Initialize observation persistence services (session summaries + learning bridge)
+  useObservationServices(projectSelection.selectedProjectId);
 
   useEffect(() => {
     if (auth.authStatus?.authenticated && !auth.loading) {

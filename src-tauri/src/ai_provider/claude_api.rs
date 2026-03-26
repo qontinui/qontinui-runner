@@ -1,11 +1,12 @@
 #![allow(dead_code)]
 
+use super::multimodal::MultimodalPrompt;
 use super::retry::retry_with_backoff;
 use super::types::AiResponse;
 use crate::config_facade::ai_keychain;
 use crate::doctor::DoctorHandle;
 use crate::settings;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Run a prompt via Claude API (direct HTTP calls)
 ///
@@ -200,6 +201,129 @@ pub(super) fn run_claude_api_with_overrides(
                 }
             }
             Err(e) => AiResponse::error(format!("Claude API request failed: {}", e)),
+        }
+    })
+}
+
+/// Run a multimodal prompt via Claude API with text + image content blocks.
+///
+/// This sends proper content arrays to Claude's Messages API, enabling vision
+/// features like screenshot analysis. Falls back to text-only if no images.
+///
+/// Claude API multimodal format:
+/// ```json
+/// {
+///   "messages": [{
+///     "role": "user",
+///     "content": [
+///       {"type": "text", "text": "..."},
+///       {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}
+///     ]
+///   }]
+/// }
+/// ```
+pub(super) fn run_claude_api_multimodal(
+    prompt: &MultimodalPrompt,
+    settings: &settings::ClaudeApiSettings,
+    model_override: Option<&str>,
+    _doctor_handle: Option<&DoctorHandle>,
+    temperature_override: Option<f32>,
+    max_tokens_override: Option<u32>,
+) -> AiResponse {
+    let model = model_override.unwrap_or(&settings.model);
+    let max_tokens = max_tokens_override.unwrap_or(settings.max_tokens);
+
+    info!(
+        "Running Claude API multimodal (model: {}, has_images: {}, blocks: {})",
+        model,
+        prompt.has_images(),
+        prompt.content.len()
+    );
+
+    let api_key = match ai_keychain().get("claude_api") {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            return AiResponse::error(
+                "No Claude API key configured. Please set your API key in Settings.".to_string(),
+            )
+        }
+        Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
+    };
+
+    let client = match reqwest::blocking::Client::builder().build() {
+        Ok(c) => c,
+        Err(e) => return AiResponse::error(format!("Failed to create HTTP client: {}", e)),
+    };
+
+    // Build multimodal request body with content block array
+    let mut request_body = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": prompt.to_claude_messages()
+    });
+
+    // Add system prompt if present
+    if let Some(ref system) = prompt.system {
+        request_body["system"] = serde_json::json!(system);
+    }
+
+    // Add temperature override if present
+    if let Some(temp) = temperature_override {
+        request_body["temperature"] = serde_json::json!(temp);
+    }
+
+    retry_with_backoff("Claude API (multimodal)", || {
+        let response = client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&request_body)
+            .send();
+
+        match response {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().unwrap_or_default();
+                    return AiResponse::error(format!(
+                        "Claude API multimodal error ({}): {}",
+                        status, body
+                    ));
+                }
+
+                match resp.json::<serde_json::Value>() {
+                    Ok(json) => {
+                        // Extract text content from response (same format as text-only)
+                        let content = json["content"]
+                            .as_array()
+                            .and_then(|arr| arr.first())
+                            .and_then(|c| c["text"].as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        let input_tokens = json["usage"]["input_tokens"].as_u64();
+                        let output_tokens = json["usage"]["output_tokens"].as_u64();
+
+                        if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
+                            debug!(
+                                "Claude API multimodal tokens - input: {}, output: {}, total: {}",
+                                input,
+                                output,
+                                input + output
+                            );
+                            AiResponse::success_with_tokens(content, input, output)
+                        } else {
+                            AiResponse::success(content)
+                        }
+                    }
+                    Err(e) => AiResponse::error(format!(
+                        "Failed to parse Claude API multimodal response: {}",
+                        e
+                    )),
+                }
+            }
+            Err(e) => AiResponse::error(format!("Claude API multimodal request failed: {}", e)),
         }
     })
 }

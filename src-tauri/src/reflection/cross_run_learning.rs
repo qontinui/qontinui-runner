@@ -16,13 +16,26 @@ use tracing::{info, warn};
 /// 2. Detect fix oscillations (fixes that work temporarily then regress)
 /// 3. Auto-disable ineffective generation rules (break point #3)
 /// 4. Auto-apply known-good fixes for recurring findings (break point #7)
+/// 5. Extract procedural skills from effective fix patterns (hermes-agent-inspired)
 ///
 /// Returns (patterns_detected, rules_disabled, fixes_auto_applied).
+/// Also returns extracted skills via the `extracted_skills` out-parameter so
+/// the async caller can emit `skill.created` events on the workflow event bus.
 pub fn post_run_analysis(
     conn: &Connection,
     workflow_name: &str,
     task_run_id: &str,
 ) -> Result<(u32, u32, u32), String> {
+    let (_p, _r, _f, _skills) = post_run_analysis_with_skills(conn, workflow_name, task_run_id)?;
+    Ok((_p, _r, _f))
+}
+
+/// Same as `post_run_analysis` but also returns extracted skills for event emission.
+pub fn post_run_analysis_with_skills(
+    conn: &Connection,
+    workflow_name: &str,
+    task_run_id: &str,
+) -> Result<(u32, u32, u32, Vec<ExtractedSkill>), String> {
     info!(
         "Starting cross-run analysis for workflow '{}' after task run {}",
         workflow_name, task_run_id
@@ -54,18 +67,29 @@ pub fn post_run_analysis(
     // 4. Auto-apply known-good fixes for recurring findings
     let fixes_applied = auto_apply_recurring_fixes(conn, workflow_name, &recurring)?;
 
+    // 5. Extract procedural skills from effective fix patterns (hermes-agent-inspired)
+    let extracted_skills = extract_procedural_skills_detailed(conn, workflow_name, task_run_id, 3)?;
+    if !extracted_skills.is_empty() {
+        info!(
+            "Extracted {} procedural skills from task run {}",
+            extracted_skills.len(), task_run_id
+        );
+    }
+
     info!(
-        "Cross-run analysis complete: {} patterns, {} oscillations, {} rules disabled, {} fixes auto-applied",
+        "Cross-run analysis complete: {} patterns, {} oscillations, {} rules disabled, {} fixes auto-applied, {} skills extracted",
         patterns_detected + oscillation_count,
         oscillation_count,
         rules_disabled,
-        fixes_applied
+        fixes_applied,
+        extracted_skills.len()
     );
 
     Ok((
         patterns_detected + oscillation_count,
         rules_disabled,
         fixes_applied,
+        extracted_skills,
     ))
 }
 
@@ -263,6 +287,283 @@ pub fn provenance_based_fix_routing(
     None
 }
 
+/// A skill that was auto-extracted during cross-run analysis.
+/// Returned to the caller so they can emit async events on the workflow event bus.
+#[derive(Debug, Clone)]
+pub struct ExtractedSkill {
+    pub skill_id: String,
+    pub skill_slug: String,
+    pub source_fix_id: String,
+    pub source_task_run_id: String,
+    pub workflow_name: String,
+}
+
+/// Extract procedural skills from successful complex task runs.
+///
+/// Inspired by hermes-agent's self-improving procedural memory: when a task run
+/// succeeds after significant effort (multiple iterations, effective fixes), the
+/// fix pattern is captured as a reusable skill with source="auto".
+///
+/// Skills are created with:
+/// - A descriptive name derived from the fix type and target component
+/// - The signature_hash embedded in the description for knowledge graph linking
+/// - Approval_status="pending" (requires review before injection into prompts)
+/// - A single-step template containing the fix as a command or prompt
+///
+/// Returns the number of skills created.
+pub fn extract_procedural_skills(
+    conn: &Connection,
+    workflow_name: &str,
+    task_run_id: &str,
+    min_iterations: i64,
+) -> Result<u32, String> {
+    let skills = extract_procedural_skills_detailed(conn, workflow_name, task_run_id, min_iterations)?;
+    Ok(skills.len() as u32)
+}
+
+/// Same as `extract_procedural_skills` but returns details of each created skill
+/// so the caller can emit `skill.created` events on the workflow event bus.
+pub fn extract_procedural_skills_detailed(
+    conn: &Connection,
+    workflow_name: &str,
+    task_run_id: &str,
+    min_iterations: i64,
+) -> Result<Vec<ExtractedSkill>, String> {
+    // Only extract from successful runs with significant iteration counts
+    let run_info: Option<(String, i64)> = conn
+        .query_row(
+            r#"SELECT status, sessions_count
+               FROM task_runs
+               WHERE id = ?1"#,
+            params![task_run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map(|v| Some(v))
+        .or_else(|e| {
+            if e == rusqlite::Error::QueryReturnedNoRows {
+                Ok(None)
+            } else {
+                Err(format!("Failed to query task run: {}", e))
+            }
+        })?;
+
+    let (_status, iterations) = match run_info {
+        Some((s, i)) if s == "completed" && i >= min_iterations => (s, i),
+        _ => return Ok(Vec::new()), // Skip non-qualifying runs
+    };
+
+    // Find effective fixes from this run that aren't already captured as skills
+    let effective_fixes: Vec<(String, String, String, Option<String>, Option<String>, Option<String>)> = conn
+        .prepare(
+            r#"SELECT rf.id, rf.fix_type, rf.fix_description,
+                      rf.file_changed, rf.old_value, rf.new_value
+               FROM reflection_fixes rf
+               WHERE rf.source_task_run_id = ?1
+               AND rf.effectiveness = 'effective'
+               AND rf.reuse_count >= 2
+               AND rf.fix_type NOT IN ('no_change', 'manual_override')
+               AND NOT EXISTS (
+                   SELECT 1 FROM user_skills us
+                   WHERE us.source = 'auto'
+                   AND us.description LIKE '%' || rf.id || '%'
+               )
+               ORDER BY rf.reuse_count DESC
+               LIMIT 5"#,
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(params![task_run_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .map_err(|e| format!("Failed to query effective fixes: {}", e))?;
+
+    if effective_fixes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut extracted: Vec<ExtractedSkill> = Vec::new();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    for (fix_id, fix_type, fix_desc, file_changed, _old_value, new_value) in &effective_fixes {
+        // Generate a slug from the fix type and affected file.
+        // Normalize Windows backslashes before extracting the filename component.
+        let normalized = file_changed
+            .as_deref()
+            .map(|f| f.replace('\\', "/"));
+        let component = normalized
+            .as_deref()
+            .and_then(|f| f.rsplit('/').next())
+            .unwrap_or("general");
+        let raw_slug = format!(
+            "auto-{}-{}",
+            fix_type.replace('_', "-"),
+            component.replace('.', "-").to_lowercase()
+        );
+        // Truncate to 80 chars and strip non-alphanumeric/hyphen characters
+        let slug: String = raw_slug
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-')
+            .take(80)
+            .collect();
+
+        // Check for existing skill with same slug
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_skills WHERE slug = ?1",
+                params![slug],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+
+        if exists {
+            continue;
+        }
+
+        let skill_id = format!("auto:{}", slug);
+        let name = format!(
+            "Auto: {} ({})",
+            fix_desc.chars().take(60).collect::<String>(),
+            fix_type
+        );
+
+        // Build description with provenance links
+        let description = format!(
+            "Procedurally extracted from workflow '{}' (task_run: {}, fix: {}). \
+             Fix type: {}. Iterations: {}. {}",
+            workflow_name,
+            task_run_id,
+            fix_id,
+            fix_type,
+            iterations,
+            file_changed
+                .as_deref()
+                .map(|f| format!("File: {}", f))
+                .unwrap_or_default()
+        );
+
+        // Create a single-step template based on the fix type
+        let step = match fix_type.as_str() {
+            "workflow_step_rewrite" | "selector_fix" | "tool_config_update" => {
+                // For step rewrites, store the new value as a prompt step
+                let content = new_value.as_deref().unwrap_or(fix_desc);
+                serde_json::json!({
+                    "kind": "single_step",
+                    "step": {
+                        "step_type": "prompt",
+                        "name": format!("Apply {} fix", fix_type),
+                        "prompt": format!("Apply the following fix: {}", content),
+                        "description": fix_desc
+                    }
+                })
+            }
+            _ => {
+                serde_json::json!({
+                    "kind": "single_step",
+                    "step": {
+                        "step_type": "prompt",
+                        "name": format!("Apply {} fix", fix_type),
+                        "prompt": format!("Apply fix: {}", fix_desc),
+                        "description": fix_desc
+                    }
+                })
+            }
+        };
+        let template_json = serde_json::to_string(&step).unwrap_or_default();
+
+        // Determine category from fix type
+        let category = match fix_type.as_str() {
+            "selector_fix" | "tool_config_update" => "testing",
+            "workflow_step_rewrite" => "ai-task",
+            _ => "custom",
+        };
+
+        // Look up matching cross_run_pattern via the fix's source finding signature_hash
+        let source_pattern_id: Option<String> = conn
+            .query_row(
+                r#"SELECT crp.id FROM cross_run_patterns crp
+                   INNER JOIN task_run_findings trf ON trf.signature_hash = crp.signature_hash
+                   INNER JOIN reflection_fixes rf ON rf.source_finding_id = trf.id
+                   WHERE rf.id = ?1
+                   LIMIT 1"#,
+                params![fix_id],
+                |row| row.get(0),
+            )
+            .ok();
+
+        // Insert the skill with source provenance FKs
+        let result = conn.execute(
+            r#"INSERT INTO user_skills (
+                id, name, slug, description, category, tags, icon, color,
+                allowed_phases, parameters, template, source,
+                version, usage_count, approval_status,
+                source_fix_id, source_pattern_id,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"#,
+            params![
+                skill_id,
+                name,
+                slug,
+                description,
+                category,
+                format!("[\"auto\",\"{}\"]", fix_type),
+                "zap",          // icon
+                "amber",        // color
+                "[\"agentic\"]", // allowed_phases — skills are injected during agentic phase
+                "[]",           // parameters — auto skills have no user-configurable params
+                template_json,
+                "auto",         // source
+                "1.0.0",        // version
+                0i64,           // usage_count
+                "pending",      // approval_status — requires review
+                fix_id,         // source_fix_id — FK to reflection_fixes
+                source_pattern_id, // source_pattern_id — FK to cross_run_patterns
+                now,
+                now,
+            ],
+        );
+
+        match result {
+            Ok(_) => {
+                info!(
+                    "Extracted procedural skill '{}' from fix {} in workflow '{}'",
+                    slug, fix_id, workflow_name
+                );
+                extracted.push(ExtractedSkill {
+                    skill_id: skill_id.clone(),
+                    skill_slug: slug.clone(),
+                    source_fix_id: fix_id.clone(),
+                    source_task_run_id: task_run_id.to_string(),
+                    workflow_name: workflow_name.to_string(),
+                });
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to create procedural skill '{}': {}",
+                    slug, e
+                );
+            }
+        }
+    }
+
+    if !extracted.is_empty() {
+        info!(
+            "Extracted {} procedural skills from task run {} (workflow '{}')",
+            extracted.len(), task_run_id, workflow_name
+        );
+    }
+
+    Ok(extracted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +708,32 @@ mod tests {
                 evidence TEXT,
                 phase TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE user_skills (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL UNIQUE,
+                description TEXT DEFAULT '',
+                category TEXT DEFAULT 'custom',
+                tags TEXT DEFAULT '[]',
+                icon TEXT DEFAULT 'puzzle',
+                color TEXT DEFAULT 'gray',
+                allowed_phases TEXT DEFAULT '["setup"]',
+                parameters TEXT DEFAULT '[]',
+                template TEXT NOT NULL DEFAULT '{}',
+                source TEXT DEFAULT 'user',
+                version TEXT DEFAULT '1.0.0',
+                author TEXT,
+                checksum TEXT,
+                depends_on TEXT,
+                usage_count INTEGER DEFAULT 0,
+                approval_status TEXT DEFAULT 'pending',
+                forked_from TEXT,
+                source_fix_id TEXT,
+                source_pattern_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             "#,
         )
@@ -572,5 +899,86 @@ mod tests {
         );
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_procedural_skills() {
+        let conn = setup_test_db();
+
+        // Create a completed task run with enough iterations
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, status, sessions_count, workflow_name)
+             VALUES ('tr-skill-1', 'Test task', 'completed', 5, 'test-workflow')",
+            [],
+        )
+        .unwrap();
+
+        // Create an effective fix
+        conn.execute(
+            r#"INSERT INTO reflection_fixes (id, source_task_run_id, reflection_task_run_id,
+                fix_type, fix_description, file_changed, effectiveness, reuse_count)
+               VALUES ('fix-skill-1', 'tr-skill-1', 'rtr-1', 'selector_fix',
+                       'Use #email-input instead of .login-field',
+                       'src/tests/login.spec.ts', 'effective', 2)"#,
+            [],
+        )
+        .unwrap();
+
+        // Extract skills
+        let created = extract_procedural_skills(&conn, "test-workflow", "tr-skill-1", 3).unwrap();
+        assert_eq!(created, 1, "Should have created 1 skill");
+
+        // Verify skill was inserted
+        let skill_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_skills WHERE source = 'auto'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(skill_count, 1);
+
+        // Verify skill properties
+        let (name, approval, category): (String, String, String) = conn
+            .query_row(
+                "SELECT name, approval_status, category FROM user_skills WHERE source = 'auto'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(name.contains("selector_fix"), "Name should reference fix type");
+        assert_eq!(approval, "pending", "Auto skills should start as pending");
+        assert_eq!(category, "testing", "Selector fixes should be categorized as testing");
+
+        // Running extraction again should not create duplicates
+        let created_again = extract_procedural_skills(&conn, "test-workflow", "tr-skill-1", 3).unwrap();
+        assert_eq!(created_again, 0, "Should not create duplicate skills");
+    }
+
+    #[test]
+    fn test_extract_procedural_skills_skips_non_qualifying_runs() {
+        let conn = setup_test_db();
+
+        // Create a failed task run
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, status, sessions_count, workflow_name)
+             VALUES ('tr-fail-1', 'Failed task', 'failed', 5, 'test-workflow')",
+            [],
+        )
+        .unwrap();
+
+        let created = extract_procedural_skills(&conn, "test-workflow", "tr-fail-1", 3).unwrap();
+        assert_eq!(created, 0, "Should not extract skills from failed runs");
+
+        // Create a successful but low-iteration run
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, status, sessions_count, workflow_name)
+             VALUES ('tr-easy-1', 'Easy task', 'completed', 1, 'test-workflow')",
+            [],
+        )
+        .unwrap();
+
+        let created = extract_procedural_skills(&conn, "test-workflow", "tr-easy-1", 3).unwrap();
+        assert_eq!(created, 0, "Should not extract skills from low-iteration runs");
     }
 }

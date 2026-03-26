@@ -6073,6 +6073,47 @@ impl CheckpointDb {
             }
         }
 
+        // Migration 161: Add source_fix_id and source_pattern_id to user_skills
+        // for proper FK linking instead of fragile LIKE-based joins.
+        if current_version < 161 {
+            info!("Migrating to version 161 (user_skills provenance FK columns)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE user_skills ADD COLUMN source_fix_id TEXT;
+                ALTER TABLE user_skills ADD COLUMN source_pattern_id TEXT;
+
+                CREATE INDEX IF NOT EXISTS idx_user_skills_source_fix ON user_skills(source_fix_id);
+                CREATE INDEX IF NOT EXISTS idx_user_skills_source_pattern ON user_skills(source_pattern_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (161, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Migration 161 failed: {}", e))?;
+
+            info!("Successfully migrated to version 161 (user_skills provenance FKs)");
+        }
+
+        // Migration 162: Add verification_passed column to task_runs.
+        // Required by fixer trigger Guard 7 (fixer_on_failure_only) to skip
+        // fixer launch when the parent workflow passed verification.
+        // Without this column, the guard silently fails (COALESCE returns 0)
+        // and fixers launch for successful runs — then fail loading nonexistent fixes.
+        if current_version < 162 {
+            info!("Migrating to version 162 (task_runs verification_passed column)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE task_runs ADD COLUMN verification_passed BOOLEAN DEFAULT 0;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (162, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Migration 162 failed: {}", e))?;
+
+            info!("Successfully migrated to version 162 (verification_passed)");
+        }
+
         Ok(())
     }
 }

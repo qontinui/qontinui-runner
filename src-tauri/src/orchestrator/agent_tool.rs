@@ -629,6 +629,113 @@ impl ToolRegistry {
                 .with_tag("documentation"),
         );
 
+        // --- Knowledge Acquisition Tools ---
+
+        // Web search tool
+        registry.register(
+            AgentTool::from_role("researcher")
+                .with_name("search_web")
+                .with_description(
+                    "Fast web search for quick fact-checking. Returns short snippets and links. \
+                     Best for: error messages, simple API questions, version compatibility checks. \
+                     For deep research, use research_error or lookup_api_docs instead.",
+                )
+                .with_input("query", ToolInputType::String)
+                .with_optional_input("max_results", ToolInputType::Integer)
+                .with_output("results", ToolInputType::Array)
+                .with_output("provider_used", ToolInputType::Array)
+                .with_tag("knowledge")
+                .with_tag("search"),
+        );
+
+        // Error research tool
+        registry.register(
+            AgentTool::from_role("researcher")
+                .with_name("research_error")
+                .with_description(
+                    "Research an error message using web search with automatic escalation. \
+                     Checks local knowledge first, then DuckDuckGo, then Tavily for deep results. \
+                     Results are cached for future lookups. Best for: debugging unfamiliar errors, \
+                     framework-specific issues, stack trace analysis.",
+                )
+                .with_input("error_message", ToolInputType::String)
+                .with_optional_input("framework", ToolInputType::String)
+                .with_optional_input("stack_trace", ToolInputType::String)
+                .with_output("results", ToolInputType::Array)
+                .with_output("provider_used", ToolInputType::Array)
+                .with_tag("knowledge")
+                .with_tag("debugging"),
+        );
+
+        // Vulnerability search tool
+        registry.register(
+            AgentTool::from_role("security_analyst")
+                .with_name("search_vulnerabilities")
+                .with_description(
+                    "Search for known exploits and proof-of-concept code by software name, \
+                     version, or CVE ID. Returns exploit source code, CVSS severity scores, \
+                     and links to original sources. Best for: checking if a dependency has known \
+                     exploits, enriching security findings with real-world exploit context.",
+                )
+                .with_input("query", ToolInputType::String)
+                .with_output("results", ToolInputType::Array)
+                .with_output("provider_used", ToolInputType::Array)
+                .with_tag("knowledge")
+                .with_tag("security"),
+        );
+
+        // Dependency audit tool
+        registry.register(
+            AgentTool::from_role("security_analyst")
+                .with_name("audit_dependencies")
+                .with_description(
+                    "Query the Open Source Vulnerabilities database for known CVEs in specific \
+                     package versions. Supports npm, PyPI, crates.io, Go, Maven, and NuGet. \
+                     Best for: dependency auditing, checking if specific package versions have \
+                     known vulnerabilities. Returns CVE IDs, CVSS scores, and remediation guidance.",
+                )
+                .with_input("packages", ToolInputType::Array)
+                .with_output("packages", ToolInputType::Array)
+                .with_output("total_vulns", ToolInputType::Integer)
+                .with_tag("knowledge")
+                .with_tag("security"),
+        );
+
+        // API docs lookup tool
+        registry.register(
+            AgentTool::from_role("researcher")
+                .with_name("lookup_api_docs")
+                .with_description(
+                    "Deep web search with AI-synthesized answers and full page content. \
+                     Uses Tavily (advanced depth) when available, falls back to DuckDuckGo. \
+                     Best for: framework migration guides, detailed API documentation, \
+                     multi-source synthesis. Slower than search_web — use only when quick \
+                     search is insufficient.",
+                )
+                .with_input("query", ToolInputType::String)
+                .with_optional_input("max_results", ToolInputType::Integer)
+                .with_output("results", ToolInputType::Array)
+                .with_output("provider_used", ToolInputType::Array)
+                .with_tag("knowledge")
+                .with_tag("documentation"),
+        );
+
+        // Manifest audit tool
+        registry.register(
+            AgentTool::from_role("security_analyst")
+                .with_name("audit_manifest")
+                .with_description(
+                    "Audit dependencies by parsing a manifest file (package.json, Cargo.toml, \
+                     or pyproject.toml). Extracts all packages and batch-queries OSV.dev for \
+                     known vulnerabilities. Returns per-package CVE lists with CVSS scores.",
+                )
+                .with_input("manifest_path", ToolInputType::FilePath)
+                .with_output("packages", ToolInputType::Array)
+                .with_output("total_vulns", ToolInputType::Integer)
+                .with_tag("knowledge")
+                .with_tag("security"),
+        );
+
         registry
     }
 }

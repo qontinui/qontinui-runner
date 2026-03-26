@@ -333,7 +333,9 @@ mod tests {
 
     #[test]
     fn test_trigram_short_strings() {
-        assert_eq!(trigram_similarity("ab", "ab"), 0.0);
+        // Identical strings return 1.0 regardless of length
+        assert_eq!(trigram_similarity("ab", "ab"), 1.0);
+        // Different strings shorter than 3 chars return 0.0 (no trigrams)
         assert_eq!(trigram_similarity("a", "abc"), 0.0);
     }
 
@@ -357,7 +359,9 @@ mod tests {
 
     #[test]
     fn test_trigram_empty_strings() {
-        assert_eq!(trigram_similarity("", ""), 0.0);
+        // Identical empty strings return 1.0 (equality check)
+        assert_eq!(trigram_similarity("", ""), 1.0);
+        // Empty vs non-empty returns 0.0
         assert_eq!(trigram_similarity("", "hello"), 0.0);
     }
 

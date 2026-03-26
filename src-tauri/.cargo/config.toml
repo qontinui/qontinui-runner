@@ -1,0 +1,6 @@
+# Increase linker stack size to prevent STATUS_STACK_BUFFER_OVERRUN
+# when linking the large test binary on Windows.
+# Default MSVC stack is 1MB; this binary needs more due to deep
+# async-graphql type expansion and Tauri codegen.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:8388608"]

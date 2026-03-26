@@ -3150,6 +3150,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/ai/execute", post(handle_ai_execute))
         .route("/ui-bridge/sdk/ai/assert", post(handle_ai_assert))
         .route("/ui-bridge/sdk/ai/snapshot", get(handle_ai_snapshot))
+        // Structured action plan execution (delegates to runner's own IPC handler)
+        .route(
+            "/ui-bridge/sdk/execute-action-plan",
+            post(crate::mcp::ui_bridge::ui_bridge_execute_action_plan_handler),
+        )
         // Clipboard
         .route(
             "/ui-bridge/sdk/clipboard",

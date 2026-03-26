@@ -969,23 +969,29 @@ impl AiVerifier {
         let system_prompt = AiVerificationContextBuilder::build_system_prompt();
         let user_prompt = AiVerificationContextBuilder::build_user_prompt(&context);
 
-        // For AI verification with images, we need to use a special prompt format
-        // that includes the base64 image. Most AI providers support this via
-        // a specific message format.
-        let full_prompt =
-            Self::build_vision_prompt(&system_prompt, &user_prompt, screenshot_base64);
+        // Build a multimodal prompt with the screenshot as a proper image content block.
+        // This sends the image in the provider's native format (Claude content blocks,
+        // Gemini inline_data) rather than appending base64 as text.
+        let multimodal_prompt =
+            crate::ai_provider::MultimodalPrompt::with_system_and_screenshot(
+                &system_prompt,
+                &user_prompt,
+                screenshot_base64,
+            );
 
         debug!(
-            "AI verification prompt built (length: {} chars)",
-            full_prompt.len()
+            "AI verification multimodal prompt built (blocks: {}, has_images: {})",
+            multimodal_prompt.content.len(),
+            multimodal_prompt.has_images()
         );
 
         // Build task context for routing (AI verification is typically simple/medium complexity)
-        let task_context = TaskContext::from_prompt(&full_prompt).with_criteria_count(1); // Single criterion being verified
+        let task_context =
+            TaskContext::from_prompt(&multimodal_prompt.text_content()).with_criteria_count(1);
 
-        // Call the AI provider with routing
-        let ai_response = crate::ai_provider::run_prompt_with_routing(
-            &full_prompt,
+        // Call the AI provider with multimodal routing (image sent as native content block)
+        let ai_response = crate::ai_provider::run_prompt_with_routing_multimodal(
+            &multimodal_prompt,
             &task_context,
             self.doctor_handle.as_ref(),
         );
@@ -1036,26 +1042,23 @@ impl AiVerifier {
         }
     }
 
-    /// Build a vision-capable prompt that includes the screenshot.
+    /// Build a vision-capable prompt that includes the screenshot as text.
     ///
-    /// This creates a prompt format that works with vision-capable AI models.
-    /// The format depends on the AI provider being used.
+    /// DEPRECATED: Use `MultimodalPrompt::with_system_and_screenshot()` with
+    /// `run_prompt_with_routing_multimodal()` instead. That sends the image as a
+    /// proper content block rather than appending base64 as text.
+    ///
+    /// Kept for backward compatibility with tests and any remaining callers.
+    #[allow(dead_code)]
     fn build_vision_prompt(
         system_prompt: &str,
         user_prompt: &str,
         screenshot_base64: &str,
     ) -> String {
-        // For Claude CLI, we can include the image as a data URL in the prompt
-        // Claude will recognize and process embedded images
-        //
-        // For other providers, the format may differ. This is a baseline that works
-        // with Claude's vision capabilities.
         format!(
             "{}\n\n---\n\n{}\n\n[Screenshot attached as base64 image - evaluate this screenshot]\n\nImage data (base64):\ndata:image/png;base64,{}",
             system_prompt,
             user_prompt,
-            // Truncate for very large images to avoid token limits
-            // In practice, we'd want proper image resizing
             if screenshot_base64.len() > 500_000 {
                 &screenshot_base64[..500_000]
             } else {

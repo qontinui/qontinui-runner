@@ -427,7 +427,10 @@ async fn execute_web_query(
     };
 
     let ka = crate::knowledge_acquisition::KnowledgeAcquisition::new();
-    let results = ka.search(search_text, domain, request.limit).await?;
+    let ctx = crate::knowledge_acquisition::SearchContext::system();
+    let results = ka
+        .search_with_context(search_text, domain, request.limit, ctx.as_ref())
+        .await?;
 
     let json_results: Vec<serde_json::Value> = results
         .iter()

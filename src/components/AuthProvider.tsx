@@ -56,6 +56,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // Timer ID for retrying dev auto-login when backend is temporarily unavailable
   const devLoginRetryTimer = useRef<number | null>(null);
   const devLoginRetryCount = useRef(0);
+  const devLoginFailed = useRef(false);
   const MAX_DEV_LOGIN_RETRIES = 10;
 
   // Log mount/unmount
@@ -216,6 +217,12 @@ export function AuthProvider({ children }: AuthProviderProps) {
         devLoginRetryTimer.current = null;
       }
       devLoginRetryCount.current = 0;
+      devLoginFailed.current = false;
+      return;
+    }
+
+    // Don't retry after a non-retryable failure (auth error, rate limit, etc.)
+    if (devLoginFailed.current) {
       return;
     }
 
@@ -244,23 +251,29 @@ export function AuthProvider({ children }: AuthProviderProps) {
         const errStr = String(err);
         const isNetworkError =
           errStr.includes("Network error") || errStr.includes("Failed to fetch");
-        if (isNetworkError && devLoginRetryCount.current < MAX_DEV_LOGIN_RETRIES) {
-          // Backend unreachable — retry after a delay (keep pending so UI shows "Signing in...")
+        const isTransientError =
+          isNetworkError ||
+          errStr.includes("Server error") ||
+          errStr.includes("Rate limit");
+        if (isTransientError && devLoginRetryCount.current < MAX_DEV_LOGIN_RETRIES) {
+          // Transient error (network, server, rate limit) — retry with backoff
           devLoginRetryCount.current += 1;
+          const delay = isNetworkError ? 5000 : 10000;
           log.warn(
-            `Dev mode auto-login failed (backend unavailable), retry ${devLoginRetryCount.current}/${MAX_DEV_LOGIN_RETRIES} in 5s...`,
+            `Dev mode auto-login failed (${isNetworkError ? "backend unavailable" : "transient error"}), retry ${devLoginRetryCount.current}/${MAX_DEV_LOGIN_RETRIES} in ${delay / 1000}s...`,
           );
           devLoginRetryTimer.current = window.setTimeout(() => {
             devLoginRetryTimer.current = null;
             checkAuthStatus();
-          }, 5000);
+          }, delay);
         } else {
-          if (isNetworkError) {
+          if (isTransientError) {
             log.error("Dev mode auto-login failed: max retries exceeded");
           } else {
             log.error("Dev mode auto-login failed (auth error):", err);
           }
           // Clear pending flag on non-retryable failure so user can see login screen
+          devLoginFailed.current = true;
           setDevAutoLoginPending(false);
         }
       });

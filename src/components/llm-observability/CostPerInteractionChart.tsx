@@ -57,7 +57,7 @@ export function CostPerInteractionChart({ days = 7 }: CostPerInteractionChartPro
             <BarChart data={chartData}>
               <XAxis dataKey="run" tick={{ fontSize: 10 }} />
               <YAxis tick={{ fontSize: 11 }} tickFormatter={(v) => `$${v.toFixed(2)}`} />
-              <Tooltip formatter={(v: number) => [`$${v.toFixed(3)}`, "Cost/Action"]} />
+              <Tooltip formatter={(v) => [`$${Number(v).toFixed(3)}`, "Cost/Action"]} />
               <Bar dataKey="costPerAction" fill="hsl(var(--chart-1))" radius={[4, 4, 0, 0]} maxBarSize={30} />
             </BarChart>
           </ResponsiveContainer>

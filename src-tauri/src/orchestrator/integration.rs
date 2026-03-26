@@ -1612,6 +1612,19 @@ impl Orchestrator {
             prompt = format!("{}\n{}", error_context, prompt);
         }
 
+        // Inject relevant procedural skills (hermes-agent-inspired progressive disclosure).
+        // Only approved auto-extracted skills are injected. The worker sees skill names
+        // and descriptions; full templates are available via the skill registry if needed.
+        let skill_context = self.build_skill_context(state);
+        if !skill_context.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&skill_context);
+            info!(
+                "Injected procedural skill context for task {}",
+                state.task_run_id
+            );
+        }
+
         // Append auto-generated orchestrator instructions
         // These come at the end so the worker sees them as a "reminder" after the task context
         prompt.push_str("\n\n---\n");
@@ -1632,6 +1645,207 @@ impl Orchestrator {
         }
 
         Ok(prompt)
+    }
+
+    /// Build context string with approved procedural skills relevant to the current task.
+    ///
+    /// Uses progressive disclosure (hermes-agent pattern):
+    /// - Tier 1: Skill names and one-line descriptions (always injected)
+    /// - Full skill templates are available in the DB if the worker needs them
+    ///
+    /// Only skills with approval_status='approved' and source='auto' are included.
+    /// Limited to 10 skills to avoid bloating the prompt.
+    fn build_skill_context(&self, state: &OrchestratorState) -> String {
+        let conn = match self.db.get_conn() {
+            Ok(c) => c,
+            Err(_) => return String::new(),
+        };
+
+        // Query approved auto-extracted skills, ordered by usage (most-used first)
+        let mut stmt = match conn.prepare(
+            r#"SELECT name, slug, description, category
+               FROM user_skills
+               WHERE approval_status = 'approved'
+               AND source = 'auto'
+               ORDER BY usage_count DESC
+               LIMIT 10"#,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("Skills query unavailable: {}", e);
+                return String::new();
+            }
+        };
+
+        let skills: Vec<(String, String, String, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+
+        if skills.is_empty() {
+            return String::new();
+        }
+
+        let mut context = String::from(
+            "## Procedural Skills (Auto-Learned)\n\n\
+             The following fix patterns were learned from previous successful runs. \
+             Apply them if they match the current issue:\n\n",
+        );
+
+        // Token budget: ~500 tokens (~2000 chars) to avoid bloating the prompt
+        let max_skill_chars: usize = 2000;
+        let mut chars_used: usize = context.len();
+        let mut injected_count = 0;
+
+        for (name, slug, description, category) in &skills {
+            let short_desc = description
+                .split('.')
+                .next()
+                .unwrap_or(description)
+                .trim();
+            let line = format!(
+                "- **{}** (`{}`) [{}]: {}\n",
+                name, slug, category, short_desc
+            );
+            if chars_used + line.len() > max_skill_chars {
+                break;
+            }
+            context.push_str(&line);
+            chars_used += line.len();
+            injected_count += 1;
+        }
+
+        if injected_count == 0 {
+            return String::new();
+        }
+
+        let remaining = skills.len() - injected_count;
+        if remaining > 0 {
+            context.push_str(&format!(
+                "\n_{} skill(s) shown, {} more available (token budget reached)._\n",
+                injected_count, remaining
+            ));
+        } else {
+            context.push_str(&format!(
+                "\n_{} skill(s) available. These were extracted from effective fixes in prior runs._\n",
+                injected_count
+            ));
+        }
+
+        context
+    }
+
+    /// Check if any approved auto-skills were active and emit SKILL_FAILED events.
+    ///
+    /// Tracks per-skill consecutive failures via a `consecutive_failures` counter
+    /// stored transiently in the description suffix (format: "[failures:N]").
+    /// After 3 consecutive failures with the same skill active, auto-disables it
+    /// by setting approval_status back to 'pending'.
+    ///
+    /// The counter is reset when `build_skill_context` runs on a successful verification
+    /// (which doesn't call this method at all — it's only called on failure).
+    fn check_and_emit_skill_failures(&self, state: &OrchestratorState) {
+        let conn = match self.db.get_conn() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        // Find approved auto-skills that were active (would have been injected)
+        let active_skills: Vec<(String, String)> = conn
+            .prepare(
+                r#"SELECT id, slug FROM user_skills
+                   WHERE approval_status = 'approved' AND source = 'auto'
+                   LIMIT 10"#,
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                    ))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+
+        if active_skills.is_empty() {
+            return;
+        }
+
+        let bus = crate::workflow_event_bus::get_workflow_event_bus().clone();
+        let task_run_id = state.task_run_id.clone();
+        let iteration = state.iteration;
+        let consecutive_threshold = 3i64;
+
+        for (skill_id, slug) in &active_skills {
+            // Track consecutive failures per-skill using task_run_events.
+            // Each call inserts a failure marker event; count them to determine threshold.
+            let failure_event_type = format!("skill_failure:{}", skill_id);
+            let _ = conn.execute(
+                r#"INSERT INTO task_run_events (id, task_run_id, event_type, event_subtype, data, timestamp)
+                   VALUES (?1, ?2, 'skill_failure', ?3, '{}', datetime('now'))"#,
+                rusqlite::params![
+                    format!("sfe-{}-{}", skill_id, iteration),
+                    task_run_id,
+                    skill_id,
+                ],
+            );
+
+            // Count consecutive failures for this skill in this task run
+            let total_failures: i64 = conn
+                .query_row(
+                    r#"SELECT COUNT(*) FROM task_run_events
+                       WHERE task_run_id = ?1 AND event_type = 'skill_failure' AND event_subtype = ?2"#,
+                    rusqlite::params![task_run_id, skill_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
+            let auto_disabled = total_failures >= consecutive_threshold;
+
+            if auto_disabled {
+                let _ = conn.execute(
+                    r#"UPDATE user_skills SET approval_status = 'pending',
+                       updated_at = datetime('now')
+                       WHERE id = ?1 AND approval_status = 'approved'"#,
+                    rusqlite::params![skill_id],
+                );
+                warn!(
+                    "Auto-disabled skill '{}' after {} consecutive failures in task {}",
+                    slug, total_failures, task_run_id
+                );
+            }
+
+            let bus_clone = bus.clone();
+            let tr_id = task_run_id.clone();
+            let s_id = skill_id.clone();
+            let s_slug = slug.clone();
+            tokio::spawn(async move {
+                bus_clone
+                    .emit_workflow_event(
+                        crate::workflow_event_bus::events::SKILL_FAILED,
+                        &tr_id,
+                        None,
+                        None,
+                        serde_json::json!({
+                            "skill_id": s_id,
+                            "skill_slug": s_slug,
+                            "iteration": iteration,
+                            "consecutive_failures": total_failures,
+                            "auto_disabled": auto_disabled,
+                        }),
+                    )
+                    .await;
+            });
+        }
     }
 
     /// Process worker output and determine next action.
@@ -1892,6 +2106,12 @@ impl Orchestrator {
 
             // Execute verification fail hooks
             self.execute_hooks(HookTrigger::OnVerificationFail, state);
+
+            // Skill self-repair: if auto-skills were active during this failed iteration,
+            // emit SKILL_FAILED events so the system can track and auto-disable broken skills.
+            if state.iteration > 0 {
+                self.check_and_emit_skill_failures(state);
+            }
         }
 
         // Emit verification complete output

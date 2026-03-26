@@ -4178,12 +4178,27 @@ pub async fn ui_bridge_ai_assert_batch_handler(
     }
 }
 
+/// Query parameters for the AI snapshot endpoint.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSnapshotQuery {
+    /// Maximum token budget for the snapshot (0 = unlimited).
+    /// When set, elements are pruned by region priority.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
+
 /// Semantic AI snapshot of the page.
 pub async fn ui_bridge_ai_snapshot_handler(
     State(state): State<Arc<ApiState>>,
+    Query(query): Query<AiSnapshotQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: AI snapshot");
-    match ui_bridge_request_sync(&state, "ai_snapshot", serde_json::json!({})).await {
+    info!("UI Bridge API: AI snapshot (maxTokens={:?})", query.max_tokens);
+    let mut payload = serde_json::json!({});
+    if let Some(max_tokens) = query.max_tokens {
+        payload["maxTokens"] = serde_json::json!(max_tokens);
+    }
+    match ui_bridge_request_sync(&state, "ai_snapshot", payload).await {
         Ok(data) => Ok(Json(ApiResponse::success(data))),
         Err(e) => {
             error!("UI Bridge API: AI snapshot failed: {}", e);
@@ -5498,10 +5513,11 @@ async fn resolve_action_plan_target(
         return Ok(id.clone());
     }
 
-    // 2. Find by data-testid attribute
+    // 2. Find by data-testid attribute (via CSS selector — find handler
+    //    doesn't support testId field directly)
     if let Some(ref test_id) = target.test_id {
         let find_payload = serde_json::json!({
-            "testId": test_id
+            "selector": format!("[data-testid=\"{}\"]", test_id)
         });
         if let Ok(data) = ui_bridge_request_sync(state, "find", find_payload).await {
             if let Some(id) = extract_first_element_id(&data) {
@@ -5542,8 +5558,22 @@ async fn resolve_action_plan_target(
 }
 
 /// Extract the first element ID from a find/search result.
+///
+/// Handles multiple response formats:
+///   - `{ results: [{ elementId, ... }] }` (ai_search)
+///   - `{ elements: [{ id, ... }] }` (find)
+///   - `{ id, ... }` (direct element)
+///   - `[{ id, ... }]` (array of elements)
 fn extract_first_element_id(data: &serde_json::Value) -> Option<String> {
-    // find returns { results: [{ elementId, ... }] } or { elements: [{ id, ... }] }
+    // find returns { elements: [{ id, ... }] }
+    if let Some(elements) = data.get("elements").and_then(|v| v.as_array()) {
+        if let Some(first) = elements.first() {
+            if let Some(id) = first.get("id").and_then(|v| v.as_str()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    // ai_search returns { results: [{ elementId, ... }] }
     if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
         if let Some(first) = results.first() {
             if let Some(id) = first

@@ -228,7 +228,8 @@ impl QueryRoot {
                 app_id: conn.app_info.app_id.clone(),
                 app_name: conn.app_info.app_name.clone(),
                 url: conn.app_url.clone(),
-                responsive: manager.active_responsive.unwrap_or(false),
+                responsive: active_url.as_deref() == Some(&conn.app_url)
+                    && manager.active_responsive.unwrap_or(false),
                 is_active: active_url.as_deref() == Some(&conn.app_url),
             });
         }
@@ -247,18 +248,23 @@ impl QueryRoot {
         workflow_type: Option<String>,
     ) -> Result<Vec<super::types::GqlTaskRun>> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let db = state.app_state.checkpoint_db.clone();
         let port = state
             .app_state
             .api_port
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        let runs = tokio::task::spawn_blocking(move || {
-            db.get_recent_task_runs_filtered(limit as u32, workflow_type.as_deref(), Some(port))
-        })
-        .await
-        .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-        .map_err(|e| Error::new(e))?;
+        let runs = if let Some(pg) = &state.app_state.pg_db {
+            pg.get_recent_task_runs_filtered(limit as u32, workflow_type.as_deref(), Some(port))
+                .await.map_err(|e| Error::new(e))?
+        } else {
+            let db = state.app_state.checkpoint_db.clone();
+            tokio::task::spawn_blocking(move || {
+                db.get_recent_task_runs_filtered(limit as u32, workflow_type.as_deref(), Some(port))
+            })
+            .await
+            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+            .map_err(|e| Error::new(e))?
+        };
 
         Ok(runs.into_iter().map(super::types::GqlTaskRun::from_db).collect())
     }
@@ -270,11 +276,15 @@ impl QueryRoot {
         id: String,
     ) -> Result<Option<super::types::GqlTaskRun>> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let db = state.app_state.checkpoint_db.clone();
-        let run = tokio::task::spawn_blocking(move || db.get_task_run(&id))
-            .await
-            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-            .map_err(|e| Error::new(e))?;
+        let run = if let Some(pg) = &state.app_state.pg_db {
+            pg.get_task_run(&id).await.map_err(|e| Error::new(e))?
+        } else {
+            let db = state.app_state.checkpoint_db.clone();
+            tokio::task::spawn_blocking(move || db.get_task_run(&id))
+                .await
+                .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+                .map_err(|e| Error::new(e))?
+        };
 
         Ok(run.map(super::types::GqlTaskRun::from_db))
     }
@@ -366,12 +376,16 @@ impl QueryRoot {
         ctx: &Context<'_>,
     ) -> Result<Vec<super::types::GqlWorkflowSummary>> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let db = state.app_state.checkpoint_db.clone();
 
-        let workflows = tokio::task::spawn_blocking(move || db.list_unified_workflows())
-            .await
-            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-            .map_err(|e| Error::new(e))?;
+        let workflows = if let Some(pg) = &state.app_state.pg_db {
+            pg.list_unified_workflows().await.map_err(|e| Error::new(e))?
+        } else {
+            let db = state.app_state.checkpoint_db.clone();
+            tokio::task::spawn_blocking(move || db.list_unified_workflows())
+                .await
+                .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+                .map_err(|e| Error::new(e))?
+        };
 
         Ok(workflows
             .into_iter()
@@ -402,12 +416,16 @@ impl QueryRoot {
         id: String,
     ) -> Result<Option<super::types::GqlWorkflow>> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let db = state.app_state.checkpoint_db.clone();
 
-        let workflow = tokio::task::spawn_blocking(move || db.get_unified_workflow(&id))
-            .await
-            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-            .map_err(|e| Error::new(e))?;
+        let workflow = if let Some(pg) = &state.app_state.pg_db {
+            pg.get_unified_workflow(&id).await.map_err(|e| Error::new(e))?
+        } else {
+            let db = state.app_state.checkpoint_db.clone();
+            tokio::task::spawn_blocking(move || db.get_unified_workflow(&id))
+                .await
+                .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+                .map_err(|e| Error::new(e))?
+        };
 
         Ok(workflow.map(|w| {
             super::types::GqlWorkflow {

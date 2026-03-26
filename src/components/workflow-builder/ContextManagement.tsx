@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 import { useWorkflowBuilder } from "./WorkflowBuilderContext";
 import { useContexts, groupContextsByScope } from "../contexts/hooks/useContexts";
+import { useObservationMemory } from "@/hooks/useObservationMemory";
 import type { ContextWithMetadata, AutoDetectResult } from "../../types/context";
 import { getAccentColors, getStatusColors } from "@/design-system";
 
@@ -40,6 +41,7 @@ export function ContextManagement() {
   const { state, updateWorkflow } = useWorkflowBuilder();
   const { workflow } = state;
   const { contexts, loading: contextsLoading, evaluateAutoInclude } = useContexts();
+  const memoryContext = useObservationMemory(workflow.project_id ?? null);
 
   // Local state
   const [isExpanded, setIsExpanded] = useState(true);
@@ -411,6 +413,40 @@ export function ContextManagement() {
                     Cancel
                   </button>
                 </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Memory context from past sessions */}
+      {memoryContext.available && memoryContext.observationCount > 0 && (
+        <div className="mt-3 pt-3 border-t border-zinc-700">
+          <div className="flex items-center gap-2 mb-2">
+            <BookOpen className="w-3.5 h-3.5 text-violet-400" />
+            <span className="text-xs font-medium text-zinc-400">
+              Memory ({memoryContext.observationCount} observations from past sessions)
+            </span>
+            <span className={`ml-auto px-1.5 py-0.5 text-[10px] ${getAccentColors("violet").bg} ${getAccentColors("violet").text} rounded`}>
+              auto-injected
+            </span>
+          </div>
+          <div className="space-y-1 max-h-32 overflow-y-auto">
+            {memoryContext.observations.slice(0, 5).map((obs) => (
+              <div
+                key={obs.id}
+                className="flex items-center gap-2 px-2 py-1 text-xs text-zinc-400"
+                title={obs.contentPreview}
+              >
+                <span className="shrink-0 px-1 py-0.5 bg-zinc-800 rounded text-[10px]">
+                  {obs.observationType}
+                </span>
+                <span className="truncate">{obs.title}</span>
+              </div>
+            ))}
+            {memoryContext.observationCount > 5 && (
+              <div className="text-[10px] text-zinc-500 pl-2">
+                +{memoryContext.observationCount - 5} more
               </div>
             )}
           </div>

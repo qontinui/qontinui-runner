@@ -4,7 +4,7 @@
  * multiple independent intervals from causing excessive re-renders.
  */
 
-import { useSyncExternalStore } from "react";
+import { useState, useEffect } from "react";
 
 // Module-level state
 let currentTime = Date.now();
@@ -34,17 +34,19 @@ function subscribe(listener: () => void): () => void {
   };
 }
 
-function getSnapshot(): number {
-  return currentTime;
-}
-
 /**
  * Hook that returns elapsed seconds since the given start time.
  * Uses a single shared interval across all consumers.
  * Returns 0 if startTime is null.
  */
 export function useSharedElapsedTime(startTime: number | null): number {
-  const now = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const [now, setNow] = useState(currentTime);
+
+  useEffect(() => {
+    const listener = () => setNow(currentTime);
+    return subscribe(listener);
+  }, []);
+
   if (startTime === null) return 0;
   return Math.floor((now - startTime) / 1000);
 }

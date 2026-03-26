@@ -200,6 +200,10 @@ impl WorkerOutput {
                     });
                 }
                 StructuredSignal::Continue => {}
+                // RequestContext and RecordStore are handled by BrainActorOrchestrator,
+                // not the legacy signal conversion path.
+                StructuredSignal::RequestContext { .. }
+                | StructuredSignal::RecordStore { .. } => {}
             }
         }
         None
@@ -242,6 +246,29 @@ pub enum StructuredSignal {
 
     /// Worker is continuing work (default, usually not emitted explicitly).
     Continue,
+
+    /// Actor requests the Brain to re-analyze the current screen state.
+    ///
+    /// Emitted when the Actor encounters a situation where the screen has changed
+    /// significantly, the action plan seems wrong, or more context is needed.
+    /// The orchestrator will re-invoke the Brain with a fresh screenshot before
+    /// the next Actor iteration.
+    RequestContext {
+        /// Reason explaining why re-analysis is needed.
+        reason: String,
+    },
+
+    /// Worker wants to persist a key-value record for later retrieval.
+    ///
+    /// Used by both Brain and Actor to save intermediate findings, observations,
+    /// or artifacts that may be needed in future iterations. Records are stored
+    /// in the BrainActorOrchestrator's record store and included in Brain context.
+    RecordStore {
+        /// Key to store the value under.
+        key: String,
+        /// Value to store.
+        value: String,
+    },
 }
 
 // ============================================================================

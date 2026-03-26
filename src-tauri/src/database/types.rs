@@ -2012,3 +2012,255 @@ pub struct ArtifactCountQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_only: Option<bool>,
 }
+
+// ============================================================================
+// Observations (Engram-inspired persistent memory)
+// ============================================================================
+
+/// A persistent observation — cross-session knowledge with type classification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Observation {
+    pub id: i64,
+    pub title: String,
+    pub content: String,
+    pub observation_type: String,
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
+    pub content_hash: String,
+    pub revision_count: i32,
+    pub duplicate_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub is_deleted: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Truncated search result with relevance rank.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservationSearchResult {
+    pub id: i64,
+    pub title: String,
+    pub content_preview: String,
+    pub observation_type: String,
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
+    pub revision_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank: Option<f32>,
+}
+
+/// Input for creating a new observation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateObservationInput {
+    pub title: String,
+    pub content: String,
+    pub observation_type: String,
+    #[serde(default = "default_scope")]
+    pub scope: String,
+    pub topic_key: Option<String>,
+    pub project_id: Option<String>,
+    pub workflow_id: Option<String>,
+    pub task_run_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+fn default_scope() -> String {
+    "project".to_string()
+}
+
+/// Input for updating an existing observation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateObservationInput {
+    #[serde(default)]
+    pub id: i64,
+    pub title: Option<String>,
+    pub content: Option<String>,
+    pub observation_type: Option<String>,
+}
+
+/// Observation type statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservationTypeStat {
+    pub observation_type: String,
+    pub count: i64,
+    pub latest_updated: String,
+}
+
+// ============================================================================
+// Activity Timeline (screenpipe-inspired capture history)
+// ============================================================================
+
+/// Input for creating an activity timeline entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityTimelineInput {
+    pub text_content: String,
+    /// Source of text extraction: "accessibility", "ocr", "ui_bridge"
+    pub source_type: String,
+    /// Automation mode: "white_box" (UI Bridge) or "black_box" (HAL)
+    pub capture_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub element_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_json: Option<String>,
+}
+
+/// Full activity timeline entry (single record).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityTimelineEntry {
+    pub id: i64,
+    pub text_content: String,
+    pub content_hash: String,
+    pub source_type: String,
+    pub capture_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot_path: Option<String>,
+    pub element_count: Option<i32>,
+    pub confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_json: Option<String>,
+    pub duplicate_count: i32,
+    pub created_at: String,
+}
+
+/// Search result from activity timeline FTS (500-char preview + rank).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityTimelineSearchResult {
+    pub id: i64,
+    pub text_preview: String,
+    pub source_type: String,
+    pub capture_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot_path: Option<String>,
+    pub element_count: Option<i32>,
+    pub confidence: Option<f64>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank: Option<f32>,
+}
+
+/// Activity timeline capture statistics by source and mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityTimelineStat {
+    pub source_type: String,
+    pub capture_mode: String,
+    pub count: i64,
+    pub latest_capture: String,
+}
+
+// ============================================================================
+// Watchers (screenpipe-inspired scheduled reactive AI agents)
+// ============================================================================
+
+/// Input for creating a new watcher.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateWatcherInput {
+    pub name: String,
+    /// ScheduleExpression as JSON (cron, interval, once, condition).
+    pub schedule_json: String,
+    /// Activity timeline FTS query string.
+    pub timeline_query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_name_filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_type_filter: Option<String>,
+    /// PostgreSQL interval for lookback (e.g. "15 minutes", "1 hour").
+    #[serde(default = "default_lookback")]
+    pub lookback_window: String,
+    /// AI prompt template with {{results}}, {{result_count}}, {{query}} placeholders.
+    pub reasoning_prompt: String,
+    /// WatcherAction as JSON (RunWorkflow, Notify, CreateObservation, LogOnly).
+    pub action_json: String,
+}
+
+fn default_lookback() -> String {
+    "15 minutes".to_string()
+}
+
+/// Input for updating an existing watcher.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateWatcherInput {
+    pub id: String,
+    pub name: Option<String>,
+    pub schedule_json: Option<String>,
+    pub timeline_query: Option<String>,
+    pub app_name_filter: Option<String>,
+    pub source_type_filter: Option<String>,
+    pub lookback_window: Option<String>,
+    pub reasoning_prompt: Option<String>,
+    pub action_json: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+/// Stored watcher definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Watcher {
+    pub id: String,
+    pub name: String,
+    pub schedule_json: String,
+    pub timeline_query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_name_filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_type_filter: Option<String>,
+    pub lookback_window: String,
+    pub reasoning_prompt: String,
+    pub action_json: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_result_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
