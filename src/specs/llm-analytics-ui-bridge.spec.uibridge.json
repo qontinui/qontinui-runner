@@ -1,130 +1,222 @@
 {
   "version": "1.0.0",
+  "id": "runner:llm-analytics-ui-bridge",
   "description": "LLM Analytics — UI Bridge Cost Attribution extensions. Adds Cost by Target App chart, Cost per Interaction chart, Page Complexity table, and Model x Action Success Matrix to the existing LLM Observability Dashboard. These components surface which apps and pages cost most to automate, and which model/action combinations are most effective. Data flows from phase_token_usage.target_app (set via get_active_sdk_app_name() during agentic phase execution) and joins with ui_bridge_events for per-interaction cost analysis.",
+  "metadata": {
+    "component": "LlmObservabilityDashboard",
+    "pageId": "llm-analytics",
+    "pageUrl": "/llm-analytics",
+    "tags": ["llm-analytics", "cost-attribution", "ui-bridge", "target-app", "page-complexity", "model-action-matrix", "cost-per-interaction"]
+  },
   "groups": [
     {
-      "id": "cost-by-target-app",
-      "name": "Cost by Target App",
-      "description": "Horizontal bar chart showing automation cost breakdown by SDK-connected application. Only appears when target_app data exists in phase_token_usage. Uses hsl(var(--chart-3)) fill. Custom tooltip shows cost, calls, input/output tokens, and avg duration per app. Backed by GET /analytics/token-usage/by-target-app.",
-      "category": "semantic",
+      "id": "llm-ui-bridge-elements",
+      "name": "UI Bridge Cost Components Presence",
+      "description": "Four new components are conditionally rendered in the LLM Observability Dashboard when target_app data exists in phase_token_usage: CostByTargetAppChart (horizontal bar), CostPerInteractionChart (vertical bar), PageComplexityTable (ranked table), and ModelActionMatrix (heatmap). All components are lazy-loaded.",
+      "category": "element-presence",
       "assertions": [
         {
-          "id": "target-app-heading",
-          "description": "The cost by target app chart shows its heading when data exists",
+          "id": "llm-target-app-chart",
+          "description": "Cost by Target App chart appears when target_app data exists",
+          "category": "element-presence",
           "severity": "warning",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Cost by Target App" },
-            "label": "Target app chart heading with Globe icon"
+            "label": "Target app chart with Globe icon"
           },
           "condition": {
             "type": "exists",
-            "target": {
-              "type": "search",
-              "criteria": { "textContains": "Cost by Target App" }
-            }
+            "target": { "type": "search", "criteria": { "textContains": "Cost by Target App" } }
           }
-        }
-      ]
-    },
-    {
-      "id": "cost-per-interaction",
-      "name": "Cost per Successful Interaction",
-      "description": "Vertical bar chart showing cost per successful UI Bridge interaction per task run. Joins phase_token_usage.cost_cents with COUNT of successful ui_bridge_events per task_run_id. Shows first 8 chars of task_run_id on x-axis, cost on y-axis formatted as $X.XX. Backed by GET /analytics/token-usage/cost-per-interaction.",
-      "category": "semantic",
-      "assertions": [
+        },
         {
-          "id": "cost-interaction-heading",
-          "description": "The cost per interaction chart is identifiable",
+          "id": "llm-cost-per-interaction-chart",
+          "description": "Cost per Successful Interaction chart exists",
+          "category": "element-presence",
           "severity": "warning",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Cost per Successful Interaction" },
-            "label": "Cost per interaction heading with DollarSign icon"
+            "label": "Cost per interaction chart with DollarSign icon"
           }
-        }
-      ]
-    },
-    {
-      "id": "page-complexity",
-      "name": "Page Complexity Scoring",
-      "description": "Ranked table of pages by automation cost. Columns: Page URL (monospace, truncated), Calls, Total Cost ($X.XX), Avg/Call ($X.XXX). Sorted by avg cost per call descending — most expensive pages to automate appear first. Sticky header with vertical scroll (max-h-64). Backed by GET /analytics/token-usage/page-complexity.",
-      "category": "semantic",
-      "assertions": [
+        },
         {
-          "id": "page-complexity-heading",
-          "description": "The page complexity table is identifiable",
+          "id": "llm-page-complexity-table",
+          "description": "Page Complexity table exists with cost ranking",
+          "category": "element-presence",
           "severity": "warning",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Page Complexity" },
-            "label": "Page complexity heading with FileText icon"
+            "label": "Page complexity table with FileText icon"
           }
         },
         {
-          "id": "page-complexity-avg-column",
-          "description": "The table shows average cost per call for each page",
-          "severity": "warning",
-          "assertionType": "exists",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "Avg/Call" },
-            "label": "Average cost per call column header"
-          }
-        }
-      ]
-    },
-    {
-      "id": "model-action-matrix",
-      "name": "Model x Action Success Matrix",
-      "description": "Heatmap-style matrix with models as rows, action types as columns. Each cell shows success rate (bold %) and attempt count (muted Nx). Color-coded: green >= 95%, yellow >= 80%, orange >= 50%, red < 50%. Empty cells show '-'. Identifies which models work best for which UI Bridge actions (e.g., Haiku for clicks, Sonnet for form fills). Requires >= 3 attempts per cell. Backed by GET /analytics/token-usage/model-action-matrix.",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "matrix-heading",
-          "description": "The model-action matrix is identifiable",
+          "id": "llm-model-action-matrix",
+          "description": "Model x Action Success Matrix heatmap exists",
+          "category": "element-presence",
           "severity": "warning",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Model x Action Success Matrix" },
-            "label": "Matrix heading with Grid3X3 icon"
+            "label": "Model-action matrix with Grid3X3 icon"
+          }
+        }
+      ]
+    },
+    {
+      "id": "llm-cost-data-display",
+      "name": "Cost Attribution Data Display",
+      "description": "CostByTargetAppChart shows a horizontal bar chart sorted by cost descending. Custom tooltip shows app name, cost ($X.XX), calls, input/output tokens, and avg duration. Uses hsl(var(--chart-3)) fill. CostPerInteractionChart shows vertical bars with first 20 task runs, x-axis shows truncated run IDs, y-axis shows cost ($X.XX). PageComplexityTable has 4 columns: Page URL (monospace truncated), Calls, Total Cost, Avg/Call (bold). Sorted by avg cost descending. Sticky header with max-h-64 scroll.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "llm-target-app-tooltip",
+          "description": "Hovering over a target app bar shows cost, calls, input tokens, output tokens, and average duration in a tooltip popup",
+          "category": "data-display",
+          "severity": "info",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cost by Target App" },
+            "label": "Tooltip with detailed cost metrics per app"
           }
         },
         {
-          "id": "matrix-color-semantics",
-          "description": "The heatmap uses green for high success rates (>= 95%), yellow for acceptable (>= 80%), orange for marginal (>= 50%), and red for poor (< 50%). This lets users quickly identify which model/action combinations need attention.",
+          "id": "llm-page-complexity-columns",
+          "description": "Page complexity table shows Avg/Call column with 3-decimal dollar precision to differentiate small cost differences",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Avg/Call" },
+            "label": "Average cost per call column"
+          }
+        }
+      ]
+    },
+    {
+      "id": "llm-matrix-semantics",
+      "name": "Model-Action Matrix Color Semantics",
+      "description": "The heatmap matrix uses color coding to communicate model/action effectiveness: green (>= 95% success), yellow (>= 80%), orange (>= 50%), red (< 50%). Each cell shows success rate (bold %) and attempt count (muted Nx). Empty cells show '-'. Rows are model names (font-mono), columns are action types (font-mono). Only cells with >= 3 attempts are shown to ensure statistical significance.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "llm-matrix-color-coding",
+          "description": "Matrix cells use 4-level color coding (green/yellow/orange/red) so users can quickly identify which model/action combinations need attention",
+          "category": "semantic",
           "severity": "warning",
           "assertionType": "semantic",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Model x Action" },
-            "label": "Color-coded success rate cells"
+            "label": "Color-coded success rates in matrix cells"
+          }
+        },
+        {
+          "id": "llm-matrix-min-attempts",
+          "description": "Only model/action pairs with >= 3 attempts appear in the matrix, preventing misleading data from single-attempt results",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Model x Action" },
+            "label": "Matrix filters out statistically insignificant cells"
+          }
+        }
+      ]
+    },
+    {
+      "id": "llm-state-consistency",
+      "name": "Empty and Loading States",
+      "description": "Each component handles empty and loading states independently. CostByTargetAppChart: 'No UI Bridge cost data available' (only shown when target_app data exists, otherwise hidden entirely). CostPerInteractionChart: 'No interaction cost data'. PageComplexityTable: 'No page cost data'. ModelActionMatrix: 'No model-action data'. All show 'Loading...' during fetch.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "llm-empty-target-app",
+          "description": "When no target_app data exists, the CostByTargetAppChart is not rendered at all (conditionally hidden, not empty state)",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "LLM Analytics" },
+            "label": "Target app chart conditionally hidden when no data"
+          }
+        },
+        {
+          "id": "llm-empty-matrix",
+          "description": "When no model-action data exists, the matrix shows 'No model-action data' instead of an empty table",
+          "category": "state-consistency",
+          "severity": "info",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No model-action data" },
+            "label": "Empty state for model-action matrix"
+          }
+        }
+      ]
+    },
+    {
+      "id": "llm-interaction-time-range",
+      "name": "Time Range Interaction",
+      "description": "The LLM dashboard's existing time range selector (1d/7d/30d/all) controls the days parameter for all cost attribution queries. CostByTargetAppChart fetches from /analytics/token-usage/by-target-app?days=N. CostPerInteractionChart fetches from /analytics/token-usage/cost-per-interaction?days=N. Changing the time range should update all four new charts.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "llm-time-range-affects-new-charts",
+          "description": "Changing the time range dropdown updates all four new UI Bridge cost charts alongside the existing charts",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "LLM Analytics" },
+            "label": "Time range selector refreshes new cost charts"
+          },
+          "expected": "Selecting '30d' from the time range dropdown should cause all four new charts to re-fetch with days=30, potentially showing more historical data."
+        }
+      ]
+    },
+    {
+      "id": "llm-cost-behavior",
+      "name": "Cost Attribution Pipeline Behavior",
+      "description": "Cost attribution data flows from the agentic phase executor. When a workflow step involves UI Bridge actions, get_active_sdk_app_name() extracts the connected app name via try_lock on the SDK connection manager, and record_phase_token_usage_with_target() writes it to phase_token_usage.target_app. This means cost attribution only appears for workflows that interact with SDK-connected apps during their agentic phase.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "llm-cost-requires-sdk",
+          "description": "Cost by Target App data only appears when workflows are run against SDK-connected apps — workflows that don't use the UI Bridge will not have target_app attribution",
+          "category": "behavior",
+          "severity": "info",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "LLM Analytics" },
+            "label": "Target app data requires SDK connection during workflow"
           }
         }
       ]
     }
-  ],
-  "metadata": {
-    "component": "LlmObservabilityDashboard",
-    "pageUrl": "/llm-analytics",
-    "tags": [
-      "llm-analytics",
-      "cost-attribution",
-      "ui-bridge",
-      "target-app",
-      "page-complexity",
-      "model-action-matrix",
-      "cost-per-interaction"
-    ]
-  }
+  ]
 }

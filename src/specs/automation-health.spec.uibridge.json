@@ -1,96 +1,180 @@
 {
   "version": "1.0.0",
+  "id": "runner:automation-health",
   "description": "Automation Health Dashboard — composite view of UI Bridge automation quality. Shows health score gauge, improvement recommendations, element reliability heatmap, action performance baselines, failure taxonomy, automation regressions, stall frequency, intervention effectiveness, and annotation gaps. Powered by cross-run analytics from ui_bridge_events (element interactions persisted per action with duration, success, error). Data flows: action handler → insert_ui_bridge_event → SQLite → 17 analytics SQL queries → 13 MCP endpoints → React hooks → dashboard panels. Health score is a weighted composite: 0.30 * element_success_rate + 0.25 * (1 - regression_rate) + 0.25 * (1 - stall_frequency) + 0.20 base. Recommendations are rule-based: flaky elements → add data-testid, stalls → increase settle_delay, unannotated → add annotations, high failure rate → review taxonomy.",
+  "metadata": {
+    "component": "AutomationHealthDashboard",
+    "pageId": "automation-health",
+    "pageUrl": "/automation-health",
+    "tags": ["automation-health", "analytics", "ui-bridge", "element-reliability", "stall-detection", "recommendations", "cross-run-patterns", "selector-decay", "failure-taxonomy", "dev-only"]
+  },
   "groups": [
     {
-      "id": "health-dashboard-layout",
-      "name": "Dashboard Layout and Navigation",
-      "description": "The dashboard has a header with title, time range selector (24h/7d/30d), and refresh button. Below is a 5-row responsive grid of analytics panels. All panels use consistent card styling (bg-card, rounded-lg, border).",
+      "id": "health-page-elements",
+      "name": "Dashboard Page Structure",
+      "description": "The dashboard has a page title ('UI Bridge Automation Health' with BarChart3 icon), time range buttons (24h, 7d, 30d), and a refresh button. Below the header, 9 analytics panels are arranged in a responsive grid (2 columns on md+, 1 column on small screens).",
       "category": "element-presence",
       "assertions": [
         {
           "id": "health-title",
-          "description": "Users can identify the automation health dashboard by its title",
+          "description": "The dashboard title identifies this as the automation health view",
+          "category": "element-presence",
           "severity": "critical",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "UI Bridge Automation Health" },
-            "label": "Dashboard title with BarChart3 icon"
+            "label": "Dashboard title heading"
           }
         },
         {
-          "id": "health-time-range-24h",
-          "description": "Users can select 24-hour time range",
+          "id": "health-time-24h",
+          "description": "The 24h time range button exists for short-window analysis",
+          "category": "element-presence",
           "severity": "warning",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContent": "24h", "role": "button" },
-            "label": "24h time range button"
+            "label": "24-hour time range button"
           }
         },
         {
-          "id": "health-time-range-7d",
-          "description": "Users can select 7-day time range (default)",
+          "id": "health-time-7d",
+          "description": "The 7d time range button exists (default selection)",
+          "category": "element-presence",
           "severity": "warning",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContent": "7d", "role": "button" },
-            "label": "7d time range button"
+            "label": "7-day time range button"
           }
         },
         {
-          "id": "health-time-range-30d",
-          "description": "Users can select 30-day time range",
+          "id": "health-time-30d",
+          "description": "The 30d time range button exists for long-window analysis",
+          "category": "element-presence",
           "severity": "warning",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContent": "30d", "role": "button" },
-            "label": "30d time range button"
+            "label": "30-day time range button"
           }
         },
         {
-          "id": "health-refresh-button",
-          "description": "Users can manually refresh all analytics data",
-          "severity": "info",
-          "assertionType": "exists",
+          "id": "health-panel-count",
+          "description": "All 9 analytics panels are rendered on the page (health score, recommendations, element reliability, action baselines, failure taxonomy, regressions, stall frequency, intervention effectiveness, annotation gaps)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "semantic",
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "role": "button", "accessibleName": "Refresh" },
-            "label": "Refresh button with RefreshCw icon"
+            "criteria": { "textContains": "Automation Health" },
+            "label": "Dashboard with all 9 panels visible"
           }
         }
       ]
     },
     {
-      "id": "health-score-card",
-      "name": "Automation Health Score",
-      "description": "Large centered numeric score (0-100) with color coding (green >= 90, yellow >= 70, orange >= 50, red < 50) and label (Excellent/Good/Fair/Poor). Below the score: breakdown of element_success_rate, regression_rate, stall_frequency, total_interactions, unique_elements. Score computed server-side from ui_bridge_events via compute_automation_health_score(). Backed by GET /ui-bridge/analytics/health-score.",
-      "category": "semantic",
+      "id": "health-navigation",
+      "name": "Navigation and Tab Access",
+      "description": "The dashboard is accessible via the 'Automation Health' item in the OBSERVE sidebar group. It appears alongside LLM Analytics, Reflection, and other observability views. The sidebar item shows an Activity icon with green accent (#10B981).",
+      "category": "navigation",
       "assertions": [
         {
-          "id": "health-score-heading",
-          "description": "The health score card is identifiable by its heading",
+          "id": "health-sidebar-item",
+          "description": "The Automation Health tab is accessible from the sidebar navigation under the OBSERVE group",
+          "category": "navigation",
           "severity": "critical",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Automation Health" },
-            "label": "Health score card heading with Activity icon"
+            "label": "Sidebar navigation item"
+          }
+        }
+      ]
+    },
+    {
+      "id": "health-interaction-time-range",
+      "name": "Time Range Selection Interaction",
+      "description": "Clicking a time range button (24h, 7d, 30d) updates all analytics panels to show data scoped to that window. The active button is highlighted with bg-primary text-primary-foreground. Inactive buttons use bg-muted text-muted-foreground. The refresh button invalidates all React Query caches and re-fetches data from all 13 MCP endpoints.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "health-time-switch",
+          "description": "Clicking a different time range button changes the active highlight and causes all panels to re-fetch with the new days parameter",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "24h", "role": "button" },
+            "label": "Time range toggle triggers data refresh"
+          },
+          "expected": "After clicking '24h', the button should gain bg-primary styling while '7d' loses it. All panels should briefly show loading state, then display data filtered to the last 24 hours."
+        },
+        {
+          "id": "health-refresh-click",
+          "description": "Clicking the refresh button re-fetches all analytics data without changing the time range",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "accessibleName": "Refresh" },
+            "label": "Refresh button invalidates cache"
+          },
+          "expected": "Clicking refresh causes React Query to invalidate the 'graph-analytics' query key, triggering re-fetch of all panels. The RefreshCw icon should be present."
+        }
+      ]
+    },
+    {
+      "id": "health-score-data-display",
+      "name": "Health Score Card Data Display",
+      "description": "Large centered numeric score (0-100) with color-coded label. Breakdown section below shows 5 metrics: Element Success Rate, Regression Rate, Stall Frequency (as percentages), Total Interactions and Unique Elements (as counts). Score = 0.30 * element_success_rate + 0.25 * (1 - regression_rate) + 0.25 * (1 - stall_frequency) + 0.20 base. Backed by GET /ui-bridge/analytics/health-score.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "health-score-heading",
+          "description": "The health score card shows 'Automation Health' heading with Activity icon",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Automation Health" },
+            "label": "Health score card heading"
           }
         },
         {
-          "id": "health-score-metric-success-rate",
-          "description": "The element success rate metric is displayed in the breakdown",
+          "id": "health-score-window-label",
+          "description": "The card shows the time window (e.g., '7d window') to contextualize the score",
+          "category": "data-display",
+          "severity": "info",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "window" },
+            "label": "Time window label on health score card"
+          }
+        },
+        {
+          "id": "health-score-success-rate",
+          "description": "Element Success Rate metric is visible in the breakdown",
+          "category": "data-display",
           "severity": "critical",
           "assertionType": "exists",
           "enabled": true,
@@ -101,8 +185,9 @@
           }
         },
         {
-          "id": "health-score-metric-regression",
-          "description": "The regression rate metric shows what fraction of elements degraded between runs",
+          "id": "health-score-regression-rate",
+          "description": "Regression Rate metric shows fraction of elements that degraded",
+          "category": "data-display",
           "severity": "warning",
           "assertionType": "exists",
           "enabled": true,
@@ -113,152 +198,210 @@
           }
         },
         {
-          "id": "health-score-metric-stall",
-          "description": "The stall frequency metric shows how often the UI got stuck during automation",
-          "severity": "warning",
-          "assertionType": "exists",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "Stall Frequency" },
-            "label": "Stall frequency metric row"
-          }
-        },
-        {
-          "id": "health-score-metric-interactions",
-          "description": "The total interactions count shows how many UI Bridge actions have been recorded",
+          "id": "health-score-total-interactions",
+          "description": "Total Interactions count shows how many UI Bridge actions were recorded",
+          "category": "data-display",
           "severity": "warning",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Total Interactions" },
-            "label": "Total interactions metric row"
+            "label": "Total interactions count"
           }
-        },
+        }
+      ]
+    },
+    {
+      "id": "health-score-semantics",
+      "name": "Health Score Color and Label Semantics",
+      "description": "The score number and label use semantic color coding: green (>= 90, 'Excellent'), yellow (>= 70, 'Good'), orange (>= 50, 'Fair'), red (< 50, 'Poor'). These thresholds communicate automation quality at a glance and match the color coding used throughout the dashboard for success rates.",
+      "category": "semantic",
+      "assertions": [
         {
-          "id": "health-score-color-semantics",
-          "description": "The score number uses green for >= 90, yellow for >= 70, orange for >= 50, red for < 50. The label matches: Excellent, Good, Fair, Poor respectively. This color coding communicates automation quality at a glance.",
+          "id": "health-score-color-green",
+          "description": "A score of 90+ is displayed in green with label 'Excellent', indicating the automation is highly reliable",
+          "category": "semantic",
           "severity": "critical",
           "assertionType": "semantic",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Automation Health" },
-            "label": "Health score with color-coded quality indicator"
+            "label": "Green score with Excellent label for >= 90"
+          }
+        },
+        {
+          "id": "health-score-formula-correct",
+          "description": "The displayed score equals 0.30 * element_success_rate + 0.25 * (1 - regression_rate) + 0.25 * (1 - stall_frequency) + 0.20, computed server-side from ui_bridge_events data within the selected time window",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Automation Health" },
+            "label": "Score matches weighted composite formula"
           }
         }
       ]
     },
     {
-      "id": "recommendations-panel",
+      "id": "health-recommendations",
       "name": "Improvement Recommendations",
-      "description": "Prioritized list of actionable recommendations generated by generate_recommendations(). Each has a numbered priority badge, color-coded category (selectors=blue, performance=orange, annotations=purple, reliability=red), a message, and an impact statement. Categories correspond to: flaky_element_count > 3 → selectors, stall_count > 2 → performance, unannotated > 5 → annotations, failure_rate > 10% → reliability. Backed by GET /ui-bridge/analytics/recommendations.",
+      "description": "Prioritized list of actionable recommendations. Each has a numbered priority circle (1, 2, 3...), color-coded category tag (selectors=blue, performance=orange, annotations=purple, reliability=red), a message describing what to do, and an impact statement explaining why. Categories map to: flaky_element_count > 3 → selectors, stall_count > 2 → performance, unannotated > 5 → annotations, failure_rate > 10% → reliability. Backed by GET /ui-bridge/analytics/recommendations.",
       "category": "semantic",
       "assertions": [
         {
           "id": "rec-heading",
-          "description": "The recommendations panel is identifiable",
+          "description": "The recommendations panel is identifiable by its Lightbulb icon heading",
+          "category": "element-presence",
           "severity": "critical",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Improvement Recommendations" },
-            "label": "Recommendations heading with Lightbulb icon"
+            "label": "Recommendations heading"
           }
         },
         {
-          "id": "rec-empty-state",
-          "description": "When no issues are found, a positive message is shown instead of an empty list",
+          "id": "rec-categories-meaningful",
+          "description": "Each recommendation has a category tag (selectors, performance, annotations, reliability) that tells the user what type of improvement is needed and is color-coded consistently",
+          "category": "semantic",
           "severity": "warning",
           "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Improvement Recommendations" },
+            "label": "Category badges on recommendation items"
+          }
+        },
+        {
+          "id": "rec-priority-ordering",
+          "description": "Recommendations are ordered by priority number (1 = most important), with each item having a numbered badge to indicate urgency",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Improvement Recommendations" },
+            "label": "Numbered priority badges in descending importance"
+          }
+        }
+      ]
+    },
+    {
+      "id": "health-state-consistency",
+      "name": "Loading, Empty, and Error States",
+      "description": "All 9 panels handle three states consistently: loading (centered muted text), empty (reassuring message specific to each panel), and error (destructive red text with error string). When no interaction data exists, the health score shows 100% (1.0) with 0 interactions. Recommendations show 'No recommendations — automation is running well'. Element reliability shows 'No flaky elements detected (all elements have >90% success rate)'. Regressions show 'No regressions detected'.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "state-empty-health-score",
+          "description": "With zero interaction data, the health score is 100% (no failures to count), but Total Interactions shows 0, signaling that data collection hasn't started",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Total Interactions" },
+            "label": "Health score with zero interactions shows 100% but 0 count"
+          }
+        },
+        {
+          "id": "state-empty-recommendations",
+          "description": "With no issues detected, recommendations show a positive empty state",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "automation is running well" },
-            "label": "Empty state message when no recommendations"
+            "label": "Empty state for recommendations when no issues"
           }
         },
         {
-          "id": "rec-category-semantics",
-          "description": "Each recommendation has a category badge (selectors, performance, annotations, or reliability) that is color-coded and tells the user what type of improvement is needed",
-          "severity": "warning",
-          "assertionType": "semantic",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "selectors|performance|annotations|reliability" },
-            "label": "Category badges on recommendation items"
-          }
-        }
-      ]
-    },
-    {
-      "id": "element-reliability",
-      "name": "Element Reliability Heatmap",
-      "description": "Table of elements with flaky interaction history. Shows element_id (monospace), flaky badge (red), interaction count, success rate bar (green >= 95%, yellow >= 80%, red < 80%), recommended confidence score, and last failure reason. Data from get_flaky_elements(min_interactions=5, max_success_rate=0.9). Elements with < 90% success are flagged as automation risks. Backed by GET /ui-bridge/history/flaky.",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "elem-reliability-heading",
-          "description": "The element reliability panel is identifiable",
-          "severity": "critical",
-          "assertionType": "exists",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "Element Reliability" },
-            "label": "Element reliability heading with MousePointerClick icon"
-          }
-        },
-        {
-          "id": "elem-reliability-columns",
-          "description": "The table has columns for Element, Interactions, Success Rate, Confidence, and Last Failure",
-          "severity": "warning",
-          "assertionType": "exists",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "Last Failure" },
-            "label": "Last Failure column header"
-          }
-        },
-        {
-          "id": "elem-reliability-empty",
-          "description": "When all elements are reliable, a reassuring message is shown",
+          "id": "state-empty-regressions",
+          "description": "With no regressions detected, the panel shows a clear empty state",
+          "category": "state-consistency",
           "severity": "info",
-          "assertionType": "semantic",
+          "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "90% success rate" },
-            "label": "Empty state when no flaky elements"
+            "criteria": { "textContains": "No regressions detected" },
+            "label": "Empty state for regressions panel"
+          }
+        },
+        {
+          "id": "state-empty-failures",
+          "description": "With no failures recorded, the failure taxonomy shows a reassuring empty state",
+          "category": "state-consistency",
+          "severity": "info",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No failures recorded" },
+            "label": "Empty state for failure taxonomy"
+          }
+        },
+        {
+          "id": "state-empty-stalls",
+          "description": "With no stall events, the stall frequency chart shows an empty state",
+          "category": "state-consistency",
+          "severity": "info",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No stall events recorded" },
+            "label": "Empty state for stall frequency"
+          }
+        },
+        {
+          "id": "state-empty-annotation-gaps",
+          "description": "With all elements annotated, the annotation gaps table shows a positive message",
+          "category": "state-consistency",
+          "severity": "info",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "All high-interaction elements have annotations" },
+            "label": "Empty state for annotation gaps"
           }
         }
       ]
     },
     {
-      "id": "action-baselines",
-      "name": "Action Performance Baselines",
-      "description": "Table showing per-action-type performance. Columns: Action (click, type, select, etc.), Count, Avg/Min/Max duration in ms, Success rate. Success rate is color-coded (green >= 95%, yellow >= 80%, red < 80%). Data from get_action_latency_baselines() over ui_bridge_events WHERE event_type = 'action_executed'. Backed by GET /ui-bridge/analytics/action-baselines.",
-      "category": "semantic",
+      "id": "health-tables-data-display",
+      "name": "Analytics Table Data Display",
+      "description": "Three tables display tabular analytics data: Action Baselines (6 columns: Action, Count, Avg/Min/Max ms, Success%), Element Reliability (5 columns: Element, Interactions, Success Rate bar, Confidence, Last Failure), and Annotation Gaps (5 columns: Element, Type, Interactions, Success%, Label). All tables use consistent styling: text-xs headers, hover:bg-muted/50 rows, tabular-nums for numbers, font-mono for element IDs.",
+      "category": "data-display",
       "assertions": [
         {
           "id": "baselines-heading",
-          "description": "The action baselines panel is identifiable",
+          "description": "Action baselines table shows 'Action Performance Baselines' heading with Timer icon",
+          "category": "data-display",
           "severity": "critical",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Action Performance Baselines" },
-            "label": "Action baselines heading with Timer icon"
+            "label": "Action baselines heading"
           }
         },
         {
-          "id": "baselines-duration-columns",
-          "description": "Duration metrics are shown as Avg, Min, and Max in milliseconds",
+          "id": "baselines-columns",
+          "description": "Action baselines table has Avg, Min, Max millisecond columns for latency analysis",
+          "category": "data-display",
           "severity": "warning",
           "assertionType": "exists",
           "enabled": true,
@@ -267,240 +410,259 @@
             "criteria": { "textContains": "Avg (ms)" },
             "label": "Average duration column header"
           }
-        }
-      ]
-    },
-    {
-      "id": "failure-taxonomy",
-      "name": "Failure Taxonomy",
-      "description": "Clusters failures by error_message from ui_bridge_events WHERE success = 0. Each cluster shows the error message (monospace, destructive color), occurrence count (red badge, Nx format), and affected element IDs (monospace tags, max 5 shown, +N more overflow). Data from get_failure_taxonomy(). Backed by GET /ui-bridge/analytics/failure-taxonomy.",
-      "category": "semantic",
-      "assertions": [
+        },
         {
-          "id": "taxonomy-heading",
-          "description": "The failure taxonomy panel is identifiable",
+          "id": "reliability-heading",
+          "description": "Element reliability shows 'Element Reliability' heading with MousePointerClick icon",
+          "category": "data-display",
           "severity": "critical",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "Failure Taxonomy" },
-            "label": "Failure taxonomy heading with AlertCircle icon"
+            "criteria": { "textContains": "Element Reliability" },
+            "label": "Element reliability heading"
           }
         },
-        {
-          "id": "taxonomy-empty",
-          "description": "When no failures exist, a reassuring message is shown",
-          "severity": "info",
-          "assertionType": "semantic",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "No failures recorded" },
-            "label": "Empty state when no failures"
-          }
-        }
-      ]
-    },
-    {
-      "id": "automation-regressions",
-      "name": "Automation Regressions",
-      "description": "Detects element+action pairs that degraded between the older and newer halves of recent events. Uses NTILE(2) window function to split events into prior/recent halves. Shows element_id, action, prior success rate (green), recent success rate (red), and delta (red, bold). Only shows pairs with >= 4 events and > 10% degradation. Backed by GET /ui-bridge/analytics/regressions.",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "regression-heading",
-          "description": "The regressions panel is identifiable",
-          "severity": "critical",
-          "assertionType": "exists",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "Automation Regressions" },
-            "label": "Regressions heading with red ArrowDown icon"
-          }
-        },
-        {
-          "id": "regression-columns",
-          "description": "The table has Prior, Recent, and Delta columns showing success rate changes",
-          "severity": "warning",
-          "assertionType": "exists",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "Delta" },
-            "label": "Delta column header showing success rate change"
-          }
-        },
-        {
-          "id": "regression-empty",
-          "description": "When no regressions exist, the user is informed",
-          "severity": "info",
-          "assertionType": "semantic",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "No regressions detected" },
-            "label": "Empty state when no regressions"
-          }
-        }
-      ]
-    },
-    {
-      "id": "stall-detection",
-      "name": "Stall Frequency and Intervention",
-      "description": "Two side-by-side charts. Stall Frequency shows bar chart of stall_events grouped by pattern_type (RepeatedIdenticalAction, Oscillation, StepLimitExceeded, StallTimeout, NoProgressDetected, UIStuck). Intervention Effectiveness shows stacked bar chart of intervention_action outcomes (WaitAndRetry, NavigateBack, RefreshPage, StopWithDiagnosis) split by Resolved vs Unresolved. Backed by GET /ui-bridge/analytics/stall-frequency and /intervention-effectiveness.",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "stall-heading",
-          "description": "The stall frequency chart is identifiable",
-          "severity": "warning",
-          "assertionType": "exists",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "Stall Frequency by Type" },
-            "label": "Stall frequency heading with PauseCircle icon"
-          }
-        },
-        {
-          "id": "intervention-heading",
-          "description": "The intervention effectiveness chart is identifiable",
-          "severity": "warning",
-          "assertionType": "exists",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "Intervention Effectiveness" },
-            "label": "Intervention effectiveness heading with Shield icon"
-          }
-        }
-      ]
-    },
-    {
-      "id": "annotation-gaps",
-      "name": "Annotation Gap Detection",
-      "description": "Table of high-interaction elements that lack semantic annotations (no data-awas-element in metadata). Shows element_id, element_type, interaction count, success rate, and label. These are automation risks — frequently used elements with no stable selector. Data from get_unannotated_high_interaction_elements(min_interactions=10). Backed by GET /ui-bridge/analytics/annotation-gaps.",
-      "category": "semantic",
-      "assertions": [
         {
           "id": "gaps-heading",
-          "description": "The annotation gaps panel is identifiable",
+          "description": "Annotation gaps table shows heading with subtitle '(elements needing data-testid)'",
+          "category": "data-display",
           "severity": "critical",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Annotation Gaps" },
-            "label": "Annotation gaps heading with Tag icon"
-          }
-        },
-        {
-          "id": "gaps-subtitle",
-          "description": "The subtitle explains what data-testid means in this context",
-          "severity": "info",
-          "assertionType": "exists",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "elements needing data-testid" },
-            "label": "Subtitle explaining purpose"
-          }
-        },
-        {
-          "id": "gaps-empty",
-          "description": "When all elements are annotated, a positive message is shown",
-          "severity": "info",
-          "assertionType": "semantic",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "All high-interaction elements have annotations" },
-            "label": "Empty state when no gaps"
+            "label": "Annotation gaps heading"
           }
         }
       ]
     },
     {
-      "id": "design-consistency",
+      "id": "health-charts-data-display",
+      "name": "Analytics Chart Data Display",
+      "description": "Four charts visualize analytics data: Failure Taxonomy (error clusters with count badges and element tags), Regression Table (prior/recent/delta success rates in green/red), Stall Frequency (bar chart by pattern type using chart-4 color), and Intervention Effectiveness (stacked bar of Resolved vs Unresolved using chart-2/chart-5 colors with legend). Charts use Recharts with ResponsiveContainer.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "taxonomy-heading",
+          "description": "Failure taxonomy shows 'Failure Taxonomy' heading with AlertCircle icon",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Failure Taxonomy" },
+            "label": "Failure taxonomy heading"
+          }
+        },
+        {
+          "id": "regression-heading",
+          "description": "Regressions table shows heading with red ArrowDown icon indicating degradation",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Automation Regressions" },
+            "label": "Regression heading with red arrow"
+          }
+        },
+        {
+          "id": "regression-delta-column",
+          "description": "Regressions table has Delta column showing success rate change between prior and recent runs",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Delta" },
+            "label": "Delta column header"
+          }
+        },
+        {
+          "id": "stall-heading",
+          "description": "Stall frequency chart shows 'Stall Frequency by Type' heading with PauseCircle icon",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Stall Frequency by Type" },
+            "label": "Stall frequency heading"
+          }
+        },
+        {
+          "id": "intervention-heading",
+          "description": "Intervention effectiveness chart shows heading with Shield icon",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Intervention Effectiveness" },
+            "label": "Intervention effectiveness heading"
+          }
+        }
+      ]
+    },
+    {
+      "id": "health-color-semantics",
+      "name": "Color Coding Semantics",
+      "description": "Consistent color coding across all panels communicates data quality at a glance. Success rates: green >= 95%, yellow >= 80%, red < 80%. Health score: green >= 90, yellow >= 70, orange >= 50, red < 50. Recommendation categories: blue (selectors), orange (performance), purple (annotations), red (reliability). Pattern status: red (active), green (resolved), gray (suppressed). Flaky badge: red bg-red-500/10. Success bar: green/yellow/red fill on muted background.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "color-success-rate-green",
+          "description": "Success rates >= 95% are shown in green (text-green-500), signaling reliable automation",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Action Performance Baselines" },
+            "label": "Green success rate for reliable actions"
+          }
+        },
+        {
+          "id": "color-success-rate-red",
+          "description": "Success rates < 80% are shown in red (text-red-500), flagging unreliable automation",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Element Reliability" },
+            "label": "Red success rate for unreliable elements"
+          }
+        },
+        {
+          "id": "color-flaky-badge",
+          "description": "Elements flagged as flaky show a red 'flaky' badge (bg-red-500/10 text-red-500) that immediately draws attention to unreliable selectors",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Element Reliability" },
+            "label": "Red flaky badge on unreliable elements"
+          }
+        }
+      ]
+    },
+    {
+      "id": "health-behavior-data-freshness",
+      "name": "Data Freshness and Pipeline Behavior",
+      "description": "Analytics data reflects recent UI Bridge interactions. When actions are performed with ?task_run_id= query parameter on the /ui-bridge/control/element/{id}/action endpoint, they are persisted to ui_bridge_events via spawn_blocking. The dashboard should show non-zero interaction counts within seconds of actions being performed. Changing the time range should filter all panels. The health score should decrease when failures are introduced.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "behavior-data-appears",
+          "description": "After performing UI Bridge actions with task_run_id, the health score panel should show non-zero Total Interactions and the action baselines should show at least one action type",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Total Interactions" },
+            "label": "Interaction count reflects recent actions"
+          },
+          "expected": "After executing actions via /ui-bridge/control/element/{id}/action?task_run_id=1, refreshing the dashboard should show Total Interactions > 0 and the action baselines table should list 'click' with duration data."
+        },
+        {
+          "id": "behavior-failures-lower-score",
+          "description": "Introducing failed actions should decrease the health score below 100% and trigger recommendations",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Automation Health" },
+            "label": "Health score decreases with failures"
+          },
+          "expected": "After actions with success=false are recorded, the health score should be < 100, the failure taxonomy should show error clusters, and recommendations should appear with actionable guidance."
+        },
+        {
+          "id": "behavior-time-range-filter",
+          "description": "Switching time range from 30d to 24h may show different data if interactions span multiple days",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "24h", "role": "button" },
+            "label": "Time range filters analytics data"
+          },
+          "expected": "Clicking '24h' should show only actions from the last 24 hours. If all actions were performed today, counts should match. If older actions exist, counts should decrease."
+        }
+      ]
+    },
+    {
+      "id": "health-backend-architecture",
+      "name": "Backend Data Pipeline Architecture",
+      "description": "Architecture: UI Bridge action handlers (mcp/ui_bridge.rs, mcp/sdk_client.rs) persist events to ui_bridge_events table via insert_ui_bridge_event() when ?task_run_id= query param is present. Events flow through 17 SQL query functions in database/ui_bridge_ops.rs, exposed via 13 MCP HTTP endpoints under /ui-bridge/analytics/*. The knowledge graph (reflection/graph_engine.rs) loads UIElement nodes and InteractedWith edges for causal analysis. The stall detector (orchestration_loop/stall_detector.rs) fetches /ui-bridge/control/health-signals to detect UIStuck patterns. Token attribution flows through phase_token_usage.target_app. CTR auto-seeding pushes reliability data to SDK apps on connect.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "arch-endpoints-respond",
+          "description": "All 13 analytics MCP endpoints respond with {success: true, data: ...} JSON structure, consistent with the ApiResponse pattern used throughout the runner",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Automation Health" },
+            "label": "All analytics endpoints return valid responses"
+          }
+        }
+      ]
+    },
+    {
+      "id": "health-design-consistency",
       "name": "Visual Design Consistency",
-      "description": "All panels use the standard card container (bg-card rounded-lg border border-border p-4). Headings use font-semibold with Lucide icon. Tables use consistent column styling (text-xs text-muted-foreground headers, hover:bg-muted/50 rows). Color thresholds are uniform: green >= 95%, yellow >= 80%, red < 80% for success rates. The responsive grid uses grid-cols-1 md:grid-cols-2 gap-4.",
+      "description": "All panels use bg-card rounded-lg border border-border p-4 container styling. Headings use font-semibold with a Lucide icon. Tables use text-xs text-muted-foreground headers, py-2 px-3 cell padding, hover:bg-muted/50 row highlights, and tabular-nums for numeric alignment. Charts use h-48 height with ResponsiveContainer. The responsive grid uses grid-cols-1 md:grid-cols-2 gap-4.",
       "category": "design",
       "assertions": [
         {
-          "id": "design-card-borders",
-          "description": "Each analytics panel has a visible border separating it from adjacent panels",
+          "id": "design-card-containers",
+          "description": "Each analytics panel is visually contained in a card with border and rounded corners, providing clear visual separation between panels",
+          "category": "design",
           "severity": "warning",
           "assertionType": "semantic",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Automation Health" },
-            "label": "Dashboard container"
+            "label": "Consistent card container styling"
           }
         },
         {
-          "id": "design-responsive-grid",
-          "description": "On medium+ screens, panels are arranged in a 2-column grid. On small screens, they stack vertically.",
+          "id": "design-responsive-layout",
+          "description": "On medium+ screens, panels are in 2-column grid. On small screens, they stack single-column for readability.",
+          "category": "design",
           "severity": "info",
           "assertionType": "semantic",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Automation Health" },
-            "label": "Responsive grid layout"
-          }
-        }
-      ]
-    },
-    {
-      "id": "backend-architecture",
-      "name": "Backend Data Pipeline",
-      "description": "Architecture: UI Bridge action handlers (mcp/ui_bridge.rs, mcp/sdk_client.rs) persist events to ui_bridge_events table via insert_ui_bridge_event() when ?task_run_id= query param is present. Events flow through 17 SQL query functions in database/ui_bridge_ops.rs, exposed via 13 MCP HTTP endpoints under /ui-bridge/analytics/*. The knowledge graph (reflection/graph_engine.rs) loads UIElement nodes and InteractedWith edges for causal analysis. The stall detector (orchestration_loop/stall_detector.rs) fetches /ui-bridge/control/health-signals to detect UIStuck patterns. Token attribution flows through phase_token_usage.target_app via get_active_sdk_app_name(). CTR auto-seeding pushes element reliability data to SDK apps on connect via push_ctr_reliability_to_sdk().",
-      "category": "semantic",
-      "assertions": [
-        {
-          "id": "arch-data-freshness",
-          "description": "Analytics data reflects recent UI Bridge interactions — if actions were performed with task_run_id, the dashboard should show non-zero interaction counts within seconds",
-          "severity": "critical",
-          "assertionType": "semantic",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "Total Interactions" },
-            "label": "Total interactions count should be non-zero after actions"
-          }
-        },
-        {
-          "id": "arch-time-range-filtering",
-          "description": "Changing the time range (24h/7d/30d) should cause all panels to refresh with data scoped to that window",
-          "severity": "critical",
-          "assertionType": "behavior",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContent": "7d", "role": "button" },
-            "label": "Time range selector changes all panel data"
+            "label": "Responsive 2-column to 1-column grid"
           }
         }
       ]
     }
-  ],
-  "metadata": {
-    "component": "AutomationHealthDashboard",
-    "pageUrl": "/automation-health",
-    "tags": [
-      "automation-health",
-      "analytics",
-      "ui-bridge",
-      "element-reliability",
-      "stall-detection",
-      "recommendations",
-      "cross-run-patterns",
-      "selector-decay",
-      "failure-taxonomy",
-      "dev-only"
-    ]
-  }
+  ]
 }

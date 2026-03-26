@@ -1,54 +1,39 @@
 {
   "version": "1.0.0",
-  "description": "Cross-Run Analytics components — CrossRunPatternsPanel and StepProvenanceTimeline. These are used within the Reflection Dashboard and can be composed into other views. CrossRunPatternsPanel shows recurring_finding and fix_oscillation patterns detected across workflow runs via the knowledge graph's cross_run_patterns table. StepProvenanceTimeline shows which pipeline agent (discovery, builder, fixer, hardener, verifier) generated each workflow step, with UI Bridge interaction counts overlaid from step_provenance.ui_bridge_event_ids. Also covers SelectorDecayChart (element success rate over time windows) and FailureChainViewer (graph traversal from UI element through task_run to workflow/finding).",
+  "id": "runner:cross-run-analytics",
+  "description": "Cross-Run Analytics components — CrossRunPatternsPanel, StepProvenanceTimeline, SelectorDecayChart, and FailureChainViewer. Used within the Reflection Dashboard and element detail views. CrossRunPatternsPanel shows recurring_finding and fix_oscillation patterns from the knowledge graph's cross_run_patterns table. StepProvenanceTimeline shows which pipeline agent generated each step with UI Bridge interaction overlays. SelectorDecayChart tracks element reliability over time. FailureChainViewer traces graph paths from UI elements through task runs to workflows, findings, and fixes.",
+  "metadata": {
+    "component": "CrossRunPatternsPanel, StepProvenanceTimeline, SelectorDecayChart, FailureChainViewer",
+    "pageId": "reflection",
+    "pageUrl": "/reflection",
+    "tags": ["cross-run-patterns", "step-provenance", "selector-decay", "failure-chain", "knowledge-graph", "pipeline-agents", "ui-bridge", "analytics"]
+  },
   "groups": [
     {
-      "id": "cross-run-patterns",
-      "name": "Cross-Run Pattern Detection",
-      "description": "Shows patterns detected across multiple workflow runs. Two pattern types: recurring_finding (same error appears in >= 3 runs, yellow badge with TrendingUp icon) and fix_oscillation (a fix resolves an issue but it recurs, orange badge with RefreshCw icon). Each pattern shows signature_hash (first 12 chars, monospace), occurrence count (bold Nx), last seen date, status badge (active=red, resolved=green, suppressed=muted), and affected components. Backed by GET /graph/cross-run-patterns.",
-      "category": "semantic",
+      "id": "crossrun-elements",
+      "name": "Cross-Run Pattern Elements",
+      "description": "The CrossRunPatternsPanel renders a list of detected patterns with type badges, signature hashes, occurrence counts, timestamps, and status indicators. Each pattern row has a type badge (recurring_finding or fix_oscillation), truncated signature hash, occurrence count, last seen date, and status badge.",
+      "category": "element-presence",
       "assertions": [
         {
-          "id": "patterns-heading",
-          "description": "The cross-run patterns panel is identifiable",
+          "id": "crossrun-heading",
+          "description": "The cross-run patterns panel is identifiable by its AlertTriangle icon heading",
+          "category": "element-presence",
           "severity": "critical",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Cross-Run Patterns" },
-            "label": "Patterns heading with AlertTriangle icon"
+            "label": "Patterns heading"
           }
         },
         {
-          "id": "patterns-type-badges",
-          "description": "Pattern types are visually distinguished: recurring findings show yellow TrendingUp badges, fix oscillations show orange RefreshCw badges",
-          "severity": "warning",
-          "assertionType": "semantic",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "Recurring Finding|Fix Oscillation" },
-            "label": "Pattern type badge indicating recurring or oscillation"
-          }
-        },
-        {
-          "id": "patterns-status-semantics",
-          "description": "Pattern status badges communicate urgency: active (red) means the pattern is still occurring, resolved (green) means a fix worked, suppressed (gray) means intentionally ignored",
-          "severity": "warning",
-          "assertionType": "semantic",
-          "enabled": true,
-          "target": {
-            "type": "search",
-            "criteria": { "textContains": "active|resolved|suppressed" },
-            "label": "Status badges on pattern rows"
-          }
-        },
-        {
-          "id": "patterns-empty",
-          "description": "When no patterns exist, the user is reassured",
+          "id": "crossrun-empty",
+          "description": "When no patterns exist, an empty state message is shown",
+          "category": "element-presence",
           "severity": "info",
-          "assertionType": "semantic",
+          "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
@@ -59,138 +44,306 @@
       ]
     },
     {
-      "id": "step-provenance-timeline",
-      "name": "Step Provenance Timeline",
-      "description": "Vertical timeline showing workflow step generation history. Each step has a colored dot (blue=discovery, green=builder, orange=fixer, purple=hardener, cyan=verifier), step name, phase badge (setup/verification/agentic/completion), step index, generating agent name (monospace), generation iteration, and UI Bridge interaction count (parsed from ui_bridge_event_ids JSON array). Legend at bottom shows agent color mapping. Max height 384px with scroll. Backed by GET /graph/step-provenance?workflow_id=X.",
+      "id": "crossrun-data-display",
+      "name": "Pattern Data Display",
+      "description": "Each pattern row shows: type badge (yellow 'Recurring Finding' with TrendingUp icon, or orange 'Fix Oscillation' with RefreshCw icon), signature_hash first 12 chars in monospace, affected_components below in muted text, occurrence count as bold 'Nx', last seen date, and status badge (active=red, resolved=green, suppressed=gray). Data from GET /graph/cross-run-patterns.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "crossrun-type-badges",
+          "description": "Pattern types are distinguished visually: recurring findings have yellow badges with TrendingUp, fix oscillations have orange badges with RefreshCw",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Recurring Finding|Fix Oscillation" },
+            "label": "Pattern type badges"
+          }
+        },
+        {
+          "id": "crossrun-occurrence-count",
+          "description": "Each pattern shows its occurrence count as a bold number with 'x' suffix (e.g., '5x')",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cross-Run Patterns" },
+            "label": "Occurrence count display"
+          }
+        }
+      ]
+    },
+    {
+      "id": "crossrun-status-semantics",
+      "name": "Pattern Status Semantics",
+      "description": "Pattern status badges communicate urgency through color: 'active' (red bg-red-500/10) means the pattern is still occurring and needs attention, 'resolved' (green bg-green-500/10) means a fix successfully addressed it, 'suppressed' (gray bg-muted) means it was intentionally ignored. These match the cross_run_patterns.status column values.",
       "category": "semantic",
       "assertions": [
         {
+          "id": "crossrun-status-active",
+          "description": "Active patterns use red styling to signal they need immediate attention",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "active" },
+            "label": "Red badge for active patterns"
+          }
+        },
+        {
+          "id": "crossrun-status-resolved",
+          "description": "Resolved patterns use green styling to confirm the fix worked",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "resolved" },
+            "label": "Green badge for resolved patterns"
+          }
+        }
+      ]
+    },
+    {
+      "id": "provenance-elements",
+      "name": "Step Provenance Timeline Elements",
+      "description": "Vertical timeline with colored dots per agent. Each step shows: agent-colored dot (3x3px rounded), step name, phase badge (setup/verification/agentic/completion in bg-muted), step index (#N), generating agent name in monospace, generation iteration, and UI Bridge interaction count badge. Legend at bottom shows all 5 agent colors. Max height 384px with scroll.",
+      "category": "element-presence",
+      "assertions": [
+        {
           "id": "provenance-heading",
-          "description": "The step provenance timeline is identifiable",
+          "description": "The provenance timeline has a GitBranch icon heading",
+          "category": "element-presence",
           "severity": "critical",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Step Provenance Timeline" },
-            "label": "Provenance heading with GitBranch icon"
+            "label": "Provenance heading"
           }
         },
         {
-          "id": "provenance-agent-colors",
-          "description": "The legend shows color coding for pipeline agents: discovery (blue), builder (green), fixer (orange), hardener (purple), verifier (cyan)",
+          "id": "provenance-empty",
+          "description": "When no provenance data exists, an empty state is shown",
+          "category": "element-presence",
+          "severity": "info",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No step provenance data" },
+            "label": "Empty state for provenance"
+          }
+        }
+      ]
+    },
+    {
+      "id": "provenance-data-display",
+      "name": "Provenance Agent Color Coding",
+      "description": "Each step's timeline dot color identifies the generating agent: discovery (blue bg-blue-500), builder (green bg-green-500), fixer (orange bg-orange-500), hardener (purple bg-purple-500), verifier (cyan bg-cyan-500), other (gray bg-muted-foreground). The legend at bottom shows all agent colors. Steps with UI Bridge interactions show a count badge (e.g., '3 UI interactions' in bg-primary/10 text-primary).",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "provenance-agent-legend",
+          "description": "The legend shows color-coded agent names: discovery, builder, fixer, hardener, verifier",
+          "category": "data-display",
           "severity": "warning",
           "assertionType": "semantic",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "discovery" },
-            "label": "Agent color legend"
+            "label": "Agent color legend with all 5 types"
           }
         },
         {
-          "id": "provenance-ui-interactions",
-          "description": "Steps that involved UI Bridge interactions show a count badge (e.g., '3 UI interactions') indicating how many element actions occurred during that step's execution",
+          "id": "provenance-ui-interaction-badge",
+          "description": "Steps that involved UI Bridge element interactions show a count badge (parsed from step_provenance.ui_bridge_event_ids JSON)",
+          "category": "data-display",
           "severity": "info",
           "assertionType": "semantic",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "UI interaction" },
-            "label": "UI interaction count on provenance steps"
+            "label": "UI interaction count badge"
           }
         }
       ]
     },
     {
-      "id": "selector-decay-chart",
-      "name": "Selector Decay Curve",
-      "description": "Line chart showing a single element's success rate over time windows. Used for element detail views, not the main dashboard. X-axis shows window labels (W1, W2, ...), Y-axis shows 0-100% with a dashed reference line at 95% (reliability threshold). Uses Recharts LineChart with primary color, stroke width 2, dots enabled. A declining curve indicates selector degradation requiring CTR updates. Backed by GET /ui-bridge/analytics/decay-curve?element_id=X&window_ms=86400000&windows=7.",
-      "category": "semantic",
+      "id": "provenance-state-consistency",
+      "name": "Provenance Loading and Error States",
+      "description": "The timeline shows 'Loading provenance...' during fetch, an error message in text-destructive on failure, and the agent legend only when data is available.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "provenance-loading",
+          "description": "During data fetch, a loading message is displayed centered in the panel",
+          "category": "state-consistency",
+          "severity": "info",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Loading provenance" },
+            "label": "Loading state text"
+          }
+        }
+      ]
+    },
+    {
+      "id": "decay-chart-data-display",
+      "name": "Selector Decay Chart Data Display",
+      "description": "Line chart showing success rate over time windows. X-axis: window labels (W1, W2, ..., newest last). Y-axis: 0-100% with dashed reference line at 95% (reliability threshold). Uses primary color stroke, width 2, dots enabled. A declining curve indicates the element's selector is degrading and needs CTR updates. Used in element detail views, not the main dashboard. Backed by GET /ui-bridge/analytics/decay-curve.",
+      "category": "data-display",
       "assertions": [
         {
           "id": "decay-heading",
-          "description": "The decay chart shows the element ID in monospace after 'Selector Decay:'",
+          "description": "The chart shows 'Selector Decay:' followed by the element ID in monospace with TrendingDown icon",
+          "category": "data-display",
           "severity": "warning",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Selector Decay" },
-            "label": "Decay chart heading with TrendingDown icon and element ID"
+            "label": "Decay chart heading with element ID"
           }
-        },
+        }
+      ]
+    },
+    {
+      "id": "decay-chart-semantics",
+      "name": "Decay Chart Reference Line Semantics",
+      "description": "The dashed line at 95% represents the reliability threshold. Elements above this line are considered reliable. Elements below need attention — their selectors may be breaking due to DOM restructuring, CSS changes, or app updates. The trend direction (rising vs falling) is more important than the absolute value.",
+      "category": "semantic",
+      "assertions": [
         {
           "id": "decay-reference-line",
-          "description": "The chart includes a dashed reference line at 95% marking the reliability threshold — elements below this line are considered unreliable",
+          "description": "A 95% reference line separates reliable (above) from unreliable (below) selector performance",
+          "category": "semantic",
           "severity": "info",
           "assertionType": "semantic",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Selector Decay" },
-            "label": "95% reference line on decay chart"
+            "label": "95% reliability threshold reference line"
           }
         }
       ]
     },
     {
-      "id": "failure-chain-viewer",
-      "name": "Failure Chain Viewer",
-      "description": "Graph traversal visualization showing the causal chain behind a UI element's failures. Traverses the knowledge graph: UIElement ← InteractedWith ← TaskRun → BelongsTo → Workflow, collecting connected findings and fixes. Each node in the chain has a colored dot (ui_element=blue, task_run=purple, workflow=green, finding=orange, fix=cyan, rule=yellow, error=red), kind label, and entity name (monospace). Nodes are connected by ChevronRight arrows with edge kind labels. Legend at bottom shows node type colors. Backed by GET /graph/ui-failure-chain?element_id=X.",
-      "category": "semantic",
+      "id": "failure-chain-elements",
+      "name": "Failure Chain Viewer Elements",
+      "description": "Displays graph traversal paths as horizontal node chains. Each node has a colored dot (7 types: ui_element=blue, task_run=purple, workflow=green, finding=orange, fix=cyan, rule=yellow, error=red), kind label, and entity name (monospace). Nodes connected by ChevronRight arrows with edge kind labels. Multiple paths shown in separate bordered cards. Legend shows all node types. Max height 384px with scroll.",
+      "category": "element-presence",
       "assertions": [
         {
           "id": "chain-heading",
-          "description": "The failure chain viewer shows the element ID being traced",
+          "description": "The viewer shows 'Failure Chain:' followed by the element ID with GitMerge icon",
+          "category": "element-presence",
           "severity": "warning",
           "assertionType": "exists",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "Failure Chain" },
-            "label": "Failure chain heading with GitMerge icon and element ID"
+            "label": "Failure chain heading with element ID"
           }
         },
         {
-          "id": "chain-node-types",
-          "description": "The legend shows all knowledge graph node types with color coding: ui_element, task_run, workflow, finding, fix, rule, error",
+          "id": "chain-empty",
+          "description": "When no causal chains exist, an informative empty state is shown",
+          "category": "element-presence",
+          "severity": "info",
+          "assertionType": "exists",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "No failure chains found" },
+            "label": "Empty state for failure chains"
+          }
+        }
+      ]
+    },
+    {
+      "id": "failure-chain-semantics",
+      "name": "Failure Chain Node Type Semantics",
+      "description": "The graph traversal follows the knowledge graph: UIElement ← InteractedWith ← TaskRun → BelongsTo → Workflow, with DetectedDuring edges connecting to findings. Each node type's color communicates its role in the causal chain: blue elements are UI targets, purple runs are execution instances, green workflows are the automation definition, orange findings are discovered issues, cyan fixes are attempted solutions. This lets users trace 'why did this element fail?' back to its root cause.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "chain-node-legend",
+          "description": "The legend shows 7 node types with consistent colors matching the knowledge graph schema",
+          "category": "semantic",
           "severity": "info",
           "assertionType": "semantic",
           "enabled": true,
           "target": {
             "type": "search",
             "criteria": { "textContains": "ui_element" },
-            "label": "Node type legend in failure chain"
+            "label": "Node type legend with all 7 types"
           }
         },
         {
-          "id": "chain-empty",
-          "description": "When no causal chain is found, the user is informed",
+          "id": "chain-traversal-direction",
+          "description": "Paths read left-to-right with arrows showing the direction of causal relationship — the leftmost node is the failed UI element, rightmost is the connected workflow, finding, or fix",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Failure Chain" },
+            "label": "Left-to-right causal path visualization"
+          }
+        }
+      ]
+    },
+    {
+      "id": "crossrun-behavior",
+      "name": "Cross-Run Data Update Behavior",
+      "description": "CrossRunPatternsPanel accepts an optional workflowName prop to filter patterns. When no workflow is selected, all patterns are shown. The panel uses useCrossRunPatterns() hook with 30s stale time and 60s refetch interval. StepProvenanceTimeline requires a workflowId prop and is disabled when empty. SelectorDecayChart requires an elementId prop. FailureChainViewer requires an elementId prop.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "crossrun-workflow-filter",
+          "description": "When a workflowName is provided, the patterns panel shows only patterns related to that workflow; when none is provided, all patterns are shown",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "enabled": true,
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Cross-Run Patterns" },
+            "label": "Workflow name filtering for patterns"
+          },
+          "expected": "Providing a workflowName prop should filter the displayed patterns to only those matching that workflow. Removing the filter should show all patterns."
+        },
+        {
+          "id": "crossrun-auto-refresh",
+          "description": "Pattern data automatically refreshes every 60 seconds without user action",
+          "category": "behavior",
           "severity": "info",
           "assertionType": "semantic",
           "enabled": true,
           "target": {
             "type": "search",
-            "criteria": { "textContains": "No failure chains found" },
-            "label": "Empty state when no chains exist"
+            "criteria": { "textContains": "Cross-Run Patterns" },
+            "label": "Auto-refresh on 60s interval"
           }
         }
       ]
     }
-  ],
-  "metadata": {
-    "component": "CrossRunPatternsPanel, StepProvenanceTimeline, SelectorDecayChart, FailureChainViewer",
-    "pageUrl": "/reflection",
-    "tags": [
-      "cross-run-patterns",
-      "step-provenance",
-      "selector-decay",
-      "failure-chain",
-      "knowledge-graph",
-      "pipeline-agents",
-      "ui-bridge",
-      "analytics"
-    ]
-  }
+  ]
 }
