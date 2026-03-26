@@ -256,12 +256,40 @@ CREATE TABLE IF NOT EXISTS execution_spans (
     attributes TEXT,
     success BOOLEAN DEFAULT true,
     error TEXT,
+
+    -- Inngest-inspired enrichment (v146)
+    queue_wait_ms BIGINT,           -- Time spent waiting in the workflow queue
+    retry_attempt INTEGER,          -- Retry attempt number (0 = first attempt)
+    phase TEXT,                     -- Workflow phase (setup, verification, agentic, completion)
+    iteration INTEGER,              -- Loop iteration number
+    workflow_id TEXT,               -- Workflow definition that owns this span
+
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_spans_execution ON execution_spans(execution_id);
 CREATE INDEX IF NOT EXISTS idx_spans_trace ON execution_spans(trace_id);
 CREATE INDEX IF NOT EXISTS idx_spans_name ON execution_spans(name);
+
+-- Durable Workflow Queue (Inngest-inspired)
+CREATE TABLE IF NOT EXISTS queued_workflows (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    workflow_name TEXT NOT NULL,
+    queued_at TIMESTAMPTZ NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    error_message TEXT,
+    task_run_id TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 3
+);
+
+CREATE INDEX IF NOT EXISTS idx_queued_workflows_status ON queued_workflows(status);
+CREATE INDEX IF NOT EXISTS idx_queued_workflows_priority ON queued_workflows(priority DESC, queued_at ASC);
 
 -- Unified Workflows (workflow definitions — core CRUD table)
 CREATE TABLE IF NOT EXISTS unified_workflows (
@@ -372,6 +400,377 @@ CREATE INDEX IF NOT EXISTS idx_uw_source_file ON unified_workflows(source_file_p
 -- Full-text search on name + description
 CREATE INDEX IF NOT EXISTS idx_uw_fts ON unified_workflows
     USING GIN (to_tsvector('english', name || ' ' || COALESCE(description, '')));
+
+-- Learning Outcomes (task execution results for meta-optimizer)
+CREATE TABLE IF NOT EXISTS learning_outcomes (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    duration_secs DOUBLE PRECISION,
+    iterations INTEGER,
+    strategy TEXT,
+    tools_used TEXT,
+    files_modified TEXT,
+    error_type TEXT,
+    error_message TEXT,
+    feedback TEXT,
+    workflow_architecture TEXT,
+    context_embedding BYTEA,
+    step_count BIGINT,
+    verification_step_count BIGINT,
+    agentic_step_count BIGINT,
+    has_ui_bridge BOOLEAN DEFAULT false,
+    total_tokens BIGINT,
+    total_cost_usd DOUBLE PRECISION,
+    composite_agentic_score DOUBLE PRECISION,
+    technology_tags TEXT,
+    domain_tags TEXT,
+    complexity_tier TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_lo_task_id ON learning_outcomes(task_id);
+CREATE INDEX IF NOT EXISTS idx_lo_status ON learning_outcomes(status);
+CREATE INDEX IF NOT EXISTS idx_lo_created_at ON learning_outcomes(created_at);
+CREATE INDEX IF NOT EXISTS idx_lo_strategy ON learning_outcomes(strategy);
+
+-- Learning Patterns (identified patterns from task analysis)
+CREATE TABLE IF NOT EXISTS learning_patterns (
+    id TEXT PRIMARY KEY,
+    pattern_type TEXT NOT NULL,
+    description TEXT NOT NULL,
+    confidence DOUBLE PRECISION NOT NULL,
+    occurrences INTEGER NOT NULL DEFAULT 1,
+    context TEXT,
+    description_embedding BYTEA,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_lp_type ON learning_patterns(pattern_type);
+CREATE INDEX IF NOT EXISTS idx_lp_confidence ON learning_patterns(confidence);
+
+-- Q-Routing Table (Q-learning state-action values for architecture routing)
+CREATE TABLE IF NOT EXISTS q_routing_table (
+    state_key TEXT NOT NULL,
+    action TEXT NOT NULL,
+    q_value DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    visit_count INTEGER NOT NULL DEFAULT 0,
+    last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (state_key, action)
+);
+
+-- Q-Routing Overrides (manual locks: force a state to use a specific architecture)
+CREATE TABLE IF NOT EXISTS q_routing_overrides (
+    state_key TEXT PRIMARY KEY,
+    forced_action TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Workflow Execution State (current state machine position)
+CREATE TABLE IF NOT EXISTS workflow_execution_state (
+    execution_id TEXT PRIMARY KEY REFERENCES task_runs(id) ON DELETE CASCADE,
+    workflow_type TEXT NOT NULL,
+    state_name TEXT NOT NULL,
+    state_data TEXT,
+    phase TEXT,
+    iteration INTEGER,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_wes_type ON workflow_execution_state(workflow_type);
+CREATE INDEX IF NOT EXISTS idx_wes_state ON workflow_execution_state(state_name);
+
+-- Workflow Step Checkpoints (step-level checkpointing for resume)
+CREATE TABLE IF NOT EXISTS workflow_step_checkpoints (
+    id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    workflow_type TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    iteration INTEGER,
+    step_index INTEGER NOT NULL,
+    step_type TEXT NOT NULL,
+    step_name TEXT,
+    status TEXT NOT NULL,
+    result_json TEXT,
+    step_config_json TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    duration_ms INTEGER,
+    error TEXT,
+    stage_index INTEGER DEFAULT 0,
+    UNIQUE(execution_id, phase, iteration, step_index, stage_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wsc_execution ON workflow_step_checkpoints(execution_id);
+CREATE INDEX IF NOT EXISTS idx_wsc_lookup ON workflow_step_checkpoints(execution_id, phase, iteration);
+CREATE INDEX IF NOT EXISTS idx_wsc_status ON workflow_step_checkpoints(status);
+CREATE INDEX IF NOT EXISTS idx_wsc_cursor ON workflow_step_checkpoints(execution_id, step_index);
+
+-- Step Progress Markers (intra-step progress tracking)
+CREATE TABLE IF NOT EXISTS step_progress_markers (
+    id BIGSERIAL PRIMARY KEY,
+    checkpoint_id TEXT NOT NULL REFERENCES workflow_step_checkpoints(id) ON DELETE CASCADE,
+    marker_type TEXT NOT NULL,
+    current_value INTEGER NOT NULL,
+    total_value INTEGER,
+    description TEXT,
+    data_json TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_spm_checkpoint ON step_progress_markers(checkpoint_id);
+
+-- UI Bridge Elements (element snapshots from pages)
+CREATE TABLE IF NOT EXISTS ui_bridge_elements (
+    id BIGSERIAL PRIMARY KEY,
+    task_run_id BIGINT,
+    timestamp BIGINT NOT NULL,
+    element_id TEXT NOT NULL,
+    tag_name TEXT,
+    element_type TEXT,
+    bounds TEXT,
+    visible BOOLEAN DEFAULT true,
+    enabled BOOLEAN DEFAULT true,
+    focused BOOLEAN DEFAULT false,
+    value TEXT,
+    text_content TEXT,
+    label TEXT,
+    role TEXT,
+    parent_element_id TEXT,
+    page_url TEXT,
+    selector TEXT,
+    state_ids TEXT,
+    metadata TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ube_task_run ON ui_bridge_elements(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_ube_element_id ON ui_bridge_elements(element_id);
+CREATE INDEX IF NOT EXISTS idx_ube_timestamp ON ui_bridge_elements(timestamp);
+
+-- UI Bridge Events (action and state change timeline)
+CREATE TABLE IF NOT EXISTS ui_bridge_events (
+    id BIGSERIAL PRIMARY KEY,
+    task_run_id BIGINT,
+    timestamp BIGINT NOT NULL,
+    sequence BIGINT NOT NULL,
+    event_type TEXT NOT NULL,
+    element_id TEXT,
+    state_id TEXT,
+    transition_id TEXT,
+    action TEXT,
+    params TEXT,
+    result TEXT,
+    duration_ms DOUBLE PRECISION,
+    success BOOLEAN DEFAULT true,
+    error_message TEXT,
+    metadata TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ubev_task_run ON ui_bridge_events(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_ubev_type ON ui_bridge_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_ubev_timestamp ON ui_bridge_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_ubev_element ON ui_bridge_events(element_id);
+CREATE INDEX IF NOT EXISTS idx_ubev_state ON ui_bridge_events(state_id);
+
+-- UI Bridge Navigation History (path execution records)
+CREATE TABLE IF NOT EXISTS ui_bridge_navigation_history (
+    id BIGSERIAL PRIMARY KEY,
+    task_run_id BIGINT,
+    timestamp BIGINT NOT NULL,
+    target_states TEXT NOT NULL,
+    path_found BOOLEAN NOT NULL,
+    transitions_planned TEXT,
+    transitions_executed TEXT,
+    total_cost DOUBLE PRECISION,
+    duration_ms DOUBLE PRECISION,
+    success BOOLEAN DEFAULT false,
+    final_active_states TEXT,
+    error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ubnav_task_run ON ui_bridge_navigation_history(task_run_id);
+
+-- Stall Events (stall detection and intervention tracking)
+CREATE TABLE IF NOT EXISTS stall_events (
+    id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    task_run_id TEXT NOT NULL,
+    iteration INTEGER NOT NULL,
+    pattern_type TEXT NOT NULL,
+    pattern_details TEXT,
+    action_count INTEGER,
+    intervention_action TEXT,
+    intervention_result TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_stall_task_run ON stall_events(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_stall_pattern ON stall_events(pattern_type);
+
+-- Shell Commands (reusable command definitions)
+CREATE TABLE IF NOT EXISTS shell_commands (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    command TEXT NOT NULL,
+    working_directory TEXT,
+    timeout_seconds INTEGER,
+    fail_on_error BOOLEAN NOT NULL DEFAULT true,
+    category TEXT DEFAULT 'general',
+    tags TEXT DEFAULT '[]',
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_sc_category ON shell_commands(category);
+CREATE INDEX IF NOT EXISTS idx_sc_enabled ON shell_commands(enabled);
+
+-- Saved API Requests (reusable API request templates)
+CREATE TABLE IF NOT EXISTS saved_api_requests (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    category TEXT DEFAULT 'general',
+    tags TEXT DEFAULT '[]',
+    method TEXT NOT NULL DEFAULT 'GET',
+    url TEXT NOT NULL,
+    headers TEXT DEFAULT '{}',
+    body TEXT,
+    body_content_type TEXT DEFAULT 'application/json',
+    timeout_ms INTEGER DEFAULT 30000,
+    follow_redirects BOOLEAN DEFAULT true,
+    variable_extractions TEXT DEFAULT '[]',
+    assertions TEXT DEFAULT '[]',
+    credential_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_sar_category ON saved_api_requests(category);
+
+-- MCP Servers (external tool server configurations)
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    transport TEXT NOT NULL,
+    stdio_config TEXT,
+    http_config TEXT,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    auto_start BOOLEAN NOT NULL DEFAULT false,
+    timeout_seconds INTEGER NOT NULL DEFAULT 30,
+    cached_tools TEXT,
+    tools_cached_at TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_enabled ON mcp_servers(enabled);
+
+-- Checks (verification check definitions)
+CREATE TABLE IF NOT EXISTS checks (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    check_type TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    command TEXT,
+    working_directory TEXT,
+    config_path TEXT,
+    auto_fix BOOLEAN NOT NULL DEFAULT false,
+    fail_on_warning BOOLEAN NOT NULL DEFAULT false,
+    timeout_seconds INTEGER,
+    is_critical BOOLEAN NOT NULL DEFAULT false,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    ai_generated BOOLEAN NOT NULL DEFAULT false,
+    ai_generation_prompt TEXT,
+    tags TEXT DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_checks_type ON checks(check_type);
+CREATE INDEX IF NOT EXISTS idx_checks_tool ON checks(tool);
+CREATE INDEX IF NOT EXISTS idx_checks_enabled ON checks(enabled);
+
+-- Check Groups (organize checks into reusable groups)
+CREATE TABLE IF NOT EXISTS check_groups (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    color TEXT,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    run_in_parallel BOOLEAN NOT NULL DEFAULT false,
+    stop_on_failure BOOLEAN NOT NULL DEFAULT true,
+    tags TEXT DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_cg_enabled ON check_groups(enabled);
+
+-- Check Group Members (many-to-many)
+CREATE TABLE IF NOT EXISTS check_group_members (
+    id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL REFERENCES check_groups(id) ON DELETE CASCADE,
+    check_id TEXT NOT NULL REFERENCES checks(id) ON DELETE CASCADE,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(group_id, check_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cgm_group ON check_group_members(group_id);
+CREATE INDEX IF NOT EXISTS idx_cgm_check ON check_group_members(check_id);
+
+-- User Skills (custom and auto-generated skill library)
+CREATE TABLE IF NOT EXISTS user_skills (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+    category TEXT DEFAULT 'custom',
+    tags TEXT DEFAULT '[]',
+    icon TEXT DEFAULT 'puzzle',
+    color TEXT DEFAULT 'gray',
+    allowed_phases TEXT NOT NULL DEFAULT '["setup"]',
+    parameters TEXT DEFAULT '[]',
+    template TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'user',
+    version TEXT DEFAULT '1.0.0',
+    author TEXT,
+    checksum TEXT,
+    depends_on TEXT DEFAULT '[]',
+    usage_count BIGINT DEFAULT 0,
+    approval_status TEXT,
+    forked_from TEXT,
+    source_fix_id TEXT,
+    source_pattern_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_us_slug ON user_skills(slug);
+CREATE INDEX IF NOT EXISTS idx_us_category ON user_skills(category);
+CREATE INDEX IF NOT EXISTS idx_us_updated_at ON user_skills(updated_at);
+CREATE INDEX IF NOT EXISTS idx_us_source ON user_skills(source);
+
+-- Approval Gates (human-in-the-loop workflow approvals)
+CREATE TABLE IF NOT EXISTS approval_gates (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    iteration INTEGER NOT NULL,
+    prompt TEXT NOT NULL,
+    context_json TEXT DEFAULT '{}',
+    action TEXT,
+    comment TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_ag_task_run_id ON approval_gates(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_ag_status ON approval_gates(status);
 
 -- Settings (key-value store with JSON values)
 CREATE TABLE IF NOT EXISTS settings (
@@ -503,3 +902,375 @@ CREATE TABLE IF NOT EXISTS watchers (
 );
 
 CREATE INDEX IF NOT EXISTS idx_watchers_enabled ON watchers(enabled) WHERE enabled;
+
+-- Agentic Metric Scores (per-metric scores for task runs)
+CREATE TABLE IF NOT EXISTS agentic_metric_scores (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    metric_type TEXT NOT NULL,
+    score DOUBLE PRECISION NOT NULL,
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    rationale TEXT,
+    is_llm_judged BOOLEAN NOT NULL DEFAULT false,
+    model_used TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ams_task_run ON agentic_metric_scores(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_ams_metric ON agentic_metric_scores(metric_type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ams_unique ON agentic_metric_scores(task_run_id, metric_type);
+
+-- Prompt Registry (versioned prompt variants per agent type)
+CREATE TABLE IF NOT EXISTS prompt_registry (
+    id TEXT PRIMARY KEY,
+    agent_type TEXT NOT NULL,
+    variant_name TEXT NOT NULL,
+    prompt_content TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    is_active BOOLEAN NOT NULL DEFAULT false,
+    source_recommendation_id TEXT,
+    performance_metrics TEXT DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(agent_type, variant_name, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pr_agent_type ON prompt_registry(agent_type);
+CREATE INDEX IF NOT EXISTS idx_pr_active ON prompt_registry(agent_type, is_active);
+
+-- Meta-Optimizer Recommendations (optimizer output — human-reviewed from UI)
+CREATE TABLE IF NOT EXISTS meta_optimizer_recommendations (
+    id TEXT PRIMARY KEY,
+    optimizer_type TEXT NOT NULL,
+    recommendation_type TEXT NOT NULL,
+    target_agent TEXT,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    current_value TEXT DEFAULT '{}',
+    recommended_value TEXT DEFAULT '{}',
+    evidence TEXT DEFAULT '{}',
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    applied_at TIMESTAMPTZ,
+    outcome_after_apply TEXT,
+    optimizer_run_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    content_hash TEXT,
+    eval_result_id TEXT,
+    eval_status TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_mor_type ON meta_optimizer_recommendations(optimizer_type);
+CREATE INDEX IF NOT EXISTS idx_mor_status ON meta_optimizer_recommendations(status);
+CREATE INDEX IF NOT EXISTS idx_mor_run ON meta_optimizer_recommendations(optimizer_run_id);
+CREATE INDEX IF NOT EXISTS idx_mor_content_hash ON meta_optimizer_recommendations(content_hash);
+
+-- Canary Rollouts (gradual rollout of optimizer recommendations)
+CREATE TABLE IF NOT EXISTS canary_rollouts (
+    id TEXT PRIMARY KEY,
+    recommendation_id TEXT NOT NULL,
+    percentage INTEGER NOT NULL DEFAULT 10,
+    status TEXT NOT NULL DEFAULT 'active',
+    start_date TIMESTAMPTZ NOT NULL,
+    end_date TIMESTAMPTZ,
+    baseline_run_count INTEGER DEFAULT 0,
+    canary_run_count INTEGER DEFAULT 0,
+    baseline_metrics_json TEXT DEFAULT '{}',
+    canary_metrics_json TEXT DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_cr_status ON canary_rollouts(status);
+CREATE INDEX IF NOT EXISTS idx_cr_rec ON canary_rollouts(recommendation_id);
+
+-- Canary Run Records (individual run results within a canary rollout)
+CREATE TABLE IF NOT EXISTS canary_run_records (
+    id TEXT PRIMARY KEY,
+    canary_id TEXT NOT NULL,
+    is_canary BOOLEAN NOT NULL,
+    task_run_id TEXT,
+    success BOOLEAN NOT NULL,
+    cost_usd DOUBLE PRECISION DEFAULT 0.0,
+    duration_ms DOUBLE PRECISION DEFAULT 0.0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_crr_canary ON canary_run_records(canary_id, is_canary);
+
+-- Prompt Template Canaries (A/B testing for prompt template versions)
+CREATE TABLE IF NOT EXISTS prompt_template_canaries (
+    id TEXT PRIMARY KEY,
+    template_id TEXT NOT NULL,
+    baseline_version INTEGER NOT NULL,
+    candidate_version INTEGER NOT NULL,
+    traffic_percentage DOUBLE PRECISION NOT NULL DEFAULT 0.1,
+    status TEXT NOT NULL DEFAULT 'active',
+    baseline_metrics_json TEXT NOT NULL DEFAULT '{}',
+    candidate_metrics_json TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ended_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_ptc_template ON prompt_template_canaries(template_id);
+CREATE INDEX IF NOT EXISTS idx_ptc_status ON prompt_template_canaries(status);
+
+-- ============================================================================
+-- Task Knowledge (knowledge acquisition flywheel)
+-- ============================================================================
+
+-- Error Events (application log error detection)
+CREATE TABLE IF NOT EXISTS error_events (
+    id BIGSERIAL PRIMARY KEY,
+
+    -- Source identification
+    log_source_id BIGINT,
+    log_source_name TEXT NOT NULL,
+
+    -- Workflow context (optional - only set during workflow runs)
+    task_run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+    workflow_step_id TEXT,
+
+    -- Timing
+    log_timestamp TIMESTAMPTZ,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- Error classification
+    severity TEXT NOT NULL DEFAULT 'error',
+    error_type TEXT,
+    error_code TEXT,
+
+    -- Error content
+    message TEXT NOT NULL,
+    stack_trace TEXT,
+    context_lines TEXT,
+    raw_entry TEXT,
+
+    -- Location (if parseable from stack trace)
+    file_path TEXT,
+    line_number INTEGER,
+    column_number INTEGER,
+    function_name TEXT,
+
+    -- Deduplication and tracking
+    signature_hash TEXT NOT NULL,
+    occurrence_count INTEGER DEFAULT 1,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- Status lifecycle
+    status TEXT DEFAULT 'new',
+
+    -- Debug agent integration
+    finding_id TEXT REFERENCES task_run_findings(id) ON DELETE SET NULL,
+    resolved_by_task_run_id TEXT,
+    resolved_by_fix_id TEXT,
+    resolution_notes TEXT,
+
+    -- Embedding vector for hybrid RAG search (384-dim MiniLM as f32)
+    message_embedding BYTEA,
+
+    -- Cross-service trace correlation
+    trace_id TEXT,
+
+    -- Status timestamps
+    acknowledged_at TIMESTAMPTZ,
+    resolved_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_error_events_log_source ON error_events(log_source_id);
+CREATE INDEX IF NOT EXISTS idx_error_events_task_run ON error_events(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_error_events_signature ON error_events(signature_hash);
+CREATE INDEX IF NOT EXISTS idx_error_events_status ON error_events(status);
+CREATE INDEX IF NOT EXISTS idx_error_events_severity ON error_events(severity);
+CREATE INDEX IF NOT EXISTS idx_error_events_captured ON error_events(captured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_error_events_last_seen ON error_events(last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_error_events_source_name ON error_events(log_source_name);
+CREATE INDEX IF NOT EXISTS idx_error_events_trace_id ON error_events(trace_id);
+
+-- Task Run Findings (detected issues within a task run)
+CREATE TABLE IF NOT EXISTS task_run_findings (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    category TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    signature_hash TEXT,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    file_path TEXT,
+    line_number INTEGER,
+    column_number INTEGER,
+    code_snippet TEXT,
+    status TEXT NOT NULL DEFAULT 'detected',
+    action_type TEXT NOT NULL DEFAULT 'auto_fix',
+    resolution TEXT,
+    detected_in_session INTEGER NOT NULL,
+    resolved_in_session INTEGER,
+    needs_input BOOLEAN DEFAULT false,
+    question TEXT,
+    input_options TEXT,
+    user_response TEXT,
+    title_embedding BYTEA,
+    description_embedding BYTEA,
+    reflection_fix_id TEXT,
+    detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_findings_task_run ON task_run_findings(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_findings_status ON task_run_findings(status);
+CREATE INDEX IF NOT EXISTS idx_findings_signature ON task_run_findings(signature_hash);
+CREATE INDEX IF NOT EXISTS idx_findings_category ON task_run_findings(category);
+
+CREATE TABLE IF NOT EXISTS task_knowledge (
+    id                      TEXT PRIMARY KEY,
+    task_run_id             TEXT NOT NULL,
+    category                TEXT NOT NULL,
+    agent_type              TEXT NOT NULL DEFAULT 'system',
+    iteration               INTEGER NOT NULL DEFAULT 0,
+    content                 TEXT NOT NULL,
+    evidence                TEXT,
+    confidence              TEXT NOT NULL DEFAULT 'medium',
+    related_files           TEXT NOT NULL DEFAULT '[]',
+    related_criterion_id    TEXT,
+    is_resolved             BOOLEAN NOT NULL DEFAULT false,
+    resolution_notes        TEXT,
+    resolved_at             TIMESTAMPTZ,
+    content_embedding       BYTEA,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tk_task_run ON task_knowledge(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_tk_category ON task_knowledge(category);
+CREATE INDEX IF NOT EXISTS idx_tk_resolved ON task_knowledge(is_resolved) WHERE NOT is_resolved;
+CREATE INDEX IF NOT EXISTS idx_tk_created ON task_knowledge(created_at DESC);
+
+-- ============================================================================
+-- Knowledge Graph Tables (workflow improvement system)
+-- ============================================================================
+
+-- Workflow version history — tracks evolution across regenerations and reflection fixes
+CREATE TABLE IF NOT EXISTS workflow_versions (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES unified_workflows(id) ON DELETE CASCADE,
+    version_number INTEGER NOT NULL,
+    parent_version_id TEXT REFERENCES workflow_versions(id) ON DELETE SET NULL,
+    generation_task_run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+    workflow_json TEXT NOT NULL,
+    diff_summary TEXT,
+    diff_json TEXT,
+    trigger TEXT NOT NULL DEFAULT 'manual',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(workflow_id, version_number)
+);
+CREATE INDEX IF NOT EXISTS idx_wv_workflow ON workflow_versions(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_wv_task_run ON workflow_versions(generation_task_run_id);
+
+-- Step-level finding attribution — links findings to the steps that produced them
+CREATE TABLE IF NOT EXISTS step_finding_links (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    step_name TEXT NOT NULL,
+    step_index INTEGER NOT NULL,
+    finding_id TEXT NOT NULL,
+    link_type TEXT NOT NULL DEFAULT 'detected_during',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sfl_task_run ON step_finding_links(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_sfl_step ON step_finding_links(step_name);
+CREATE INDEX IF NOT EXISTS idx_sfl_finding ON step_finding_links(finding_id);
+
+-- Per-step generation agent tracking — which pipeline agent created each step
+CREATE TABLE IF NOT EXISTS step_provenance (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES unified_workflows(id) ON DELETE CASCADE,
+    workflow_version_id TEXT REFERENCES workflow_versions(id) ON DELETE SET NULL,
+    step_name TEXT NOT NULL,
+    step_index INTEGER NOT NULL,
+    phase TEXT NOT NULL,
+    generating_agent TEXT NOT NULL,
+    generation_iteration INTEGER,
+    original_step_json TEXT,
+    final_step_json TEXT,
+    ui_bridge_event_ids TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sp_workflow ON step_provenance(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_sp_agent ON step_provenance(generating_agent);
+
+-- Generation pipeline telemetry — per-phase events with timing and validation data
+CREATE TABLE IF NOT EXISTS generation_pipeline_events (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    workflow_id TEXT REFERENCES unified_workflows(id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    phase TEXT,
+    iteration INTEGER,
+    payload TEXT,
+    duration_ms BIGINT,
+    token_count BIGINT,
+    validation_errors_before INTEGER,
+    validation_errors_after INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_gpe_task_run ON generation_pipeline_events(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_gpe_type ON generation_pipeline_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_gpe_phase ON generation_pipeline_events(phase);
+
+-- Rule influence tracking — which generation rules were active during each generation
+CREATE TABLE IF NOT EXISTS rule_influence_log (
+    id TEXT PRIMARY KEY,
+    rule_id TEXT NOT NULL,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    workflow_id TEXT REFERENCES unified_workflows(id) ON DELETE SET NULL,
+    influence_type TEXT NOT NULL DEFAULT 'loaded',
+    evidence TEXT,
+    phase TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ril_rule ON rule_influence_log(rule_id);
+CREATE INDEX IF NOT EXISTS idx_ril_task_run ON rule_influence_log(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_ril_influence ON rule_influence_log(influence_type);
+
+-- Cross-run pattern detection — recurring findings and fix oscillations
+CREATE TABLE IF NOT EXISTS cross_run_patterns (
+    id TEXT PRIMARY KEY,
+    pattern_type TEXT NOT NULL,
+    signature_hash TEXT NOT NULL,
+    workflow_name TEXT,
+    occurrence_count INTEGER NOT NULL DEFAULT 1,
+    first_seen_task_run_id TEXT,
+    last_seen_task_run_id TEXT,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    affected_components TEXT,
+    pattern_data TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    resolved_by_fix_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(pattern_type, signature_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_crp_type ON cross_run_patterns(pattern_type);
+CREATE INDEX IF NOT EXISTS idx_crp_workflow ON cross_run_patterns(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_crp_status ON cross_run_patterns(status);
+CREATE INDEX IF NOT EXISTS idx_crp_signature ON cross_run_patterns(signature_hash);
+
+-- Prompt Evolution (meta-prompt optimizer history)
+CREATE TABLE IF NOT EXISTS prompt_evolution (
+    id TEXT PRIMARY KEY,
+    agent_type TEXT NOT NULL,
+    parent_variant_id TEXT,
+    variant_id TEXT NOT NULL,
+    recommendation_id TEXT,
+    critique TEXT,
+    changes_summary TEXT,
+    canary_verdict TEXT,
+    score_before DOUBLE PRECISION,
+    score_after DOUBLE PRECISION,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_pe_agent ON prompt_evolution(agent_type);
+CREATE INDEX IF NOT EXISTS idx_pe_verdict ON prompt_evolution(agent_type, canary_verdict);
+CREATE INDEX IF NOT EXISTS idx_pe_variant ON prompt_evolution(variant_id);

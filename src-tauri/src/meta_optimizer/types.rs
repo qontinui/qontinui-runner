@@ -81,6 +81,7 @@ pub enum OptimizerType {
     PipelinePrompt,
     Architecture,
     GenerationTemplate,
+    MetaPrompt,
 }
 
 impl OptimizerType {
@@ -89,6 +90,7 @@ impl OptimizerType {
             Self::PipelinePrompt => "pipeline_prompt",
             Self::Architecture => "architecture",
             Self::GenerationTemplate => "generation_template",
+            Self::MetaPrompt => "meta_prompt",
         }
     }
 
@@ -97,6 +99,7 @@ impl OptimizerType {
             Self::PipelinePrompt => "Pipeline Prompt Optimizer",
             Self::Architecture => "Architecture Optimizer",
             Self::GenerationTemplate => "Generation Template Optimizer",
+            Self::MetaPrompt => "Meta-Prompt Optimizer",
         }
     }
 
@@ -105,6 +108,7 @@ impl OptimizerType {
             OptimizerType::PipelinePrompt,
             OptimizerType::Architecture,
             OptimizerType::GenerationTemplate,
+            OptimizerType::MetaPrompt,
         ]
     }
 }

@@ -6114,6 +6114,112 @@ impl CheckpointDb {
             info!("Successfully migrated to version 162 (verification_passed)");
         }
 
+        // Migration 163: Add prompt_evolution table for meta-prompt optimizer.
+        // Tracks prompt rewrite attempts and their canary verdicts so the
+        // optimizer learns from past failures and avoids repeating them.
+        if current_version < 163 {
+            info!("Migrating to version 163 (prompt_evolution table)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS prompt_evolution (
+                    id TEXT PRIMARY KEY,
+                    agent_type TEXT NOT NULL,
+                    parent_variant_id TEXT,
+                    variant_id TEXT NOT NULL,
+                    recommendation_id TEXT,
+                    critique TEXT,
+                    changes_summary TEXT,
+                    canary_verdict TEXT,
+                    score_before REAL,
+                    score_after REAL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_prompt_evolution_agent ON prompt_evolution(agent_type);
+                CREATE INDEX IF NOT EXISTS idx_prompt_evolution_verdict ON prompt_evolution(agent_type, canary_verdict);
+                CREATE INDEX IF NOT EXISTS idx_prompt_evolution_variant ON prompt_evolution(variant_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (163, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Migration 163 failed: {}", e))?;
+
+            info!("Successfully migrated to version 163 (prompt_evolution)");
+        }
+
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Verify that schema.sql creates all columns that migration code references.
+    /// This catches schema.sql drift — when migrations add columns but schema.sql
+    /// doesn't include them, fresh databases fail.
+    #[test]
+    fn schema_sql_has_critical_columns() {
+        let schema = include_str!("schema.sql");
+
+        // task_runs columns that migrations add and code queries
+        let task_runs_cols = [
+            "total_input_tokens",
+            "total_output_tokens",
+            "total_cost_cents",
+            "is_meta_optimizer",
+            "iteration_history",
+            "pipeline_checkpoint",
+            "iteration_diffs",
+            "iteration_commits",
+            "verification_passed",
+            "runner_port",
+            "workspace_id",
+        ];
+        for col in &task_runs_cols {
+            assert!(
+                schema.contains(col),
+                "schema.sql missing task_runs column: {}",
+                col
+            );
+        }
+
+        // unified_workflows columns
+        let uw_cols = [
+            "multi_agent_mode",
+            "use_worktree",
+            "workflow_architecture",
+            "strict_cwd",
+            "enforce_token_budget",
+            "rollback_policy",
+            "flow_control_json",
+            "phase_timeouts_json",
+        ];
+        for col in &uw_cols {
+            assert!(
+                schema.contains(col),
+                "schema.sql missing unified_workflows column: {}",
+                col
+            );
+        }
+
+        // Tables that migrations create
+        let tables = [
+            "sm_element_thumbnails",
+            "worktrees",
+            "generation_pipeline_artifacts",
+        ];
+        for table in &tables {
+            assert!(
+                schema.contains(table),
+                "schema.sql missing table: {}",
+                table
+            );
+        }
+
+        // Verify version header is reasonably current
+        assert!(
+            schema.contains("Version: 162") || schema.contains("Version: 16"),
+            "schema.sql version header may be stale"
+        );
     }
 }

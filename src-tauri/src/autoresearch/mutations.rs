@@ -1,6 +1,7 @@
 //! Mutation strategies for generating the next experiment configuration.
 
 use super::agentic_verification::WorkflowArchitecture;
+use super::q_router::{QRouter, TaskState};
 use super::types::{ExperimentConfig, ExperimentResult, SearchDimension};
 use rand::prelude::*;
 
@@ -491,6 +492,76 @@ fn extract_json_from_output(output: &str) -> Option<String> {
     None
 }
 
+/// Q-learning mutation strategy for WorkflowArchitecture selection.
+///
+/// Uses a learned Q-table to pick the best architecture for each task state.
+/// Falls back to sequential grid search when insufficient data exists.
+/// For non-architecture dimensions, delegates to the fallback sequential mutator.
+pub struct QLearningMutator {
+    /// Q-router with loaded Q-table.
+    pub q_router: QRouter,
+    /// Fallback for cold-start or non-architecture dimensions.
+    fallback: SequentialMutator,
+    /// The task state to route for (set by the engine before each experiment).
+    current_task_state: Option<TaskState>,
+}
+
+impl QLearningMutator {
+    pub fn new(q_router: QRouter) -> Self {
+        Self {
+            q_router,
+            fallback: SequentialMutator::new(),
+            current_task_state: None,
+        }
+    }
+
+    /// Set the current task state for Q-routing decisions.
+    /// Called by the engine before requesting the next experiment.
+    pub fn set_task_state(&mut self, state: TaskState) {
+        self.current_task_state = Some(state);
+    }
+
+    /// Generate the next experiment config.
+    ///
+    /// For the WorkflowArchitecture dimension, uses Q-routing if sufficient
+    /// data exists; otherwise falls back to grid search. All other dimensions
+    /// are handled by the sequential fallback.
+    pub fn next_experiment(
+        &mut self,
+        control: &ExperimentConfig,
+        dimensions: &[SearchDimension],
+        history: &[(u32, ExperimentResult)],
+    ) -> Option<ExperimentConfig> {
+        // Start with the fallback's next experiment (handles non-architecture dimensions)
+        let mut config = self.fallback.next_experiment(control, dimensions, history)?;
+
+        // Override the architecture dimension if we have a task state and Q-data
+        if dimensions.iter().any(|d| matches!(d, SearchDimension::WorkflowArchitecture)) {
+            if let Some(ref task_state) = self.current_task_state {
+                if self.q_router.has_sufficient_data(task_state) {
+                    let selected = self.q_router.select_architecture(task_state);
+                    let epsilon = self.q_router.effective_epsilon(task_state);
+                    tracing::info!(
+                        "Q-router selected {} for state {} (Q={:.3}, ε={:.3})",
+                        selected,
+                        task_state,
+                        self.q_router.get_q(task_state, &selected).q_value,
+                        epsilon,
+                    );
+                    config.workflow_architecture = Some(selected);
+                } else {
+                    tracing::debug!(
+                        "Q-router cold-start for state {} — using fallback",
+                        task_state,
+                    );
+                }
+            }
+        }
+
+        Some(config)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +653,84 @@ mod tests {
                 val
             );
         }
+    }
+
+    #[test]
+    fn test_q_learning_mutator_uses_q_router_when_sufficient_data() {
+        use crate::autoresearch::q_router::{ComplexityTier, Domain};
+
+        let mut q_router = QRouter::with_alpha(1.0);
+        let task_state = TaskState {
+            primary_domain: Domain::Frontend,
+            complexity: ComplexityTier::Moderate,
+            has_ui_component: true,
+        };
+
+        // Give AgenticVerification the best score
+        q_router.update(&task_state, &WorkflowArchitecture::Traditional, 0.3);
+        q_router.update(&task_state, &WorkflowArchitecture::AgenticVerification, 0.9);
+        q_router.update(&task_state, &WorkflowArchitecture::MultiAgentPipeline, 0.5);
+
+        let mut mutator = QLearningMutator::new(q_router);
+        mutator.set_task_state(task_state);
+
+        let control = ExperimentConfig {
+            model: Some("sonnet".into()),
+            max_iterations: Some(10),
+            multi_agent_mode: None,
+            max_context_tokens: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
+            extra: Default::default(),
+        };
+        let dims = vec![SearchDimension::WorkflowArchitecture];
+
+        // Run many times — greedy should dominate (ε is low with 3 visits but still present)
+        let mut agentic_count = 0;
+        for _ in 0..100 {
+            let config = mutator.next_experiment(&control, &dims, &[]).unwrap();
+            if config.workflow_architecture == Some(WorkflowArchitecture::AgenticVerification) {
+                agentic_count += 1;
+            }
+        }
+
+        // AgenticVerification should be selected most of the time
+        assert!(
+            agentic_count > 50,
+            "AgenticVerification should be selected >50% of the time, got {}%",
+            agentic_count
+        );
+    }
+
+    #[test]
+    fn test_q_learning_mutator_falls_back_without_data() {
+        use crate::autoresearch::q_router::{ComplexityTier, Domain};
+
+        let q_router = QRouter::new(); // Empty Q-table
+        let mut mutator = QLearningMutator::new(q_router);
+
+        // Set a task state with no Q-data
+        mutator.set_task_state(TaskState {
+            primary_domain: Domain::Backend,
+            complexity: ComplexityTier::Complex,
+            has_ui_component: false,
+        });
+
+        let control = ExperimentConfig {
+            model: None,
+            max_iterations: None,
+            multi_agent_mode: None,
+            max_context_tokens: None,
+            workflow_architecture: None,
+            agentic_verification_config: None,
+            multi_agent_pipeline_config: None,
+            extra: Default::default(),
+        };
+        let dims = vec![SearchDimension::WorkflowArchitecture];
+
+        // Should still produce configs via fallback
+        let config = mutator.next_experiment(&control, &dims, &[]).unwrap();
+        assert!(config.workflow_architecture.is_some());
     }
 }

@@ -13,10 +13,12 @@ import { ConfigSuggestionsTab } from "../components/meta-optimizer/ConfigSuggest
 import { RunHistoryTab } from "../components/meta-optimizer/RunHistoryTab";
 import { EvalSpecsTab } from "../components/meta-optimizer/EvalSpecsTab";
 import { RobustnessTab } from "../components/meta-optimizer/RobustnessTab";
+import { PromptOptimizationTab } from "../components/meta-optimizer/PromptOptimizationTab";
 
 type SubTab =
   | "progress"
   | "recommendations"
+  | "prompt_optimization"
   | "prompts"
   | "config"
   | "history"
@@ -26,6 +28,7 @@ type SubTab =
 const TABS: { id: SubTab; label: string }[] = [
   { id: "progress", label: "Progress" },
   { id: "recommendations", label: "Recommendations" },
+  { id: "prompt_optimization", label: "Prompt Optimization" },
   { id: "prompts", label: "Prompt Registry" },
   { id: "config", label: "Config Suggestions" },
   { id: "history", label: "Run History" },
@@ -59,6 +62,7 @@ export function MetaOptimizerPage() {
       <div className="flex-1 overflow-auto">
         {tab === "progress" && <ProgressTab />}
         {tab === "recommendations" && <RecommendationsTab />}
+        {tab === "prompt_optimization" && <PromptOptimizationTab />}
         {tab === "prompts" && <PromptRegistryTab />}
         {tab === "config" && <ConfigSuggestionsTab />}
         {tab === "history" && <RunHistoryTab />}

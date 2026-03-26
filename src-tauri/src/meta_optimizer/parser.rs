@@ -85,6 +85,20 @@ pub struct ParsedRuleExample {
     pub negative_explanation: String,
 }
 
+/// A parsed meta-prompt rewrite from meta_prompt_optimizer output.
+#[derive(Debug, Clone)]
+pub struct ParsedMetaPromptRewrite {
+    pub target_phase: String,
+    pub target_agent: String,
+    pub critique: String,
+    pub weaknesses: String,
+    pub strengths_to_preserve: String,
+    pub changes_summary: String,
+    pub expected_improvement: String,
+    pub confidence: f64,
+    pub rewritten_prompt: String,
+}
+
 // ── Marker extraction ───────────────────────────────────────────────────
 
 /// Extract all blocks between `[TAG]` and `[/TAG]` from `output`.
@@ -344,6 +358,33 @@ pub fn parse_rule_examples(output: &str) -> Vec<ParsedRuleExample> {
         .collect()
 }
 
+/// Parse `[META_PROMPT_REWRITE]` blocks from meta_prompt_optimizer output.
+pub fn parse_meta_prompt_rewrites(output: &str) -> Vec<ParsedMetaPromptRewrite> {
+    extract_marker_blocks(output, "META_PROMPT_REWRITE")
+        .into_iter()
+        .filter_map(|block| {
+            let kv = parse_key_value_pairs(&block);
+            let target_agent = get_str(&kv, "target_agent");
+            let rewritten_prompt = get_str(&kv, "rewritten_prompt");
+            if target_agent.is_empty() || rewritten_prompt.is_empty() {
+                warn!("Skipping META_PROMPT_REWRITE with missing target_agent or rewritten_prompt");
+                return None;
+            }
+            Some(ParsedMetaPromptRewrite {
+                target_phase: get_str(&kv, "target_phase"),
+                target_agent,
+                critique: get_str(&kv, "critique"),
+                weaknesses: get_str(&kv, "weaknesses"),
+                strengths_to_preserve: get_str(&kv, "strengths_to_preserve"),
+                changes_summary: get_str(&kv, "changes_summary"),
+                expected_improvement: get_str(&kv, "expected_improvement"),
+                confidence: get_f64(&kv, "confidence"),
+                rewritten_prompt,
+            })
+        })
+        .collect()
+}
+
 // ── Deduplication helper ─────────────────────────────────────────────────
 
 /// Check if a recommendation with the same content already exists in a non-terminal state.
@@ -388,7 +429,7 @@ fn is_duplicate_recommendation(
 
 /// Parse recommendations from AI output and save them to the database.
 ///
-/// `optimizer_type` should be one of: `"pipeline_prompt"`, `"architecture"`, `"generation_template"`.
+/// `optimizer_type` should be one of: `"pipeline_prompt"`, `"architecture"`, `"generation_template"`, `"meta_prompt"`.
 ///
 /// Returns the number of recommendations created.
 pub fn save_parsed_recommendations(
@@ -740,6 +781,157 @@ pub fn save_parsed_recommendations(
                     examples.len()
                 );
                 save_rule_examples(db, &examples);
+            }
+        }
+
+        "meta_prompt" => {
+            let rewrites = parse_meta_prompt_rewrites(output);
+            info!(
+                "Parsed {} META_PROMPT_REWRITE(s) from output",
+                rewrites.len()
+            );
+            for rec in &rewrites {
+                if rec.confidence < 0.45 {
+                    debug!(
+                        "Skipping low-confidence meta-prompt rewrite ({:.0}%): {}",
+                        rec.confidence * 100.0,
+                        rec.target_agent
+                    );
+                    continue;
+                }
+
+                let title = format!(
+                    "Meta-prompt rewrite for {}/{}",
+                    rec.target_phase, rec.target_agent
+                );
+                let description = if rec.changes_summary.is_empty() {
+                    rec.critique.clone()
+                } else {
+                    rec.changes_summary.clone()
+                };
+
+                // Store the rewritten prompt as a prompt variant
+                let variant_name = format!("meta_rewrite_v{}", chrono::Utc::now().timestamp());
+
+                let recommended_value = serde_json::json!({
+                    "agent_type": rec.target_agent,
+                    "variant_name": variant_name,
+                    "prompt_content": rec.rewritten_prompt,
+                })
+                .to_string();
+
+                if is_duplicate_recommendation(
+                    db,
+                    &title,
+                    optimizer_type,
+                    "prompt_rewrite",
+                    Some(&rec.target_agent),
+                    Some(&recommended_value),
+                ) {
+                    debug!("Skipping duplicate meta-prompt rewrite: {}", title);
+                    continue;
+                }
+
+                // Robustness validation gate: reject prompts that fail basic checks
+                let robustness_warnings =
+                    crate::workflow_generation::hardener::validate_prompt_robustness(
+                        &rec.rewritten_prompt,
+                    );
+                if !robustness_warnings.is_empty() {
+                    warn!(
+                        "Meta-prompt rewrite for {} failed robustness validation ({} warnings): {:?}",
+                        rec.target_agent,
+                        robustness_warnings.len(),
+                        robustness_warnings
+                    );
+                    // Allow prompts with only minor warnings (1-2), block those with many
+                    if robustness_warnings.len() > 2 {
+                        warn!(
+                            "Skipping meta-prompt rewrite for {} — too many robustness warnings",
+                            rec.target_agent
+                        );
+                        continue;
+                    }
+                }
+
+                let evidence = serde_json::json!({
+                    "critique": rec.critique,
+                    "weaknesses": rec.weaknesses,
+                    "strengths_to_preserve": rec.strengths_to_preserve,
+                    "expected_improvement": rec.expected_improvement,
+                    "robustness_warnings": robustness_warnings,
+                })
+                .to_string();
+
+                // Create the recommendation
+                let recommendation = recommendations::create_recommendation(
+                    db,
+                    optimizer_type,
+                    "prompt_rewrite",
+                    Some(&rec.target_agent),
+                    &title,
+                    &description,
+                    None,
+                    Some(&recommended_value),
+                    Some(&evidence),
+                    rec.confidence,
+                    optimizer_run_id,
+                )?;
+
+                // Create prompt variant immediately (inactive)
+                let variant = super::prompt_registry::create_variant(
+                    db,
+                    &rec.target_agent,
+                    &variant_name,
+                    &rec.rewritten_prompt,
+                    Some(&recommendation.id),
+                )?;
+
+                // Get the current active variant as parent
+                let parent_id = super::prompt_registry::get_active_prompt(db, &rec.target_agent)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.id);
+
+                // Get current mean score for this group
+                let samples = super::prompt_extractor::extract_prompt_samples(db, 500)
+                    .unwrap_or_default();
+                let groups = super::prompt_extractor::compute_group_metrics(&samples);
+                let score_before = groups
+                    .iter()
+                    .find(|g| g.agent_type == rec.target_agent)
+                    .map(|g| g.mean_score);
+
+                // Record evolution entry
+                let _ = super::prompt_evolution::record_evolution(
+                    db,
+                    &rec.target_agent,
+                    parent_id.as_deref(),
+                    &variant.id,
+                    Some(&recommendation.id),
+                    Some(&rec.critique),
+                    Some(&rec.changes_summary),
+                    score_before,
+                );
+
+                // Auto-start canary for the new variant
+                if rec.confidence >= 0.60 {
+                    if let Err(e) =
+                        super::canary::start_canary(db, &recommendation.id, 20)
+                    {
+                        warn!(
+                            "Failed to auto-start canary for meta-prompt rewrite {}: {}",
+                            recommendation.id, e
+                        );
+                    } else {
+                        info!(
+                            "Auto-started canary at 20% for meta-prompt rewrite {}",
+                            recommendation.id
+                        );
+                    }
+                }
+
+                count += 1;
             }
         }
 
@@ -1305,5 +1497,96 @@ negative_example: bad example
 "#;
         let examples = parse_rule_examples(output);
         assert_eq!(examples.len(), 0); // Missing rule_id
+    }
+
+    // ── Meta-prompt rewrite parser tests ──────────────────────────────
+
+    #[test]
+    fn test_parse_meta_prompt_rewrite() {
+        let output = r#"
+Based on the analysis, the verifier prompt needs improvement.
+
+[META_PROMPT_REWRITE]
+target_phase: verification
+target_agent: verifier
+critique: |
+  The current prompt lacks specific output format requirements.
+  The agent often produces unstructured responses.
+weaknesses: |
+  - No JSON output format specification
+  - Missing role definition
+strengths_to_preserve: |
+  - Good task decomposition instructions
+  - Clear boundary constraints
+changes_summary: |
+  Added JSON output format requirement and explicit role definition.
+expected_improvement: |
+  Expect 15-20% reduction in failure rate from format compliance.
+confidence: 0.72
+rewritten_prompt: |
+  You are a code verification expert. Your role is to verify code changes.
+  Always respond in JSON format with keys: status, issues, suggestions.
+  You must never execute arbitrary commands.
+[/META_PROMPT_REWRITE]
+"#;
+        let rewrites = parse_meta_prompt_rewrites(output);
+        assert_eq!(rewrites.len(), 1);
+        assert_eq!(rewrites[0].target_phase, "verification");
+        assert_eq!(rewrites[0].target_agent, "verifier");
+        assert!(rewrites[0].critique.contains("output format"));
+        assert!(rewrites[0].weaknesses.contains("JSON"));
+        assert!(rewrites[0].strengths_to_preserve.contains("decomposition"));
+        assert!(rewrites[0].changes_summary.contains("JSON output format"));
+        assert!((rewrites[0].confidence - 0.72).abs() < 0.01);
+        assert!(rewrites[0].rewritten_prompt.contains("verification expert"));
+    }
+
+    #[test]
+    fn test_parse_meta_prompt_rewrite_missing_required_fields() {
+        // Missing target_agent
+        let output = r#"
+[META_PROMPT_REWRITE]
+target_phase: generation
+rewritten_prompt: |
+  Some prompt text
+[/META_PROMPT_REWRITE]
+"#;
+        let rewrites = parse_meta_prompt_rewrites(output);
+        assert_eq!(rewrites.len(), 0);
+
+        // Missing rewritten_prompt
+        let output2 = r#"
+[META_PROMPT_REWRITE]
+target_agent: implementer
+critique: The prompt is bad
+[/META_PROMPT_REWRITE]
+"#;
+        let rewrites2 = parse_meta_prompt_rewrites(output2);
+        assert_eq!(rewrites2.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_meta_prompt_rewrite_multiple() {
+        let output = r#"
+[META_PROMPT_REWRITE]
+target_phase: generation
+target_agent: implementer
+confidence: 0.65
+rewritten_prompt: |
+  First rewrite
+[/META_PROMPT_REWRITE]
+
+[META_PROMPT_REWRITE]
+target_phase: verification
+target_agent: verifier
+confidence: 0.80
+rewritten_prompt: |
+  Second rewrite
+[/META_PROMPT_REWRITE]
+"#;
+        let rewrites = parse_meta_prompt_rewrites(output);
+        assert_eq!(rewrites.len(), 2);
+        assert_eq!(rewrites[0].target_agent, "implementer");
+        assert_eq!(rewrites[1].target_agent, "verifier");
     }
 }

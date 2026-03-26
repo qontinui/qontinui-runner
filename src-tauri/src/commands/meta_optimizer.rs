@@ -292,31 +292,42 @@ pub fn rollback_canary_rollout(
 // ── Prompt Template A/B Testing ──────────────────────────────────────────
 
 #[tauri::command]
-pub fn create_prompt_canary(
+pub async fn create_prompt_canary(
     app_state: State<'_, Arc<AppState>>,
     template_id: String,
     baseline_version: i32,
     candidate_version: i32,
     traffic_pct: f64,
 ) -> Result<String, String> {
-    crate::meta_optimizer::canary::create_prompt_template_canary(
-        &app_state.checkpoint_db,
-        &template_id,
-        baseline_version,
-        candidate_version,
-        traffic_pct,
-    )
+    if let Some(ref pg) = app_state.pg_db {
+        pg.create_template_canary(&template_id, baseline_version, candidate_version, traffic_pct)
+            .await
+    } else {
+        crate::meta_optimizer::canary::create_prompt_template_canary(
+            &app_state.checkpoint_db,
+            &template_id,
+            baseline_version,
+            candidate_version,
+            traffic_pct,
+        )
+    }
 }
 
 #[tauri::command]
-pub fn get_prompt_canary_status(
+pub async fn get_prompt_canary_status(
     app_state: State<'_, Arc<AppState>>,
     canary_id: String,
 ) -> Result<serde_json::Value, String> {
-    let canary = crate::meta_optimizer::canary::get_prompt_template_canary(
-        &app_state.checkpoint_db,
-        &canary_id,
-    )?;
+    let canary = if let Some(ref pg) = app_state.pg_db {
+        pg.get_template_canary(&canary_id)
+            .await?
+            .ok_or_else(|| format!("Prompt template canary not found: {}", canary_id))?
+    } else {
+        crate::meta_optimizer::canary::get_prompt_template_canary(
+            &app_state.checkpoint_db,
+            &canary_id,
+        )?
+    };
     let evaluation = crate::meta_optimizer::canary::evaluate_prompt_canary(&canary);
 
     let mut val =
@@ -338,6 +349,7 @@ pub fn trigger_meta_optimizer(
         "pipeline_prompt" => OptimizerType::PipelinePrompt,
         "architecture" => OptimizerType::Architecture,
         "generation_template" => OptimizerType::GenerationTemplate,
+        "meta_prompt" => OptimizerType::MetaPrompt,
         _ => return Err(format!("Unknown optimizer type: {}", optimizer_type)),
     };
 
@@ -596,5 +608,78 @@ pub fn convert_comparison_to_recommendation(
     crate::meta_optimizer::comparison_bridge::comparison_to_recommendation(
         &app_state.checkpoint_db,
         &comparison_id,
+    )
+}
+
+// ── Prompt Optimization (Meta-Prompt Optimizer) ────────────────────────
+
+#[tauri::command]
+pub fn get_prompt_optimization_status(
+    app_state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    let db = &app_state.checkpoint_db;
+
+    // Get prompt group metrics
+    let samples = crate::meta_optimizer::prompt_extractor::extract_prompt_samples(db, 500)?;
+    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db(&samples, db);
+
+    // Get active evolution entries (canaries in progress)
+    let evolution =
+        crate::meta_optimizer::prompt_evolution::get_evolution_history(db, None, 50)?;
+    let active_canaries: Vec<_> = evolution
+        .iter()
+        .filter(|e| e.canary_verdict.is_none())
+        .collect();
+
+    serde_json::to_value(serde_json::json!({
+        "prompt_groups": groups,
+        "active_canaries": active_canaries,
+        "evolution_history": evolution,
+    }))
+    .map_err(|e| format!("Serialization error: {}", e))
+}
+
+#[tauri::command]
+pub fn get_prompt_group_metrics(
+    app_state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::meta_optimizer::prompt_extractor::PromptGroupMetrics>, String> {
+    let samples =
+        crate::meta_optimizer::prompt_extractor::extract_prompt_samples(&app_state.checkpoint_db, 500)?;
+    Ok(crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db(&samples, &app_state.checkpoint_db))
+}
+
+#[tauri::command]
+pub fn get_prompt_optimization_evidence(
+    app_state: State<'_, Arc<AppState>>,
+    phase: String,
+    max_failures: Option<usize>,
+    max_successes: Option<usize>,
+) -> Result<serde_json::Value, String> {
+    let (failures, successes) =
+        crate::meta_optimizer::prompt_extractor::collect_evidence_samples(
+            &app_state.checkpoint_db,
+            &phase,
+            "",
+            max_failures.unwrap_or(5),
+            max_successes.unwrap_or(2),
+        )?;
+
+    serde_json::to_value(serde_json::json!({
+        "failures": failures,
+        "successes": successes,
+    }))
+    .map_err(|e| format!("Serialization error: {}", e))
+}
+
+#[tauri::command]
+pub fn get_prompt_evolution_history(
+    app_state: State<'_, Arc<AppState>>,
+    agent_type: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::meta_optimizer::prompt_evolution::PromptEvolutionEntry>, String> {
+    crate::meta_optimizer::prompt_evolution::get_evolution_history(
+        &app_state.checkpoint_db,
+        agent_type.as_deref(),
+        limit.unwrap_or(50),
     )
 }

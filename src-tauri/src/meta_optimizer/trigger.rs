@@ -147,6 +147,51 @@ pub fn should_launch_optimizer(
     })
 }
 
+/// Additional guards specific to the meta-prompt optimizer.
+///
+/// Guards:
+/// 1. A prompt group exists with failure_rate > 30% and >= 10 samples
+/// 2. No active evolution (canary in progress) for the worst-performing group
+/// 3. 24-hour cooldown per agent_type since last rewrite attempt
+fn should_launch_meta_prompt_optimizer(db: &CheckpointDb) -> bool {
+    // Check if there's an optimization target meeting the threshold
+    let target = match super::prompt_extractor::select_optimization_target(db, 10, 0.30) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            debug!("MetaPrompt guard: no prompt group exceeds 30% failure rate with >= 10 samples");
+            return false;
+        }
+        Err(e) => {
+            debug!("MetaPrompt guard: failed to select target: {}", e);
+            return false;
+        }
+    };
+
+    // Check no active canary for this agent_type
+    if super::prompt_evolution::has_active_evolution(db, &target.agent_type) {
+        debug!(
+            "MetaPrompt guard: active evolution already in progress for {}",
+            target.agent_type
+        );
+        return false;
+    }
+
+    // Check 24-hour cooldown
+    if super::prompt_evolution::is_in_cooldown(db, &target.agent_type, 24) {
+        debug!(
+            "MetaPrompt guard: {} is in 24h cooldown",
+            target.agent_type
+        );
+        return false;
+    }
+
+    info!(
+        "MetaPrompt guard passed: target={}/{} failure_rate={:.1}% samples={}",
+        target.phase, target.agent_type, target.failure_rate * 100.0, target.sample_count
+    );
+    true
+}
+
 /// Check all optimizer types and launch any that pass their guards.
 /// Called from loop_controller.rs after the fixer launch block.
 ///
@@ -160,10 +205,19 @@ pub fn check_and_launch_optimizers(
 
     for optimizer_type in OptimizerType::all() {
         match should_launch_optimizer(db, *optimizer_type, &source_task_run_id) {
-            Ok(true) => match launch_optimizer(&deps, *optimizer_type) {
-                Ok(id) => launched.push(id),
-                Err(e) => warn!("Failed to launch {}: {}", optimizer_type, e),
-            },
+            Ok(true) => {
+                // Meta-prompt optimizer has additional guards beyond the generic ones
+                if *optimizer_type == OptimizerType::MetaPrompt
+                    && !should_launch_meta_prompt_optimizer(db)
+                {
+                    debug!("Skipping MetaPrompt — additional guards not met");
+                    continue;
+                }
+                match launch_optimizer(&deps, *optimizer_type) {
+                    Ok(id) => launched.push(id),
+                    Err(e) => warn!("Failed to launch {}: {}", optimizer_type, e),
+                }
+            }
             Ok(false) => {}
             Err(e) => warn!("Error checking {}: {}", optimizer_type, e),
         }
@@ -459,6 +513,16 @@ fn launch_optimizer_internal(
             );
             let setup = super::generation_template_optimizer::build_setup_steps();
             let verify = super::generation_template_optimizer::build_verification_steps();
+            (config, setup, verify)
+        }
+        OptimizerType::MetaPrompt => {
+            let config = super::meta_prompt_optimizer::build_config(
+                &task_run_id,
+                &task_name,
+                style_index,
+            );
+            let setup = super::meta_prompt_optimizer::build_setup_steps();
+            let verify = super::meta_prompt_optimizer::build_verification_steps();
             (config, setup, verify)
         }
     };

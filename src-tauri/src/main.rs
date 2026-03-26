@@ -1254,6 +1254,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             autoresearch::commands::compare_worktree_branches,
             autoresearch::commands::rerun_autoresearch_campaign,
             autoresearch::commands::compare_autoresearch_campaigns,
+            autoresearch::commands::get_q_routing_table,
+            autoresearch::commands::get_q_routing_policy,
+            autoresearch::commands::get_q_routing_stats,
+            autoresearch::commands::get_q_routing_overrides,
+            autoresearch::commands::set_q_routing_override,
+            autoresearch::commands::remove_q_routing_override,
             // Orchestration loop saved config CRUD
             commands::orchestration_loop_configs::ol_list_configs,
             commands::orchestration_loop_configs::ol_get_config,
@@ -1342,6 +1348,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::meta_optimizer::refresh_model_profiles,
             commands::meta_optimizer::get_model_recommendations,
             commands::meta_optimizer::convert_comparison_to_recommendation,
+            // Prompt optimization (meta-prompt optimizer)
+            commands::meta_optimizer::get_prompt_optimization_status,
+            commands::meta_optimizer::get_prompt_group_metrics,
+            commands::meta_optimizer::get_prompt_optimization_evidence,
+            commands::meta_optimizer::get_prompt_evolution_history,
             // Comparison commands
             commands::comparison::start_comparison,
             commands::comparison::get_comparison_status,

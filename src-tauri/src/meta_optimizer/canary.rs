@@ -4,7 +4,7 @@
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::database::CheckpointDb;
 
@@ -510,6 +510,11 @@ pub fn promote_canary(db: &CheckpointDb, canary_id: &str) -> Result<(), String> 
         }
     })?;
 
+    // Update prompt evolution verdict if this was a meta-prompt rewrite canary
+    if let Err(e) = update_evolution_for_recommendation(db, &rec_id, "adopt", None) {
+        debug!("No prompt evolution entry for recommendation {}: {}", rec_id, e);
+    }
+
     info!("Promoted canary {} (recommendation {})", canary_id, rec_id);
     Ok(())
 }
@@ -535,18 +540,23 @@ pub fn rollback_canary_with_eval(
         .and_then(|e| serde_json::to_string(e).ok())
         .unwrap_or_else(|| "{}".to_string());
 
-    db.with_conn({
+    // Get rec_id outside the closure so we can use it for evolution update
+    let rec_id: String = db.with_conn({
         let canary_id = canary_id_str.clone();
         move |conn| {
-            // Get recommendation_id
-            let rec_id: String = conn
-                .query_row(
-                    "SELECT recommendation_id FROM canary_rollouts WHERE id = ?1",
-                    params![canary_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("Canary not found: {}", e))?;
+            conn.query_row(
+                "SELECT recommendation_id FROM canary_rollouts WHERE id = ?1",
+                params![canary_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Canary not found: {}", e))
+        }
+    })?;
 
+    db.with_conn({
+        let canary_id = canary_id_str.clone();
+        let rec_id = rec_id.clone();
+        move |conn| {
             // Update canary status
             conn.execute(
                 "UPDATE canary_rollouts SET status = 'rolled_back', end_date = ?1 WHERE id = ?2",
@@ -567,6 +577,48 @@ pub fn rollback_canary_with_eval(
             );
             Ok(())
         }
+    })?;
+
+    // Compute canary success rate as score_after for evolution tracking
+    let score_after = eval.map(|e| e.canary_success_rate / 100.0);
+
+    // Update prompt evolution verdict if this was a meta-prompt rewrite canary
+    if let Err(e) = update_evolution_for_recommendation(db, &rec_id, "reject", score_after) {
+        debug!("No prompt evolution entry for recommendation {}: {}", rec_id, e);
+    }
+
+    Ok(())
+}
+
+/// Update the prompt evolution verdict for a recommendation.
+///
+/// Looks up the prompt_evolution entry by recommendation_id and updates its
+/// canary_verdict and score_after. This closes the feedback loop for the
+/// meta-prompt optimizer.
+fn update_evolution_for_recommendation(
+    db: &CheckpointDb,
+    recommendation_id: &str,
+    verdict: &str,
+    score_after: Option<f64>,
+) -> Result<(), String> {
+    let rec_id = recommendation_id.to_string();
+    let verdict_str = verdict.to_string();
+
+    db.with_conn(move |conn| {
+        let updated = conn
+            .execute(
+                "UPDATE prompt_evolution SET canary_verdict = ?1, score_after = ?2 WHERE recommendation_id = ?3 AND canary_verdict IS NULL",
+                params![verdict_str, score_after, rec_id],
+            )
+            .map_err(|e| format!("Failed to update evolution verdict: {}", e))?;
+
+        if updated > 0 {
+            info!(
+                "Updated prompt evolution verdict for recommendation {}: {}",
+                rec_id, verdict_str
+            );
+        }
+        Ok(())
     })
 }
 
@@ -1026,6 +1078,83 @@ pub fn resolve_prompt_with_canary(
         Err(e) => {
             warn!(
                 "Canary {}: failed to load version v{} for '{}': {}, falling back to default",
+                canary.id, version, canary.template_id, e,
+            );
+            default_content.to_string()
+        }
+    };
+
+    CanaryResolvedPrompt {
+        content,
+        canary_id: Some(canary.id),
+        used_candidate: use_candidate,
+    }
+}
+
+/// Async variant of `resolve_prompt_with_canary` that queries PostgreSQL.
+///
+/// If no active canary exists, returns the `default_content` as-is.
+/// If a canary is active, uses `should_use_candidate()` to pick baseline vs candidate,
+/// loads the chosen version from the PG prompt registry, and returns it.
+///
+/// The original SQLite version is kept for fallback when PG is unavailable.
+pub async fn resolve_prompt_with_canary_pg(
+    pg: &crate::database::pg::PgDb,
+    template_id: &str,
+    default_content: &str,
+) -> CanaryResolvedPrompt {
+    let canary_opt = match pg.get_active_template_canary(template_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to query PG for active canary: {}", e);
+            return CanaryResolvedPrompt {
+                content: default_content.to_string(),
+                canary_id: None,
+                used_candidate: false,
+            };
+        }
+    };
+
+    let Some(canary) = canary_opt else {
+        return CanaryResolvedPrompt {
+            content: default_content.to_string(),
+            canary_id: None,
+            used_candidate: false,
+        };
+    };
+
+    let use_candidate = should_use_candidate(&canary);
+    let version = if use_candidate {
+        canary.candidate_version
+    } else {
+        canary.baseline_version
+    };
+
+    // Load the prompt content for the selected version from the PG prompt registry
+    let content = match pg
+        .get_prompt_by_version(&canary.template_id, version)
+        .await
+    {
+        Ok(Some(variant)) => {
+            info!(
+                "Canary {}: using {} version v{} for template '{}' [PG]",
+                canary.id,
+                if use_candidate { "candidate" } else { "baseline" },
+                version,
+                canary.template_id,
+            );
+            variant.prompt_content
+        }
+        Ok(None) => {
+            warn!(
+                "Canary {}: version v{} not found in PG prompt registry for '{}', falling back to default",
+                canary.id, version, canary.template_id,
+            );
+            default_content.to_string()
+        }
+        Err(e) => {
+            warn!(
+                "Canary {}: failed to load version v{} for '{}' from PG: {}, falling back to default",
                 canary.id, version, canary.template_id, e,
             );
             default_content.to_string()

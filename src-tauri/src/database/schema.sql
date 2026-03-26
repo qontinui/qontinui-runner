@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 133
+-- Version: 162
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -265,6 +265,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     is_fixer INTEGER DEFAULT 0,                 -- Whether this is a fixer run (aggregates reflection/follow-up fixes)
     fixer_source_task_run_id TEXT,               -- Source task run that this fixer addresses
 
+    -- Token/cost tracking (v85)
+    total_input_tokens INTEGER DEFAULT 0,       -- Accumulated input tokens across all sessions
+    total_output_tokens INTEGER DEFAULT 0,      -- Accumulated output tokens across all sessions
+    total_cost_cents INTEGER DEFAULT 0,         -- Accumulated cost in cents across all sessions
+
     -- Meta-Optimizer (v119)
     is_meta_optimizer INTEGER DEFAULT 0,        -- Whether this is a meta-optimizer run
 
@@ -301,6 +306,8 @@ CREATE INDEX IF NOT EXISTS idx_task_runs_root_task_run_id ON task_runs(root_task
 CREATE INDEX IF NOT EXISTS idx_task_runs_bridge_id ON task_runs(bridge_id);
 -- Runner port index for filtering by runner instance
 CREATE INDEX IF NOT EXISTS idx_task_runs_runner_port ON task_runs(runner_port);
+-- Workspace ID index for multi-tenant queries (v37)
+CREATE INDEX IF NOT EXISTS idx_task_runs_workspace_id ON task_runs(workspace_id);
 
 -- Per-phase token usage tracking for cost analysis.
 -- Records input/output tokens and estimated cost for each AI call in a workflow.
@@ -947,6 +954,10 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     acceptance_criteria TEXT DEFAULT NULL,
     ai_reviewed INTEGER DEFAULT 1,
 
+    -- Multi-agent and worktree support (v117)
+    multi_agent_mode INTEGER DEFAULT 1,       -- Whether to use multi-agent mode
+    use_worktree INTEGER DEFAULT 0,           -- Whether to use git worktree for isolation
+
     -- Execution architecture override ('traditional', 'agentic_verification', 'multi_agent_pipeline')
     workflow_architecture TEXT DEFAULT NULL,
 
@@ -1255,6 +1266,23 @@ CREATE TABLE IF NOT EXISTS learning_patterns (
 );
 CREATE INDEX IF NOT EXISTS idx_learning_patterns_type ON learning_patterns(pattern_type);
 CREATE INDEX IF NOT EXISTS idx_learning_patterns_confidence ON learning_patterns(confidence);
+
+-- Q-Routing Table (Q-learning state-action values for architecture routing)
+CREATE TABLE IF NOT EXISTS q_routing_table (
+    state_key TEXT NOT NULL,
+    action TEXT NOT NULL,
+    q_value REAL NOT NULL DEFAULT 0.0,
+    visit_count INTEGER NOT NULL DEFAULT 0,
+    last_updated TEXT NOT NULL,
+    PRIMARY KEY (state_key, action)
+);
+
+-- Q-Routing Overrides (manual locks: force a state to use a specific architecture)
+CREATE TABLE IF NOT EXISTS q_routing_overrides (
+    state_key TEXT PRIMARY KEY,
+    forced_action TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 
 -- Orchestrator Checkpoints: State snapshots for time-travel debugging
 CREATE TABLE IF NOT EXISTS orchestrator_checkpoints (
@@ -2426,6 +2454,9 @@ CREATE TABLE IF NOT EXISTS generation_pipeline_artifacts (
     quality_report TEXT DEFAULT NULL,
     revision_cycles INTEGER DEFAULT NULL,
 
+    -- Confidence score (v109)
+    confidence_score REAL DEFAULT NULL,        -- AI-assessed confidence in the generated workflow (0.0-1.0)
+
     -- Outcome
     success INTEGER NOT NULL DEFAULT 1,
     error_message TEXT,
@@ -2434,6 +2465,35 @@ CREATE TABLE IF NOT EXISTS generation_pipeline_artifacts (
 
 CREATE INDEX IF NOT EXISTS idx_pipeline_artifacts_workflow ON generation_pipeline_artifacts(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_pipeline_artifacts_created ON generation_pipeline_artifacts(created_at);
+
+-- State machine element thumbnails (v110)
+CREATE TABLE IF NOT EXISTS sm_element_thumbnails (
+    config_id TEXT NOT NULL REFERENCES state_machine_configs(id) ON DELETE CASCADE,
+    fingerprint_hash TEXT NOT NULL,
+    thumbnail_base64 TEXT NOT NULL,
+    PRIMARY KEY (config_id, fingerprint_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sm_thumbnails_config ON sm_element_thumbnails(config_id);
+
+-- Git worktrees for isolated workflow execution (v117)
+CREATE TABLE IF NOT EXISTS worktrees (
+    id TEXT PRIMARY KEY,
+    worktree_path TEXT NOT NULL,
+    branch_name TEXT NOT NULL,
+    source_branch TEXT NOT NULL,
+    source_commit TEXT NOT NULL,
+    repo_path TEXT NOT NULL,
+    task_run_id TEXT,
+    workflow_name TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status);
+CREATE INDEX IF NOT EXISTS idx_worktrees_task_run_id ON worktrees(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_worktrees_repo_path ON worktrees(repo_path);
 
 CREATE TABLE IF NOT EXISTS generator_benchmarks (
     id TEXT PRIMARY KEY,
@@ -3715,3 +3775,29 @@ CREATE INDEX IF NOT EXISTS idx_ptc_template ON prompt_template_canaries(template
 CREATE INDEX IF NOT EXISTS idx_ptc_status ON prompt_template_canaries(status);
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (160, datetime('now'));
+
+-- =============================================================================
+-- Prompt Evolution Table (migration 161)
+-- =============================================================================
+-- Tracks the history of meta-prompt optimizer rewrite attempts and their
+-- canary verdicts, enabling the optimizer to learn from past failures.
+
+CREATE TABLE IF NOT EXISTS prompt_evolution (
+    id TEXT PRIMARY KEY,
+    agent_type TEXT NOT NULL,
+    parent_variant_id TEXT,               -- previous version (NULL for first rewrite)
+    variant_id TEXT NOT NULL,             -- the new prompt variant
+    recommendation_id TEXT,               -- FK to meta_optimizer_recommendations
+    critique TEXT,                        -- LLM's critique of the original prompt
+    changes_summary TEXT,                 -- what was changed and why
+    canary_verdict TEXT,                  -- 'adopt', 'reject', 'inconclusive', or NULL (pending)
+    score_before REAL,                    -- mean score before rewrite
+    score_after REAL,                     -- mean score after canary
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_prompt_evolution_agent ON prompt_evolution(agent_type);
+CREATE INDEX IF NOT EXISTS idx_prompt_evolution_verdict ON prompt_evolution(agent_type, canary_verdict);
+CREATE INDEX IF NOT EXISTS idx_prompt_evolution_variant ON prompt_evolution(variant_id);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (161, datetime('now'));

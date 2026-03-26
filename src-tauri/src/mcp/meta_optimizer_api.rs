@@ -2051,6 +2051,124 @@ pub async fn evaluate_canary_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Prompt Optimization handlers (meta-prompt optimizer)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct PromptEvolutionQuery {
+    pub agent_type: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PromptEvidenceQuery {
+    pub phase: Option<String>,
+    pub max_failures: Option<usize>,
+    pub max_successes: Option<usize>,
+}
+
+async fn get_prompt_optimization_status_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = &state.app_state.checkpoint_db;
+
+    let samples =
+        crate::meta_optimizer::prompt_extractor::extract_prompt_samples(db, 500)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db(&samples, db);
+    let evolution =
+        crate::meta_optimizer::prompt_evolution::get_evolution_history(db, None, 50)
+            .unwrap_or_default();
+
+    let active_canaries: Vec<_> = evolution
+        .iter()
+        .filter(|e| e.canary_verdict.is_none())
+        .cloned()
+        .collect();
+
+    Ok(Json(ApiResponse {
+        success: true,
+        data: Some(serde_json::json!({
+            "prompt_groups": groups,
+            "active_canaries": active_canaries,
+            "evolution_history": evolution,
+        })),
+        error: None,
+        error_detail: None,
+    }))
+}
+
+async fn get_prompt_group_metrics_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = &state.app_state.checkpoint_db;
+
+    let samples =
+        crate::meta_optimizer::prompt_extractor::extract_prompt_samples(db, 500)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db(&samples, db);
+
+    Ok(Json(ApiResponse {
+        success: true,
+        data: Some(serde_json::json!(groups)),
+        error: None,
+        error_detail: None,
+    }))
+}
+
+async fn get_prompt_optimization_evidence_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<PromptEvidenceQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = &state.app_state.checkpoint_db;
+    let phase = query.phase.as_deref().unwrap_or("generation");
+    let max_failures = query.max_failures.unwrap_or(5);
+    let max_successes = query.max_successes.unwrap_or(2);
+
+    let (failures, successes) =
+        crate::meta_optimizer::prompt_extractor::collect_evidence_samples(
+            db,
+            phase,
+            "",
+            max_failures,
+            max_successes,
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+
+    Ok(Json(ApiResponse {
+        success: true,
+        data: Some(serde_json::json!({
+            "failures": failures,
+            "successes": successes,
+        })),
+        error: None,
+        error_detail: None,
+    }))
+}
+
+async fn get_prompt_evolution_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<PromptEvolutionQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let db = &state.app_state.checkpoint_db;
+    let limit = query.limit.unwrap_or(50) as usize;
+
+    let history = crate::meta_optimizer::prompt_evolution::get_evolution_history(
+        db,
+        query.agent_type.as_deref(),
+        limit,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+
+    Ok(Json(ApiResponse {
+        success: true,
+        data: Some(serde_json::json!(history)),
+        error: None,
+        error_detail: None,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
 
@@ -2140,4 +2258,24 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/meta-optimizer/canaries/{id}/evaluation",
             get(evaluate_canary_handler),
         )
+        // Prompt optimization routes (meta-prompt optimizer)
+        .route(
+            "/meta-optimizer/prompt-optimization/status",
+            get(get_prompt_optimization_status_handler),
+        )
+        .route(
+            "/meta-optimizer/prompt-optimization/group-metrics",
+            get(get_prompt_group_metrics_handler),
+        )
+        .route(
+            "/meta-optimizer/prompt-optimization/evidence",
+            get(get_prompt_optimization_evidence_handler),
+        )
+        .route(
+            "/meta-optimizer/prompt-evolution",
+            get(get_prompt_evolution_handler),
+        )
+        // Note: POST /prompt-optimization/trigger is handled via Tauri command
+        // `trigger_meta_optimizer` with optimizer_type="meta_prompt", not HTTP API,
+        // because launching workflows requires AppHandle and ConfigStorage.
 }
