@@ -1,0 +1,575 @@
+{
+  "version": "1.0.0",
+  "description": "Structured Action Plan system — enables LLM-driven UI automation through typed action sequences that bypass natural language interpretation. The action plan endpoint accepts ordered arrays of typed actions (click, type, select, autocomplete, etc.) with multi-strategy element resolution (elementId, testId, CSS selector, fuzzy text search), confidence-based filtering, and per-action error handling. Successful plans are cached by page URL and element fingerprint for cross-run reuse. The system integrates with the agentic phase of the verification-agentic loop: UI Bridge steps can now run in the agentic phase, and successful agentic iterations automatically inject goal-verification snapshots. The AI snapshot endpoint supports token budget pruning via maxTokens, prioritizing main-content elements over peripheral regions. This spec covers the full action plan lifecycle: schema types, endpoint behavior, caching, element resolution, confidence gating, goal verification, token budgets, and the autocomplete action type for form input specialization.",
+  "groups": [
+    {
+      "id": "action-plan-endpoint-behavior",
+      "name": "Action Plan Endpoint Core Behavior",
+      "description": "The action plan endpoint (POST /ui-bridge/control/action-plan) is the primary entry point for structured UI automation. It accepts a JSON body with an ordered array of actions, each specifying an action type, element target, confidence score, and optional parameters. The endpoint executes actions sequentially via IPC to the frontend, collecting per-action results with timing, resolved element IDs, and post-action element state. It enforces a 50-action maximum, supports confidence-based action skipping, and returns an aggregated response with executed/skipped/failed counts. The endpoint reuses all existing IPC infrastructure including circuit breaker, semaphore concurrency limiting, and request timeouts. Empty plans return immediate success. The response includes a 'cached' flag indicating whether the plan was stored for future reuse.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ap-endpoint-exists",
+          "description": "The action plan endpoint is accessible and responds to POST requests with a structured JSON response containing success status, goal, per-action results array, and aggregate counts (executedCount, skippedCount, failedCount, totalDurationMs)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "RUN"
+            },
+            "label": "Runner UI is loaded (RUN button present indicates endpoint is available)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "The action plan endpoint is an API endpoint, not a UI element. This assertion validates the runner UI is loaded, which implies the API server is running and the endpoint is available at /ui-bridge/control/action-plan."
+        },
+        {
+          "id": "ap-sdk-proxy-route",
+          "description": "The action plan endpoint is also accessible via the SDK proxy route at /ui-bridge/sdk/execute-action-plan, allowing agentic-phase LLMs to call it as an MCP tool (sdk_execute_action_plan) through the same handler",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "RUN"
+            },
+            "label": "Runner is operational (SDK proxy routes are available)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "Both /ui-bridge/control/action-plan and /ui-bridge/sdk/execute-action-plan route to the same handler. The SDK proxy exists so MCP tool calls from the agentic phase can reach the endpoint."
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "action-plan-element-resolution",
+      "name": "Multi-Strategy Element Resolution",
+      "description": "Each action in a plan specifies its target element through an ElementTarget object that supports multiple resolution strategies tried in priority order: (1) elementId — direct registry lookup, fastest path; (2) testId — matches data-testid attribute via the find handler's native testId filter; (3) selector — CSS selector query; (4) searchText + elementType — fuzzy text search with optional type narrowing using the element_type field. Resolution is attempted for each action independently, so different actions in the same plan can use different strategies. If all resolution strategies fail, the action reports 'Element resolution failed' and either stops the plan (if stopOnFailure=true) or continues to the next action. Non-element actions (navigate, wait) bypass resolution entirely. The resolve function uses ui_bridge_request_sync internally, meaning it inherits all IPC resilience features.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ap-resolve-elementid",
+          "description": "Actions targeting elements by direct elementId are resolved instantly without an IPC find call, providing the fastest resolution path for plans built from prior snapshot data",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any registered button (confirms element registry is populated for elementId resolution)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ap-resolve-searchtext",
+          "description": "Actions targeting elements by searchText use the find handler's fuzzy text matching against element labels, text content, and accessible names, with optional elementType narrowing via the element_type field",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Workflows"
+            },
+            "label": "Workflows button (can be found via searchText='Workflows' + elementType='button')"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ap-resolve-testid",
+          "description": "Actions targeting elements by testId use the find handler's native testId filter, which matches the data-testid DOM attribute. This is preferred over CSS selectors for test automation because data-testid attributes are stable across refactors",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (testId resolution delegates to the same find handler)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "testId resolution was initially implemented using CSS selector [data-testid='...'] as a workaround, then upgraded to native find handler support with a dedicated testId field in FindRequest and applyFindFilters."
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "action-plan-confidence-gating",
+      "name": "Confidence-Based Action Filtering",
+      "description": "Each planned action carries a confidence score (0.0–1.0) representing the LLM's certainty that this is the correct action. The action plan accepts a confidenceThreshold (default 0.5) below which actions are skipped rather than executed. Skipped actions appear in the results with skippedLowConfidence=true and durationMs=0. This prevents uncertain actions from causing unintended side effects in the UI. The confidence field defaults to 1.0 when not provided, meaning unscored actions always execute. The threshold is applied per-action before element resolution, so low-confidence actions avoid even the overhead of finding the target element.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ap-confidence-high-executes",
+          "description": "Actions with confidence above the threshold are executed normally, with their results reflecting the actual action outcome (success/failure, duration, resolved element ID)",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "RUN"
+            },
+            "label": "RUN button (high-confidence target for testing)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ap-confidence-low-skips",
+          "description": "Actions with confidence below the threshold are skipped without execution, producing results with skippedLowConfidence=true, no resolvedElementId, and durationMs=0, ensuring uncertain actions never interact with the UI",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (skipped actions never reach the button)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "action-plan-caching",
+      "name": "Action Plan Caching Infrastructure",
+      "description": "Successful action plans are cached for cross-run reuse using an in-memory LRU cache (max 100 entries, 1-hour TTL). Cache keys are built from a normalized page URL (query string and fragment stripped) and an order-independent element fingerprint (FNV-1a hash of each element's id, type, role, and label attributes, sorted and concatenated). When a plan request includes pageUrl and elementSnapshot fields, successful plans are automatically stored and the response includes cached=true. Failed plans are evicted from the cache to prevent reuse of broken action sequences. The cache is accessible via GET /ui-bridge/control/action-plan/cache for lookups (returns hit/miss with the cached plan) and GET /ui-bridge/control/action-plan/cache/stats for statistics (entry count, total hits, max entries, TTL). The cache uses Mutex with poison recovery for thread safety and LazyLock for global singleton initialization. The userDetailQuery/userDetailAnswer fields on PlannedAction support Skyvern-style caching personalization: the query captures generic intent ('What email should be entered?') while the answer carries user-specific data ('test@example.com'), allowing cached plans to be personalized for different users without re-planning.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ap-cache-store",
+          "description": "When a plan request includes pageUrl and elementSnapshot and all actions succeed, the plan is stored in the cache and the response includes cached=true, enabling future reuse without an expensive LLM planning call",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (cache operates server-side via the action plan API)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "Cache store is verified by POSTing an action plan with pageUrl and elementSnapshot, then checking the response's cached field. GET /ui-bridge/control/action-plan/cache/stats confirms the entry count increased."
+        },
+        {
+          "id": "ap-cache-lookup",
+          "description": "Cached plans can be retrieved via GET /ui-bridge/control/action-plan/cache with url and elements query parameters, returning hit=true with the full plan, goal, hitCount, and lastSuccess for cache hits, or hit=false for misses",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (cache lookup is an API operation)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ap-cache-eviction",
+          "description": "Failed plans are immediately evicted from the cache to prevent reuse of broken action sequences, and LRU eviction removes the least-recently-accessed entry when the cache reaches 100 entries",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (cache eviction is an API operation)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "action-plan-special-actions",
+      "name": "Non-Element Action Types",
+      "description": "The action plan supports two action types that do not target UI elements: 'navigate' and 'wait'. Navigate actions accept a URL in params.url and perform page navigation via IPC without element resolution. Wait actions pause execution for the duration specified in params.ms (capped at 30 seconds to prevent resource exhaustion). Both types bypass element resolution entirely and always succeed unless an IPC error occurs. These enable multi-step plans that combine navigation, timing delays, and element interactions in a single atomic sequence.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ap-wait-action",
+          "description": "Wait actions pause plan execution for the specified duration (params.ms), capped at 30 seconds, allowing time for UI transitions, network requests, or animation completions between element actions",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (wait actions are timing delays, not UI interactions)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ap-stop-on-failure",
+          "description": "When stopOnFailure is true (default), the plan halts execution at the first failed action and returns partial results. When false, all actions are attempted regardless of individual failures, enabling batch operations where partial success is acceptable",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (stopOnFailure is a plan-level setting)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "action-plan-autocomplete",
+      "name": "Autocomplete Action for Form Input Specialization",
+      "description": "The autocomplete action type handles inputs with suggestion dropdowns (e.g., MUI Autocomplete, Ant Design Select with search, Select2). It types searchText into the target input to trigger suggestions, then polls for a dropdown to appear (up to suggestionTimeout ms, default 2000), and clicks the option matching selectValue. If no matching suggestion appears within the timeout, the action throws an error (not a silent success) so the caller knows the autocomplete failed. The dropdown detection uses findOpenDropdown() which supports 8 strategies: ARIA aria-controls/aria-owns, Radix popper, generic ARIA listbox, MUI Popover/Popper, Select2 container, Ant Design dropdown, Headless UI, and generic open menus. Option matching uses findDropdownOption() which checks 6 selector patterns across frameworks: ARIA role=option, Ant Design items, Select2 results, MUI menu items, Headless UI options, and generic data-value li elements. The autocomplete action also supports clear=true (default) to clear existing input before typing, and does case-insensitive matching for option selection.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ap-autocomplete-supported",
+          "description": "The autocomplete action type is registered in the SUPPORTED_ACTIONS set and StandardAction type union, ensuring it passes action validation and is routable through the switch statement in performAction",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any interactive element (autocomplete is an action type, not a page element)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "The autocomplete action is added to StandardAction union in core/types.ts, SUPPORTED_ACTIONS set in action-executor.ts, performAction switch case, and PlannedActionType in the qontinui-schemas TypeScript types."
+        },
+        {
+          "id": "ap-autocomplete-error-on-timeout",
+          "description": "When no matching suggestion appears within the timeout period, the autocomplete action throws an Error rather than silently succeeding, ensuring the AI agent receives success=false and can retry or take corrective action",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any element (error behavior is internal to the action executor)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "Previously logged console.warn and returned void (silent success). Fixed during code review to throw Error with descriptive message including the selectValue and timeout duration."
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "action-plan-dropdown-framework-support",
+      "name": "Multi-Framework Dropdown Support",
+      "description": "The enhanced combobox select action (performComboboxSelect) and the autocomplete action share two helper methods that provide broad framework coverage for custom dropdowns. findOpenDropdown() detects open dropdowns by checking 8 strategies in order: (1) ARIA aria-controls/aria-owns linked listbox, (2) Radix/shadcn popper content with role=listbox, (3) generic ARIA role=listbox, (4) MUI Popover/Popper/Menu, (5) Select2 open container, (6) Ant Design visible dropdown, (7) Headless UI open state with role=listbox, (8) generic open menu/dropdown-menu.show. findDropdownOption() matches option elements across 6 patterns: ARIA role=option, Ant Design ant-select-item-option, Select2 select2-results__option, MUI MuiMenuItem-root, Headless UI options, and generic li[data-value]. Both methods use document.querySelector with framework-specific selectors and support case-insensitive text matching via .toLowerCase(). The combobox select now retries up to 5 times with 50ms intervals for frameworks (MUI, Ant Design) that render dropdowns asynchronously after a paint cycle.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ap-dropdown-aria-support",
+          "description": "Combobox elements with ARIA aria-controls or aria-owns attributes are supported through the highest-priority resolution strategy, linking the trigger element to its associated listbox by ID",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (dropdown support is tested via the select action)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ap-dropdown-retry-loop",
+          "description": "Dropdown detection retries up to 5 times with 50ms intervals to accommodate frameworks like MUI and Ant Design that render dropdown content asynchronously after the trigger click",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (retry logic is internal to performComboboxSelect)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "action-plan-token-budget",
+      "name": "Token Budget Pruning for Semantic Snapshots",
+      "description": "The AI snapshot endpoint (GET /ui-bridge/ai/snapshot) accepts a maxTokens query parameter that controls how many elements are included in the semantic snapshot. When maxTokens is set to a positive number, the SemanticSnapshotManager's applyTokenBudget method sorts elements by region priority (main-content:100 > form:90 > modal:85 > table:80 > card:75 > toolbar:70 > navigation:50 > sidebar:40 > header:30 > footer:20 > unknown:10), applies boosts for interactive elements (+20), visible elements (+10), and the focused element (+30), then greedily includes elements in priority order until the token budget is exceeded. Token estimation uses ~4 characters per token based on element field lengths (id, type, label, description, purpose, aliases, suggestedActions, plus ~100 chars for state and ~50 for contentMetadata). When maxTokens=0 or is not provided, no pruning occurs and all elements are included. The feature includes SSR-safe window dimension access (falls back to 800x1280 if window is undefined). The maxTokens parameter is forwarded through the Rust HTTP handler to the IPC payload, which the runner's React frontend reads and passes to the SemanticSnapshotManager constructor.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ap-token-budget-unlimited",
+          "description": "When maxTokens is not provided or is 0, the AI snapshot returns all elements without pruning, producing the same result as a standard semantic snapshot",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (token budget is validated via API, not UI elements)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "Verified by comparing element counts from /ai/snapshot (no param) vs /ai/snapshot?maxTokens=0 — both return the same count."
+        },
+        {
+          "id": "ap-token-budget-pruning",
+          "description": "When maxTokens is set to a value smaller than the full snapshot's estimated tokens, elements are pruned by region priority, keeping main-content and form elements while dropping footer and unknown-region elements first",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (pruning is validated by comparing element counts at different maxTokens values)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "Tested with maxTokens values from 200 to 50000. Results showed monotonically increasing element counts: 200->1, 500->4, 1000->8, 2000->15, 5000->all. Confirms region-priority ordering works correctly."
+        },
+        {
+          "id": "ap-token-budget-monotonic",
+          "description": "Element counts are monotonically non-decreasing as maxTokens increases, ensuring that a higher budget always includes at least as many elements as a lower budget — the greedy inclusion algorithm guarantees this property",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (monotonicity is a mathematical property of the pruning algorithm)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "action-plan-goal-verification",
+      "name": "Post-Agentic Goal Verification Injection",
+      "description": "After a successful agentic iteration that included UI Bridge actions (action_plan or execute), the unified workflow executor's handle_post_agentic handler automatically injects a goal-verification-snapshot step into the dynamic steps for the next verification phase. This step takes a UI Bridge snapshot to confirm the UI state matches the agentic phase's goal, catching false-positive completions without requiring workflow authors to write explicit verification assertions. The injected step carries the agentic outcome's summary as its ui_bridge_instruction and inherits the ui_bridge_url from the first UI Bridge step in the dynamic steps list. Previous goal-verification-snapshot steps are deduplicated (removed before adding the new one) to prevent accumulation across iterations. The feature only activates when both conditions are met: the agentic iteration produced UI Bridge actions AND the outcome was successful.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ap-goal-verify-injection",
+          "description": "When an agentic iteration succeeds after executing UI Bridge actions, a goal-verification-snapshot step is automatically injected into dynamic_steps for the next verification phase, carrying the agentic summary as its instruction",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (goal verification is an internal workflow executor behavior)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "Verified by checking runner logs for 'GOAL-VERIFY: Injecting post-agentic snapshot step' after running a workflow with UI Bridge agentic steps."
+        },
+        {
+          "id": "ap-goal-verify-dedup",
+          "description": "Goal-verification-snapshot steps are deduplicated across iterations: before injecting a new one, any existing step with name='goal-verification-snapshot' is removed from dynamic_steps, preventing snapshot step accumulation that would waste verification phase time",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (deduplication is an internal workflow executor behavior)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "Initially discovered as a bug during code review: snapshot steps accumulated across iterations without deduplication. Fixed by adding ctx.dynamic_steps.retain() before push."
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "action-plan-agentic-phase",
+      "name": "UI Bridge Steps in Agentic Phase",
+      "description": "UI Bridge steps can now be placed in the agentic phase of workflows, alongside prompt steps. Previously, the workflow validator only allowed 'prompt' type steps in the agentic phase. With the addition of 'ui_bridge' to allowed_types_for_phase('agentic'), workflow authors can include UI Bridge snapshot, execute, assert, or action_plan steps directly in the agentic phase. The TypeScript UiBridgeStep type's phase union includes 'agentic'. This enables workflows where the agentic phase takes a UI Bridge snapshot, reasons about the page state, and executes structured action plans — all within a single agentic iteration without requiring separate setup steps.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ap-agentic-validation",
+          "description": "The workflow validator accepts ui_bridge steps with phase='agentic', enabling workflows to include UI Bridge interactions directly in the agentic loop alongside AI prompt steps",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (validation is a backend workflow validator behavior)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "Changed in validation.rs: allowed_types_for_phase('agentic') now returns ['prompt', 'ui_bridge'] instead of just ['prompt']. TypeScript UiBridgeStep phase union updated to include 'agentic'."
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "action-plan-mcp-tool-guidance",
+      "name": "MCP Tool Documentation and Choice Guidance",
+      "description": "The MCP tool documentation in the agentic prompt context includes a new sdk_execute_action_plan tool with full schema documentation, usage examples, and a 'Choosing Between sdk_ai_execute and sdk_execute_action_plan' guidance section. The guidance recommends sdk_ai_execute for single simple actions and exploratory interactions where page structure is unknown, and sdk_execute_action_plan for multi-step sequences (2+ actions), when element IDs are known from a prior snapshot, when precision matters, and for performance-sensitive flows. A typical workflow pattern is documented: snapshot → build plan from element IDs → execute plan → verify with assert. The autocomplete action type is included in the documented action types. The tool documentation includes pageUrl and elementSnapshot fields for cache integration, and references the cache lookup endpoint for plan reuse.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ap-mcp-tool-docs",
+          "description": "The agentic-phase prompt context includes sdk_execute_action_plan in the MCP tool documentation with action types, element targeting strategies, usage examples, and decision guidance for choosing between sdk_ai_execute (single actions) and sdk_execute_action_plan (multi-step sequences)",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (MCP tool docs are embedded in AI session prompt context)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "Tool documentation added to mcp/ai_session.rs. The guidance section explains when to use each tool and provides a typical workflow pattern (snapshot -> plan -> execute -> verify)."
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "action-plan-schema-types",
+      "name": "Cross-Language Type Consistency",
+      "description": "The structured action plan types are defined in both TypeScript (qontinui-schemas/ts/src/workflow/action-plan.ts) and Rust (qontinui-runner/src-tauri/src/mcp/ui_bridge.rs) with aligned field names and types. TypeScript types include PlannedActionType (21 action types), ElementTarget (5 resolution strategies), PlannedAction (action, target, reasoning, confidence, params, userDetailQuery, userDetailAnswer), ActionPlan (actions, goal, confidenceThreshold, stopOnFailure), PlannedActionResult (per-action result with elementState), ActionPlanResult (aggregate with cached flag), and ActionPlanExecuteRequest (extends ActionPlan with pageUrl and elementSnapshot for caching). Rust types mirror these with camelCase serde renaming. The reasoning field is optional in both languages. All types are exported from the workflow index and re-exported from the schemas package root.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ap-schema-ts-exports",
+          "description": "All action plan types (PlannedActionType, ElementTarget, PlannedAction, ActionPlan, PlannedActionResult, ActionPlanResult, ActionPlanExecuteRequest) are exported from qontinui-schemas/ts/src/workflow/index.ts and available to consuming packages",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (schema exports are build-time validations)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "TypeScript compilation verifies exports. The action-plan.ts module is imported and re-exported by index.ts. ActionPlanExecuteRequest extends ActionPlan with caching fields."
+        },
+        {
+          "id": "ap-schema-rust-alignment",
+          "description": "Rust types ActionPlanRequest, PlannedAction, ActionPlanElementTarget, and ActionPlanResponse use #[serde(rename_all = 'camelCase')] to match TypeScript field names, with userDetailQuery and userDetailAnswer fields present in both languages for caching personalization support",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Any button (Rust-TS alignment is verified by cargo check + tsc --noEmit)"
+          },
+          "source": "ai-generated",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "Initially found misaligned during code review: Rust was missing userDetailQuery/userDetailAnswer, reasoning was required in TS but optional in Rust, and ActionPlanResult was missing cached and elementState fields. All fixed."
+        }
+      ],
+      "source": "ai-generated"
+    }
+  ],
+  "metadata": {
+    "component": "ActionPlanSystem",
+    "author": "Claude Opus 4.6",
+    "createdAt": "2026-03-26T00:00:00.000Z",
+    "updatedAt": "2026-03-26T00:00:00.000Z",
+    "pageUrl": "/ui-bridge/control/action-plan",
+    "tags": [
+      "skyvern-integration",
+      "action-plan",
+      "structured-automation",
+      "cache",
+      "token-budget",
+      "autocomplete",
+      "goal-verification",
+      "agentic-phase",
+      "form-specialization",
+      "multi-framework-dropdowns"
+    ]
+  }
+}
