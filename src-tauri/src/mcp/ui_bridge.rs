@@ -4909,7 +4909,12 @@ pub async fn ui_bridge_get_workflow_status_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting workflow status for run {}", run_id);
 
-    match state.app_state.checkpoint_db.get_task_run(&run_id) {
+    let task_run_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_task_run(&run_id).await
+    } else {
+        state.app_state.checkpoint_db.get_task_run(&run_id)
+    };
+    match task_run_result {
         Ok(Some(task_run)) => {
             let status = match task_run.status.as_str() {
                 "running" | "in_progress" => "running",
@@ -5538,14 +5543,14 @@ async fn resolve_action_plan_target(
         }
     }
 
-    // 4. Fuzzy search by text + type
+    // 4. Fuzzy search by text + element type
     if let Some(ref text) = target.search_text {
         let mut find_payload = serde_json::json!({
             "text": text,
             "fuzzy": true
         });
         if let Some(ref el_type) = target.element_type {
-            find_payload["type"] = serde_json::json!(el_type);
+            find_payload["element_type"] = serde_json::json!(el_type);
         }
         if let Ok(data) = ui_bridge_request_sync(state, "find", find_payload).await {
             if let Some(id) = extract_first_element_id(&data) {
