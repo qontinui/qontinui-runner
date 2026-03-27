@@ -80,7 +80,8 @@ export type MainTabId =
   | "activity-timeline"
   | "watchers"
   | "knowledge-explorer"
-  | "event-history";
+  | "event-history"
+  | "demo-video";
 
 const VALID_TAB_IDS: MainTabId[] = [
   "gui-automation",
@@ -163,6 +164,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "watchers",
   "knowledge-explorer",
   "event-history",
+  "demo-video",
 ];
 
 export const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";

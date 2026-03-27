@@ -85,6 +85,7 @@ const AutomationHealthDashboard = lazy(() => import("../ui-bridge/AutomationHeal
 const ObservationBrowser = lazy(() => import("../observations/ObservationBrowser").then(m => ({ default: m.ObservationBrowser })));
 const ActivityTimelinePanel = lazy(() => import("../activity-timeline/ActivityTimelinePanel").then(m => ({ default: m.ActivityTimelinePanel })));
 const WatcherManagementPanel = lazy(() => import("../activity-timeline/WatcherManagementPanel").then(m => ({ default: m.WatcherManagementPanel })));
+const DemoVideoPanel = lazy(() => import("../demo-video/DemoVideoPanel").then(m => ({ default: m.DemoVideoPanel })));
 
 /** Register the active page with UI Bridge for AI discoverability */
 function PageRegistration({ id, name, description }: { id: string; name: string; description: string }) {
@@ -805,6 +806,16 @@ export function TabContent({
       return (
         <div className="h-full overflow-hidden">
           <EventHistoryPage />
+        </div>
+      );
+
+    case "demo-video":
+      return (
+        <div className="h-full overflow-hidden">
+          <PageRegistration id="demo-video" name="Demo Videos" description="Generate demo videos from UI Bridge page specs" />
+          <Suspense fallback={<LazyFallback />}>
+            <DemoVideoPanel />
+          </Suspense>
         </div>
       );
 
