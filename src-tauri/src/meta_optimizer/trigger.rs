@@ -387,6 +387,27 @@ fn auto_evaluate_canaries(db: &CheckpointDb, app_handle: Option<&tauri::AppHandl
                         "Canary {} evaluation: continue (delta={:+.1}pp, {} canary runs)",
                         canary.id, eval.delta, canary.canary_run_count
                     );
+
+                    // For borderline results with many runs, increase canary traffic
+                    // to gather more data faster (extend the evaluation period).
+                    if canary.canary_run_count >= 30 && canary.percentage < 50 {
+                        let new_pct = std::cmp::min(canary.percentage + 10, 50);
+                        if let Err(e) = super::canary::update_canary_percentage(
+                            db,
+                            &canary.id,
+                            new_pct,
+                        ) {
+                            debug!(
+                                "Failed to extend canary {} traffic to {}%: {}",
+                                canary.id, new_pct, e
+                            );
+                        } else {
+                            info!(
+                                "Extended canary {} traffic from {}% to {}% (inconclusive after {} runs)",
+                                canary.id, canary.percentage, new_pct, canary.canary_run_count
+                            );
+                        }
+                    }
                 }
             },
             Err(e) => {
@@ -422,6 +443,21 @@ pub fn launch_optimizer_manual(
     deps: &MetaOptimizerDeps,
     optimizer_type: OptimizerType,
 ) -> Result<String, String> {
+    // Meta-prompt optimizer has additional guards even for manual triggers
+    // to prevent creating competing canaries for the same agent_type
+    if optimizer_type == OptimizerType::MetaPrompt {
+        let db = &deps.app_state.checkpoint_db;
+        if let Ok(Some(target)) =
+            super::prompt_extractor::select_optimization_target(db, 10, 0.30)
+        {
+            if super::prompt_evolution::has_active_evolution(db, &target.agent_type) {
+                return Err(format!(
+                    "Cannot trigger MetaPrompt optimizer: active canary already in progress for {}",
+                    target.agent_type
+                ));
+            }
+        }
+    }
     launch_optimizer_internal(deps, optimizer_type, "manual")
 }
 

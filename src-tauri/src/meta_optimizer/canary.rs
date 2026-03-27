@@ -141,6 +141,28 @@ pub fn get_active_canaries(db: &CheckpointDb) -> Result<Vec<CanaryRollout>, Stri
     })
 }
 
+/// Update the traffic percentage for an active canary rollout.
+///
+/// Used to extend canary evaluation by increasing traffic when results are
+/// inconclusive after many runs.
+pub fn update_canary_percentage(
+    db: &CheckpointDb,
+    canary_id: &str,
+    new_percentage: i64,
+) -> Result<(), String> {
+    let canary_id = canary_id.to_string();
+    let pct = new_percentage.clamp(1, 100);
+
+    db.with_conn(move |conn| {
+        conn.execute(
+            "UPDATE canary_rollouts SET percentage = ?1 WHERE id = ?2 AND status = 'active'",
+            params![pct, canary_id],
+        )
+        .map_err(|e| format!("Failed to update canary percentage: {}", e))?;
+        Ok(())
+    })
+}
+
 /// Get completed canary rollouts (promoted or rolled back) for history display.
 pub fn get_canary_history(db: &CheckpointDb, limit: u32) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.min(100) as i64;

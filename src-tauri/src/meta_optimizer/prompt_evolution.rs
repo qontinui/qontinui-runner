@@ -456,4 +456,167 @@ mod tests {
         assert_eq!(history[0].changes_summary.as_deref(), Some("second"));
         assert_eq!(history[1].changes_summary.as_deref(), Some("first"));
     }
+
+    // ── Integration tests: recommendation linking and canary verdict flow ──
+
+    #[test]
+    fn test_recommendation_variant_linking() {
+        let db = setup_test_db();
+
+        // Simulate the parser flow: create evolution entry with recommendation_id
+        let rec_id = "mor-test-rec-123";
+        let variant_id = "pv-test-var-456";
+
+        let evo_id = record_evolution(
+            &db,
+            "verifier",
+            None,              // no parent (first rewrite)
+            variant_id,
+            Some(rec_id),      // linked to recommendation
+            Some("The prompt lacks JSON output format spec"),
+            Some("Added structured output requirements"),
+            Some(0.35),        // score_before = 35%
+        )
+        .unwrap();
+
+        // Verify the evolution entry links recommendation to variant
+        let history = get_evolution_history(&db, Some("verifier"), 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, evo_id);
+        assert_eq!(history[0].recommendation_id.as_deref(), Some(rec_id));
+        assert_eq!(history[0].variant_id, variant_id);
+        assert!(history[0].canary_verdict.is_none()); // pending
+        assert_eq!(history[0].score_before, Some(0.35));
+        assert!(history[0].score_after.is_none());
+
+        // There should be an active evolution (canary in progress)
+        assert!(has_active_evolution(&db, "verifier"));
+    }
+
+    #[test]
+    fn test_canary_verdict_feedback_loop_adopt() {
+        let db = setup_test_db();
+
+        // Step 1: Create evolution entry (simulating parser creating variant + starting canary)
+        let rec_id = "mor-adopt-test";
+        let evo_id = record_evolution(
+            &db,
+            "implementer",
+            None,
+            "pv-new-variant",
+            Some(rec_id),
+            Some("Missing error handling examples"),
+            Some("Added error handling few-shot examples"),
+            Some(0.40),
+        )
+        .unwrap();
+
+        // Active evolution should exist
+        assert!(has_active_evolution(&db, "implementer"));
+
+        // Step 2: Canary completes — verdict: adopt (score improved to 0.72)
+        update_verdict(&db, &evo_id, "adopt", Some(0.72)).unwrap();
+
+        // Active evolution should be cleared (verdict is set)
+        assert!(!has_active_evolution(&db, "implementer"));
+
+        // Verify the evolution entry is updated
+        let history = get_evolution_history(&db, Some("implementer"), 10).unwrap();
+        assert_eq!(history[0].canary_verdict.as_deref(), Some("adopt"));
+        assert_eq!(history[0].score_after, Some(0.72));
+        assert!(history[0].score_after.unwrap() > history[0].score_before.unwrap());
+
+        // No rejected entry should exist
+        assert!(get_latest_rejected(&db, "implementer").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_canary_verdict_feedback_loop_reject() {
+        let db = setup_test_db();
+
+        // Step 1: Create evolution entry
+        let rec_id = "mor-reject-test";
+        let evo_id = record_evolution(
+            &db,
+            "spec_analyst",
+            None,
+            "pv-rejected-variant",
+            Some(rec_id),
+            Some("Prompt too verbose, agents confused by multi-step instructions"),
+            Some("Simplified to single-step focus"),
+            Some(0.45),
+        )
+        .unwrap();
+
+        // Step 2: Canary completes — verdict: reject (score degraded to 0.30)
+        update_verdict(&db, &evo_id, "reject", Some(0.30)).unwrap();
+
+        // Active evolution cleared
+        assert!(!has_active_evolution(&db, "spec_analyst"));
+
+        // Step 3: Next optimizer round should see the rejected attempt
+        let rejected = get_latest_rejected(&db, "spec_analyst").unwrap().unwrap();
+        assert_eq!(rejected.changes_summary.as_deref(), Some("Simplified to single-step focus"));
+        assert_eq!(rejected.score_after, Some(0.30));
+        assert!(rejected.score_after.unwrap() < rejected.score_before.unwrap());
+
+        // Step 4: Create a second attempt taking a different approach
+        let evo_id2 = record_evolution(
+            &db,
+            "spec_analyst",
+            Some("pv-rejected-variant"), // parent is the rejected variant
+            "pv-second-attempt",
+            Some("mor-reject-test-2"),
+            Some("Previous simplification degraded quality; try adding examples instead"),
+            Some("Added few-shot examples while preserving multi-step structure"),
+            Some(0.45),
+        )
+        .unwrap();
+
+        // Both entries should exist in history
+        let history = get_evolution_history(&db, Some("spec_analyst"), 10).unwrap();
+        assert_eq!(history.len(), 2);
+        // Most recent first
+        assert_eq!(history[0].id, evo_id2);
+        assert_eq!(history[0].parent_variant_id.as_deref(), Some("pv-rejected-variant"));
+
+        // Active evolution for second attempt
+        assert!(has_active_evolution(&db, "spec_analyst"));
+
+        // Step 5: Second attempt succeeds
+        update_verdict(&db, &evo_id2, "adopt", Some(0.68)).unwrap();
+
+        // Latest rejected is still the first attempt (adopt != reject)
+        let rejected = get_latest_rejected(&db, "spec_analyst").unwrap().unwrap();
+        assert_eq!(rejected.id, evo_id);
+    }
+
+    #[test]
+    fn test_update_verdict_by_variant_closes_loop() {
+        let db = setup_test_db();
+
+        // Create evolution entry
+        record_evolution(
+            &db,
+            "locator",
+            None,
+            "pv-canary-test",
+            Some("mor-canary-rec"),
+            None,
+            None,
+            Some(0.50),
+        )
+        .unwrap();
+
+        assert!(has_active_evolution(&db, "locator"));
+
+        // Update via variant_id (simulates canary.rs calling update_verdict_by_variant)
+        update_verdict_by_variant(&db, "pv-canary-test", "reject", Some(0.40)).unwrap();
+
+        assert!(!has_active_evolution(&db, "locator"));
+
+        let history = get_evolution_history(&db, Some("locator"), 10).unwrap();
+        assert_eq!(history[0].canary_verdict.as_deref(), Some("reject"));
+        assert_eq!(history[0].score_after, Some(0.40));
+    }
 }
