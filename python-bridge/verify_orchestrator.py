@@ -95,13 +95,15 @@ def verify_type_hints(cls):
 def verify_command_bindings():
     """Verify command binding functions exist."""
     try:
-        from qontinui_executor import execute_transition  # noqa: F401
-        from qontinui_executor import get_active_states  # noqa: F401
-        from qontinui_executor import get_available_transitions  # noqa: F401
-        from qontinui_executor import get_orchestrator  # noqa: F401
-        from qontinui_executor import initialize_orchestrator  # noqa: F401
-        from qontinui_executor import navigate_to_multiple_states  # noqa: F401
-        from qontinui_executor import navigate_to_state  # noqa: F401
+        from qontinui_executor import (
+            execute_transition,  # noqa: F401
+            get_active_states,  # noqa: F401
+            get_available_transitions,  # noqa: F401
+            get_orchestrator,  # noqa: F401
+            initialize_orchestrator,  # noqa: F401
+            navigate_to_multiple_states,  # noqa: F401
+            navigate_to_state,  # noqa: F401
+        )
 
         print("✓ All command binding functions exist")
         return True
