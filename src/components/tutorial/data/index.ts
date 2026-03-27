@@ -15,6 +15,10 @@ import { workflowOrchestrationTutorial } from "./workflow-orchestration";
 import { graphqlInfrastructureTutorial } from "./graphql-infrastructure";
 import { knowledgeAcquisitionTutorial } from "./knowledge-acquisition";
 import { actionPlanTutorial } from "./action-plan";
+import { observationMemoryTutorial } from "./observation-memory";
+import { blameAttributionTutorial } from "./blame-attribution";
+import { multimodalVisionTutorial } from "./multimodal-vision";
+import { traceAnalysisTutorial } from "./trace-analysis";
 
 /**
  * All available tutorials
@@ -31,6 +35,9 @@ export const tutorials: Tutorial[] = [
   graphqlInfrastructureTutorial, // Architecture - full-stack GraphQL system
   knowledgeAcquisitionTutorial, // Featured - Knowledge acquisition system
   actionPlanTutorial, // Featured - Structured action plan API
+  blameAttributionTutorial, // Featured - Blame attribution & convergence
+  multimodalVisionTutorial, // Featured - Multimodal vision pipeline
+  traceAnalysisTutorial, // Featured - Trace analysis & critical path
 ];
 
 /**
@@ -106,3 +113,6 @@ export { opikIntegrationTutorial } from "./opik-integration";
 export { knowledgeAcquisitionTutorial } from "./knowledge-acquisition";
 export { graphqlInfrastructureTutorial } from "./graphql-infrastructure";
 export { actionPlanTutorial } from "./action-plan";
+export { blameAttributionTutorial } from "./blame-attribution";
+export { multimodalVisionTutorial } from "./multimodal-vision";
+export { traceAnalysisTutorial } from "./trace-analysis";
