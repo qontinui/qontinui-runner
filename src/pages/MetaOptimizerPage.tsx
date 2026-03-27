@@ -47,6 +47,7 @@ export function MetaOptimizerPage() {
           <button
             key={t.id}
             onClick={() => setTab(t.id)}
+            data-tutorial-id={`${t.id}-tab`}
             className={`px-3 py-1.5 text-sm rounded-t-md transition-colors ${
               tab === t.id
                 ? "bg-zinc-800 text-zinc-100 border border-b-0 border-zinc-700"

@@ -19,6 +19,8 @@ import { observationMemoryTutorial } from "./observation-memory";
 import { blameAttributionTutorial } from "./blame-attribution";
 import { multimodalVisionTutorial } from "./multimodal-vision";
 import { traceAnalysisTutorial } from "./trace-analysis";
+import { activityTimelineTutorial } from "./activity-timeline";
+import { metaPromptOptimizerTutorial } from "./meta-prompt-optimizer";
 
 /**
  * All available tutorials
@@ -39,6 +41,8 @@ export const tutorials: Tutorial[] = [
   blameAttributionTutorial, // Featured - Blame attribution & convergence
   multimodalVisionTutorial, // Featured - Multimodal vision pipeline
   traceAnalysisTutorial, // Featured - Trace analysis & critical path
+  activityTimelineTutorial, // Featured - Screenpipe-inspired capture history & watchers
+  metaPromptOptimizerTutorial, // Featured - LLM-based prompt rewriting with canary A/B testing
 ];
 
 /**
@@ -118,3 +122,4 @@ export { observationMemoryTutorial } from "./observation-memory";
 export { blameAttributionTutorial } from "./blame-attribution";
 export { multimodalVisionTutorial } from "./multimodal-vision";
 export { traceAnalysisTutorial } from "./trace-analysis";
+export { metaPromptOptimizerTutorial } from "./meta-prompt-optimizer";
