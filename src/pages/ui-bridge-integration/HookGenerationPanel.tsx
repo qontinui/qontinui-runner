@@ -45,6 +45,17 @@ import type {
 } from "./types";
 import { getApiBase } from "@/lib/runner-api";
 import {
+  planDemoScript,
+  fetchRegisteredElements,
+} from "@/lib/demo-video/script-planner";
+import {
+  executeScript,
+} from "@/lib/demo-video/script-executor";
+import { generateNarration } from "@/lib/demo-video/narration-generator";
+import type { DemoScript } from "@/lib/demo-video/types";
+import { DEFAULT_RECORDING_CONFIG } from "@/lib/demo-video/types";
+import type { SpecConfig } from "@/lib/spec-prompt-builder";
+import {
   buildRegistrationPrompt,
   buildPageSpecPrompt,
   buildTutorialPrompt,
@@ -115,7 +126,8 @@ type IntegrationStep =
   | "architecture-spec"
   | "page-registrations"
   | "page-spec"
-  | "page-tutorial";
+  | "page-tutorial"
+  | "page-demo-script";
 
 interface StepStatus {
   state: "pending" | "active" | "done" | "skipped" | "error";
@@ -256,12 +268,17 @@ export function HookGenerationPanel({
     generateRegistrations: true,
     generateSpecs: true,
     generateTutorials: false,
+    generateDemoVideos: false,
   });
   const currentPageRef = useRef<{
     page: PageComponent;
     source: ReadPageSourceResult | null;
     registrationOutput: string;
   } | null>(null);
+  // Collected demo video scripts for batch recording after all pages are done
+  const demoVideoScriptsRef = useRef<DemoScript[]>([]);
+  // Last generated spec JSON per page (used by demo script planner)
+  const lastSpecJsonRef = useRef<string>("");
 
   // Track how many AI messages we've already processed to avoid duplicate extraction
   const processedMessageCountRef = useRef(0);
@@ -499,6 +516,9 @@ export function HookGenerationPanel({
           "",
         );
         session.sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
+      } else if (opts.generateDemoVideos) {
+        // Skip to demo script planning
+        chainToDemoScript(cur?.page.route ?? "", controller.signal);
       } else {
         // Advance to next page
         advanceToNextPage(controller.signal);
@@ -507,6 +527,7 @@ export function HookGenerationPanel({
       processedMessageCountRef.current = aiMessages.length;
       const jsonBlock = extractJsonBlock(fullContent);
       if (jsonBlock) {
+        lastSpecJsonRef.current = jsonBlock;
         const specName = currentPageRef.current
           ? `${currentPageRef.current.page.route.replace(/^\//, "").replace(/\//g, "-") || "root"}.spec.uibridge.json`
           : "page.spec.uibridge.json";
@@ -534,6 +555,8 @@ export function HookGenerationPanel({
           jsonBlock || "",
         );
         session.sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
+      } else if (opts.generateDemoVideos) {
+        chainToDemoScript(cur?.page.route ?? "", controller.signal);
       } else {
         advanceToNextPage(controller.signal);
       }
@@ -546,10 +569,60 @@ export function HookGenerationPanel({
       setStepStatuses((prev) =>
         prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
       );
+      const opts = pageOptionsRef.current;
+      if (opts.generateDemoVideos) {
+        const cur = currentPageRef.current;
+        chainToDemoScript(cur?.page.route ?? "", controller.signal);
+      } else {
+        advanceToNextPage(controller.signal);
+      }
+    } else if (currentStep === "page-demo-script") {
+      // Demo script planning is handled inline (non-AI) — this case handles
+      // the completion signal. The script was already added to demoVideoScriptsRef
+      // by chainToDemoScript. Just advance.
+      setStepStatuses((prev) =>
+        prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
+      );
       advanceToNextPage(controller.signal);
     }
 
-    // Helper: advance to the next page in the queue or go to preview
+    // Helper: chain to demo script planning (non-AI — calls the planner API directly)
+    function chainToDemoScript(route: string, signal: AbortSignal) {
+      pendingStepRef.current = "page-demo-script";
+      setStepStatuses((prev) => [
+        ...prev,
+        { state: "active", label: `Demo Script: ${route}` },
+      ]);
+
+      (async () => {
+        try {
+          // Parse the last generated spec JSON into a SpecConfig
+          let specConfig: SpecConfig | null = null;
+          if (lastSpecJsonRef.current) {
+            try {
+              specConfig = JSON.parse(lastSpecJsonRef.current) as SpecConfig;
+            } catch {
+              // Spec JSON couldn't be parsed — skip this page's demo script
+            }
+          }
+
+          if (specConfig) {
+            const elements = await fetchRegisteredElements();
+            const script = await planDemoScript(specConfig, elements);
+            demoVideoScriptsRef.current.push(script);
+          }
+        } catch (err) {
+          console.warn("Demo script planning failed for", route, err);
+        }
+
+        setStepStatuses((prev) =>
+          prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
+        );
+        advanceToNextPage(signal);
+      })();
+    }
+
+    // Helper: advance to the next page in the queue or go to preview/recording
     function advanceToNextPage(signal: AbortSignal) {
       const queue = pageQueueRef.current;
       if (queue.length > 0) {
@@ -559,7 +632,39 @@ export function HookGenerationPanel({
         // All pages done
         pendingStepRef.current = null;
         currentPageRef.current = null;
-        setPhase("preview");
+
+        // If demo videos were planned, start batch recording
+        const scripts = demoVideoScriptsRef.current;
+        if (scripts.length > 0 && pageOptionsRef.current.generateDemoVideos) {
+          setStepStatuses((prev) => [
+            ...prev,
+            { state: "active", label: `Recording ${scripts.length} demo video${scripts.length !== 1 ? "s" : ""}...` },
+          ]);
+          (async () => {
+            for (let i = 0; i < scripts.length; i++) {
+              const script = scripts[i];
+              try {
+                const result = await executeScript(script, DEFAULT_RECORDING_CONFIG);
+                const narr = generateNarration(script, result);
+                // Save narration files alongside generated code files
+                setGeneratedFiles((prev) => [
+                  ...prev,
+                  { filePath: `${script.targetPage.replace(/^\//, "").replace(/\//g, "-") || "demo"}-narration.srt`, content: narr.srt },
+                  { filePath: `${script.targetPage.replace(/^\//, "").replace(/\//g, "-") || "demo"}-narration.md`, content: narr.markdown },
+                ]);
+              } catch (err) {
+                console.warn(`Demo video recording failed for ${script.title}:`, err);
+              }
+            }
+            demoVideoScriptsRef.current = [];
+            setStepStatuses((prev) =>
+              prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
+            );
+            setPhase("preview");
+          })();
+        } else {
+          setPhase("preview");
+        }
       }
     }
 
@@ -681,6 +786,9 @@ export function HookGenerationPanel({
         await session.sendMessage(
           `Generate a tutorial for ${page.route}.\n\n` + tutPrompt,
         );
+      } else if (opts.generateDemoVideos) {
+        // Only demo videos selected — chain directly to demo script planning
+        chainToDemoScript(page.route, signal);
       }
     }
 
@@ -850,11 +958,14 @@ export function HookGenerationPanel({
           options.generateRegistrations && "regs",
           options.generateSpecs && "spec",
           options.generateTutorials && "tutorial",
+          options.generateDemoVideos && "demo",
         ]
           .filter(Boolean)
           .join("+")})`,
       }));
       setStepStatuses(steps);
+      demoVideoScriptsRef.current = [];
+      lastSpecJsonRef.current = "";
 
       // Close existing session
       if (session.taskRunId) {

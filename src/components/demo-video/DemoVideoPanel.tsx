@@ -5,7 +5,7 @@
  * and launching demo video recording.
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   Video,
   Play,
@@ -16,6 +16,7 @@ import {
   CheckCircle,
   Sparkles,
   RefreshCw,
+  CheckSquare,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useUIComponent } from "ui-bridge";
@@ -83,7 +84,7 @@ function RecordingConfigPanel({
   onChange: (config: DemoRecordingConfig) => void;
 }) {
   return (
-    <div className="grid grid-cols-3 gap-3 text-sm">
+    <div className="grid grid-cols-4 gap-3 text-sm">
       <label className="space-y-1">
         <span className="text-muted-foreground">Resolution</span>
         <select
@@ -124,6 +125,21 @@ function RecordingConfigPanel({
           <option value="high">High</option>
         </select>
       </label>
+
+      <label className="space-y-1">
+        <span className="text-muted-foreground">Codec</span>
+        <select
+          value={config.codec}
+          onChange={(e) =>
+            onChange({ ...config, codec: e.target.value as DemoRecordingConfig["codec"] })
+          }
+          className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+        >
+          <option value="h264">H.264</option>
+          <option value="h265">H.265</option>
+          <option value="vp9">VP9</option>
+        </select>
+      </label>
     </div>
   );
 }
@@ -141,79 +157,121 @@ export function DemoVideoPanel() {
   });
 
   const [specs, setSpecs] = useState<DiscoveredSpecEntry[]>([]);
-  const [selectedSpecId, setSelectedSpecId] = useState<string>("");
+  const [selectedSpecIds, setSelectedSpecIds] = useState<Set<string>>(new Set());
   const [config, setConfig] = useState<DemoRecordingConfig>(DEFAULT_RECORDING_CONFIG);
   const [state, setState] = useState<DemoGenerationState>(INITIAL_GENERATION_STATE);
   const [narration, setNarration] = useState<NarrationOutput | null>(null);
+
+  // Multi-page batch state
+  const [allScripts, setAllScripts] = useState<DemoScript[]>([]);
+  const [allResults, setAllResults] = useState<
+    { script: DemoScript; result: DemoExecutionResult; narration: NarrationOutput }[]
+  >([]);
+  const [batchIndex, setBatchIndex] = useState(0);
+  const scriptsRef = useRef<DemoScript[]>([]);
 
   // Load specs on mount
   useEffect(() => {
     discoverSpecs().then((found) => {
       setSpecs(found);
-      if (found.length > 0) {
-        setSelectedSpecId((prev) => prev || found[0].specId);
-      }
     });
   }, []);
 
-  const selectedSpec = specs.find((s) => s.specId === selectedSpecId)?.config;
+  const toggleSpec = useCallback((specId: string) => {
+    setSelectedSpecIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(specId)) next.delete(specId);
+      else next.add(specId);
+      return next;
+    });
+  }, []);
+
+  const toggleAll = useCallback(() => {
+    setSelectedSpecIds((prev) =>
+      prev.size === specs.length ? new Set() : new Set(specs.map((s) => s.specId)),
+    );
+  }, [specs]);
+
+  const selectedSpecs = specs.filter((s) => selectedSpecIds.has(s.specId));
 
   // -------------------------------------------------------------------------
-  // Plan Script
+  // Plan Scripts (all selected pages)
   // -------------------------------------------------------------------------
   const handlePlanScript = useCallback(async () => {
-    if (!selectedSpec) return;
+    if (selectedSpecs.length === 0) return;
 
     setState((s) => ({ ...s, phase: "planning", error: null, script: null, result: null }));
     setNarration(null);
+    setAllScripts([]);
+    setAllResults([]);
+    setBatchIndex(0);
 
     try {
       const elements = await fetchRegisteredElements();
-      const script = await planDemoScript(selectedSpec, elements);
-      setState((s) => ({ ...s, phase: "previewing", script }));
+      const scripts: DemoScript[] = [];
+
+      for (const entry of selectedSpecs) {
+        const script = await planDemoScript(entry.config, elements);
+        scripts.push(script);
+      }
+
+      scriptsRef.current = scripts;
+      setAllScripts(scripts);
+      // Show the first script in the preview
+      setState((s) => ({ ...s, phase: "previewing", script: scripts[0] }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setState((s) => ({ ...s, phase: "error", error: msg }));
     }
-  }, [selectedSpec]);
+  }, [selectedSpecs]);
 
   // -------------------------------------------------------------------------
-  // Record
+  // Record (batch — all planned scripts sequentially)
   // -------------------------------------------------------------------------
   const handleRecord = useCallback(async () => {
-    if (!state.script) return;
+    const scripts = scriptsRef.current;
+    if (scripts.length === 0) return;
 
     setState((s) => ({ ...s, phase: "recording", currentStepIndex: 0 }));
+    setAllResults([]);
+
+    const results: typeof allResults = [];
 
     try {
-      const result = await executeScript(state.script, config, {
-        onStepStart: (index) => {
-          setState((s) => ({ ...s, currentStepIndex: index }));
-        },
-        onStepComplete: (index) => {
-          setState((s) => ({ ...s, currentStepIndex: index }));
-        },
-        onError: (error, index) => {
-          console.warn(`Demo step ${index} error:`, error);
-        },
-      });
+      for (let si = 0; si < scripts.length; si++) {
+        const script = scripts[si];
+        setBatchIndex(si);
+        setState((s) => ({ ...s, script, currentStepIndex: 0 }));
 
+        const result = await executeScript(script, config, {
+          onStepStart: (index) => {
+            setState((s) => ({ ...s, currentStepIndex: index }));
+          },
+          onStepComplete: (index) => {
+            setState((s) => ({ ...s, currentStepIndex: index }));
+          },
+          onError: (error, index) => {
+            console.warn(`Demo ${script.title} step ${index} error:`, error);
+          },
+        });
+
+        const narrationOutput = generateNarration(script, result);
+        results.push({ script, result, narration: narrationOutput });
+      }
+
+      setAllResults(results);
+      // Show first result
       setState((s) => ({
         ...s,
-        phase: "post-processing",
-        result,
+        phase: "done",
+        result: results[0]?.result ?? null,
       }));
-
-      // Generate narration
-      const narrationOutput = generateNarration(state.script, result);
-      setNarration(narrationOutput);
-
-      setState((s) => ({ ...s, phase: "done" }));
+      setNarration(results[0]?.narration ?? null);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setState((s) => ({ ...s, phase: "error", error: msg }));
     }
-  }, [state.script, config]);
+  }, [config]);
 
   // -------------------------------------------------------------------------
   // Stop Recording
@@ -225,16 +283,14 @@ export function DemoVideoPanel() {
   // -------------------------------------------------------------------------
   // Open in Explorer
   // -------------------------------------------------------------------------
-  const handleOpenFolder = useCallback(async () => {
-    if (!state.result?.videoPath) return;
-    const dir = state.result.videoPath.replace(/[/\\][^/\\]+$/, "");
+  const handleOpenFolder = useCallback(async (videoPath: string) => {
+    const dir = videoPath.replace(/[/\\][^/\\]+$/, "");
     try {
       await invoke("open_path", { path: dir });
     } catch {
-      // Fallback: try shell open
       await invoke("plugin:shell|open", { path: dir }).catch(() => {});
     }
-  }, [state.result?.videoPath]);
+  }, []);
 
   // -------------------------------------------------------------------------
   // Reset
@@ -242,6 +298,10 @@ export function DemoVideoPanel() {
   const handleReset = useCallback(() => {
     setState(INITIAL_GENERATION_STATE);
     setNarration(null);
+    setAllScripts([]);
+    setAllResults([]);
+    setBatchIndex(0);
+    scriptsRef.current = [];
   }, []);
 
   // =========================================================================
@@ -265,23 +325,56 @@ export function DemoVideoPanel() {
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-6">
-        {/* Page Selector */}
+        {/* Page Selector — multi-select */}
         <div className="space-y-2">
-          <label className="text-sm font-medium">Select Page</label>
-          <select
-            value={selectedSpecId}
-            onChange={(e) => setSelectedSpecId(e.target.value)}
-            disabled={state.phase === "recording"}
-            className="w-full rounded border border-border bg-background px-3 py-2 text-sm"
-          >
-            {specs.length === 0 && <option value="">No specs found</option>}
-            {specs.map((s) => (
-              <option key={s.specId} value={s.specId}>
-                {s.config.metadata?.component || s.specId}
-                {s.config.description ? ` — ${s.config.description.slice(0, 60)}` : ""}
-              </option>
-            ))}
-          </select>
+          <div className="flex items-center justify-between">
+            <label className="text-sm font-medium">Select Pages</label>
+            <button
+              onClick={toggleAll}
+              disabled={state.phase === "recording" || specs.length === 0}
+              className="text-xs text-muted-foreground hover:text-foreground"
+            >
+              {selectedSpecIds.size === specs.length ? "Deselect all" : "Select all"}
+            </button>
+          </div>
+          {specs.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No specs found</p>
+          ) : (
+            <div className="max-h-48 overflow-y-auto border border-border rounded-md divide-y divide-border">
+              {specs.map((s) => {
+                const selected = selectedSpecIds.has(s.specId);
+                return (
+                  <button
+                    key={s.specId}
+                    onClick={() => toggleSpec(s.specId)}
+                    disabled={state.phase === "recording"}
+                    className={`w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-accent/50 ${
+                      selected ? "bg-accent/30" : ""
+                    }`}
+                  >
+                    {selected ? (
+                      <CheckSquare className="h-4 w-4 text-primary shrink-0" />
+                    ) : (
+                      <Square className="h-4 w-4 text-muted-foreground shrink-0" />
+                    )}
+                    <span className="truncate">
+                      {s.config.metadata?.component || s.specId}
+                    </span>
+                    {s.config.description && (
+                      <span className="text-xs text-muted-foreground truncate ml-1">
+                        — {s.config.description.slice(0, 50)}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {selectedSpecIds.size > 0 && (
+            <p className="text-xs text-muted-foreground">
+              {selectedSpecIds.size} page{selectedSpecIds.size !== 1 ? "s" : ""} selected
+            </p>
+          )}
         </div>
 
         {/* Recording Config */}
@@ -295,11 +388,11 @@ export function DemoVideoPanel() {
           {(state.phase === "idle" || state.phase === "error") && (
             <button
               onClick={handlePlanScript}
-              disabled={!selectedSpec}
+              disabled={selectedSpecs.length === 0}
               className="flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
             >
               <Sparkles className="h-4 w-4" />
-              Generate Script
+              Generate Script{selectedSpecs.length > 1 ? "s" : ""}
             </button>
           )}
 
@@ -309,7 +402,7 @@ export function DemoVideoPanel() {
               className="flex items-center gap-2 px-4 py-2 rounded-md bg-green-600 text-white text-sm font-medium hover:bg-green-700"
             >
               <Play className="h-4 w-4" />
-              Start Recording
+              Record {allScripts.length} Video{allScripts.length !== 1 ? "s" : ""}
             </button>
           )}
 
@@ -338,15 +431,15 @@ export function DemoVideoPanel() {
         {state.phase === "planning" && (
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
-            Planning demo script with AI...
+            Planning demo script{selectedSpecs.length > 1 ? "s" : ""} with AI...
           </div>
         )}
 
         {state.phase === "recording" && (
           <div className="flex items-center gap-2 text-sm text-green-400">
             <div className="h-2 w-2 rounded-full bg-red-500 animate-pulse" />
-            Recording — Step {state.currentStepIndex + 1} of{" "}
-            {state.script?.steps.length ?? 0}
+            Recording{allScripts.length > 1 ? ` (video ${batchIndex + 1}/${allScripts.length})` : ""}{" "}
+            — Step {state.currentStepIndex + 1} of {state.script?.steps.length ?? 0}
           </div>
         )}
 
@@ -364,69 +457,83 @@ export function DemoVideoPanel() {
           </div>
         )}
 
-        {/* Script Preview */}
-        {state.script && (state.phase === "previewing" || state.phase === "recording") && (
-          <div className="border border-border rounded-md p-4">
-            <ScriptPreview
-              script={state.script}
-              activeStepIndex={state.phase === "recording" ? state.currentStepIndex : -1}
-            />
+        {/* Script Previews */}
+        {allScripts.length > 0 && (state.phase === "previewing" || state.phase === "recording") && (
+          <div className="space-y-4">
+            {allScripts.map((script, i) => (
+              <div key={script.targetPage} className="border border-border rounded-md p-4">
+                {allScripts.length > 1 && (
+                  <div className="text-xs text-muted-foreground mb-2">
+                    Video {i + 1} of {allScripts.length}
+                  </div>
+                )}
+                <ScriptPreview
+                  script={script}
+                  activeStepIndex={
+                    state.phase === "recording" && batchIndex === i
+                      ? state.currentStepIndex
+                      : -1
+                  }
+                />
+              </div>
+            ))}
           </div>
         )}
 
-        {/* Output Section */}
-        {state.phase === "done" && state.result && (
-          <div className="space-y-4 border border-border rounded-md p-4">
+        {/* Output Section — batch results */}
+        {state.phase === "done" && allResults.length > 0 && (
+          <div className="space-y-4">
             <div className="flex items-center gap-2 text-sm text-green-400">
               <CheckCircle className="h-4 w-4" />
-              Recording complete
+              {allResults.length} video{allResults.length !== 1 ? "s" : ""} recorded
             </div>
 
-            <div className="space-y-2 text-sm">
-              <div className="flex items-center gap-2">
-                <span className="text-muted-foreground">Video:</span>
-                <code className="text-xs bg-muted px-2 py-0.5 rounded">
-                  {state.result.videoPath}
-                </code>
-                <button
-                  onClick={handleOpenFolder}
-                  className="text-xs text-primary hover:underline flex items-center gap-1"
-                >
-                  <FolderOpen className="h-3 w-3" />
-                  Open folder
-                </button>
-              </div>
+            {allResults.map((entry, i) => (
+              <div
+                key={entry.result.videoPath}
+                className="space-y-3 border border-border rounded-md p-4"
+              >
+                <h4 className="text-sm font-medium">{entry.script.title}</h4>
 
-              <div>
-                <span className="text-muted-foreground">Duration:</span>{" "}
-                {Math.round(state.result.totalDurationMs / 1000)}s
-              </div>
-            </div>
-
-            {/* Narration Output */}
-            {narration && (
-              <div className="space-y-3">
-                <h4 className="text-sm font-medium">Narration Script</h4>
+                <div className="space-y-1 text-sm">
+                  <div className="flex items-center gap-2">
+                    <span className="text-muted-foreground">Video:</span>
+                    <code className="text-xs bg-muted px-2 py-0.5 rounded truncate max-w-md">
+                      {entry.result.videoPath}
+                    </code>
+                    <button
+                      onClick={() => handleOpenFolder(entry.result.videoPath)}
+                      className="text-xs text-primary hover:underline flex items-center gap-1 shrink-0"
+                    >
+                      <FolderOpen className="h-3 w-3" />
+                      Open
+                    </button>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Duration:</span>{" "}
+                    {Math.round(entry.result.totalDurationMs / 1000)}s
+                  </div>
+                </div>
 
                 <details className="group">
                   <summary className="text-xs text-muted-foreground cursor-pointer hover:text-foreground">
                     SRT Subtitles
                   </summary>
                   <pre className="mt-2 text-xs bg-muted p-3 rounded-md overflow-x-auto whitespace-pre-wrap max-h-48 overflow-y-auto">
-                    {narration.srt}
+                    {entry.narration.srt}
                   </pre>
                 </details>
 
-                <details className="group" open>
+                <details className="group">
                   <summary className="text-xs text-muted-foreground cursor-pointer hover:text-foreground">
                     Markdown Script
                   </summary>
                   <pre className="mt-2 text-xs bg-muted p-3 rounded-md overflow-x-auto whitespace-pre-wrap max-h-48 overflow-y-auto">
-                    {narration.markdown}
+                    {entry.narration.markdown}
                   </pre>
                 </details>
               </div>
-            )}
+            ))}
           </div>
         )}
       </div>
