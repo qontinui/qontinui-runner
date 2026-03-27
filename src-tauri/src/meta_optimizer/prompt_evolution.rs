@@ -23,7 +23,24 @@ pub struct PromptEvolutionEntry {
     pub canary_verdict: Option<String>,
     pub score_before: Option<f64>,
     pub score_after: Option<f64>,
+    /// SHA256 hash of the baseline prompt at the time of rewrite.
+    /// Detects when the baseline has drifted (e.g., code changes to hardcoded prompts),
+    /// which would invalidate pending canary results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_prompt_hash: Option<String>,
+    /// Number of consecutive rejections for this agent_type at time of creation.
+    /// Used by the diminishing-returns circuit breaker.
+    #[serde(default)]
+    pub consecutive_rejections: i32,
     pub created_at: String,
+}
+
+/// Compute SHA256 hash of a prompt string for baseline drift detection.
+pub fn compute_prompt_hash(prompt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(prompt.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Record a new prompt evolution entry when a meta-prompt rewrite is created.
@@ -37,8 +54,36 @@ pub fn record_evolution(
     changes_summary: Option<&str>,
     score_before: Option<f64>,
 ) -> Result<String, String> {
+    record_evolution_full(
+        db,
+        agent_type,
+        parent_variant_id,
+        variant_id,
+        recommendation_id,
+        critique,
+        changes_summary,
+        score_before,
+        None,
+    )
+}
+
+/// Record a new prompt evolution entry with baseline hash and rejection count.
+pub fn record_evolution_full(
+    db: &CheckpointDb,
+    agent_type: &str,
+    parent_variant_id: Option<&str>,
+    variant_id: &str,
+    recommendation_id: Option<&str>,
+    critique: Option<&str>,
+    changes_summary: Option<&str>,
+    score_before: Option<f64>,
+    baseline_prompt_hash: Option<&str>,
+) -> Result<String, String> {
     let id = format!("pe-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
+
+    // Count consecutive rejections for this agent_type (for circuit breaker)
+    let consecutive_rejections = count_consecutive_rejections(db, agent_type);
 
     let id_clone = id.clone();
     let agent_type = agent_type.to_string();
@@ -47,13 +92,15 @@ pub fn record_evolution(
     let recommendation_id = recommendation_id.map(|s| s.to_string());
     let critique = critique.map(|s| s.to_string());
     let changes_summary = changes_summary.map(|s| s.to_string());
+    let baseline_hash = baseline_prompt_hash.map(|s| s.to_string());
 
     db.with_conn(move |conn| {
         conn.execute(
             r#"INSERT INTO prompt_evolution
                (id, agent_type, parent_variant_id, variant_id, recommendation_id,
-                critique, changes_summary, canary_verdict, score_before, score_after, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, ?9)"#,
+                critique, changes_summary, canary_verdict, score_before, score_after,
+                baseline_prompt_hash, consecutive_rejections, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, ?9, ?10, ?11)"#,
             params![
                 id_clone,
                 agent_type,
@@ -63,14 +110,16 @@ pub fn record_evolution(
                 critique,
                 changes_summary,
                 score_before,
+                baseline_hash,
+                consecutive_rejections,
                 now,
             ],
         )
         .map_err(|e| format!("Failed to record prompt evolution: {}", e))?;
 
         info!(
-            "Recorded prompt evolution {} for agent {} (variant {})",
-            id_clone, agent_type, variant_id
+            "Recorded prompt evolution {} for agent {} (variant {}, consecutive_rejections={})",
+            id_clone, agent_type, variant_id, consecutive_rejections
         );
         Ok(())
     })?;
@@ -196,7 +245,7 @@ pub fn get_evolution_history(
                 (
                     r#"SELECT id, agent_type, parent_variant_id, variant_id, recommendation_id,
                               critique, changes_summary, canary_verdict, score_before, score_after,
-                              created_at
+                              baseline_prompt_hash, COALESCE(consecutive_rejections, 0), created_at
                        FROM prompt_evolution
                        WHERE agent_type = ?1
                        ORDER BY created_at DESC
@@ -208,7 +257,7 @@ pub fn get_evolution_history(
                 (
                     r#"SELECT id, agent_type, parent_variant_id, variant_id, recommendation_id,
                               critique, changes_summary, canary_verdict, score_before, score_after,
-                              created_at
+                              baseline_prompt_hash, COALESCE(consecutive_rejections, 0), created_at
                        FROM prompt_evolution
                        ORDER BY created_at DESC
                        LIMIT ?1"#
@@ -234,7 +283,9 @@ pub fn get_evolution_history(
                     canary_verdict: row.get(7)?,
                     score_before: row.get(8)?,
                     score_after: row.get(9)?,
-                    created_at: row.get(10)?,
+                    baseline_prompt_hash: row.get(10)?,
+                    consecutive_rejections: row.get(11)?,
+                    created_at: row.get(12)?,
                 })
             })
             .map_err(|e| format!("Failed to query evolution history: {}", e))?
@@ -274,7 +325,7 @@ pub fn get_latest_rejected(
         let result = conn.query_row(
             r#"SELECT id, agent_type, parent_variant_id, variant_id, recommendation_id,
                       critique, changes_summary, canary_verdict, score_before, score_after,
-                      created_at
+                      baseline_prompt_hash, COALESCE(consecutive_rejections, 0), created_at
                FROM prompt_evolution
                WHERE agent_type = ?1 AND canary_verdict = 'reject'
                ORDER BY created_at DESC
@@ -292,7 +343,9 @@ pub fn get_latest_rejected(
                     canary_verdict: row.get(7)?,
                     score_before: row.get(8)?,
                     score_after: row.get(9)?,
-                    created_at: row.get(10)?,
+                    baseline_prompt_hash: row.get(10)?,
+                    consecutive_rejections: row.get(11)?,
+                    created_at: row.get(12)?,
                 })
             },
         );
@@ -320,6 +373,124 @@ pub fn is_in_cooldown(db: &CheckpointDb, agent_type: &str, cooldown_hours: i64) 
             )
             .unwrap_or(0);
         Ok(count > 0)
+    })
+    .unwrap_or(false)
+}
+
+/// Count consecutive recent rejections for an agent_type.
+///
+/// Looks at the most recent evolution entries and counts how many consecutive
+/// "reject" verdicts appear (stopping at the first non-reject). Used by the
+/// diminishing-returns circuit breaker.
+pub fn count_consecutive_rejections(db: &CheckpointDb, agent_type: &str) -> i32 {
+    let agent_type = agent_type.to_string();
+    db.with_conn(move |conn| {
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT canary_verdict FROM prompt_evolution
+                   WHERE agent_type = ?1 AND canary_verdict IS NOT NULL
+                   ORDER BY created_at DESC
+                   LIMIT 10"#,
+            )
+            .map_err(|e| format!("Failed to count rejections: {}", e))?;
+
+        let verdicts: Vec<String> = stmt
+            .query_map(params![agent_type], |row| row.get(0))
+            .map_err(|e| format!("Failed to query verdicts: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut count = 0i32;
+        for v in &verdicts {
+            if v == "reject" {
+                count += 1;
+            } else {
+                break; // Stop at first non-reject
+            }
+        }
+        Ok(count)
+    })
+    .unwrap_or(0)
+}
+
+/// Compute the adaptive cooldown hours based on consecutive rejections.
+///
+/// Implements exponential backoff: 24h → 72h → 168h (1 week) → 336h (2 weeks).
+/// After 4+ consecutive rejections, the optimizer should largely leave this
+/// agent's prompt alone — it's likely near-optimal or has structural issues
+/// that prompt rewriting can't fix.
+pub fn adaptive_cooldown_hours(consecutive_rejections: i32) -> i64 {
+    match consecutive_rejections {
+        0 => 24,      // No rejections: standard 24h cooldown
+        1 => 72,      // 1 rejection: 3 days
+        2 => 168,     // 2 rejections: 1 week
+        3 => 336,     // 3 rejections: 2 weeks
+        _ => 672,     // 4+ rejections: 4 weeks
+    }
+}
+
+/// Get all rejected prompt variant contents for an agent_type.
+///
+/// Returns (variant_id, prompt_content) pairs for similarity comparison.
+/// Only fetches variants that were part of rejected evolution entries.
+pub fn get_rejected_prompt_contents(
+    db: &CheckpointDb,
+    agent_type: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let agent_type = agent_type.to_string();
+    db.with_conn(move |conn| {
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT pe.variant_id, pr.prompt_content
+                   FROM prompt_evolution pe
+                   INNER JOIN prompt_registry pr ON pr.id = pe.variant_id
+                   WHERE pe.agent_type = ?1 AND pe.canary_verdict = 'reject'
+                   ORDER BY pe.created_at DESC
+                   LIMIT 10"#,
+            )
+            .map_err(|e| format!("Failed to query rejected prompts: {}", e))?;
+
+        let results: Vec<(String, String)> = stmt
+            .query_map(params![agent_type], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Failed to fetch rejected prompts: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    })
+}
+
+/// Check if the baseline prompt has drifted since a canary was started.
+///
+/// Compares the stored `baseline_prompt_hash` against the current prompt hash.
+/// Returns true if the baseline has changed, indicating the canary results may
+/// be invalid (the prompt being compared against is different from when the
+/// canary started).
+pub fn has_baseline_drifted(
+    db: &CheckpointDb,
+    agent_type: &str,
+    current_prompt_hash: &str,
+) -> bool {
+    let agent_type = agent_type.to_string();
+    let current_hash = current_prompt_hash.to_string();
+
+    db.with_conn(move |conn| {
+        let stored_hash: Option<String> = conn
+            .query_row(
+                r#"SELECT baseline_prompt_hash FROM prompt_evolution
+                   WHERE agent_type = ?1 AND canary_verdict IS NULL
+                   ORDER BY created_at DESC LIMIT 1"#,
+                params![agent_type],
+                |row| row.get(0),
+            )
+            .ok();
+
+        match stored_hash {
+            Some(h) if !h.is_empty() => Ok(h != current_hash),
+            _ => Ok(false), // No stored hash or NULL — can't detect drift
+        }
     })
     .unwrap_or(false)
 }

@@ -5,7 +5,7 @@
 
 pub mod activity_timeline;
 pub mod agentic_metrics;
-// pub mod graph_ops;  // Requires Clorinde regeneration with graph_ops row types
+pub mod graph_ops;
 pub mod approval_gates;
 pub mod error_monitor;
 pub mod canary;
@@ -256,6 +256,8 @@ impl PgDb {
                 canary_verdict          TEXT,
                 score_before            DOUBLE PRECISION,
                 score_after             DOUBLE PRECISION,
+                baseline_prompt_hash    TEXT,
+                consecutive_rejections  INTEGER DEFAULT 0,
                 created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
             "CREATE INDEX IF NOT EXISTS idx_pe_agent ON prompt_evolution(agent_type)",

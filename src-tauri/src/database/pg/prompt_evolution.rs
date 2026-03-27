@@ -121,7 +121,7 @@ impl PgDb {
             conn.query(
                 r#"SELECT id, agent_type, parent_variant_id, variant_id, recommendation_id,
                           critique, changes_summary, canary_verdict, score_before, score_after,
-                          created_at::text
+                          baseline_prompt_hash, COALESCE(consecutive_rejections, 0), created_at::text
                    FROM prompt_evolution
                    WHERE agent_type = $1
                    ORDER BY created_at DESC
@@ -133,7 +133,7 @@ impl PgDb {
             conn.query(
                 r#"SELECT id, agent_type, parent_variant_id, variant_id, recommendation_id,
                           critique, changes_summary, canary_verdict, score_before, score_after,
-                          created_at::text
+                          baseline_prompt_hash, COALESCE(consecutive_rejections, 0), created_at::text
                    FROM prompt_evolution
                    ORDER BY created_at DESC
                    LIMIT $1"#,
@@ -156,7 +156,9 @@ impl PgDb {
                 canary_verdict: r.get(7),
                 score_before: r.get(8),
                 score_after: r.get(9),
-                created_at: r.get(10),
+                baseline_prompt_hash: r.get(10),
+                consecutive_rejections: r.get::<_, Option<i32>>(11).unwrap_or(0),
+                created_at: r.get(12),
             })
             .collect())
     }

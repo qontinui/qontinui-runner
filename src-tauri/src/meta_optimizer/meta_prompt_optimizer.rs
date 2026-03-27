@@ -228,16 +228,38 @@ If prerequisites are NOT met, explain why and output ZERO [META_PROMPT_REWRITE] 
 
 ## Learning From Past Failures
 
-**CRITICAL:** Check `{{prompt_evolution_history}}` for entries with `canary_verdict: "reject"`.
-If a previous rewrite attempt for the same agent was rejected, you MUST:
+**CRITICAL:** The system will programmatically BLOCK any rewrite that is >90% similar to a
+previously rejected prompt. You MUST produce a substantially different approach.
 
-1. Read the rejected entry's `critique` and `changes_summary` to understand what was tried
-2. Analyze why it failed (the `score_after` vs `score_before` comparison)
-3. Take a DIFFERENT approach — do not repeat the same changes
-4. Explicitly state in your output: "Previous attempt for {agent} tried X, which was rejected. This rewrite takes a different approach: Y."
+Check `{{prompt_evolution_history}}` for entries with `canary_verdict: "reject"`.
+For each rejected attempt, the `consecutive_rejections` counter tells you how many
+times in a row rewrites have been rejected for that agent.
 
-If there are multiple rejected attempts for the same agent, this means the obvious fixes don't work.
-Consider more fundamental structural changes or accept that the prompt may already be near-optimal.
+### REJECTED APPROACHES — DO NOT REPEAT
+
+If `{{prompt_evolution_history}}` contains rejected entries for your target agent,
+they will appear below. Study each one carefully:
+
+**For each rejected entry, note:**
+- `changes_summary`: What approach was tried
+- `score_before` → `score_after`: How the score changed (decrease = regression)
+- `critique`: The original diagnosis that led to this failed rewrite
+
+**You MUST:**
+1. Explicitly name each prior rejected approach in your output
+2. Explain why your new approach is fundamentally different
+3. If `consecutive_rejections` >= 3, the obvious fixes have all failed.
+   Consider: (a) the prompt may already be near-optimal — output ZERO markers,
+   or (b) the problem is structural (wrong agent responsibilities, missing context)
+   rather than instructional (prompt wording).
+4. Format in your output: "Previous attempts: [list]. This rewrite differs by: [explanation]."
+
+### CIRCUIT BREAKER
+
+If `consecutive_rejections` for an agent reaches 4+, the system has exponentially
+increased cooldowns. The prompt is likely near-optimal or has issues that prompt
+rewriting cannot fix. Seriously consider outputting ZERO [META_PROMPT_REWRITE] markers
+and instead documenting what structural changes might help.
 
 ## Your Task
 

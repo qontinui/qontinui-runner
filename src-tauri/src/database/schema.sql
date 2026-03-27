@@ -3793,6 +3793,8 @@ CREATE TABLE IF NOT EXISTS prompt_evolution (
     canary_verdict TEXT,                  -- 'adopt', 'reject', 'inconclusive', or NULL (pending)
     score_before REAL,                    -- mean score before rewrite
     score_after REAL,                     -- mean score after canary
+    baseline_prompt_hash TEXT,            -- SHA256 of baseline prompt at rewrite time (drift detection)
+    consecutive_rejections INTEGER DEFAULT 0,  -- consecutive rejections at creation (circuit breaker)
     created_at TEXT NOT NULL
 );
 

@@ -832,6 +832,32 @@ pub fn save_parsed_recommendations(
                     continue;
                 }
 
+                // Semantic similarity guard: reject near-duplicate rewrites
+                let rejected_prompts = super::prompt_evolution::get_rejected_prompt_contents(
+                    db,
+                    &rec.target_agent,
+                )
+                .unwrap_or_default();
+
+                let mut too_similar = false;
+                for (rejected_variant_id, rejected_content) in &rejected_prompts {
+                    let similarity = crate::reflection::fuzzy_matching::trigram_similarity(
+                        &rec.rewritten_prompt,
+                        rejected_content,
+                    );
+                    if similarity > 0.90 {
+                        warn!(
+                            "Meta-prompt rewrite for {} is too similar to previously rejected variant {} (similarity={:.2}). Skipping.",
+                            rec.target_agent, rejected_variant_id, similarity
+                        );
+                        too_similar = true;
+                        break;
+                    }
+                }
+                if too_similar {
+                    continue;
+                }
+
                 // Robustness validation gate: reject prompts that fail basic checks
                 let robustness_warnings =
                     crate::workflow_generation::hardener::validate_prompt_robustness(
@@ -902,8 +928,16 @@ pub fn save_parsed_recommendations(
                     .find(|g| g.agent_type == rec.target_agent)
                     .map(|g| g.mean_score);
 
-                // Record evolution entry
-                let _ = super::prompt_evolution::record_evolution(
+                // Compute baseline prompt hash for drift detection
+                let baseline_prompt = super::prompt_extractor::get_default_agent_prompt(&rec.target_agent);
+                let baseline_hash = if baseline_prompt.is_empty() {
+                    None
+                } else {
+                    Some(super::prompt_evolution::compute_prompt_hash(&baseline_prompt))
+                };
+
+                // Record evolution entry with baseline hash
+                let _ = super::prompt_evolution::record_evolution_full(
                     db,
                     &rec.target_agent,
                     parent_id.as_deref(),
@@ -912,6 +946,7 @@ pub fn save_parsed_recommendations(
                     Some(&rec.critique),
                     Some(&rec.changes_summary),
                     score_before,
+                    baseline_hash.as_deref(),
                 );
 
                 // Auto-start canary for the new variant

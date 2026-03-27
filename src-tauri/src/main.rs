@@ -1260,6 +1260,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             autoresearch::commands::get_q_routing_overrides,
             autoresearch::commands::set_q_routing_override,
             autoresearch::commands::remove_q_routing_override,
+            autoresearch::commands::reset_q_routing_table,
             // Orchestration loop saved config CRUD
             commands::orchestration_loop_configs::ol_list_configs,
             commands::orchestration_loop_configs::ol_get_config,
@@ -1353,6 +1354,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::meta_optimizer::get_prompt_group_metrics,
             commands::meta_optimizer::get_prompt_optimization_evidence,
             commands::meta_optimizer::get_prompt_evolution_history,
+            commands::meta_optimizer::get_prompt_variant_content,
+            commands::meta_optimizer::get_prompt_evolution_diff,
             // Comparison commands
             commands::comparison::start_comparison,
             commands::comparison::get_comparison_status,

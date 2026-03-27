@@ -1269,6 +1269,8 @@ CREATE TABLE IF NOT EXISTS prompt_evolution (
     canary_verdict TEXT,
     score_before DOUBLE PRECISION,
     score_after DOUBLE PRECISION,
+    baseline_prompt_hash TEXT,
+    consecutive_rejections INTEGER DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_pe_agent ON prompt_evolution(agent_type);

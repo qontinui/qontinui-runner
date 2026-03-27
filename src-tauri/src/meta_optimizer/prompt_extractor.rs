@@ -143,7 +143,8 @@ fn compute_group_metrics_inner(
             let sum_iterations: f64 = group_samples.iter().map(|s| s.iteration as f64).sum();
             let sum_cost: f64 = group_samples.iter().map(|s| s.cost_usd).sum();
 
-            // Try to get the active prompt variant text from the registry
+            // Try to get the active prompt variant text from the registry,
+            // falling back to the hardcoded default for the agent type.
             let latest_prompt = db
                 .and_then(|db| {
                     super::prompt_registry::get_active_prompt(db, &agent_type)
@@ -151,7 +152,7 @@ fn compute_group_metrics_inner(
                         .flatten()
                         .map(|v| v.prompt_content)
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|| get_default_agent_prompt(&agent_type));
 
             PromptGroupMetrics {
                 phase,
@@ -203,6 +204,62 @@ pub fn select_optimization_target(
         .find(|g| g.sample_count >= min_samples && g.failure_rate >= min_failure_rate);
 
     Ok(target)
+}
+
+/// Get the default/hardcoded prompt for a known agent type.
+///
+/// When no prompt variant is active in the registry, this returns the
+/// built-in prompt that the pipeline uses by default. This ensures the
+/// meta-prompt optimizer can see and critique the actual prompt being used,
+/// even before any variants have been created.
+pub fn get_default_agent_prompt(agent_type: &str) -> String {
+    match agent_type {
+        "locator" => {
+            // The locator prompt is a template with placeholders — return the
+            // structural template so the optimizer can see the instructions.
+            r#"You are a code locator agent. Given acceptance criteria and a project directory structure, identify which files are most relevant to each criterion.
+
+## Acceptance Criteria
+{criteria_text}
+
+## Project Directory Structure (L0 — directories only)
+{file_tree}
+
+## Instructions
+1. Review the directory structure above and identify 2-4 directories most relevant to each criterion.
+2. Use tool use to list files within those directories.
+3. For each criterion, identify 1-5 files that are most likely to need changes or inspection.
+4. Rate your confidence from 0.0 to 1.0 in each mapping.
+
+Output JSON array with: criterion_id, spec_assertion_id, description, target_files, related_files, confidence."#.to_string()
+        }
+        "verifier" | "verification" => {
+            crate::autoresearch::agentic_verification::AgenticVerificationPrompts::verifier_system_prompt(
+                "{goal}",
+                None,
+            )
+        }
+        "implementer" => {
+            r#"Multi-Agent Pipeline: Implement the acceptance criteria for the specified subtree.
+
+You are an implementer agent in a multi-agent pipeline. Your job is to make code changes that satisfy the acceptance criteria provided by the spec analyst, targeting the files identified by the locator agent.
+
+## Instructions
+1. Read the target files identified by the locator
+2. Understand the acceptance criteria requirements
+3. Make the minimum code changes needed to satisfy each criterion
+4. Verify your changes compile and don't break existing functionality
+5. Report what you changed and why
+
+Focus on correctness over cleverness. Make the smallest change that satisfies the criteria."#.to_string()
+        }
+        "agentic_fixer" => {
+            r#"You are a code fixer agent. Your job is to fix verification failures identified in the previous iteration.
+
+Review the failure output carefully, identify the root cause, and make targeted fixes. Do not make unrelated changes."#.to_string()
+        }
+        _ => String::new(),
+    }
 }
 
 /// Collect failure and success samples for a specific prompt group.

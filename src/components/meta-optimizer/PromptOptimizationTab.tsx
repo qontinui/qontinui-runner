@@ -5,8 +5,9 @@
  * evolution history timeline, and manual trigger button.
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import * as Diff from "diff";
 
 interface PromptGroupMetrics {
   phase: string;
@@ -30,7 +31,17 @@ interface PromptEvolutionEntry {
   canary_verdict: string | null;
   score_before: number | null;
   score_after: number | null;
+  baseline_prompt_hash: string | null;
+  consecutive_rejections: number;
   created_at: string;
+}
+
+interface PromptDiffData {
+  old_content: string;
+  new_content: string;
+  agent_type: string;
+  critique: string | null;
+  changes_summary: string | null;
 }
 
 interface OptimizationStatus {
@@ -45,6 +56,8 @@ export function PromptOptimizationTab() {
   const [triggering, setTriggering] = useState(false);
   const [expandedGroup, setExpandedGroup] = useState<string | null>(null);
   const [expandedEvolution, setExpandedEvolution] = useState<string | null>(null);
+  const [diffData, setDiffData] = useState<PromptDiffData | null>(null);
+  const [diffLoading, setDiffLoading] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -63,6 +76,21 @@ export function PromptOptimizationTab() {
   useEffect(() => {
     load();
   }, [load]);
+
+  const loadDiff = async (evolutionId: string) => {
+    try {
+      setDiffLoading(true);
+      const result = await invoke<PromptDiffData>(
+        "get_prompt_evolution_diff",
+        { evolutionId }
+      );
+      setDiffData(result);
+    } catch (e) {
+      console.error("Failed to load diff:", e);
+    } finally {
+      setDiffLoading(false);
+    }
+  };
 
   const handleTrigger = async () => {
     try {
@@ -291,12 +319,30 @@ export function PromptOptimizationTab() {
                           </pre>
                         </div>
                       )}
-                      <div className="text-zinc-600">
-                        Variant: {e.variant_id}
-                        {e.parent_variant_id &&
-                          ` (parent: ${e.parent_variant_id})`}
-                        {e.recommendation_id &&
-                          ` | Rec: ${e.recommendation_id}`}
+                      <div className="flex items-center justify-between">
+                        <div className="text-zinc-600">
+                          Variant: {e.variant_id}
+                          {e.parent_variant_id &&
+                            ` (parent: ${e.parent_variant_id})`}
+                          {e.recommendation_id &&
+                            ` | Rec: ${e.recommendation_id}`}
+                          {e.consecutive_rejections > 0 && (
+                            <span className="ml-2 text-orange-400">
+                              ({e.consecutive_rejections} prior rejection
+                              {e.consecutive_rejections > 1 ? "s" : ""})
+                            </span>
+                          )}
+                        </div>
+                        <button
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            loadDiff(e.id);
+                          }}
+                          disabled={diffLoading}
+                          className="px-2 py-1 text-xs bg-zinc-700 text-zinc-300 rounded hover:bg-zinc-600 disabled:opacity-50"
+                        >
+                          {diffLoading ? "Loading..." : "View Diff"}
+                        </button>
                       </div>
                     </div>
                   )}
@@ -305,6 +351,132 @@ export function PromptOptimizationTab() {
             })}
           </div>
         )}
+      </div>
+
+      {/* Diff overlay */}
+      {diffData && (
+        <PromptDiffView
+          data={diffData}
+          onClose={() => setDiffData(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function PromptDiffView({
+  data,
+  onClose,
+}: {
+  data: PromptDiffData;
+  onClose: () => void;
+}) {
+  const diffResult = useMemo(
+    () => Diff.diffLines(data.old_content, data.new_content),
+    [data.old_content, data.new_content]
+  );
+
+  const stats = useMemo(() => {
+    let additions = 0;
+    let deletions = 0;
+    diffResult.forEach((part) => {
+      const lines = part.value.split("\n").filter((l) => l.length > 0).length;
+      if (part.added) additions += lines;
+      else if (part.removed) deletions += lines;
+    });
+    return { additions, deletions };
+  }, [diffResult]);
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4">
+      <div className="bg-zinc-900 rounded-lg border border-zinc-700 w-full max-w-4xl max-h-[80vh] flex flex-col">
+        {/* Header */}
+        <div className="flex items-center justify-between p-4 border-b border-zinc-800">
+          <div>
+            <h3 className="text-sm font-semibold text-zinc-100">
+              Prompt Diff: {data.agent_type}
+            </h3>
+            <div className="text-xs text-zinc-400 mt-1">
+              <span className="text-green-400">+{stats.additions}</span>
+              {" / "}
+              <span className="text-red-400">-{stats.deletions}</span>
+              {" lines"}
+              {data.changes_summary && (
+                <span className="ml-2 text-zinc-500">
+                  &mdash; {data.changes_summary}
+                </span>
+              )}
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-zinc-400 hover:text-zinc-200"
+          >
+            &times;
+          </button>
+        </div>
+
+        {/* Diff content */}
+        <div className="flex-1 overflow-auto p-4">
+          <pre className="text-xs font-mono leading-5">
+            {diffResult.map((part, i) => {
+              if (part.added) {
+                return (
+                  <span
+                    key={i}
+                    className="bg-green-900/30 text-green-300 block"
+                  >
+                    {part.value
+                      .split("\n")
+                      .filter((l) => l.length > 0)
+                      .map((line, j) => (
+                        <div key={j}>+ {line}</div>
+                      ))}
+                  </span>
+                );
+              }
+              if (part.removed) {
+                return (
+                  <span
+                    key={i}
+                    className="bg-red-900/30 text-red-300 block"
+                  >
+                    {part.value
+                      .split("\n")
+                      .filter((l) => l.length > 0)
+                      .map((line, j) => (
+                        <div key={j}>- {line}</div>
+                      ))}
+                  </span>
+                );
+              }
+              // Unchanged — show context (first/last 3 lines of each block)
+              const lines = part.value.split("\n").filter((l) => l.length > 0);
+              if (lines.length <= 6) {
+                return (
+                  <span key={i} className="text-zinc-500 block">
+                    {lines.map((line, j) => (
+                      <div key={j}>  {line}</div>
+                    ))}
+                  </span>
+                );
+              }
+              return (
+                <span key={i} className="text-zinc-500 block">
+                  {lines.slice(0, 3).map((line, j) => (
+                    <div key={j}>  {line}</div>
+                  ))}
+                  <div className="text-zinc-600 italic">
+                    ... {lines.length - 6} unchanged lines ...
+                  </div>
+                  {lines.slice(-3).map((line, j) => (
+                    <div key={`end-${j}`}>  {line}</div>
+                  ))}
+                </span>
+              );
+            })}
+          </pre>
+        </div>
       </div>
     </div>
   );

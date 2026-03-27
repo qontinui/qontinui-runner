@@ -6148,6 +6148,24 @@ impl CheckpointDb {
             info!("Successfully migrated to version 163 (prompt_evolution)");
         }
 
+        // Migration 164: Add baseline_prompt_hash and consecutive_rejections
+        // to prompt_evolution for drift detection and circuit breaker.
+        if current_version < 164 {
+            info!("Migrating to version 164 (prompt_evolution drift detection columns)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE prompt_evolution ADD COLUMN baseline_prompt_hash TEXT;
+                ALTER TABLE prompt_evolution ADD COLUMN consecutive_rejections INTEGER DEFAULT 0;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (164, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Migration 164 failed: {}", e))?;
+
+            info!("Successfully migrated to version 164 (drift detection)");
+        }
+
         Ok(())
     }
 }

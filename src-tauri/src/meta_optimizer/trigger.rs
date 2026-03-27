@@ -176,18 +176,35 @@ fn should_launch_meta_prompt_optimizer(db: &CheckpointDb) -> bool {
         return false;
     }
 
-    // Check 24-hour cooldown
-    if super::prompt_evolution::is_in_cooldown(db, &target.agent_type, 24) {
+    // Adaptive cooldown based on consecutive rejections (circuit breaker)
+    let consecutive = super::prompt_evolution::count_consecutive_rejections(db, &target.agent_type);
+    let cooldown_hours = super::prompt_evolution::adaptive_cooldown_hours(consecutive);
+    if super::prompt_evolution::is_in_cooldown(db, &target.agent_type, cooldown_hours) {
         debug!(
-            "MetaPrompt guard: {} is in 24h cooldown",
-            target.agent_type
+            "MetaPrompt guard: {} is in {}h cooldown (consecutive_rejections={})",
+            target.agent_type, cooldown_hours, consecutive
         );
         return false;
     }
 
+    // Check for baseline drift (hardcoded prompt changed since canary started)
+    let current_prompt = super::prompt_extractor::get_default_agent_prompt(&target.agent_type);
+    if !current_prompt.is_empty() {
+        let current_hash = super::prompt_evolution::compute_prompt_hash(&current_prompt);
+        if super::prompt_evolution::has_baseline_drifted(db, &target.agent_type, &current_hash) {
+            warn!(
+                "MetaPrompt guard: baseline prompt for {} has drifted — existing canary results may be invalid",
+                target.agent_type
+            );
+            // Don't block — just warn. The canary will naturally conclude and the next
+            // round will work against the new baseline.
+        }
+    }
+
     info!(
-        "MetaPrompt guard passed: target={}/{} failure_rate={:.1}% samples={}",
-        target.phase, target.agent_type, target.failure_rate * 100.0, target.sample_count
+        "MetaPrompt guard passed: target={}/{} failure_rate={:.1}% samples={} consecutive_rejections={} cooldown={}h",
+        target.phase, target.agent_type, target.failure_rate * 100.0, target.sample_count,
+        consecutive, cooldown_hours
     );
     true
 }
