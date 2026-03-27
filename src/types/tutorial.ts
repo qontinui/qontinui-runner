@@ -287,7 +287,13 @@ export type TutorialFocusPage =
   | "library"
   | "ai"
   | "settings"
-  | "help";
+  | "help"
+  | "evaluation"
+  | "llm-analytics"
+  | "meta-optimizer"
+  | "knowledge-explorer"
+  | "activity-timeline"
+  | "watchers";
 
 /**
  * Complete tutorial definition

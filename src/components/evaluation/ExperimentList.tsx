@@ -74,6 +74,7 @@ export function ExperimentList({
           size="sm"
           variant={showCreate ? "ghost" : "outline"}
           onClick={() => setShowCreate(!showCreate)}
+          data-tutorial-id="evaluation-create-experiment"
         >
           <Plus className="w-3.5 h-3.5" />
           {showCreate ? "Cancel" : "New Experiment"}

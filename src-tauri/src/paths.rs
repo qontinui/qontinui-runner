@@ -201,9 +201,19 @@ pub fn resolve_working_directory(wd: &str) -> PathBuf {
         .as_ref()
         .map(|root| root.join("qontinui-runner"));
 
-    // Try runner_dir first — working directories like ".." are typically relative
-    // to the runner project, not the workspace root. E.g. ".." from runner_dir
-    // goes to workspace_root, whereas ".." from workspace_root escapes the workspace.
+    // For the default "." path, prefer workspace root so that cross-repo steps
+    // (e.g., `test -d ui-bridge/packages/ui-bridge`) resolve correctly.
+    // Only fall back to runner_dir for "." if workspace root is unavailable.
+    if wd == "." {
+        if let Some(ref root) = workspace_root {
+            if root.exists() {
+                return normalize_path_separators(root.clone());
+            }
+        }
+    }
+
+    // Try runner_dir for relative paths like ".." or subdirectories.
+    // E.g. ".." from runner_dir goes to workspace_root.
     if let Some(ref runner) = runner_dir {
         if runner.exists() {
             let resolved = runner.join(&path);

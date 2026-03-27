@@ -60,7 +60,7 @@ impl ResearchEngine {
         &mut self,
         config: ResearchConfig,
         db: Arc<crate::database::CheckpointDb>,
-        pg_db: Option<std::sync::Arc<crate::database::pg::PgDb>>,
+        pg_db: std::sync::Arc<crate::database::pg::PgDb>,
     ) -> Result<String, String> {
         // Check if already running
         {
@@ -244,21 +244,17 @@ async fn run_campaign_loop(
     state: Arc<Mutex<ResearchState>>,
     stop_rx: watch::Receiver<bool>,
     db: Arc<crate::database::CheckpointDb>,
-    pg_db: Option<std::sync::Arc<crate::database::pg::PgDb>>,
+    pg_db: std::sync::Arc<crate::database::pg::PgDb>,
 ) {
     let runner = RunnerClient::new(config.target_runner_port);
 
     // Load Q-table from PG-first if available, fallback to SQLite
-    let pg_q_rows = if let Some(ref pg) = pg_db {
-        match pg.get_all_q_entries().await {
-            Ok(rows) if !rows.is_empty() => {
-                info!("Loaded {} Q-table entries from PG", rows.len());
-                Some(rows)
-            }
-            _ => None,
+    let pg_q_rows = match pg_db.get_all_q_entries().await {
+        Ok(rows) if !rows.is_empty() => {
+            info!("Loaded {} Q-table entries from PG", rows.len());
+            Some(rows)
         }
-    } else {
-        None
+        _ => None,
     };
 
     let mut mutator = Mutator::from_strategy(&config.mutation_strategy, &config.ai_guidance, &db, pg_q_rows);
@@ -306,11 +302,7 @@ async fn run_campaign_loop(
                 {
                     config.mutation_strategy = new_config.mutation_strategy;
                     // Reload PG Q-data on strategy change
-                    let reload_pg_rows = if let Some(ref pg) = pg_db {
-                        pg.get_all_q_entries().await.ok().filter(|r| !r.is_empty())
-                    } else {
-                        None
-                    };
+                    let reload_pg_rows = pg_db.get_all_q_entries().await.ok().filter(|r| !r.is_empty());
                     mutator =
                         Mutator::from_strategy(&config.mutation_strategy, &config.ai_guidance, &db, reload_pg_rows);
                     info!("Mutation strategy changed — resetting mutator");

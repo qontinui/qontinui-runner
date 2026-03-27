@@ -11,8 +11,9 @@ import { WorktreeComparisonTab } from "../components/autoresearch/WorktreeCompar
 import { PerAgentTab } from "../components/autoresearch/PerAgentTab";
 import { ComparisonTab } from "../components/autoresearch/ComparisonTab";
 import { ModelProfilesTab } from "../components/autoresearch/ModelProfilesTab";
+import { QRoutingTab } from "../components/autoresearch/QRoutingTab";
 
-type SubTab = "campaign" | "results" | "worktrees" | "comparison" | "per_agent" | "model_profiles";
+type SubTab = "campaign" | "results" | "worktrees" | "comparison" | "model_profiles" | "q_routing" | "per_agent";
 
 const TABS: { id: SubTab; label: string; devOnly?: boolean }[] = [
   { id: "campaign", label: "Campaign" },
@@ -20,6 +21,7 @@ const TABS: { id: SubTab; label: string; devOnly?: boolean }[] = [
   { id: "worktrees", label: "Worktrees" },
   { id: "comparison", label: "Comparison" },
   { id: "model_profiles", label: "Model Profiles" },
+  { id: "q_routing", label: "Q-Routing" },
   { id: "per_agent", label: "Per-Agent", devOnly: true },
 ];
 
@@ -55,6 +57,7 @@ export function AutoresearchPage() {
         {tab === "worktrees" && <WorktreeComparisonTab />}
         {tab === "comparison" && <ComparisonTab />}
         {tab === "model_profiles" && <ModelProfilesTab />}
+        {tab === "q_routing" && <QRoutingTab />}
         {tab === "per_agent" && <PerAgentTab />}
       </div>
     </div>

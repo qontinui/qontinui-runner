@@ -234,7 +234,7 @@ pub fn spawn_workflow_with_panic_guard<F>(
     execution_id: String,
     workflow_name: String,
     url_lock_manager: Option<Arc<crate::executor::UrlLockManager>>,
-    pg_db: Option<Arc<crate::database::pg::PgDb>>,
+    pg_db: Arc<crate::database::pg::PgDb>,
     fut: F,
 ) where
     F: std::future::Future<Output = loop_controller::WorkflowResult> + Send + 'static,
@@ -293,11 +293,7 @@ pub fn spawn_workflow_with_panic_guard<F>(
 
                 // Mark the task as failed so Continue button appears
                 let error_message = format!("Workflow panicked: {}", panic_msg);
-                let fail_err = if let Some(ref pg) = pg_db {
-                    pg.fail_task_run(&execution_id, &error_message).await.err()
-                } else {
-                    checkpoint_db.fail_task_run(&execution_id, &error_message).err()
-                };
+                let fail_err = pg_db.fail_task_run(&execution_id, &error_message).await.err();
                 if let Some(e) = fail_err {
                     error!(
                         "Failed to mark panicked workflow {} as failed: {}",
@@ -329,7 +325,7 @@ pub fn spawn_sequence_with_panic_guard<F>(
     execution_id: String,
     sequence_name: String,
     url_lock_manager: Option<Arc<crate::executor::UrlLockManager>>,
-    pg_db: Option<Arc<crate::database::pg::PgDb>>,
+    pg_db: Arc<crate::database::pg::PgDb>,
     fut: F,
 ) where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -383,11 +379,7 @@ pub fn spawn_sequence_with_panic_guard<F>(
 
                 // Mark the task as failed so Continue button appears
                 let error_message = format!("Workflow sequence panicked: {}", panic_msg);
-                let fail_err = if let Some(ref pg) = pg_db {
-                    pg.fail_task_run(&execution_id, &error_message).await.err()
-                } else {
-                    checkpoint_db.fail_task_run(&execution_id, &error_message).err()
-                };
+                let fail_err = pg_db.fail_task_run(&execution_id, &error_message).await.err();
                 if let Some(e) = fail_err {
                     error!(
                         "Failed to mark panicked sequence {} as failed: {}",

@@ -5465,11 +5465,7 @@ pub async fn ui_bridge_get_workflow_status_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting workflow status for run {}", run_id);
 
-    let task_run_result = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_task_run(&run_id).await
-    } else {
-        state.app_state.checkpoint_db.get_task_run(&run_id)
-    };
+    let task_run_result = state.app_state.pg_db.get_task_run(&run_id).await;
     match task_run_result {
         Ok(Some(task_run)) => {
             let status = match task_run.status.as_str() {

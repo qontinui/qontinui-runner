@@ -1,60 +1,575 @@
 {
   "version": "1.0.0",
-  "description": "Run Traces page — displays an execution trace waterfall/timeline visualization showing parent-child span relationships, operation durations, phase groupings, and performance insights. Uses the TraceViewerWidget to render hierarchical execution spans.",
+  "description": "Run Traces page — a multi-view execution trace analysis tool showing parent-child span relationships, operation durations, phase groupings, and performance insights. Provides three visualization modes: a waterfall timeline, a flamechart showing where time is spent (with gap collapsing), and a cross-run comparison view for regression detection. All views are powered by the execution_spans API (GET /execution-spans?execution_id={id}&order=asc) which returns TraceSpan records with trace_id, span_id, parent_span_id, duration_ms, and phase information. Data is polled every 2 seconds for live updates via React Query. The page is mounted inside RunSelectionProvider, which supplies the selected run ID from the RunSelector dropdown in RunPageLayout.",
   "groups": [
+    {
+      "id": "traces-view-mode-navigation",
+      "name": "View Mode Navigation",
+      "description": "The Traces page offers three visualization modes via tab buttons: Waterfall (default, timeline-positioned spans), Flamechart (gap-collapsed, duration-proportional), and Comparison (cross-run diff). Users switch between modes using the tab bar at the top of the widget. The active tab is visually highlighted. Each mode shares the same underlying span data from useTraceViewerData but presents it differently. The Waterfall and Flamechart views share the SpanDetailPanel sidebar and PerformanceInsights footer; the Comparison view has its own summary bar and inline detail expansion.",
+      "category": "navigation",
+      "assertions": [
+        {
+          "id": "traces-view-tabs-present",
+          "description": "Users see three view mode tabs — Waterfall, Flamechart, and Comparison — allowing them to switch between different trace visualization approaches",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Waterfall"
+            },
+            "label": "Waterfall view tab"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-flamechart-tab",
+          "description": "Users can access the Flamechart view which shows time-proportional span widths with idle gaps collapsed",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Flamechart"
+            },
+            "label": "Flamechart view tab"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-comparison-tab",
+          "description": "Users can access the Comparison view which diffs execution spans between two runs of the same workflow",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Comparison"
+            },
+            "label": "Comparison view tab"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-active-tab-highlighted",
+          "description": "The currently active view tab is visually distinguished from inactive tabs so users know which view they are in",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Waterfall"
+            },
+            "label": "Active tab visual state"
+          },
+          "expected": "The active tab has a highlighted background (bg-zinc-700) while inactive tabs have no background",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
     {
       "id": "traces-waterfall-visualization",
       "name": "Trace Waterfall Visualization",
-      "description": "The core of the Traces page is a waterfall chart that visualizes execution spans as horizontal bars arranged on a timeline. Each bar represents an operation (workflow phase, AI session, verification step, command execution, etc.) and its width indicates duration. Parent-child relationships between spans create a hierarchical tree structure, showing how operations nest within each other. This visualization gives users an immediate visual understanding of where time was spent, what ran in parallel, and how the execution flowed from start to finish.",
+      "description": "The default view is a waterfall chart that visualizes execution spans as horizontal bars arranged on a timeline. Each bar represents an operation (workflow phase, AI session, verification step, command execution, etc.) and its width indicates duration relative to total trace time. Parent-child relationships between spans create a hierarchical tree structure via depth-based indentation. The waterfall uses react-window for virtualization (32px row height), supporting traces with hundreds of spans. Time bounds are computed from all spans (not just filtered), ensuring the timeline stays stable as filters change. The timeline header shows time marks at 0%, 25%, 50%, 75%, and 100% of total duration.",
       "category": "semantic",
       "assertions": [
         {
           "id": "traces-waterfall-rendered",
-          "description": "The user can see a waterfall-style timeline visualization where execution spans are displayed as horizontal bars, with bar width proportional to duration and vertical position showing the span hierarchy, providing an intuitive visual map of the entire execution",
+          "description": "Users see a waterfall-style timeline visualization where execution spans are displayed as horizontal bars, with bar width proportional to duration and vertical position showing the span hierarchy",
           "category": "semantic",
           "severity": "critical",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "trace|span|Trace"
+              "textContent": "Name"
             },
-            "label": "Trace waterfall chart"
+            "label": "Waterfall timeline header"
           },
           "assertionType": "exists",
+          "precondition": "At least one workflow has been run and the run is selected in RunSelector",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "traces-span-hierarchy",
-          "description": "The user can see parent-child relationships between spans, with child spans visually nested under their parents, showing how high-level operations decompose into sub-operations",
+          "description": "Users see parent-child relationships between spans via depth-based indentation (20px per level), showing how high-level operations decompose into sub-operations",
           "category": "semantic",
           "severity": "critical",
           "target": {
             "type": "search",
             "criteria": {
-              "role": "row"
+              "role": "button"
             },
             "label": "Span hierarchy rows"
           },
           "assertionType": "exists",
+          "precondition": "A run with hierarchical spans (parent_span_id relationships) is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-phase-color-coding",
+          "description": "Each span is color-coded by its workflow phase: setup (blue), verification (amber), agentic (purple), completion (emerald), AI (green), python (orange), unknown (zinc). Phase is inferred from the span name via inferPhase()",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "setup|verification|agentic|completion|ai|python"
+            },
+            "label": "Phase badges on span rows"
+          },
+          "expected": "Phase badges appear next to each span name with color matching: setup=blue, verification=amber, agentic=purple, completion=emerald, ai=green, python=orange",
+          "precondition": "At least one workflow has been run",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "traces-span-duration-visible",
-          "description": "Each span in the waterfall shows its duration, either as text or through the visual width of the bar, allowing the user to quickly identify the longest-running operations",
-          "category": "semantic",
-          "severity": "major",
+          "description": "Each span in the waterfall shows its formatted duration (ms/s/m) to the right of the timeline bar, allowing quick identification of the longest-running operations",
+          "category": "data-display",
+          "severity": "critical",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "ms|sec|duration"
+              "textContent": "ms|s$"
             },
-            "label": "Span duration display"
+            "label": "Span duration labels"
           },
           "assertionType": "exists",
+          "precondition": "At least one workflow has been run",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "traces-flamechart",
+      "name": "Flamechart Visualization",
+      "description": "The Flamechart view is a canvas-based (HTML5 Canvas) stacked visualization that shows span hierarchy by call depth, with each span's width proportional to its duration. Unlike the waterfall (which shows wall-clock position), the flamechart collapses idle gaps between sibling spans so it shows where time is *spent*. Children are packed proportionally within their parent's width range — a parent with two children of 600ms and 400ms allocates 60% and 40% of its width respectively, regardless of idle gaps between them. The canvas renders at device pixel ratio for crisp display on HiDPI screens, with a dark zinc-900 background. Phase colors use raw hex values (not Tailwind) for canvas rendering.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "traces-flamechart-canvas",
+          "description": "The Flamechart view renders spans as colored rectangles on an HTML5 Canvas element, with width proportional to span duration and vertical stacking by call depth (22px row height + 2px gap)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "canvas"
+            },
+            "label": "Flamechart canvas element"
+          },
+          "precondition": "At least one workflow has been run and the Flamechart tab is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-flamechart-gap-collapsing",
+          "description": "The flamechart collapses idle gaps between sibling spans, so children are packed proportionally within their parent's width. This makes the chart show where time is spent rather than when operations occurred",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "canvas"
+            },
+            "label": "Gap-collapsed flamechart"
+          },
+          "expected": "Sibling spans with idle time between them appear adjacent in the flamechart, not separated by gaps. Each child's width fraction equals its duration / total sibling duration",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-flamechart-text-labels",
+          "description": "Spans wide enough (>60px rendered width) display their name and duration as text inside the rectangle, clipped to the rectangle bounds",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "canvas"
+            },
+            "label": "Flamechart text labels"
+          },
+          "expected": "Text labels appear inside rectangles that are wide enough, formatted as 'spanName (duration)'",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-flamechart-zoom-pan",
+          "description": "Users can zoom the flamechart horizontally via mouse wheel (1x to 50x) and pan via click-drag. Zoom keeps the mouse position stable. A 'Reset zoom' button appears when zoomed in",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Reset zoom"
+            },
+            "label": "Zoom reset button"
+          },
+          "expected": "Mouse wheel zooms horizontally (min 1x, max 50x). Click-drag pans. 'Reset zoom' button appears when zoom > 1x",
+          "precondition": "Flamechart tab is active and the view has been zoomed in",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-flamechart-depth-slider",
+          "description": "Users can limit the maximum visible depth via a depth slider, hiding deeply nested spans to focus on high-level structure",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Depth"
+            },
+            "label": "Depth filter slider"
+          },
+          "precondition": "Flamechart tab is active",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-flamechart-focus-subtree",
+          "description": "Users can double-click a span with children to focus on its subtree, making it the new root. A breadcrumb trail (Root / parent / child) allows navigation back to any ancestor level",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Root"
+            },
+            "label": "Breadcrumb root button"
+          },
+          "expected": "The breadcrumb trail always shows 'Root' at the left. After double-clicking a span, its name appears in the breadcrumb. Clicking any breadcrumb segment navigates to that level",
+          "precondition": "Flamechart tab is active",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-flamechart-hover-tooltip",
+          "description": "Hovering over a span shows a tooltip with the span name, duration, percentage of total, error status, and critical path info. The tooltip follows the cursor and includes a 'Double-click to focus subtree' hint",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Double-click to focus subtree"
+            },
+            "label": "Flamechart hover tooltip"
+          },
+          "expected": "Fixed-position tooltip appears near cursor showing: span name, formatted duration, percentage of root duration, error indicator if failed, critical path status and slack if critical path is enabled",
+          "precondition": "Flamechart tab is active and user is hovering over a span",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "traces-comparison",
+      "name": "Cross-Run Trace Comparison",
+      "description": "The Comparison view enables side-by-side analysis of execution spans from two runs of the same workflow, highlighting timing differences, added/removed spans, and regressions. It aligns spans between runs by matching on name + phase + iteration, then classifies each pair as unchanged, faster, slower, added, removed, or status_changed. The view defaults to comparing the current run (Run B) against the most recent prior run with the same workflow_name (Run A). Both runs can be overridden via dropdown selectors. Data is fetched from the same execution_spans API for each run independently via useTraceComparisonData, which calls useTraceViewerData for each run ID.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "traces-comparison-run-selectors",
+          "description": "Users see two run selector dropdowns — 'Run A (baseline)' and 'Run B (current)' — populated with recent task runs, allowing them to pick which runs to compare",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Run A (baseline)"
+            },
+            "label": "Run A selector label"
+          },
+          "precondition": "Comparison tab is active and at least two runs exist",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-comparison-auto-baseline",
+          "description": "The baseline (Run A) auto-selects the most recent prior run with the same workflow_name as the selected run. If no matching prior run exists, baseline is null and the user sees a message to select runs",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Run A (baseline)"
+            },
+            "label": "Auto-selected baseline"
+          },
+          "expected": "Run A dropdown pre-selects the previous run with the same workflow_name. If only one run exists, no baseline is selected and an explanatory message is shown",
+          "precondition": "Comparison tab is active",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-comparison-summary-bar",
+          "description": "A summary bar at the top shows the total duration of each run, the overall percentage change, and counts of faster/slower/added/removed/status-changed spans",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "overall"
+            },
+            "label": "Comparison summary bar"
+          },
+          "expected": "Shows 'Run A: Xs', 'Run B: Xs', '+/-N.N% overall', and colored counts for each status category",
+          "precondition": "Comparison tab is active with two runs selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-comparison-regression-banner",
+          "description": "When regressions are detected (>50% slower spans, success→error status changes, or new error spans), a red banner lists them by name with percentage or failure details",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Regressions detected"
+            },
+            "label": "Regression warning banner"
+          },
+          "precondition": "Comparison tab is active and the compared runs contain regressions",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-comparison-status-filter-tabs",
+          "description": "Users can filter the match list by status category (All, Slower, Faster, Added, Removed, Status Changed, Unchanged) with counts shown for each category",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Slower"
+            },
+            "label": "Comparison status filter tabs"
+          },
+          "precondition": "Comparison tab is active with two runs selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-comparison-match-list",
+          "description": "Each matched span pair is shown as a row with status badge, span name, phase, duration for Run A, duration for Run B, and the delta (absolute and percentage). Rows are sorted by severity: status_changed first, then slower, added, removed, faster, unchanged",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Run A"
+            },
+            "label": "Comparison match list header"
+          },
+          "precondition": "Comparison tab is active with two runs selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-comparison-detail-expand",
+          "description": "Clicking a matched span pair expands inline to show a duration comparison bar chart, status change details (if applicable), and an attribute diff showing which attributes changed between runs",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Duration comparison"
+            },
+            "label": "Expanded comparison detail"
+          },
+          "expected": "The expanded area shows horizontal bar charts for Run A and Run B durations, with the longer run's bar in red (if slower) or green (if faster). Attribute diffs show old→new values",
+          "precondition": "Comparison tab is active and a match row has been clicked",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-comparison-no-prior-run",
+          "description": "When no baseline run is available (workflow has only been run once), users see a message explaining that at least two runs are needed for comparison",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No previous runs available"
+            },
+            "label": "No baseline available message"
+          },
+          "precondition": "Comparison tab is active and only one run exists for the workflow",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "traces-critical-path",
+      "name": "Critical Path Analysis",
+      "description": "When the 'Critical Path' checkbox is enabled, the system computes and highlights the longest sequential chain of spans from root to leaf — the critical path that determines total execution time. The algorithm walks the span tree bottom-up: each node's 'weight' is its own duration plus the maximum child weight. The root-to-leaf path with the highest total weight is the critical path. For parallel siblings, only the longest is on the critical path. Non-critical spans have 'slack' — how much longer they could run without extending total time. This analysis works on both the Waterfall and Flamechart views and is computed on-demand (only when the toggle is checked) via computeCriticalPath() in trace-utils.ts.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "traces-critical-path-toggle",
+          "description": "Users can enable critical path highlighting via a 'Critical Path' checkbox in the toolbar, available on both Waterfall and Flamechart views (not on Comparison)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Critical Path"
+            },
+            "label": "Critical Path checkbox toggle"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-critical-path-waterfall-dimming",
+          "description": "When enabled in the Waterfall view, spans on the critical path appear at full opacity with bold text and a red glow border, while non-critical spans are dimmed to 40% opacity",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Critical path span styling"
+          },
+          "expected": "Critical path spans: opacity 1, font-medium text, ring-1 ring-red-400/60 with box shadow. Non-critical spans: opacity 0.4",
+          "precondition": "Critical Path toggle is checked and at least one run with multiple spans is selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-critical-path-connector-line",
+          "description": "A dashed red SVG line connects consecutive critical path spans in the waterfall's timeline column, making the critical path visually traceable through the span hierarchy",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "line"
+            },
+            "label": "Critical path connector SVG lines"
+          },
+          "expected": "Dashed red lines (stroke #ef4444, strokeDasharray 4 3) connect the center of each critical path span's timeline bar to the next one",
+          "precondition": "Critical Path toggle is checked and the trace has at least 2 spans on the critical path",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-critical-path-flamechart",
+          "description": "When enabled in the Flamechart view, critical path spans have a red stroke border and full opacity, while non-critical spans render at 35% opacity",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "canvas"
+            },
+            "label": "Flamechart critical path rendering"
+          },
+          "expected": "Critical path spans: globalAlpha 1, strokeStyle #ef4444, lineWidth 1.5. Non-critical: globalAlpha 0.35",
+          "precondition": "Flamechart tab is active and Critical Path toggle is checked",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-critical-path-insights-footer",
+          "description": "The PerformanceInsights footer shows critical path statistics: total critical path duration with percentage of overall time, the bottleneck span (longest individual span on the path), and parallel slack (time saved by parallelism)",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Critical path"
+            },
+            "label": "Critical path stats in footer"
+          },
+          "expected": "Footer shows 'Critical path: Xs (N%)' | 'Bottleneck: spanName (Xs)' | 'Parallel slack: Xs'",
+          "precondition": "Critical Path toggle is checked",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-critical-path-detail-panel",
+          "description": "When a span is selected with critical path enabled, the SpanDetailPanel shows whether the span is on the critical path or its slack time. Critical path spans show 'On critical path'. Non-critical spans show 'Off critical path' with 'Slack: Xs'",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "critical path"
+            },
+            "label": "Critical path info in detail panel"
+          },
+          "expected": "For critical path spans: 'On critical path' in red text. For non-critical: 'Off critical path' with slack duration",
+          "precondition": "Critical Path toggle is checked and a span is selected",
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -65,18 +580,18 @@
     {
       "id": "traces-filtering-and-search",
       "name": "Filtering and Search",
-      "description": "With potentially hundreds of spans in a complex workflow execution, users need filtering tools to focus on specific operations. The toolbar provides search by span name, minimum duration filter (to find slow operations), phase filter (setup, verification, agentic, completion), and status filter (success, error). These filters work together to narrow the visible spans, making it practical to analyze specific aspects of a large execution trace.",
+      "description": "The TraceToolbar provides four filter controls that work together to narrow the visible spans in Waterfall and Flamechart views (not shown in Comparison mode). Filters are applied client-side via filterSpans() after building and flattening the span tree. The toolbar also shows a span count indicator ('N / M spans' when filtered, 'M spans' when unfiltered). All filter state is maintained in the parent TraceViewerWidget and passed down.",
       "category": "semantic",
       "assertions": [
         {
           "id": "traces-name-search",
-          "description": "The user can search for spans by name, filtering the waterfall to show only spans whose names match the search term, enabling quick navigation to specific operations in a large trace",
-          "category": "semantic",
-          "severity": "major",
+          "description": "Users can search for spans by name using a text input, filtering the view to show only spans whose names contain the search term (case-insensitive)",
+          "category": "interaction",
+          "severity": "critical",
           "target": {
             "type": "search",
             "criteria": {
-              "role": "searchbox"
+              "textContent": "Search spans"
             },
             "label": "Span name search input"
           },
@@ -87,15 +602,15 @@
         },
         {
           "id": "traces-duration-filter",
-          "description": "The user can filter spans by minimum duration to focus on slow operations, which is the primary workflow for identifying performance bottlenecks in execution",
-          "category": "semantic",
-          "severity": "major",
+          "description": "Users can filter spans by minimum duration (in milliseconds) to focus on slow operations and identify performance bottlenecks",
+          "category": "interaction",
+          "severity": "warning",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "duration|Duration|min"
+              "textContent": "Min ms"
             },
-            "label": "Duration filter control"
+            "label": "Minimum duration filter input"
           },
           "assertionType": "exists",
           "source": "manual",
@@ -103,16 +618,50 @@
           "enabled": true
         },
         {
-          "id": "traces-phase-status-filters",
-          "description": "The user can filter spans by execution phase (setup, verification, agentic, completion) and status (success, error), allowing targeted analysis of specific workflow phases or error investigation",
-          "category": "semantic",
-          "severity": "minor",
+          "id": "traces-phase-filter",
+          "description": "Users can filter spans by workflow phase (All Phases, Setup, Verification, Agentic, Completion, AI, Python) using a dropdown selector",
+          "category": "interaction",
+          "severity": "warning",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "Phase|Status|phase|status"
+              "textContent": "All Phases"
             },
-            "label": "Phase and status filters"
+            "label": "Phase filter dropdown"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-status-filter",
+          "description": "Users can filter spans by status (All Status, Success, Errors) to quickly isolate failed operations for investigation",
+          "category": "interaction",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "All Status"
+            },
+            "label": "Status filter dropdown"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-span-count",
+          "description": "The toolbar shows a span count that reflects the current filter state: 'N / M spans' when filtered, 'M spans' when showing all",
+          "category": "data-display",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "spans"
+            },
+            "label": "Filtered span count indicator"
           },
           "assertionType": "exists",
           "source": "manual",
@@ -125,56 +674,77 @@
     {
       "id": "traces-span-details",
       "name": "Span Detail Inspection",
-      "description": "When the user clicks on a span in the waterfall, a detail panel opens showing comprehensive information about that specific operation. Details include the span name, duration, start and end times, status, associated metadata, and any error information. This drill-down capability transforms the waterfall from a visual overview into a detailed diagnostic tool, allowing users to investigate any specific operation that catches their attention.",
+      "description": "When the user clicks a span in the Waterfall or Flamechart view, a 280px-wide detail panel opens on the right side showing comprehensive information about that span. The panel displays: span name (stripped of 'qontinui.' prefix), status (Success/Error), phase with colored badge, formatted duration, start and end timestamps, trace/span/parent IDs in monospace, error message (if any), and all span attributes as key-value pairs. When critical path is enabled, the panel also shows whether the span is on the critical path and its slack time. Clicking the same span again or clicking the close button deselects it.",
       "category": "semantic",
       "assertions": [
         {
           "id": "traces-span-clickable",
-          "description": "The user can click on any span in the waterfall to select it and view its detailed information in a side panel, enabling investigation of specific operations",
-          "category": "semantic",
+          "description": "Users can click any span in the Waterfall or Flamechart to select it and view its details in the side panel. Clicking the same span deselects it",
+          "category": "interaction",
           "severity": "critical",
           "target": {
             "type": "search",
             "criteria": {
-              "role": "row"
+              "role": "button"
             },
             "label": "Clickable span row"
           },
           "assertionType": "exists",
+          "precondition": "Waterfall or Flamechart view is active with spans loaded",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
-          "id": "traces-detail-panel",
-          "description": "When a span is selected, a detail panel displays comprehensive information including the operation name, duration, timing, status, and any metadata or error details associated with that span",
-          "category": "semantic",
-          "severity": "major",
+          "id": "traces-detail-panel-content",
+          "description": "The detail panel shows span status, phase badge, duration, start/end timestamps, trace/span/parent IDs, and attributes",
+          "category": "data-display",
+          "severity": "critical",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "Detail|detail|span"
+              "textContent": "Status"
             },
-            "label": "Span detail panel"
+            "label": "Span detail panel fields"
           },
           "assertionType": "exists",
+          "precondition": "A span is selected in Waterfall or Flamechart view",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-detail-close",
+          "description": "Users can close the detail panel by clicking the close button (✕), which deselects the span and hides the panel",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "✕"
+            },
+            "label": "Detail panel close button"
+          },
+          "precondition": "A span is selected and the detail panel is visible",
           "source": "manual",
           "reviewed": true,
           "enabled": true
         },
         {
           "id": "traces-performance-insights",
-          "description": "The user can view performance insights that summarize key metrics from the trace, such as the critical path, longest operations, and overall execution efficiency, providing actionable optimization guidance",
-          "category": "semantic",
-          "severity": "minor",
+          "description": "The footer shows performance insights: total duration, span count, error count (if any), slowest span name and duration, and phase breakdown (top 3 phases by time)",
+          "category": "data-display",
+          "severity": "warning",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "Insight|insight|Performance|critical"
+              "textContent": "Total"
             },
-            "label": "Performance insights section"
+            "label": "Performance insights footer"
           },
           "assertionType": "exists",
+          "precondition": "At least one span is loaded in Waterfall or Flamechart view",
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -184,15 +754,15 @@
     },
     {
       "id": "traces-empty-and-loading-states",
-      "name": "Empty and Loading States",
-      "description": "The Traces page must handle the case where no run is selected, where trace data is loading, where loading fails, and where no trace spans exist for the selected run. Each state should communicate clearly so the user understands what they need to do next.",
-      "category": "semantic",
+      "name": "Empty, Loading, and Error States",
+      "description": "The Traces page handles four boundary states: (1) no run selected — shows 'Select a task run to view traces'; (2) loading — shows 'Loading trace data...' while the first fetch is in progress; (3) error — shows 'Failed to load traces: {error}' in red; (4) empty — shows 'No spans to display' when a run is selected but has zero execution spans. These early returns happen before any view rendering, so they apply regardless of the active view mode.",
+      "category": "behavior",
       "assertions": [
         {
           "id": "traces-no-run-selected",
-          "description": "When no task run is selected, the user sees a message prompting them to select a run to view its traces, providing a clear call to action",
-          "category": "semantic",
-          "severity": "major",
+          "description": "When no task run is selected, users see a clear prompt to select one",
+          "category": "behavior",
+          "severity": "critical",
           "target": {
             "type": "search",
             "criteria": {
@@ -207,13 +777,13 @@
         },
         {
           "id": "traces-loading-state",
-          "description": "While trace data is being fetched, the user sees a loading indicator confirming that trace data retrieval is in progress",
-          "category": "semantic",
-          "severity": "minor",
+          "description": "While trace data is being fetched for the first time, a loading message is shown",
+          "category": "behavior",
+          "severity": "warning",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "Loading trace"
+              "textContent": "Loading trace data"
             },
             "label": "Loading state message"
           },
@@ -224,17 +794,35 @@
         },
         {
           "id": "traces-error-state",
-          "description": "When trace data fails to load, the user sees an error message explaining what went wrong, so they can determine whether to retry or investigate the underlying issue",
-          "category": "semantic",
-          "severity": "minor",
+          "description": "When trace data fails to load, an error message in red text shows the failure reason",
+          "category": "behavior",
+          "severity": "warning",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "Failed to load"
+              "textContent": "Failed to load traces"
             },
             "label": "Error state message"
           },
           "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-live-polling",
+          "description": "Trace data is automatically refreshed every 2 seconds via React Query refetchInterval, enabling live monitoring of in-progress executions without manual refresh",
+          "category": "behavior",
+          "severity": "info",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "spans"
+            },
+            "label": "Live polling behavior"
+          },
+          "expected": "Span data updates automatically every 2 seconds. New spans from an in-progress execution appear without page reload",
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -245,11 +833,30 @@
   ],
   "metadata": {
     "component": "TraceViewerPage",
-    "author": "Joshua Spinak",
+    "author": "Claude",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-26T00:00:00.000Z",
     "pageUrl": "/runs/traces",
     "elementSource": "sdk",
-    "tags": ["run-traces", "trace-viewer", "waterfall", "performance", "execution-spans", "observe"]
+    "tags": ["run-traces", "trace-viewer", "waterfall", "flamechart", "comparison", "critical-path", "performance", "execution-spans", "observe"],
+    "backendFiles": [
+      "src/components/widgets/trace-viewer/TraceViewerWidget.tsx",
+      "src/components/widgets/trace-viewer/TraceWaterfall.tsx",
+      "src/components/widgets/trace-viewer/FlameChart.tsx",
+      "src/components/widgets/trace-viewer/TraceComparison.tsx",
+      "src/components/widgets/trace-viewer/SpanDetailPanel.tsx",
+      "src/components/widgets/trace-viewer/PerformanceInsights.tsx",
+      "src/components/widgets/trace-viewer/TraceToolbar.tsx",
+      "src/components/widgets/trace-viewer/SpanRow.tsx",
+      "src/components/widgets/trace-viewer/trace-utils.ts",
+      "src/components/widgets/trace-viewer/useTraceViewerData.ts",
+      "src/components/widgets/trace-viewer/useTraceComparisonData.ts",
+      "src/components/widgets/trace-viewer/types.ts",
+      "src/components/run-dashboard/TraceViewerPage.tsx"
+    ],
+    "apiEndpoints": [
+      "GET /execution-spans?execution_id={id}&order=asc"
+    ],
+    "specType": "semantic"
   }
 }

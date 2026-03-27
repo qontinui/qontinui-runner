@@ -225,7 +225,7 @@ export function DatasetDetail({ dataset, items, isLoading, onAddItems, isAdding,
         <div className="flex items-center gap-1.5">
           {items.length > 0 && (
             <>
-              <Button size="sm" variant="ghost" onClick={handleExportJson} title="Export as JSON">
+              <Button size="sm" variant="ghost" onClick={handleExportJson} title="Export as JSON" data-tutorial-id="evaluation-export-json">
                 <Download className="w-3.5 h-3.5" />
                 JSON
               </Button>
@@ -239,6 +239,7 @@ export function DatasetDetail({ dataset, items, isLoading, onAddItems, isAdding,
             size="sm"
             variant={showAddForm ? "ghost" : "outline"}
             onClick={() => setShowAddForm(!showAddForm)}
+            data-tutorial-id="evaluation-add-items"
           >
             {showAddForm ? <X className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
             {showAddForm ? "Cancel" : "Add Items"}
@@ -275,6 +276,7 @@ export function DatasetDetail({ dataset, items, isLoading, onAddItems, isAdding,
                 variant="outline"
                 onClick={() => fileInputRef.current?.click()}
                 disabled={isAdding}
+                data-tutorial-id="evaluation-import-file"
               >
                 <Upload className="w-3.5 h-3.5" />
                 Import File
@@ -300,7 +302,7 @@ export function DatasetDetail({ dataset, items, isLoading, onAddItems, isAdding,
             <p className="text-xs">Click "Add Items" to get started</p>
           </div>
         ) : (
-          <table className="w-full text-xs">
+          <table className="w-full text-xs" data-tutorial-id="evaluation-items-table">
             <thead className="sticky top-0 bg-card z-10">
               <tr className="border-b border-border/50 text-left text-muted-foreground">
                 <th className="px-4 py-2 font-medium w-1/2">Input</th>

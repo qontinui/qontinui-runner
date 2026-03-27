@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { useUIComponent } from "ui-bridge";
 import {
   Zap,
   Image,
@@ -73,21 +74,23 @@ import { SpecsPage } from "@/pages/specs/SpecsPage";
 import { UIBridgeIntegrationPage } from "@/pages/ui-bridge-integration/UIBridgeIntegrationPage";
 import { UIBridgeStateMachinePage } from "@/pages/state-machine";
 import { ImageQualityTestsPage } from "@/pages/ImageQualityTestsPage";
+import { EventHistoryPage } from "@/pages/EventHistoryPage";
 import { lazy, Suspense } from "react";
 import { Loader2 } from "lucide-react";
 
 const LlmObservabilityDashboard = lazy(() => import("../llm-observability/LlmObservabilityDashboard"));
 const EvaluationDashboard = lazy(() => import("../evaluation/EvaluationDashboard"));
-const ElementReliabilityDashboard = lazy(() => import("../element-reliability/ElementReliabilityDashboard"));
-const PipelineEventsTimeline = lazy(() => import("../pipeline-events/PipelineEventsTimeline").then(m => ({ default: m.PipelineEventsTimeline })));
-const RuleInfluencePanel = lazy(() => import("../rule-influence/RuleInfluencePanel").then(m => ({ default: m.RuleInfluencePanel })));
-const UnifiedSearchPanel = lazy(() => import("../unified-search/UnifiedSearchPanel"));
-const WorkflowVersionLineage = lazy(() => import("../workflow-versions/WorkflowVersionLineage").then(m => ({ default: m.WorkflowVersionLineage })));
 const SkillApprovalPanel = lazy(() => import("../skills/SkillApprovalPanel").then(m => ({ default: m.SkillApprovalPanel })));
 const AutomationHealthDashboard = lazy(() => import("../ui-bridge/AutomationHealthDashboard").then(m => ({ default: m.AutomationHealthDashboard })));
 const ObservationBrowser = lazy(() => import("../observations/ObservationBrowser").then(m => ({ default: m.ObservationBrowser })));
 const ActivityTimelinePanel = lazy(() => import("../activity-timeline/ActivityTimelinePanel").then(m => ({ default: m.ActivityTimelinePanel })));
 const WatcherManagementPanel = lazy(() => import("../activity-timeline/WatcherManagementPanel").then(m => ({ default: m.WatcherManagementPanel })));
+
+/** Register the active page with UI Bridge for AI discoverability */
+function PageRegistration({ id, name, description }: { id: string; name: string; description: string }) {
+  useUIComponent({ id: `page-${id}`, name, description, actions: [] });
+  return null;
+}
 
 /** Suspense fallback for lazy-loaded tab panels */
 function LazyFallback() {
@@ -201,10 +204,10 @@ export function TabContent({
 
   switch (activeTab) {
     case "gui-automation":
-      return <ExecuteTab onLog={addLog} onNavigateToActive={() => setActiveTab("active")} />;
+      return (<><PageRegistration id="gui-automation" name="Workflows" description="Configure and launch GUI automation workflows" /><ExecuteTab onLog={addLog} onNavigateToActive={() => setActiveTab("active")} /></>);
 
     case "workflow-queue":
-      return <WorkflowQueueTab onNavigateToActive={() => setActiveTab("active")} onLog={addLog} />;
+      return (<><PageRegistration id="workflow-queue" name="Workflow Queue" description="Queue and manage multiple workflow executions" /><WorkflowQueueTab onNavigateToActive={() => setActiveTab("active")} onLog={addLog} /></>);
 
     case "active":
       return (
@@ -233,6 +236,7 @@ export function TabContent({
     case "error-monitor":
       return (
         <div className="h-full overflow-hidden">
+          <PageRegistration id="error-monitor" name="Error Monitor" description="Real-time application error monitoring and log analysis" />
           <ErrorMonitorTab />
         </div>
       );
@@ -240,6 +244,7 @@ export function TabContent({
     case "processes":
       return (
         <div className="h-full overflow-hidden">
+          <PageRegistration id="processes" name="Process Manager" description="Manage and monitor development processes (web backend, frontend, mobile)" />
           <ProcessManagerTab />
         </div>
       );
@@ -247,6 +252,7 @@ export function TabContent({
     case "reflection":
       return (
         <div className="h-full overflow-hidden">
+          <PageRegistration id="reflection" name="Reflection" description="Review reflection analysis from automation runs" />
           <ReflectionDashboard />
         </div>
       );
@@ -254,6 +260,7 @@ export function TabContent({
     case "observations":
       return (
         <div className="h-full overflow-hidden">
+          <PageRegistration id="observations" name="Memory" description="Cross-session observation memory from past automation runs" />
           <Suspense fallback={<LazyFallback />}>
             <ObservationBrowser projectId={projectSelection.selectedProjectId} />
           </Suspense>
@@ -575,7 +582,7 @@ export function TabContent({
       );
 
     case "library":
-      return <LibraryDashboard onLog={addLog} />;
+      return (<><PageRegistration id="library" name="Library" description="Prompt library, macros, checks, shell commands, and reusable components" /><LibraryDashboard onLog={addLog} /></>);
 
     case "specs":
       return (
@@ -620,6 +627,7 @@ export function TabContent({
     case "unified-workflow-builder":
       return (
         <div className="h-full overflow-hidden">
+          <PageRegistration id="workflow-builder" name="Workflow Builder" description="Build and edit multi-step automation workflows with AI assistance" />
           <WorkflowBuilderTab
             editWorkflowId={editWorkflowId}
             onNavigateToActive={() => setActiveTab("active")}
@@ -777,56 +785,11 @@ export function TabContent({
     case "terminal":
       return null;
 
-    case "element-reliability":
-      return (
-        <div className="h-full overflow-hidden">
-          <Suspense fallback={<LazyFallback />}>
-            <ElementReliabilityDashboard />
-          </Suspense>
-        </div>
-      );
-
     case "automation-health":
       return (
         <div className="h-full overflow-auto p-4">
           <Suspense fallback={<LazyFallback />}>
             <AutomationHealthDashboard />
-          </Suspense>
-        </div>
-      );
-
-    case "pipeline-events":
-      return (
-        <div className="h-full overflow-hidden">
-          <Suspense fallback={<LazyFallback />}>
-            <PipelineEventsTimeline />
-          </Suspense>
-        </div>
-      );
-
-    case "rule-influence":
-      return (
-        <div className="h-full overflow-hidden">
-          <Suspense fallback={<LazyFallback />}>
-            <RuleInfluencePanel />
-          </Suspense>
-        </div>
-      );
-
-    case "unified-search":
-      return (
-        <div className="h-full overflow-hidden">
-          <Suspense fallback={<LazyFallback />}>
-            <UnifiedSearchPanel onSearch={() => {}} />
-          </Suspense>
-        </div>
-      );
-
-    case "workflow-versions":
-      return (
-        <div className="h-full overflow-hidden">
-          <Suspense fallback={<LazyFallback />}>
-            <WorkflowVersionLineage />
           </Suspense>
         </div>
       );
@@ -838,8 +801,15 @@ export function TabContent({
         </div>
       );
 
+    case "event-history":
+      return (
+        <div className="h-full overflow-hidden">
+          <EventHistoryPage />
+        </div>
+      );
+
     case "help":
-      return <HelpTab />;
+      return (<><PageRegistration id="help" name="Help" description="Tutorials, documentation, and getting started guides" /><HelpTab /></>);
 
     default:
       return null;

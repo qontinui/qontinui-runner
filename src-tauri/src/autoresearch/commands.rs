@@ -394,10 +394,8 @@ async fn load_q_rows_pg_first(
     db: &CheckpointDb,
     app_state: &crate::commands::AppState,
 ) -> Vec<(String, String, f64, u32)> {
-    if let Some(ref pg) = app_state.pg_db {
-        if let Ok(rows) = pg.get_all_q_entries().await {
-            return rows;
-        }
+    if let Ok(rows) = app_state.pg_db.get_all_q_entries().await {
+        return rows;
     }
     load_q_table(db).unwrap_or_default()
 }
@@ -407,10 +405,8 @@ async fn load_overrides_pg_first(
     db: &CheckpointDb,
     app_state: &crate::commands::AppState,
 ) -> Vec<(String, String)> {
-    if let Some(ref pg) = app_state.pg_db {
-        if let Ok(overrides) = pg.get_all_q_overrides().await {
-            return overrides;
-        }
+    if let Ok(overrides) = app_state.pg_db.get_all_q_overrides().await {
+        return overrides;
     }
     load_q_overrides(db).unwrap_or_default()
 }
@@ -482,9 +478,7 @@ pub async fn set_q_routing_override(
     }
 
     // PG-first
-    if let Some(ref pg) = app_state.pg_db {
-        pg.upsert_q_override(&state_key, &forced_action).await?;
-    }
+    app_state.pg_db.upsert_q_override(&state_key, &forced_action).await?;
 
     // SQLite fallback
     let now = chrono::Utc::now().to_rfc3339();
@@ -511,10 +505,8 @@ pub async fn remove_q_routing_override(
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<bool, String> {
     // PG-first
-    if let Some(ref pg) = app_state.pg_db {
-        if let Err(e) = pg.delete_q_override(&state_key).await {
-            tracing::warn!("Failed to delete PG override for {}: {}", state_key, e);
-        }
+    if let Err(e) = app_state.pg_db.delete_q_override(&state_key).await {
+        tracing::warn!("Failed to delete PG override for {}: {}", state_key, e);
     }
 
     // SQLite
@@ -548,9 +540,7 @@ pub async fn reset_q_routing_table(
     let mut deleted_pg: u64 = 0;
 
     // PG-first
-    if let Some(ref pg) = app_state.pg_db {
-        deleted_pg = pg.clear_q_table().await.unwrap_or(0);
-    }
+    deleted_pg = app_state.pg_db.clear_q_table().await.unwrap_or(0);
 
     // SQLite
     let deleted_sqlite = db.with_conn(|conn| {

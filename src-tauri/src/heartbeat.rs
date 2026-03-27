@@ -82,17 +82,13 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             let ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
 
             // Get running task count from the database (PG-primary, SQLite fallback)
-            let (task_count, task_ids) = if let Some(pg) = &app_state.pg_db {
-                match pg.get_running_task_runs(None).await {
-                    Ok(runs) => {
-                        let count = runs.len() as u32;
-                        let ids = runs.into_iter().map(|r| r.id).collect();
-                        (count, ids)
-                    }
-                    Err(_) => get_running_tasks(&app_state),
+            let (task_count, task_ids) = match app_state.pg_db.get_running_task_runs(None).await {
+                Ok(runs) => {
+                    let count = runs.len() as u32;
+                    let ids = runs.into_iter().map(|r| r.id).collect();
+                    (count, ids)
                 }
-            } else {
-                get_running_tasks(&app_state)
+                Err(_) => get_running_tasks(&app_state),
             };
 
             let payload = HeartbeatPayload {

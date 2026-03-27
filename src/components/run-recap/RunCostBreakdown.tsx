@@ -139,7 +139,7 @@ export function RunCostBreakdown({ runId }: RunCostBreakdownProps) {
   }
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-3" data-tutorial-id="run-cost-breakdown">
       {/* Totals */}
       <TotalsStrip
         totalCost={data.total_cost_usd}

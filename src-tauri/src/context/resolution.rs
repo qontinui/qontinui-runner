@@ -299,11 +299,11 @@ pub fn inject_contexts(
 /// search_query (e.g. workflow name) for relevance-based retrieval.
 /// Uses progressive disclosure: 300-char previews with IDs.
 pub async fn format_observation_memory_for_prompt(
-    pg_db: Option<&crate::database::pg::PgDb>,
+    pg_db: &crate::database::pg::PgDb,
     project_id: Option<&str>,
     search_query: Option<&str>,
 ) -> Option<String> {
-    let pg = pg_db?;
+    let pg = pg_db;
 
     let observations = if let Some(pid) = project_id.filter(|s| !s.is_empty()) {
         pg.get_project_context(pid, None, 15)

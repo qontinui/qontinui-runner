@@ -189,10 +189,9 @@ fn build_compressed_iteration_history(
     max_context_tokens: usize,
     cross_workflow_learning: bool,
     project_path: Option<&str>,
-    pg_db: Option<&std::sync::Arc<crate::database::pg::PgDb>>,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
 ) -> Option<String> {
     // Helper: run an async PG call synchronously via block_on.
-    // Returns Result<T, String>. Falls through to Err on panic (caller uses SQLite fallback).
     macro_rules! pg_block {
         ($pg:expr, $fut:expr) => {{
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -219,12 +218,7 @@ fn build_compressed_iteration_history(
 
     // 1. Latest verification feedback from knowledge base (most actionable -- show first)
     // Priority: CRITICAL -- always included regardless of budget
-    if let Ok(feedback) = if let Some(pg) = pg_db {
-        pg_block!(pg, pg.list_task_knowledge(execution_id, Some("verification_feedback"), false))
-            .or_else(|_| checkpoint_db.list_task_knowledge(execution_id, Some("verification_feedback"), false))
-    } else {
-        checkpoint_db.list_task_knowledge(execution_id, Some("verification_feedback"), false)
-    } {
+    if let Ok(feedback) = pg_block!(pg_db, pg_db.list_task_knowledge(execution_id, Some("verification_feedback"), false)) {
         if let Some(latest) = feedback.last() {
             let mut lines = vec!["### Last Verification Feedback".to_string()];
             lines.push(String::new());
@@ -241,12 +235,7 @@ fn build_compressed_iteration_history(
 
     // 2. Collect findings from the findings database (task_run_findings table)
     // Priority: HIGH
-    let findings_result = if let Some(pg) = pg_db {
-        pg_block!(pg, pg.get_findings_for_task(execution_id))
-            .or_else(|_| checkpoint_db.get_findings_for_task(execution_id))
-    } else {
-        checkpoint_db.get_findings_for_task(execution_id)
-    };
+    let findings_result = pg_block!(pg_db, pg_db.get_findings_for_task(execution_id));
     if let Ok(findings) = findings_result {
         if !findings.is_empty() {
             let mut findings_lines = vec!["### Findings from Previous Iterations".to_string()];
@@ -288,20 +277,12 @@ fn build_compressed_iteration_history(
     let recent_cutoff = current_iteration.saturating_sub(full_fidelity_iterations);
 
     // Load all observations once for efficient per-iteration lookup
-    let all_observations = if let Some(pg) = pg_db {
-        pg_block!(pg, pg.list_task_knowledge(execution_id, Some("observation"), false))
-            .unwrap_or_else(|_| checkpoint_db.list_task_knowledge(execution_id, Some("observation"), false).unwrap_or_default())
-    } else {
-        checkpoint_db.list_task_knowledge(execution_id, Some("observation"), false).unwrap_or_default()
-    };
+    let all_observations = pg_block!(pg_db, pg_db.list_task_knowledge(execution_id, Some("observation"), false))
+        .unwrap_or_default();
 
     // Load all solutions for fix descriptions
-    let all_solutions = if let Some(pg) = pg_db {
-        pg_block!(pg, pg.list_task_knowledge(execution_id, Some("solution"), false))
-            .unwrap_or_else(|_| checkpoint_db.list_task_knowledge(execution_id, Some("solution"), false).unwrap_or_default())
-    } else {
-        checkpoint_db.list_task_knowledge(execution_id, Some("solution"), false).unwrap_or_default()
-    };
+    let all_solutions = pg_block!(pg_db, pg_db.list_task_knowledge(execution_id, Some("solution"), false))
+        .unwrap_or_default();
 
     // --- 3a. Recent iteration (full fidelity) ---
     // Priority: HIGH -- recent iteration details are critical for the AI
@@ -314,12 +295,7 @@ fn build_compressed_iteration_history(
         recent_lines.push(String::new());
 
         // Full verification results for recent iteration
-        if let Ok(Some(result)) = if let Some(pg) = pg_db {
-            pg_block!(pg, pg.get_verification_phase_result(execution_id, recent_iter))
-                .or_else(|_| checkpoint_db.get_verification_phase_result(execution_id, recent_iter))
-        } else {
-            checkpoint_db.get_verification_phase_result(execution_id, recent_iter)
-        } {
+        if let Ok(Some(result)) = pg_block!(pg_db, pg_db.get_verification_phase_result(execution_id, recent_iter)) {
             let passed = result
                 .get("passed_steps")
                 .and_then(|v| v.as_u64())
@@ -403,13 +379,7 @@ fn build_compressed_iteration_history(
             let mut current_failed_names: Vec<String> = Vec::new();
 
             // Verification pass/fail summary
-            if let Ok(Some(result)) = if let Some(pg) = pg_db {
-                pg_block!(pg, pg.get_verification_phase_result(execution_id, iter))
-                    .or_else(|_| checkpoint_db.get_verification_phase_result(execution_id, iter))
-            } else {
-                checkpoint_db.get_verification_phase_result(execution_id, iter)
-            }
-            {
+            if let Ok(Some(result)) = pg_block!(pg_db, pg_db.get_verification_phase_result(execution_id, iter)) {
                 let passed = result
                     .get("passed_steps")
                     .and_then(|v| v.as_u64())
@@ -555,12 +525,7 @@ fn build_compressed_iteration_history(
     // 4. Accumulated knowledge (unresolved only -- deduped against iteration history above)
     // Priority: MEDIUM
     if budget_remaining > 200 {
-        if let Ok(all_knowledge) = if let Some(pg) = pg_db {
-            pg_block!(pg, pg.list_task_knowledge(execution_id, None, false))
-                .or_else(|_| checkpoint_db.list_task_knowledge(execution_id, None, false))
-        } else {
-            checkpoint_db.list_task_knowledge(execution_id, None, false)
-        } {
+        if let Ok(all_knowledge) = pg_block!(pg_db, pg_db.list_task_knowledge(execution_id, None, false)) {
             if !all_knowledge.is_empty() {
                 let unresolved: Vec<_> = all_knowledge
                     .iter()
@@ -662,12 +627,7 @@ fn build_compressed_iteration_history(
                 }
             } else {
                 // Fallback: chronological ordering (pre-v99 databases)
-                if let Ok(historical) = if let Some(pg) = pg_db {
-                    pg_block!(pg, pg.list_workflow_knowledge(wf_name, execution_id, &["recurring_pattern", "context"], 10))
-                        .or_else(|_| checkpoint_db.list_workflow_knowledge(wf_name, execution_id, &["recurring_pattern", "context"], 10))
-                } else {
-                    checkpoint_db.list_workflow_knowledge(wf_name, execution_id, &["recurring_pattern", "context"], 10)
-                } {
+                if let Ok(historical) = pg_block!(pg_db, pg_db.list_workflow_knowledge(wf_name, execution_id, &["recurring_pattern", "context"], 10)) {
                     if !historical.is_empty() {
                         let mut lines =
                             vec!["### Historical Knowledge (from previous runs)".to_string()];
@@ -701,12 +661,7 @@ fn build_compressed_iteration_history(
     // Priority: MEDIUM -- only on first iteration when cross_workflow_learning is enabled
     if cross_workflow_learning && current_iteration <= 1 && budget_remaining > 200 {
         if let Some(wf_name) = workflow_name {
-            if let Ok(insights) = if let Some(pg) = pg_db {
-                pg_block!(pg, pg.get_cross_workflow_knowledge(wf_name, execution_id, 3))
-                    .or_else(|_| checkpoint_db.get_cross_workflow_knowledge(wf_name, execution_id, 3))
-            } else {
-                checkpoint_db.get_cross_workflow_knowledge(wf_name, execution_id, 3)
-            } {
+            if let Ok(insights) = pg_block!(pg_db, pg_db.get_cross_workflow_knowledge(wf_name, execution_id, 3)) {
                 if !insights.is_empty() {
                     let mut lines = vec!["## Insights from similar workflows".to_string()];
                     lines.push(String::new());
@@ -736,12 +691,7 @@ fn build_compressed_iteration_history(
     // Priority: MEDIUM -- only on first iteration when project_path is available
     if current_iteration <= 1 && budget_remaining > 200 {
         if let Some(pp) = project_path {
-            if let Ok(knowledge) = if let Some(pg) = pg_db {
-                pg_block!(pg, pg.list_project_knowledge(pp, execution_id, 10))
-                    .or_else(|_| checkpoint_db.list_project_knowledge(pp, execution_id, 10))
-            } else {
-                checkpoint_db.list_project_knowledge(pp, execution_id, 10)
-            } {
+            if let Ok(knowledge) = pg_block!(pg_db, pg_db.list_project_knowledge(pp, execution_id, 10)) {
                 if !knowledge.is_empty() {
                     let mut lines = vec!["## Project Knowledge".to_string()];
                     lines.push(
@@ -776,12 +726,7 @@ fn build_compressed_iteration_history(
     // 4e. Fix predictions (suggest known fixes for unresolved findings)
     // Priority: MEDIUM -- only on iteration 1, max 3 predictions
     if current_iteration <= 1 && budget_remaining > 200 {
-        let findings_result2 = if let Some(pg) = pg_db {
-            pg_block!(pg, pg.get_findings_for_task(execution_id))
-                .or_else(|_| checkpoint_db.get_findings_for_task(execution_id))
-        } else {
-            checkpoint_db.get_findings_for_task(execution_id)
-        };
+        let findings_result2 = pg_block!(pg_db, pg_db.get_findings_for_task(execution_id));
         if let Ok(findings) = findings_result2 {
             let unresolved_findings: Vec<_> = findings
                 .iter()

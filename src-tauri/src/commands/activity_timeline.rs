@@ -27,10 +27,7 @@ pub async fn insert_activity_entry(
     mut input: ActivityTimelineInput,
     state: State<'_, Arc<AppState>>,
 ) -> Result<i64, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     // Content filtering: skip sensitive windows, scrub PII
     let filter = get_content_filter();
@@ -55,10 +52,7 @@ pub async fn search_activity_timeline(
     max_results: Option<i64>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<ActivityTimelineSearchResult>, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     pg.search_timeline(&query, max_results.unwrap_or(50)).await
 }
@@ -73,10 +67,7 @@ pub async fn search_activity_timeline_filtered(
     max_results: Option<i64>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<ActivityTimelineSearchResult>, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     pg.search_timeline_filtered(
         &query,
@@ -96,10 +87,7 @@ pub async fn get_activity_timeline_range(
     max_results: Option<i64>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<ActivityTimelineSearchResult>, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     let start = chrono::DateTime::parse_from_rfc3339(&start_time)
         .map_err(|e| format!("Invalid start_time: {}", e))?;
@@ -116,10 +104,7 @@ pub async fn get_activity_timeline_entry(
     id: i64,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<ActivityTimelineEntry>, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     pg.get_timeline_entry(id).await
 }
@@ -130,10 +115,7 @@ pub async fn get_activity_timeline_for_task_run(
     task_run_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<ActivityTimelineSearchResult>, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     pg.get_timeline_by_task_run(&task_run_id).await
 }
@@ -144,10 +126,7 @@ pub async fn delete_activity_timeline_entry(
     id: i64,
     state: State<'_, Arc<AppState>>,
 ) -> Result<bool, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     let deleted = pg.delete_timeline_entry(id).await?;
     if deleted {
@@ -161,10 +140,7 @@ pub async fn delete_activity_timeline_entry(
 pub async fn get_activity_timeline_stats(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<ActivityTimelineStat>, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     pg.get_timeline_stats().await
 }

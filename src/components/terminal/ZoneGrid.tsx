@@ -702,7 +702,8 @@ function ZoneCell({
                     ? "#e0af68"
                     : borderColor
         }`,
-        borderLeft: `${state === "needs-input" ? "3px" : "2px"} solid ${stateColor}`,
+        borderLeftWidth: state === "needs-input" ? "3px" : "2px",
+        borderLeftColor: stateColor,
         borderStyle: isSwapSource
           ? "dashed"
           : isStale && !isFocused && !searchMatch

@@ -205,29 +205,16 @@ impl LoopController {
                             &commit[..commit.len().min(8)],
                             config.rollback_policy
                         );
-                        let _ = if let Some(pg) = &self.app_state.pg_db {
-                            pg.append_task_output_ex(
-                                &config.execution_id,
-                                &format!(
-                                    "\n=== COMPENSATION ROLLBACK ===\nRolled back to commit {} (policy: {:?})\n",
-                                    &commit[..commit.len().min(8)],
-                                    config.rollback_policy
-                                ),
-                                false,
-                                false,
-                            ).await
-                        } else {
-                            self.checkpoint_db.append_task_output_ex(
-                                &config.execution_id,
-                                &format!(
-                                    "\n=== COMPENSATION ROLLBACK ===\nRolled back to commit {} (policy: {:?})\n",
-                                    &commit[..commit.len().min(8)],
-                                    config.rollback_policy
-                                ),
-                                false,
-                                false,
-                            )
-                        };
+                        let _ = self.app_state.pg_db.append_task_output_ex(
+                            &config.execution_id,
+                            &format!(
+                                "\n=== COMPENSATION ROLLBACK ===\nRolled back to commit {} (policy: {:?})\n",
+                                &commit[..commit.len().min(8)],
+                                config.rollback_policy
+                            ),
+                            false,
+                            false,
+                        ).await;
                     }
                     Ok(None) => {
                         debug!("COMPENSATION: No rollback performed (policy returned None)");
@@ -347,11 +334,7 @@ impl LoopController {
         // sessions_count is incremented in the database on each agentic session,
         // so this enforces the overall session budget even in multi-stage workflows.
         if let Some(max) = config.max_sessions {
-            let task_run_result = if let Some(pg) = &self.app_state.pg_db {
-                pg.get_task_run(&config.execution_id).await
-            } else {
-                self.checkpoint_db.get_task_run(&config.execution_id)
-            };
+            let task_run_result = self.app_state.pg_db.get_task_run(&config.execution_id).await;
             if let Ok(Some(task_run)) = task_run_result {
                 if task_run.sessions_count >= max {
                     warn!(
@@ -388,12 +371,7 @@ impl LoopController {
         // This ensures that any external modifications (e.g., AI calling APIs) don't
         // prematurely mark the task as complete or failed. The loop controller is
         // the ONLY authority on task completion in unified workflows.
-        let status_result = if let Some(pg) = &self.app_state.pg_db {
-            pg.update_task_run_status(&config.execution_id, "running").await
-        } else {
-            self.checkpoint_db
-                .update_task_run_status(&config.execution_id, "running")
-        };
+        let status_result = self.app_state.pg_db.update_task_run_status(&config.execution_id, "running").await;
         if let Err(e) = status_result {
             warn!(
                 "Failed to reset task status to running for iteration {}: {}",
@@ -441,27 +419,15 @@ impl LoopController {
         // Use append_task_output_ex with check_completion_marker=false
         // because in unified workflows, VERIFICATION is the authority on completion,
         // not the [TASK_COMPLETE] marker from the AI
-        let _ = if let Some(pg) = &self.app_state.pg_db {
-            pg.append_task_output_ex(
-                &config.execution_id,
-                &format!(
-                    "\n\n=== Verification-Agentic Loop: Iteration {} ===\n",
-                    ctx.iteration
-                ),
-                false,
-                false,
-            ).await
-        } else {
-            self.checkpoint_db.append_task_output_ex(
-                &config.execution_id,
-                &format!(
-                    "\n\n=== Verification-Agentic Loop: Iteration {} ===\n",
-                    ctx.iteration
-                ),
-                false,
-                false, // Don't check for completion marker - verification is the authority
-            )
-        };
+        let _ = self.app_state.pg_db.append_task_output_ex(
+            &config.execution_id,
+            &format!(
+                "\n\n=== Verification-Agentic Loop: Iteration {} ===\n",
+                ctx.iteration
+            ),
+            false,
+            false,
+        ).await;
 
         LoopState::CheckEnvironment
     }
@@ -495,27 +461,15 @@ impl LoopController {
 
             if !env_result.ready {
                 // Log environment issue to task output
-                let _ = if let Some(pg) = &self.app_state.pg_db {
-                    pg.append_task_output_ex(
-                        &config.execution_id,
-                        &format!(
-                            "\n--- Environment Check (Iteration {}): NOT READY ---\n{}\n",
-                            ctx.iteration, env_result.summary
-                        ),
-                        false,
-                        false,
-                    ).await
-                } else {
-                    self.checkpoint_db.append_task_output_ex(
-                        &config.execution_id,
-                        &format!(
-                            "\n--- Environment Check (Iteration {}): NOT READY ---\n{}\n",
-                            ctx.iteration, env_result.summary
-                        ),
-                        false,
-                        false,
-                    )
-                };
+                let _ = self.app_state.pg_db.append_task_output_ex(
+                    &config.execution_id,
+                    &format!(
+                        "\n--- Environment Check (Iteration {}): NOT READY ---\n{}\n",
+                        ctx.iteration, env_result.summary
+                    ),
+                    false,
+                    false,
+                ).await;
 
                 // Merge env failure context with any existing health regression from the
                 // previous iteration (don't clobber — both are valuable diagnostic context).
@@ -534,27 +488,15 @@ impl LoopController {
                 );
             } else {
                 if env_result.recovery_attempted {
-                    let _ = if let Some(pg) = &self.app_state.pg_db {
-                        pg.append_task_output_ex(
-                            &config.execution_id,
-                            &format!(
-                                "\n--- Environment Check (Iteration {}): RECOVERED ---\n{}\n",
-                                ctx.iteration, env_result.summary
-                            ),
-                            false,
-                            false,
-                        ).await
-                    } else {
-                        self.checkpoint_db.append_task_output_ex(
-                            &config.execution_id,
-                            &format!(
-                                "\n--- Environment Check (Iteration {}): RECOVERED ---\n{}\n",
-                                ctx.iteration, env_result.summary
-                            ),
-                            false,
-                            false,
-                        )
-                    };
+                    let _ = self.app_state.pg_db.append_task_output_ex(
+                        &config.execution_id,
+                        &format!(
+                            "\n--- Environment Check (Iteration {}): RECOVERED ---\n{}\n",
+                            ctx.iteration, env_result.summary
+                        ),
+                        false,
+                        false,
+                    ).await;
                 }
                 debug!("ENV-DOCTOR: {}", env_result.summary);
             }
@@ -804,40 +746,23 @@ impl LoopController {
                 }
             }
 
-            let _ = if let Some(pg) = &self.app_state.pg_db {
-                pg.append_task_output_ex(
-                    &config.execution_id,
-                    &format!("{}{}", summary_line, details),
-                    false,
-                    false,
-                ).await
-            } else {
-                self.checkpoint_db.append_task_output_ex(
-                    &config.execution_id,
-                    &format!("{}{}", summary_line, details),
-                    false,
-                    false,
-                )
-            };
+            let _ = self.app_state.pg_db.append_task_output_ex(
+                &config.execution_id,
+                &format!("{}{}", summary_line, details),
+                false,
+                false,
+            ).await;
         }
 
         // Store verification result in database for Recap page
         // Use parent task ID for workflow sequences (same remapping as step checkpoints)
         if let Ok(result_json) = serde_json::to_value(&verification_result) {
             let parent_id = get_parent_task_id(&config.execution_id);
-            let _ = if let Some(pg) = &self.app_state.pg_db {
-                pg.store_verification_phase_result(
-                    &parent_id,
-                    ctx.iteration,
-                    &result_json,
-                ).await
-            } else {
-                self.checkpoint_db.store_verification_phase_result(
-                    &parent_id,
-                    ctx.iteration,
-                    &result_json,
-                )
-            };
+            let _ = self.app_state.pg_db.store_verification_phase_result(
+                &parent_id,
+                ctx.iteration,
+                &result_json,
+            ).await;
 
             // Sync to web backend (best-effort, non-blocking)
             let parent_id_clone = parent_id.clone();
@@ -1159,7 +1084,7 @@ impl LoopController {
                 &get_parent_task_id(&config.execution_id),
                 ctx.iteration,
                 &verification_result,
-                self.app_state.pg_db.as_ref(),
+                &self.app_state.pg_db,
             ) {
                 Some(warning) => format!("{}\n\n{}", warning, failure_context),
                 None => failure_context,
@@ -1390,8 +1315,8 @@ impl LoopController {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     duration_ms: None,
                 };
-                if let Some(pg) = &self.app_state.pg_db {
-                    let pg = pg.clone();
+                {
+                    let pg = self.app_state.pg_db.clone();
                     let event_clone = blame_event.clone();
                     tokio::spawn(async move {
                         if let Err(e) = pg.create_task_run_event(&event_clone).await {
@@ -1604,19 +1529,11 @@ impl LoopController {
 
                 // Persist constraint results to database for post-run review
                 let parent_id = get_parent_task_id(&config.execution_id);
-                let constraint_store_result = if let Some(pg) = &self.app_state.pg_db {
-                    pg.store_constraint_results(
-                        &parent_id,
-                        ctx.iteration,
-                        &constraint_results,
-                    ).await
-                } else {
-                    self.checkpoint_db.store_constraint_results(
-                        &parent_id,
-                        ctx.iteration,
-                        &constraint_results,
-                    )
-                };
+                let constraint_store_result = self.app_state.pg_db.store_constraint_results(
+                    &parent_id,
+                    ctx.iteration,
+                    &constraint_results,
+                ).await;
                 if let Err(e) = constraint_store_result {
                     warn!(
                         "Failed to store constraint results: {} - continuing anyway",
@@ -1741,7 +1658,7 @@ impl LoopController {
         let (mut trace_tokens_in, mut trace_tokens_out) =
             super::multi_agent_pipeline_loop::query_iteration_tokens(
                 &self.checkpoint_db,
-                self.app_state.pg_db.as_ref(),
+                &self.app_state.pg_db,
                 &config.execution_id,
                 ctx.iteration,
             );
@@ -1813,21 +1730,12 @@ impl LoopController {
                     ctx.iteration
                 ),
             };
-            let _ = if let Some(pg) = &self.app_state.pg_db {
-                pg.append_task_output_ex(
-                    &config.execution_id,
-                    &output_text,
-                    true,
-                    false,
-                ).await
-            } else {
-                self.checkpoint_db.append_task_output_ex(
-                    &config.execution_id,
-                    &output_text,
-                    true,  // increment session count
-                    false, // Don't check for completion marker - verification is the authority
-                )
-            };
+            let _ = self.app_state.pg_db.append_task_output_ex(
+                &config.execution_id,
+                &output_text,
+                true,
+                false,
+            ).await;
         }
 
         // Sync session to web backend (best-effort, non-blocking).
@@ -2046,10 +1954,8 @@ impl LoopController {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     duration_ms: None,
                 };
-                if let Some(pg) = &self.app_state.pg_db {
-                    if let Err(e) = pg.create_task_run_event(&findings_event).await {
-                        warn!("Failed to store agentic findings event (PG): {}", e);
-                    }
+                if let Err(e) = self.app_state.pg_db.create_task_run_event(&findings_event).await {
+                    warn!("Failed to store agentic findings event (PG): {}", e);
                 } else if let Err(e) = self.checkpoint_db.create_task_run_event(&findings_event) {
                     warn!("Failed to store agentic findings event: {}", e);
                 }
@@ -2098,21 +2004,12 @@ impl LoopController {
                 "\n=== AI SIGNALED UNFIXABLE ERRORS ===\nThe AI has determined that some errors cannot be fixed automatically.\nReason: {}\nProceeding to completion phase.\n",
                 reason
             );
-            let _ = if let Some(pg) = &self.app_state.pg_db {
-                pg.append_task_output_ex(
-                    &config.execution_id,
-                    &unfixable_msg,
-                    false,
-                    false,
-                ).await
-            } else {
-                self.checkpoint_db.append_task_output_ex(
-                    &config.execution_id,
-                    &unfixable_msg,
-                    false,
-                    false,
-                )
-            };
+            let _ = self.app_state.pg_db.append_task_output_ex(
+                &config.execution_id,
+                &unfixable_msg,
+                false,
+                false,
+            ).await;
 
             return LoopState::Complete {
                 reason: CompletionReason::UnfixableErrors,
@@ -2255,23 +2152,13 @@ impl LoopController {
 
             // Record to database for audit trail
             let context_json = serde_json::to_string(&context).unwrap_or_else(|_| "{}".to_string());
-            let _ = if let Some(pg) = &self.app_state.pg_db {
-                pg.insert_approval_gate(
-                    &approval_id,
-                    &config.execution_id,
-                    ctx.iteration as i32,
-                    &request.prompt,
-                    &context_json,
-                ).await
-            } else {
-                self.checkpoint_db.insert_approval_gate(
-                    &approval_id,
-                    &config.execution_id,
-                    ctx.iteration,
-                    &request.prompt,
-                    &context_json,
-                )
-            };
+            let _ = self.app_state.pg_db.insert_approval_gate(
+                &approval_id,
+                &config.execution_id,
+                ctx.iteration as i32,
+                &request.prompt,
+                &context_json,
+            ).await;
 
             // Persist workflow state: ApprovalPending
             self.persist_workflow_state(
@@ -2298,27 +2185,15 @@ impl LoopController {
             );
 
             // Log the pause
-            let _ = if let Some(pg) = &self.app_state.pg_db {
-                pg.append_task_output_ex(
-                    &config.execution_id,
-                    &format!(
-                        "\n=== APPROVAL GATE (Iteration {}) ===\nWaiting for human review...\n",
-                        ctx.iteration
-                    ),
-                    false,
-                    false,
-                ).await
-            } else {
-                self.checkpoint_db.append_task_output_ex(
-                    &config.execution_id,
-                    &format!(
-                        "\n=== APPROVAL GATE (Iteration {}) ===\nWaiting for human review...\n",
-                        ctx.iteration
-                    ),
-                    false,
-                    false,
-                )
-            };
+            let _ = self.app_state.pg_db.append_task_output_ex(
+                &config.execution_id,
+                &format!(
+                    "\n=== APPROVAL GATE (Iteration {}) ===\nWaiting for human review...\n",
+                    ctx.iteration
+                ),
+                false,
+                false,
+            ).await;
 
             // Wait for the human response (or stop signal)
             let approval_response = tokio::select! {
@@ -2357,26 +2232,18 @@ impl LoopController {
             };
 
             // Record the response to the database
-            let _ = if let Some(pg) = &self.app_state.pg_db {
-                let status = match approval_response.action.as_str() {
-                    "approve" => "approved",
-                    "reject" => "rejected",
-                    "abort" => "aborted",
-                    other => other,
-                };
-                pg.resolve_approval_gate(
-                    &approval_id,
-                    &approval_response.action,
-                    approval_response.comment.as_deref(),
-                    status,
-                ).await
-            } else {
-                self.checkpoint_db.resolve_approval_gate(
-                    &approval_id,
-                    &approval_response.action,
-                    approval_response.comment.as_deref(),
-                )
+            let status = match approval_response.action.as_str() {
+                "approve" => "approved",
+                "reject" => "rejected",
+                "abort" => "aborted",
+                other => other,
             };
+            let _ = self.app_state.pg_db.resolve_approval_gate(
+                &approval_id,
+                &approval_response.action,
+                approval_response.comment.as_deref(),
+                status,
+            ).await;
 
             // Emit resolved event
             broadcaster.approval_resolved(
@@ -2387,29 +2254,16 @@ impl LoopController {
             );
 
             // Log the decision
-            let _ = if let Some(pg) = &self.app_state.pg_db {
-                pg.append_task_output_ex(
-                    &config.execution_id,
-                    &format!(
-                        "Approval decision: {} (comment: {})\n",
-                        approval_response.action,
-                        approval_response.comment.as_deref().unwrap_or("none")
-                    ),
-                    false,
-                    false,
-                ).await
-            } else {
-                self.checkpoint_db.append_task_output_ex(
-                    &config.execution_id,
-                    &format!(
-                        "Approval decision: {} (comment: {})\n",
-                        approval_response.action,
-                        approval_response.comment.as_deref().unwrap_or("none")
-                    ),
-                    false,
-                    false,
-                )
-            };
+            let _ = self.app_state.pg_db.append_task_output_ex(
+                &config.execution_id,
+                &format!(
+                    "Approval decision: {} (comment: {})\n",
+                    approval_response.action,
+                    approval_response.comment.as_deref().unwrap_or("none")
+                ),
+                false,
+                false,
+            ).await;
 
             // Handle the response
             if approval_response.action == "abort" {

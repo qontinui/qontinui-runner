@@ -601,8 +601,8 @@ impl StepExecutor {
                 };
 
                 // PG-primary: fire-and-forget async write to PostgreSQL
-                if let Some(pg) = &self.app_state.pg_db {
-                    let pg = pg.clone();
+                {
+                    let pg = self.app_state.pg_db.clone();
                     let event_clone = event.clone();
                     tokio::spawn(async move {
                         if let Err(e) = pg.create_task_run_event(&event_clone).await {

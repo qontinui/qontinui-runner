@@ -57,7 +57,7 @@ pub struct StepEventLogger {
     /// Database for persisting events
     checkpoint_db: Arc<CheckpointDb>,
     /// PostgreSQL database (PG-primary, SQLite fallback)
-    pg_db: Option<Arc<PgDb>>,
+    pg_db: Arc<PgDb>,
     /// Workflow name for event context
     workflow_name: String,
 }
@@ -67,7 +67,7 @@ impl std::fmt::Debug for StepEventLogger {
         f.debug_struct("StepEventLogger")
             .field("tracker", &self.tracker)
             .field("checkpoint_db", &"<CheckpointDb>")
-            .field("pg_db", &self.pg_db.as_ref().map(|_| "<PgDb>"))
+            .field("pg_db", &"<PgDb>")
             .field("workflow_name", &self.workflow_name)
             .finish()
     }
@@ -81,7 +81,7 @@ impl StepEventLogger {
     /// only parent IDs exist in task_runs (required by foreign key constraint).
     pub fn new(
         checkpoint_db: Arc<CheckpointDb>,
-        pg_db: Option<Arc<PgDb>>,
+        pg_db: Arc<PgDb>,
         execution_id: impl Into<String>,
         workflow_name: impl Into<String>,
     ) -> Self {
@@ -105,7 +105,7 @@ impl StepEventLogger {
     ///
     /// For full logging support, use the direct run_* methods with a
     /// proper StepEventLogger instance.
-    pub fn noop() -> Self {
+    pub fn noop(pg_db: Arc<PgDb>) -> Self {
         // Use a minimal in-memory database that won't persist anything
         // This is a workaround - events logged to this logger are silently discarded
         // because we use an in-memory database that's not shared.
@@ -113,7 +113,7 @@ impl StepEventLogger {
         Self {
             tracker: TrackerHandle::new("noop"),
             checkpoint_db: Arc::new(db),
-            pg_db: None,
+            pg_db,
             workflow_name: String::new(),
         }
     }
@@ -158,8 +158,8 @@ impl StepEventLogger {
         let event = builder.build_start();
 
         // PG-primary: fire-and-forget async write to PostgreSQL
-        if let Some(pg) = &self.pg_db {
-            let pg = pg.clone();
+        {
+            let pg = self.pg_db.clone();
             let event_clone = event.clone();
             tokio::spawn(async move {
                 if let Err(e) = pg.create_task_run_event(&event_clone).await {
@@ -210,8 +210,8 @@ impl StepEventLogger {
         let event = builder.build_complete(duration_ms);
 
         // PG-primary: fire-and-forget async write to PostgreSQL
-        if let Some(pg) = &self.pg_db {
-            let pg = pg.clone();
+        {
+            let pg = self.pg_db.clone();
             let event_clone = event.clone();
             tokio::spawn(async move {
                 if let Err(e) = pg.create_task_run_event(&event_clone).await {
@@ -263,8 +263,8 @@ impl StepEventLogger {
         let event = builder.build_error(duration_ms, error);
 
         // PG-primary: fire-and-forget async write to PostgreSQL
-        if let Some(pg) = &self.pg_db {
-            let pg = pg.clone();
+        {
+            let pg = self.pg_db.clone();
             let event_clone = event.clone();
             tokio::spawn(async move {
                 if let Err(e) = pg.create_task_run_event(&event_clone).await {

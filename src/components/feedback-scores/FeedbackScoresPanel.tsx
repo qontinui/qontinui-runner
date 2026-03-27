@@ -316,12 +316,12 @@ export function FeedbackScoresPanel({ runId }: FeedbackScoresPanelProps) {
   }
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-3" data-tutorial-id="feedback-scores-panel">
       {/* Header */}
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-muted-foreground">Feedback Scores</h3>
         {!showForm && (
-          <Button variant="outline" size="sm" onClick={() => setShowForm(true)}>
+          <Button variant="outline" size="sm" onClick={() => setShowForm(true)} data-tutorial-id="feedback-add-score">
             <Plus className="w-3.5 h-3.5 mr-1.5" />
             Add Score
           </Button>
@@ -348,7 +348,7 @@ export function FeedbackScoresPanel({ runId }: FeedbackScoresPanelProps) {
       )}
 
       {/* Summary */}
-      {memoizedSummary && <SummaryStrip summary={memoizedSummary} />}
+      {memoizedSummary && <div data-tutorial-id="feedback-summary"><SummaryStrip summary={memoizedSummary} /></div>}
 
       {/* Individual scores */}
       <div className="space-y-2">

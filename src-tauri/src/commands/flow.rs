@@ -132,11 +132,7 @@ pub async fn start_flow_execution(
     inputs: HashMap<String, serde_json::Value>,
 ) -> Result<String, String> {
     // Get flow from database
-    let flow_json = if let Some(pg) = &app_state.pg_db {
-        pg.get_flow(&flow_id).await?
-    } else {
-        app_state.checkpoint_db.get_flow(&flow_id)?
-    }
+    let flow_json = app_state.pg_db.get_flow(&flow_id).await?
     .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
 
     let flow: Flow = serde_json::from_value(flow_json)
@@ -163,11 +159,7 @@ pub async fn start_flow_execution(
     // Persist to database
     let state_json = serde_json::to_value(&state)
         .map_err(|e| format!("Failed to serialize flow execution: {}", e))?;
-    if let Some(pg) = &app_state.pg_db {
-        pg.save_flow_execution(&state_json).await?;
-    } else {
-        app_state.checkpoint_db.save_flow_execution(&state_json)?;
-    }
+    app_state.pg_db.save_flow_execution(&state_json).await?;
 
     // Emit flow started event
     emit_flow_event(
@@ -240,11 +232,7 @@ pub async fn step_flow_execution(
 
     // Persist updated state
     if let Ok(state_json) = serde_json::to_value(&*state) {
-        if let Some(pg) = &app_state.pg_db {
-            let _ = pg.save_flow_execution(&state_json).await;
-        } else {
-            let _ = app_state.checkpoint_db.save_flow_execution(&state_json);
-        }
+        let _ = app_state.pg_db.save_flow_execution(&state_json).await;
     }
 
     match result {
@@ -324,11 +312,7 @@ pub async fn run_flow_execution(
 
     // Persist final state
     if let Ok(state_json) = serde_json::to_value(&state) {
-        if let Some(pg) = &app_state.pg_db {
-            let _ = pg.save_flow_execution(&state_json).await;
-        } else {
-            let _ = app_state.checkpoint_db.save_flow_execution(&state_json);
-        }
+        let _ = app_state.pg_db.save_flow_execution(&state_json).await;
     }
 
     // Record learning outcome + agentic metrics for this flow execution
@@ -412,11 +396,7 @@ pub async fn provide_flow_input(
 
     // Persist updated state
     if let Ok(state_json) = serde_json::to_value(&*state) {
-        if let Some(pg) = &app_state.pg_db {
-            let _ = pg.save_flow_execution(&state_json).await;
-        } else {
-            let _ = app_state.checkpoint_db.save_flow_execution(&state_json);
-        }
+        let _ = app_state.pg_db.save_flow_execution(&state_json).await;
     }
 
     Ok(true)
@@ -437,11 +417,7 @@ pub async fn get_flow_execution(
     }
 
     // Fall back to database for completed executions
-    let exec_json = if let Some(pg) = &state.pg_db {
-        pg.get_flow_execution(&instance_id).await?
-    } else {
-        state.checkpoint_db.get_flow_execution(&instance_id)?
-    };
+    let exec_json = state.pg_db.get_flow_execution(&instance_id).await?;
     if let Some(e) = exec_json {
         match serde_json::from_value::<FlowState>(e) {
             Ok(exec) => Ok(Some(exec)),
@@ -539,11 +515,7 @@ pub async fn cancel_flow_execution(
 
         // Update database
         if let Ok(state_json) = serde_json::to_value(&*state) {
-            if let Some(pg) = &app_state.pg_db {
-            let _ = pg.save_flow_execution(&state_json).await;
-        } else {
-            let _ = app_state.checkpoint_db.save_flow_execution(&state_json);
-        }
+            let _ = app_state.pg_db.save_flow_execution(&state_json).await;
         }
 
         info!(instance_id = %instance_id, "Flow execution cancelled");
@@ -790,11 +762,7 @@ pub async fn pause_flow_execution(
 
         // Persist updated state
         if let Ok(state_json) = serde_json::to_value(&*state) {
-            if let Some(pg) = &app_state.pg_db {
-            let _ = pg.save_flow_execution(&state_json).await;
-        } else {
-            let _ = app_state.checkpoint_db.save_flow_execution(&state_json);
-        }
+            let _ = app_state.pg_db.save_flow_execution(&state_json).await;
         }
 
         // Emit pause event (using flow_id captured before mutable borrow)
@@ -888,11 +856,7 @@ pub async fn resume_flow_execution(
 
     // Persist final state
     if let Ok(state_json) = serde_json::to_value(&state) {
-        if let Some(pg) = &app_state.pg_db {
-            let _ = pg.save_flow_execution(&state_json).await;
-        } else {
-            let _ = app_state.checkpoint_db.save_flow_execution(&state_json);
-        }
+        let _ = app_state.pg_db.save_flow_execution(&state_json).await;
     }
 
     match result {
@@ -967,11 +931,7 @@ pub async fn step_into_flow(
 
     // Persist updated state
     if let Ok(state_json) = serde_json::to_value(&*state) {
-        if let Some(pg) = &app_state.pg_db {
-            let _ = pg.save_flow_execution(&state_json).await;
-        } else {
-            let _ = app_state.checkpoint_db.save_flow_execution(&state_json);
-        }
+        let _ = app_state.pg_db.save_flow_execution(&state_json).await;
     }
 
     match result {

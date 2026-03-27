@@ -175,10 +175,8 @@ impl StepHandler for WorkflowRefHandler {
             .with_workflow_type("unified");
 
         // PG-primary: write to PostgreSQL first
-        if let Some(pg) = &context.app_state.pg_db {
-            if let Err(e) = pg.create_task_run(&input).await {
-                warn!("PG create_task_run for workflow_ref failed: {}", e);
-            }
+        if let Err(e) = context.app_state.pg_db.create_task_run(&input).await {
+            warn!("PG create_task_run for workflow_ref failed: {}", e);
         }
         if let Err(e) = context.app_state.checkpoint_db.create_task_run(&input) {
             warn!("Failed to create task_run for workflow_ref: {}", e);
@@ -282,9 +280,7 @@ impl StepHandler for WorkflowRefHandler {
                 if workflow_result.success {
                     info!("workflow_ref '{}' completed successfully", workflow.name);
                     // PG-primary
-                    if let Some(pg) = &context.app_state.pg_db {
-                        let _ = pg.complete_task_run(&execution_id).await;
-                    }
+                    let _ = context.app_state.pg_db.complete_task_run(&execution_id).await;
                     let _ = context
                         .app_state
                         .checkpoint_db
@@ -301,9 +297,7 @@ impl StepHandler for WorkflowRefHandler {
                     let error_msg = format!("workflow_ref '{}' failed", workflow.name);
                     warn!("{}", error_msg);
                     // PG-primary
-                    if let Some(pg) = &context.app_state.pg_db {
-                        let _ = pg.fail_task_run(&execution_id, &error_msg).await;
-                    }
+                    let _ = context.app_state.pg_db.fail_task_run(&execution_id, &error_msg).await;
                     let _ = context
                         .app_state
                         .checkpoint_db
@@ -328,9 +322,7 @@ impl StepHandler for WorkflowRefHandler {
                 );
                 warn!("{}", error_msg);
                 // PG-primary
-                if let Some(pg) = &context.app_state.pg_db {
-                    let _ = pg.fail_task_run(&execution_id, &error_msg).await;
-                }
+                let _ = context.app_state.pg_db.fail_task_run(&execution_id, &error_msg).await;
                 let _ = context
                     .app_state
                     .checkpoint_db

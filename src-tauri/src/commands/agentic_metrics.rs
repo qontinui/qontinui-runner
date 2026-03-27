@@ -85,13 +85,7 @@ pub async fn push_agentic_scores_to_backend(
         task_run_id, target_type, target_id
     );
 
-    let scores = if let Some(ref pg) = state.pg_db {
-        pg.get_agentic_scores_for_run(&task_run_id).await?
-    } else {
-        state
-            .checkpoint_db
-            .get_agentic_scores_for_run(&task_run_id)?
-    };
+    let scores = state.pg_db.get_agentic_scores_for_run(&task_run_id).await?;
 
     if scores.is_empty() {
         info!("No agentic scores found for task_run_id={}", task_run_id);
@@ -189,20 +183,9 @@ pub async fn push_latest_agentic_scores(
 ) -> Result<PushScoresResult, String> {
     info!("Finding most recent task run with agentic scores...");
 
-    let task_run_id: String = if let Some(ref pg) = state.pg_db {
-        pg.get_latest_scored_task_run_id()
-            .await?
-            .ok_or_else(|| "No agentic scores found".to_string())?
-    } else {
-        state.checkpoint_db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT task_run_id FROM agentic_metric_scores ORDER BY scored_at DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("No agentic scores found: {}", e))
-        })?
-    };
+    let task_run_id: String = state.pg_db.get_latest_scored_task_run_id()
+        .await?
+        .ok_or_else(|| "No agentic scores found".to_string())?;
 
     info!("Most recent task_run_id with scores: {}", task_run_id);
 

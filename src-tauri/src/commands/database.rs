@@ -77,11 +77,7 @@ pub fn optimize_database(
 pub async fn get_database_stats(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Getting database statistics");
 
-    let stats: DatabaseStats = if let Some(pg) = &state.pg_db {
-        pg.get_database_stats().await?
-    } else {
-        state.checkpoint_db.get_database_stats()?
-    };
+    let stats: DatabaseStats = state.pg_db.get_database_stats().await?;
 
     let message = format!(
         "Database size: {:.2} MB, {} tables, {} total rows",
@@ -121,11 +117,7 @@ pub async fn explain_query_plan(
 ) -> Result<CommandResponse, String> {
     info!("Running EXPLAIN QUERY PLAN for query: {}", query);
 
-    let plan = if let Some(pg) = &state.pg_db {
-        pg.explain_query_plan(&query).await?
-    } else {
-        state.checkpoint_db.explain_query_plan(&query)?
-    };
+    let plan = state.pg_db.explain_query_plan(&query).await?;
 
     Ok(CommandResponse {
         success: true,

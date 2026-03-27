@@ -162,7 +162,7 @@ struct SubtreeOutput {
 #[derive(Clone)]
 struct PipelineShared {
     checkpoint_db: Arc<crate::database::CheckpointDb>,
-    pg_db: Option<Arc<crate::database::pg::PgDb>>,
+    pg_db: Arc<crate::database::pg::PgDb>,
     agentic_executor: Arc<super::phases::AgenticExecutor>,
     verification_executor: Arc<super::phases::VerificationExecutor>,
 }
@@ -180,21 +180,16 @@ impl PipelineShared {
     /// Mirror of `LoopController::is_task_stopped` — only needs `checkpoint_db`.
     fn is_task_stopped(&self, execution_id: &str) -> bool {
         let task_id_to_check = super::types::get_parent_task_id(execution_id);
-        // PG-primary: try PG first, fall back to SQLite
-        let task_result = if let Some(ref pg) = self.pg_db {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let pg = pg.clone();
-                let id = task_id_to_check.clone();
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle.block_on(async move { pg.get_task_run(&id).await })
-                }))
-                .unwrap_or_else(|_| Err("block_on panicked".to_string()))
-                .or_else(|_| self.checkpoint_db.get_task_run(&task_id_to_check))
-            } else {
-                self.checkpoint_db.get_task_run(&task_id_to_check)
-            }
+        // PG-primary: use block_on to call async PG from sync context
+        let task_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let pg = self.pg_db.clone();
+            let id = task_id_to_check.clone();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.block_on(async move { pg.get_task_run(&id).await })
+            }))
+            .unwrap_or_else(|_| Err("block_on panicked".to_string()))
         } else {
-            self.checkpoint_db.get_task_run(&task_id_to_check)
+            Err("no tokio runtime".to_string())
         };
         match task_result {
             Ok(Some(task)) => {
@@ -441,7 +436,7 @@ fn build_dependency_dag(criteria: &[PipelineAcceptanceCriterion]) -> ExecutionDA
 /// Returns (input_tokens, output_tokens). Falls back to (0, 0) on error.
 pub(super) fn query_iteration_tokens(
     db: &crate::database::CheckpointDb,
-    pg_db: Option<&std::sync::Arc<crate::database::pg::PgDb>>,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     execution_id: &str,
     iteration: u32,
 ) -> (u64, u64) {
@@ -449,16 +444,14 @@ pub(super) fn query_iteration_tokens(
     // Uses catch_unwind because Handle::block_on panics if called from within
     // an async context (which these sync helpers are called from). On panic,
     // we silently fall through to the SQLite path.
-    if let Some(pg) = pg_db {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let pg = pg.clone();
-            let id = execution_id.to_string();
-            let pg_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle.block_on(async move { pg.get_iteration_token_totals(&id, iteration).await })
-            }));
-            if let Ok(Ok(totals)) = pg_result {
-                return totals;
-            }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let id = execution_id.to_string();
+        let pg_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle.block_on(async move { pg.get_iteration_token_totals(&id, iteration).await })
+        }));
+        if let Ok(Ok(totals)) = pg_result {
+            return totals;
         }
     }
 
@@ -513,16 +506,7 @@ impl LoopController {
             let mut variants = std::collections::HashMap::new();
             for agent_type in &["spec_analyst", "locator", "implementer", "verifier"] {
                 // Use PG prompt registry when available, fall back to SQLite
-                let variant_opt = if let Some(ref pg) = self.app_state.pg_db {
-                    pg.get_active_prompt(agent_type).await.ok().flatten()
-                } else {
-                    crate::meta_optimizer::prompt_registry::get_active_prompt(
-                        &self.checkpoint_db,
-                        agent_type,
-                    )
-                    .ok()
-                    .flatten()
-                };
+                let variant_opt = self.app_state.pg_db.get_active_prompt(agent_type).await.ok().flatten();
                 if let Some(variant) = variant_opt {
                     debug!(
                         "MULTI-AGENT-PIPELINE: Using prompt variant '{}' v{} for {}",
@@ -530,20 +514,12 @@ impl LoopController {
                     );
                     // Route through canary A/B split if an active canary exists.
                     // Use PG canary resolution when available, fall back to SQLite.
-                    let resolved = if let Some(ref pg) = self.app_state.pg_db {
-                        crate::meta_optimizer::canary::resolve_prompt_with_canary_pg(
-                            pg,
-                            agent_type,
-                            &variant.prompt_content,
-                        )
-                        .await
-                    } else {
-                        crate::meta_optimizer::canary::resolve_prompt_with_canary(
-                            &self.checkpoint_db,
-                            agent_type,
-                            &variant.prompt_content,
-                        )
-                    };
+                    let resolved = crate::meta_optimizer::canary::resolve_prompt_with_canary_pg(
+                        &self.app_state.pg_db,
+                        agent_type,
+                        &variant.prompt_content,
+                    )
+                    .await;
                     if let Some(ref cid) = resolved.canary_id {
                         info!(
                             "MULTI-AGENT-PIPELINE: Canary {} active for {}, using {} version",
@@ -942,7 +918,7 @@ Only output the JSON array, nothing else."#,
             // Query token usage recorded during the locator's run_agentic call (iteration=0).
             // Fall back to tokens carried on AgenticOutcome when DB has no records.
             let (mut locator_tokens_in, mut locator_tokens_out) =
-                query_iteration_tokens(&self.checkpoint_db, self.app_state.pg_db.as_ref(), &config.execution_id, 0);
+                query_iteration_tokens(&self.checkpoint_db, &self.app_state.pg_db, &config.execution_id, 0);
             if locator_tokens_in == 0 && locator_tokens_out == 0 {
                 let (ot_in, ot_out) = locator_outcome.token_usage();
                 locator_tokens_in = ot_in.unwrap_or(0);
@@ -1767,7 +1743,7 @@ impl PipelineShared {
                 // PG data is always available via dual-write.
                 let (mut impl_tokens_in, mut impl_tokens_out) = query_iteration_tokens(
                     &self.checkpoint_db,
-                    None,
+                    &self.pg_db,
                     &config.execution_id,
                     local_iterations,
                 );

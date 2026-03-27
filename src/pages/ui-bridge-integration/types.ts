@@ -141,6 +141,34 @@ export interface WriteHooksResult {
   warnings: string[];
 }
 
+// --- Page Discovery (AI-powered preparation) ---
+
+export interface PageComponent {
+  route: string;
+  component_path: string;
+  component_name: string;
+  has_registrations: boolean;
+  has_spec: boolean;
+  has_tutorial: boolean;
+}
+
+export interface DiscoverPagesResult {
+  pages: PageComponent[];
+  framework: Framework;
+}
+
+export interface ReadPageSourceResult {
+  main_source: string;
+  imported_sources: Array<{ path: string; content: string }>;
+  total_lines: number;
+}
+
+export interface PageGenerationOptions {
+  generateRegistrations: boolean;
+  generateSpecs: boolean;
+  generateTutorials: boolean;
+}
+
 // --- API Response wrapper ---
 
 export interface ApiResponse<T> {

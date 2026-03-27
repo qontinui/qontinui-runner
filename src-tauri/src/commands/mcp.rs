@@ -59,11 +59,7 @@ impl<T> McpResponse<T> {
 pub async fn list_mcp_servers(
     state: State<'_, Arc<AppState>>,
 ) -> Result<McpResponse<Vec<McpServerConfig>>, String> {
-    let result = if let Some(pg) = &state.pg_db {
-        pg.list_mcp_servers().await
-    } else {
-        state.checkpoint_db.list_mcp_servers()
-    };
+    let result = state.pg_db.list_mcp_servers().await;
     match result {
         Ok(servers) => Ok(McpResponse::ok(servers)),
         Err(e) => {
@@ -79,11 +75,7 @@ pub async fn get_mcp_server(
     state: State<'_, Arc<AppState>>,
     server_id: String,
 ) -> Result<McpResponse<McpServerConfig>, String> {
-    let result = if let Some(pg) = &state.pg_db {
-        pg.get_mcp_server(&server_id).await
-    } else {
-        state.checkpoint_db.get_mcp_server(&server_id)
-    };
+    let result = state.pg_db.get_mcp_server(&server_id).await;
     match result {
         Ok(Some(server)) => Ok(McpResponse::ok(server)),
         Ok(None) => Ok(McpResponse::err(format!(
@@ -105,11 +97,7 @@ pub async fn create_mcp_server(
 ) -> Result<McpResponse<McpServerConfig>, String> {
     info!("Creating MCP server: {}", input.name);
 
-    let result = if let Some(pg) = &state.pg_db {
-        pg.create_mcp_server(input).await
-    } else {
-        state.checkpoint_db.create_mcp_server(input)
-    };
+    let result = state.pg_db.create_mcp_server(input).await;
     match result {
         Ok(server) => {
             info!("Created MCP server: {} ({})", server.name, server.id);

@@ -132,7 +132,7 @@ pub fn record_evolution_full(
 /// Like `record_evolution`, but also writes to PostgreSQL if a pool is provided.
 pub fn record_evolution_with_pg(
     db: &CheckpointDb,
-    pg_db: Option<&std::sync::Arc<crate::database::pg::PgDb>>,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     agent_type: &str,
     parent_variant_id: Option<&str>,
     variant_id: &str,
@@ -153,34 +153,32 @@ pub fn record_evolution_with_pg(
     )?;
 
     // Fire-and-forget PG write
-    if let Some(pg) = pg_db {
-        let pg = pg.clone();
-        let id_clone = id.clone();
-        let agent_type = agent_type.to_string();
-        let parent_variant_id = parent_variant_id.map(|s| s.to_string());
-        let variant_id = variant_id.to_string();
-        let recommendation_id = recommendation_id.map(|s| s.to_string());
-        let critique = critique.map(|s| s.to_string());
-        let changes_summary = changes_summary.map(|s| s.to_string());
+    let pg = pg_db.clone();
+    let id_clone = id.clone();
+    let agent_type = agent_type.to_string();
+    let parent_variant_id = parent_variant_id.map(|s| s.to_string());
+    let variant_id = variant_id.to_string();
+    let recommendation_id = recommendation_id.map(|s| s.to_string());
+    let critique = critique.map(|s| s.to_string());
+    let changes_summary = changes_summary.map(|s| s.to_string());
 
-        tokio::spawn(async move {
-            if let Err(e) = pg
-                .record_prompt_evolution(
-                    &id_clone,
-                    &agent_type,
-                    parent_variant_id.as_deref(),
-                    &variant_id,
-                    recommendation_id.as_deref(),
-                    critique.as_deref(),
-                    changes_summary.as_deref(),
-                    score_before,
-                )
-                .await
-            {
-                tracing::warn!("PG prompt_evolution write failed: {}", e);
-            }
-        });
-    }
+    tokio::spawn(async move {
+        if let Err(e) = pg
+            .record_prompt_evolution(
+                &id_clone,
+                &agent_type,
+                parent_variant_id.as_deref(),
+                &variant_id,
+                recommendation_id.as_deref(),
+                critique.as_deref(),
+                changes_summary.as_deref(),
+                score_before,
+            )
+            .await
+        {
+            tracing::warn!("PG prompt_evolution write failed: {}", e);
+        }
+    });
 
     Ok(id)
 }

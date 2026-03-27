@@ -299,18 +299,8 @@ pub async fn create_prompt_canary(
     candidate_version: i32,
     traffic_pct: f64,
 ) -> Result<String, String> {
-    if let Some(ref pg) = app_state.pg_db {
-        pg.create_template_canary(&template_id, baseline_version, candidate_version, traffic_pct)
-            .await
-    } else {
-        crate::meta_optimizer::canary::create_prompt_template_canary(
-            &app_state.checkpoint_db,
-            &template_id,
-            baseline_version,
-            candidate_version,
-            traffic_pct,
-        )
-    }
+    app_state.pg_db.create_template_canary(&template_id, baseline_version, candidate_version, traffic_pct)
+        .await
 }
 
 #[tauri::command]
@@ -318,16 +308,9 @@ pub async fn get_prompt_canary_status(
     app_state: State<'_, Arc<AppState>>,
     canary_id: String,
 ) -> Result<serde_json::Value, String> {
-    let canary = if let Some(ref pg) = app_state.pg_db {
-        pg.get_template_canary(&canary_id)
-            .await?
-            .ok_or_else(|| format!("Prompt template canary not found: {}", canary_id))?
-    } else {
-        crate::meta_optimizer::canary::get_prompt_template_canary(
-            &app_state.checkpoint_db,
-            &canary_id,
-        )?
-    };
+    let canary = app_state.pg_db.get_template_canary(&canary_id)
+        .await?
+        .ok_or_else(|| format!("Prompt template canary not found: {}", canary_id))?;
     let evaluation = crate::meta_optimizer::canary::evaluate_prompt_canary(&canary);
 
     let mut val =

@@ -6,7 +6,7 @@
  */
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { aiDataService } from "../services/ai-data-service";
 import {
   useRunnerEvents,
@@ -132,7 +132,26 @@ export function useTaskRuns(limit?: number) {
  */
 export function useTaskRun(taskId: string | null) {
   const queryClient = useQueryClient();
-  const [taskIsRunning, setTaskIsRunning] = useState(false);
+  const query = useQuery({
+    queryKey: aiDataKeys.taskRun(taskId ?? ""),
+    queryFn: async (): Promise<TaskRun | null> => {
+      if (!taskId) return null;
+      const response = await aiDataService.getTaskRun(taskId);
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to load task run");
+      }
+      return response.data;
+    },
+    enabled: !!taskId,
+    staleTime: 5000,
+    // Relaxed polling — subscription handles real-time updates
+    refetchInterval: (q) => {
+      return q.state.data?.status === "running" ? 10000 : false;
+    },
+  });
+
+  // Derive running state from query data (avoids setState-in-callback render loops)
+  const taskIsRunning = query.data?.status === "running";
 
   // Subscribe to this task's progress when it's running
   const { data: progressData } = useTaskRunProgressForInvalidation(
@@ -150,26 +169,6 @@ export function useTaskRun(taskId: string | null) {
     }
   }, [progressData, taskId, queryClient]);
 
-  const query = useQuery({
-    queryKey: aiDataKeys.taskRun(taskId ?? ""),
-    queryFn: async (): Promise<TaskRun | null> => {
-      if (!taskId) return null;
-      const response = await aiDataService.getTaskRun(taskId);
-      if (!response.success || !response.data) {
-        throw new Error(response.error || "Failed to load task run");
-      }
-      return response.data;
-    },
-    enabled: !!taskId,
-    staleTime: 5000,
-    // Relaxed polling — subscription handles real-time updates
-    refetchInterval: (query) => {
-      const status = query.state.data?.status;
-      const running = status === "running";
-      setTaskIsRunning(running);
-      return running ? 10000 : false;
-    },
-  });
   return query;
 }
 

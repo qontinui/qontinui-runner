@@ -201,7 +201,9 @@ export function SkillApprovalPanel() {
           <div className="px-4 py-8 text-center text-sm text-muted-foreground">
             {filter === "pending"
               ? "No pending skills to review. Skills are auto-extracted when workflows succeed after complex fixes."
-              : `No ${filter} skills found.`}
+              : filter === "all"
+                ? "No auto-extracted skills yet. Skills are created when workflows succeed after complex fixes."
+                : `No ${filter} skills found.`}
           </div>
         )}
 

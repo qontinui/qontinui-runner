@@ -74,14 +74,13 @@ export type MainTabId =
   | "terminal"
   | "llm-analytics"
   | "evaluation"
-  | "element-reliability"
-  | "pipeline-events"
-  | "rule-influence"
-  | "unified-search"
-  | "workflow-versions"
   | "skills"
   | "help"
-  | "automation-health";
+  | "automation-health"
+  | "activity-timeline"
+  | "watchers"
+  | "knowledge-explorer"
+  | "event-history";
 
 const VALID_TAB_IDS: MainTabId[] = [
   "gui-automation",
@@ -157,14 +156,13 @@ const VALID_TAB_IDS: MainTabId[] = [
   "terminal",
   "llm-analytics",
   "evaluation",
-  "element-reliability",
-  "pipeline-events",
-  "rule-influence",
-  "unified-search",
-  "workflow-versions",
   "skills",
   "help",
   "automation-health",
+  "activity-timeline",
+  "watchers",
+  "knowledge-explorer",
+  "event-history",
 ];
 
 export const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";

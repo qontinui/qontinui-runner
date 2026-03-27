@@ -280,7 +280,7 @@ export function DashboardPage({
       // Restore window if it was auto-minimized
       await windowManager.restoreIfMinimized();
     }
-  }, [state.taskInfo?.taskId, isFlowActive, flowExecutionData.instanceId]);
+  }, [state.taskInfo?.taskId, isFlowActive, flowExecutionData.instanceId, taskControls]);
 
   // Handle play/pause toggle - works for GUI automation and flow execution
   const handlePlayPause = useCallback(async () => {
@@ -375,6 +375,7 @@ export function DashboardPage({
     isFlowActive,
     flowExecutionData.instanceId,
     flowExecutionData.status,
+    taskControls,
   ]);
 
   // Get current action text for bottom bar

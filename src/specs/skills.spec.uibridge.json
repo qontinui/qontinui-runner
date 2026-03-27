@@ -1,0 +1,671 @@
+{
+  "version": "1.0.0",
+  "id": "runner:skills",
+  "description": "Procedural Skills Approval Panel -- review interface for auto-extracted fix patterns learned from successful workflow runs. When a workflow iterates 3+ times and produces an effective fix (reuse_count >= 2), the fix pattern is captured as a reusable skill with source='auto' and approval_status='pending'. Users review pending skills here and approve or reject them; approved skills are injected into future worker agent prompts during the agentic phase (up to 10 skills, 2000-char token budget). The self-repair loop auto-disables approved skills that cause 3+ consecutive verification failures by reverting them to 'pending'. Data source: GET /skills fetches from user_skills table (SQLite), filtered client-side to source='auto'. Approval mutations use POST /skills/{id}/approve. Skill metrics available at GET /graph/skill-metrics. Skills are also mirrored to PG observations (topic_key='skill:<slug>') for cross-session full-text search, and materialized as Skill nodes in the knowledge graph with DerivedFrom, UsedIn, and Supersedes edges.",
+  "metadata": {
+    "component": "SkillApprovalPanel",
+    "pageId": "skills",
+    "pageUrl": "/skills",
+    "elementSource": "sdk",
+    "tags": [
+      "skills",
+      "procedural-memory",
+      "hermes-agent",
+      "approval-workflow",
+      "self-repair",
+      "knowledge-graph",
+      "cross-run-learning",
+      "meta-optimizer"
+    ],
+    "backendFiles": [
+      "src-tauri/src/mcp/skills.rs",
+      "src-tauri/src/database/skills_ops.rs",
+      "src-tauri/src/skills/mod.rs",
+      "src-tauri/src/skills/builtin.json",
+      "src-tauri/src/reflection/cross_run_learning.rs",
+      "src-tauri/src/orchestrator/integration.rs",
+      "src-tauri/src/reflection/graph_engine.rs",
+      "src-tauri/src/mcp/graph_api.rs",
+      "src-tauri/src/workflow_event_bus.rs"
+    ],
+    "apiEndpoints": [
+      "GET /skills",
+      "GET /skills/{id}",
+      "POST /skills/{id}/approve",
+      "POST /skills/{id}/increment-usage",
+      "GET /graph/skill-metrics",
+      "GET /graph/summary"
+    ]
+  },
+  "groups": [
+    {
+      "id": "skills-semantic-purpose",
+      "name": "Page Purpose and Identity",
+      "description": "The Skills page is the human review gate for auto-extracted procedural memory. It answers: 'What fix patterns has the system learned, and should they be trusted to guide future work?' The page header identifies itself with a lightning bolt (Zap) icon, the title 'Procedural Skills', and a subtitle explaining provenance. The page is empty by default until workflows extract skills -- this is expected, not an error.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "skills-page-heading",
+          "description": "Users see the heading 'Procedural Skills' identifying this as the skill review interface",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Procedural Skills", "tagName": "h2" },
+            "label": "Page heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "skills-provenance-subtitle",
+          "description": "Users see the subtitle 'Auto-extracted from successful runs' explaining that skills are machine-generated, not manually created",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Auto-extracted from successful runs" },
+            "label": "Provenance subtitle"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "skills-empty-pending-guidance",
+          "description": "When no pending skills exist (default state for a fresh system), users see guidance text explaining how skills are created: 'No pending skills to review. Skills are auto-extracted when workflows succeed after complex fixes.'",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No pending skills to review" },
+            "label": "Empty state guidance"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "This message appears on the Pending filter (default). Other filters show 'No {status} skills found.'"
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "skills-navigation",
+      "name": "Page Navigation",
+      "description": "The Skills page is reachable from the runner sidebar under the OBSERVE navigation group, positioned after Meta-Optimizer. The sidebar entry uses a Zap icon with amber (#F59E0B) color. The tab ID is 'skills' and the page is lazy-loaded via React.lazy.",
+      "category": "navigation",
+      "assertions": [
+        {
+          "id": "skills-sidebar-nav-item",
+          "description": "The sidebar contains a 'Skills' navigation entry that users can click to open this page",
+          "category": "navigation",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Skills" },
+            "label": "Skills sidebar item"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "skills-page-loads-after-nav",
+          "description": "After clicking the Skills sidebar entry, the main content area shows the 'Procedural Skills' heading within 2 seconds",
+          "category": "navigation",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Procedural Skills" },
+            "label": "Page heading after navigation"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "Component is lazy-loaded (React.lazy) so there may be a brief loading flash on first visit."
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "skills-element-presence",
+      "name": "Core UI Elements",
+      "description": "The page has a header bar (title + subtitle + refresh button), a filter tab bar (4 buttons: Pending, Approved, Rejected, All), and a scrollable content area showing skill rows or empty state. The refresh button shows a spinning icon during API fetch.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "skills-refresh-button",
+          "description": "A refresh button exists in the header bar with title='Refresh', showing a RefreshCw icon",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Refresh button (has title='Refresh')"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "The button has no visible text -- only an icon. Find by title attribute or by proximity to the heading."
+        },
+        {
+          "id": "skills-filter-pending-tab",
+          "description": "The 'Pending' filter tab button exists with a count suffix showing (N) where N is the number of pending skills",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Pending" },
+            "label": "Pending filter button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "expected": "Button text is 'Pending (N)' where N is the count of pending auto-skills. When selected, it has class bg-primary text-primary-foreground."
+        },
+        {
+          "id": "skills-filter-approved-tab",
+          "description": "The 'Approved' filter tab button exists with a count suffix",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Approved" },
+            "label": "Approved filter button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "skills-filter-rejected-tab",
+          "description": "The 'Rejected' filter tab button exists with a count suffix",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Rejected" },
+            "label": "Rejected filter button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "skills-filter-all-tab",
+          "description": "The 'All' filter tab button exists (shows no count suffix)",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "All" },
+            "label": "All filter button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "skills-data-display-rows",
+      "name": "Skill Row Data Display",
+      "description": "Each skill is rendered as a row with: a chevron toggle (ChevronRight when collapsed, ChevronDown when expanded), a status icon (green CheckCircle for approved, red XCircle for rejected, amber Clock for pending), the skill name (truncated via CSS text-ellipsis), and secondary metadata line showing 'category . vX.Y.Z . used Nx'. Data comes from GET /skills, filtered client-side to source='auto'.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "skills-row-expand-chevron",
+          "description": "Each skill row shows a clickable chevron icon that toggles between collapsed (right arrow) and expanded (down arrow) states",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Expand/collapse toggle"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "At least one auto-extracted skill exists in the user_skills table with source='auto'"
+        },
+        {
+          "id": "skills-row-name-display",
+          "description": "The skill name is shown as the primary text in the row, using font-medium weight and text-xs size. Auto-extracted skills have names starting with 'Auto:' followed by the fix description",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Auto:" },
+            "label": "Skill name starting with Auto:"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "At least one auto-extracted skill exists in the user_skills table with source='auto'"
+        },
+        {
+          "id": "skills-row-metadata-line",
+          "description": "Below each skill name, a metadata line shows the category, version (e.g., 'v1.0.0'), and usage count (e.g., 'used 0x') separated by middot characters",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "used" },
+            "label": "Usage count in metadata line"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "At least one auto-extracted skill exists in the user_skills table with source='auto'",
+          "expected": "Text format is '{category} . v{version} . used {N}x' where N is an integer >= 0"
+        },
+        {
+          "id": "skills-row-pending-icon",
+          "description": "Pending skills show an amber Clock icon as their status indicator",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Auto:" },
+            "label": "Pending skill row"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "At least one skill with approval_status='pending' exists",
+          "expected": "The row contains an SVG element with class text-amber-500 (the Clock icon)"
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "skills-data-display-expanded",
+      "name": "Expanded Skill Detail View",
+      "description": "Clicking the chevron expands a detail panel below the skill row, indented to align with the skill name. The panel shows labeled fields: Description (full text), Tags (comma-separated), Phases (comma-separated), and Created (localized datetime). For auto-extracted skills, a Provenance section appears with a muted background showing Fix type (monospace), Source run (monospace, 10px), Fix ID (monospace, 10px), and Effectiveness (green text). Provenance data is parsed from the skill's description field which embeds 'task_run: {id}, fix: {id}' and 'Fix type: {type}' patterns.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "skills-detail-description-field",
+          "description": "The expanded view shows a 'Description:' label followed by the full skill description text",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Description:" },
+            "label": "Description field label"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "A skill row has been expanded by clicking its chevron",
+          "expected": "For auto-extracted skills, the description text includes: workflow name, task_run ID, fix ID, fix type, and iteration count"
+        },
+        {
+          "id": "skills-detail-tags-field",
+          "description": "The expanded view shows a 'Tags:' label followed by comma-separated tag values",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Tags:" },
+            "label": "Tags field label"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "A skill row has been expanded by clicking its chevron",
+          "expected": "For auto-extracted skills, tags include 'auto' and the fix type (e.g., 'auto, selector_fix'). Skills with no tags show 'none'."
+        },
+        {
+          "id": "skills-detail-phases-field",
+          "description": "The expanded view shows a 'Phases:' label followed by comma-separated workflow phase names",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Phases:" },
+            "label": "Phases field label"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "A skill row has been expanded by clicking its chevron",
+          "expected": "Auto-extracted skills show 'agentic' since they are restricted to the agentic phase"
+        },
+        {
+          "id": "skills-detail-created-field",
+          "description": "The expanded view shows a 'Created:' label followed by a localized datetime string",
+          "category": "data-display",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Created:" },
+            "label": "Created field label"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "A skill row has been expanded by clicking its chevron"
+        },
+        {
+          "id": "skills-detail-provenance-section",
+          "description": "The expanded view shows a 'Provenance' section with a muted background (bg-muted/50) containing fix traceability data",
+          "category": "data-display",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Provenance" },
+            "label": "Provenance section heading"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "An auto-extracted skill with a parseable description (containing 'task_run:' and 'Fix type:' patterns) has been expanded",
+          "expected": "Section displays: Fix type (monospace font), Source run ID (monospace, 10px), Fix ID from source_fix_id column (monospace, 10px), Effectiveness rating (green text, typically 'effective')"
+        },
+        {
+          "id": "skills-detail-fix-id",
+          "description": "The provenance section shows 'Fix ID:' followed by the source_fix_id value in monospace font",
+          "category": "data-display",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Fix ID:" },
+            "label": "Fix ID field in provenance"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "An auto-extracted skill with source_fix_id set has been expanded"
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "skills-interaction-approval",
+      "name": "Approval and Rejection Actions",
+      "description": "Pending skills show inline Approve (green) and Reject (red) buttons in the row. Approved/rejected skills show these buttons in the expanded detail panel instead, along with a 'Reset to Pending' button (amber). All three buttons call POST /skills/{id}/approve with the target status. The UI updates optimistically -- the skill immediately moves to the new filter tab. If the API returns a non-ok response, the update is not applied (no rollback of optimistic state since the API call happens before the state update).",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "skills-approve-button-pending",
+          "description": "Users can click 'Approve' on a pending skill to mark it for injection into future worker prompts. The button has green styling (bg-green-500/10 text-green-600).",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Approve" },
+            "label": "Approve button on pending skill"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "At least one skill with approval_status='pending' exists in user_skills with source='auto'",
+          "expected": "After clicking, the skill disappears from the Pending tab. The Pending count decreases by 1 and the Approved count increases by 1. The skill appears under the Approved filter tab."
+        },
+        {
+          "id": "skills-reject-button-pending",
+          "description": "Users can click 'Reject' on a pending skill to prevent it from being injected into prompts. The button has red styling (bg-red-500/10 text-red-600).",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Reject" },
+            "label": "Reject button on pending skill"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "At least one skill with approval_status='pending' exists in user_skills with source='auto'",
+          "expected": "After clicking, the skill disappears from the Pending tab. The Pending count decreases by 1 and the Rejected count increases by 1."
+        },
+        {
+          "id": "skills-reset-button-expanded",
+          "description": "Users can click 'Reset to Pending' on an approved or rejected skill (in its expanded detail view) to return it to the pending state for re-review. The button has amber styling (bg-amber-500/10 text-amber-600).",
+          "category": "interaction",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Reset to Pending" },
+            "label": "Reset to Pending button"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "A skill with approval_status='approved' or 'rejected' has been expanded by clicking its chevron",
+          "expected": "After clicking, the skill moves to the Pending tab. The source status count decreases by 1 and the Pending count increases by 1."
+        },
+        {
+          "id": "skills-filter-tab-click",
+          "description": "Users can click any filter tab (Pending, Approved, Rejected, All) to switch which skills are displayed. The active tab gets primary styling (bg-primary text-primary-foreground) while inactive tabs show muted styling.",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Approved" },
+            "label": "Approved filter tab"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "expected": "Clicking switches the content area to show only skills matching the selected status. The clicked tab gets bg-primary styling. The count in parentheses reflects the actual number of skills in that category."
+        },
+        {
+          "id": "skills-chevron-expand-toggle",
+          "description": "Users can click the chevron button on a skill row to toggle the detail panel open or closed",
+          "category": "interaction",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Chevron expand button on a skill row"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "At least one auto-extracted skill exists",
+          "expected": "Clicking toggles the detail panel. Only one skill can be expanded at a time -- expanding a new skill collapses the previously expanded one. The chevron rotates from right-pointing to down-pointing."
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "skills-behavior",
+      "name": "Loading, Error, and Refresh Behavior",
+      "description": "The panel fetches skills from GET /skills on mount (via useEffect) and on refresh button click. During fetch, the RefreshCw icon gains the animate-spin CSS class. If the API returns an error or the fetch throws, a red error message appears in the content area. The panel filters the API response client-side to only show skills with source='auto'.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "skills-no-error-on-load",
+          "description": "Under normal operation, no error message is visible -- the page loads skills successfully from GET /skills",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Failed to fetch" },
+            "label": "Error message (should not appear)"
+          },
+          "assertionType": "notExists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "expected": "No element with class text-destructive containing error text is visible. If this assertion fails, the GET /skills API endpoint is not responding."
+        },
+        {
+          "id": "skills-refresh-triggers-reload",
+          "description": "Clicking the refresh button re-fetches skills from GET /skills and updates the displayed list. During fetch, the RefreshCw icon spins.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Refresh button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "expected": "After clicking, the icon briefly gains animate-spin class. When fetch completes, the skill list reflects the latest database state (including any newly extracted or modified skills)."
+        },
+        {
+          "id": "skills-empty-state-per-filter",
+          "description": "When no skills match the active filter, users see a centered, muted text message instead of a blank area",
+          "category": "behavior",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "skills" },
+            "label": "Empty state message (varies by filter)"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "expected": "Pending filter shows: 'No pending skills to review. Skills are auto-extracted when workflows succeed after complex fixes.' Other filters show: 'No {status} skills found.'"
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "skills-state-consistency",
+      "name": "State Consistency After Mutations",
+      "description": "When a skill's approval status is changed, the filter tab counts must update immediately and the skill must appear under the correct filter. The state is managed client-side via React useState -- no page reload occurs. The API mutation (POST /skills/{id}/approve) fires before the state update, so a failed API call prevents the UI from changing.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "skills-count-consistency",
+          "description": "The sum of Pending + Approved + Rejected counts always equals the total number of auto-extracted skills (visible on the All tab)",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "All" },
+            "label": "All filter tab"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "expected": "Clicking 'All' shows every auto-extracted skill regardless of status. The total count should equal the sum of the three status counts shown on the other tabs."
+        },
+        {
+          "id": "skills-approve-updates-counts",
+          "description": "After approving a skill, the Pending count decreases by 1 and the Approved count increases by 1, both immediately visible on the filter tabs",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Approved" },
+            "label": "Approved filter tab after approval"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "A pending skill was just approved by clicking its Approve button"
+        },
+        {
+          "id": "skills-approved-skill-in-prompt",
+          "description": "After a skill is approved, it becomes eligible for injection into worker agent prompts during the agentic phase. The next workflow run's worker prompt will include a '## Procedural Skills (Auto-Learned)' section listing the approved skill's name, slug, category, and first sentence of description.",
+          "category": "state-consistency",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Approved" },
+            "label": "Approved tab (backend verification)"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "notes": "This is a backend behavior -- not directly observable in the UI. The prompt injection is handled by build_skill_context() in integration.rs which queries WHERE approval_status = 'approved' AND source = 'auto'."
+        },
+        {
+          "id": "skills-auto-disable-reflected",
+          "description": "If the self-repair system auto-disables a skill (reverts from approved to pending after 3 consecutive failures), clicking Refresh shows the skill back in the Pending tab",
+          "category": "state-consistency",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Pending" },
+            "label": "Pending tab after auto-disable"
+          },
+          "assertionType": "exists",
+          "enabled": true,
+          "source": "manual",
+          "reviewed": true,
+          "precondition": "An approved skill was auto-disabled by the self-repair system (3+ consecutive verification failures in a task run with the skill active), and the user clicked Refresh"
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "skills-design",
+      "name": "Visual Design and Layout",
+      "description": "The panel uses a vertical flex layout (flex-col h-full): header bar with border-b, filter tab bar with border-b, and flex-1 overflow-y-auto content area. Skill rows have border-b with last:border-0. Action buttons use 10px font size with semi-transparent colored backgrounds. Status icons are 14px (w-3.5 h-3.5). The expanded detail panel is indented to pl-10 to align with the skill name.",
+      "category": "design",
+      "assertions": [
+        {
+          "id": "skills-header-border",
+          "description": "The header bar has a bottom border separating it from the filter tabs",
+          "category": "design",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Procedural Skills" },
+            "label": "Header container"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "expected": "The header div has classes 'border-b border-border' providing visual separation from the filter tabs below"
+        },
+        {
+          "id": "skills-filter-tab-active-styling",
+          "description": "The currently active filter tab is visually distinguished from inactive tabs",
+          "category": "design",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Pending" },
+            "label": "Active Pending tab (default)"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "expected": "Active tab has classes 'bg-primary text-primary-foreground'. Inactive tabs have 'text-muted-foreground hover:bg-accent'. All tabs use 'text-xs rounded-md transition-colors'."
+        }
+      ],
+      "source": "manual"
+    }
+  ]
+}

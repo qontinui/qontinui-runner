@@ -113,20 +113,9 @@ impl InstanceManager {
             config.name, pid, config.port
         );
 
-        // Assign to Job Object so it's cleaned up if parent crashes
-        #[cfg(windows)]
-        {
-            use windows_sys::Win32::Foundation::CloseHandle;
-            use windows_sys::Win32::System::Threading::OpenProcess;
-            const PROCESS_ALL_ACCESS: u32 = 0x001F_0FFF;
-            unsafe {
-                let process_handle = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
-                if !process_handle.is_null() {
-                    crate::job_object::assign_process_to_job(process_handle);
-                    CloseHandle(process_handle);
-                }
-            }
-        }
+        // Do NOT assign instances to the Job Object.  The supervisor
+        // explicitly stops unprotected secondaries before killing the primary,
+        // and protected instances must survive primary restarts/rebuilds.
 
         instances.insert(
             config.id.clone(),

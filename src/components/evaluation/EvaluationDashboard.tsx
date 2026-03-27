@@ -131,7 +131,7 @@ export default function EvaluationDashboard() {
   }
 
   return (
-    <div className="h-full overflow-hidden flex flex-col">
+    <div className="h-full overflow-hidden flex flex-col" data-tutorial-id="evaluation-dashboard">
       {/* Top bar */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-border/50 shrink-0">
         <div>
@@ -151,6 +151,7 @@ export default function EvaluationDashboard() {
           <Button
             size="sm"
             onClick={() => setShowCreateDataset(!showCreateDataset)}
+            data-tutorial-id="evaluation-create-dataset"
           >
             <Plus className="w-3.5 h-3.5" />
             New Dataset
@@ -195,7 +196,7 @@ export default function EvaluationDashboard() {
       {/* Main two-panel layout */}
       <div className="flex-1 flex min-h-0 overflow-hidden">
         {/* Left panel: datasets + detail */}
-        <div className="w-1/2 flex flex-col border-r border-border/50 min-h-0">
+        <div className="w-1/2 flex flex-col border-r border-border/50 min-h-0" data-tutorial-id="evaluation-datasets-panel">
           {/* Dataset list (top portion) */}
           <Card className="m-2 mb-1 shrink-0 max-h-[40%] overflow-auto">
             <div className="px-3 py-2 border-b border-border/50">
@@ -238,7 +239,7 @@ export default function EvaluationDashboard() {
         </div>
 
         {/* Right panel: experiments + results / live evaluation */}
-        <div className="w-1/2 flex flex-col min-h-0">
+        <div className="w-1/2 flex flex-col min-h-0" data-tutorial-id="evaluation-experiments-panel">
           {/* Tab switcher */}
           <div className="flex items-center gap-1 px-2 pt-2 shrink-0">
             <button

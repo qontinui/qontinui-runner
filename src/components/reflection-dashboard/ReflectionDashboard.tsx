@@ -211,6 +211,72 @@ const AXIS_TICK_STYLE = {
 };
 
 // ============================================================================
+// Graph Insights Sub-Tabs
+// ============================================================================
+
+type GraphTab = "patterns" | "rules" | "pipeline" | "provenance" | "versions";
+
+const GRAPH_TABS: { id: GraphTab; label: string }[] = [
+  { id: "patterns", label: "Cross-Run Patterns" },
+  { id: "rules", label: "Rule Influence" },
+  { id: "pipeline", label: "Pipeline Events" },
+  { id: "provenance", label: "Step Provenance" },
+  { id: "versions", label: "Versions" },
+];
+
+function GraphInsightsSection({
+  workflowName,
+  pipelineEvents,
+  eventsLoading,
+}: {
+  workflowName: string;
+  pipelineEvents: import("../../hooks/useGraphAnalytics").PipelineEvent[];
+  eventsLoading: boolean;
+}) {
+  const [activeTab, setActiveTab] = useState<GraphTab>("patterns");
+
+  return (
+    <div className="space-y-3" data-tutorial-id="graph-insights-section">
+      <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+        Graph Insights
+      </h3>
+      <div className="flex gap-1 border-b border-border pb-px" data-tutorial-id="graph-insights-tabs">
+        {GRAPH_TABS.map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            data-tutorial-id={`graph-tab-${tab.id}`}
+            className={`px-3 py-1.5 text-xs font-medium rounded-t transition-colors ${
+              activeTab === tab.id
+                ? "bg-card text-foreground border border-border border-b-transparent -mb-px"
+                : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+      <div>
+        {activeTab === "patterns" && (
+          <CrossRunPatternsPanel workflowName={workflowName} />
+        )}
+        {activeTab === "rules" && <RuleInfluencePanel />}
+        {activeTab === "pipeline" && (
+          <PipelineEventsTimeline
+            events={pipelineEvents}
+            isLoading={eventsLoading}
+          />
+        )}
+        {activeTab === "provenance" && (
+          <StepProvenanceTimeline workflowId={workflowName} />
+        )}
+        {activeTab === "versions" && <WorkflowVersionLineage />}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
 // Component
 // ============================================================================
 
@@ -727,18 +793,13 @@ export function ReflectionDashboard() {
               </div>
             </div>
 
-            {/* Graph Insights Section */}
+            {/* Graph Insights Section — sub-tabbed for focus */}
             {workflowName && (
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">Graph Insights</h3>
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                  <CrossRunPatternsPanel workflowName={workflowName} />
-                  <RuleInfluencePanel />
-                </div>
-                <PipelineEventsTimeline events={pipelineEvents || []} isLoading={eventsLoading} />
-                <StepProvenanceTimeline workflowId={workflowName} />
-                <WorkflowVersionLineage />
-              </div>
+              <GraphInsightsSection
+                workflowName={workflowName}
+                pipelineEvents={pipelineEvents || []}
+                eventsLoading={eventsLoading}
+              />
             )}
           </>
         )}

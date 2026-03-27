@@ -1,16 +1,22 @@
 import React from "react";
-import type { TraceInsights } from "./types";
+import type { TraceInsights, CriticalPathInfo } from "./types";
 import { formatDuration } from "./trace-utils";
 
 interface PerformanceInsightsProps {
   insights: TraceInsights;
+  criticalPath?: CriticalPathInfo | null;
 }
 
-export const PerformanceInsights: React.FC<PerformanceInsightsProps> = ({ insights }) => {
+export const PerformanceInsights: React.FC<PerformanceInsightsProps> = ({ insights, criticalPath }) => {
   if (insights.spanCount === 0) return null;
 
+  const parallelSlack =
+    criticalPath && insights.totalDurationMs > 0
+      ? insights.totalDurationMs - criticalPath.pathDurationMs
+      : null;
+
   return (
-    <div className="flex items-center gap-4 px-3 py-1.5 bg-zinc-900 border-t border-zinc-700 text-[11px] text-zinc-500">
+    <div className="flex flex-wrap items-center gap-4 px-3 py-1.5 bg-zinc-900 border-t border-zinc-700 text-[11px] text-zinc-500" data-tutorial-id="trace-performance-insights">
       <span>
         Total: <span className="text-zinc-300">{formatDuration(insights.totalDurationMs)}</span>
       </span>
@@ -31,6 +37,36 @@ export const PerformanceInsights: React.FC<PerformanceInsightsProps> = ({ insigh
           </span>
         </span>
       )}
+
+      {/* Critical path stats */}
+      {criticalPath && criticalPath.pathDurationMs > 0 && (
+        <>
+          <span className="text-zinc-600">|</span>
+          <span>
+            Critical path:{" "}
+            <span className="text-red-300">
+              {formatDuration(criticalPath.pathDurationMs)}
+              {insights.totalDurationMs > 0 &&
+                ` (${((criticalPath.pathDurationMs / insights.totalDurationMs) * 100).toFixed(0)}%)`}
+            </span>
+          </span>
+          {criticalPath.bottleneck && (
+            <span>
+              Bottleneck:{" "}
+              <span className="text-red-300">
+                {criticalPath.bottleneck.name.replace(/^qontinui\./, "")} (
+                {formatDuration(criticalPath.bottleneck.durationMs)})
+              </span>
+            </span>
+          )}
+          {parallelSlack !== null && parallelSlack > 0 && (
+            <span>
+              Parallel slack: <span className="text-zinc-300">{formatDuration(parallelSlack)}</span>
+            </span>
+          )}
+        </>
+      )}
+
       {/* Phase breakdown */}
       <span className="ml-auto flex gap-2">
         {Object.entries(insights.phaseBreakdown)

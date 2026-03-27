@@ -45,7 +45,7 @@ pub(super) fn get_active_sdk_app_name(app_state: &crate::commands::AppState) -> 
 /// Silently ignores errors (best-effort tracking).
 pub(super) fn record_phase_token_usage(
     db: &CheckpointDb,
-    pg_db: Option<&std::sync::Arc<PgDb>>,
+    pg_db: &std::sync::Arc<PgDb>,
     task_run_id: &str,
     phase: &str,
     stage_index: Option<u32>,
@@ -66,7 +66,7 @@ pub(super) fn record_phase_token_usage(
 /// Record phase token usage with optional UI Bridge target app attribution.
 pub(super) fn record_phase_token_usage_with_target(
     db: &CheckpointDb,
-    pg_db: Option<&std::sync::Arc<PgDb>>,
+    pg_db: &std::sync::Arc<PgDb>,
     task_run_id: &str,
     phase: &str,
     stage_index: Option<u32>,
@@ -95,29 +95,29 @@ pub(super) fn record_phase_token_usage_with_target(
     );
 
     // PG-primary: fire-and-forget async write to PostgreSQL
-    if let Some(pg) = pg_db {
-        let pg = pg.clone();
-        let task_run_id = task_run_id.to_string();
-        let phase = phase.to_string();
-        let model_used = model_used.map(|s| s.to_string());
-        let provider_used = provider_used.map(|s| s.to_string());
-        let target_app_owned = target_app.map(|s| s.to_string());
-        let target_page_owned = target_page_url.map(|s| s.to_string());
+    {
+        let pg = pg_db.clone();
+        let pg_task_run_id = task_run_id.to_string();
+        let pg_phase = phase.to_string();
+        let pg_model = model_used.map(|s| s.to_string());
+        let pg_provider = provider_used.map(|s| s.to_string());
+        let pg_app = target_app.map(|s| s.to_string());
+        let pg_page = target_page_url.map(|s| s.to_string());
         tokio::spawn(async move {
             if let Err(e) = pg
                 .create_phase_token_usage_with_target(
-                    &task_run_id,
-                    &phase,
+                    &pg_task_run_id,
+                    &pg_phase,
                     stage_index,
                     iteration,
-                    model_used.as_deref(),
-                    provider_used.as_deref(),
+                    pg_model.as_deref(),
+                    pg_provider.as_deref(),
                     input,
                     output,
                     cost_cents,
                     duration_ms,
-                    target_app_owned.as_deref(),
-                    target_page_owned.as_deref(),
+                    pg_app.as_deref(),
+                    pg_page.as_deref(),
                 )
                 .await
             {

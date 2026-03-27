@@ -69,3 +69,64 @@ export interface TraceInsights {
   slowestSpan: { name: string; durationMs: number } | null;
   phaseBreakdown: Record<string, number>;
 }
+
+// ---------------------------------------------------------------------------
+// Flamechart types
+// ---------------------------------------------------------------------------
+
+/** A node in the flamechart layout (computed from TraceTreeNode). */
+export interface FlameNode {
+  span: TraceSpan;
+  phase: WorkflowPhase;
+  depth: number;
+  /** Fractional x start within [0, 1] relative to the root being displayed. */
+  xStart: number;
+  /** Fractional x end within [0, 1]. */
+  xEnd: number;
+  children: FlameNode[];
+}
+
+// ---------------------------------------------------------------------------
+// Cross-run comparison types
+// ---------------------------------------------------------------------------
+
+/** Alignment result between two spans from different runs. */
+export interface SpanMatch {
+  spanA: TraceSpan | null;
+  spanB: TraceSpan | null;
+  durationDelta: number | null;
+  durationDeltaPct: number | null;
+  status: "unchanged" | "faster" | "slower" | "added" | "removed" | "status_changed";
+}
+
+/** Summary of a cross-run comparison. */
+export interface ComparisonSummary {
+  totalDurationA: number;
+  totalDurationB: number;
+  totalDeltaPct: number;
+  fasterCount: number;
+  slowerCount: number;
+  addedCount: number;
+  removedCount: number;
+  statusChangedCount: number;
+  regressions: SpanMatch[];
+}
+
+// ---------------------------------------------------------------------------
+// Critical path types
+// ---------------------------------------------------------------------------
+
+/** Critical path analysis result. */
+export interface CriticalPathInfo {
+  /** Span IDs on the critical path. */
+  spanIds: Set<string>;
+  /** Total duration of the critical path in ms. */
+  pathDurationMs: number;
+  /** The bottleneck span (longest individual span on the path). */
+  bottleneck: { name: string; durationMs: number } | null;
+  /** Slack per span: how much longer a span could take without affecting total time. */
+  slackBySpanId: Map<string, number>;
+}
+
+/** Active view mode for the trace viewer. */
+export type TraceViewMode = "waterfall" | "flamechart" | "comparison";

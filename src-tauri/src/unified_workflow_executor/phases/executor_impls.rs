@@ -118,7 +118,7 @@ impl Executor for SetupExecutor {
                 &config.prompt_steps,
                 &config.execution_id,
                 &config.workflow_name,
-                &StepEventLogger::noop(),
+                &StepEventLogger::noop(self.app_state.pg_db.clone()),
                 None,
                 config.model_override.clone(),
                 config.provider_override.clone(),
@@ -148,7 +148,7 @@ impl Executor for VerificationExecutor {
                 &config.execution_id,
                 config.iteration,
                 &config.workflow_name,
-                &StepEventLogger::noop(),
+                &StepEventLogger::noop(self.app_state.pg_db.clone()),
                 None,
             )
             .await;
@@ -226,7 +226,7 @@ impl Executor for AgenticExecutor {
                 &config.failure_context,
                 config.has_agentic_steps,
                 &[], // No step configs available via trait interface
-                &StepEventLogger::noop(),
+                &StepEventLogger::noop(self.app_state.pg_db.clone()),
             )
             .await;
 
@@ -251,7 +251,7 @@ impl Executor for CompletionExecutor {
                 &config.execution_id,
                 &config.workflow_name,
                 config.iterations_run,
-                &StepEventLogger::noop(),
+                &StepEventLogger::noop(self.app_state.pg_db.clone()),
                 None,
                 config.model_override.clone(),
                 config.provider_override.clone(),

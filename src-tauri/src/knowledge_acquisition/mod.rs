@@ -29,19 +29,44 @@ static GLOBAL_INSTANCE: OnceLock<Arc<KnowledgeAcquisition>> = OnceLock::new();
 
 /// Optional context for knowledge flywheel (Tier 0 lookup + Tier 3 storage).
 /// When provided, search() will check local knowledge first and store results after.
+/// Supports both SQLite (CheckpointDb) and PostgreSQL (PgDb) backends.
 pub struct SearchContext {
     pub db: Arc<crate::database::CheckpointDb>,
+    pub pg: Option<Arc<crate::database::pg::PgDb>>,
     pub task_run_id: String,
 }
 
 impl SearchContext {
-    /// Create a system-level context (for API routes without a specific task)
+    /// Create a system-level context (for API routes without a specific task).
+    /// Attempts PG connection from DATABASE_URL env var; falls back to SQLite-only.
     pub fn system() -> Option<Self> {
         let db = crate::database::CheckpointDb::new().ok()?;
+        // Try PG — safe on both single- and multi-threaded tokio runtimes
+        let pg = std::env::var("DATABASE_URL").ok().and_then(|url| {
+            let handle = tokio::runtime::Handle::try_current().ok()?;
+            std::thread::spawn(move || handle.block_on(crate::database::pg::PgDb::try_new(&url)))
+                .join()
+                .ok()?
+                .map(Arc::new)
+        });
         Some(Self {
             db: Arc::new(db),
+            pg,
             task_run_id: "system".to_string(),
         })
+    }
+
+    /// Create with an explicit PG reference (for callers that already have one)
+    pub fn with_pg(
+        db: Arc<crate::database::CheckpointDb>,
+        pg: Option<Arc<crate::database::pg::PgDb>>,
+        task_run_id: String,
+    ) -> Self {
+        Self {
+            db,
+            pg,
+            task_run_id,
+        }
     }
 }
 
@@ -140,15 +165,20 @@ impl KnowledgeAcquisition {
         let mut all_results: Vec<KnowledgeResult> = Vec::new();
 
         // === Tier 0: Local knowledge (if DB available) ===
-        if let Some(ref ctx) = ctx {
-            if let Ok(local_results) = self.search_local(query, &mut budget, ctx).await {
-                if !local_results.is_empty() {
+        if let Some(ctx) = ctx {
+            match self.search_local(query, &mut budget, ctx).await {
+                Ok(local_results) if !local_results.is_empty() => {
                     let count = local_results.len() as u64;
                     self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    self.stats
-                        .local_knowledge
-                        .record_success(count, 0);
+                    self.stats.local_knowledge.record_success(count, 0);
                     return Ok(local_results);
+                }
+                Ok(_) => {
+                    // Queried successfully but no matches — record the attempt
+                    self.stats.local_knowledge.record_success(0, 0);
+                }
+                Err(_) => {
+                    self.stats.local_knowledge.record_failure();
                 }
             }
         }
@@ -182,7 +212,10 @@ impl KnowledgeAcquisition {
                     Err(_) => {
                         self.stats.ui_bridge.record_timeout();
                     }
-                    _ => {}
+                    Ok(Ok(_)) => {
+                        // Empty results — still a successful query
+                        self.stats.ui_bridge.record_success(0, 0);
+                    }
                 }
             }
         }
@@ -303,7 +336,13 @@ impl KnowledgeAcquisition {
         if !all_results.is_empty() {
             if let Some(ctx) = ctx {
                 let outcomes =
-                    ingestor::ingest_results(&all_results, &ctx.task_run_id, &ctx.db).await;
+                    ingestor::ingest_results(
+                        &all_results,
+                        &ctx.task_run_id,
+                        &ctx.db,
+                        ctx.pg.as_ref(),
+                    )
+                    .await;
                 let stored = outcomes
                     .iter()
                     .filter(|o| matches!(o, ingestor::IngestOutcome::Stored { .. }))
@@ -337,7 +376,8 @@ impl KnowledgeAcquisition {
         Ok(all_results)
     }
 
-    /// Tier 0: Check local task_knowledge via hybrid_search
+    /// Tier 0: Check local task_knowledge via hybrid_search.
+    /// Prefers PG when available, falls back to SQLite.
     async fn search_local(
         &self,
         query: &str,
@@ -345,7 +385,7 @@ impl KnowledgeAcquisition {
         ctx: &SearchContext,
     ) -> Result<Vec<KnowledgeResult>, String> {
         use crate::database::embedding_client::EmbeddingClient;
-        use crate::database::hybrid_search::{hybrid_search_knowledge, HybridSearchConfig};
+        use crate::database::hybrid_search::HybridSearchConfig;
 
         let embedding_client = EmbeddingClient::new();
         if !embedding_client.is_available().await {
@@ -364,13 +404,21 @@ impl KnowledgeAcquisition {
             min_similarity: 0.5,
         };
 
-        let conn = ctx
-            .db
-            .get_conn()
-            .map_err(|e| format!("DB connection failed: {e}"))?;
-
-        let results = hybrid_search_knowledge(&conn, &embedding, None, &config)
-            .map_err(|e| format!("Hybrid search failed: {e}"))?;
+        // Prefer PG, fall back to SQLite
+        let results = if let Some(ref pg) = ctx.pg {
+            pg.hybrid_search_knowledge(&embedding, None, &config)
+                .await
+                .map_err(|e| format!("PG hybrid search failed: {e}"))?
+        } else {
+            let conn = ctx
+                .db
+                .get_conn()
+                .map_err(|e| format!("DB connection failed: {e}"))?;
+            crate::database::hybrid_search::hybrid_search_knowledge(
+                &conn, &embedding, None, &config,
+            )
+            .map_err(|e| format!("Hybrid search failed: {e}"))?
+        };
 
         if results.is_empty() {
             return Ok(Vec::new());
@@ -401,6 +449,7 @@ impl KnowledgeAcquisition {
             return Ok(Vec::new());
         }
 
+        self.stats.total_searches.fetch_add(1, Ordering::Relaxed);
         let mut budget = self.config.to_budget();
         let mut all_results: Vec<KnowledgeResult> = Vec::new();
 
@@ -454,7 +503,19 @@ impl KnowledgeAcquisition {
         snapshot_type: SnapshotType,
         query: Option<&str>,
     ) -> Result<Vec<KnowledgeResult>, String> {
-        self.ui_bridge.fetch(snapshot_type, query).await
+        match self.ui_bridge.fetch(snapshot_type, query).await {
+            Ok(results) => {
+                let bytes: usize = results.iter().map(|r| r.content.len()).sum();
+                self.stats
+                    .ui_bridge
+                    .record_success(results.len() as u64, bytes as u64);
+                Ok(results)
+            }
+            Err(e) => {
+                self.stats.ui_bridge.record_failure();
+                Err(e)
+            }
+        }
     }
 
     /// Deep API documentation search via Tavily
@@ -463,11 +524,23 @@ impl KnowledgeAcquisition {
         query: &str,
         max_results: usize,
     ) -> Result<Vec<KnowledgeResult>, String> {
-        if let Some(ref tavily) = self.tavily {
-            tavily.search(query, max_results, "advanced").await
+        let (provider, result) = if let Some(ref tavily) = self.tavily {
+            (SearchProvider::Tavily, tavily.search(query, max_results, "advanced").await)
         } else {
-            self.duckduckgo.search(query, max_results).await
+            (SearchProvider::DuckDuckGo, self.duckduckgo.search(query, max_results).await)
+        };
+        match &result {
+            Ok(results) => {
+                let bytes: usize = results.iter().map(|r| r.content.len()).sum();
+                self.stats
+                    .provider(provider)
+                    .record_success(results.len() as u64, bytes as u64);
+            }
+            Err(_) => {
+                self.stats.provider(provider).record_failure();
+            }
         }
+        result
     }
 
     /// Query OSV.dev for a specific package version
@@ -480,7 +553,17 @@ impl KnowledgeAcquisition {
         if !self.config.enabled {
             return Ok(Vec::new());
         }
-        self.osv.query_package(name, ecosystem, version).await
+        match self.osv.query_package(name, ecosystem, version).await {
+            Ok(results) => {
+                let bytes: usize = results.iter().map(|r| r.content.len()).sum();
+                self.stats.osv.record_success(results.len() as u64, bytes as u64);
+                Ok(results)
+            }
+            Err(e) => {
+                self.stats.osv.record_failure();
+                Err(e)
+            }
+        }
     }
 
     /// Batch audit dependencies via OSV.dev
@@ -491,7 +574,17 @@ impl KnowledgeAcquisition {
         if !self.config.enabled {
             return Ok(Vec::new());
         }
-        self.osv.query_batch(packages).await
+        match self.osv.query_batch(packages).await {
+            Ok(results) => {
+                let total_vulns: usize = results.iter().map(|(_, v)| v.len()).sum();
+                self.stats.osv.record_success(total_vulns as u64, 0);
+                Ok(results)
+            }
+            Err(e) => {
+                self.stats.osv.record_failure();
+                Err(e)
+            }
+        }
     }
 }
 

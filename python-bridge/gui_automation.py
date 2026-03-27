@@ -90,8 +90,106 @@ class GUIAutomation:
         self.ai_prompt_executor = AIPromptExecutor(emit_log_fn=emit_log_fn)
         self.gemini_executor = GeminiExecutor(emit_log_fn=emit_log_fn)
 
+        # Activity timeline capture callback (set by executor, optional)
+        self._emit_timeline_capture: Callable[[dict], None] | None = None
+
         # Initialize accessibility capture service for ref-based actions
         self._accessibility_service: AccessibilityCaptureService | None = None
+
+    def set_timeline_capture_fn(self, fn: Callable[[dict], None]) -> None:
+        """Set the callback for emitting activity timeline captures."""
+        self._emit_timeline_capture = fn
+
+    def _emit_capture_for_action(self, action_type: str, success: bool) -> None:
+        """Emit a rich activity timeline capture after an action completes.
+
+        Screenpipe-inspired: captures real screen content (accessibility tree text
+        or OCR) and emits it to the Rust side for searchable timeline storage.
+
+        Uses a paired-capture approach:
+        1. Try accessibility tree text (fast, structured) if connected
+        2. Fall back to action summary if a11y not available
+        """
+        if not self._emit_timeline_capture:
+            return
+
+        try:
+            text_content = ""
+            source_type = "accessibility"
+            element_count = 0
+            confidence = 1.0 if success else 0.0
+            app_name = None
+            window_title = None
+            url = None
+
+            # Try to capture rich text from the accessibility tree
+            a11y_service = self._accessibility_service
+            if a11y_service and a11y_service.is_connected():
+                try:
+                    import asyncio
+
+                    # Capture a11y tree snapshot
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # We're already in an async context — use create_task
+                        import concurrent.futures
+                        with concurrent.futures.ThreadPoolExecutor() as pool:
+                            snapshot = pool.submit(
+                                asyncio.run, a11y_service.capture_tree()
+                            ).result(timeout=3.0)
+                    else:
+                        snapshot = asyncio.run(a11y_service.capture_tree())
+
+                    # Extract text from tree nodes
+                    text_parts = []
+                    self._walk_a11y_tree(snapshot.root, text_parts, depth=0)
+                    text_content = " ".join(text_parts)
+                    element_count = snapshot.total_nodes
+                    url = snapshot.url
+                    window_title = snapshot.title
+                    confidence = snapshot.interactive_nodes / max(snapshot.total_nodes, 1)
+                except Exception as e:
+                    self.emit_log("debug", f"A11y tree capture failed, using summary: {e}")
+
+            # Fallback: action summary with context
+            if not text_content:
+                source_type = "ocr"  # Mark as lower-quality source
+                confidence = 0.5
+                # Include action context for searchability
+                state_name = ""
+                if self.state_executor and self.state_executor.current_state:
+                    state_name = f" in state '{self.state_executor.current_state}'"
+                text_content = (
+                    f"Action: {action_type} (success={success}){state_name}"
+                )
+
+            capture_data = {
+                "textContent": text_content[:5000],  # Cap at 5KB
+                "sourceType": source_type,
+                "captureMode": "black_box",
+                "appName": app_name,
+                "windowTitle": window_title,
+                "url": url,
+                "elementCount": element_count,
+                "confidence": confidence,
+            }
+            self._emit_timeline_capture(capture_data)
+        except Exception as e:
+            self.emit_log("debug", f"Timeline capture failed (non-fatal): {e}")
+
+    @staticmethod
+    def _walk_a11y_tree(node, parts: list, depth: int = 0) -> None:
+        """Recursively extract text from accessibility tree nodes."""
+        if depth > 200:
+            return
+        if node.name:
+            parts.append(node.name)
+        if node.value and node.value != node.name:
+            parts.append(node.value)
+        if node.description and node.description not in (node.name, node.value):
+            parts.append(node.description)
+        for child in node.children:
+            GUIAutomation._walk_a11y_tree(child, parts, depth + 1)
 
     def _get_accessibility_service(self) -> AccessibilityCaptureService:
         """Get or create the accessibility capture service (lazy initialization)."""
@@ -481,6 +579,9 @@ class GUIAutomation:
 
             # Emit tree event with enriched metadata
             self.emit_tree_event("action_completed" if success else "action_failed", node, None)
+
+            # Emit activity timeline capture (screenpipe-inspired post-action capture)
+            self._emit_capture_for_action(action_type, success)
 
         return success
 

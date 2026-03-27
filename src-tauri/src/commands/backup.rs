@@ -138,11 +138,7 @@ pub struct ImportPreview {
 #[tauri::command]
 pub async fn get_export_summary(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     info!("Getting export summary");
-    if let Some(pg) = &state.pg_db {
-        pg.get_export_summary().await
-    } else {
-        state.checkpoint_db.get_export_summary()
-    }
+    state.pg_db.get_export_summary().await
 }
 
 /// Export all user data to a JSON structure.
@@ -157,131 +153,79 @@ pub async fn export_all_data(
     let summary = state.checkpoint_db.get_export_summary()?;
 
     let flows = if opts.flows {
-        if let Some(pg) = &state.pg_db {
-            pg.export_all_flows().await?
-        } else {
-            state.checkpoint_db.export_all_flows()?
-        }
+        state.pg_db.export_all_flows().await?
     } else {
         vec![]
     };
 
     let flow_executions = if opts.flow_executions {
-        if let Some(pg) = &state.pg_db {
-            pg.export_all_flow_executions().await?
-        } else {
-            state.checkpoint_db.export_all_flow_executions()?
-        }
+        state.pg_db.export_all_flow_executions().await?
     } else {
         vec![]
     };
 
     let checkpoints = if opts.checkpoints {
-        if let Some(pg) = &state.pg_db {
-            pg.export_all_orchestrator_checkpoints().await?
-        } else {
-            state.checkpoint_db.export_all_orchestrator_checkpoints()?
-        }
+        state.pg_db.export_all_orchestrator_checkpoints().await?
     } else {
         vec![]
     };
 
     let learning_outcomes = if opts.learning_outcomes {
-        if let Some(pg) = &state.pg_db {
-            pg.get_learning_outcomes(None).await?
-        } else {
-            state.checkpoint_db.get_learning_outcomes(None)?
-        }
+        state.pg_db.get_learning_outcomes(None).await?
     } else {
         vec![]
     };
 
     let learning_patterns = if opts.learning_patterns {
-        if let Some(pg) = &state.pg_db {
-            pg.get_learning_patterns().await?
-        } else {
-            state.checkpoint_db.get_learning_patterns()?
-        }
+        state.pg_db.get_learning_patterns().await?
     } else {
         vec![]
     };
 
     let settings = if opts.settings {
-        if let Some(pg) = &state.pg_db {
-            pg.export_all_settings().await?
-        } else {
-            state.checkpoint_db.export_all_settings()?
-        }
+        state.pg_db.export_all_settings().await?
     } else {
         vec![]
     };
 
     let prompts = if opts.prompts {
-        if let Some(pg) = &state.pg_db {
-            pg.export_all_prompts().await?
-        } else {
-            state.checkpoint_db.export_all_prompts()?
-        }
+        state.pg_db.export_all_prompts().await?
     } else {
         vec![]
     };
 
     let unified_workflows = if opts.unified_workflows {
-        if let Some(pg) = &state.pg_db {
-            pg.export_all_unified_workflows().await?
-        } else {
-            state.checkpoint_db.export_all_unified_workflows()?
-        }
+        state.pg_db.export_all_unified_workflows().await?
     } else {
         vec![]
     };
 
     let verification_tests = if opts.verification_tests {
-        if let Some(pg) = &state.pg_db {
-            pg.export_all_verification_tests().await?
-        } else {
-            state.checkpoint_db.export_all_verification_tests()?
-        }
+        state.pg_db.export_all_verification_tests().await?
     } else {
         vec![]
     };
 
     let task_hooks = if opts.task_hooks {
-        if let Some(pg) = &state.pg_db {
-            pg.export_all_task_hooks().await?
-        } else {
-            state.checkpoint_db.export_all_task_hooks()?
-        }
+        state.pg_db.export_all_task_hooks().await?
     } else {
         vec![]
     };
 
     let scheduled_tasks = if opts.scheduled_tasks {
-        if let Some(pg) = &state.pg_db {
-            pg.export_all_scheduled_tasks().await?
-        } else {
-            state.checkpoint_db.export_all_scheduled_tasks()?
-        }
+        state.pg_db.export_all_scheduled_tasks().await?
     } else {
         vec![]
     };
 
     let saved_api_requests = if opts.saved_api_requests {
-        if let Some(pg) = &state.pg_db {
-            pg.export_all_saved_api_requests().await?
-        } else {
-            state.checkpoint_db.export_all_saved_api_requests()?
-        }
+        state.pg_db.export_all_saved_api_requests().await?
     } else {
         vec![]
     };
 
     let configs = if opts.configs {
-        if let Some(pg) = &state.pg_db {
-            pg.export_all_configs().await?
-        } else {
-            state.checkpoint_db.export_all_configs()?
-        }
+        state.pg_db.export_all_configs().await?
     } else {
         vec![]
     };

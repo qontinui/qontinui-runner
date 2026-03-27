@@ -1,0 +1,653 @@
+{
+  "version": "1.0.0",
+  "description": "The Q-Routing tab within the Autoresearch page provides visualization and control of the Q-learning architecture router. This system learns which WorkflowArchitecture (Traditional, AgenticVerification, MultiAgentPipeline) performs best for different task types by discretizing tasks into a 50-state space (5 domains × 5 complexity tiers × 2 UI flags) and maintaining a Q-table of learned (state, action) → reward values. The tab offers three views — Q-value heatmap, greedy policy, and visit count density — plus manual override controls and a reset action. Data is sourced from Tauri commands that read from PostgreSQL (primary) with SQLite fallback. Q-values are updated automatically after every workflow completion via the learning recorder pipeline, using epsilon-greedy exploration that auto-decays as visit counts grow.",
+  "groups": [
+    {
+      "id": "q-routing-navigation",
+      "name": "Tab Reachability",
+      "description": "The Q-Routing tab is accessible within the Autoresearch page's tab bar. It is always visible (not dev-only) and renders the QRoutingTab component when selected.",
+      "category": "navigation",
+      "assertions": [
+        {
+          "id": "q-routing-tab-visible",
+          "description": "The 'Q-Routing' tab button is visible in the Autoresearch page tab bar alongside Campaign, Results, Worktrees, Comparison, and Model Profiles",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Q-Routing"
+            },
+            "label": "Q-Routing tab button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "q-routing-tab-selectable",
+          "description": "Clicking the 'Q-Routing' tab renders the Q-routing content area, replacing the previously active tab content",
+          "category": "navigation",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "q-routing-empty-state",
+      "name": "Empty State",
+      "description": "When no Q-routing data exists yet (no workflow outcomes have been recorded with architecture tags), the tab shows an informative empty state guiding the user on how to seed the Q-table. This occurs on fresh installations or before any autoresearch campaigns with WorkflowArchitecture dimension have run.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "q-routing-empty-message",
+          "description": "When no Q-routing data exists, the tab displays 'No Q-routing data yet' with guidance text explaining that Q-values are populated automatically as workflows complete",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No Q-routing data yet"
+            },
+            "label": "Empty state message"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "No workflow outcomes with architecture data have been recorded"
+        },
+        {
+          "id": "q-routing-empty-mentions-strategy",
+          "description": "The empty state guidance mentions the 'q_learning' mutation strategy name so the user knows what to configure",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "q_learning"
+            },
+            "label": "Strategy name in empty state"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "No workflow outcomes with architecture data have been recorded"
+        }
+      ]
+    },
+    {
+      "id": "q-routing-stats-bar",
+      "name": "Stats Bar",
+      "description": "Six metric cards displayed in a responsive grid at the top of the tab, providing an at-a-glance summary of Q-routing system health and coverage. Data sourced from the get_q_routing_stats Tauri command which computes stats from the Q-table (PG-first, SQLite fallback). The 50-state maximum comes from the 5×5×2 discretization of the task state space.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "q-stats-states-with-data",
+          "description": "A 'States with Data' card shows the count of unique task states that have at least one Q-value entry, with a denominator of 50 (the total possible states)",
+          "category": "data-display",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "States with Data"
+            },
+            "label": "States with Data stat card"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data has loaded"
+        },
+        {
+          "id": "q-stats-routable-states",
+          "description": "A 'Routable States' card shows the count of states with sufficient data for Q-routing (at least 1 visit per architecture), indicating how many states can use learned routing vs. falling back to grid search",
+          "category": "data-display",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Routable States"
+            },
+            "label": "Routable States stat card"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data has loaded"
+        },
+        {
+          "id": "q-stats-total-visits",
+          "description": "A 'Total Visits' card shows the cumulative count of all (state, action) Q-value updates, reflecting how much experience the router has accumulated",
+          "category": "data-display",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Total Visits"
+            },
+            "label": "Total Visits stat card"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data has loaded"
+        },
+        {
+          "id": "q-stats-avg-q-value",
+          "description": "An 'Avg Q-Value' card shows the mean Q-value across all state-action pairs, formatted to 3 decimal places, indicating the overall quality of learned routing decisions",
+          "category": "data-display",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Avg Q-Value"
+            },
+            "label": "Avg Q-Value stat card"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data has loaded"
+        },
+        {
+          "id": "q-stats-coverage",
+          "description": "A 'Coverage' card shows the percentage of the 50 possible states that have any Q-data, formatted as a whole number percentage",
+          "category": "data-display",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Coverage"
+            },
+            "label": "Coverage stat card"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data has loaded"
+        },
+        {
+          "id": "q-stats-state-action-pairs",
+          "description": "A 'State-Action Pairs' card shows the total number of entries in the Q-table (max 150: 50 states × 3 architectures)",
+          "category": "data-display",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "State-Action Pairs"
+            },
+            "label": "State-Action Pairs stat card"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data has loaded"
+        }
+      ]
+    },
+    {
+      "id": "q-routing-view-modes",
+      "name": "View Mode Toggle",
+      "description": "Three toggle buttons control which view is displayed: 'Q-Values' (heatmap), 'Policy' (greedy routing recommendations with override controls), and 'Visit Counts' (exploration density). Only one view is active at a time. The toggle sits between the stats bar and the main content area.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "q-view-q-values-button",
+          "description": "A 'Q-Values' toggle button exists and is highlighted (blue background) when the heatmap view is active",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Q-Values"
+            },
+            "label": "Q-Values view mode button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data has loaded"
+        },
+        {
+          "id": "q-view-policy-button",
+          "description": "A 'Policy' toggle button exists that switches to the greedy policy view with override controls",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Policy"
+            },
+            "label": "Policy view mode button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data has loaded"
+        },
+        {
+          "id": "q-view-visits-button",
+          "description": "A 'Visit Counts' toggle button exists that switches to the visit density view",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Visit Counts"
+            },
+            "label": "Visit Counts view mode button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data has loaded"
+        },
+        {
+          "id": "q-view-reset-button",
+          "description": "A 'Reset Q-Table' button exists in the toolbar, styled in red, that clears all Q-values from both PG and SQLite while preserving overrides. Requires confirmation dialog before executing.",
+          "category": "interaction",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Reset Q-Table"
+            },
+            "label": "Reset Q-Table button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data has loaded"
+        }
+      ]
+    },
+    {
+      "id": "q-routing-heatmap-view",
+      "name": "Q-Values Heatmap View",
+      "description": "The default view: an HTML table with task states as rows and the three workflow architectures (Traditional, Agentic Verify, Multi-Agent) as columns. Each cell is colored by Q-value intensity (green gradient for higher values, zinc-800 for zero/empty). Cells show the Q-value (3 decimal places) and visit count (n=X). The best architecture for each state is highlighted with a blue ring. A 'Best' column shows the recommended architecture (or 'locked' in orange if a manual override is active). States are formatted as 'Domain / Complexity [+ UI]' (e.g., 'Frontend / Moderate + UI'). The color function maps Q∈[0,1] to a green intensity gradient.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "q-heatmap-architecture-columns",
+          "description": "The heatmap table has column headers for all three architectures: 'Traditional', 'Agentic Verify', and 'Multi-Agent'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Traditional"
+            },
+            "label": "Traditional column header"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data exists and heatmap view is active"
+        },
+        {
+          "id": "q-heatmap-state-column",
+          "description": "The heatmap table has a 'State' column header on the left showing the task state dimension",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "State"
+            },
+            "label": "State column header"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data exists and heatmap view is active"
+        },
+        {
+          "id": "q-heatmap-best-column",
+          "description": "The heatmap table has a 'Best' column showing the recommended architecture per state, displayed in blue text, or '(locked)' in orange if a manual override is active for that state",
+          "category": "element-presence",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Best"
+            },
+            "label": "Best column header"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data exists and heatmap view is active"
+        },
+        {
+          "id": "q-heatmap-cells-show-q-value",
+          "description": "Each populated cell in the heatmap shows the Q-value formatted to 3 decimal places (e.g., '0.723') and a visit count label (e.g., 'n=15'). Empty cells show '--'.",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data exists with at least one state-action pair"
+        },
+        {
+          "id": "q-heatmap-color-encoding",
+          "description": "Cells are color-coded by Q-value: higher Q-values appear greener (rgb intensity gradient), zero/empty cells appear as dark zinc-800 (#27272a). The best architecture cell for each row has a blue ring outline.",
+          "category": "semantic",
+          "severity": "major",
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data exists with varying Q-values"
+        }
+      ]
+    },
+    {
+      "id": "q-routing-policy-view",
+      "name": "Policy View",
+      "description": "A table showing the greedy Q-routing policy: one row per task state with the recommended architecture, Q-value, confidence percentage (1 - epsilon), total visits, active/cold status, and an override control column. Rows are sorted by total visits descending. Status badges indicate 'Active' (green, ≥3 visits with all architectures sampled) or 'Cold' (gray, insufficient data for routing). The override column provides a dropdown to lock a state to a specific architecture, or shows the current override with a remove button.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "q-policy-recommended-column",
+          "description": "Each policy row shows a 'Recommended' architecture with a colored dot indicator (blue=Traditional, green=AgenticVerification, purple=MultiAgentPipeline) and the architecture label",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Recommended"
+            },
+            "label": "Recommended column header"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data exists and policy view is active"
+        },
+        {
+          "id": "q-policy-confidence-column",
+          "description": "Each policy row shows a confidence percentage (0-100%) reflecting 1 minus the current epsilon for that state. Higher confidence means the router is more certain about its recommendation. Color-coded: green ≥90%, blue ≥70%, yellow ≥50%, gray below.",
+          "category": "data-display",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Confidence"
+            },
+            "label": "Confidence column header"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data exists and policy view is active"
+        },
+        {
+          "id": "q-policy-status-badges",
+          "description": "Each state shows an 'Active' badge (green) when all 3 architectures have been sampled at least once, or a 'Cold' badge (gray) when insufficient data exists for Q-routing and the system falls back to grid search",
+          "category": "state-consistency",
+          "severity": "major",
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data exists with a mix of well-explored and sparse states"
+        },
+        {
+          "id": "q-policy-override-dropdown",
+          "description": "Each policy row has an 'Override' column containing either: (a) a 'Lock to...' dropdown with options for Traditional, Agentic Verify, and Multi-Agent, or (b) the currently locked architecture shown as an orange badge with an 'x' remove button",
+          "category": "interaction",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Override"
+            },
+            "label": "Override column header"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data exists and policy view is active"
+        },
+        {
+          "id": "q-policy-set-override",
+          "description": "Selecting an architecture from the 'Lock to...' dropdown invokes set_q_routing_override (PG-first, then SQLite) and the override immediately appears as an orange badge. Subsequent Q-routing decisions for that state will always return the locked architecture, bypassing epsilon-greedy exploration.",
+          "category": "interaction",
+          "severity": "major",
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data exists and policy view is active"
+        },
+        {
+          "id": "q-policy-remove-override",
+          "description": "Clicking the 'x' button next to an active override removes it (from both PG and SQLite) and the row reverts to showing the 'Lock to...' dropdown. The state resumes epsilon-greedy routing.",
+          "category": "interaction",
+          "severity": "major",
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "At least one override has been set"
+        }
+      ]
+    },
+    {
+      "id": "q-routing-visits-view",
+      "name": "Visit Counts View",
+      "description": "A table with the same states × architectures layout as the heatmap, but colored by visit density instead of Q-value. Uses a blue intensity gradient: darker blue = more visits (30+ visits = full intensity). Includes a visual legend showing the gradient mapping at the bottom. Helps the user identify under-explored states that may benefit from more data collection before trusting the Q-routing policy.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "q-visits-count-display",
+          "description": "Each cell shows the raw visit count as a number, or '--' for unvisited state-action pairs. A 'Total' column on the right shows the sum of visits across all architectures for each state.",
+          "category": "data-display",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Total"
+            },
+            "label": "Total visits column"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data exists and visits view is active"
+        },
+        {
+          "id": "q-visits-density-legend",
+          "description": "A legend at the bottom of the visits table shows the visit density color gradient with reference points: 0 (dark), 5, 15, and 30+ (full blue intensity)",
+          "category": "element-presence",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Visit density"
+            },
+            "label": "Visit density legend"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data exists and visits view is active"
+        }
+      ]
+    },
+    {
+      "id": "q-routing-auto-refresh",
+      "name": "Automatic Data Refresh",
+      "description": "The tab polls all four Tauri commands (get_q_routing_table, get_q_routing_policy, get_q_routing_stats, get_q_routing_overrides) every 10 seconds via setInterval. Data is fetched in parallel using Promise.all. This allows the Q-table to update live as workflows complete in the background without manual refresh. Errors during polling are silently ignored to avoid disruptive error states.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "q-routing-polling",
+          "description": "The tab automatically refreshes Q-routing data every 10 seconds. New Q-value updates from completed workflows appear without manual intervention.",
+          "category": "behavior",
+          "severity": "major",
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing tab is active and workflows are running"
+        },
+        {
+          "id": "q-routing-loading-state",
+          "description": "While data is loading on initial mount, the tab shows 'Loading Q-routing data...' text. Subsequent polling refreshes do not show loading indicators.",
+          "category": "behavior",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Loading Q-routing data"
+            },
+            "label": "Loading indicator"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Tab has just been opened and data has not loaded yet"
+        }
+      ]
+    },
+    {
+      "id": "q-routing-reset",
+      "name": "Reset Q-Table",
+      "description": "The Reset Q-Table button clears all learned Q-values from both PostgreSQL and SQLite databases, effectively resetting the router to cold-start state. Manual overrides are preserved. The operation requires a browser confirmation dialog ('Reset all Q-routing data? Overrides will be preserved.'). After reset, the tab refreshes and shows the empty state or overrides-only data. The backend command returns counts of deleted rows from both databases.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "q-reset-confirmation",
+          "description": "Clicking 'Reset Q-Table' shows a browser confirmation dialog before proceeding. Canceling the dialog aborts the reset.",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data exists"
+        },
+        {
+          "id": "q-reset-preserves-overrides",
+          "description": "After resetting the Q-table, any previously set manual overrides remain in place. Only learned Q-values and visit counts are cleared.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Q-routing data and at least one override exist"
+        }
+      ]
+    },
+    {
+      "id": "q-routing-state-consistency",
+      "name": "State Consistency",
+      "description": "The Q-Routing tab accurately reflects the backend Q-table state. The PG-first read strategy means multi-instance deployments see consistent data. Q-values update automatically as the learning_recorder pipeline processes workflow outcomes. Override writes are dual-written to both PG and SQLite, ensuring the engine's QLearningMutator (which loads from SQLite on campaign start) stays in sync with the UI (which reads PG-first).",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "q-state-reflects-completions",
+          "description": "After a workflow completes with a WorkflowArchitecture tag, the Q-routing tab shows an updated Q-value for the corresponding (state, architecture) pair within 10 seconds (one polling cycle)",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "A workflow has just completed with a workflow_architecture tag"
+        },
+        {
+          "id": "q-override-reflected-in-heatmap",
+          "description": "When a manual override is set in the Policy view, the Heatmap view's 'Best' column for that state shows the overridden architecture with '(locked)' in orange text instead of the Q-value-derived recommendation",
+          "category": "state-consistency",
+          "severity": "major",
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "A manual override has been set for at least one state"
+        },
+        {
+          "id": "q-routing-pg-first-reads",
+          "description": "The tab reads data from PostgreSQL first. If PG is connected and the query succeeds (even returning empty results), PG data is used. SQLite is only used as fallback when PG is unavailable or errors.",
+          "category": "state-consistency",
+          "severity": "major",
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "q-routing-architecture",
+      "name": "Architecture Documentation",
+      "description": "The Q-routing system uses tabular Q-learning (not deep RL) with a 50-state discrete state space. State features are extracted from learning_outcomes fields: technology_tags (→ has_ui_component), domain_tags (→ primary_domain), and complexity_tier (→ complexity). The Q-update formula is Q(s,a) ← Q(s,a) + 0.1 × (reward − Q(s,a)) where reward = composite_agentic_score − 0.01 × total_cost_usd, clamped to [0,1]. Epsilon-greedy exploration uses ε = max(0.05, 0.3 × exp(−visits/20)), auto-decaying per state. The system is opt-in via MutationStrategy::QLearning in autoresearch campaign config.",
+      "category": "semantic",
+      "assertions": [],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "QRoutingTab",
+    "author": "Claude",
+    "createdAt": "2026-03-27T00:00:00.000Z",
+    "updatedAt": "2026-03-27T00:00:00.000Z",
+    "pageUrl": "/autoresearch",
+    "tags": [
+      "q-learning",
+      "architecture-routing",
+      "autoresearch",
+      "meta-optimizer",
+      "reinforcement-learning"
+    ],
+    "backendFiles": [
+      "qontinui-runner/src-tauri/src/autoresearch/q_router.rs",
+      "qontinui-runner/src-tauri/src/autoresearch/commands.rs",
+      "qontinui-runner/src-tauri/src/autoresearch/mutations.rs",
+      "qontinui-runner/src-tauri/src/autoresearch/engine.rs",
+      "qontinui-runner/src-tauri/src/orchestrator/learning_recorder.rs",
+      "qontinui-runner/src-tauri/src/database/pg/q_routing.rs",
+      "qontinui-runner/src-tauri/queries/q_routing.sql"
+    ],
+    "apiEndpoints": [
+      "Tauri: get_q_routing_table() -> Vec<QTableRow{state_key, action, q_value, visit_count}>",
+      "Tauri: get_q_routing_policy() -> Vec<PolicyEntry{state_key, recommended_architecture, q_value, confidence, total_visits}>",
+      "Tauri: get_q_routing_stats() -> QRoutingStats{total_state_action_pairs, states_with_data, routable_states, total_possible_states, total_visits, avg_q_value}",
+      "Tauri: get_q_routing_overrides() -> Vec<OverrideEntry{state_key, forced_action}>",
+      "Tauri: set_q_routing_override(stateKey, forcedAction) -> () [PG-first, then SQLite]",
+      "Tauri: remove_q_routing_override(stateKey) -> bool [PG-first, then SQLite]",
+      "Tauri: reset_q_routing_table() -> {deleted_pg, deleted_sqlite} [clears Q-values, preserves overrides]"
+    ],
+    "elementSource": "sdk",
+    "specType": "semantic"
+  }
+}

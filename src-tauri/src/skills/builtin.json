@@ -554,5 +554,86 @@
       }
     },
     "source": "builtin"
+  },
+  {
+    "id": "builtin:ui-bridge-health-verify",
+    "name": "UI Bridge Health Verify",
+    "slug": "ui-bridge-health-verify",
+    "description": "Verify a page is healthy after code changes using the UI Bridge. Takes a snapshot, checks for empty content areas, error signals, broken layouts, and stuck loading states. Reports pass/fail with details.",
+    "category": "testing",
+    "tags": ["ui-bridge", "health", "verification", "smoke-test"],
+    "icon": "heartPulse",
+    "color": "green",
+    "allowed_phases": ["verification", "completion"],
+    "parameters": [
+      {
+        "name": "base_url",
+        "type": "select",
+        "label": "Target Application",
+        "description": "Which application to verify",
+        "required": true,
+        "default": "http://localhost:9876/ui-bridge",
+        "options": [
+          { "label": "Runner UI", "value": "http://localhost:9876/ui-bridge" },
+          { "label": "Web Frontend", "value": "http://localhost:3001/api/ui-bridge" }
+        ]
+      },
+      {
+        "name": "expected_elements",
+        "type": "number",
+        "label": "Min Expected Elements",
+        "description": "Minimum number of interactive elements expected on a healthy page",
+        "required": false,
+        "default": 5,
+        "min": 1,
+        "max": 500
+      },
+      {
+        "name": "check_console_errors",
+        "type": "boolean",
+        "label": "Check Console Errors",
+        "description": "Fail if JavaScript console errors are present",
+        "required": false,
+        "default": true
+      }
+    ],
+    "template": {
+      "kind": "multi_step",
+      "steps": [
+        {
+          "type": "command",
+          "name": "Focus Window",
+          "command": "curl -sf -X POST http://localhost:9876/gui-config/focus-window > /dev/null && sleep 1 && echo 'Window focused'",
+          "working_directory": ".",
+          "fail_on_error": false,
+          "timeout_seconds": 5
+        },
+        {
+          "type": "command",
+          "name": "Discover Elements",
+          "command": "curl -sf -X POST {{base_url}}/control/discover -H \"Content-Type: application/json\" -d '{\"interactive_only\": false}' | python -c \"import sys,json; d=json.load(sys.stdin); c=d.get('count',d.get('data',{}).get('count',0)); print(f'Discovered {c} elements')\"",
+          "working_directory": ".",
+          "fail_on_error": false,
+          "timeout_seconds": 10
+        },
+        {
+          "type": "command",
+          "name": "UI Bridge Snapshot",
+          "command": "curl -sf {{base_url}}/control/snapshot | python -c \"import sys,json; d=json.load(sys.stdin); elems=d.get('elements',[]); print(f'Elements: {len(elems)}'); sys.exit(0 if len(elems)>={{expected_elements}} else 1)\"",
+          "working_directory": ".",
+          "fail_on_error": true,
+          "timeout_seconds": 15
+        },
+        {
+          "type": "command",
+          "name": "Check Console Errors",
+          "command": "curl -sf {{base_url}}/control/console-errors | python -c \"import sys,json; errs=json.load(sys.stdin).get('data',{}).get('errors',[]); print(f'Console errors: {len(errs)}'); [print(f'  - {e.get(\\\"message\\\",\\\"\\\")[:100]}') for e in errs[:5]]; sys.exit(1 if errs and {{check_console_errors}} else 0)\"",
+          "working_directory": ".",
+          "fail_on_error": false,
+          "timeout_seconds": 10
+        }
+      ]
+    },
+    "source": "builtin"
   }
 ]

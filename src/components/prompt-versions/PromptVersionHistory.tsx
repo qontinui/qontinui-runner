@@ -104,7 +104,7 @@ export function PromptVersionHistory({ templateId }: PromptVersionHistoryProps) 
   // --- list view ---
 
   return (
-    <div className="p-4 space-y-4">
+    <div className="p-4 space-y-4" data-tutorial-id="prompt-version-history">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
@@ -144,6 +144,7 @@ export function PromptVersionHistory({ templateId }: PromptVersionHistoryProps) 
                 onClick={handleStartCompare}
                 disabled={sorted.length < 2}
                 className="flex items-center gap-1 px-3 py-1 text-xs bg-muted/60 text-muted-foreground rounded hover:bg-muted disabled:opacity-40 disabled:cursor-not-allowed"
+                data-tutorial-id="prompt-version-compare"
               >
                 <GitCompare className="w-3.5 h-3.5" />
                 Compare

@@ -1,0 +1,299 @@
+{
+  "version": "1.0.0",
+  "description": "Pipeline Events Timeline — shows the sequence of events during workflow generation, including phase durations, token usage, and validation error changes, helping developers understand and debug the generation pipeline.",
+  "groups": [
+    {
+      "id": "pipeline-events-timeline",
+      "name": "Pipeline Events Timeline",
+      "description": "Users need a chronological timeline of generation pipeline events showing what happened during each phase of workflow generation.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "pipe-evt-heading",
+          "description": "Users can identify the Pipeline Events timeline and understand its purpose as a tool for viewing generation pipeline activity",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Pipeline Events"
+            },
+            "label": "Pipeline Events heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "pipe-evt-phase-badges",
+          "description": "Each event row displays a phase badge indicating which pipeline stage (discovery, generation, validation, fixing, hardening, reflection) the event belongs to",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "listitem"
+            },
+            "label": "Event rows with phase badges"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "pipe-evt-timestamps",
+          "description": "Each event row shows a formatted timestamp so users can understand when each pipeline phase occurred and correlate events with other system activity",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": ":"
+            },
+            "label": "Event timestamp display"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "pipeline-events-metrics",
+      "name": "Per-Event Metrics",
+      "description": "Users need to see per-event metrics including duration in milliseconds, token counts, and validation error deltas to identify bottlenecks and measure improvement.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "pipe-evt-duration",
+          "description": "Each event displays its duration in milliseconds so users can identify which pipeline phases are slowest and optimize accordingly",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "ms"
+            },
+            "label": "Duration in milliseconds label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "pipe-evt-tokens",
+          "description": "Each event displays token usage counts so users can track LLM consumption per pipeline phase and identify expensive operations",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "tokens"
+            },
+            "label": "Token count label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "pipe-evt-errors",
+          "description": "Each event displays validation error deltas using arrow notation to show whether the phase reduced or increased errors",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "errors:"
+            },
+            "label": "Validation error delta with arrow notation"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "pipeline-events-phases",
+      "name": "Phase Color Coding",
+      "description": "Each pipeline phase is color-coded for quick identification: blue for discovery, green for generation, yellow for validation, orange for fixing, purple for hardening, cyan for reflection.",
+      "category": "style",
+      "assertions": [
+        {
+          "id": "pipe-evt-phase-colors",
+          "description": "Pipeline phase badges display distinct color-coded dots (blue, green, yellow, orange, purple, cyan) so users can visually distinguish phases at a glance in the timeline",
+          "category": "style",
+          "severity": "info",
+          "assertionType": "visual",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "listitem"
+            },
+            "label": "Phase color dots in event rows"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "pipeline-events-states",
+      "name": "Loading and Empty States",
+      "description": "Empty and loading states communicate pipeline status clearly.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "pipe-evt-loading",
+          "description": "Users see a loading indicator while pipeline event data is being fetched, preventing confusion about a blank timeline",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Loading events..."
+            },
+            "label": "Loading state message"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "pipe-evt-empty",
+          "description": "Users see an informative empty state when no pipeline events have been recorded yet, explaining that events appear after workflow generation runs",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No pipeline events recorded"
+            },
+            "label": "Empty state message"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "pipeline-events-data-display",
+      "name": "Event Data Rendering",
+      "description": "Each event row must accurately render the event type, phase, timestamp (HH:mm:ss format), duration in milliseconds, token count, and validation error delta from the API response.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "pipe-data-timestamp",
+          "description": "Each event shows a timestamp formatted as HH:mm:ss derived from the created_at ISO datetime",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "exists",
+          "expected": "HH:mm:ss format derived from ISO 8601 created_at",
+          "target": { "type": "search", "criteria": { "textContent": ":" }, "label": "Formatted timestamp" },
+          "source": "manual", "reviewed": true, "enabled": true
+        },
+        {
+          "id": "pipe-data-duration",
+          "description": "Events with duration_ms show the value suffixed with 'ms' (e.g. '1234ms')",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "containsText",
+          "expected": "Integer suffixed with 'ms', e.g. '1234ms'",
+          "target": { "type": "search", "criteria": { "textContent": "ms" }, "label": "Duration in milliseconds" },
+          "source": "manual", "reviewed": true, "enabled": true
+        },
+        {
+          "id": "pipe-data-error-delta",
+          "description": "When both validation_errors_before and validation_errors_after are present, the event shows 'errors: N → M' indicating how validation errors changed during that phase",
+          "category": "data-display",
+          "severity": "info",
+          "assertionType": "containsText",
+          "expected": "Format 'errors: N → M' where N=validation_errors_before, M=validation_errors_after",
+          "target": { "type": "search", "criteria": { "textContent": "errors:" }, "label": "Validation error delta" },
+          "source": "manual", "reviewed": true, "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "pipeline-events-behavior",
+      "name": "Timeline Behavior",
+      "description": "The timeline is scrollable when events exceed the visible area (max-h-96), events are ordered chronologically by created_at, and the timeline connector lines visually link sequential events.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "pipe-behavior-scroll",
+          "description": "When more events exist than fit in the visible area, the container scrolls vertically to reveal additional events",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "precondition": "More events exist than fit in the max-h-96 container",
+          "target": { "type": "search", "criteria": { "textContent": "Pipeline Events" }, "label": "Scrollable events container" },
+          "source": "manual", "reviewed": true, "enabled": true
+        },
+        {
+          "id": "pipe-behavior-chronological",
+          "description": "Events are displayed in chronological order (oldest first, newest last) matching the pipeline execution sequence",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "order",
+          "precondition": "Multiple events exist for the task run",
+          "target": { "type": "search", "criteria": { "textContent": "Pipeline Events" }, "label": "Chronological event ordering" },
+          "source": "manual", "reviewed": true, "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "pipeline-events-presence",
+      "name": "Required Timeline Elements",
+      "description": "Each event row must contain a phase color dot, event type label, and timeline connector line. The header must show the Zap icon.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "pipe-presence-phase-dot",
+          "description": "Each event has a colored phase indicator dot (2.5x2.5 rounded circle) visually identifying the pipeline phase",
+          "category": "element-presence",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": { "type": "search", "criteria": { "textContent": "Pipeline Events" }, "label": "Phase indicator dots" },
+          "source": "manual", "reviewed": true, "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "PipelineEventsTimeline",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-26T00:00:00.000Z",
+    "updatedAt": "2026-03-26T00:00:00.000Z",
+    "pageUrl": "/pipeline-events",
+    "elementSource": "sdk",
+    "tags": ["knowledge-graph", "pipeline", "generation", "telemetry", "runner-only"],
+    "preconditions": [
+      "Requires at least one workflow generation with instrumented generator — generation_pipeline_events table must have entries",
+      "Events are per-task-run — the component needs a task_run_id from execution context or props",
+      "Empty state is valid when no generations have occurred since instrumentation was added"
+    ],
+    "backendDependencies": [
+      "GET /graph/pipeline-events?task_run_id=<id> — returns PipelineEvent[] ordered by created_at",
+      "GET /graph/phase-stats?workflow_id=<id> — aggregate stats by phase"
+    ]
+  }
+}

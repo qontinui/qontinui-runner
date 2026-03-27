@@ -17,6 +17,10 @@ import { getGraphQLClient } from "./lib/graphql-client";
 import { UIBridgeProvider, AutoRegisterProvider } from "ui-bridge";
 
 import { setupEventHandlers, eventRouter } from "./managers";
+import {
+  startBackgroundObserver,
+  stopBackgroundObserver,
+} from "./services/background-observer-service";
 
 import {
   useApiReady,
@@ -175,6 +179,22 @@ function AppContent() {
 
   // Initialize observation persistence services (session summaries + learning bridge)
   useObservationServices(projectSelection.selectedProjectId);
+
+  // Start screenpipe-inspired background observer for activity timeline
+  useEffect(() => {
+    // Delay start to ensure UI Bridge registry is initialized
+    const timer = setTimeout(() => {
+      try {
+        startBackgroundObserver();
+      } catch (e) {
+        console.debug("[App] BackgroundObserver start deferred:", e);
+      }
+    }, 5000);
+    return () => {
+      clearTimeout(timer);
+      stopBackgroundObserver();
+    };
+  }, []);
 
   useEffect(() => {
     if (auth.authStatus?.authenticated && !auth.loading) {

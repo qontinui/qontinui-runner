@@ -503,7 +503,7 @@ pub fn hybrid_search_universal_fixes(
 // ============================================================================
 
 /// Rank candidates using hybrid scoring (SQL position + vector similarity).
-fn rank_results<T>(
+pub(crate) fn rank_results<T>(
     candidates: Vec<(T, Option<Vec<f32>>)>,
     query_embedding: &[f32],
     config: &HybridSearchConfig,

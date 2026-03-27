@@ -1,0 +1,391 @@
+{
+  "version": "1.0.0",
+  "description": "Element Reliability Dashboard — shows the stability and success rates of UI elements across automated interactions, helping users identify flaky elements that may cause automation failures.",
+  "groups": [
+    {
+      "id": "element-reliability-overview",
+      "name": "Reliability Overview Statistics",
+      "description": "Users need summary statistics showing how many elements are stable vs flaky vs unreliable, providing a quick assessment of automation health across all tracked elements.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "elem-rel-heading",
+          "description": "Users can identify the Element Reliability dashboard and understand its purpose as a tool for evaluating UI element stability across automated interactions",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Element Reliability"
+            },
+            "label": "Element Reliability dashboard heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "elem-rel-stable-count",
+          "description": "Users can see the count of stable elements (>=95% success rate), giving them confidence in the proportion of elements that reliably work during automation",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Stable"
+            },
+            "label": "Stable elements summary count"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "elem-rel-flaky-count",
+          "description": "Users can see the count of flaky elements (>=80% but <95% success rate), identifying elements that intermittently fail and may need selector improvements",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Flaky"
+            },
+            "label": "Flaky elements summary count"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "elem-rel-unreliable-count",
+          "description": "Users can see the count of unreliable elements (<80% success rate), highlighting the most problematic elements that need immediate attention",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Unreliable"
+            },
+            "label": "Unreliable elements summary count"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "element-reliability-list",
+      "name": "Elements by Reliability",
+      "description": "Users need to see individual elements sorted by reliability, with success rates and interaction counts, to identify which specific elements need attention or alternative selectors.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "elem-rel-list-heading",
+          "description": "Users can see a section listing individual elements sorted by their reliability scores, enabling targeted investigation of problematic elements",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Elements by Reliability"
+            },
+            "label": "Elements list section heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "elem-rel-list-percentage",
+          "description": "Each element row displays its success rate as a percentage so users can quickly assess how reliably each element is found and interacted with",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "%"
+            },
+            "label": "Element success rate percentage"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "elem-rel-list-interactions",
+          "description": "Each element row shows the total number of interactions, providing context for whether the reliability percentage is based on a statistically meaningful sample size",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "interactions"
+            },
+            "label": "Element interaction count label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "element-reliability-states",
+      "name": "Loading, Error, and Empty States",
+      "description": "Users need clear feedback during loading, error, and empty states so they understand the system status.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "elem-rel-loading",
+          "description": "Users see a loading indicator while element reliability data is being fetched, preventing confusion about a blank screen",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Loading element data..."
+            },
+            "label": "Loading state message"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "elem-rel-error",
+          "description": "Users see a clear error message when element data fails to load, helping them understand that a technical issue occurred rather than there being no data",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Failed to load"
+            },
+            "label": "Error state message"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "elem-rel-empty-heading",
+          "description": "Users see a clear empty state message when no element data exists yet, indicating that this is expected for new setups",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No element reliability data yet"
+            },
+            "label": "Empty state heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "elem-rel-empty-guidance",
+          "description": "Users see guidance text explaining how to populate element reliability data by running automations, reducing confusion about next steps",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Run some automations to build up element history"
+            },
+            "label": "Empty state guidance text"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "element-reliability-badges",
+      "name": "Reliability Color-Coded Badges",
+      "description": "Reliability badges use color coding to quickly communicate element health: green for stable (>=95%), yellow for flaky (>=80%), red for unreliable (<80%).",
+      "category": "style",
+      "assertions": [
+        {
+          "id": "elem-rel-badge-stable",
+          "description": "Stable elements display a green badge indicating high reliability (>=95% success rate), providing immediate positive visual feedback",
+          "category": "style",
+          "severity": "info",
+          "assertionType": "visual",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Stable"
+            },
+            "label": "Green stable reliability badge"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "elem-rel-badge-flaky",
+          "description": "Flaky elements display a yellow badge indicating moderate reliability (>=80% but <95%), signaling caution without alarm",
+          "category": "style",
+          "severity": "info",
+          "assertionType": "visual",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Flaky"
+            },
+            "label": "Yellow flaky reliability badge"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "elem-rel-badge-unreliable",
+          "description": "Unreliable elements display a red badge indicating low reliability (<80%), drawing immediate attention to elements that need remediation",
+          "category": "style",
+          "severity": "info",
+          "assertionType": "visual",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Unreliable"
+            },
+            "label": "Red unreliable reliability badge"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "element-reliability-data-display",
+      "name": "Element Data Rendering",
+      "description": "Each element row must render its element ID, total interaction count, and success rate percentage accurately from the API data. The summary cards must show correct counts of stable (>=95%), flaky (>=80%), and unreliable (<80%) elements computed from the success_rate field.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "elem-data-success-rate",
+          "description": "Each element row displays a success rate as a whole percentage (e.g. '94%') computed from the element's success_rate field (0-1 float multiplied by 100 and rounded)",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "exists",
+          "expected": "Percentage 0-100, computed as Math.round(success_rate * 100)",
+          "target": { "type": "search", "criteria": { "textContent": "%" }, "label": "Success rate percentage" },
+          "source": "manual", "reviewed": true, "enabled": true
+        },
+        {
+          "id": "elem-data-interaction-count",
+          "description": "Each element row shows the total number of interactions (e.g. '47 interactions') providing volume context for the reliability assessment",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "containsText",
+          "expected": "Integer followed by ' interactions'",
+          "target": { "type": "search", "criteria": { "textContent": "interactions" }, "label": "Interaction count label" },
+          "source": "manual", "reviewed": true, "enabled": true
+        },
+        {
+          "id": "elem-data-element-id",
+          "description": "Each element row displays the element_id as a monospace identifier, or 'Unknown' when the element_id is empty",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": { "type": "search", "criteria": { "textContent": "success" }, "label": "Success label under percentage" },
+          "source": "manual", "reviewed": true, "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "element-reliability-presence",
+      "name": "Required UI Elements",
+      "description": "All structural elements must be present for the dashboard to function: the Shield header icon, the 3-column summary grid, the scrollable element list container, and reliability badge components.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "elem-presence-header-icon",
+          "description": "The Shield icon is present in the header alongside the 'Element Reliability' title",
+          "category": "element-presence",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": { "type": "search", "criteria": { "textContent": "Element Reliability" }, "label": "Header with icon" },
+          "source": "manual", "reviewed": true, "enabled": true
+        },
+        {
+          "id": "elem-presence-summary-grid",
+          "description": "The 3-column summary grid showing Stable, Flaky, and Unreliable counts is present above the element list",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": { "type": "search", "criteria": { "textContent": "Stable" }, "label": "Stable count card" },
+          "source": "manual", "reviewed": true, "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "element-reliability-state-consistency",
+      "name": "State Transitions",
+      "description": "The dashboard transitions cleanly between loading, error, empty, and data states. Summary card counts must be mathematically consistent with the element list (stable + flaky + unreliable = total elements).",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "elem-state-loading-to-data",
+          "description": "When data loads, the 'Loading element data...' message is replaced by the summary cards and element list — both never shown simultaneously",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "stateChange",
+          "precondition": "Page has just loaded and is fetching from /ui-bridge/history/flaky",
+          "target": { "type": "search", "criteria": { "textContent": "Loading element data" }, "label": "Loading state" },
+          "source": "manual", "reviewed": true, "enabled": true
+        },
+        {
+          "id": "elem-state-counts-consistent",
+          "description": "The sum of Stable + Flaky + Unreliable counts in the summary cards equals the total number of element rows in the list below",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "precondition": "Data has loaded successfully (not in loading/error/empty state)",
+          "target": { "type": "search", "criteria": { "textContent": "Elements by Reliability" }, "label": "Element list section" },
+          "source": "manual", "reviewed": true, "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "ElementReliabilityDashboard",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-26T00:00:00.000Z",
+    "updatedAt": "2026-03-26T00:00:00.000Z",
+    "pageUrl": "/element-reliability",
+    "elementSource": "sdk",
+    "tags": ["knowledge-graph", "element-reliability", "ui-bridge", "quality", "runner-only"],
+    "preconditions": [
+      "Requires UI Bridge automation runs to have occurred — element interaction history is populated during workflow execution with UI Bridge-connected apps",
+      "Empty state is valid on fresh installs"
+    ],
+    "backendDependencies": [
+      "GET /ui-bridge/history/flaky — returns ElementReliability[] with element_id, success_rate (0-1 float), total_interactions",
+      "GET /ui-bridge/history/elements?task_run_id=<id> — per-run element history"
+    ]
+  }
+}

@@ -31,11 +31,9 @@ use crate::database::types::{Observation, ObservationSearchResult};
 /// Uses a single batch query instead of N+1 individual fetches.
 /// Returns empty vectors if PG is unavailable — graph still builds from SQLite.
 async fn fetch_observations_for_graph(
-    pg_db: Option<&crate::database::pg::PgDb>,
+    pg_db: &crate::database::pg::PgDb,
 ) -> (Vec<ObservationSearchResult>, Vec<Observation>) {
-    let Some(pg) = pg_db else {
-        return (Vec::new(), Vec::new());
-    };
+    let pg = pg_db;
 
     // Single batch query for full observations (replaces N+1 pattern)
     let full = pg
@@ -180,7 +178,7 @@ async fn summary_handler(
 
     // Pre-fetch observations from PG (async) before the sync graph build
     let (obs_previews, obs_full) = fetch_observations_for_graph(
-        state.app_state.pg_db.as_deref(),
+        &state.app_state.pg_db,
     )
     .await;
 

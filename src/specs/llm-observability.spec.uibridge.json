@@ -1,0 +1,1167 @@
+{
+  "version": "1.0.0",
+  "description": "The LLM Observability Dashboard provides analytics for LLM token usage, cost breakdown, and provider performance. Displays summary metric cards, cost-over-time and cost-by-model charts, phase cost breakdown, provider latency distribution, a 7-day moving average cost trend line, and a per-run cost table. Data sourced via Tauri commands (SQLite) and web API (PostgreSQL) with TanStack Query caching.",
+  "groups": [
+    {
+      "id": "llm-summary-cards",
+      "name": "Summary Cards",
+      "description": "Four metric cards at the top of the dashboard showing aggregate LLM usage statistics: Total Cost (formatted as dollars from cents, with provider count subtitle), Total Tokens (input + output with K/M suffixes, with in/out breakdown subtitle), Total Calls (with unique model count subtitle), and Avg Cost/Call (with average duration subtitle when available). These cards give the user an instant overview of LLM spend and usage volume for the selected time range.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "llm-summary-total-cost-card",
+          "description": "The user can see a 'Total Cost' metric card displaying the total LLM spend formatted as dollars (e.g., '$12.34') with a subtitle showing the number of unique providers used",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Total Cost"
+            },
+            "label": "Total Cost metric card"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "LLM analytics data has loaded successfully"
+        },
+        {
+          "id": "llm-summary-total-tokens-card",
+          "description": "The user can see a 'Total Tokens' metric card displaying the combined input + output token count with K/M suffixes, and a subtitle showing the input/output breakdown (e.g., '1.2M in / 800.0K out')",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Total Tokens"
+            },
+            "label": "Total Tokens metric card"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "LLM analytics data has loaded successfully"
+        },
+        {
+          "id": "llm-summary-total-calls-card",
+          "description": "The user can see a 'Total Calls' metric card displaying the number of LLM API calls made, with a subtitle showing the count of unique models used",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Total Calls"
+            },
+            "label": "Total Calls metric card"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "LLM analytics data has loaded successfully"
+        },
+        {
+          "id": "llm-summary-avg-cost-card",
+          "description": "The user can see an 'Avg Cost/Call' metric card displaying the average cost per LLM call formatted as dollars, with an optional subtitle showing average duration in milliseconds when available",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Avg Cost/Call"
+            },
+            "label": "Avg Cost/Call metric card"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "LLM analytics data has loaded successfully"
+        }
+      ]
+    },
+    {
+      "id": "llm-time-range-selection",
+      "name": "Time Range Selection",
+      "description": "A dropdown selector and refresh button in the dashboard header that controls the time window for all analytics data. Options are 'Last 24 hours' (1d), 'Last 7 days' (7d, default), 'Last 30 days' (30d), and 'All time' (all). Changing the selection triggers a re-fetch of all Tauri-backed queries with the corresponding days parameter. The refresh button manually invalidates all cached queries.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "llm-time-range-selector-visible",
+          "description": "The user can see a time range dropdown selector with a clock icon, defaulting to 'Last 7 days', that allows filtering all dashboard data by time period",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "combobox",
+              "textContent": "Last 7 days"
+            },
+            "label": "Time range selector dropdown"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-time-range-options",
+          "description": "The time range dropdown contains exactly four options: 'Last 24 hours', 'Last 7 days', 'Last 30 days', and 'All time'",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Last 24 hours|Last 7 days|Last 30 days|All time"
+            },
+            "label": "Time range option labels"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-refresh-button",
+          "description": "The user can click a 'Refresh analytics' button (with aria-label) to manually re-fetch all dashboard data without changing the time range",
+          "category": "interaction",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Refresh analytics"
+            },
+            "label": "Refresh analytics button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-time-range-filters-charts",
+          "description": "Changing the time range selection causes all charts and summary cards to update, reflecting data from the newly selected period via the useLlmAnalytics hook re-fetching with the new days parameter",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "combobox"
+            },
+            "label": "Time range selector"
+          },
+          "assertionType": "state",
+          "expectedState": {
+            "description": "Selecting a different time range causes all Tauri queries to re-fetch with the updated days parameter and chart data to reflect the new time window"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "llm-cost-charts",
+      "name": "Cost Charts",
+      "description": "Three cost visualization charts arranged in a responsive grid: (1) Cost Over Time \u00e2\u20ac\u201d a Recharts LineChart showing daily LLM cost with date on X-axis and dollar amount on Y-axis, with tooltips showing cost, calls, input/output tokens per day; (2) Cost by Model \u00e2\u20ac\u201d a horizontal BarChart ranking models by total cost descending, with tooltips showing cost, calls, tokens, and avg duration; (3) Cost by Phase \u00e2\u20ac\u201d a horizontal BarChart breaking down cost by workflow phase (setup/agentic/completion), sorted by cost descending.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "llm-cost-over-time-chart",
+          "description": "The user can see a 'Cost Over Time' line chart with a TrendingUp icon, showing daily LLM cost on the Y-axis (formatted as dollars) and dates on the X-axis (formatted as MM/DD)",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Cost Over Time"
+            },
+            "label": "Cost Over Time chart heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)"
+        },
+        {
+          "id": "llm-cost-over-time-tooltip",
+          "description": "The Cost Over Time chart has interactive tooltips showing the date, cost in dollars, number of calls, and input/output token counts for each data point",
+          "category": "interaction",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Cost:|Calls:|Input tokens:|Output tokens:"
+            },
+            "label": "Cost Over Time tooltip content"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)"
+        },
+        {
+          "id": "llm-cost-by-model-chart",
+          "description": "The user can see a 'Cost by Model' horizontal bar chart with a Cpu icon, showing each LLM model name on the Y-axis and its total cost on the X-axis, sorted by cost descending",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Cost by Model"
+            },
+            "label": "Cost by Model chart heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)"
+        },
+        {
+          "id": "llm-cost-by-model-tooltip",
+          "description": "The Cost by Model chart has interactive tooltips showing the model name, cost, call count, input/output tokens, and average duration in milliseconds",
+          "category": "interaction",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Avg duration:"
+            },
+            "label": "Cost by Model tooltip with duration"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)"
+        },
+        {
+          "id": "llm-cost-by-phase-chart",
+          "description": "The user can see a 'Cost by Phase' horizontal bar chart with a Layers icon, showing workflow phases on the Y-axis and their total cost on the X-axis, sorted by cost descending",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Cost by Phase"
+            },
+            "label": "Cost by Phase chart heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)"
+        },
+        {
+          "id": "llm-cost-by-phase-tooltip",
+          "description": "The Cost by Phase chart has interactive tooltips showing the phase name, cost in dollars, and input/output token counts",
+          "category": "interaction",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Input tokens:|Output tokens:"
+            },
+            "label": "Cost by Phase tooltip content"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)"
+        }
+      ]
+    },
+    {
+      "id": "llm-cost-trends",
+      "name": "Cost Trends",
+      "description": "A dedicated cost trend chart that fetches its own data independently from the web backend via useCostTrends (fetch API \u00e2\u2020\u2019 PostgreSQL). Shows a Recharts LineChart with two lines: 'Daily Cost' (solid line with dots) and '7-Day Average' (dashed line, computed client-side via 7-day rolling window). Displays summary stats above the chart: Total spend, Avg/day cost, and Trend direction (up/down/flat icon). The trend direction compares the average of the last 7 days against the previous 7 days, with a 5% threshold.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "llm-cost-trends-heading",
+          "description": "The user can see a 'Cost Trends' chart section with a TrendingUp icon in the heading",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Cost Trends"
+            },
+            "label": "Cost Trends chart heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Cost trends data has loaded and at least 7 days of data exist"
+        },
+        {
+          "id": "llm-cost-trends-summary-stats",
+          "description": "The user can see summary statistics above the cost trend chart: 'Total:' showing total spend in dollars, 'Avg/day:' showing average daily cost, and 'Trend:' with a directional icon (TrendingUp red for increasing costs, TrendingDown green for decreasing, Minus for flat)",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Total:|Avg/day:|Trend:"
+            },
+            "label": "Cost trend summary stats"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Cost trends data has loaded and at least 7 days of data exist"
+        },
+        {
+          "id": "llm-cost-trends-daily-line",
+          "description": "The chart displays a 'Daily Cost' line (solid, primary color) showing per-day LLM cost, with small dots at each data point",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Daily Cost"
+            },
+            "label": "Daily Cost legend entry"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Cost trends data has loaded and at least 7 days of data exist"
+        },
+        {
+          "id": "llm-cost-trends-moving-avg-line",
+          "description": "The chart displays a '7-Day Average' line (dashed style) overlaying the daily cost data, computed as a 7-day rolling average that starts rendering after the first 7 data points",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "7-Day Average"
+            },
+            "label": "7-Day Average legend entry"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Cost trends data has loaded and at least 7 days of data exist"
+        },
+        {
+          "id": "llm-cost-trends-tooltip",
+          "description": "The Cost Trends chart has interactive tooltips showing the date, 'Daily cost' in dollars, '7-day avg' in dollars (when available), calls count, and input/output token counts",
+          "category": "interaction",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Daily cost:|7-day avg:"
+            },
+            "label": "Cost Trends tooltip content"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "Cost trends data has loaded and at least 7 days of data exist"
+        }
+      ]
+    },
+    {
+      "id": "llm-provider-latency",
+      "name": "Provider Latency",
+      "description": "A grouped bar chart showing response time distribution per LLM provider. Each provider has three bars: Avg (primary color), Min (accent color), and Max (secondary color) latency in milliseconds. Includes a Recharts Legend identifying the three series. Tooltips show provider name, avg/min/max latency, and call count.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "llm-provider-latency-chart",
+          "description": "The user can see a 'Provider Latency' chart with a Clock icon, showing a grouped bar chart with provider names on the X-axis and latency in milliseconds on the Y-axis",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Provider Latency"
+            },
+            "label": "Provider Latency chart heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)"
+        },
+        {
+          "id": "llm-provider-latency-series",
+          "description": "The chart displays three bar series per provider \u00e2\u20ac\u201d 'Avg', 'Min', and 'Max' \u00e2\u20ac\u201d with a legend identifying each series, allowing the user to compare latency distributions across providers",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Avg|Min|Max"
+            },
+            "label": "Provider latency legend entries"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)"
+        },
+        {
+          "id": "llm-provider-latency-tooltip",
+          "description": "The Provider Latency chart has interactive tooltips showing the provider name, average latency (e.g., 'Avg: 250ms'), minimum latency, maximum latency, and total call count",
+          "category": "interaction",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Avg:|Min:|Max:|Calls:"
+            },
+            "label": "Provider latency tooltip content"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "LLM analytics data has loaded successfully (not in loading or error state)"
+        }
+      ]
+    },
+    {
+      "id": "llm-task-run-cost-table",
+      "name": "Task Run Cost Table",
+      "description": "A sortable table showing per-task-run LLM cost breakdown, limited to the most recent 50 runs. Columns: Task Run (truncated ID with full ID in title attribute), Cost (sortable, default sort descending), Input tokens, Output tokens, Calls (sortable), and Started (sortable, formatted as 'Mon DD, HH:MM'). Sort toggles between ascending and descending when clicking the same column header. An ArrowUpDown icon appears next to the active sort column.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "llm-task-run-cost-table-heading",
+          "description": "The user can see a 'Task Run Costs' table section with a ListChecks icon and a run count indicator (e.g., '(12 runs)')",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Task Run Costs"
+            },
+            "label": "Task Run Costs table heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "At least one task run with LLM cost data exists"
+        },
+        {
+          "id": "llm-task-run-cost-table-columns",
+          "description": "The table displays columns for 'Task Run' (truncated run ID), 'Cost' (dollar amount), 'Input' (input tokens with K/M suffixes), 'Output' (output tokens), 'Calls' (API call count), and 'Started' (formatted date)",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Task Run|Cost|Input|Output|Calls|Started"
+            },
+            "label": "Task run cost table column headers"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "At least one task run with LLM cost data exists"
+        },
+        {
+          "id": "llm-task-run-cost-table-sort-cost",
+          "description": "The user can click the 'Cost' column header button (aria-label 'Sort by Cost') to sort the table by cost, toggling between ascending and descending order, with the default being descending (highest cost first)",
+          "category": "interaction",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Sort by Cost"
+            },
+            "label": "Sort by Cost button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "At least one task run with LLM cost data exists"
+        },
+        {
+          "id": "llm-task-run-cost-table-sort-calls",
+          "description": "The user can click the 'Calls' column header button (aria-label 'Sort by Calls') to sort the table by call count",
+          "category": "interaction",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Sort by Calls"
+            },
+            "label": "Sort by Calls button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "At least one task run with LLM cost data exists"
+        },
+        {
+          "id": "llm-task-run-cost-table-sort-started",
+          "description": "The user can click the 'Started' column header button (aria-label 'Sort by Started') to sort the table by start time",
+          "category": "interaction",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Sort by Started"
+            },
+            "label": "Sort by Started button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "At least one task run with LLM cost data exists"
+        },
+        {
+          "id": "llm-task-run-cost-table-id-tooltip",
+          "description": "Each task run row shows a truncated run ID (first 8 characters followed by '...') with the full run ID accessible via a title attribute on hover",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "..."
+            },
+            "label": "Truncated task run ID with title tooltip"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true,
+          "precondition": "At least one task run with LLM cost data exists"
+        }
+      ]
+    },
+    {
+      "id": "llm-loading-error-states",
+      "name": "Dashboard Loading & Error States",
+      "description": "The dashboard handles three non-data states: (1) Loading \u00e2\u20ac\u201d a centered spinning RefreshCw icon while any Tauri query is in-flight; (2) Error \u00e2\u20ac\u201d an AlertTriangle icon with 'Failed to load LLM analytics', the error message text, and a 'Retry' button that triggers refresh; (3) Empty \u00e2\u20ac\u201d a CreditCard icon with 'No LLM usage data available' and 'Run some workflows to start collecting LLM analytics' when summary is null or total_calls is 0. Individual chart components also have their own empty states when their specific data arrays are empty.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "llm-loading-spinner",
+          "description": "While LLM analytics data is being fetched, the dashboard shows a centered spinning refresh icon (RefreshCw with animate-spin) instead of any dashboard content",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "className": "animate-spin"
+            },
+            "label": "Loading spinner animation"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-error-message",
+          "description": "When data fetching fails, the dashboard displays an AlertTriangle icon, the text 'Failed to load LLM analytics', and the specific error message below it",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Failed to load LLM analytics"
+            },
+            "label": "Error message text"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-error-retry-button",
+          "description": "When an error occurs, a 'Retry' button is displayed that calls the refresh function to re-fetch all analytics data",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Retry"
+            },
+            "label": "Retry button on error state"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-empty-state-no-data",
+          "description": "When no LLM usage data exists (summary is null or total_calls is 0), the dashboard shows a CreditCard icon, 'No LLM usage data available', and 'Run some workflows to start collecting LLM analytics'",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No LLM usage data available"
+            },
+            "label": "Empty state message"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-empty-state-guidance",
+          "description": "The empty state includes guidance text 'Run some workflows to start collecting LLM analytics' to help the user understand what action is needed to populate the dashboard",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Run some workflows to start collecting LLM analytics"
+            },
+            "label": "Empty state guidance text"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-cost-over-time-empty",
+          "description": "When there is no daily cost data, the Cost Over Time chart shows 'No daily cost data available' and 'Run some workflows to start tracking costs' instead of an empty chart",
+          "category": "state-consistency",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No daily cost data available"
+            },
+            "label": "Cost Over Time empty state"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-cost-by-model-empty",
+          "description": "When there is no model cost data, the Cost by Model chart shows 'No model cost data available' instead of an empty chart",
+          "category": "state-consistency",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No model cost data available"
+            },
+            "label": "Cost by Model empty state"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-cost-by-phase-empty",
+          "description": "When there is no phase cost data, the Cost by Phase chart shows 'No phase cost data available' instead of an empty chart",
+          "category": "state-consistency",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No phase cost data available"
+            },
+            "label": "Cost by Phase empty state"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-provider-latency-empty",
+          "description": "When there is no latency data, the Provider Latency chart shows 'No latency data available' instead of an empty chart",
+          "category": "state-consistency",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No latency data available"
+            },
+            "label": "Provider Latency empty state"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-task-run-cost-empty",
+          "description": "When there is no task run cost data, the table shows 'No task run cost data available' and 'Costs will appear here after workflows run'",
+          "category": "state-consistency",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No task run cost data available"
+            },
+            "label": "Task Run Cost Table empty state"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-cost-trends-empty",
+          "description": "When there is no cost trend data, the Cost Trends chart shows 'No cost trend data available' and 'Run some workflows to start tracking cost trends'",
+          "category": "state-consistency",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No cost trend data available"
+            },
+            "label": "Cost Trends empty state"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-cost-trends-error",
+          "description": "When the cost trends API call fails, the Cost Trends section shows 'Failed to load cost trends' with a 'Retry' link that re-fetches the data independently of the main dashboard refresh",
+          "category": "state-consistency",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Failed to load cost trends"
+            },
+            "label": "Cost Trends error state"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-cost-trends-loading",
+          "description": "While cost trends data is being fetched from the web backend, the Cost Trends section shows its own spinning RefreshCw icon independently of the main dashboard loading state",
+          "category": "state-consistency",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "className": "animate-spin",
+              "textContent": "Cost Trends"
+            },
+            "label": "Cost Trends loading spinner"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "llm-data-display",
+      "name": "Data Display",
+      "description": "Assertions verifying that data values are rendered with correct formatting, units, axis labels, and proportional representation across summary cards, charts, and tables.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "llm-data-display-summary-card-units",
+          "description": "Summary card values are formatted with appropriate units: Total Cost as '$X.XX' (cents converted to dollars via formatCost), Total Tokens with K/M suffixes (e.g., '1.2M', '800.0K'), Total Calls as locale-formatted number, and Avg Cost/Call as '$X.XX'",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Total Cost|Total Tokens|Total Calls|Avg Cost/Call"
+            },
+            "label": "Summary card formatted values"
+          },
+          "assertionType": "content",
+          "expectedContent": {
+            "description": "Total Cost shows '$X.XX', Total Tokens shows K/M suffixed count, Total Calls shows locale-formatted integer, Avg Cost/Call shows '$X.XX'"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-data-display-cost-over-time-axes",
+          "description": "Cost Over Time chart has a labeled X-axis showing dates formatted as MM/DD (via tickFormatter splitting on '-') and a Y-axis showing cost formatted as '$X.XX'",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Cost Over Time"
+            },
+            "label": "Cost Over Time chart with labeled axes"
+          },
+          "assertionType": "content",
+          "expectedContent": {
+            "description": "XAxis dataKey='date' with MM/DD tickFormatter, YAxis with '$X.XX' tickFormatter"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-data-display-cost-by-model-bars",
+          "description": "Cost by Model chart bars are proportional to each model's total cost, rendered as a horizontal BarChart with model names on the Y-axis and cost values on the X-axis sorted descending",
+          "category": "data-display",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Cost by Model"
+            },
+            "label": "Cost by Model proportional bars"
+          },
+          "assertionType": "content",
+          "expectedContent": {
+            "description": "Horizontal BarChart with bars proportional to each model's total_cost_cents, sorted by cost descending"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-data-display-task-run-table-row-data",
+          "description": "Task run cost table rows show the truncated task_run_id (first 8 characters + '...'), cost formatted as '$X.XX', input/output tokens with K/M suffixes via formatTokens, call_count, and started_at formatted as 'Mon DD, HH:MM' via formatDate",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Task Run|Cost|Input|Output|Calls|Started"
+            },
+            "label": "Task run cost table row data"
+          },
+          "assertionType": "content",
+          "expectedContent": {
+            "description": "Each row: truncated run ID with title attribute, cost as '$X.XX', input/output tokens with K/M suffixes, call count, formatted date"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-data-display-cost-trend-two-lines",
+          "description": "Cost Trends chart has two visible lines: 'Daily Cost' (solid line with dataKey='cost', strokeWidth=1.5, small dots at r=2) and '7-Day Average' (dashed line with dataKey='movingAvg', strokeDasharray='5 3', no dots)",
+          "category": "data-display",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Daily Cost|7-Day Average"
+            },
+            "label": "Cost Trends dual line series"
+          },
+          "assertionType": "content",
+          "expectedContent": {
+            "description": "Two Line elements: name='Daily Cost' with solid stroke and dot={r:2}, name='7-Day Average' with strokeDasharray='5 3' and dot=false"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "llm-behavior",
+      "name": "Behavior",
+      "description": "Assertions verifying interactive behavior: time range filtering, refresh, chart animations, and tooltip interactions.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "llm-behavior-time-range-updates-all",
+          "description": "The time range selection controls all chart data simultaneously. useLlmAnalytics(timeRange) re-fetches summary, dailyCost, costByModel, costByPhase, providerLatency, taskRunCosts, and costByTargetApp when the time range changes",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "combobox",
+              "textContent": "Select time range"
+            },
+            "label": "Time range selector"
+          },
+          "assertionType": "state",
+          "expectedState": {
+            "description": "Selecting a new time range calls setTimeRange, which causes useLlmAnalytics to re-fetch all data with the new days parameter, updating every chart and summary card"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-behavior-refresh-reloads-all",
+          "description": "The 'Refresh analytics' button (aria-label='Refresh analytics') invokes the refresh function from useLlmAnalytics, which invalidates all cached queries and reloads all dashboard data",
+          "category": "behavior",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Refresh analytics"
+            },
+            "label": "Refresh analytics button"
+          },
+          "assertionType": "state",
+          "expectedState": {
+            "description": "Clicking refresh calls the refresh function returned by useLlmAnalytics, invalidating all cached Tauri queries and triggering a full data reload"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-behavior-charts-animate",
+          "description": "Charts animate on data load via Recharts default animation (isAnimationActive defaults to true on Line and Bar components), providing smooth transitions when data changes",
+          "category": "behavior",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Cost Over Time|Cost by Model|Cost Trends"
+            },
+            "label": "Recharts animated chart components"
+          },
+          "assertionType": "state",
+          "expectedState": {
+            "description": "Recharts Line and Bar components render with default isAnimationActive=true, animating on initial render and data updates"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-behavior-chart-tooltip-on-hover",
+          "description": "Chart elements display tooltips with contextual details: Cost Over Time tooltip shows date, 'Cost: $X.XX', 'Calls:', 'Input tokens:', 'Output tokens:'; Cost Trends tooltip shows date, 'Daily cost: $X.XX', '7-day avg: $X.XX', 'Calls:', 'Input tokens:', 'Output tokens:'",
+          "category": "behavior",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Cost:|Daily cost:|7-day avg:"
+            },
+            "label": "Chart hover tooltips"
+          },
+          "assertionType": "state",
+          "expectedState": {
+            "description": "CustomTooltip renders on hover with active=true, displaying formatted cost, call count, and token breakdown from the payload data point"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "llm-navigation",
+      "name": "Navigation",
+      "description": "Assertions verifying dashboard accessibility via tab navigation, state persistence, and scroll behavior.",
+      "category": "navigation",
+      "assertions": [
+        {
+          "id": "llm-navigation-tab-accessible",
+          "description": "The 'LLM Analytics' tab is accessible from the main tab bar, rendering the LlmObservabilityDashboard component with the heading 'LLM Analytics' and subtitle 'Token usage, costs, and provider performance'",
+          "category": "navigation",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "LLM Analytics"
+            },
+            "label": "LLM Analytics tab and heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-navigation-tab-persists",
+          "description": "The LLM Analytics tab state (selected time range and loaded data) persists when switching away and back, because timeRange is held in component state and useLlmAnalytics caches query results",
+          "category": "navigation",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "LLM Analytics"
+            },
+            "label": "LLM Analytics tab persistence"
+          },
+          "assertionType": "state",
+          "expectedState": {
+            "description": "Navigating away and returning to the LLM Analytics tab preserves the selected timeRange and cached data from useLlmAnalytics"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-navigation-dashboard-scrolls",
+          "description": "The dashboard container has className 'h-full overflow-auto p-4 space-y-4', enabling vertical scrolling to show all chart sections: SummaryCards, CostOverTimeChart, CostByModelChart, CostTrendChart, CostByPhaseChart, ProviderLatencyChart, CostByTargetAppChart, and TaskRunCostTable",
+          "category": "navigation",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "className": "overflow-auto"
+            },
+            "label": "Dashboard scrollable container"
+          },
+          "assertionType": "state",
+          "expectedState": {
+            "description": "The root div with overflow-auto allows the user to scroll vertically to reach all chart sections when content exceeds viewport height"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "llm-element-presence",
+      "name": "Element Presence",
+      "description": "Assertions verifying that key UI elements are present and visible in the dashboard layout.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "llm-element-presence-four-summary-cards",
+          "description": "All 4 summary cards are present: 'Total Cost' (DollarSign icon), 'Total Tokens' (Hash icon), 'Total Calls' (Phone icon), and 'Avg Cost/Call' (TrendingUp icon), rendered in a grid with className 'grid grid-cols-2 md:grid-cols-4 gap-3'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Total Cost|Total Tokens|Total Calls|Avg Cost/Call"
+            },
+            "label": "Four summary metric cards"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-element-presence-time-range-dropdown",
+          "description": "The time range dropdown is visible as a <select> element with aria-label='Select time range', className including 'bg-muted border border-border rounded-md', containing options for 'Last 24 hours', 'Last 7 days', 'Last 30 days', and 'All time'",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "combobox",
+              "textContent": "Select time range"
+            },
+            "label": "Time range dropdown select element"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-element-presence-refresh-button",
+          "description": "The refresh button is visible with aria-label='Refresh analytics', title='Refresh analytics', containing a RefreshCw icon (w-4 h-4), styled with 'p-2 rounded-md hover:bg-muted transition-colors'",
+          "category": "element-presence",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Refresh analytics"
+            },
+            "label": "Refresh button with RefreshCw icon"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-element-presence-chart-headings",
+          "description": "Each chart section has a heading label rendered as an <h3> with className 'font-semibold' and an icon: 'Cost Over Time' (TrendingUp), 'Cost by Model' (Cpu), 'Cost by Phase' (Layers), 'Cost Trends' (TrendingUp), 'Provider Latency' (Clock), and 'Task Run Costs' (ListChecks)",
+          "category": "element-presence",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Cost Over Time|Cost by Model|Cost by Phase|Cost Trends|Provider Latency|Task Run Costs"
+            },
+            "label": "Chart section heading labels"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "llm-element-presence-cost-trend-legend",
+          "description": "The Cost Trends chart shows a Recharts Legend (verticalAlign='top', height=28) with two entries: 'Daily Cost' for the solid primary-colored line and '7-Day Average' for the dashed secondary-colored line",
+          "category": "element-presence",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Daily Cost|7-Day Average"
+            },
+            "label": "Cost Trends chart legend labels"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "component": "LlmObservabilityDashboard",
+    "author": "opik-integration",
+    "createdAt": "2026-03-26T00:00:00.000Z",
+    "updatedAt": "2026-03-26T00:00:00.000Z",
+    "pageUrl": "/llm-analytics",
+    "elementSource": "sdk",
+    "specType": "semantic",
+    "tags": [
+      "llm-observability",
+      "cost-tracking",
+      "token-analytics",
+      "opik",
+      "tier-2"
+    ]
+  }
+}

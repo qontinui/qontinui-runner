@@ -809,20 +809,7 @@ async fn get_device_info(
 async fn get_backup_summary(
     State(api_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = if let Some(pg) = &api_state.app_state.pg_db {
-        pg.get_export_summary().await
-    } else {
-        let db = api_state.app_state.checkpoint_db.clone();
-        tokio::task::spawn_blocking(move || db.get_export_summary())
-            .await
-            .map_err(|e| {
-                error!("Failed to get backup summary: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!("Task failed: {}", e))),
-                )
-            })?
-    };
+    let result = api_state.app_state.pg_db.get_export_summary().await;
 
     match result {
         Ok(summary) => Ok(Json(ApiResponse::success(summary))),

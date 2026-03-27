@@ -28,6 +28,7 @@ import { KnowledgeTab } from "./KnowledgeTab";
 import { ContextTab } from "./ContextTab";
 import { ErrorMonitorTab } from "../error-monitor/ErrorMonitorTab";
 import { CanvasRecapTab } from "./CanvasRecapTab";
+import { TaskRunLivePanel } from "../graphql/TaskRunLivePanel";
 import { DurableExecutionTab } from "./DurableExecutionTab";
 import { useErrorBadge } from "../../hooks/useErrorMonitor";
 import { FeedbackScoresPanel } from "../feedback-scores/FeedbackScoresPanel";
@@ -103,8 +104,16 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
   const summaryGeneratedAt = selectedRun?.summary_generated_at || null;
   const taskRunId = selectedRun?.id || data.task_run_id;
 
+  // Show live panel for running tasks — provides real-time events via GraphQL subscriptions
+  const isLive = !isFinished && selectedRun?.status === "running";
+
   return (
     <div className="h-full overflow-y-auto p-4 space-y-4">
+      {/* Live panel for active tasks — shows real-time progress, findings, output */}
+      {isLive && taskRunId && (
+        <TaskRunLivePanel taskRunId={taskRunId} compact className="border rounded-lg bg-card" />
+      )}
+
       {/* 1. Compact Status Strip */}
       <CompactStatusStrip
         status={data.status}

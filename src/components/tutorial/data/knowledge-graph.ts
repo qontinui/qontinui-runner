@@ -190,15 +190,15 @@ A fix with score > 0 is net positive; negative means it caused more regressions 
 Patterns are stored in the \`cross_run_patterns\` table with status: **active**, **resolved**, or **suppressed**.`,
       estimatedDuration: 1,
       targetElement: {
-        selector: '[data-tutorial-id="sidebar-reflection"]',
-        highlightType: "border",
-        position: "right",
+        selector: '[data-tutorial-id="graph-insights-section"]',
+        highlightType: "spotlight",
+        position: "top",
         scrollIntoView: true,
       },
       tips: [
-        "View cross-run patterns on the Reflection Dashboard",
-        "Active patterns (red badges) need attention",
-        "Resolved patterns (green badges) confirm a fix worked",
+        "The Graph Insights section appears at the bottom of the Reflection Dashboard when a workflow is selected",
+        "Use the sub-tabs to switch between Cross-Run Patterns, Rule Influence, Pipeline Events, Step Provenance, and Versions",
+        "Active patterns (red badges) need attention — resolved patterns (green) confirm a fix worked",
         "The system auto-disables rules that consistently have no effect",
       ],
     },
@@ -340,9 +340,9 @@ score = 0.30 * element_success_rate
 All panels are backed by **13 MCP endpoints** under \`/ui-bridge/analytics/*\` and use **17 SQL analytics queries** against the \`ui_bridge_events\` table.`,
       estimatedDuration: 1,
       targetElement: {
-        selector: '[data-tutorial-id="sidebar-automation-health"]',
+        selector: '[data-tutorial-id="graph-insights-tabs"]',
         highlightType: "pulse",
-        position: "right",
+        position: "bottom",
         scrollIntoView: true,
       },
       tips: [

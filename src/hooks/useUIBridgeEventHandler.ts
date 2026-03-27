@@ -241,6 +241,10 @@ export function useUIBridgeEventHandler(): void {
 
         log.debug("Listener set up successfully");
 
+        // Signal readiness immediately rather than waiting for next ping cycle.
+        // This unblocks any Rust-side requests waiting on the readiness gate.
+        httpSendPong().catch(() => {});
+
         // Store ping unlisten for cleanup
         const originalUnlisten = unlisten;
         unlisten = () => {

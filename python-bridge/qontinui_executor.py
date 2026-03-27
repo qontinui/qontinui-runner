@@ -682,6 +682,10 @@ class QontinuiExecutor:
             )
             # Set pause event for synchronization
             self.gui_automation.set_pause_event(self._pause_event)
+            # Set activity timeline capture callback (screenpipe-inspired)
+            self.gui_automation.set_timeline_capture_fn(
+                self.event_manager.emit_timeline_capture
+            )
 
             # Inject self as workflow executor for navigation
             if QONTINUI_AVAILABLE:

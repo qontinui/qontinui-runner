@@ -188,7 +188,7 @@ export function PromptCanaryPanel() {
   };
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4" data-tutorial-id="prompt-canary-panel">
       <div className="flex items-center justify-between">
         <div className="text-sm text-zinc-400">Prompt Canary A/B Tests</div>
         <div className="flex items-center gap-2">

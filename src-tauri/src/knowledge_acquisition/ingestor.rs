@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use crate::database::embedding_client::EmbeddingClient;
 use crate::database::embeddings::store_knowledge_embedding;
 use crate::database::hybrid_search::{hybrid_search_knowledge, HybridSearchConfig};
+use crate::database::pg::PgDb;
 use crate::database::CheckpointDb;
 use crate::knowledge_acquisition::summarizer;
 use crate::knowledge_acquisition::types::KnowledgeResult;
@@ -168,6 +171,7 @@ pub async fn ingest_results(
     results: &[KnowledgeResult],
     task_run_id: &str,
     db: &CheckpointDb,
+    pg: Option<&Arc<PgDb>>,
 ) -> Vec<IngestOutcome> {
     let embedding_client = EmbeddingClient::new();
 
@@ -183,18 +187,19 @@ pub async fn ingest_results(
     let mut outcomes = Vec::with_capacity(results.len());
 
     for result in results {
-        let outcome = ingest_single(result, task_run_id, db, &embedding_client).await;
+        let outcome = ingest_single(result, task_run_id, db, pg, &embedding_client).await;
         outcomes.push(outcome);
     }
 
     outcomes
 }
 
-/// Ingest a single result
+/// Ingest a single result. Prefers PG when available, falls back to SQLite.
 async fn ingest_single(
     result: &KnowledgeResult,
     task_run_id: &str,
     db: &CheckpointDb,
+    pg: Option<&Arc<PgDb>>,
     embedding_client: &EmbeddingClient,
 ) -> IngestOutcome {
     // Step 0: Scan for prompt injection (hermes-agent-inspired)
@@ -238,38 +243,43 @@ async fn ingest_single(
         }
     };
 
-    // Step 3: Dedup check via hybrid_search
+    // Step 3: Dedup check via hybrid_search (prefer PG)
     let dedup_config = HybridSearchConfig {
-        sql_weight: 0.0,      // pure vector search for dedup
+        sql_weight: 0.0, // pure vector search for dedup
         vector_weight: 1.0,
         limit: 1,
         min_similarity: DEDUP_SIMILARITY_THRESHOLD,
     };
 
-    match db.get_conn() {
-        Ok(conn) => {
-            match hybrid_search_knowledge(
+    let dedup_result = if let Some(pg) = pg {
+        pg.hybrid_search_knowledge(
+            &embedding,
+            Some(EXTERNAL_KNOWLEDGE_CATEGORY),
+            &dedup_config,
+        )
+        .await
+    } else {
+        match db.get_conn() {
+            Ok(conn) => hybrid_search_knowledge(
                 &conn,
                 &embedding,
                 Some(EXTERNAL_KNOWLEDGE_CATEGORY),
                 &dedup_config,
-            ) {
-                Ok(existing) => {
-                    if let Some(top) = existing.first() {
-                        if top.similarity >= DEDUP_SIMILARITY_THRESHOLD {
-                            return IngestOutcome::Duplicate {
-                                existing_id: top.item.id.clone(),
-                            };
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Dedup search failed, proceeding with insert: {e}");
-                }
+            ),
+            Err(e) => {
+                warn!("DB connection failed for dedup check, proceeding with insert: {e}");
+                Ok(vec![])
             }
         }
-        Err(e) => {
-            warn!("DB connection failed for dedup check, proceeding with insert: {e}");
+    };
+
+    if let Ok(existing) = dedup_result {
+        if let Some(top) = existing.first() {
+            if top.similarity >= DEDUP_SIMILARITY_THRESHOLD {
+                return IngestOutcome::Duplicate {
+                    existing_id: top.item.id.clone(),
+                };
+            }
         }
     }
 
@@ -283,18 +293,39 @@ async fn ingest_single(
         _ => "medium",
     };
 
-    // Step 5: Insert into task_knowledge
-    let stored = match db.create_task_knowledge(
-        task_run_id,
-        EXTERNAL_KNOWLEDGE_CATEGORY,
-        SYSTEM_AGENT_TYPE,
-        0, // iteration
-        &content,
-        Some(&evidence),
-        confidence,
-        &[], // no related files
-    ) {
-        Ok(stored) => stored,
+    let id = uuid::Uuid::new_v4().to_string();
+    let related_files_json = "[]";
+
+    // Step 5: Insert into task_knowledge (prefer PG)
+    let stored_id = if let Some(pg) = pg {
+        pg.create_task_knowledge(
+            &id,
+            task_run_id,
+            EXTERNAL_KNOWLEDGE_CATEGORY,
+            SYSTEM_AGENT_TYPE,
+            0,
+            &content,
+            Some(&evidence),
+            confidence,
+            related_files_json,
+        )
+        .await
+    } else {
+        db.create_task_knowledge(
+            task_run_id,
+            EXTERNAL_KNOWLEDGE_CATEGORY,
+            SYSTEM_AGENT_TYPE,
+            0,
+            &content,
+            Some(&evidence),
+            confidence,
+            &[],
+        )
+        .map(|stored| stored.id)
+    };
+
+    let stored_id = match stored_id {
+        Ok(id) => id,
         Err(e) => {
             return IngestOutcome::Failed {
                 error: format!("DB insert failed: {e}"),
@@ -302,14 +333,21 @@ async fn ingest_single(
         }
     };
 
-    // Step 6: Store embedding
-    if let Ok(conn) = db.get_conn() {
-        if let Err(e) = store_knowledge_embedding(&conn, &stored.id, &embedding) {
-            warn!(id = %stored.id, "Failed to store embedding: {e}");
+    // Step 6: Store embedding (prefer PG)
+    if let Some(pg) = pg {
+        if let Err(e) = pg.store_knowledge_embedding(&stored_id, &embedding).await {
+            warn!(id = %stored_id, "Failed to store embedding in PG: {e}");
+        }
+    } else if let Ok(conn) = db.get_conn() {
+        if let Err(e) = store_knowledge_embedding(&conn, &stored_id, &embedding) {
+            warn!(id = %stored_id, "Failed to store embedding: {e}");
         }
     }
 
-    IngestOutcome::Stored { id: stored.id, injection_flagged: scan.is_suspicious }
+    IngestOutcome::Stored {
+        id: stored_id,
+        injection_flagged: scan.is_suspicious,
+    }
 }
 
 /// Build evidence JSON from a search result

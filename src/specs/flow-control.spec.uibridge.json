@@ -1,0 +1,694 @@
+{
+  "version": "1.0.0",
+  "description": "Flow Control Settings Panel -- a workflow builder component (FlowControlPanel.tsx) for configuring per-workflow Inngest-inspired flow control policies and per-phase timeout overrides. Integrated into WorkflowEditor in qontinui-web. Produces two JSON strings (flow_control_json, phase_timeouts_json) persisted to unified_workflows table. At runtime, LoopController loads configs and enforces them: FlowControlEnforcer checks concurrency/throttle/debounce/rate-limit before admitting a workflow, and phase_timeout_ms enforces per-phase deadlines via check_timeout(). Backend: flow_control.rs, orchestrator/state.rs, loop_controller.rs, loop_handlers.rs, unified_workflows.rs, workflow_ops.rs, migrations v147.",
+  "groups": [
+    {
+      "id": "fc-concurrency",
+      "name": "Concurrency Limit Configuration",
+      "description": "Controls max simultaneous instances of this workflow. When limit reached, new executions queue and wait (FlowControlDecision::Wait). Optionally scoped by key. Backend: FlowControl.concurrency (ConcurrencyLimit), enforced by FlowControlEnforcer.check(), tracked by record_start/record_end.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "fc-conc-heading",
+          "description": "Concurrency section is clearly labeled",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Concurrency"
+            },
+            "label": "Concurrency section heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-conc-limit-input",
+          "description": "Users can set max concurrent executions via a numeric input",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "spinbutton"
+            },
+            "label": "Concurrency limit number input"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-conc-limit-default",
+          "description": "The concurrency limit defaults to a sensible value (e.g., 1 or empty) when no config exists",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "spinbutton"
+            },
+            "label": "Default concurrency value"
+          },
+          "expected": "Input is empty or shows a placeholder when no flow_control_json is saved on the workflow",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-conc-scope-key",
+          "description": "Users can optionally enter a scope key to apply limits per-key rather than globally",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Scope key"
+            },
+            "label": "Scope key input label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-conc-input-validation",
+          "description": "The concurrency input only accepts positive integers; invalid values are rejected or clamped",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "spinbutton"
+            },
+            "label": "Concurrency input validation"
+          },
+          "expected": "Input has min=1 attribute and type=number, preventing zero or negative values",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "fc-throttle",
+      "name": "Throttle Configuration",
+      "description": "Limits workflow throughput over time. Unlike rate limiting, throttled requests queue and wait. Backend: FlowControl.throttle (ThrottleConfig), enforced by FlowControlEnforcer via sliding-window timestamps.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "fc-throttle-heading",
+          "description": "Throttle section is clearly labeled",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Throttle"
+            },
+            "label": "Throttle section heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-throttle-limit-input",
+          "description": "Users can set the max runs allowed within the throttle period",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Max runs"
+            },
+            "label": "Throttle limit label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-throttle-period-presets",
+          "description": "Period can be selected from preset buttons (1min, 5min, 15min, 1hr) for quick configuration",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "1min"
+            },
+            "label": "1-minute throttle period preset"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-throttle-preset-click",
+          "description": "Clicking a period preset button updates the period value immediately without additional save action",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "5min"
+            },
+            "label": "Period preset click behavior"
+          },
+          "expected": "Clicking '5min' sets period_seconds to 300 and highlights the button as selected",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "fc-rate-limit",
+      "name": "Rate Limit Configuration",
+      "description": "Hard cap that drops excess requests (unlike throttle which queues). Backend: FlowControl.rate_limit, returns FlowControlDecision::Skip.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "fc-rl-heading",
+          "description": "Rate Limit section is clearly labeled",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Rate Limit"
+            },
+            "label": "Rate Limit section heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-rl-limit-input",
+          "description": "Users can set the hard cap for runs in the period",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Max runs"
+            },
+            "label": "Rate limit cap input"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-rl-period-presets",
+          "description": "Rate limit period has preset buttons matching the throttle presets for consistency",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "1hr"
+            },
+            "label": "1-hour rate limit period preset"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "fc-debounce",
+      "name": "Debounce Configuration",
+      "description": "Sliding window deduplication \u00e2\u20ac\u201d only the latest trigger executes. Backend: FlowControl.debounce (DebounceConfig), enforced with saturating_sub for clock safety.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "fc-debounce-heading",
+          "description": "Debounce section is clearly labeled",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Debounce"
+            },
+            "label": "Debounce section heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-debounce-preset-500ms",
+          "description": "500ms preset available for short debounce windows",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "500ms"
+            },
+            "label": "500ms debounce preset"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-debounce-preset-selection",
+          "description": "Clicking a debounce preset sets the window_ms value and visually highlights the selected preset",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "1s"
+            },
+            "label": "Debounce preset selection"
+          },
+          "expected": "Clicking '1s' sets window_ms to 1000, highlights the button, and triggers onFlowControlChange callback",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-debounce-custom-input",
+          "description": "Users can enter a custom debounce window in milliseconds when presets don't fit",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Custom"
+            },
+            "label": "Custom debounce input"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "fc-phase-timeouts",
+      "name": "Phase Timeout Configuration",
+      "description": "Per-phase timeout overrides in minutes. Backend: PhaseTimeouts in orchestrator/state.rs, parsed from phase_timeouts_json in types.rs, enforced by check_timeout() in loop_handlers.rs. Defaults: setup=5min, execution=30min, verification=10min, completion=5min.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "fc-timeout-heading",
+          "description": "Phase Timeouts section is clearly labeled",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Phase Timeouts"
+            },
+            "label": "Phase Timeouts heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-timeout-setup",
+          "description": "Setup phase timeout configurable in minutes",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Setup"
+            },
+            "label": "Setup timeout label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-timeout-execution",
+          "description": "Execution (agentic) phase timeout configurable \u00e2\u20ac\u201d most impactful as it governs the main AI work loop",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Execution"
+            },
+            "label": "Execution timeout label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-timeout-verification",
+          "description": "Verification phase timeout configurable",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Verification"
+            },
+            "label": "Verification timeout label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-timeout-completion",
+          "description": "Completion phase timeout configurable",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Completion"
+            },
+            "label": "Completion timeout label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-timeout-unit-label",
+          "description": "Timeout inputs show 'min' unit suffix so users know they're entering minutes, not seconds or milliseconds",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "min"
+            },
+            "label": "Minutes unit label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-timeout-default-values",
+          "description": "Timeout inputs show default values when no phase_timeouts_json is saved (setup=5, execution=30, verification=10, completion=5)",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Execution"
+            },
+            "label": "Default timeout values"
+          },
+          "expected": "If phase_timeouts_json is null/empty, inputs show placeholder or default: setup=5, execution=30, verification=10, completion=5 (matching PhaseTimeouts::default() in state.rs)",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-timeout-input-type",
+          "description": "Timeout inputs are numeric with min=1 to prevent zero or negative timeouts",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "spinbutton"
+            },
+            "label": "Timeout numeric input"
+          },
+          "expected": "Input type=number with min=1",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "fc-persistence",
+      "name": "Configuration Persistence and State Consistency",
+      "description": "Settings serialize to JSON and persist as flow_control_json and phase_timeouts_json on unified_workflows. On save, WorkflowEditor PATCHes via MCP API. On load, LoopController reads for enforcement. Both SQLite (v147) and PostgreSQL store these fields.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "fc-persist-save",
+          "description": "Changes persist when the workflow is saved, surviving page navigation and app restarts",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Concurrency"
+            },
+            "label": "Flow control settings persist on save"
+          },
+          "expected": "After setting concurrency=2, saving the workflow, navigating away, and returning, the concurrency input still shows 2. The workflow's flow_control_json contains '{\"concurrency\":{\"limit\":2}}'",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-persist-load-existing",
+          "description": "When opening a workflow with existing flow_control_json, the panel pre-populates with saved values",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Concurrency"
+            },
+            "label": "Flow control loads from DB"
+          },
+          "expected": "If the workflow has flow_control_json='{\"concurrency\":{\"limit\":3},\"throttle\":{\"limit\":5,\"period_seconds\":60}}', the concurrency input shows 3 and throttle shows 5/1min",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-persist-null-handling",
+          "description": "When flow_control_json is null/empty, all inputs show defaults or empty state, not errors",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Flow Control"
+            },
+            "label": "Null config handling"
+          },
+          "expected": "No console errors or broken UI when flow_control_json is null. All sections show their default/empty state",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-persist-runtime-enforcement",
+          "description": "Saved flow control settings are enforced at workflow execution time by the LoopController",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Flow Control"
+            },
+            "label": "Runtime enforcement consistency"
+          },
+          "expected": "If concurrency limit=1 is saved and two instances of the workflow are triggered, the second one waits (FlowControlDecision::Wait) until the first completes. The wait is logged in the runner console.",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "fc-layout",
+      "name": "Panel Layout and Visual Structure",
+      "description": "The FlowControlPanel renders as a collapsible section within the workflow editor settings. Each flow control type (concurrency, throttle, rate limit, debounce) is a distinct subsection with a heading, inputs, and optional scope key. Phase timeouts are a separate subsection with per-phase rows.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "fc-layout-panel-heading",
+          "description": "The panel has a top-level Flow Control heading identifying the settings area",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Flow Control"
+            },
+            "label": "Flow Control panel heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-layout-section-separation",
+          "description": "Each flow control type (concurrency, throttle, rate limit, debounce, timeouts) is visually separated as a distinct section",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Concurrency"
+            },
+            "label": "Visually separated sections"
+          },
+          "expected": "Each section has its own heading and is separated by spacing or borders from adjacent sections. The panel has at least 5 labeled subsections",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "fc-callback-integration",
+      "name": "Callback Integration with Workflow Editor",
+      "description": "The FlowControlPanel communicates changes to its parent (WorkflowEditor) via callbacks. When any flow control value changes, onFlowControlChange fires with the serialized JSON. When any timeout changes, onPhaseTimeoutsChange fires. The parent is responsible for saving via updateWorkflow().",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "fc-callback-flow-control",
+          "description": "Changing any flow control input triggers the onFlowControlChange callback with valid JSON",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Concurrency"
+            },
+            "label": "Flow control change callback"
+          },
+          "expected": "After changing concurrency limit from empty to 3, the parent component receives a JSON string like '{\"concurrency\":{\"limit\":3}}'. Empty/null sections are omitted from the JSON",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "fc-callback-phase-timeouts",
+          "description": "Changing any timeout input triggers the onPhaseTimeoutsChange callback with valid JSON",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Phase Timeouts"
+            },
+            "label": "Phase timeouts change callback"
+          },
+          "expected": "After setting execution timeout to 45 minutes, the parent receives '{\"execution_ms\":2700000}'. Values are converted from minutes to milliseconds for the backend",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "FlowControlPanel",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-26T00:00:00.000Z",
+    "updatedAt": "2026-03-26T00:00:00.000Z",
+    "pageUrl": "/build/workflows/:id",
+    "elementSource": "sdk",
+    "tags": [
+      "inngest",
+      "flow-control",
+      "concurrency",
+      "throttle",
+      "debounce",
+      "rate-limit",
+      "phase-timeouts",
+      "workflow-builder",
+      "tier-2"
+    ],
+    "specType": "semantic",
+    "assertionCategories": {
+      "semantic": 5,
+      "element-presence": 15,
+      "data-display": 3,
+      "interaction": 5,
+      "behavior": 5,
+      "state-consistency": 4
+    },
+    "backendFiles": [
+      "src-tauri/src/flow_control.rs",
+      "src-tauri/src/orchestrator/state.rs",
+      "src-tauri/src/unified_workflow_executor/loop_controller.rs",
+      "src-tauri/src/unified_workflow_executor/loop_handlers.rs",
+      "src-tauri/src/unified_workflow_executor/loop_state_machine.rs",
+      "src-tauri/src/unified_workflow_executor/types.rs",
+      "src-tauri/src/unified_workflows.rs",
+      "src-tauri/src/database/workflow_ops.rs",
+      "src-tauri/src/database/migrations.rs",
+      "src-tauri/src/workflow_generation/schema_context.rs"
+    ],
+    "dbColumns": [
+      "unified_workflows.flow_control_json TEXT (migration v147)",
+      "unified_workflows.phase_timeouts_json TEXT (migration v147)"
+    ],
+    "rustTypes": {
+      "FlowControl": "flow_control.rs \u00e2\u20ac\u201d concurrency, throttle, debounce, rate_limit, priority fields",
+      "ConcurrencyLimit": "flow_control.rs \u00e2\u20ac\u201d limit: u32, key: Option<String>",
+      "ThrottleConfig": "flow_control.rs \u00e2\u20ac\u201d limit: u32, period_seconds: u64, key: Option<String>",
+      "DebounceConfig": "flow_control.rs \u00e2\u20ac\u201d window_ms: u64, key: Option<String>",
+      "RateLimitConfig": "flow_control.rs \u00e2\u20ac\u201d limit: u32, period_seconds: u64, key: Option<String>",
+      "PhaseTimeouts": "orchestrator/state.rs \u00e2\u20ac\u201d setup_ms, execution_ms, verification_ms, completion_ms, summary_ms",
+      "FlowControlDecision": "flow_control.rs \u00e2\u20ac\u201d Allow | Wait { wait_ms, reason } | Skip { reason }",
+      "FlowControlEnforcer": "flow_control.rs \u00e2\u20ac\u201d global singleton with concurrency_counts, throttle_windows, rate_limit_windows, debounce_timers"
+    }
+  }
+}

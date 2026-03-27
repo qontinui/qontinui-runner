@@ -43,6 +43,8 @@ class EventType(Enum):
     EXTRACTION_COMPLETE = "extraction_complete"
     EXTRACTION_ERROR = "extraction_error"
     # UI Bridge exploration events
+    # Activity timeline capture events (screenpipe-inspired)
+    ACTIVITY_TIMELINE_CAPTURE = "activity_timeline_capture"
     UI_BRIDGE_EXPLORATION_STARTED = "ui_bridge_exploration_started"
     UI_BRIDGE_EXPLORATION_PROGRESS = "ui_bridge_exploration_progress"
     UI_BRIDGE_EXPLORATION_COMPLETED = "ui_bridge_exploration_completed"
@@ -96,6 +98,18 @@ class EventManager:
             message: Log message
         """
         self.emit_event(EventType.LOG, {"level": level, "message": message})
+
+    def emit_timeline_capture(self, capture_data: dict[str, Any]) -> None:
+        """
+        Emit an activity timeline capture event.
+
+        The Rust side can intercept this to store the capture in the activity
+        timeline (PostgreSQL). The capture_data should match ActivityTimelineInput.
+
+        Args:
+            capture_data: Dict with textContent, sourceType, captureMode, etc.
+        """
+        self.emit_event(EventType.ACTIVITY_TIMELINE_CAPTURE, capture_data)
 
     def emit_tree_event(self, event_type: str, node: Any, extra_data: dict | None = None) -> None:
         """

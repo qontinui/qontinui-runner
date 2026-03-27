@@ -14,13 +14,9 @@ use crate::mcp::shared::{emit_ai_output, AiSessionContext};
 use crate::mcp::types::{ApiResponse, ApiState};
 use crate::safe_lock::safe_lock_or_recover;
 
-/// PG-primary get_task_run helper. Falls back to SQLite when PG unavailable.
+/// PG-primary get_task_run helper.
 async fn pg_get_task_run(state: &Arc<ApiState>, id: &str) -> Result<Option<TaskRun>, String> {
-    if let Some(pg) = &state.app_state.pg_db {
-        pg.get_task_run(id).await
-    } else {
-        state.app_state.checkpoint_db.get_task_run(id)
-    }
+    state.app_state.pg_db.get_task_run(id).await
 }
 use crate::summary_generator;
 use tauri::Manager;
@@ -51,19 +47,7 @@ pub async fn list_task_runs(
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    let runs = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_recent_task_runs_filtered(limit, workflow_type.as_deref(), Some(port)).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        tokio::task::spawn_blocking(move || {
-            db.get_recent_task_runs_filtered(limit, workflow_type.as_deref(), Some(port))
-        })
-        .await
-        .map_err(|e| {
-            error!("spawn_blocking error in list_task_runs: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?
-    }
+    let runs = state.app_state.pg_db.get_recent_task_runs_filtered(limit, workflow_type.as_deref(), Some(port)).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(ApiResponse::success(runs)))
@@ -152,15 +136,9 @@ pub async fn create_task_run(
         input = input.with_log_sources_json(lsj);
     }
 
-    if let Some(pg) = &state.app_state.pg_db {
-        pg.create_task_run(&input).await
-            .map(Json)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
-    } else {
-        state.app_state.checkpoint_db.create_task_run(&input)
-            .map(Json)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
-    }
+    state.app_state.pg_db.create_task_run(&input).await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 /// Get a task run by ID.
@@ -168,15 +146,9 @@ pub async fn get_task_run(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Option<TaskRun>>, (StatusCode, String)> {
-    if let Some(pg) = &state.app_state.pg_db {
-        pg.get_task_run(&id).await
-            .map(Json)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
-    } else {
-        state.app_state.checkpoint_db.get_task_run(&id)
-            .map(Json)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
-    }
+    state.app_state.pg_db.get_task_run(&id).await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 /// Response for workflow state endpoint.
@@ -187,11 +159,7 @@ pub async fn stop_task_run(
     info!("Stopping task run: {}", id);
 
     // Verify task exists first
-    let task_run = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_task_run(&id).await
-    } else {
-        state.app_state.checkpoint_db.get_task_run(&id)
-    }
+    let task_run = state.app_state.pg_db.get_task_run(&id).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -235,11 +203,7 @@ pub async fn stop_task_run(
     }
 
     // Mark as stopped in database
-    if let Some(pg) = &state.app_state.pg_db {
-        pg.stop_task_run(&id, "User stopped").await
-    } else {
-        state.app_state.checkpoint_db.stop_task_run(&id)
-    }
+    state.app_state.pg_db.stop_task_run(&id, "User stopped").await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Explicitly release URL locks for this task (don't rely solely on
@@ -383,12 +347,7 @@ pub async fn delete_task_run(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let result = if let Some(pg) = &state.app_state.pg_db {
-        pg.delete_task_run(&id).await
-    } else {
-        state.app_state.checkpoint_db.delete_task_run(&id)
-    };
-    result
+    state.app_state.pg_db.delete_task_run(&id).await
         .map(|deleted| {
             Json(serde_json::json!({
                 "success": deleted,
@@ -744,18 +703,7 @@ pub async fn get_task_run_events(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
-    let events = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_task_run_events(&id, query.event_type.as_deref(), query.limit).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        let id_clone = id.clone();
-        let event_type = query.event_type.clone();
-        let limit = query.limit;
-        tokio::task::spawn_blocking(move || db.get_task_run_events(&id_clone, event_type.as_deref(), limit))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let events = state.app_state.pg_db.get_task_run_events(&id, query.event_type.as_deref(), query.limit).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
@@ -790,11 +738,7 @@ pub async fn get_task_run_checkpoints(
 
     let limit = query.limit.unwrap_or(50).min(100); // Cap at 100 per page
 
-    let (checkpoints, next_cursor) = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_workflow_step_checkpoints_paginated(&id, query.cursor, limit).await
-    } else {
-        state.app_state.checkpoint_db.get_workflow_step_checkpoints_paginated(&id, query.cursor, limit)
-    }
+    let (checkpoints, next_cursor) = state.app_state.pg_db.get_workflow_step_checkpoints_paginated(&id, query.cursor, limit).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
@@ -1017,27 +961,7 @@ pub async fn get_task_run_api_requests(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get API requests
-    // PG version has no success filter — fall back to SQLite for filtered queries
-    let requests = if query.success.is_none() {
-        if let Some(pg) = &state.app_state.pg_db {
-            pg.get_task_run_api_requests(&id).await
-        } else {
-            let db = state.app_state.checkpoint_db.clone();
-            let id_clone = id.clone();
-            tokio::task::spawn_blocking(move || db.get_task_run_api_requests(&id_clone, None))
-                .await
-                .map_err(|e| format!("spawn_blocking error: {}", e))
-                .and_then(|r| r)
-        }
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        let id_clone = id.clone();
-        let success = query.success;
-        tokio::task::spawn_blocking(move || db.get_task_run_api_requests(&id_clone, success))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let requests = state.app_state.pg_db.get_task_run_api_requests(&id).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Apply limit if specified
@@ -1098,27 +1022,7 @@ pub async fn get_task_run_playwright_results(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get Playwright results
-    // PG version has no status filter — fall back to SQLite for filtered queries
-    let results = if query.status.is_none() {
-        if let Some(pg) = &state.app_state.pg_db {
-            pg.get_task_run_playwright_results(&id).await
-        } else {
-            let db = state.app_state.checkpoint_db.clone();
-            let id_clone = id.clone();
-            tokio::task::spawn_blocking(move || db.get_task_run_playwright_results(&id_clone, None))
-                .await
-                .map_err(|e| format!("spawn_blocking error: {}", e))
-                .and_then(|r| r)
-        }
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        let id_clone = id.clone();
-        let status = query.status.clone();
-        tokio::task::spawn_blocking(move || db.get_task_run_playwright_results(&id_clone, status.as_deref()))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let results = state.app_state.pg_db.get_task_run_playwright_results(&id).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Apply limit if specified
@@ -1167,16 +1071,7 @@ pub async fn get_task_run_awas_steps(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get AWAS steps
-    let steps = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_task_run_awas_steps(&id).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        let id_clone = id.clone();
-        tokio::task::spawn_blocking(move || db.get_task_run_awas_steps(&id_clone))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let steps = state.app_state.pg_db.get_task_run_awas_steps(&id).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Calculate summary
@@ -1402,17 +1297,7 @@ pub async fn get_current_execution_steps(
     let task = &running_tasks[0];
 
     // Get all events for this task (don't filter by event_type, we'll filter in code)
-    let events = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_task_run_events(&task.id, None, query.limit).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        let task_id = task.id.clone();
-        let limit = query.limit;
-        tokio::task::spawn_blocking(move || db.get_task_run_events(&task_id, None, limit))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let events = state.app_state.pg_db.get_task_run_events(&task.id, None, query.limit).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Aggregate events by action_id (preferred) or step_name + step_index to merge start/complete events
@@ -1806,16 +1691,7 @@ pub async fn get_task_run_screenshots(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
-    let screenshots = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_task_run_screenshots(&id, None).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        let id_clone = id.clone();
-        tokio::task::spawn_blocking(move || db.get_task_run_screenshots(&id_clone, None))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let screenshots = state.app_state.pg_db.get_task_run_screenshots(&id, None).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
@@ -2000,11 +1876,7 @@ pub async fn send_message_to_session(
 
     // Persist user message to output_log for recap/summary generation
     let msg = format!("\n[USER_MESSAGE]\n{}\n[/USER_MESSAGE]\n", req.message);
-    let append_err = if let Some(pg) = &state.app_state.pg_db {
-        pg.append_task_output_ex(&id, &msg, false, false).await.err()
-    } else {
-        state.app_state.checkpoint_db.append_task_output_ex(&id, &msg, false, false).err().map(|e| e.to_string())
-    };
+    let append_err = state.app_state.pg_db.append_task_output_ex(&id, &msg, false, false).await.err();
     if let Some(e) = append_err {
         warn!("Failed to persist user message to output_log: {}", e);
     }
@@ -2631,15 +2503,7 @@ pub async fn get_approval_gates(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(task_run_id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let gates = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_approval_gates_for_task_run(&task_run_id).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        let id = task_run_id.clone();
-        tokio::task::spawn_blocking(move || db.get_approval_gates_for_task_run(&id))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {}", e)))?
-    }
+    let gates = state.app_state.pg_db.get_approval_gates_for_task_run(&task_run_id).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
 
     Ok(Json(serde_json::json!(gates)))

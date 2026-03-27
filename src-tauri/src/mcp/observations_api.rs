@@ -65,12 +65,7 @@ async fn save_handler(
     State(state): State<Arc<ApiState>>,
     Json(input): Json<CreateObservationInput>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let pg = state.app_state.pg_db.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error("PostgreSQL not available".to_string())),
-        )
-    })?;
+    let pg = &state.app_state.pg_db;
 
     let id = pg.save_observation(&input).await.map_err(|e| {
         (
@@ -90,12 +85,7 @@ async fn search_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<ApiResponse<Vec<ObservationSearchResult>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let pg = state.app_state.pg_db.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error("PostgreSQL not available".to_string())),
-        )
-    })?;
+    let pg = &state.app_state.pg_db;
 
     let results = pg
         .search_observations(&query.q, query.project_id.as_deref(), query.max_results)
@@ -118,12 +108,7 @@ async fn context_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ContextQuery>,
 ) -> Result<Json<ApiResponse<Vec<ObservationSearchResult>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let pg = state.app_state.pg_db.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error("PostgreSQL not available".to_string())),
-        )
-    })?;
+    let pg = &state.app_state.pg_db;
 
     let results = pg
         .get_project_context(
@@ -149,12 +134,7 @@ async fn context_handler(
 async fn stats_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<ObservationTypeStat>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let pg = state.app_state.pg_db.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error("PostgreSQL not available".to_string())),
-        )
-    })?;
+    let pg = &state.app_state.pg_db;
 
     let stats = pg.get_observation_stats().await.map_err(|e| {
         (
@@ -174,12 +154,7 @@ async fn by_task_run_handler(
     State(state): State<Arc<ApiState>>,
     Path(task_run_id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<ObservationSearchResult>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let pg = state.app_state.pg_db.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error("PostgreSQL not available".to_string())),
-        )
-    })?;
+    let pg = &state.app_state.pg_db;
 
     let results = pg.get_observations_by_task_run(&task_run_id).await.map_err(|e| {
         (
@@ -199,12 +174,7 @@ async fn get_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<Observation>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let pg = state.app_state.pg_db.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error("PostgreSQL not available".to_string())),
-        )
-    })?;
+    let pg = &state.app_state.pg_db;
 
     let obs = pg.get_observation(id).await.map_err(|e| {
         (
@@ -233,12 +203,7 @@ async fn update_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     input.id = id;
 
-    let pg = state.app_state.pg_db.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error("PostgreSQL not available".to_string())),
-        )
-    })?;
+    let pg = &state.app_state.pg_db;
 
     let updated = pg.update_observation(&input).await.map_err(|e| {
         (
@@ -264,12 +229,7 @@ async fn delete_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let pg = state.app_state.pg_db.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error("PostgreSQL not available".to_string())),
-        )
-    })?;
+    let pg = &state.app_state.pg_db;
 
     let deleted = pg.delete_observation(id).await.map_err(|e| {
         (
@@ -313,12 +273,7 @@ async fn cleanup_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<CleanupQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let pg = state.app_state.pg_db.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error("PostgreSQL not available".to_string())),
-        )
-    })?;
+    let pg = &state.app_state.pg_db;
 
     let archived = pg
         .cleanup_stale_observations(query.retention_days, query.max_revision_count)
@@ -345,12 +300,7 @@ async fn export_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::types::Observation>>>, (StatusCode, Json<ApiResponse<()>>)>
 {
-    let pg = state.app_state.pg_db.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(api_error("PostgreSQL not available".to_string())),
-        )
-    })?;
+    let pg = &state.app_state.pg_db;
 
     let observations = pg.get_all_observations_full(10000).await.map_err(|e| {
         (

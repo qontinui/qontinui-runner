@@ -239,7 +239,7 @@ export function ExperimentResults({ results, summary, isLoading, error, onEvalua
 
       {/* Results table */}
       <div className="flex-1 overflow-auto">
-        <table className="w-full text-xs">
+        <table className="w-full text-xs" data-tutorial-id="experiment-results-table">
           <thead className="sticky top-0 bg-card z-10">
             <tr className="border-b border-border/50 text-left text-muted-foreground">
               <th className="px-4 py-2 font-medium">Input</th>
@@ -333,7 +333,7 @@ export function ExperimentResults({ results, summary, isLoading, error, onEvalua
 
       {/* Pagination */}
       {sorted.length > PAGE_SIZE && (
-        <div className="flex items-center justify-between px-4 py-3 border-t border-border/50 text-xs text-muted-foreground">
+        <div className="flex items-center justify-between px-4 py-3 border-t border-border/50 text-xs text-muted-foreground" data-tutorial-id="experiment-results-pagination">
           <span>
             Showing {start + 1}-{Math.min(start + PAGE_SIZE, sorted.length)} of{" "}
             {sorted.length} results

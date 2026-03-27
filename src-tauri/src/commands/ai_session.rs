@@ -301,16 +301,7 @@ pub async fn create_ai_session(
     let input = CreateTaskRunInput::new(task_run_id.clone(), name.clone())
         .with_prompt("AI session")
         .with_workflow_type("chat");
-    let create_ok = if let Some(pg) = &app_state.pg_db {
-        pg.create_task_run(&input).await.is_ok()
-    } else {
-        let db = app_state.checkpoint_db.clone();
-        let input_clone = input;
-        tokio::task::spawn_blocking(move || db.create_task_run(&input_clone))
-            .await
-            .map(|r| r.is_ok())
-            .unwrap_or(false)
-    };
+    let create_ok = app_state.pg_db.create_task_run(&input).await.is_ok();
 
     if !create_ok {
         return Ok(CommandResponse {
@@ -413,14 +404,7 @@ pub async fn close_ai_session(
     }
 
     // Update DB status
-    if let Some(pg) = &app_state.pg_db {
-        let _ = pg.update_task_run_status(&task_run_id, "stopped").await;
-    } else {
-        let db = app_state.checkpoint_db.clone();
-        let id_clone = task_run_id.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || db.update_task_run_status(&id_clone, "stopped")).await;
-    }
+    let _ = app_state.pg_db.update_task_run_status(&task_run_id, "stopped").await;
 
     // Emit closed state
     emit_session_state(
@@ -453,17 +437,7 @@ pub async fn rename_ai_session(
         task_run_id, name
     );
 
-    let result: Result<(), String> = if let Some(pg) = &app_state.pg_db {
-        pg.update_task_name(&task_run_id, &name).await
-    } else {
-        let db = app_state.checkpoint_db.clone();
-        let id_clone = task_run_id.clone();
-        let name_clone = name.clone();
-        match tokio::task::spawn_blocking(move || db.update_task_run_name(&id_clone, &name_clone)).await {
-            Ok(r) => r,
-            Err(e) => Err(e.to_string()),
-        }
-    };
+    let result: Result<(), String> = app_state.pg_db.update_task_name(&task_run_id, &name).await;
 
     match result {
         Ok(()) => Ok(CommandResponse {

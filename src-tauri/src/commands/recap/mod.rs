@@ -33,11 +33,7 @@ pub async fn get_task_run_recap(
     info!("Getting recap for task run: {}", task_run_id);
 
     // Get the task run
-    let task_run_result = if let Some(pg) = &state.pg_db {
-        pg.get_task_run(&task_run_id).await
-    } else {
-        state.checkpoint_db.get_task_run(&task_run_id)
-    };
+    let task_run_result = state.pg_db.get_task_run(&task_run_id).await;
     let task_run = match task_run_result {
         Ok(Some(run)) => run,
         Ok(None) => {

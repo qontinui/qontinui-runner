@@ -1,0 +1,323 @@
+{
+  "version": "1.0.0",
+  "description": "GraphQL Live Task Panel — real-time task monitoring component embedded in the Run Summary page. Appears only when the selected task run is in 'running' status. Uses GraphQL WebSocket subscriptions for zero-polling updates. Includes inline lifecycle controls backed by GraphQL mutations.",
+  "preconditions": ["At least one task run in 'running' status"],
+  "page": "Run Summary (select a running task from the task list)",
+  "groups": [
+    {
+      "id": "graphql-live-status",
+      "name": "Task Status Display",
+      "description": "The live panel header shows task identity and current status. Status updates are pushed via WebSocket subscription, not polled.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "graphql-live-task-name",
+          "description": "The task name is displayed as a heading in the live panel",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": { "type": "search", "criteria": { "tag": "h3" }, "label": "Task name heading" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "graphql-live-status-badge",
+          "description": "A status badge displays the current state: 'running', 'paused', 'complete', 'failed', or 'stopped'",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": { "type": "search", "criteria": { "textContent": "running|paused|complete|failed|stopped" }, "label": "Status badge" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "graphql-live-metadata",
+      "name": "Task Metadata",
+      "description": "Below the header, a metadata grid shows key task run properties.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "graphql-live-session-count",
+          "description": "Session count displays as 'N / M' when a max is set, or just 'N' when unlimited",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "containsText",
+          "target": { "type": "search", "criteria": { "textContent": "Sessions" }, "label": "Session count" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "graphql-live-workflow-name",
+          "description": "The workflow name that this task run executes is shown",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "containsText",
+          "target": { "type": "search", "criteria": { "textContent": "Workflow" }, "label": "Workflow name row" },
+          "precondition": "Task run was created from a workflow",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "graphql-live-created-time",
+          "description": "Creation timestamp is displayed in localized format, not raw ISO string",
+          "category": "data-display",
+          "severity": "info",
+          "assertionType": "containsText",
+          "target": { "type": "search", "criteria": { "textContent": "Created" }, "label": "Created timestamp" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "graphql-live-events",
+      "name": "Live Progress Indicator",
+      "description": "A progress indicator shows the most recent event from the WebSocket subscription. Updates automatically as steps execute.",
+      "category": "semantic",
+      "precondition": "Task is actively executing (not idle between phases)",
+      "assertions": [
+        {
+          "id": "graphql-live-event-text",
+          "description": "An indicator shows current progress: step name and status, or current phase, or status update",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": { "type": "search", "criteria": { "textContent": "Step:|Status:|Phase:" }, "label": "Progress indicator" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "graphql-live-pulse-dot",
+          "description": "A pulsing dot animates next to the progress text, indicating live data flow",
+          "category": "element-presence",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": { "type": "search", "criteria": { "tag": "span" }, "label": "Pulsing indicator dot" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "graphql-live-controls",
+      "name": "Lifecycle Controls",
+      "description": "Inline buttons for managing the task. Controls are context-sensitive to current status. Backed by GraphQL mutations with automatic cache update.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "graphql-live-stop",
+          "description": "A stop button is available for running tasks. Clicking it transitions the task to 'stopped' status.",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "exists",
+          "precondition": "Task status is 'running'",
+          "expected": "Status changes to 'stopped' within 2 seconds",
+          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Stop button" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "graphql-live-pause",
+          "description": "A pause button is available for running tasks. Clicking it transitions the task to 'paused' status.",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "exists",
+          "precondition": "Task status is 'running'",
+          "expected": "Status changes to 'paused', Resume button appears",
+          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Pause button" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "graphql-live-resume",
+          "description": "A resume button is available for paused tasks. Clicking it transitions the task back to 'running'.",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "exists",
+          "precondition": "Task status is 'paused'",
+          "expected": "Status changes to 'running', Pause+Stop buttons reappear",
+          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Resume button" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "graphql-live-delete",
+          "description": "A delete button is available for terminal tasks. Clicking it removes the task run.",
+          "category": "interaction",
+          "severity": "info",
+          "assertionType": "exists",
+          "precondition": "Task status is 'complete', 'failed', or 'stopped'",
+          "expected": "Task run is removed from the task list",
+          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Delete button" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "graphql-live-controls-context",
+          "description": "Only controls appropriate for the current status are shown — running shows pause+stop, paused shows resume+stop, terminal shows delete",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Context-sensitive controls" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "graphql-live-mutation-disables",
+          "description": "Buttons are disabled during mutation execution to prevent double-submission",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Disabled during mutation" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "graphql-live-error",
+      "name": "Error Display",
+      "description": "Error messages from failed tasks are displayed prominently.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "graphql-live-error-shown",
+          "description": "When a task has an error message, it is displayed in a red-bordered container",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "exists",
+          "precondition": "Task has a non-null error_message",
+          "target": { "type": "search", "criteria": { "textContent": "error|Error" }, "label": "Error message" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "graphql-live-loading",
+      "name": "Loading State",
+      "description": "Initial data fetch shows a loading indicator.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "graphql-live-loading-indicator",
+          "description": "A loading spinner and 'Loading task run...' text display while the initial GraphQL query is in flight",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": { "type": "search", "criteria": { "textContent": "Loading task run" }, "label": "Loading indicator" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "graphql-live-visibility",
+      "name": "Panel Visibility Rules",
+      "description": "The live panel conditionally renders based on task status.",
+      "category": "navigation",
+      "assertions": [
+        {
+          "id": "graphql-live-visible-when-running",
+          "description": "The panel renders when the selected task has status 'running'",
+          "category": "navigation",
+          "severity": "critical",
+          "assertionType": "exists",
+          "precondition": "Selected task run has status 'running'",
+          "target": { "type": "search", "criteria": { "textContent": "running" }, "label": "Panel visible for running task" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "graphql-live-hidden-when-terminal",
+          "description": "The panel does not render when the selected task has a terminal status",
+          "category": "navigation",
+          "severity": "critical",
+          "assertionType": "not-exists",
+          "precondition": "Selected task run has status 'complete' or 'failed' or 'stopped'",
+          "target": { "type": "search", "criteria": { "textContent": "Loading task run" }, "label": "Panel absent for terminal task" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "graphql-live-realtime",
+      "name": "Real-Time Update Behavior",
+      "description": "Status and progress updates arrive via WebSocket push within seconds, not via HTTP polling.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "graphql-live-fast-update",
+          "description": "Status changes (stop, complete, fail) are reflected in the UI within 2 seconds of the backend state change",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": { "type": "search", "criteria": { "textContent": "stopped|complete|failed" }, "label": "Fast status update" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "graphql-live-event-updates",
+          "description": "The progress indicator text changes over time as different steps execute — it is not static",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "precondition": "Task is actively executing steps",
+          "target": { "type": "search", "criteria": { "textContent": "Step:|Phase:" }, "label": "Progress changes over time" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "graphql-live-style",
+      "name": "Visual Style",
+      "description": "The panel follows the runner's dark theme design system.",
+      "category": "style",
+      "assertions": [
+        {
+          "id": "graphql-live-badge-colors",
+          "description": "Status badges use semantic colors: blue for running, green for complete, red for failed, yellow for stopped, orange for paused",
+          "category": "style",
+          "severity": "warning",
+          "assertionType": "visual",
+          "target": { "type": "search", "criteria": { "textContent": "running|complete|failed" }, "label": "Color-coded status badge" },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ]
+}

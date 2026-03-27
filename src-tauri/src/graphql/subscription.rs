@@ -132,15 +132,7 @@ impl SubscriptionRoot {
                 let trid = task_run_id.clone();
 
                 // Check task status — stop polling if terminal
-                let task_status = if let Some(pg) = &state.app_state.pg_db {
-                    pg.get_task_run(&trid).await.ok().flatten().map(|t| t.status)
-                } else {
-                    let db2 = state.app_state.checkpoint_db.clone();
-                    let trid2 = task_run_id.clone();
-                    tokio::task::spawn_blocking(move || {
-                        db2.get_task_run(&trid2).ok().flatten().map(|t| t.status)
-                    }).await.ok().flatten()
-                };
+                let task_status = state.app_state.pg_db.get_task_run(&trid).await.ok().flatten().map(|t| t.status);
 
                 let is_terminal = matches!(
                     task_status.as_deref(),

@@ -22,7 +22,7 @@ use super::super::phase_helpers::{build_llm_metrics, execute_prompt_response_mod
 /// Executes the completion phase (runs once after verification passes).
 /// AI session execution is delegated to the UnifiedAiSessionExecutor.
 pub struct CompletionExecutor {
-    app_state: Arc<AppState>,
+    pub(crate) app_state: Arc<AppState>,
     executor: StepExecutor,
     ai_executor: UnifiedAiSessionExecutor,
     checkpoint_db: Arc<CheckpointDb>,
@@ -451,7 +451,7 @@ impl CompletionExecutor {
                             let duration_ms = start.elapsed().as_millis() as u64;
                             record_phase_token_usage(
                                 &self.checkpoint_db,
-                                self.app_state.pg_db.as_ref(),
+                                &self.app_state.pg_db,
                                 execution_id,
                                 "completion",
                                 stage_index,
@@ -480,10 +480,8 @@ impl CompletionExecutor {
                                     "\n--- AI Completion Output ({}) ---\n{}\n",
                                     step_name, output
                                 );
-                                if let Some(pg) = &self.app_state.pg_db {
-                                    if let Err(e) = pg.append_task_output_ex(execution_id, &formatted, false, false).await {
-                                        warn!("PG append_task_output_ex failed: {}", e);
-                                    }
+                                if let Err(e) = self.app_state.pg_db.append_task_output_ex(execution_id, &formatted, false, false).await {
+                                    warn!("PG append_task_output_ex failed: {}", e);
                                 }
                                 if let Err(e) = self.checkpoint_db.append_task_output_ex(
                                     execution_id,
@@ -893,20 +891,16 @@ impl CompletionExecutor {
 
         // Fetch and include accumulated output_log (from agentic phases)
         // PG-primary: try PG first (different method name), fall back to SQLite
-        let output_result: Result<String, String> = if let Some(pg) = &self.app_state.pg_db {
-            // Note: must use tokio::runtime::Handle since build_prior_phase_context is sync
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let pg = pg.clone();
-                let id = execution_id.to_string();
-                let pg_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle.block_on(async move { pg.get_task_output(&id).await })
-                }));
-                match pg_res {
-                    Ok(Ok(output)) => Ok(output),
-                    _ => self.checkpoint_db.get_full_task_output(execution_id),
-                }
-            } else {
-                self.checkpoint_db.get_full_task_output(execution_id)
+        let output_result: Result<String, String> = // Note: must use tokio::runtime::Handle since build_prior_phase_context is sync
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let pg = self.app_state.pg_db.clone();
+            let id = execution_id.to_string();
+            let pg_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.block_on(async move { self.app_state.pg_db.get_task_output(&id).await })
+            }));
+            match pg_res {
+                Ok(Ok(output)) => Ok(output),
+                _ => self.checkpoint_db.get_full_task_output(execution_id),
             }
         } else {
             self.checkpoint_db.get_full_task_output(execution_id)
@@ -938,19 +932,15 @@ impl CompletionExecutor {
         }
 
         // Fetch and include findings (PG-primary, SQLite fallback)
-        let findings_result = if let Some(pg) = &self.app_state.pg_db {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let pg = pg.clone();
-                let id = execution_id.to_string();
-                let pg_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle.block_on(async move { pg.get_findings_for_task(&id).await })
-                }));
-                match pg_res {
-                    Ok(r) => r,
-                    _ => self.checkpoint_db.get_findings_for_task(execution_id),
-                }
-            } else {
-                self.checkpoint_db.get_findings_for_task(execution_id)
+        let findings_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let pg = self.app_state.pg_db.clone();
+            let id = execution_id.to_string();
+            let pg_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.block_on(async move { self.app_state.pg_db.get_findings_for_task(&id).await })
+            }));
+            match pg_res {
+                Ok(r) => r,
+                _ => self.checkpoint_db.get_findings_for_task(execution_id),
             }
         } else {
             self.checkpoint_db.get_findings_for_task(execution_id)

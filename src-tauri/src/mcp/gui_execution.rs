@@ -343,17 +343,10 @@ pub async fn load_config(
                 .unwrap_or_else(|| path_to_name(&config_path_for_event));
 
             // Upsert: update if exists, insert if new
-            let save_result = if let Some(pg) = &state.app_state.pg_db {
-                pg.save_config_with_id(
-                    &config_id, config_data.clone(), &config_name,
-                    "file", Some(&config_path_for_event),
-                ).await
-            } else {
-                state.app_state.checkpoint_db.save_config_with_id(
-                    &config_id, config_data.clone(), &config_name,
-                    "file", Some(&config_path_for_event),
-                )
-            };
+            let save_result = state.app_state.pg_db.save_config_with_id(
+                &config_id, config_data.clone(), &config_name,
+                "file", Some(&config_path_for_event),
+            ).await;
             if let Err(e) = save_result {
                 warn!(
                     "MCP API: Failed to auto-store config in ConfigStorage: {}",

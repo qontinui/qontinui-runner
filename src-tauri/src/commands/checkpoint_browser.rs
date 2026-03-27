@@ -432,20 +432,11 @@ pub async fn replay_from_checkpoint(
         RestorationInstructions::from_checkpoint(&checkpoint, &restoration_config);
 
     // Create a new task run in the database (branched from checkpoint)
-    let original_prompt = if let Some(pg) = &app_state.pg_db {
-        pg.get_task_run(&checkpoint.task_id)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|tr| tr.prompt)
-    } else {
-        app_state
-            .checkpoint_db
-            .get_task_run(&checkpoint.task_id)
-            .ok()
-            .flatten()
-            .and_then(|tr| tr.prompt)
-    };
+    let original_prompt = app_state.pg_db.get_task_run(&checkpoint.task_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|tr| tr.prompt);
 
     let replay_prompt = format!(
         "[Replayed from checkpoint {} at iteration {}]\n\n{}",
@@ -463,11 +454,7 @@ pub async fn replay_from_checkpoint(
     let input = CreateTaskRunInput::new(&new_task_run_id, &replay_task_name)
         .with_prompt(&replay_prompt)
         .with_auto_continue(true);
-    if let Some(pg) = &app_state.pg_db {
-        pg.create_task_run(&input).await?;
-    } else {
-        app_state.checkpoint_db.create_task_run(&input)?;
-    }
+    app_state.pg_db.create_task_run(&input).await?;
 
     // Save replay lineage to database
     let _lineage_json = serde_json::to_string(&replay_result.lineage)
@@ -481,11 +468,7 @@ pub async fn replay_from_checkpoint(
         "restored_state": checkpoint.state.state,
     })
     .to_string();
-    if let Some(pg) = &app_state.pg_db {
-        pg.update_task_run_runtime_context(&new_task_run_id, &runtime_ctx).await?;
-    } else {
-        app_state.checkpoint_db.update_task_run_runtime_context(&new_task_run_id, &runtime_ctx)?;
-    }
+    app_state.pg_db.update_task_run_runtime_context(&new_task_run_id, &runtime_ctx).await?;
 
     Ok(ReplayFromCheckpointResponse {
         session: replay_result.session,

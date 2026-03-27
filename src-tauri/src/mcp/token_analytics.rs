@@ -41,15 +41,7 @@ pub async fn get_token_usage_summary(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let summary = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_token_usage_summary(days).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        tokio::task::spawn_blocking(move || db.get_token_usage_summary(days))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let summary = state.app_state.pg_db.get_token_usage_summary(days).await
     .map_err(|e| {
         error!("Failed to get token usage summary: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e)
@@ -69,15 +61,7 @@ pub async fn get_daily_cost(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_daily_cost(days).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        tokio::task::spawn_blocking(move || db.get_daily_cost(days))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let rows = state.app_state.pg_db.get_daily_cost(days).await
     .map_err(|e| {
         error!("Failed to get daily cost: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e)
@@ -98,15 +82,7 @@ pub async fn get_cost_by_model(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_cost_by_model(days).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        tokio::task::spawn_blocking(move || db.get_cost_by_model(days))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let rows = state.app_state.pg_db.get_cost_by_model(days).await
     .map_err(|e| {
         error!("Failed to get cost by model: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e)
@@ -127,15 +103,7 @@ pub async fn get_cost_by_phase(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_cost_by_phase(days).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        tokio::task::spawn_blocking(move || db.get_cost_by_phase(days))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let rows = state.app_state.pg_db.get_cost_by_phase(days).await
     .map_err(|e| {
         error!("Failed to get cost by phase: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e)
@@ -156,15 +124,7 @@ pub async fn get_provider_latency(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_provider_latency(days).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        tokio::task::spawn_blocking(move || db.get_provider_latency(days))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let rows = state.app_state.pg_db.get_provider_latency(days).await
     .map_err(|e| {
         error!("Failed to get provider latency: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e)
@@ -186,15 +146,7 @@ pub async fn get_task_run_costs(
     let days = params.days.unwrap_or(7);
     let limit = params.limit.unwrap_or(50);
 
-    let rows = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_task_run_costs(days, limit).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        tokio::task::spawn_blocking(move || db.get_task_run_costs(days, limit))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let rows = state.app_state.pg_db.get_task_run_costs(days, limit).await
     .map_err(|e| {
         error!("Failed to get task run costs: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e)
@@ -220,15 +172,7 @@ pub async fn get_cost_by_target_app(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_cost_by_target_app(days).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        tokio::task::spawn_blocking(move || db.get_cost_by_target_app(days))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let rows = state.app_state.pg_db.get_cost_by_target_app(days).await
     .map_err(|e| {
         error!("Failed to get cost by target app: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e)
@@ -249,15 +193,7 @@ pub async fn get_cost_by_target_page(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_cost_by_target_page(days).await
-    } else {
-        let db = state.app_state.checkpoint_db.clone();
-        tokio::task::spawn_blocking(move || db.get_cost_by_target_page(days))
-            .await
-            .map_err(|e| format!("spawn_blocking error: {}", e))
-            .and_then(|r| r)
-    }
+    let rows = state.app_state.pg_db.get_cost_by_target_page(days).await
     .map_err(|e| {
         error!("Failed to get cost by target page: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e)

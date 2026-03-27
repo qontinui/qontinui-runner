@@ -27,7 +27,7 @@ use super::super::phase_helpers::{build_llm_metrics, execute_prompt_response_mod
 /// Handles both automation steps (shell commands, workflows) and prompt steps (AI tasks).
 /// AI session execution is delegated to the UnifiedAiSessionExecutor.
 pub struct SetupExecutor {
-    app_state: Arc<AppState>,
+    pub(crate) app_state: Arc<AppState>,
     executor: StepExecutor,
     ai_executor: UnifiedAiSessionExecutor,
     checkpoint_db: Arc<CheckpointDb>,
@@ -323,7 +323,7 @@ impl SetupExecutor {
                             let duration_ms = start.elapsed().as_millis() as u64;
                             record_phase_token_usage(
                                 &self.checkpoint_db,
-                                self.app_state.pg_db.as_ref(),
+                                &self.app_state.pg_db,
                                 execution_id,
                                 "setup",
                                 stage_index,
@@ -352,10 +352,8 @@ impl SetupExecutor {
                                     "\n--- AI Setup Output ({}) ---\n{}\n",
                                     step_name, output
                                 );
-                                if let Some(pg) = &self.app_state.pg_db {
-                                    if let Err(e) = pg.append_task_output_ex(execution_id, &formatted, false, false).await {
-                                        warn!("PG append_task_output_ex failed: {}", e);
-                                    }
+                                if let Err(e) = self.app_state.pg_db.append_task_output_ex(execution_id, &formatted, false, false).await {
+                                    warn!("PG append_task_output_ex failed: {}", e);
                                 }
                                 if let Err(e) = self.checkpoint_db.append_task_output_ex(
                                     execution_id,

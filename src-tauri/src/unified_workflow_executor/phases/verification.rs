@@ -30,6 +30,7 @@ use super::super::phase_helpers::{
 
 /// Executes verification steps and determines if they all pass.
 pub struct VerificationExecutor {
+    pub(crate) app_state: Arc<AppState>,
     executor: StepExecutor,
     checkpoint_db: Arc<CheckpointDb>,
 }
@@ -42,6 +43,7 @@ impl VerificationExecutor {
     ) -> Self {
         let checkpoint_db = app_state.checkpoint_db.clone();
         Self {
+            app_state: app_state.clone(),
             executor: StepExecutor::with_app_handle(app_state.clone(), config_storage, app_handle),
             checkpoint_db,
         }

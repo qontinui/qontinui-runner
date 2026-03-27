@@ -1,6 +1,6 @@
 import React, { useMemo } from "react";
 import { List, type RowComponentProps } from "react-window";
-import type { TraceSpan, TraceTreeNode } from "./types";
+import type { TraceSpan, TraceTreeNode, CriticalPathInfo } from "./types";
 import { formatDuration } from "./trace-utils";
 import { SpanRow } from "./SpanRow";
 
@@ -11,6 +11,7 @@ interface TraceWaterfallProps {
   selectedSpanId: string | null;
   onSelectSpan: (span: TraceSpan) => void;
   height: number;
+  criticalPath?: CriticalPathInfo | null;
 }
 
 interface TraceRowProps {
@@ -19,6 +20,7 @@ interface TraceRowProps {
   traceDurationMs: number;
   selectedSpanId: string | null;
   onSelectSpan: (span: TraceSpan) => void;
+  criticalPath?: CriticalPathInfo | null;
 }
 
 function TraceRow({
@@ -29,6 +31,7 @@ function TraceRow({
   traceDurationMs,
   selectedSpanId,
   onSelectSpan,
+  criticalPath,
 }: RowComponentProps<TraceRowProps>) {
   const node = filteredNodes[index];
   return (
@@ -39,6 +42,7 @@ function TraceRow({
         traceDurationMs={traceDurationMs}
         isSelected={selectedSpanId === node.span.span_id}
         onClick={() => onSelectSpan(node.span)}
+        criticalPath={criticalPath}
       />
     </div>
   );
@@ -50,6 +54,7 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
   selectedSpanId,
   onSelectSpan,
   height,
+  criticalPath,
 }) => {
   // Compute trace time bounds (uses all spans for the full timeline, not just filtered)
   const { traceStartMs, traceDurationMs } = useMemo(() => {
@@ -66,6 +71,37 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
 
   const ROW_HEIGHT = 32;
 
+  // Compute critical path connector line segments (row index pairs)
+  // Must be before any early returns to satisfy Rules of Hooks.
+  const criticalPathSegments = useMemo(() => {
+    if (!criticalPath || criticalPath.spanIds.size === 0) return [];
+
+    // Find row indices of critical path spans in display order
+    const critRows: number[] = [];
+    for (let i = 0; i < filteredNodes.length; i++) {
+      if (criticalPath.spanIds.has(filteredNodes[i].span.span_id)) {
+        critRows.push(i);
+      }
+    }
+
+    // Build consecutive pairs
+    const segments: { fromRow: number; toRow: number; fromSpan: TraceSpan; toSpan: TraceSpan }[] = [];
+    for (let i = 0; i < critRows.length - 1; i++) {
+      segments.push({
+        fromRow: critRows[i],
+        toRow: critRows[i + 1],
+        fromSpan: filteredNodes[critRows[i]].span,
+        toSpan: filteredNodes[critRows[i + 1]].span,
+      });
+    }
+    return segments;
+  }, [criticalPath, filteredNodes]);
+
+  const listHeight = Math.max(height - 24, 100);
+
+  // Timeline header
+  const timeMarks = [0, 0.25, 0.5, 0.75, 1.0];
+
   if (filteredNodes.length === 0) {
     return (
       <div className="flex-1 flex items-center justify-center text-zinc-500 text-sm">
@@ -73,9 +109,6 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
       </div>
     );
   }
-
-  // Timeline header
-  const timeMarks = [0, 0.25, 0.5, 0.75, 1.0];
 
   return (
     <div className="flex-1 flex flex-col min-w-0">
@@ -95,20 +128,66 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
         </div>
       </div>
 
-      {/* Virtualized span list */}
-      <List
-        rowCount={filteredNodes.length}
-        rowHeight={ROW_HEIGHT}
-        rowComponent={TraceRow}
-        rowProps={{
-          filteredNodes,
-          traceStartMs,
-          traceDurationMs,
-          selectedSpanId,
-          onSelectSpan,
-        }}
-        style={{ width: "100%", height: Math.max(height - 24, 100) }}
-      />
+      {/* Virtualized span list with critical path overlay */}
+      <div className="relative" style={{ height: listHeight }}>
+        <List
+          rowCount={filteredNodes.length}
+          rowHeight={ROW_HEIGHT}
+          rowComponent={TraceRow}
+          rowProps={{
+            filteredNodes,
+            traceStartMs,
+            traceDurationMs,
+            selectedSpanId,
+            onSelectSpan,
+            criticalPath,
+          }}
+          style={{ width: "100%", height: listHeight }}
+        />
+
+        {/* Critical path connector lines (SVG overlay) */}
+        {criticalPathSegments.length > 0 && (
+          <svg
+            className="absolute top-0 left-[240px] pointer-events-none"
+            style={{ width: "calc(100% - 240px)", height: listHeight }}
+          >
+            {criticalPathSegments.map((seg, i) => {
+              // Center of each span's timeline bar
+              const fromDur = seg.fromSpan.duration_ms ?? 0;
+              const toDur = seg.toSpan.duration_ms ?? 0;
+              const fromCenterPct =
+                traceDurationMs > 0
+                  ? ((new Date(seg.fromSpan.start_ts).getTime() - traceStartMs + fromDur / 2) /
+                      traceDurationMs) *
+                    100
+                  : 50;
+              const toCenterPct =
+                traceDurationMs > 0
+                  ? ((new Date(seg.toSpan.start_ts).getTime() - traceStartMs + toDur / 2) /
+                      traceDurationMs) *
+                    100
+                  : 50;
+
+              const y1 = seg.fromRow * ROW_HEIGHT + ROW_HEIGHT / 2;
+              const y2 = seg.toRow * ROW_HEIGHT + ROW_HEIGHT / 2;
+
+              return (
+                <line
+                  key={i}
+                  x1={`${fromCenterPct}%`}
+                  y1={y1}
+                  x2={`${toCenterPct}%`}
+                  y2={y2}
+                  stroke="#ef4444"
+                  strokeWidth={1.5}
+                  strokeOpacity={0.5}
+                  strokeDasharray="4 3"
+                />
+              );
+            })}
+          </svg>
+        )}
+      </div>
     </div>
   );
 };

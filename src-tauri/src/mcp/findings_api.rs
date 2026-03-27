@@ -82,13 +82,8 @@ pub async fn update_finding_status_handler(
         )
     })?;
 
-    // PG-primary, SQLite fallback
-    let update_result = if let Some(pg) = &state.app_state.pg_db {
-        pg.update_finding_status(&finding_id, status.as_str(), req.resolution.as_deref(), None).await
-    } else {
-        state.app_state.checkpoint_db.update_finding_status(&finding_id, &status, req.resolution.as_deref(), None)
-    };
-    update_result.map_err(|e| {
+    state.app_state.pg_db.update_finding_status(&finding_id, status.as_str(), req.resolution.as_deref(), None).await
+    .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to update finding status: {}", e))),
@@ -116,18 +111,8 @@ pub async fn resolve_finding_handler(
     Path(finding_id): Path<String>,
     Json(req): Json<ResolveFindingRequest>,
 ) -> Result<Json<ApiResponse<FindingMutationResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // PG-primary, SQLite fallback
-    let resolve_result = if let Some(pg) = &state.app_state.pg_db {
-        pg.update_finding_status(&finding_id, "resolved", Some(&req.resolution), None).await
-    } else {
-        state.app_state.checkpoint_db.update_finding_status(
-            &finding_id,
-            &FindingStatus::Resolved,
-            Some(&req.resolution),
-            None,
-        )
-    };
-    resolve_result.map_err(|e| {
+    state.app_state.pg_db.update_finding_status(&finding_id, "resolved", Some(&req.resolution), None).await
+    .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to resolve finding: {}", e))),
@@ -199,20 +184,10 @@ pub async fn clear_all_findings_handler(
 
     let mut cleared_count = 0;
 
-    // Resolve each non-terminal finding (PG-primary, SQLite fallback)
+    // Resolve each non-terminal finding
     for finding in &findings {
         if !finding.status.is_terminal() {
-            let clear_result = if let Some(pg) = &state.app_state.pg_db {
-                pg.update_finding_status(&finding.id, "resolved", Some("Cleared by user"), None).await
-            } else {
-                state.app_state.checkpoint_db.update_finding_status(
-                    &finding.id,
-                    &FindingStatus::Resolved,
-                    Some("Cleared by user"),
-                    None,
-                )
-            };
-            if let Err(e) = clear_result {
+            if let Err(e) = state.app_state.pg_db.update_finding_status(&finding.id, "resolved", Some("Cleared by user"), None).await {
                 info!("HTTP: Failed to clear finding {}: {}", finding.id, e);
                 continue;
             }

@@ -387,13 +387,7 @@ async fn handle_relay_command(
 
                     // Persist to output log
                     let msg = format!("\n[USER_MESSAGE]\n{}\n[/USER_MESSAGE]\n", content);
-                    if let Some(pg) = &api_state.app_state.pg_db {
-                        let _ = pg.append_task_output_ex(task_run_id, &msg, false, false).await;
-                    } else {
-                        let _ = api_state.app_state.checkpoint_db.append_task_output_ex(
-                            task_run_id, &msg, false, false,
-                        );
-                    }
+                    let _ = api_state.app_state.pg_db.append_task_output_ex(task_run_id, &msg, false, false).await;
 
                     match session.send_user_message(content) {
                         Ok(sent_immediately) => Some(serde_json::json!({

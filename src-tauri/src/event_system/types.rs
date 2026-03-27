@@ -261,6 +261,26 @@ pub enum AppEvent {
     },
 
     // ========================================================================
+    // Blame Attribution Events
+    // ========================================================================
+    /// Blame attribution results from the blame engine.
+    /// Emitted when verification failures are attributed to specific iterations.
+    BlameAttribution {
+        /// Task run ID
+        task_run_id: String,
+        /// Current iteration number
+        iteration: u32,
+        /// Number of failures with blame attributions
+        attributed_failures: u32,
+        /// Number of files exhibiting oscillation (modified 3+ consecutive iterations)
+        oscillating_files: u32,
+        /// Number of files exhibiting revert patterns
+        revert_patterns: u32,
+        /// Full blame report as JSON
+        blame_json: String,
+    },
+
+    // ========================================================================
     // Constraint Engine Events
     // ========================================================================
     /// Constraint evaluation results after an agentic phase.
@@ -363,6 +383,9 @@ impl AppEvent {
 
             // Convergence tracking events
             AppEvent::IterationMetrics { .. } => "iteration-metrics",
+
+            // Blame attribution events
+            AppEvent::BlameAttribution { .. } => "blame-attribution",
 
             // Constraint engine events
             AppEvent::ConstraintResults { .. } => "constraint-results",
@@ -606,6 +629,25 @@ impl AppEvent {
             new_failures,
             repeated_failures,
             is_stalled,
+        }
+    }
+
+    /// Create a blame attribution event.
+    pub fn blame_attribution(
+        task_run_id: impl Into<String>,
+        iteration: u32,
+        attributed_failures: u32,
+        oscillating_files: u32,
+        revert_patterns: u32,
+        blame_json: impl Into<String>,
+    ) -> Self {
+        AppEvent::BlameAttribution {
+            task_run_id: task_run_id.into(),
+            iteration,
+            attributed_failures,
+            oscillating_files,
+            revert_patterns,
+            blame_json: blame_json.into(),
         }
     }
 

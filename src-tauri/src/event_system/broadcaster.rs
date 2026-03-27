@@ -301,6 +301,26 @@ impl EventBroadcaster {
         ));
     }
 
+    /// Broadcast a blame attribution event when failures are attributed to specific iterations.
+    pub fn blame_attribution(
+        &self,
+        task_run_id: &str,
+        iteration: u32,
+        attributed_failures: u32,
+        oscillating_files: u32,
+        revert_patterns: u32,
+        blame_json: &str,
+    ) {
+        self.broadcast_or_warn(AppEvent::blame_attribution(
+            task_run_id,
+            iteration,
+            attributed_failures,
+            oscillating_files,
+            revert_patterns,
+            blame_json,
+        ));
+    }
+
     /// Broadcast a constraint results event after constraint engine evaluation.
     pub fn constraint_results(
         &self,

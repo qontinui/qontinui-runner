@@ -1928,13 +1928,22 @@ async fn handle_write_hooks(
             .collect()
     };
 
-    // After writing hook files, also modify the root layout to import and render <UIBridgeHooks />
+    // Post-apply: modify source files to integrate generated artifacts
     let mut all_warnings = warnings;
     if success {
         if let Ok(analysis) = analyze_project(&req.project_path).await {
+            // Add UIBridgeHooks import to root layout
             let layout_warnings = add_hooks_to_layout(&project, &analysis, &files_written).await;
             all_warnings.extend(layout_warnings);
         }
+
+        // Add registration hook imports to page components
+        let reg_warnings = add_registration_imports(&project, &files_written).await;
+        all_warnings.extend(reg_warnings);
+
+        // Update tutorial registry with new tutorial files
+        let tut_warnings = update_tutorial_registry(&project, &files_written).await;
+        all_warnings.extend(tut_warnings);
     }
 
     Json(ApiResponse::success(WriteHooksResult {
@@ -2034,6 +2043,245 @@ async fn add_hooks_to_layout(
             warnings.push(format!(
                 "Added UIBridgeHooks import and component to {}",
                 entry.path
+            ));
+        }
+    }
+
+    warnings
+}
+
+// ============================================================================
+// Post-Apply: Auto-add registration imports to page components
+// ============================================================================
+
+/// After writing registration files, modify each page component to import and call
+/// the registration hook. Only modifies files that don't already import the hook.
+async fn add_registration_imports(
+    project: &std::path::Path,
+    written_files: &[String],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // Find registration files among written files
+    let reg_files: Vec<&str> = written_files
+        .iter()
+        .filter(|f| f.contains("-registrations.") && f.contains("/pages/"))
+        .map(|f| f.as_str())
+        .collect();
+
+    for reg_file in reg_files {
+        // Derive the page component path from the registration file name
+        // e.g., "src/lib/ui-bridge/pages/dashboard-registrations.tsx" → need to find the page component
+        let file_stem = std::path::Path::new(reg_file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let page_name = file_stem.trim_end_matches("-registrations");
+
+        // Derive the hook name: "useDashboardRegistrations"
+        let hook_name = {
+            let mut chars = page_name.chars();
+            match chars.next() {
+                Some(c) => format!("use{}{}Registrations", c.to_uppercase(), chars.as_str()),
+                None => continue,
+            }
+        };
+
+        // Try to find the corresponding page component
+        let mut page_path: Option<PathBuf> = None;
+        for pattern in &[
+            format!("src/app/{}/page.tsx", page_name),
+            format!("src/app/{}/page.jsx", page_name),
+            format!("src/pages/{}/index.tsx", page_name),
+            format!("src/pages/{}.tsx", page_name),
+            format!("app/{}/page.tsx", page_name),
+            format!("pages/{}/index.tsx", page_name),
+        ] {
+            let candidate = project.join(pattern);
+            if candidate.exists() {
+                page_path = Some(candidate);
+                break;
+            }
+        }
+
+        let page_path = match page_path {
+            Some(p) => p,
+            None => {
+                warnings.push(format!(
+                    "Could not find page component for registration file: {}",
+                    reg_file
+                ));
+                continue;
+            }
+        };
+
+        // Read the page component
+        let content = match tokio::fs::read_to_string(&page_path).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Skip if already imports the hook
+        if content.contains(&hook_name) {
+            continue;
+        }
+
+        // Build the import path (relative from page to registration file)
+        let import_path = format!("@/lib/ui-bridge/pages/{}-registrations", page_name);
+
+        let mut new_content = content.clone();
+
+        // Add import statement after the last existing import
+        let import_line = format!(
+            "import {{ {} }} from '{}';\n",
+            hook_name, import_path
+        );
+        let import_pos = find_last_import_pos(&new_content);
+        new_content.insert_str(import_pos, &import_line);
+
+        // Add hook call at the start of the component function body
+        // Find "export function" or "export default function" followed by "{"
+        let hook_call = format!("  const {{ }} = {}();\n", hook_name);
+        if let Some(fn_pos) = new_content.find("export function ")
+            .or_else(|| new_content.find("export default function "))
+        {
+            // Find the opening { of the function body
+            if let Some(brace_pos) = new_content[fn_pos..].find('{') {
+                let insert_pos = fn_pos + brace_pos + 1;
+                // Insert after the { and its newline
+                let after_brace = &new_content[insert_pos..];
+                let offset = if after_brace.starts_with('\n') { 1 } else { 0 };
+                new_content.insert_str(insert_pos + offset, &hook_call);
+            }
+        }
+
+        // Write the modified page component
+        if let Err(e) = tokio::fs::write(&page_path, &new_content).await {
+            warnings.push(format!(
+                "Failed to add {} import to {}: {}",
+                hook_name,
+                page_path.display(),
+                e
+            ));
+        } else {
+            warnings.push(format!(
+                "Added {} import to {}",
+                hook_name,
+                page_path.strip_prefix(project).unwrap_or(&page_path).display()
+            ));
+        }
+    }
+
+    warnings
+}
+
+// ============================================================================
+// Post-Apply: Auto-update tutorial registry
+// ============================================================================
+
+/// After writing tutorial .ts files, update the tutorial registry (data/index.ts)
+/// to import and register the new tutorials.
+async fn update_tutorial_registry(
+    project: &std::path::Path,
+    written_files: &[String],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // Find tutorial files among written files
+    let tutorial_files: Vec<&str> = written_files
+        .iter()
+        .filter(|f| f.contains("tutorial/data/") && f.ends_with(".ts") && !f.ends_with("index.ts"))
+        .map(|f| f.as_str())
+        .collect();
+
+    if tutorial_files.is_empty() {
+        return warnings;
+    }
+
+    // Find the tutorial registry file
+    let registry_path = project.join("src/components/tutorial/data/index.ts");
+    if !registry_path.exists() {
+        warnings.push("Tutorial registry not found at src/components/tutorial/data/index.ts".to_string());
+        return warnings;
+    }
+
+    let content = match tokio::fs::read_to_string(&registry_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            warnings.push(format!("Failed to read tutorial registry: {}", e));
+            return warnings;
+        }
+    };
+
+    let mut new_content = content.clone();
+    let mut added_count = 0;
+
+    for tutorial_file in &tutorial_files {
+        // Extract the tutorial name from file path
+        // e.g., "src/components/tutorial/data/dashboard.ts" → "dashboard"
+        let file_stem = std::path::Path::new(tutorial_file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        if file_stem.is_empty() {
+            continue;
+        }
+
+        // Build the export name: "dashboardTutorial"
+        let export_name = {
+            let parts: Vec<&str> = file_stem.split('-').collect();
+            let mut name = String::new();
+            for (i, part) in parts.iter().enumerate() {
+                if i == 0 {
+                    name.push_str(part);
+                } else {
+                    let mut chars = part.chars();
+                    if let Some(c) = chars.next() {
+                        name.push(c.to_uppercase().next().unwrap_or(c));
+                        name.push_str(chars.as_str());
+                    }
+                }
+            }
+            format!("{}Tutorial", name)
+        };
+
+        // Skip if already imported
+        if new_content.contains(&export_name) {
+            continue;
+        }
+
+        // Add import statement at the end of imports
+        let import_line = format!(
+            "import {{ {} }} from \"./{}\";\n",
+            export_name, file_stem
+        );
+        let import_pos = find_last_import_pos(&new_content);
+        new_content.insert_str(import_pos, &import_line);
+
+        // Add to the tutorials array — find the closing "];" of the array
+        if let Some(array_end) = new_content.rfind("];") {
+            // Find the last entry before the closing
+            let before_close = &new_content[..array_end];
+            let insert_pos = if let Some(last_comma) = before_close.rfind(',') {
+                last_comma + 1
+            } else {
+                array_end
+            };
+            let entry = format!("\n  {},", export_name);
+            new_content.insert_str(insert_pos, &entry);
+        }
+
+        added_count += 1;
+    }
+
+    if added_count > 0 {
+        if let Err(e) = tokio::fs::write(&registry_path, &new_content).await {
+            warnings.push(format!("Failed to update tutorial registry: {}", e));
+        } else {
+            warnings.push(format!(
+                "Added {} tutorial(s) to registry at src/components/tutorial/data/index.ts",
+                added_count
             ));
         }
     }

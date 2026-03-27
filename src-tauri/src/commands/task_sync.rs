@@ -840,11 +840,7 @@ pub async fn sync_ai_task_created(
     project_id: Option<String>,
     app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<AITaskResponse, String> {
-    let task = if let Some(pg) = &app_state.pg_db {
-        pg.get_task_run(&task_id).await?
-    } else {
-        app_state.checkpoint_db.get_task_run(&task_id)?
-    }
+    let task = app_state.pg_db.get_task_run(&task_id).await?
     .ok_or_else(|| format!("Task {} not found", task_id))?;
 
     let service = AITaskSyncService::new();
@@ -888,11 +884,7 @@ pub async fn sync_ai_findings(
     task_id: String,
     app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<Vec<AITaskFindingSyncResponse>, String> {
-    let findings = if let Some(pg) = &app_state.pg_db {
-        pg.get_findings_for_task(&task_id).await?
-    } else {
-        app_state.checkpoint_db.get_findings_for_task(&task_id)?
-    };
+    let findings = app_state.pg_db.get_findings_for_task(&task_id).await?;
 
     if findings.is_empty() {
         return Ok(vec![]);
@@ -908,11 +900,7 @@ pub async fn sync_ai_task_completed(
     task_id: String,
     app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<AITaskResponse, String> {
-    let task = if let Some(pg) = &app_state.pg_db {
-        pg.get_task_run(&task_id).await?
-    } else {
-        app_state.checkpoint_db.get_task_run(&task_id)?
-    }
+    let task = app_state.pg_db.get_task_run(&task_id).await?
     .ok_or_else(|| format!("Task {} not found", task_id))?;
 
     let service = AITaskSyncService::new();
@@ -951,11 +939,7 @@ pub async fn sync_all_pending_ai_tasks(
     }
 
     // Get recent task runs (limit to last 50)
-    let tasks = if let Some(pg) = &app_state.pg_db {
-        pg.get_recent_task_runs(50, None).await?
-    } else {
-        app_state.checkpoint_db.get_recent_task_runs(50, None)?
-    };
+    let tasks = app_state.pg_db.get_recent_task_runs(50, None).await?;
 
     let mut synced_count = 0u32;
 

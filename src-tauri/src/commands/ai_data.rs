@@ -48,11 +48,7 @@ pub async fn get_task_runs_for_viewer(
 ) -> Result<AiDataResponse<Vec<TaskRun>>, String> {
     let limit = limit.unwrap_or(20);
 
-    let result = if let Some(pg) = &state.pg_db {
-        pg.get_recent_task_runs(limit, None).await
-    } else {
-        state.checkpoint_db.get_recent_task_runs(limit, None)
-    };
+    let result = state.pg_db.get_recent_task_runs(limit, None).await;
     match result {
         Ok(runs) => Ok(AiDataResponse::ok(runs)),
         Err(e) => Ok(AiDataResponse::err(e)),
@@ -65,11 +61,7 @@ pub async fn get_task_run_for_viewer(
     state: State<'_, Arc<AppState>>,
     task_id: String,
 ) -> Result<AiDataResponse<TaskRun>, String> {
-    let result = if let Some(pg) = &state.pg_db {
-        pg.get_task_run(&task_id).await
-    } else {
-        state.checkpoint_db.get_task_run(&task_id)
-    };
+    let result = state.pg_db.get_task_run(&task_id).await;
     match result {
         Ok(Some(run)) => Ok(AiDataResponse::ok(run)),
         Ok(None) => Ok(AiDataResponse::err(format!(
@@ -263,11 +255,7 @@ pub async fn read_jsonl_logs_for_task_run(
     task_run_id: String,
 ) -> Result<AiDataResponse<JsonlLogsResult>, String> {
     // Get the task run to get time range
-    let task_run_result = if let Some(pg) = &state.pg_db {
-        pg.get_task_run(&task_run_id).await
-    } else {
-        state.checkpoint_db.get_task_run(&task_run_id)
-    };
+    let task_run_result = state.pg_db.get_task_run(&task_run_id).await;
     let task_run = match task_run_result {
         Ok(Some(run)) => run,
         Ok(None) => {
@@ -368,11 +356,7 @@ pub async fn get_consolidated_ai_output(
     task_run_id: String,
 ) -> Result<AiDataResponse<ConsolidatedAiOutputResult>, String> {
     // Get the task run to get time range
-    let task_run_result = if let Some(pg) = &state.pg_db {
-        pg.get_task_run(&task_run_id).await
-    } else {
-        state.checkpoint_db.get_task_run(&task_run_id)
-    };
+    let task_run_result = state.pg_db.get_task_run(&task_run_id).await;
     let task_run = match task_run_result {
         Ok(Some(run)) => run,
         Ok(None) => {
@@ -716,11 +700,7 @@ pub async fn read_text_logs_for_viewer(
     task_run_id: String,
 ) -> Result<AiDataResponse<TextLogsResult>, String> {
     // Get the task run to get time range
-    let task_run_result = if let Some(pg) = &state.pg_db {
-        pg.get_task_run(&task_run_id).await
-    } else {
-        state.checkpoint_db.get_task_run(&task_run_id)
-    };
+    let task_run_result = state.pg_db.get_task_run(&task_run_id).await;
     let task_run = match task_run_result {
         Ok(Some(run)) => run,
         Ok(None) => {
@@ -784,11 +764,7 @@ pub async fn get_text_logs_summary(
     task_run_id: String,
 ) -> Result<AiDataResponse<TextLogsSummary>, String> {
     // Get the task run to get time range
-    let task_run_result = if let Some(pg) = &state.pg_db {
-        pg.get_task_run(&task_run_id).await
-    } else {
-        state.checkpoint_db.get_task_run(&task_run_id)
-    };
+    let task_run_result = state.pg_db.get_task_run(&task_run_id).await;
     let task_run = match task_run_result {
         Ok(Some(run)) => run,
         Ok(None) => {
@@ -1041,11 +1017,7 @@ pub async fn get_ai_prompts_for_viewer(
     task_run_id: String,
 ) -> Result<AiDataResponse<AiPromptsResult>, String> {
     // Get the task run to find associated prompt files
-    let task_run_result = if let Some(pg) = &state.pg_db {
-        pg.get_task_run(&task_run_id).await
-    } else {
-        state.checkpoint_db.get_task_run(&task_run_id)
-    };
+    let task_run_result = state.pg_db.get_task_run(&task_run_id).await;
     let task_run = match task_run_result {
         Ok(Some(run)) => run,
         Ok(None) => {
@@ -1417,11 +1389,7 @@ pub async fn get_task_run_awas_steps_from_db(
     task_run_id: String,
     step_type: Option<String>,
 ) -> Result<AiDataResponse<TaskRunAwasStepsResult>, String> {
-    let steps_result = if let Some(pg) = &state.pg_db {
-        pg.get_task_run_awas_steps(&task_run_id).await
-    } else {
-        state.checkpoint_db.get_task_run_awas_steps(&task_run_id)
-    };
+    let steps_result = state.pg_db.get_task_run_awas_steps(&task_run_id).await;
     match steps_result {
         Ok(steps) => {
             // Filter by step_type if provided

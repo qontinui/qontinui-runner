@@ -529,7 +529,7 @@ pub fn detect_regression(
     execution_id: &str,
     current_iteration: u32,
     current_result: &crate::step_executor::VerificationPhaseResult,
-    pg_db: Option<&std::sync::Arc<crate::database::pg::PgDb>>,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
 ) -> Option<String> {
     if current_iteration <= 1 {
         return None;
@@ -538,18 +538,14 @@ pub fn detect_regression(
     // Retrieve previous iteration result (PG-primary with SQLite fallback)
     let prev_result = {
         let prev_iter = current_iteration - 1;
-        let pg_result = if let Some(pg) = pg_db {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let pg = pg.clone();
-                let id = execution_id.to_string();
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle.block_on(async move { pg.get_verification_phase_result(&id, prev_iter).await })
-                }))
-                .ok()
-                .and_then(|r| r.ok())
-            } else {
-                None
-            }
+        let pg_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let pg = pg_db.clone();
+            let id = execution_id.to_string();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.block_on(async move { pg_db.get_verification_phase_result(&id, prev_iter).await })
+            }))
+            .ok()
+            .and_then(|r| r.ok())
         } else {
             None
         };
@@ -664,24 +660,20 @@ pub fn build_resume_agentic_context(
     checkpoint_db: &Arc<CheckpointDb>,
     execution_id: &str,
     iteration: u32,
-    pg_db: Option<&std::sync::Arc<crate::database::pg::PgDb>>,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
 ) -> String {
     // Strategy 1: Try loading the full verification phase result.
     // The result may be stored under the execution_id or a child ID.
     // PG-primary with SQLite fallback
-    let phase_result = if let Some(pg) = pg_db {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let pg = pg.clone();
-            let id = execution_id.to_string();
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle.block_on(async move { pg.get_verification_phase_result(&id, iteration).await })
-            }))
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_else(|| checkpoint_db.get_verification_phase_result(execution_id, iteration).ok().flatten())
-        } else {
-            checkpoint_db.get_verification_phase_result(execution_id, iteration).ok().flatten()
-        }
+    let phase_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let id = execution_id.to_string();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle.block_on(async move { pg_db.get_verification_phase_result(&id, iteration).await })
+        }))
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_else(|| checkpoint_db.get_verification_phase_result(execution_id, iteration).ok().flatten())
     } else {
         checkpoint_db.get_verification_phase_result(execution_id, iteration).ok().flatten()
     };

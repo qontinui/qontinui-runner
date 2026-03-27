@@ -30,7 +30,7 @@ use super::{
 /// Executes the AI agentic phase with failure context.
 /// AI session execution is delegated to the UnifiedAiSessionExecutor.
 pub struct AgenticExecutor {
-    app_state: Arc<AppState>,
+    pub(crate) app_state: Arc<AppState>,
     ai_executor: UnifiedAiSessionExecutor,
     checkpoint_db: Arc<CheckpointDb>,
     reflection_fix_ctx: Option<crate::mcp::shared::ReflectionFixContext>,
@@ -181,8 +181,8 @@ impl AgenticExecutor {
                 duration_ms: None,
             };
             // PG-primary: fire-and-forget async write to PostgreSQL
-            if let Some(pg) = &self.app_state.pg_db {
-                let pg = pg.clone();
+            {
+                let pg = self.app_state.pg_db.clone();
                 let event_clone = resp_start_event.clone();
                 tokio::spawn(async move {
                     if let Err(e) = pg.create_task_run_event(&event_clone).await {
@@ -267,7 +267,7 @@ impl AgenticExecutor {
                             let target_app = get_active_sdk_app_name(&self.app_state);
                             record_phase_token_usage_with_target(
                                 &self.checkpoint_db,
-                                self.app_state.pg_db.as_ref(),
+                                &self.app_state.pg_db,
                                 &config.execution_id,
                                 "agentic",
                                 config.stage_index,
@@ -338,8 +338,8 @@ impl AgenticExecutor {
                             duration_ms: Some(resp_duration),
                         };
                         // PG-primary: fire-and-forget async write to PostgreSQL
-                        if let Some(pg) = &self.app_state.pg_db {
-                            let pg = pg.clone();
+                        {
+                            let pg = self.app_state.pg_db.clone();
                             let event_clone = complete_event.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = pg.create_task_run_event(&event_clone).await {
@@ -419,8 +419,8 @@ impl AgenticExecutor {
                             duration_ms: Some(resp_duration),
                         };
                         // PG-primary: fire-and-forget async write to PostgreSQL
-                        if let Some(pg) = &self.app_state.pg_db {
-                            let pg = pg.clone();
+                        {
+                            let pg = self.app_state.pg_db.clone();
                             let event_clone = error_event.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = pg.create_task_run_event(&event_clone).await {
@@ -488,8 +488,8 @@ impl AgenticExecutor {
             duration_ms: None,
         };
         // PG-primary: fire-and-forget async write to PostgreSQL
-        if let Some(pg) = &self.app_state.pg_db {
-            let pg = pg.clone();
+        {
+            let pg = self.app_state.pg_db.clone();
             let event_clone = start_event.clone();
             tokio::spawn(async move {
                 if let Err(e) = pg.create_task_run_event(&event_clone).await {
@@ -661,7 +661,7 @@ impl AgenticExecutor {
                 config.max_context_tokens,
                 config.cross_workflow_learning,
                 config.project_path.as_deref(),
-                self.app_state.pg_db.as_ref(),
+                &self.app_state.pg_db,
             ) {
                 Some(ctx) => {
                     let label = if iteration == 1 {
@@ -805,11 +805,7 @@ impl AgenticExecutor {
         // Check if there's an interrupted session we can resume via `--resume`.
         // If so, reuse its CLI session ID; otherwise generate a fresh one.
         let parent_task_id = get_parent_task_id(&config.execution_id);
-        let (cli_session_id, is_resume) = match if let Some(pg) = &self.app_state.pg_db {
-            pg.get_workflow_ai_session(&parent_task_id, iteration as i32, "agentic").await
-        } else {
-            self.checkpoint_db.get_workflow_ai_session(&parent_task_id, iteration as i32, "agentic")
-        } {
+        let (cli_session_id, is_resume) = match self.app_state.pg_db.get_workflow_ai_session(&parent_task_id, iteration as i32, "agentic").await {
             Ok(Some((prev_cli_id, prev_status))) if prev_status == "interrupted" => {
                 info!(
                     "AGENTIC-PHASE: Found interrupted CLI session {} for iteration {} — will resume",
@@ -833,13 +829,11 @@ impl AgenticExecutor {
         });
 
         // Record the AI session in the database for restart recovery
-        if let Some(pg) = &self.app_state.pg_db {
-            if let Err(e) = pg.create_workflow_ai_session(
-                &parent_task_id, iteration as i32, "agentic",
-                config.stage_index.map(|i| i as i32), &cli_session_id,
-            ).await {
-                warn!("PG create_workflow_ai_session failed: {}", e);
-            }
+        if let Err(e) = self.app_state.pg_db.create_workflow_ai_session(
+            &parent_task_id, iteration as i32, "agentic",
+            config.stage_index.map(|i| i as i32), &cli_session_id,
+        ).await {
+            warn!("PG create_workflow_ai_session failed: {}", e);
         }
         if let Err(e) = self.checkpoint_db.create_workflow_ai_session(
             &parent_task_id,
@@ -914,13 +908,11 @@ impl AgenticExecutor {
                 is_resume: false,
             });
             // Update the DB record with the new session ID
-            if let Some(pg) = &self.app_state.pg_db {
-                if let Err(e) = pg.create_workflow_ai_session(
-                    &parent_task_id, iteration as i32, "agentic",
-                    config.stage_index.map(|i| i as i32), &fresh_cli_id,
-                ).await {
-                    warn!("PG create fallback workflow AI session failed: {}", e);
-                }
+            if let Err(e) = self.app_state.pg_db.create_workflow_ai_session(
+                &parent_task_id, iteration as i32, "agentic",
+                config.stage_index.map(|i| i as i32), &fresh_cli_id,
+            ).await {
+                warn!("PG create fallback workflow AI session failed: {}", e);
             }
             if let Err(e) = self.checkpoint_db.create_workflow_ai_session(
                 &parent_task_id,
@@ -1011,7 +1003,7 @@ impl AgenticExecutor {
             let target_app = get_active_sdk_app_name(&self.app_state);
             record_phase_token_usage_with_target(
                 &self.checkpoint_db,
-                self.app_state.pg_db.as_ref(),
+                &self.app_state.pg_db,
                 &config.execution_id,
                 "agentic",
                 config.stage_index,
@@ -1041,13 +1033,11 @@ impl AgenticExecutor {
                 AgenticOutcome::Skipped => "completed",
             };
             let output_len = outcome.output().map(|o| o.len() as i64).unwrap_or(0);
-            if let Some(pg) = &self.app_state.pg_db {
-                if let Err(e) = pg.complete_workflow_ai_session(
-                    &parent_task_id, iteration as i32, "agentic",
-                    config.stage_index.map(|i| i as i32), session_status, output_len,
-                ).await {
-                    warn!("PG complete_workflow_ai_session failed: {}", e);
-                }
+            if let Err(e) = self.app_state.pg_db.complete_workflow_ai_session(
+                &parent_task_id, iteration as i32, "agentic",
+                config.stage_index.map(|i| i as i32), session_status, output_len,
+            ).await {
+                warn!("PG complete_workflow_ai_session failed: {}", e);
             }
             if let Err(e) = self.checkpoint_db.complete_workflow_ai_session(
                 &parent_task_id,
@@ -1118,8 +1108,8 @@ impl AgenticExecutor {
             duration_ms: Some(agentic_duration_ms),
         };
         // PG-primary: fire-and-forget async write to PostgreSQL
-        if let Some(pg) = &self.app_state.pg_db {
-            let pg = pg.clone();
+        {
+            let pg = self.app_state.pg_db.clone();
             let event_clone = completion_event.clone();
             tokio::spawn(async move {
                 if let Err(e) = pg.create_task_run_event(&event_clone).await {

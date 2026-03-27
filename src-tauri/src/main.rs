@@ -231,36 +231,42 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         checkpoint_db.path()
     );
 
-    // Initialize PostgreSQL connection (PG-primary with SQLite fallback during migration).
+    // Initialize PostgreSQL connection (required — local docker-compose PG).
     // Uses RUNNER_DATABASE_URL env var, or defaults to the local docker-compose PostgreSQL.
     // Uses a dedicated tokio runtime for the one-shot async connection — cannot use
     // tauri::async_runtime::block_on here because the Tauri runtime hasn't started yet.
-    let pg_db = {
+    let pg_db: Arc<crate::database::pg::PgDb> = {
         let pg_url = std::env::var("RUNNER_DATABASE_URL").unwrap_or_else(|_| {
             "host=localhost port=5432 user=qontinui_user password=qontinui_dev_password dbname=qontinui_db".to_string()
         });
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .ok();
-        rt.and_then(|rt| {
-            rt.block_on(crate::database::pg::PgDb::try_new(&pg_url))
-                .map(Arc::new)
-        })
+            .expect("Failed to create tokio runtime for PG initialization");
+        let pg = rt.block_on(crate::database::pg::PgDb::new(&pg_url))
+            .expect("PostgreSQL connection required — ensure docker-compose PG is running");
+        Arc::new(pg)
     };
 
-    // One-time migration of token usage data from SQLite to PostgreSQL
-    if let Some(ref pg) = pg_db {
-        if let Some(rt) = tokio::runtime::Builder::new_current_thread()
+    // One-time full data migration from SQLite to PostgreSQL (idempotent)
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .ok()
-        {
-            match rt.block_on(pg.migrate_token_data_from_sqlite(&checkpoint_db)) {
-                Ok(0) => {} // No migration needed or already done
-                Ok(n) => info!("Migrated {} token usage rows to PostgreSQL", n),
-                Err(e) => warn!("Token data migration to PG failed (non-fatal): {}", e),
+            .expect("Failed to create tokio runtime for data migration");
+        match rt.block_on(pg_db.migrate_all_from_sqlite(&checkpoint_db)) {
+            Ok(stats) => {
+                if stats.rows_migrated > 0 {
+                    info!(
+                        "SQLite→PG migration complete: {} tables, {} rows migrated",
+                        stats.tables_migrated, stats.rows_migrated
+                    );
+                }
+                if !stats.errors.is_empty() {
+                    warn!("SQLite→PG migration had {} errors: {:?}", stats.errors.len(), &stats.errors[..stats.errors.len().min(5)]);
+                }
             }
+            Err(e) => warn!("SQLite→PG data migration failed (non-fatal): {}", e),
         }
     }
 

@@ -76,7 +76,7 @@ export default function LlmObservabilityDashboard() {
   }
 
   return (
-    <div className="h-full overflow-auto p-4 space-y-4">
+    <div className="h-full overflow-auto p-4 space-y-4" data-tutorial-id="llm-observability-dashboard">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -90,7 +90,7 @@ export default function LlmObservabilityDashboard() {
         </div>
         <div className="flex items-center gap-3">
           {/* Time Range Selector */}
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2" data-tutorial-id="llm-time-range">
             <Clock className="w-4 h-4 text-muted-foreground" />
             <select
               value={timeRange}
@@ -117,7 +117,9 @@ export default function LlmObservabilityDashboard() {
       </div>
 
       {/* Summary Cards */}
-      <SummaryCards summary={summary} />
+      <div data-tutorial-id="llm-summary-cards">
+        <SummaryCards summary={summary} />
+      </div>
 
       {/* Charts Row 1 */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

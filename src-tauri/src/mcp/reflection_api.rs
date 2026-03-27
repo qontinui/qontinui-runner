@@ -460,11 +460,7 @@ pub struct ReflectionSettingsResponse {
 pub async fn get_reflection_settings_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<ReflectionSettingsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let dev_mode = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_setting("dev_mode").await
-    } else {
-        state.app_state.checkpoint_db.get_setting("dev_mode")
-    }
+    let dev_mode = state.app_state.pg_db.get_setting("dev_mode").await
     .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -490,11 +486,7 @@ pub async fn update_reflection_settings_handler(
     Json(req): Json<ReflectionSettingsResponse>,
 ) -> Result<Json<ApiResponse<ReflectionSettingsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Read current dev_mode setting or start with empty object
-    let mut dev_mode = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_setting("dev_mode").await
-    } else {
-        state.app_state.checkpoint_db.get_setting("dev_mode")
-    }
+    let mut dev_mode = state.app_state.pg_db.get_setting("dev_mode").await
     .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -512,11 +504,7 @@ pub async fn update_reflection_settings_handler(
     }
 
     // Write back
-    if let Some(pg) = &state.app_state.pg_db {
-        pg.set_setting("dev_mode", &dev_mode).await
-    } else {
-        state.app_state.checkpoint_db.set_setting("dev_mode", &dev_mode)
-    }
+    state.app_state.pg_db.set_setting("dev_mode", &dev_mode).await
     .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,

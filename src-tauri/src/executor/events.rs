@@ -2,8 +2,10 @@ use super::file_logger::FileLogger;
 use super::lifecycle::ExecutorMessage;
 use super::protocol::ExecutorEvent;
 use crate::commands::AppState;
+use crate::database::types::ActivityTimelineInput;
 use crate::display::RawEvent;
 use crate::event_system::EventEmitter;
+use crate::recording::content_filter::ContentFilter;
 use crate::safe_eprintln;
 use serde_json::json;
 use std::sync::Arc;
@@ -25,6 +27,90 @@ impl EventForwarder {
                 if app_state.event_broadcast.receiver_count() > 0 {
                     warn!("Failed to broadcast event to WebSocket clients: {}", e);
                 }
+            }
+        }
+    }
+
+    /// Handle an activity_timeline_capture event from the Python bridge.
+    ///
+    /// Extracts capture data from the event payload, applies content filtering
+    /// (PII scrubbing + sensitive window skipping), and inserts into the
+    /// activity timeline via PgDb.
+    async fn handle_timeline_capture(
+        app_handle: &tauri::AppHandle,
+        data: &serde_json::Value,
+    ) {
+        let app_state = match app_handle.try_state::<Arc<AppState>>() {
+            Some(s) => s,
+            None => return,
+        };
+        let pg = &app_state.pg_db;
+
+        // Parse the capture data from the Python event
+        let text = data
+            .get("textContent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if text.is_empty() {
+            return;
+        }
+
+        let app_name = data.get("appName").and_then(|v| v.as_str()).unwrap_or("");
+        let window_title = data
+            .get("windowTitle")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // Content filtering: skip sensitive windows, scrub PII
+        static FILTER: std::sync::OnceLock<ContentFilter> = std::sync::OnceLock::new();
+        let filter = FILTER.get_or_init(ContentFilter::new);
+
+        if filter.should_skip(app_name, window_title) {
+            return;
+        }
+        let scrubbed = filter.scrub(text);
+
+        let input = ActivityTimelineInput {
+            text_content: scrubbed.text,
+            source_type: data
+                .get("sourceType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("accessibility")
+                .to_string(),
+            capture_mode: "black_box".to_string(),
+            app_name: if app_name.is_empty() {
+                None
+            } else {
+                Some(app_name.to_string())
+            },
+            window_title: if window_title.is_empty() {
+                None
+            } else {
+                Some(window_title.to_string())
+            },
+            url: data
+                .get("url")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+            task_run_id: None,
+            screenshot_path: None,
+            element_count: data
+                .get("elementCount")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32),
+            confidence: data
+                .get("confidence")
+                .and_then(|v| v.as_f64()),
+            metadata_json: None,
+        };
+
+        match pg.insert_activity_entry(&input).await {
+            Ok(id) => {
+                debug!("Timeline capture from Python bridge stored: entry {}", id);
+            }
+            Err(e) => {
+                debug!("Timeline capture insert failed (non-fatal): {}", e);
             }
         }
     }
@@ -98,6 +184,12 @@ impl EventForwarder {
                         .on_execution_completed(data)
                         .await;
                 }
+            }
+
+            // Intercept activity_timeline_capture events from Python bridge
+            // and auto-insert into the activity timeline (PostgreSQL).
+            if event == "activity_timeline_capture" {
+                Self::handle_timeline_capture(app_handle, data).await;
             }
         }
 

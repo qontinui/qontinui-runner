@@ -1,5 +1,5 @@
 import React from "react";
-import type { TraceTreeNode } from "./types";
+import type { TraceTreeNode, CriticalPathInfo } from "./types";
 import { PHASE_COLORS } from "./types";
 import { inferPhase, formatDuration } from "./trace-utils";
 
@@ -9,10 +9,11 @@ interface SpanRowProps {
   traceDurationMs: number;
   isSelected: boolean;
   onClick: () => void;
+  criticalPath?: CriticalPathInfo | null;
 }
 
 export const SpanRow: React.FC<SpanRowProps> = React.memo(
-  ({ node, traceStartMs, traceDurationMs, isSelected, onClick }) => {
+  ({ node, traceStartMs, traceDurationMs, isSelected, onClick, criticalPath }) => {
     const { span, depth } = node;
     const phase = inferPhase(span.name);
     const colors = PHASE_COLORS[phase];
@@ -31,11 +32,16 @@ export const SpanRow: React.FC<SpanRowProps> = React.memo(
     // Short display name (strip qontinui. prefix)
     const displayName = span.name.replace(/^qontinui\./, "");
 
+    // Critical path styling
+    const onCritPath = criticalPath?.spanIds.has(span.span_id);
+    const dimmed = criticalPath && !onCritPath;
+
     return (
       <div
         className={`flex items-center h-8 cursor-pointer hover:bg-zinc-800/50 border-b border-zinc-800/30 ${
           isSelected ? "bg-zinc-700/50" : ""
         }`}
+        style={{ opacity: dimmed ? 0.4 : 1 }}
         onClick={onClick}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
@@ -52,7 +58,7 @@ export const SpanRow: React.FC<SpanRowProps> = React.memo(
           style={{ paddingLeft: `${depth * 20 + 8}px` }}
         >
           {!span.success && <span className="w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" />}
-          <span className={`truncate ${span.success ? "text-zinc-300" : "text-red-400"}`}>
+          <span className={`truncate ${span.success ? "text-zinc-300" : "text-red-400"} ${onCritPath ? "font-medium" : ""}`}>
             {displayName}
           </span>
           <span className={`text-[10px] px-1 rounded ${colors.badge} ${colors.text} shrink-0`}>
@@ -65,7 +71,7 @@ export const SpanRow: React.FC<SpanRowProps> = React.memo(
           <div
             className={`absolute top-1.5 h-5 rounded-xs ${colors.bar} ${
               !span.success ? "ring-1 ring-red-500/50" : ""
-            }`}
+            } ${onCritPath ? "ring-1 ring-red-400/60 shadow-[0_0_6px_rgba(239,68,68,0.3)]" : ""}`}
             style={{
               left: `${leftPercent}%`,
               width: `${widthPercent}%`,

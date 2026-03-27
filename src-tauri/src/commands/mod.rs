@@ -160,9 +160,8 @@ pub struct AppState {
     pub event_broadcast: broadcast::Sender<serde_json::Value>,
     /// SQLite database for checkpoints, sessions, settings, and scheduler state.
     pub checkpoint_db: Arc<CheckpointDb>,
-    /// PostgreSQL database (Clorinde-generated queries). None if PG unavailable.
-    /// During migration, callers prefer PG and fall back to SQLite.
-    pub pg_db: Option<Arc<PgDb>>,
+    /// PostgreSQL database (Clorinde-generated queries). Required — local docker-compose PG.
+    pub pg_db: Arc<PgDb>,
     /// Run recording handler for automatic workflow execution recording.
     /// Records runs to the Tiered Information system.
     pub run_recording_handler: Arc<RunRecordingHandler>,

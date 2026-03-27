@@ -122,7 +122,7 @@ export function CostTrendChart() {
   }
 
   return (
-    <div className="bg-card rounded-lg border border-border p-4">
+    <div className="bg-card rounded-lg border border-border p-4" data-tutorial-id="llm-cost-trend-chart">
       <div className="flex items-center justify-between mb-4">
         <h3 className="font-semibold flex items-center gap-2">
           <TrendingUp className="w-4 h-4" />

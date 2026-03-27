@@ -25,7 +25,7 @@ pub struct SchedulerService {
     /// Database handle for scheduler persistence
     db: Arc<CheckpointDb>,
     /// PostgreSQL database for activity timeline and watchers (optional)
-    pg_db: Option<Arc<PgDb>>,
+    pg_db: Arc<PgDb>,
     /// Flag to stop the service
     stop_signal: Arc<AtomicBool>,
     /// Currently running task IDs
@@ -36,7 +36,7 @@ pub struct SchedulerService {
 
 impl SchedulerService {
     /// Create a new scheduler service
-    pub fn new(db: Arc<CheckpointDb>, pg_db: Option<Arc<PgDb>>) -> Self {
+    pub fn new(db: Arc<CheckpointDb>, pg_db: Arc<PgDb>) -> Self {
         Self {
             db,
             pg_db,
@@ -685,10 +685,7 @@ After making fixes, run tests if applicable to verify the fixes work."#
         &self,
         watcher_id: &str,
     ) -> Result<(bool, Option<String>), String> {
-        let pg = self
-            .pg_db
-            .as_ref()
-            .ok_or_else(|| "PostgreSQL not available — watchers require PgDb".to_string())?;
+        let pg = &self.pg_db;
 
         // 1. Load watcher definition
         let watcher = pg
@@ -705,16 +702,34 @@ After making fixes, run tests if applicable to verify the fixes work."#
             watcher.name, watcher.timeline_query, watcher.lookback_window
         );
 
-        // 2. Query the activity timeline
-        let results = pg
+        // 2. Query the activity timeline with lookback window
+        // Parse lookback_window (e.g., "15 minutes", "1 hour", "30 seconds")
+        // and filter results by creation time. The FTS query runs first,
+        // then we post-filter by time since Clorinde doesn't have a combined
+        // FTS+time-range query yet.
+        let lookback_cutoff = parse_lookback_window(&watcher.lookback_window);
+
+        let all_results = pg
             .search_timeline_filtered(
                 &watcher.timeline_query,
                 watcher.app_name_filter.as_deref(),
                 watcher.source_type_filter.as_deref(),
                 None, // no task_run_id filter
-                50,   // max results
+                200,  // fetch more, then filter by time
             )
             .await?;
+
+        // Filter by lookback window
+        let results: Vec<_> = if let Some(cutoff) = lookback_cutoff {
+            let cutoff_str = cutoff.to_rfc3339();
+            all_results
+                .into_iter()
+                .filter(|r| r.created_at >= cutoff_str)
+                .take(50)
+                .collect()
+        } else {
+            all_results.into_iter().take(50).collect()
+        };
 
         // 3. Format the AI reasoning prompt
         let results_text = if results.is_empty() {
@@ -783,6 +798,41 @@ After making fixes, run tests if applicable to verify the fixes work."#
     // ========================================================================
     // Condition Checking
     // ========================================================================
+
+}
+
+/// Parse a human-friendly lookback window string (e.g., "15 minutes", "1 hour", "30 seconds")
+/// into an absolute cutoff DateTime. Returns None if the string cannot be parsed.
+fn parse_lookback_window(window: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let parts: Vec<&str> = window.trim().split_whitespace().collect();
+    if parts.len() != 2 {
+        warn!("Cannot parse lookback_window '{}': expected '<number> <unit>'", window);
+        return None;
+    }
+
+    let amount: i64 = match parts[0].parse() {
+        Ok(n) => n,
+        Err(_) => {
+            warn!("Cannot parse lookback_window number: '{}'", parts[0]);
+            return None;
+        }
+    };
+
+    let duration = match parts[1].trim_end_matches('s') {
+        "second" => chrono::Duration::seconds(amount),
+        "minute" => chrono::Duration::minutes(amount),
+        "hour" => chrono::Duration::hours(amount),
+        "day" => chrono::Duration::days(amount),
+        _ => {
+            warn!("Unknown lookback_window unit: '{}'", parts[1]);
+            return None;
+        }
+    };
+
+    Some(chrono::Utc::now() - duration)
+}
+
+impl SchedulerService {
 
     /// Check if a task's conditions are met
     /// Returns (all_conditions_met, updated_status)
@@ -997,7 +1047,7 @@ static SCHEDULER_SERVICE: Lazy<Mutex<Option<Arc<SchedulerService>>>> =
     Lazy::new(|| Mutex::new(None));
 
 /// Start the global scheduler service
-pub async fn start_scheduler_service(db: Arc<CheckpointDb>, pg_db: Option<Arc<PgDb>>) {
+pub async fn start_scheduler_service(db: Arc<CheckpointDb>, pg_db: Arc<PgDb>) {
     let mut service_guard = SCHEDULER_SERVICE.lock().await;
 
     if service_guard.is_some() {
@@ -1079,14 +1129,14 @@ mod tests {
     #[tokio::test]
     async fn test_scheduler_service_creation() {
         let db = make_test_db();
-        let service = SchedulerService::new(db);
+        let service = SchedulerService::new(db, None);
         assert_eq!(service.check_interval_secs, 60);
     }
 
     #[tokio::test]
     async fn test_running_tasks_tracking() {
         let db = make_test_db();
-        let service = SchedulerService::new(db);
+        let service = SchedulerService::new(db, None);
 
         // Initially empty
         let running = service.get_running_tasks().await;

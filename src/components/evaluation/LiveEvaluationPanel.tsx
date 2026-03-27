@@ -105,7 +105,7 @@ export default function LiveEvaluationPanel({
   const totalCount = results?.length ?? 0;
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full" data-tutorial-id="live-evaluation-panel">
       {/* Header */}
       <div className="px-4 py-3 border-b border-border/50 shrink-0">
         <h3 className="text-sm font-semibold flex items-center gap-2">
@@ -213,7 +213,7 @@ export default function LiveEvaluationPanel({
 
         {/* Actions */}
         <div className="flex items-center gap-2">
-          <Button size="sm" onClick={handleEvaluate} disabled={!canEvaluate}>
+          <Button size="sm" onClick={handleEvaluate} disabled={!canEvaluate} data-tutorial-id="live-evaluation-run">
             {loading ? (
               <>
                 <RefreshCw className="w-3.5 h-3.5 animate-spin" />

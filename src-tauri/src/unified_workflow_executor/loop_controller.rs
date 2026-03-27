@@ -339,11 +339,7 @@ impl LoopController {
                                 created_at: now.clone(),
                                 updated_at: now.clone(),
                             };
-                            let wt_result = if let Some(pg) = &self.app_state.pg_db {
-                                pg.insert_worktree(&record).await
-                            } else {
-                                self.checkpoint_db.insert_worktree(&record)
-                            };
+                            let wt_result = self.app_state.pg_db.insert_worktree(&record).await;
                             if let Err(e) = wt_result {
                                 warn!(
                                     "WORKTREE: Failed to record worktree for {}: {}",
@@ -367,7 +363,7 @@ impl LoopController {
                             &mut completion_automation_steps,
                             &mut completion_prompt_steps,
                             &self.checkpoint_db,
-                            self.app_state.pg_db.as_ref(),
+                            &self.app_state.pg_db,
                         );
                     }
                 }
@@ -383,7 +379,7 @@ impl LoopController {
                     &mut completion_automation_steps,
                     &mut completion_prompt_steps,
                     &self.checkpoint_db,
-                    self.app_state.pg_db.as_ref(),
+                    &self.app_state.pg_db,
                 );
             }
         }
@@ -425,8 +421,7 @@ impl LoopController {
         // =====================================================================
         // DETERMINE RESUME POINT (must happen before transition loading)
         // =====================================================================
-        let resume_manager = ResumeManager::new(self.checkpoint_db.clone())
-            .with_pg_db(self.app_state.pg_db.clone());
+        let resume_manager = ResumeManager::new(self.checkpoint_db.clone(), self.app_state.pg_db.clone());
         let resume_point = resume_manager
             .determine_resume_point(&config.execution_id)
             .unwrap_or_else(|e| {
@@ -443,11 +438,7 @@ impl LoopController {
         // Load existing transitions when resuming to preserve prior phase history
         let (transitions, current_stage) = if !matches!(resume_point, ResumePoint::FromStart) {
             // Try to load existing transition history from database
-            let task_run_opt = if let Some(pg) = &self.app_state.pg_db {
-                pg.get_task_run(&config.execution_id).await
-            } else {
-                self.checkpoint_db.get_task_run(&config.execution_id)
-            };
+            let task_run_opt = self.app_state.pg_db.get_task_run(&config.execution_id).await;
             if let Ok(Some(task_run)) = task_run_opt {
                 if let Some(ref history_json) = task_run.transition_history_json {
                     if let Ok(loaded_transitions) =
@@ -765,17 +756,9 @@ impl LoopController {
                 ) {
                     Ok(overrides) => {
                         for (key, value) in overrides {
-                            let original = if let Some(pg) = &self.app_state.pg_db {
-                                pg.get_setting(&key).await.ok().flatten()
-                            } else {
-                                self.checkpoint_db.get_setting(&key).ok().flatten()
-                            };
+                            let original = self.app_state.pg_db.get_setting(&key).await.ok().flatten();
                             canary_config_originals.push((key.clone(), original));
-                            let set_result = if let Some(pg) = &self.app_state.pg_db {
-                                pg.set_setting(&key, &value).await
-                            } else {
-                                self.checkpoint_db.set_setting(&key, &value)
-                            };
+                            let set_result = self.app_state.pg_db.set_setting(&key, &value).await;
                             if let Err(e) = set_result {
                                 warn!("CANARY: Failed to set config {}={}: {}", key, value, e);
                             } else {
@@ -873,11 +856,7 @@ impl LoopController {
 
             // Check global max_sessions budget before starting a new stage
             if let Some(max) = config.max_sessions {
-                let sessions_task_run = if let Some(pg) = &self.app_state.pg_db {
-                    pg.get_task_run(&config.execution_id).await
-                } else {
-                    self.checkpoint_db.get_task_run(&config.execution_id)
-                };
+                let sessions_task_run = self.app_state.pg_db.get_task_run(&config.execution_id).await;
                 if let Ok(Some(task_run)) = sessions_task_run {
                     if task_run.sessions_count >= max {
                         warn!(
@@ -936,21 +915,12 @@ impl LoopController {
                 "\n\n{}\n=== STAGE {}/{}: \"{}\" ===\n{}\n",
                 separator, stage_num, total_stages, stage.name, separator
             );
-            if let Some(pg) = &self.app_state.pg_db {
-                let _ = pg.append_task_output_ex(
-                    &config.execution_id,
-                    &stage_header,
-                    false,
-                    false,
-                ).await;
-            } else {
-                let _ = self.checkpoint_db.append_task_output_ex(
-                    &config.execution_id,
-                    &stage_header,
-                    false,
-                    false,
-                );
-            }
+            let _ = self.app_state.pg_db.append_task_output_ex(
+                &config.execution_id,
+                &stage_header,
+                false,
+                false,
+            ).await;
 
             info!(
                 "=== STAGE {}/{}: {} (id: {}) ===",
@@ -1027,21 +997,12 @@ impl LoopController {
                             sr.duration_ms,
                         ));
                     }
-                    if let Some(pg) = &self.app_state.pg_db {
-                        let _ = pg.append_task_output_ex(
-                            &config.execution_id,
-                            &output,
-                            false,
-                            false,
-                        ).await;
-                    } else {
-                        let _ = self.checkpoint_db.append_task_output_ex(
-                            &config.execution_id,
-                            &output,
-                            false,
-                            false,
-                        );
-                    }
+                    let _ = self.app_state.pg_db.append_task_output_ex(
+                        &config.execution_id,
+                        &output,
+                        false,
+                        false,
+                    ).await;
                 }
 
                 all_step_results.extend(setup_results);
@@ -1371,7 +1332,7 @@ impl LoopController {
                         &self.checkpoint_db,
                         &config.execution_id,
                         agentic_iteration,
-                        self.app_state.pg_db.as_ref(),
+                        &self.app_state.pg_db,
                     );
 
                     let (outcome, injected_steps) = self
@@ -1417,21 +1378,12 @@ impl LoopController {
                         AgenticOutcome::Skipped => String::new(),
                     };
                     if !output_text.is_empty() {
-                        if let Some(pg) = &self.app_state.pg_db {
-                            let _ = pg.append_task_output_ex(
-                                &config.execution_id,
-                                &output_text,
-                                true,
-                                false,
-                            ).await;
-                        } else {
-                            let _ = self.checkpoint_db.append_task_output_ex(
-                                &config.execution_id,
-                                &output_text,
-                                true,
-                                false,
-                            );
-                        }
+                        let _ = self.app_state.pg_db.append_task_output_ex(
+                            &config.execution_id,
+                            &output_text,
+                            true,
+                            false,
+                        ).await;
                     }
 
                     self.persist_workflow_state(
@@ -1719,17 +1671,10 @@ impl LoopController {
 
             // Record verification result before completing (used by fixer trigger Guard 7)
             if let Some(ref lr) = last_loop_result {
-                let vp_result = if let Some(pg) = &self.app_state.pg_db {
-                    pg.set_verification_passed(
-                        &config.execution_id,
-                        lr.verification_passed,
-                    ).await
-                } else {
-                    self.checkpoint_db.set_verification_passed(
-                        &config.execution_id,
-                        lr.verification_passed,
-                    )
-                };
+                let vp_result = self.app_state.pg_db.set_verification_passed(
+                    &config.execution_id,
+                    lr.verification_passed,
+                ).await;
                 if let Err(e) = vp_result {
                     error!("Failed to set verification_passed for {}: {}", config.execution_id, e);
                 }
@@ -1989,20 +1934,18 @@ impl LoopController {
                 // PG Q-routing update — only if SQLite recording succeeded
                 // (composite_agentic_score is read back from SQLite)
                 if sqlite_ok.is_ok() {
-                    if let Some(ref pg) = pg_db_for_q {
-                        let composite_score = db.with_conn(|conn| {
-                            conn.query_row(
-                                "SELECT COALESCE(composite_agentic_score, 0.0) FROM learning_outcomes WHERE task_id = ?1",
-                                rusqlite::params![outcome.task_run_id],
-                                |row| row.get::<_, f64>(0),
-                            ).map_err(|e| format!("Failed to read composite score: {}", e))
-                        }).unwrap_or(0.0);
+                    let composite_score = db.with_conn(|conn| {
+                        conn.query_row(
+                            "SELECT COALESCE(composite_agentic_score, 0.0) FROM learning_outcomes WHERE task_id = ?1",
+                            rusqlite::params![outcome.task_run_id],
+                            |row| row.get::<_, f64>(0),
+                        ).map_err(|e| format!("Failed to read composite score: {}", e))
+                    }).unwrap_or(0.0);
 
-                        if let Err(e) = crate::orchestrator::learning_recorder::update_q_routing_table_pg(
-                            pg, &outcome, composite_score,
-                        ).await {
-                            warn!("Failed PG Q-routing update: {}", e);
-                        }
+                    if let Err(e) = crate::orchestrator::learning_recorder::update_q_routing_table_pg(
+                        &pg_db_for_q, &outcome, composite_score,
+                    ).await {
+                        warn!("Failed PG Q-routing update: {}", e);
                     }
                 }
             });
@@ -2297,7 +2240,8 @@ impl LoopController {
                                         ).await;
 
                                         // 2. Mirror to PG observations for cross-session FTS
-                                        if let Some(ref pg) = pg_for_mirror {
+                                        {
+                                            let pg = &pg_for_mirror;
                                             let obs_input = crate::database::types::CreateObservationInput {
                                                 title: format!("Skill: {}", skill.skill_slug),
                                                 content: format!(
@@ -2326,8 +2270,8 @@ impl LoopController {
 
                             // 3. Save detected patterns as observations
                             if patterns > 0 {
-                                if let Some(ref pg) = cra_pg_db {
-                                    let pg = pg.clone();
+                                {
+                                    let pg = cra_pg_db.clone();
                                     let wf = source_wf_name.clone();
                                     let tr = cra_task_run_id.clone();
                                     tokio::spawn(async move {
@@ -2722,21 +2666,12 @@ impl LoopController {
             };
 
             if !output_text.is_empty() {
-                let _ = if let Some(pg) = &self.app_state.pg_db {
-                    pg.append_task_output_ex(
-                        &config.execution_id,
-                        &output_text,
-                        true,
-                        false,
-                    ).await
-                } else {
-                    self.checkpoint_db.append_task_output_ex(
-                        &config.execution_id,
-                        &output_text,
-                        true,  // increment session count
-                        false, // don't check for completion marker
-                    )
-                };
+                let _ = self.app_state.pg_db.append_task_output_ex(
+                    &config.execution_id,
+                    &output_text,
+                    true,
+                    false,
+                ).await;
             }
 
             iterations_run = iteration + 1;

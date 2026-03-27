@@ -67,7 +67,7 @@ export function PromptRegistryTab() {
   );
 
   return (
-    <div className="p-4 space-y-4">
+    <div className="p-4 space-y-4" data-tutorial-id="prompt-registry">
       <PromptCanaryPanel />
 
       <div className="border-t border-zinc-800 pt-4" />

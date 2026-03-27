@@ -254,11 +254,9 @@ impl QueryRoot {
             .load(std::sync::atomic::Ordering::Relaxed);
 
         let runs = 'pg: {
-            if let Some(pg) = &state.app_state.pg_db {
-                match pg.get_recent_task_runs_filtered(limit as u32, workflow_type.as_deref(), Some(port)).await {
-                    Ok(r) => break 'pg r,
-                    Err(e) => tracing::warn!("PG failed for task_runs, falling back to SQLite: {}", e),
-                }
+            match state.app_state.pg_db.get_recent_task_runs_filtered(limit as u32, workflow_type.as_deref(), Some(port)).await {
+                Ok(r) => break 'pg r,
+                Err(e) => tracing::warn!("PG failed for task_runs, falling back to SQLite: {}", e),
             }
             let db = state.app_state.checkpoint_db.clone();
             tokio::task::spawn_blocking(move || {
@@ -280,11 +278,9 @@ impl QueryRoot {
     ) -> Result<Option<super::types::GqlTaskRun>> {
         let state = ctx.data::<Arc<ApiState>>()?;
         let run = 'pg: {
-            if let Some(pg) = &state.app_state.pg_db {
-                match pg.get_task_run(&id).await {
-                    Ok(r) => break 'pg r,
-                    Err(e) => tracing::warn!("PG failed for task_run, falling back to SQLite: {}", e),
-                }
+            match state.app_state.pg_db.get_task_run(&id).await {
+                Ok(r) => break 'pg r,
+                Err(e) => tracing::warn!("PG failed for task_run, falling back to SQLite: {}", e),
             }
             let db = state.app_state.checkpoint_db.clone();
             tokio::task::spawn_blocking(move || db.get_task_run(&id))
@@ -308,11 +304,9 @@ impl QueryRoot {
         let state = ctx.data::<Arc<ApiState>>()?;
 
         let full_output = 'pg: {
-            if let Some(pg) = &state.app_state.pg_db {
-                match pg.get_task_output(&id).await {
-                    Ok(r) => break 'pg r,
-                    Err(e) => tracing::warn!("PG failed for task_run_output, falling back to SQLite: {}", e),
-                }
+            match state.app_state.pg_db.get_task_output(&id).await {
+                Ok(r) => break 'pg r,
+                Err(e) => tracing::warn!("PG failed for task_run_output, falling back to SQLite: {}", e),
             }
             let db = state.app_state.checkpoint_db.clone();
             let id_clone = id.clone();
@@ -393,11 +387,9 @@ impl QueryRoot {
         let state = ctx.data::<Arc<ApiState>>()?;
 
         let workflows = 'pg: {
-            if let Some(pg) = &state.app_state.pg_db {
-                match pg.list_unified_workflows().await {
-                    Ok(r) => break 'pg r,
-                    Err(e) => tracing::warn!("PG failed for workflows, falling back to SQLite: {}", e),
-                }
+            match state.app_state.pg_db.list_unified_workflows().await {
+                Ok(r) => break 'pg r,
+                Err(e) => tracing::warn!("PG failed for workflows, falling back to SQLite: {}", e),
             }
             let db = state.app_state.checkpoint_db.clone();
             tokio::task::spawn_blocking(move || db.list_unified_workflows())
@@ -437,11 +429,9 @@ impl QueryRoot {
         let state = ctx.data::<Arc<ApiState>>()?;
 
         let workflow = 'pg: {
-            if let Some(pg) = &state.app_state.pg_db {
-                match pg.get_unified_workflow(&id).await {
-                    Ok(r) => break 'pg r,
-                    Err(e) => tracing::warn!("PG failed for workflow, falling back to SQLite: {}", e),
-                }
+            match state.app_state.pg_db.get_unified_workflow(&id).await {
+                Ok(r) => break 'pg r,
+                Err(e) => tracing::warn!("PG failed for workflow, falling back to SQLite: {}", e),
             }
             let db = state.app_state.checkpoint_db.clone();
             tokio::task::spawn_blocking(move || db.get_unified_workflow(&id))

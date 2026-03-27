@@ -118,6 +118,52 @@ impl Default for RoutingConfig {
     }
 }
 
+impl RoutingConfig {
+    /// Replace deprecated model IDs with current defaults.
+    /// Called when loading routing config from DB to prevent stale persisted
+    /// model IDs from silently breaking AI-routed tasks.
+    pub fn sanitize_model_ids(&mut self) {
+        // Known-good model ID prefixes (current generation)
+        const VALID_PREFIXES: &[&str] = &[
+            "claude-haiku-4",
+            "claude-sonnet-4",
+            "claude-opus-4",
+            // Allow explicit versioned IDs from any current model
+            "claude-3-5-sonnet-", // Still valid if user explicitly set it
+        ];
+
+        fn is_valid(model: &str) -> bool {
+            VALID_PREFIXES.iter().any(|prefix| model.starts_with(prefix))
+                || model.is_empty() // Empty = use default
+        }
+
+        if !is_valid(&self.simple_model) {
+            tracing::info!(
+                "Replacing stale simple_model '{}' with default '{}'",
+                self.simple_model,
+                default_simple_model()
+            );
+            self.simple_model = default_simple_model();
+        }
+        if !is_valid(&self.medium_model) {
+            tracing::info!(
+                "Replacing stale medium_model '{}' with default '{}'",
+                self.medium_model,
+                default_medium_model()
+            );
+            self.medium_model = default_medium_model();
+        }
+        if !is_valid(&self.complex_model) {
+            tracing::info!(
+                "Replacing stale complex_model '{}' with default '{}'",
+                self.complex_model,
+                default_complex_model()
+            );
+            self.complex_model = default_complex_model();
+        }
+    }
+}
+
 // ============================================================================
 // Task Complexity
 // ============================================================================
@@ -214,7 +260,9 @@ pub struct TaskRouter {
 
 impl TaskRouter {
     /// Create a new task router with the given configuration.
-    pub fn new(config: RoutingConfig) -> Self {
+    /// Automatically sanitizes stale model IDs to prevent silent failures.
+    pub fn new(mut config: RoutingConfig) -> Self {
+        config.sanitize_model_ids();
         Self { config }
     }
 

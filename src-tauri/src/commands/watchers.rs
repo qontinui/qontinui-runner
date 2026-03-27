@@ -16,10 +16,7 @@ pub async fn create_watcher(
     input: CreateWatcherInput,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     let id = pg.create_watcher(&input).await?;
     info!("Created watcher '{}' ({})", input.name, id);
@@ -32,10 +29,7 @@ pub async fn get_watcher(
     id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<Watcher>, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     pg.get_watcher(&id).await
 }
@@ -45,10 +39,7 @@ pub async fn get_watcher(
 pub async fn list_watchers(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<Watcher>, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     pg.list_watchers().await
 }
@@ -59,10 +50,7 @@ pub async fn update_watcher(
     input: UpdateWatcherInput,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<String>, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     let result = pg.update_watcher(&input).await?;
     if result.is_some() {
@@ -77,10 +65,7 @@ pub async fn delete_watcher(
     id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<bool, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     let deleted = pg.delete_watcher(&id).await?;
     if deleted {
@@ -96,10 +81,7 @@ pub async fn set_watcher_enabled(
     enabled: bool,
     state: State<'_, Arc<AppState>>,
 ) -> Result<bool, String> {
-    let pg = state
-        .pg_db
-        .as_ref()
-        .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+    let pg = &state.pg_db;
 
     let updated = pg.set_watcher_enabled(&id, enabled).await?;
     if updated {

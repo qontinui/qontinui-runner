@@ -117,6 +117,7 @@ impl ExecutorContext {
 
         Some(StepEventLogger::new(
             self.app_state.checkpoint_db.clone(),
+            self.app_state.pg_db.clone(),
             self.execution_id.clone(),
             self.workflow_name.clone(),
         ))
@@ -132,6 +133,7 @@ impl ExecutorContext {
 
         StepEventLogger::new(
             self.app_state.checkpoint_db.clone(),
+            self.app_state.pg_db.clone(),
             execution_id,
             self.workflow_name.clone(),
         )

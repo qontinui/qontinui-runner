@@ -21,6 +21,7 @@ import {
   AlertTriangle,
   Circle,
   BookOpen,
+  FolderOpen,
 } from "lucide-react";
 import { useAiSession } from "@/hooks/useAiSession";
 import { MarkdownViewer } from "@/components/MarkdownViewer";
@@ -34,8 +35,20 @@ import {
   HOOK_CATEGORY_DESCRIPTIONS,
 } from "@/lib/hook-gen-prompt-builder";
 import type { HookCategory } from "@/lib/hook-gen-prompt-builder";
-import type { ProjectAnalysis, ApiResponse, WriteHooksResult } from "./types";
+import type {
+  ProjectAnalysis,
+  ApiResponse,
+  WriteHooksResult,
+  PageComponent,
+  PageGenerationOptions,
+  ReadPageSourceResult,
+} from "./types";
 import { getApiBase } from "@/lib/runner-api";
+import {
+  buildRegistrationPrompt,
+  buildPageSpecPrompt,
+  buildTutorialPrompt,
+} from "@/lib/page-analysis-prompt-builder";
 
 // =============================================================================
 // File extraction from AI output
@@ -97,7 +110,12 @@ function extractJsonBlock(content: string): string | null {
 // Step types
 // =============================================================================
 
-type IntegrationStep = "hooks" | "architecture-spec";
+type IntegrationStep =
+  | "hooks"
+  | "architecture-spec"
+  | "page-registrations"
+  | "page-spec"
+  | "page-tutorial";
 
 interface StepStatus {
   state: "pending" | "active" | "done" | "skipped" | "error";
@@ -108,6 +126,9 @@ type PanelPhase =
   | "idle"
   | "generating-hooks"
   | "generating-spec"
+  | "generating-page-registrations"
+  | "generating-page-spec"
+  | "generating-page-tutorial"
   | "preview"
   | "applying"
   | "applied";
@@ -229,6 +250,22 @@ export function HookGenerationPanel({
   const prevSessionStateRef = useRef<string>(session.sessionState);
   const specRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Per-page generation queue
+  const pageQueueRef = useRef<PageComponent[]>([]);
+  const pageOptionsRef = useRef<PageGenerationOptions>({
+    generateRegistrations: true,
+    generateSpecs: true,
+    generateTutorials: false,
+  });
+  const currentPageRef = useRef<{
+    page: PageComponent;
+    source: ReadPageSourceResult | null;
+    registrationOutput: string;
+  } | null>(null);
+
+  // Track how many AI messages we've already processed to avoid duplicate extraction
+  const processedMessageCountRef = useRef(0);
+
   const isRegenHooks = analysis.has_generated_hooks;
   const isRegenSpec = analysis.has_architecture_spec;
 
@@ -264,11 +301,14 @@ export function HookGenerationPanel({
       };
     }
 
-    // Gather all AI content
-    const allContent = session.messages
-      .filter((m) => m.role === "ai")
-      .map((m) => m.content)
-      .join("\n\n");
+    // Gather AI content — for per-page steps, only look at NEW messages
+    // to prevent re-extracting files from earlier steps
+    const aiMessages = session.messages.filter((m) => m.role === "ai");
+    const isPerPageStep = currentStep === "page-registrations" || currentStep === "page-spec" || currentStep === "page-tutorial";
+    const relevantMessages = isPerPageStep
+      ? aiMessages.slice(processedMessageCountRef.current)
+      : aiMessages;
+    const allContent = relevantMessages.map((m) => m.content).join("\n\n");
     const fullContent = session.streamingContent
       ? allContent + "\n\n" + session.streamingContent
       : allContent;
@@ -364,8 +404,7 @@ export function HookGenerationPanel({
         : specContent;
 
       if (!tryExtractSpec(fullSpecContent)) {
-        // Race condition: state changed to "ready" before all text events arrived.
-        // Retry after a delay by fetching the full output from the runner API.
+        // Race condition: text events still in transit. Retry via API.
         const taskRunId = session.taskRunId;
         if (specRetryTimerRef.current) clearTimeout(specRetryTimerRef.current);
         retryTimer = setTimeout(async () => {
@@ -394,6 +433,254 @@ export function HookGenerationPanel({
           }
         }, 1000);
         specRetryTimerRef.current = retryTimer;
+      }
+
+    // ---- Per-page step handlers ----
+
+    } else if (currentStep === "page-registrations") {
+      processedMessageCountRef.current = aiMessages.length; // Mark messages as processed
+      const files = extractGeneratedFiles(fullContent);
+      if (files.length > 0) {
+        setGeneratedFiles((prev) => [...prev, ...files]);
+        // Store registration output for spec/tutorial prompts
+        if (currentPageRef.current) {
+          currentPageRef.current.registrationOutput = files.map((f) => f.content).join("\n\n");
+        }
+        setStepStatuses((prev) =>
+          prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
+        );
+      }
+
+      // Chain to page-spec if enabled
+      const opts = pageOptionsRef.current;
+      const cur = currentPageRef.current;
+      if (opts.generateSpecs && cur?.source) {
+        pendingStepRef.current = "page-spec";
+        setPhase("generating-page-spec");
+        setStepStatuses((prev) => [
+          ...prev,
+          { state: "active", label: `Spec: ${cur.page.route}` },
+        ]);
+
+        // Load existing spec for merge mode if available
+        (async () => {
+          let existingSpec: string | undefined;
+          if (cur.page.has_spec) {
+            const specName = `${cur.page.route.replace(/^\//, "").replace(/\//g, "-") || "root"}.spec.uibridge.json`;
+            existingSpec = await readProjectFile(`src/specs/${specName}`, controller.signal)
+              || await readProjectFile(specName, controller.signal)
+              || undefined;
+          }
+          const specPrompt = buildPageSpecPrompt(
+            cur.source!.main_source,
+            cur.source!.imported_sources,
+            cur.page.component_name,
+            cur.page.route,
+            cur.registrationOutput || "",
+            existingSpec,
+          );
+          session.sendMessage(
+            "Now generate a page spec (.spec.uibridge.json) for this page.\n\n" + specPrompt,
+          );
+        })();
+      } else if (opts.generateTutorials && cur?.source) {
+        // Skip to tutorial
+        pendingStepRef.current = "page-tutorial";
+        setPhase("generating-page-tutorial");
+        setStepStatuses((prev) => [
+          ...prev,
+          { state: "active", label: `Tutorial: ${cur.page.route}` },
+        ]);
+        const tutPrompt = buildTutorialPrompt(
+          cur.source.main_source,
+          cur.page.component_name,
+          cur.page.route,
+          cur.registrationOutput || "",
+          "",
+        );
+        session.sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
+      } else {
+        // Advance to next page
+        advanceToNextPage(controller.signal);
+      }
+    } else if (currentStep === "page-spec") {
+      processedMessageCountRef.current = aiMessages.length;
+      const jsonBlock = extractJsonBlock(fullContent);
+      if (jsonBlock) {
+        const specName = currentPageRef.current
+          ? `${currentPageRef.current.page.route.replace(/^\//, "").replace(/\//g, "-") || "root"}.spec.uibridge.json`
+          : "page.spec.uibridge.json";
+        setGeneratedFiles((prev) => [...prev, { filePath: specName, content: jsonBlock }]);
+        setStepStatuses((prev) =>
+          prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
+        );
+      }
+
+      // Chain to tutorial if enabled
+      const opts = pageOptionsRef.current;
+      const cur = currentPageRef.current;
+      if (opts.generateTutorials && cur?.source) {
+        pendingStepRef.current = "page-tutorial";
+        setPhase("generating-page-tutorial");
+        setStepStatuses((prev) => [
+          ...prev,
+          { state: "active", label: `Tutorial: ${cur.page.route}` },
+        ]);
+        const tutPrompt = buildTutorialPrompt(
+          cur.source.main_source,
+          cur.page.component_name,
+          cur.page.route,
+          cur.registrationOutput || "",
+          jsonBlock || "",
+        );
+        session.sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
+      } else {
+        advanceToNextPage(controller.signal);
+      }
+    } else if (currentStep === "page-tutorial") {
+      processedMessageCountRef.current = aiMessages.length;
+      const files = extractGeneratedFiles(fullContent);
+      if (files.length > 0) {
+        setGeneratedFiles((prev) => [...prev, ...files]);
+      }
+      setStepStatuses((prev) =>
+        prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
+      );
+      advanceToNextPage(controller.signal);
+    }
+
+    // Helper: advance to the next page in the queue or go to preview
+    function advanceToNextPage(signal: AbortSignal) {
+      const queue = pageQueueRef.current;
+      if (queue.length > 0) {
+        const nextPage = queue.shift()!;
+        startPageGeneration(nextPage, signal);
+      } else {
+        // All pages done
+        pendingStepRef.current = null;
+        currentPageRef.current = null;
+        setPhase("preview");
+      }
+    }
+
+    /** Read an existing file from the project (returns empty string on failure). */
+    async function readProjectFile(filePath: string, signal: AbortSignal): Promise<string> {
+      try {
+        const resp = await fetch(`${getApiBase()}/ui-bridge/integration/read-file`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ project_path: projectPath, file_path: filePath }),
+          signal,
+        });
+        if (signal.aborted) return "";
+        const data = await resp.json();
+        return data.success && data.data ? data.data : "";
+      } catch {
+        return "";
+      }
+    }
+
+    async function startPageGeneration(page: PageComponent, signal: AbortSignal) {
+      currentPageRef.current = { page, source: null, registrationOutput: "" };
+      setStepStatuses((prev) => [
+        ...prev,
+        { state: "active", label: `Registrations: ${page.route}` },
+      ]);
+
+      // Fetch page source
+      try {
+        const resp = await fetch(`${getApiBase()}/ui-bridge/integration/read-page-source`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            project_path: projectPath,
+            component_path: page.component_path,
+            max_depth: 2,
+          }),
+          signal,
+        });
+        if (signal.aborted) return;
+        const data: ApiResponse<ReadPageSourceResult> = await resp.json();
+        if (data.success && data.data) {
+          currentPageRef.current!.source = data.data;
+        }
+      } catch {
+        if (signal.aborted) return;
+      }
+
+      const source = currentPageRef.current?.source;
+      if (!source) {
+        setStepStatuses((prev) =>
+          prev.map((s) => (s.state === "active" ? { ...s, state: "error" } : s)),
+        );
+        advanceToNextPage(signal);
+        return;
+      }
+
+      const opts = pageOptionsRef.current;
+      if (opts.generateRegistrations) {
+        pendingStepRef.current = "page-registrations";
+        setPhase("generating-page-registrations");
+
+        // Load existing registrations for merge mode
+        let existingRegs: string | undefined;
+        if (page.has_registrations) {
+          const pageName = page.component_name.toLowerCase().replace(/page$/, "");
+          existingRegs = await readProjectFile(
+            `src/lib/ui-bridge/pages/${pageName}-registrations.tsx`,
+            signal,
+          );
+          if (!existingRegs) {
+            // Try reading from the component file itself (inline registrations)
+            existingRegs = undefined;
+          }
+        }
+
+        const prompt = buildRegistrationPrompt(
+          source.main_source,
+          source.imported_sources,
+          page.component_name,
+          page.route,
+          analysis.framework,
+          existingRegs || undefined,
+        );
+        await session.sendMessage(
+          `Analyze the page at ${page.route} and generate UI Bridge registrations.\n\n` + prompt,
+        );
+      } else if (opts.generateSpecs) {
+        pendingStepRef.current = "page-spec";
+        setPhase("generating-page-spec");
+        setStepStatuses((prev) => [
+          ...prev.filter((s) => s.state !== "active"),
+          { state: "active", label: `Spec: ${page.route}` },
+        ]);
+        const specPrompt = buildPageSpecPrompt(
+          source.main_source,
+          source.imported_sources,
+          page.component_name,
+          page.route,
+          "",
+        );
+        await session.sendMessage(
+          `Generate a page spec for ${page.route}.\n\n` + specPrompt,
+        );
+      } else if (opts.generateTutorials) {
+        pendingStepRef.current = "page-tutorial";
+        setPhase("generating-page-tutorial");
+        setStepStatuses((prev) => [
+          ...prev.filter((s) => s.state !== "active"),
+          { state: "active", label: `Tutorial: ${page.route}` },
+        ]);
+        const tutPrompt = buildTutorialPrompt(
+          source.main_source,
+          page.component_name,
+          page.route,
+          "",
+          "",
+        );
+        await session.sendMessage(
+          `Generate a tutorial for ${page.route}.\n\n` + tutPrompt,
+        );
       }
     }
 
@@ -544,6 +831,139 @@ export function HookGenerationPanel({
     isRegenSpec,
   ]);
 
+  // Start per-page AI generation (called from PageSelectionPanel via window event)
+  const handleGeneratePages = useCallback(
+    async (pages: PageComponent[], options: PageGenerationOptions) => {
+      if (pages.length === 0) return;
+
+      setError(null);
+      setGeneratedFiles([]);
+      setWriteResult(null);
+      pageQueueRef.current = [...pages];
+      pageOptionsRef.current = options;
+      processedMessageCountRef.current = 0;
+
+      // Build initial step statuses
+      const steps: StepStatus[] = pages.map((p) => ({
+        state: "pending" as const,
+        label: `${p.route} (${[
+          options.generateRegistrations && "regs",
+          options.generateSpecs && "spec",
+          options.generateTutorials && "tutorial",
+        ]
+          .filter(Boolean)
+          .join("+")})`,
+      }));
+      setStepStatuses(steps);
+
+      // Close existing session
+      if (session.taskRunId) {
+        session.close();
+        session.resetSession();
+      }
+
+      const id = await session.createSession("Page Preparation: AI Generation");
+      if (!id) {
+        setError("Failed to create AI session");
+        return;
+      }
+
+      // Start first page
+      const firstPage = pageQueueRef.current.shift()!;
+      currentPageRef.current = { page: firstPage, source: null, registrationOutput: "" };
+      setStepStatuses((prev) =>
+        prev.map((s, i) => (i === 0 ? { ...s, state: "active" } : s)),
+      );
+
+      // Fetch page source and send first prompt
+      try {
+        const resp = await fetch(
+          `${getApiBase()}/ui-bridge/integration/read-page-source`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              project_path: projectPath,
+              component_path: firstPage.component_path,
+              max_depth: 2,
+            }),
+          },
+        );
+        const data: ApiResponse<ReadPageSourceResult> = await resp.json();
+        if (data.success && data.data) {
+          currentPageRef.current!.source = data.data;
+        }
+      } catch {
+        // Continue with empty source
+      }
+
+      const source = currentPageRef.current?.source;
+      if (!source) {
+        setError(`Failed to read source for ${firstPage.component_path}`);
+        setPhase("idle");
+        return;
+      }
+
+      if (options.generateRegistrations) {
+        pendingStepRef.current = "page-registrations";
+        setPhase("generating-page-registrations");
+        const prompt = buildRegistrationPrompt(
+          source.main_source,
+          source.imported_sources,
+          firstPage.component_name,
+          firstPage.route,
+          analysis.framework,
+        );
+        await session.sendMessage(
+          `Analyze the page at ${firstPage.route} and generate UI Bridge registrations.\n\n` +
+            prompt,
+        );
+      } else if (options.generateSpecs) {
+        pendingStepRef.current = "page-spec";
+        setPhase("generating-page-spec");
+        const specPrompt = buildPageSpecPrompt(
+          source.main_source,
+          source.imported_sources,
+          firstPage.component_name,
+          firstPage.route,
+          "",
+        );
+        await session.sendMessage(
+          `Generate a page spec for ${firstPage.route}.\n\n` + specPrompt,
+        );
+      } else if (options.generateTutorials) {
+        pendingStepRef.current = "page-tutorial";
+        setPhase("generating-page-tutorial");
+        const tutPrompt = buildTutorialPrompt(
+          source.main_source,
+          firstPage.component_name,
+          firstPage.route,
+          "",
+          "",
+        );
+        await session.sendMessage(
+          `Generate a tutorial for ${firstPage.route}.\n\n` + tutPrompt,
+        );
+      }
+    },
+    [session, analysis, projectPath],
+  );
+
+  // Listen for page generation trigger from PageSelectionPanel via CustomEvent
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as {
+        pages: PageComponent[];
+        options: PageGenerationOptions;
+      } | undefined;
+      if (detail) {
+        handleGeneratePages(detail.pages, detail.options);
+      }
+    };
+    window.addEventListener("ui-bridge-generate-pages", handler);
+    return () => window.removeEventListener("ui-bridge-generate-pages", handler);
+  }, [handleGeneratePages]);
+
   // Apply generated files to project
   const handleApply = useCallback(async () => {
     if (generatedFiles.length === 0) return;
@@ -617,7 +1037,37 @@ export function HookGenerationPanel({
   }, []);
 
   const isProcessing = session.sessionState === "processing";
-  const isGenerating = phase === "generating-hooks" || phase === "generating-spec";
+  const isPerPagePhase =
+    phase === "generating-page-registrations" ||
+    phase === "generating-page-spec" ||
+    phase === "generating-page-tutorial";
+  const isGenerating =
+    phase === "generating-hooks" ||
+    phase === "generating-spec" ||
+    isPerPagePhase;
+  const currentPageName = currentPageRef.current?.page.route || "";
+
+  // Group generated files by page for preview
+  const groupedFiles = generatedFiles.reduce<Record<string, GeneratedFile[]>>((acc, f) => {
+    // Group by: page-specific files go under their page route, others under "project"
+    const isPageSpec = f.filePath.endsWith(".spec.uibridge.json") && !f.filePath.includes("architecture");
+    const isPageReg = f.filePath.includes("/pages/") && f.filePath.includes("-registrations");
+    const isPageTut = f.filePath.includes("tutorial/data/");
+    let group = "Project";
+    if (isPageSpec || isPageReg || isPageTut) {
+      // Extract page name from file path
+      const parts = f.filePath.split("/");
+      const fileName = parts[parts.length - 1];
+      const pageName = fileName
+        .replace("-registrations.tsx", "")
+        .replace(".spec.uibridge.json", "")
+        .replace(".ts", "");
+      group = `Page: /${pageName}`;
+    }
+    if (!acc[group]) acc[group] = [];
+    acc[group].push(f);
+    return acc;
+  }, {});
 
   return (
     <div className="p-4 rounded-lg border border-border bg-card/50">
@@ -634,8 +1084,8 @@ export function HookGenerationPanel({
       </div>
 
       <p className="text-xs text-muted-foreground mb-3">
-        AI analyzes your project&apos;s source code and generates UI Bridge hooks and an
-        architecture spec — fully setting up the project for AI-driven workflows.
+        AI analyzes your project and generates hooks, architecture specs, element registrations,
+        page specs, and tutorials — fully preparing the project for AI-driven automation.
       </p>
 
       {/* Configuration — shown in idle/applied states */}
@@ -702,7 +1152,17 @@ export function HookGenerationPanel({
       )}
 
       {/* Progress steps — shown during generation */}
-      {isGenerating && stepStatuses.length > 0 && <StepIndicator steps={stepStatuses} />}
+      {isGenerating && stepStatuses.length > 0 && (
+        <div className="mb-2">
+          {isPerPagePhase && currentPageName && (
+            <div className="flex items-center gap-1.5 text-xs text-cyan-400 font-medium mb-2">
+              <FolderOpen className="w-3.5 h-3.5" />
+              Processing: {currentPageName}
+            </div>
+          )}
+          <StepIndicator steps={stepStatuses} />
+        </div>
+      )}
 
       {/* Generating — streaming view */}
       {isGenerating && (
@@ -757,44 +1217,74 @@ export function HookGenerationPanel({
           {stepStatuses.length > 0 && <StepIndicator steps={stepStatuses} />}
 
           <p className="text-[10px] text-muted-foreground font-medium mb-2">
-            Generated {generatedFiles.length} file{generatedFiles.length !== 1 ? "s" : ""}:
+            Generated {generatedFiles.length} file{generatedFiles.length !== 1 ? "s" : ""}
+            {Object.keys(groupedFiles).length > 1
+              ? ` across ${Object.keys(groupedFiles).length} groups`
+              : ""}
+            :
           </p>
 
-          <div className="flex flex-col gap-1.5 mb-3">
-            {generatedFiles.map((file) => {
-              const isSpec = file.filePath.endsWith(".json");
-              return (
-                <div key={file.filePath} className="rounded border border-border bg-white/[0.02]">
-                  <button
-                    onClick={() => toggleFile(file.filePath)}
-                    className="w-full flex items-center gap-1.5 px-2 py-1.5 text-xs text-left hover:bg-white/5 transition-colors"
-                  >
-                    {expandedFiles.has(file.filePath) ? (
-                      <ChevronDown className="w-3 h-3 text-muted-foreground shrink-0" />
-                    ) : (
-                      <ChevronRight className="w-3 h-3 text-muted-foreground shrink-0" />
-                    )}
-                    {isSpec ? (
+          <div className="flex flex-col gap-2 mb-3">
+            {Object.entries(groupedFiles).map(([group, files]) => (
+              <div key={group}>
+                {/* Group header — only show if multiple groups */}
+                {Object.keys(groupedFiles).length > 1 && (
+                  <div className="flex items-center gap-1.5 text-[10px] font-medium text-muted-foreground mb-1">
+                    <FolderOpen className="w-3 h-3" />
+                    {group}
+                    <span className="text-muted-foreground/40">
+                      ({files.length} file{files.length !== 1 ? "s" : ""})
+                    </span>
+                  </div>
+                )}
+                <div className="flex flex-col gap-1">
+                  {files.map((file) => {
+                    const isSpec = file.filePath.endsWith(".json");
+                    const isTutorial = file.filePath.includes("tutorial");
+                    const fileIcon = isSpec ? (
                       <BookOpen className="w-3 h-3 text-cyan-400 shrink-0" />
+                    ) : isTutorial ? (
+                      <BookOpen className="w-3 h-3 text-amber-400 shrink-0" />
                     ) : (
                       <FileCode className="w-3 h-3 text-purple-400 shrink-0" />
-                    )}
-                    <span className="font-medium text-foreground truncate">{file.filePath}</span>
-                    <span className="text-[10px] text-muted-foreground/50 ml-auto shrink-0">
-                      {file.content.split("\n").length} lines
-                    </span>
-                  </button>
+                    );
 
-                  {expandedFiles.has(file.filePath) && (
-                    <div className="border-t border-border">
-                      <pre className="text-[10px] text-muted-foreground p-2 overflow-x-auto max-h-[400px] overflow-y-auto leading-relaxed">
-                        {file.content}
-                      </pre>
-                    </div>
-                  )}
+                    return (
+                      <div
+                        key={file.filePath}
+                        className="rounded border border-border bg-white/[0.02]"
+                      >
+                        <button
+                          onClick={() => toggleFile(file.filePath)}
+                          className="w-full flex items-center gap-1.5 px-2 py-1.5 text-xs text-left hover:bg-white/5 transition-colors"
+                        >
+                          {expandedFiles.has(file.filePath) ? (
+                            <ChevronDown className="w-3 h-3 text-muted-foreground shrink-0" />
+                          ) : (
+                            <ChevronRight className="w-3 h-3 text-muted-foreground shrink-0" />
+                          )}
+                          {fileIcon}
+                          <span className="font-medium text-foreground truncate">
+                            {file.filePath}
+                          </span>
+                          <span className="text-[10px] text-muted-foreground/50 ml-auto shrink-0">
+                            {file.content.split("\n").length} lines
+                          </span>
+                        </button>
+
+                        {expandedFiles.has(file.filePath) && (
+                          <div className="border-t border-border">
+                            <pre className="text-[10px] text-muted-foreground p-2 overflow-x-auto max-h-[400px] overflow-y-auto leading-relaxed">
+                              {file.content}
+                            </pre>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
-              );
-            })}
+              </div>
+            ))}
           </div>
 
           <div className="flex items-center gap-2">
@@ -872,8 +1362,8 @@ export function HookGenerationPanel({
           )}
 
           <p className="text-[10px] text-muted-foreground mt-2">
-            Restart your dev server to activate the hooks. The architecture spec is ready for
-            workflow generation in the Specs page.
+            Restart your dev server to activate the changes. Hooks, registrations, and specs are
+            ready for AI-driven workflows in the Specs and Workflows pages.
           </p>
         </div>
       )}

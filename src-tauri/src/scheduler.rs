@@ -520,6 +520,11 @@ pub fn create_task(
     scheduled_task.success_criteria = success_criteria;
     scheduled_task.conditions = conditions;
 
+    // Compute initial next_run
+    let now = chrono::Utc::now();
+    scheduled_task.next_run =
+        compute_next_run(&scheduled_task.schedule, now).map(|dt| dt.to_rfc3339());
+
     db.insert_scheduled_task(&scheduled_task)?;
 
     info!(
@@ -577,6 +582,14 @@ pub fn update_task(
         // Clear condition_status when conditions change
         scheduled_task.condition_status = None;
     }
+
+    // Recompute next_run when schedule or enabled status changes
+    let now = chrono::Utc::now();
+    scheduled_task.next_run = if scheduled_task.enabled {
+        compute_next_run(&scheduled_task.schedule, now).map(|dt| dt.to_rfc3339())
+    } else {
+        None
+    };
 
     scheduled_task.touch();
     db.update_scheduled_task(&scheduled_task)?;
@@ -719,11 +732,18 @@ pub fn compute_next_run(
                 .filter(|dt| *dt > from)
         }
         ScheduleExpression::Cron(cron_expr) => {
-            // Use the cron crate to compute next run
+            // Use the cron crate to compute next run (requires 6 or 7 field expressions).
+            // Auto-normalize standard 5-field cron (min hr dom mon dow) by prepending "0" for seconds.
             use cron::Schedule;
             use std::str::FromStr;
 
-            Schedule::from_str(cron_expr)
+            let normalized = if cron_expr.split_whitespace().count() == 5 {
+                format!("0 {}", cron_expr)
+            } else {
+                cron_expr.clone()
+            };
+
+            Schedule::from_str(&normalized)
                 .ok()
                 .and_then(|schedule| schedule.after(&from).next())
         }
@@ -764,11 +784,20 @@ mod tests {
 
     #[test]
     fn test_cron_parsing() {
-        // Test daily at 9 AM
+        // Test daily at 9 AM (6-field with seconds)
         let schedule = ScheduleExpression::Cron("0 0 9 * * *".to_string());
         let now = chrono::Utc::now();
         let next = compute_next_run(&schedule, now);
         assert!(next.is_some());
+    }
+
+    #[test]
+    fn test_cron_5_field_normalization() {
+        // Standard 5-field cron (no seconds) should be auto-normalized
+        let schedule = ScheduleExpression::Cron("0 3 * * *".to_string());
+        let now = chrono::Utc::now();
+        let next = compute_next_run(&schedule, now);
+        assert!(next.is_some(), "5-field cron '0 3 * * *' should be normalized and parsed");
     }
 
     #[test]

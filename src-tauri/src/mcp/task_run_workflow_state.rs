@@ -18,11 +18,7 @@ use tauri::Manager;
 
 /// PG-primary get_task_run helper.
 async fn pg_get_task_run(state: &Arc<ApiState>, id: &str) -> Result<Option<TaskRun>, String> {
-    if let Some(pg) = &state.app_state.pg_db {
-        pg.get_task_run(id).await
-    } else {
-        state.app_state.checkpoint_db.get_task_run(id)
-    }
+    state.app_state.pg_db.get_task_run(id).await
 }
 
 /// Response for workflow state endpoint.
@@ -98,20 +94,12 @@ pub async fn get_workflow_state(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Try to get explicit workflow state
-    let explicit_state = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_workflow_execution_state(&id).await
-    } else {
-        state.app_state.checkpoint_db.get_workflow_execution_state(&id)
-    }
+    let explicit_state = state.app_state.pg_db.get_workflow_execution_state(&id).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Try to get workflow definition for max_iterations and verification info
     let workflow_def = if let Some(ref workflow_name) = task_run.workflow_name {
-        if let Some(pg) = &state.app_state.pg_db {
-            pg.get_unified_workflow_by_name(workflow_name).await.ok().flatten()
-        } else {
-            state.app_state.checkpoint_db.get_unified_workflow_by_name(workflow_name).ok().flatten()
-        }
+        state.app_state.pg_db.get_unified_workflow_by_name(workflow_name).await.ok().flatten()
     } else {
         None
     };
@@ -402,11 +390,7 @@ pub async fn get_full_workflow_state(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get orchestrator state
-    let explicit_state = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_workflow_execution_state(&id).await
-    } else {
-        state.app_state.checkpoint_db.get_workflow_execution_state(&id)
-    }
+    let explicit_state = state.app_state.pg_db.get_workflow_execution_state(&id).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let orchestrator_state = explicit_state.map(|ws| {
@@ -456,11 +440,7 @@ pub async fn get_full_workflow_state(
         .collect();
 
     // Get current step progress
-    let progress_raw = if let Some(pg) = &state.app_state.pg_db {
-        pg.get_current_step_progress(&id).await
-    } else {
-        state.app_state.checkpoint_db.get_current_step_progress(&id)
-    }
+    let progress_raw = state.app_state.pg_db.get_current_step_progress(&id).await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let current_step_progress = progress_raw.map(|p| StepProgressData {
@@ -479,6 +459,7 @@ pub async fn get_full_workflow_state(
     // Compute resume point using ResumeManager
     let resume_point = compute_resume_point(
         state.app_state.checkpoint_db.clone(),
+        state.app_state.pg_db.clone(),
         &id,
         &orchestrator_state,
     );
@@ -558,13 +539,14 @@ pub async fn get_full_workflow_state(
 /// Compute the resume point for a workflow execution.
 pub fn compute_resume_point(
     db: std::sync::Arc<crate::database::CheckpointDb>,
+    pg_db: std::sync::Arc<crate::database::pg::PgDb>,
     execution_id: &str,
     orchestrator_state: &Option<OrchestratorStateData>,
 ) -> ResumePointData {
     // Try to use the ResumeManager for accurate resume point calculation
     use crate::unified_workflow_executor::ResumeManager;
 
-    let resume_mgr = ResumeManager::new(db);
+    let resume_mgr = ResumeManager::new(db, pg_db);
     match resume_mgr.determine_resume_point(execution_id) {
         Ok(resume_point) => {
             use crate::unified_workflow_executor::ResumePoint;

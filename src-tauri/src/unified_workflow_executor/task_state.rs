@@ -21,21 +21,16 @@ impl LoopController {
         // check the parent task instead since children don't have their own task_run records
         let task_id_to_check = get_parent_task_id(execution_id);
 
-        // PG-primary: try PG first for get_task_run, fall back to SQLite
-        let task_result = if let Some(pg) = &self.app_state.pg_db {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let pg = pg.clone();
-                let id = task_id_to_check.clone();
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle.block_on(async move { pg.get_task_run(&id).await })
-                }))
-                .unwrap_or_else(|_| Err("block_on panicked".to_string()))
-                .or_else(|_| self.checkpoint_db.get_task_run(&task_id_to_check))
-            } else {
-                self.checkpoint_db.get_task_run(&task_id_to_check)
-            }
+        // PG-primary: use block_on to call async PG from sync context
+        let task_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let pg = self.app_state.pg_db.clone();
+            let id = task_id_to_check.clone();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.block_on(async move { pg.get_task_run(&id).await })
+            }))
+            .unwrap_or_else(|_| Err("block_on panicked".to_string()))
         } else {
-            self.checkpoint_db.get_task_run(&task_id_to_check)
+            Err("no tokio runtime".to_string())
         };
 
         match task_result {
@@ -82,21 +77,16 @@ impl LoopController {
     pub(crate) fn is_task_paused(&self, execution_id: &str) -> bool {
         let task_id_to_check = get_parent_task_id(execution_id);
 
-        // PG-primary: try PG first, fall back to SQLite
-        let task_result = if let Some(pg) = &self.app_state.pg_db {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let pg = pg.clone();
-                let id = task_id_to_check.clone();
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle.block_on(async move { pg.get_task_run(&id).await })
-                }))
-                .unwrap_or_else(|_| Err("block_on panicked".to_string()))
-                .or_else(|_| self.checkpoint_db.get_task_run(&task_id_to_check))
-            } else {
-                self.checkpoint_db.get_task_run(&task_id_to_check)
-            }
+        // PG-primary: use block_on to call async PG from sync context
+        let task_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let pg = self.app_state.pg_db.clone();
+            let id = task_id_to_check.clone();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.block_on(async move { pg.get_task_run(&id).await })
+            }))
+            .unwrap_or_else(|_| Err("block_on panicked".to_string()))
         } else {
-            self.checkpoint_db.get_task_run(&task_id_to_check)
+            Err("no tokio runtime".to_string())
         };
 
         match task_result {

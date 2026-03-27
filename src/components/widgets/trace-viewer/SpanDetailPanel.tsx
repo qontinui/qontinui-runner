@@ -1,21 +1,22 @@
 import React from "react";
-import type { TraceSpan } from "./types";
+import type { TraceSpan, CriticalPathInfo } from "./types";
 import { PHASE_COLORS } from "./types";
 import { inferPhase, formatDuration } from "./trace-utils";
 
 interface SpanDetailPanelProps {
   span: TraceSpan | null;
   onClose: () => void;
+  criticalPath?: CriticalPathInfo | null;
 }
 
-export const SpanDetailPanel: React.FC<SpanDetailPanelProps> = ({ span, onClose }) => {
+export const SpanDetailPanel: React.FC<SpanDetailPanelProps> = ({ span, onClose, criticalPath }) => {
   if (!span) return null;
 
   const phase = inferPhase(span.name);
   const colors = PHASE_COLORS[phase];
 
   return (
-    <div className="w-[280px] min-w-[280px] border-l border-zinc-700 bg-zinc-900 overflow-y-auto">
+    <div className="w-[280px] min-w-[280px] border-l border-zinc-700 bg-zinc-900 overflow-y-auto" data-tutorial-id="trace-span-detail-panel">
       <div className="flex items-center justify-between p-3 border-b border-zinc-700">
         <h3 className="text-sm font-medium text-zinc-200 truncate">
           {span.name.replace(/^qontinui\./, "")}
@@ -83,6 +84,28 @@ export const SpanDetailPanel: React.FC<SpanDetailPanelProps> = ({ span, onClose 
             <pre className="mt-1 text-red-300/80 whitespace-pre-wrap break-words bg-red-900/20 rounded p-2">
               {span.error}
             </pre>
+          </div>
+        )}
+
+        {/* Critical path insight */}
+        {criticalPath && criticalPath.pathDurationMs > 0 && (
+          <div className="pt-2 border-t border-zinc-800">
+            {criticalPath.spanIds.has(span.span_id) ? (
+              <>
+                <span className="text-red-300 font-medium text-[10px]">On critical path</span>
+                <p className="text-zinc-400 mt-1">
+                  Reducing this span's duration by X would reduce total time by X.
+                </p>
+              </>
+            ) : (
+              <>
+                <span className="text-zinc-500 font-medium text-[10px]">Off critical path</span>
+                <p className="text-zinc-400 mt-1">
+                  Slack: {formatDuration(criticalPath.slackBySpanId.get(span.span_id) ?? 0)} —
+                  this span could take that much longer without affecting total time.
+                </p>
+              </>
+            )}
           </div>
         )}
 

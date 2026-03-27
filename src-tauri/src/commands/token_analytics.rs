@@ -12,11 +12,7 @@ pub async fn get_daily_cost(
     days: Option<u32>,
 ) -> Result<Vec<DailyCostRow>, String> {
     let d = days.unwrap_or(7);
-    if let Some(pg) = &state.pg_db {
-        pg.get_daily_cost(d).await
-    } else {
-        state.checkpoint_db.get_daily_cost(d)
-    }
+    state.pg_db.get_daily_cost(d).await
 }
 
 /// Get cost breakdown by AI model for the last N days (default: 7).
@@ -26,11 +22,7 @@ pub async fn get_cost_by_model(
     days: Option<u32>,
 ) -> Result<Vec<ModelCostRow>, String> {
     let d = days.unwrap_or(7);
-    if let Some(pg) = &state.pg_db {
-        pg.get_cost_by_model(d).await
-    } else {
-        state.checkpoint_db.get_cost_by_model(d)
-    }
+    state.pg_db.get_cost_by_model(d).await
 }
 
 /// Get cost breakdown by workflow phase for the last N days (default: 7).
@@ -40,11 +32,7 @@ pub async fn get_cost_by_phase(
     days: Option<u32>,
 ) -> Result<Vec<PhaseCostRow>, String> {
     let d = days.unwrap_or(7);
-    if let Some(pg) = &state.pg_db {
-        pg.get_cost_by_phase(d).await
-    } else {
-        state.checkpoint_db.get_cost_by_phase(d)
-    }
+    state.pg_db.get_cost_by_phase(d).await
 }
 
 /// Get latency stats by AI provider for the last N days (default: 7).
@@ -54,11 +42,7 @@ pub async fn get_provider_latency(
     days: Option<u32>,
 ) -> Result<Vec<ProviderLatencyRow>, String> {
     let d = days.unwrap_or(7);
-    if let Some(pg) = &state.pg_db {
-        pg.get_provider_latency(d).await
-    } else {
-        state.checkpoint_db.get_provider_latency(d)
-    }
+    state.pg_db.get_provider_latency(d).await
 }
 
 /// Get per-task-run cost breakdown for the last N days, limited to top N runs.
@@ -70,11 +54,7 @@ pub async fn get_task_run_costs(
 ) -> Result<Vec<TaskRunCostRow>, String> {
     let d = days.unwrap_or(7);
     let l = limit.unwrap_or(50);
-    if let Some(pg) = &state.pg_db {
-        pg.get_task_run_costs(d, l).await
-    } else {
-        state.checkpoint_db.get_task_run_costs(d, l)
-    }
+    state.pg_db.get_task_run_costs(d, l).await
 }
 
 /// Get cost breakdown by target application for the last N days (default: 7).
@@ -84,11 +64,7 @@ pub async fn get_cost_by_target_app(
     days: Option<u32>,
 ) -> Result<Vec<TargetAppCostRow>, String> {
     let d = days.unwrap_or(7);
-    if let Some(pg) = &state.pg_db {
-        pg.get_cost_by_target_app(d).await
-    } else {
-        state.checkpoint_db.get_cost_by_target_app(d)
-    }
+    state.pg_db.get_cost_by_target_app(d).await
 }
 
 /// Get aggregate token usage summary for the last N days (default: 7).
@@ -98,9 +74,5 @@ pub async fn get_token_usage_summary(
     days: Option<u32>,
 ) -> Result<TokenUsageSummary, String> {
     let d = days.unwrap_or(7);
-    if let Some(pg) = &state.pg_db {
-        pg.get_token_usage_summary(d).await
-    } else {
-        state.checkpoint_db.get_token_usage_summary(d)
-    }
+    state.pg_db.get_token_usage_summary(d).await
 }
