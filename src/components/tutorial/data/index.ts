@@ -10,6 +10,11 @@ import { workflowExecutionTutorial } from "./workflow-execution";
 import { aiAnalysisTutorial } from "./ai-analysis";
 import { promptWorkflowTutorial } from "./prompt-workflow";
 import { knowledgeGraphTutorial } from "./knowledge-graph";
+import { opikIntegrationTutorial } from "./opik-integration";
+import { workflowOrchestrationTutorial } from "./workflow-orchestration";
+import { graphqlInfrastructureTutorial } from "./graphql-infrastructure";
+import { knowledgeAcquisitionTutorial } from "./knowledge-acquisition";
+import { actionPlanTutorial } from "./action-plan";
 
 /**
  * All available tutorials
@@ -21,6 +26,11 @@ export const tutorials: Tutorial[] = [
   workflowExecutionTutorial,
   aiAnalysisTutorial,
   knowledgeGraphTutorial,
+  opikIntegrationTutorial, // Featured - LLM observability & evaluation
+  workflowOrchestrationTutorial, // Featured - Inngest-inspired orchestration
+  graphqlInfrastructureTutorial, // Architecture - full-stack GraphQL system
+  knowledgeAcquisitionTutorial, // Featured - Knowledge acquisition system
+  actionPlanTutorial, // Featured - Structured action plan API
 ];
 
 /**
@@ -91,3 +101,8 @@ export { promptWorkflowTutorial } from "./prompt-workflow";
 export { workflowExecutionTutorial } from "./workflow-execution";
 export { aiAnalysisTutorial } from "./ai-analysis";
 export { knowledgeGraphTutorial } from "./knowledge-graph";
+export { workflowOrchestrationTutorial } from "./workflow-orchestration";
+export { opikIntegrationTutorial } from "./opik-integration";
+export { knowledgeAcquisitionTutorial } from "./knowledge-acquisition";
+export { graphqlInfrastructureTutorial } from "./graphql-infrastructure";
+export { actionPlanTutorial } from "./action-plan";
