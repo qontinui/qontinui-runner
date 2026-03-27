@@ -15,6 +15,27 @@ interface TaskRunCostTableProps {
 type SortField = "cost" | "calls" | "started_at";
 type SortDir = "asc" | "desc";
 
+const SortButton = ({
+  field,
+  label,
+  sortField,
+  onSort,
+}: {
+  field: SortField;
+  label: string;
+  sortField: SortField;
+  onSort: (field: SortField) => void;
+}) => (
+  <button
+    onClick={() => onSort(field)}
+    aria-label={`Sort by ${label}`}
+    className="flex items-center gap-1 hover:text-foreground transition-colors"
+  >
+    {label}
+    {sortField === field && <ArrowUpDown className="w-3 h-3" />}
+  </button>
+);
+
 /** Format cents as dollars */
 function formatCost(cents: number): string {
   return `$${(cents / 100).toFixed(2)}`;
@@ -94,17 +115,6 @@ export function TaskRunCostTable({ data }: TaskRunCostTableProps) {
     );
   }
 
-  const SortButton = ({ field, label }: { field: SortField; label: string }) => (
-    <button
-      onClick={() => handleSort(field)}
-      aria-label={`Sort by ${label}`}
-      className="flex items-center gap-1 hover:text-foreground transition-colors"
-    >
-      {label}
-      {sortField === field && <ArrowUpDown className="w-3 h-3" />}
-    </button>
-  );
-
   return (
     <div className="bg-card rounded-lg border border-border p-4">
       <h3 className="font-semibold mb-4 flex items-center gap-2">
@@ -121,15 +131,15 @@ export function TaskRunCostTable({ data }: TaskRunCostTableProps) {
             <tr className="border-b border-border text-left">
               <th className="pb-2 font-medium text-muted-foreground">Task Run</th>
               <th className="pb-2 font-medium text-muted-foreground text-right">
-                <SortButton field="cost" label="Cost" />
+                <SortButton field="cost" label="Cost" sortField={sortField} onSort={handleSort} />
               </th>
               <th className="pb-2 font-medium text-muted-foreground text-right">Input</th>
               <th className="pb-2 font-medium text-muted-foreground text-right">Output</th>
               <th className="pb-2 font-medium text-muted-foreground text-right">
-                <SortButton field="calls" label="Calls" />
+                <SortButton field="calls" label="Calls" sortField={sortField} onSort={handleSort} />
               </th>
               <th className="pb-2 font-medium text-muted-foreground text-right">
-                <SortButton field="started_at" label="Started" />
+                <SortButton field="started_at" label="Started" sortField={sortField} onSort={handleSort} />
               </th>
             </tr>
           </thead>
