@@ -32,6 +32,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::database::pg::PgDb;
+use crate::database::CheckpointDb;
+use crate::memory::unified_query::{self, UnifiedMemoryQuery};
 
 // ============================================================================
 // Memory Item
@@ -173,6 +178,34 @@ impl MemoryItem {
         self.last_accessed = chrono::Utc::now().to_rfc3339();
         self.access_count += 1;
     }
+
+    /// Get a display-friendly type string.
+    pub fn item_type_str(&self) -> &'static str {
+        match self.item_type {
+            MemoryItemType::Observation => "observation",
+            MemoryItemType::Decision => "decision",
+            MemoryItemType::Action => "action",
+            MemoryItemType::Error => "error",
+            MemoryItemType::Learning => "learning",
+            MemoryItemType::UserInput => "user_input",
+            MemoryItemType::SystemEvent => "system_event",
+            MemoryItemType::Custom => "custom",
+        }
+    }
+}
+
+/// Compute importance × recency score for sorting memory items.
+/// Items that are both important and recent score highest.
+fn importance_recency_score(item: &MemoryItem, now: &chrono::DateTime<chrono::Utc>) -> f64 {
+    let created = chrono::DateTime::parse_from_rfc3339(&item.created_at)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let age_hours = created
+        .map(|dt| now.signed_duration_since(dt).num_minutes() as f64 / 60.0)
+        .unwrap_or(24.0);
+    // Recency factor: 1.0 for just-created, decays over hours
+    let recency = 1.0 / (1.0 + age_hours * 0.1);
+    item.importance as f64 * recency
 }
 
 // ============================================================================
@@ -781,14 +814,28 @@ impl MemorySystem {
     }
 
     /// Build context from recent memory for AI prompt.
+    ///
+    /// Sorts short-term items by importance × recency to surface the most
+    /// relevant context first. High-importance recent items appear before
+    /// low-importance older items.
     pub fn build_context(&self, max_items: usize) -> String {
         let mut context = String::new();
 
-        // Recent observations
-        let recent = self.short_term.build_context(max_items);
-        if !recent.is_empty() {
+        // Get all short-term items, sorted by importance × recency
+        let mut items: Vec<&MemoryItem> = self.short_term.all().iter().collect();
+        let now = chrono::Utc::now();
+        items.sort_by(|a, b| {
+            let score_a = importance_recency_score(a, &now);
+            let score_b = importance_recency_score(b, &now);
+            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let selected: Vec<&MemoryItem> = items.into_iter().take(max_items).collect();
+        if !selected.is_empty() {
             context.push_str("## Recent Context\n");
-            context.push_str(&recent);
+            for item in &selected {
+                context.push_str(&format!("- [{}] {}\n", item.item_type_str(), item.content));
+            }
             context.push('\n');
         }
 
@@ -799,6 +846,50 @@ impl MemorySystem {
             for learning in learnings.iter().take(5) {
                 context.push_str(&format!("- [{}] {}\n", learning.category, learning.insight));
             }
+        }
+
+        context
+    }
+
+    /// Build context from memory for AI prompt, augmented with unified memory query.
+    ///
+    /// Uses `build_context()` as the base and appends results from the unified
+    /// memory query (PG + SQLite + graph) when available. Falls back gracefully
+    /// to just the base context if the unified query fails or returns no results.
+    pub async fn build_context_unified(
+        &self,
+        max_items: usize,
+        task_description: &str,
+        pg: &PgDb,
+        db: Arc<CheckpointDb>,
+    ) -> String {
+        let mut context = self.build_context(max_items);
+
+        let params = UnifiedMemoryQuery {
+            query: task_description.to_string(),
+            limit: 10,
+            sources: None,
+            from: None,
+            to: None,
+            min_score: Some(0.3),
+        };
+
+        match unified_query::query_memory(&params, pg, db, None).await {
+            Ok(results) if !results.is_empty() => {
+                context.push_str("\n## Unified Memory\n");
+                for r in results.iter().take(10) {
+                    context.push_str(&format!(
+                        "- [{}] {} (score: {:.2})\n  {}\n",
+                        serde_json::to_string(&r.source)
+                            .unwrap_or_default()
+                            .trim_matches('"'),
+                        r.title,
+                        r.fused_score,
+                        r.snippet.chars().take(200).collect::<String>(),
+                    ));
+                }
+            }
+            _ => {} // Graceful fallback — unified memory is optional
         }
 
         context

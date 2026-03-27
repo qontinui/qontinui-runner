@@ -1816,9 +1816,9 @@ struct DiscoverAndCacheRequest {
 async fn handle_cached_specs_all(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<Vec<serde_json::Value>>> {
-    let db = &state.app_state.checkpoint_db;
+    let pg = &state.app_state.pg_db;
 
-    match db.get_all_cached_specs() {
+    match pg.get_all_cached_specs().await {
         Ok(specs) => {
             let data: Vec<serde_json::Value> = specs
                 .into_iter()
@@ -1853,9 +1853,9 @@ async fn handle_cached_specs_for_app(
         None => return Json(ApiResponse::error("Missing app_url query parameter")),
     };
 
-    let db = &state.app_state.checkpoint_db;
+    let pg = &state.app_state.pg_db;
 
-    match db.get_cached_specs_for_app(&app_url) {
+    match pg.get_cached_specs_for_app(&app_url).await {
         Ok(specs) => {
             let data: Vec<serde_json::Value> = specs
                 .into_iter()
@@ -1939,7 +1939,7 @@ async fn handle_discover_and_cache(
     };
 
     // Step 3: Parse and cache each spec
-    let db = &state.app_state.checkpoint_db;
+    let pg = &state.app_state.pg_db;
     let specs_data = specs_response.get("data").or(Some(&specs_response));
 
     let specs_array = match specs_data.and_then(|d| d.as_array()) {
@@ -1972,7 +1972,7 @@ async fn handle_discover_and_cache(
 
         let spec_json_str = serde_json::to_string(spec).unwrap_or_default();
 
-        if let Err(e) = db.upsert_cached_spec(&url, &app_name, spec_id, &spec_json_str, page_url) {
+        if let Err(e) = pg.upsert_cached_spec(&url, &app_name, spec_id, &spec_json_str, page_url).await {
             warn!("Failed to cache spec {}: {}", spec_id, e);
             continue;
         }
@@ -2001,9 +2001,9 @@ async fn handle_delete_cached_specs(
         None => return Json(ApiResponse::error("Missing app_url query parameter")),
     };
 
-    let db = &state.app_state.checkpoint_db;
+    let pg = &state.app_state.pg_db;
 
-    match db.delete_cached_specs_for_app(&app_url) {
+    match pg.delete_cached_specs_for_app(&app_url).await {
         Ok(count) => Json(ApiResponse::success(serde_json::json!({
             "deleted": count,
             "app_url": app_url,

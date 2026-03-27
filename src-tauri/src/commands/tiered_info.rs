@@ -141,10 +141,8 @@ pub async fn get_run_details(
     state: State<'_, Arc<AppState>>,
     run_id: String,
 ) -> Result<TieredInfoResponse<RunDetails>, String> {
-    let db = &state.checkpoint_db;
-
     // Query from task_run_automation table (run_details table removed)
-    match db.get_task_run_automation_by_id(&run_id) {
+    match state.pg_db.get_task_run_automation_by_id(&run_id).await {
         Ok(Some(automation)) => {
             // Convert TaskRunAutomation to RunDetails for backward compatibility
             let run = RunDetails {

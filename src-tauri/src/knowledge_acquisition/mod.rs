@@ -378,6 +378,7 @@ impl KnowledgeAcquisition {
 
     /// Tier 0: Check local task_knowledge via hybrid_search.
     /// Prefers PG when available, falls back to SQLite.
+    /// When hybrid search returns sparse results, supplements from unified memory query.
     async fn search_local(
         &self,
         query: &str,
@@ -389,7 +390,12 @@ impl KnowledgeAcquisition {
 
         let embedding_client = EmbeddingClient::new();
         if !embedding_client.is_available().await {
-            return Ok(Vec::new());
+            // Even without embeddings, try unified memory as fallback
+            let supplemental = self.supplement_from_unified_memory(query, &[], ctx).await;
+            if !supplemental.is_empty() {
+                budget.record_action(0);
+            }
+            return Ok(supplemental);
         }
 
         let embedding = embedding_client
@@ -420,13 +426,7 @@ impl KnowledgeAcquisition {
             .map_err(|e| format!("Hybrid search failed: {e}"))?
         };
 
-        if results.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        budget.record_action(0);
-
-        Ok(results
+        let mut knowledge_results: Vec<KnowledgeResult> = results
             .into_iter()
             .map(|r| KnowledgeResult {
                 provider: SearchProvider::LocalKnowledge,
@@ -437,7 +437,94 @@ impl KnowledgeAcquisition {
                 relevance_score: Some(r.similarity as f64),
                 metadata: KnowledgeMetadata::default(),
             })
-            .collect())
+            .collect();
+
+        // Supplement from unified memory when hybrid search returns sparse results
+        if knowledge_results.len() < 2 {
+            let supplemental = self
+                .supplement_from_unified_memory(query, &knowledge_results, ctx)
+                .await;
+            if !supplemental.is_empty() {
+                eprintln!(
+                    "[knowledge_acquisition] Supplemented {} hybrid results with {} from unified memory",
+                    knowledge_results.len(),
+                    supplemental.len(),
+                );
+                knowledge_results.extend(supplemental);
+
+                // Dedup by title (unified memory results have no URL)
+                let mut seen_titles = std::collections::HashSet::new();
+                knowledge_results.retain(|r| seen_titles.insert(r.title.clone()));
+            }
+        }
+
+        if knowledge_results.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        budget.record_action(0);
+
+        Ok(knowledge_results)
+    }
+
+    /// Supplement sparse local results with unified memory query (observations,
+    /// timeline, findings, fixes, graph nodes, etc.).
+    /// Only activates when PG is available; silently returns empty on any error.
+    async fn supplement_from_unified_memory(
+        &self,
+        query: &str,
+        existing_results: &[KnowledgeResult],
+        ctx: &SearchContext,
+    ) -> Vec<KnowledgeResult> {
+        use crate::memory::unified_query::{self, UnifiedMemoryQuery};
+
+        let Some(ref pg) = ctx.pg else {
+            return Vec::new();
+        };
+
+        let params = UnifiedMemoryQuery {
+            query: query.to_string(),
+            limit: 5,
+            sources: None,
+            from: None,
+            to: None,
+            min_score: Some(0.5),
+        };
+
+        match unified_query::query_memory(&params, pg, ctx.db.clone(), None).await {
+            Ok(results) => {
+                // Build a set of existing content prefixes to avoid near-duplicates
+                let existing_prefixes: std::collections::HashSet<String> = existing_results
+                    .iter()
+                    .map(|r| r.content.chars().take(100).collect::<String>())
+                    .collect();
+
+                results
+                    .into_iter()
+                    .filter(|r| r.fused_score > 0.5)
+                    .filter(|r| {
+                        // Skip results whose content overlaps with existing hybrid results
+                        let prefix: String = r.snippet.chars().take(100).collect();
+                        !existing_prefixes.contains(&prefix)
+                    })
+                    .map(|r| KnowledgeResult {
+                        provider: SearchProvider::LocalKnowledge,
+                        query: query.to_string(),
+                        title: format!("Memory[{:?}]: {}", r.source, r.title),
+                        content: r.snippet,
+                        url: None,
+                        relevance_score: Some(r.fused_score),
+                        metadata: KnowledgeMetadata::default(),
+                    })
+                    .collect()
+            }
+            Err(e) => {
+                eprintln!(
+                    "[knowledge_acquisition] Unified memory supplement failed: {e}"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Vulnerability-specific search — queries Sploitus (and logs CVE IDs for OSV)

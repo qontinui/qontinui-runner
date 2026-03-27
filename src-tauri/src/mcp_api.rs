@@ -492,6 +492,7 @@ pub fn create_router(
         .merge(crate::mcp::reflection_api::routes())
         .merge(crate::mcp::graph_api::routes())
         .merge(crate::mcp::observations_api::routes())
+        .merge(crate::mcp::memory_consolidation_api::routes())
         .merge(crate::mcp::decision_trail_api::routes())
         .merge(crate::mcp::saved_api_requests::routes())
         .merge(crate::mcp::scheduler::routes())

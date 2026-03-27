@@ -125,6 +125,10 @@ proc-macro2 = { version = "1.0", features = ["span-locations"] }
 name = "mock_claude_cli"
 path = "src/bin/mock_claude_cli.rs"
 
+[[bin]]
+name = "pg_migrate"
+path = "src/bin/pg_migrate.rs"
+
 [lints.rust]
 dead_code = "allow"
 unused_variables = "allow"

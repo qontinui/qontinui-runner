@@ -9,6 +9,7 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -28,9 +29,15 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/observations/cleanup", post(cleanup_handler))
         .route("/observations/export", get(export_handler))
         .route("/observations/by-task-run/{task_run_id}", get(by_task_run_handler))
+        .route("/observations/temporal-search", get(temporal_search_handler))
+        .route("/observations/snapshot", get(snapshot_handler))
+        .route("/observations/trends", get(trends_handler))
+        .route("/observations/most-revised", get(most_revised_handler))
         .route("/observations/{id}", get(get_handler))
         .route("/observations/{id}", put(update_handler))
         .route("/observations/{id}", delete(delete_handler))
+        .route("/observations/{id}/history", get(history_handler))
+        .route("/observations/{id}/supersede", post(supersede_handler))
 }
 
 // ============================================================================
@@ -308,6 +315,200 @@ async fn export_handler(
             Json(api_error(format!("Export failed: {}", e))),
         )
     })?;
+
+    Ok(Json(ApiResponse::success(observations)))
+}
+
+// ============================================================================
+// Temporal query types
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct TemporalSearchQuery {
+    q: Option<String>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    as_of: Option<DateTime<Utc>>,
+    #[serde(default = "default_max_results")]
+    max_results: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrendsQuery {
+    #[serde(default = "default_weeks")]
+    weeks: i32,
+}
+
+fn default_weeks() -> i32 {
+    8
+}
+
+#[derive(Debug, Deserialize)]
+struct MostRevisedQuery {
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    #[serde(default = "default_max_results")]
+    max_results: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SupersedeInput {
+    new_observation_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotQuery {
+    as_of: DateTime<Utc>,
+    #[serde(default = "default_max_results")]
+    max_results: i64,
+}
+
+// ============================================================================
+// GET /observations/temporal-search?q=...&from=...&to=...&as_of=...
+// ============================================================================
+
+async fn temporal_search_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<TemporalSearchQuery>,
+) -> Result<Json<ApiResponse<Vec<ObservationSearchResult>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let pg = &state.app_state.pg_db;
+
+    let results = pg
+        .search_observations_temporal(
+            query.q.as_deref(),
+            query.from,
+            query.to,
+            query.as_of,
+            query.max_results,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Temporal search failed: {}", e))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(results)))
+}
+
+// ============================================================================
+// GET /observations/{id}/history — full revision history
+// ============================================================================
+
+async fn history_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<ApiResponse<Vec<ObservationHistoryEntry>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let pg = &state.app_state.pg_db;
+
+    let history = pg.get_observation_history(id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("History query failed: {}", e))),
+        )
+    })?;
+
+    Ok(Json(ApiResponse::success(history)))
+}
+
+// ============================================================================
+// GET /observations/trends?weeks=8 — weekly observation counts by type
+// ============================================================================
+
+async fn trends_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<TrendsQuery>,
+) -> Result<Json<ApiResponse<Vec<WeeklyTrend>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let pg = &state.app_state.pg_db;
+
+    let trends = pg.observation_trend(query.weeks).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Trends query failed: {}", e))),
+        )
+    })?;
+
+    Ok(Json(ApiResponse::success(trends)))
+}
+
+// ============================================================================
+// GET /observations/most-revised?from=...&to=...&max_results=20
+// ============================================================================
+
+async fn most_revised_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<MostRevisedQuery>,
+) -> Result<Json<ApiResponse<Vec<TopicRevisionCount>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let pg = &state.app_state.pg_db;
+
+    let results = pg
+        .most_revised_topics(query.from, query.to, query.max_results)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Most-revised query failed: {}", e))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(results)))
+}
+
+// ============================================================================
+// POST /observations/{id}/supersede — mark as superseded by another
+// ============================================================================
+
+async fn supersede_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<i64>,
+    Json(input): Json<SupersedeInput>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let pg = &state.app_state.pg_db;
+
+    let superseded = pg
+        .supersede_observation(id, input.new_observation_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Supersede failed: {}", e))),
+            )
+        })?;
+
+    if superseded {
+        Ok(Json(ApiResponse::success(serde_json::json!({
+            "superseded": true,
+            "observation_id": id,
+            "superseded_by": input.new_observation_id
+        }))))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Observation {} not found", id))),
+        ))
+    }
+}
+
+// ============================================================================
+// GET /observations/snapshot?as_of=...&max_results=20 — point-in-time snapshot
+// ============================================================================
+
+async fn snapshot_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::database::types::Observation>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let pg = &state.app_state.pg_db;
+
+    let observations = pg
+        .snapshot_at(query.as_of, query.max_results)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Snapshot query failed: {}", e))),
+            )
+        })?;
 
     Ok(Json(ApiResponse::success(observations)))
 }

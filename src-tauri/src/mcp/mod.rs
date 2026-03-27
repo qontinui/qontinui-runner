@@ -57,6 +57,7 @@ pub mod knowledge_acquisition_api;
 pub mod log_sources;
 pub mod macros;
 pub mod mcp_servers;
+pub mod memory_consolidation_api;
 pub mod meta_optimizer_api;
 pub mod misc;
 pub mod models;

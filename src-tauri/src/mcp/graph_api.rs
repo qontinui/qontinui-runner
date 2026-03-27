@@ -1,8 +1,9 @@
-//! MCP HTTP endpoints for the knowledge graph.
+//! MCP HTTP endpoints for the knowledge graph and unified memory search.
 //!
 //! Provides HTTP handlers for graph summary, unified search, cross-run patterns,
 //! workflow versions, step provenance, rule influence, pipeline events,
-//! phase stats, pattern detection, fuzzy error matching, and graph traversals.
+//! phase stats, pattern detection, fuzzy error matching, graph traversals,
+//! and unified memory retrieval with Reciprocal Rank Fusion.
 
 use axum::{
     extract::{Query, State},
@@ -16,6 +17,7 @@ use std::sync::Arc;
 
 use crate::database::{cross_run_ops, graph_ops};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::memory::unified_query::{self, MemorySource, UnifiedMemoryQuery};
 use crate::reflection::{
     cross_run_learning, fuzzy_matching, graph_engine::KnowledgeGraph,
     graph_types::GraphSummary, unified_search,
@@ -53,6 +55,9 @@ async fn fetch_observations_for_graph(
             topic_key: obs.topic_key.clone(),
             revision_count: obs.revision_count,
             project_id: obs.project_id.clone(),
+            valid_from: obs.valid_from.clone(),
+            valid_until: obs.valid_until.clone(),
+            superseded_by: obs.superseded_by,
             created_at: obs.created_at.clone(),
             updated_at: obs.updated_at.clone(),
             rank: None,
@@ -88,6 +93,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/graph/ui-failure-chain", get(ui_failure_chain_handler))
         .route("/graph/ui-fix-effectiveness", get(ui_fix_effectiveness_handler))
         .route("/graph/skill-metrics", get(skill_metrics_handler))
+        // Unified memory search (RRF fusion across all stores)
+        .route("/memory/search", get(memory_search_handler))
 }
 
 // ============================================================================
@@ -147,6 +154,18 @@ struct SimilarErrorsQuery {
 struct GraphTraversalQuery {
     node_key: Option<String>,
     depth: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemorySearchQuery {
+    q: String,
+    limit: Option<usize>,
+    from: Option<String>,
+    to: Option<String>,
+    sources: Option<String>,
+    min_score: Option<f64>,
+    /// If true, include per-source scores and found_by strategy list.
+    explain: Option<bool>,
 }
 
 // ============================================================================
@@ -735,4 +754,89 @@ async fn skill_metrics_handler(
         Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
     }
+}
+
+// ============================================================================
+// Endpoint: GET /memory/search — Unified memory retrieval with RRF fusion
+// ============================================================================
+
+/// Unified memory search response. In explain mode, includes per-source details.
+#[derive(Debug, Serialize)]
+struct MemorySearchResponse {
+    results: Vec<unified_query::MemoryResult>,
+    total: usize,
+    query: String,
+}
+
+async fn memory_search_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<MemorySearchQuery>,
+) -> Result<Json<ApiResponse<MemorySearchResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let sources = query.sources.as_deref().map(MemorySource::parse_list);
+
+    let from = query
+        .from
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+
+    let to = query
+        .to
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+
+    let params = UnifiedMemoryQuery {
+        query: query.q.clone(),
+        limit: query.limit.unwrap_or(20),
+        sources,
+        from,
+        to,
+        min_score: query.min_score,
+    };
+
+    let pg = &state.app_state.pg_db;
+    let db = &state.app_state.checkpoint_db;
+
+    // Graph is expensive to build — only include if caller asks for graph_node source
+    // or requests all sources (default).
+    let want_graph = params
+        .sources
+        .as_ref()
+        .map_or(true, |s| s.contains(&MemorySource::GraphNode));
+
+    let graph = if want_graph {
+        // Build graph in spawn_blocking (sync petgraph construction)
+        let db_clone = db.clone();
+        match tokio::task::spawn_blocking(move || {
+            db_clone.with_conn(|conn| {
+                KnowledgeGraph::build_from_db(conn, None).map_err(|e| format!("{e}"))
+            })
+        })
+        .await
+        {
+            Ok(Ok(g)) => Some(g),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let results = unified_query::query_memory(&params, pg, db.clone(), graph.as_ref())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Memory search failed: {}", e))),
+            )
+        })?;
+
+    let total = results.len();
+    let response = MemorySearchResponse {
+        results,
+        total,
+        query: query.q,
+    };
+
+    Ok(Json(ApiResponse::success(response)))
 }

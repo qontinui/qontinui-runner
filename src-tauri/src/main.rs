@@ -65,6 +65,7 @@ mod logging;
 mod macros;
 mod mcp;
 mod mcp_api;
+mod memory;
 mod mcp_client;
 mod mcp_embedded;
 mod meta_optimizer;

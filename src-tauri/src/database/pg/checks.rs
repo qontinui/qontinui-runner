@@ -259,4 +259,114 @@ impl PgDb {
         self.get_check_group(&id).await?
             .ok_or_else(|| "Failed to retrieve created check group".to_string())
     }
+
+    // ========================================================================
+    // Check Results (raw SQL)
+    // ========================================================================
+
+    /// Save a check execution result.
+    pub async fn save_check_result(
+        &self,
+        check_id: &str,
+        status: &str,
+        started_at: Option<&str>,
+        completed_at: Option<&str>,
+        duration_ms: Option<i64>,
+        output: Option<&str>,
+        error_message: Option<&str>,
+        issues_found: i32,
+        issues_fixed: i32,
+        files_checked: i32,
+        structured_output: Option<&str>,
+        task_run_id: Option<&str>,
+    ) -> Result<String, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"INSERT INTO check_results (
+                id, check_id, task_run_id, status,
+                started_at, completed_at, duration_ms,
+                output, error_message, issues_found,
+                issues_fixed, files_checked, structured_output,
+                created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"#,
+            &[
+                &id,
+                &check_id,
+                &task_run_id,
+                &status,
+                &started_at,
+                &completed_at,
+                &duration_ms,
+                &output,
+                &error_message,
+                &(issues_found as i64),
+                &(issues_fixed as i64),
+                &(files_checked as i64),
+                &structured_output,
+                &now,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG save_check_result: {}", e))?;
+
+        Ok(id)
+    }
+
+    /// Get check results for a check, ordered by creation date descending.
+    pub async fn get_check_results(
+        &self,
+        check_id: &str,
+        limit: u32,
+    ) -> Result<Vec<crate::database::types::CheckResult>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let limit_i64 = limit as i64;
+
+        let rows = conn
+            .query(
+                r#"SELECT id, check_id, task_run_id, status,
+                       started_at, completed_at, duration_ms,
+                       output, error_message, issues_found,
+                       issues_fixed, files_checked, structured_output,
+                       created_at
+                FROM check_results
+                WHERE check_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2"#,
+                &[&check_id, &limit_i64],
+            )
+            .await
+            .map_err(|e| format!("PG get_check_results: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| crate::database::types::CheckResult {
+                id: r.get(0),
+                check_id: r.get(1),
+                task_run_id: r.get(2),
+                status: r.get(3),
+                started_at: r.get(4),
+                completed_at: r.get(5),
+                duration_ms: r.get(6),
+                output: r.get(7),
+                error_message: r.get(8),
+                issues_found: r.get::<_, Option<i64>>(9).unwrap_or(0) as i32,
+                issues_fixed: r.get::<_, Option<i64>>(10).unwrap_or(0) as i32,
+                files_checked: r.get::<_, Option<i64>>(11).unwrap_or(0) as i32,
+                structured_output: r.get(12),
+                created_at: r.get(13),
+            })
+            .collect())
+    }
+
+    /// Get latest check results for a check (alias for get_check_results).
+    pub async fn get_latest_check_results(
+        &self,
+        check_id: &str,
+        limit: u32,
+    ) -> Result<Vec<crate::database::types::CheckResult>, String> {
+        self.get_check_results(check_id, limit).await
+    }
 }

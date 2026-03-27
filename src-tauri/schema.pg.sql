@@ -814,6 +814,10 @@ CREATE TABLE IF NOT EXISTS observations (
     task_run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
     session_id TEXT,
     is_deleted BOOLEAN NOT NULL DEFAULT false,
+    -- Temporal validity: when this observation was/is considered true
+    valid_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    valid_until TIMESTAMPTZ,  -- NULL = still valid (current knowledge)
+    superseded_by BIGINT REFERENCES observations(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -828,6 +832,53 @@ CREATE INDEX IF NOT EXISTS idx_obs_task_run ON observations(task_run_id) WHERE t
 CREATE INDEX IF NOT EXISTS idx_obs_fts ON observations
     USING GIN (to_tsvector('english', title || ' ' || content))
     WHERE NOT is_deleted;
+-- Temporal validity indexes
+CREATE INDEX IF NOT EXISTS idx_obs_valid_from ON observations(valid_from) WHERE NOT is_deleted;
+CREATE INDEX IF NOT EXISTS idx_obs_valid_until ON observations(valid_until) WHERE NOT is_deleted;
+CREATE INDEX IF NOT EXISTS idx_obs_superseded ON observations(superseded_by) WHERE superseded_by IS NOT NULL;
+
+-- Memory consolidation columns (importance-weighted decay & mental model synthesis)
+-- These support the consolidation service that synthesizes raw observations into mental models.
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS importance DOUBLE PRECISION NOT NULL DEFAULT 0.5;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMPTZ;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS access_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS decay_rate DOUBLE PRECISION NOT NULL DEFAULT 0.1;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS consolidated_from BIGINT[];  -- IDs of source observations
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS is_mental_model BOOLEAN NOT NULL DEFAULT false;
+
+CREATE INDEX IF NOT EXISTS idx_obs_importance ON observations(importance) WHERE NOT is_deleted;
+CREATE INDEX IF NOT EXISTS idx_obs_mental_model ON observations(is_mental_model) WHERE NOT is_deleted AND is_mental_model;
+CREATE INDEX IF NOT EXISTS idx_obs_last_accessed ON observations(last_accessed_at) WHERE NOT is_deleted;
+
+-- Track consolidation runs
+CREATE TABLE IF NOT EXISTS memory_consolidation_log (
+    id BIGSERIAL PRIMARY KEY,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    observations_scanned INTEGER NOT NULL DEFAULT 0,
+    groups_found INTEGER NOT NULL DEFAULT 0,
+    models_created INTEGER NOT NULL DEFAULT 0,
+    observations_merged INTEGER NOT NULL DEFAULT 0,
+    observations_decayed INTEGER NOT NULL DEFAULT 0,
+    observations_archived INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+);
+
+-- Observation History (tracks prior versions of topic-keyed observations)
+CREATE TABLE IF NOT EXISTS observation_history (
+    id BIGSERIAL PRIMARY KEY,
+    observation_id BIGINT NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    valid_from TIMESTAMPTZ NOT NULL,
+    valid_until TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    revision_number INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_obs_history_obs_id ON observation_history(observation_id);
+CREATE INDEX IF NOT EXISTS idx_obs_history_valid ON observation_history(valid_from, valid_until);
 
 -- Activity Timeline (screenpipe-inspired searchable capture history)
 -- Stores extracted text from all capture sources (UI Bridge snapshots, OCR, accessibility trees)

@@ -5,6 +5,7 @@
 
 pub mod activity_timeline;
 pub mod agentic_metrics;
+pub mod cached_specs;
 pub mod graph_ops;
 pub mod approval_gates;
 pub mod error_monitor;
@@ -36,6 +37,21 @@ pub mod worktrees;
 pub mod export;
 pub mod data_migration;
 pub mod decision_trail;
+pub mod generation;
+pub mod generation_artifacts;
+pub mod generation_feedback;
+pub mod meta_optimizer;
+pub mod pipeline_traces;
+pub mod reflection;
+pub mod log_sources;
+pub mod known_issues;
+pub mod state_machine;
+pub mod process_sessions;
+pub mod canvas;
+pub mod orchestration_loop;
+pub mod scheduler;
+pub mod recordings;
+pub mod step_type_knowledge;
 
 use tracing::{info, warn};
 
@@ -486,6 +502,213 @@ impl PgDb {
                 updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
             "CREATE INDEX IF NOT EXISTS idx_cs_fts ON concept_summaries USING GIN (to_tsvector('english', name || ' ' || tagline || ' ' || description)) WHERE NOT is_deleted",
+            // Temporal validity columns on observations (idempotent ALTERs)
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS superseded_by BIGINT REFERENCES observations(id)",
+            "CREATE INDEX IF NOT EXISTS idx_obs_valid_from ON observations(valid_from) WHERE NOT is_deleted",
+            "CREATE INDEX IF NOT EXISTS idx_obs_valid_until ON observations(valid_until) WHERE NOT is_deleted",
+            "CREATE INDEX IF NOT EXISTS idx_obs_superseded ON observations(superseded_by) WHERE superseded_by IS NOT NULL",
+            // Backfill valid_from from created_at for existing rows
+            "UPDATE observations SET valid_from = created_at WHERE valid_from = NOW() AND created_at < NOW() - INTERVAL '1 second'",
+            // Observation History table
+            "CREATE TABLE IF NOT EXISTS observation_history (
+                id              BIGSERIAL PRIMARY KEY,
+                observation_id  BIGINT NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+                title           TEXT NOT NULL,
+                content         TEXT NOT NULL,
+                content_hash    TEXT NOT NULL,
+                valid_from      TIMESTAMPTZ NOT NULL,
+                valid_until     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                revision_number INTEGER NOT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_obs_history_obs_id ON observation_history(observation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_obs_history_valid ON observation_history(valid_from, valid_until)",
+            // Generation Rules
+            "CREATE TABLE IF NOT EXISTS generation_rules (
+                id              TEXT PRIMARY KEY,
+                agent           TEXT NOT NULL,
+                section         TEXT NOT NULL,
+                rule_number     INTEGER NOT NULL,
+                title           TEXT NOT NULL,
+                content         TEXT NOT NULL,
+                condition       TEXT,
+                status          TEXT NOT NULL DEFAULT 'active',
+                provenance      TEXT NOT NULL DEFAULT 'seed',
+                source_fix_id   TEXT,
+                confidence      DOUBLE PRECISION DEFAULT 1.0,
+                auto_generated_at TEXT,
+                evidence_count  INTEGER DEFAULT 0,
+                severity        TEXT NOT NULL DEFAULT 'normal',
+                failure_count   INTEGER NOT NULL DEFAULT 0,
+                examples_json   TEXT,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_generation_rules_agent ON generation_rules(agent)",
+            "CREATE INDEX IF NOT EXISTS idx_generation_rules_status ON generation_rules(status)",
+            "CREATE INDEX IF NOT EXISTS idx_generation_rules_agent_section ON generation_rules(agent, section, rule_number)",
+            // Generation Pipeline Artifacts
+            "CREATE TABLE IF NOT EXISTS generation_pipeline_artifacts (
+                id              TEXT PRIMARY KEY,
+                workflow_id     TEXT,
+                task_run_id     TEXT,
+                description     TEXT NOT NULL,
+                category        TEXT,
+                created_at      TEXT NOT NULL,
+                investigation_duration_ms INTEGER,
+                investigation_enriched_description TEXT,
+                discovery_duration_ms INTEGER,
+                builder_duration_ms INTEGER,
+                autofix_duration_ms INTEGER,
+                verification_duration_ms INTEGER,
+                hardener_duration_ms INTEGER,
+                total_duration_ms INTEGER,
+                discovery_calls TEXT,
+                builder_raw_output TEXT,
+                builder_parsed_json TEXT,
+                autofix_diff    TEXT,
+                verification_iterations TEXT,
+                fixer_snapshots TEXT,
+                hardening_summary TEXT,
+                hardened_json   TEXT,
+                final_json      TEXT,
+                validation_errors TEXT,
+                specification_duration_ms INTEGER,
+                specification_criteria TEXT,
+                specification_prompt TEXT,
+                builder_prompt  TEXT,
+                verification_prompts TEXT,
+                hardener_prompt TEXT,
+                revision_duration_ms INTEGER,
+                quality_report  TEXT,
+                revision_cycles INTEGER,
+                confidence_score DOUBLE PRECISION,
+                success         BOOLEAN NOT NULL DEFAULT true,
+                error_message   TEXT,
+                model_used      TEXT
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_pipeline_artifacts_workflow ON generation_pipeline_artifacts(workflow_id)",
+            "CREATE INDEX IF NOT EXISTS idx_pipeline_artifacts_created ON generation_pipeline_artifacts(created_at)",
+            // Pipeline Agent Traces
+            "CREATE TABLE IF NOT EXISTS pipeline_agent_traces (
+                id              TEXT PRIMARY KEY,
+                task_run_id     TEXT NOT NULL,
+                agent_type      TEXT NOT NULL,
+                agent_id        TEXT NOT NULL,
+                run_id          TEXT NOT NULL,
+                input_snapshot  TEXT NOT NULL DEFAULT '{}',
+                output_snapshot TEXT NOT NULL DEFAULT '{}',
+                config_json     TEXT NOT NULL DEFAULT '{}',
+                duration_ms     INTEGER NOT NULL DEFAULT 0,
+                tokens_in       INTEGER NOT NULL DEFAULT 0,
+                tokens_out      INTEGER NOT NULL DEFAULT 0,
+                cost_usd        DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                downstream_success BOOLEAN,
+                output_quality_score DOUBLE PRECISION,
+                parent_span_id  TEXT,
+                span_type       TEXT DEFAULT 'agent',
+                guardrail_results_json TEXT,
+                handoff_context_json TEXT,
+                created_at      TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_task_run ON pipeline_agent_traces(task_run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_agent_type ON pipeline_agent_traces(agent_type)",
+            "CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_run_id ON pipeline_agent_traces(run_id)",
+            // Meta-Optimizer Runs
+            "CREATE TABLE IF NOT EXISTS meta_optimizer_runs (
+                id              TEXT PRIMARY KEY,
+                optimizer_type  TEXT NOT NULL,
+                trigger_type    TEXT NOT NULL DEFAULT 'threshold',
+                runs_analyzed   INTEGER NOT NULL DEFAULT 0,
+                recommendations_produced INTEGER NOT NULL DEFAULT 0,
+                task_run_id     TEXT,
+                status          TEXT NOT NULL DEFAULT 'running',
+                created_at      TEXT NOT NULL,
+                completed_at    TEXT
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_meta_optimizer_runs_type ON meta_optimizer_runs(optimizer_type)",
+            // Meta-Optimizer Snapshots
+            "CREATE TABLE IF NOT EXISTS meta_optimizer_snapshots (
+                id              TEXT PRIMARY KEY,
+                snapshot_type   TEXT NOT NULL,
+                period_start    TEXT NOT NULL,
+                period_end      TEXT NOT NULL,
+                metrics_json    TEXT NOT NULL,
+                breakdown_json  TEXT DEFAULT '{}',
+                recommendation_id TEXT,
+                runs_included   INTEGER NOT NULL DEFAULT 0,
+                created_at      TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_meta_optimizer_snapshots_type ON meta_optimizer_snapshots(snapshot_type)",
+            "CREATE INDEX IF NOT EXISTS idx_meta_optimizer_snapshots_rec ON meta_optimizer_snapshots(recommendation_id)",
+            // Reflection Fixes
+            "CREATE TABLE IF NOT EXISTS reflection_fixes (
+                id              TEXT PRIMARY KEY,
+                source_task_run_id TEXT NOT NULL,
+                reflection_task_run_id TEXT NOT NULL,
+                source_finding_id TEXT,
+                source_knowledge_id TEXT,
+                fix_type        TEXT NOT NULL,
+                fix_description TEXT NOT NULL,
+                file_changed    TEXT,
+                old_value       TEXT,
+                new_value       TEXT,
+                confidence      TEXT NOT NULL DEFAULT 'medium',
+                content_hash    TEXT,
+                status          TEXT NOT NULL DEFAULT 'applied',
+                effectiveness   TEXT,
+                effectiveness_evidence TEXT,
+                applied_at      TEXT NOT NULL,
+                evaluated_at    TEXT,
+                created_at      TEXT NOT NULL,
+                source_agent    TEXT,
+                reasoning       TEXT,
+                alternatives_considered TEXT,
+                reflection_scope TEXT DEFAULT 'workflow',
+                project_path    TEXT,
+                target_component TEXT,
+                reuse_count     INTEGER DEFAULT 0,
+                applicability_context TEXT,
+                fix_description_embedding BYTEA
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_reflection_fixes_source ON reflection_fixes(source_task_run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_reflection_fixes_reflection ON reflection_fixes(reflection_task_run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_reflection_fixes_content_hash ON reflection_fixes(content_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_reflection_fixes_status ON reflection_fixes(status)",
+            "CREATE INDEX IF NOT EXISTS idx_reflection_fixes_source_agent ON reflection_fixes(source_agent)",
+            // Fix Applications
+            "CREATE TABLE IF NOT EXISTS fix_applications (
+                id              TEXT PRIMARY KEY,
+                fix_id          TEXT NOT NULL,
+                task_run_id     TEXT NOT NULL,
+                error_signature_hash TEXT,
+                outcome         TEXT DEFAULT 'pending',
+                applied_at      TEXT NOT NULL,
+                evaluated_at    TEXT
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_fix_applications_fix ON fix_applications(fix_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fix_applications_task ON fix_applications(task_run_id)",
+            // Workflow Generation Feedback
+            "CREATE TABLE IF NOT EXISTS workflow_generation_feedback (
+                id              TEXT PRIMARY KEY,
+                workflow_id     TEXT NOT NULL,
+                task_run_id     TEXT,
+                feedback_type   TEXT NOT NULL,
+                edited_field    TEXT,
+                old_value       TEXT,
+                new_value       TEXT,
+                delete_reason   TEXT,
+                rating          INTEGER,
+                rating_comment  TEXT,
+                workflow_category TEXT,
+                workflow_description TEXT,
+                created_at      TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_wgf_workflow_id ON workflow_generation_feedback(workflow_id)",
+            "CREATE INDEX IF NOT EXISTS idx_wgf_feedback_type ON workflow_generation_feedback(feedback_type)",
+            "CREATE INDEX IF NOT EXISTS idx_wgf_created_at ON workflow_generation_feedback(created_at)",
         ];
 
         for sql in &ddl {

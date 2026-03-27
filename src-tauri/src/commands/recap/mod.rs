@@ -50,8 +50,9 @@ pub async fn get_task_run_recap(
 
     // Get automation records
     let automations = state
-        .checkpoint_db
+        .pg_db
         .get_task_run_automations(&task_run_id)
+        .await
         .unwrap_or_else(|e| {
             warn!("Failed to get automations for {}: {}", task_run_id, e);
             Vec::new()

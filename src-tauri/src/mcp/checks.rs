@@ -448,6 +448,7 @@ pub async fn run_check_handler(
 
     let db = state.app_state.checkpoint_db.clone();
     let task_run_id = request.task_run_id.clone();
+    let task_run_id_pg = task_run_id.clone();
 
     // Execute in spawn_blocking since check execution is synchronous I/O
     let result = tokio::task::spawn_blocking(move || {
@@ -511,6 +512,35 @@ pub async fn run_check_handler(
             Json(api_error(format!("Internal error: {}", e))),
         )
     })?;
+
+    // Dual-write check result to PG
+    if let Some(ref run_id) = task_run_id_pg {
+        let status_str = serde_json::to_string(&result.status)
+            .unwrap_or("\"pending\"".to_string())
+            .trim_matches('"')
+            .to_string();
+        let structured = result
+            .structured_output
+            .as_ref()
+            .map(|o| serde_json::to_string(o).unwrap_or_default());
+
+        if let Err(e) = state.app_state.pg_db.save_check_result(
+            &result.check_id,
+            &status_str,
+            Some(result.started_at.as_str()),
+            Some(result.completed_at.as_str()),
+            Some(result.duration_ms as i64),
+            Some(result.output.as_str()),
+            result.error.as_deref(),
+            result.issues_found as i32,
+            result.issues_fixed as i32,
+            result.files_checked as i32,
+            structured.as_deref(),
+            Some(run_id.as_str()),
+        ).await {
+            tracing::error!("Failed to store check result in PG: {}", e);
+        }
+    }
 
     info!(
         "HTTP: Check executed: status={:?}, duration={}ms",

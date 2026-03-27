@@ -2044,6 +2044,11 @@ pub struct Observation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     pub is_deleted: bool,
+    pub valid_from: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2062,10 +2067,49 @@ pub struct ObservationSearchResult {
     pub revision_count: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    pub valid_from: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rank: Option<f32>,
+}
+
+/// A historical version of an observation (from observation_history table).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservationHistoryEntry {
+    pub id: i64,
+    pub observation_id: i64,
+    pub title: String,
+    pub content_preview: String,
+    pub content_hash: String,
+    pub valid_from: String,
+    pub valid_until: String,
+    pub revision_number: i32,
+    pub created_at: String,
+}
+
+/// Weekly observation trend data point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WeeklyTrend {
+    pub observation_type: String,
+    pub week_start: String,
+    pub count: i64,
+}
+
+/// Topic revision frequency data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopicRevisionCount {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
+    pub title: String,
+    pub revisions: i64,
 }
 
 /// Input for creating a new observation.
@@ -2106,6 +2150,53 @@ pub struct ObservationTypeStat {
     pub observation_type: String,
     pub count: i64,
     pub latest_updated: String,
+}
+
+// ============================================================================
+// Memory Consolidation types
+// ============================================================================
+
+/// Consolidation log entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsolidationLogEntry {
+    pub id: i64,
+    pub started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    pub observations_scanned: i32,
+    pub groups_found: i32,
+    pub models_created: i32,
+    pub observations_merged: i32,
+    pub observations_decayed: i32,
+    pub observations_archived: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Memory health statistics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryHealthStats {
+    pub total_observations: i64,
+    pub total_mental_models: i64,
+    pub decay_queue_size: i64,
+    pub avg_importance: Option<f64>,
+    pub avg_access_count: Option<f64>,
+}
+
+/// Decay preview entry — shows what would be archived.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecayPreviewEntry {
+    pub id: i64,
+    pub title: String,
+    pub observation_type: String,
+    pub importance: f64,
+    pub decay_rate: f64,
+    pub is_mental_model: bool,
+    pub last_activity: String,
+    pub current_retention: f64,
 }
 
 // ============================================================================

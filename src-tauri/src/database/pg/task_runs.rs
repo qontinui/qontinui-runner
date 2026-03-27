@@ -544,4 +544,363 @@ impl PgDb {
             }
         }).collect())
     }
+
+    // ========================================================================
+    // Task Run Automation (raw SQL)
+    // ========================================================================
+
+    /// Create a new task run automation record.
+    pub async fn create_task_run_automation(
+        &self,
+        task_run_id: &str,
+        workflow_name: Option<&str>,
+        iteration_number: u32,
+    ) -> Result<String, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let iter_num = iteration_number as i64;
+
+        conn.execute(
+            r#"INSERT INTO task_run_automation (id, task_run_id, workflow_name, started_at, automation_status, iteration_number)
+               VALUES ($1, $2, $3, $4, 'running', $5)"#,
+            &[&id, &task_run_id, &workflow_name, &now, &iter_num],
+        )
+        .await
+        .map_err(|e| format!("PG create_task_run_automation: {}", e))?;
+
+        Ok(id)
+    }
+
+    /// Complete a task run automation record with success.
+    pub async fn complete_task_run_automation(
+        &self,
+        id: &str,
+        actions_summary: Option<&str>,
+        states_visited: Option<&str>,
+        transitions_executed: Option<&str>,
+        template_matches: Option<&str>,
+        anomalies: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        // Get start time to calculate duration
+        let row = conn
+            .query_one(
+                "SELECT started_at FROM task_run_automation WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG get automation start time: {}", e))?;
+
+        let started_at: String = row.get(0);
+        let now = chrono::Utc::now();
+        let duration_ms = if let Ok(start) = chrono::DateTime::parse_from_rfc3339(&started_at) {
+            now.signed_duration_since(start.with_timezone(&chrono::Utc)).num_milliseconds()
+        } else {
+            0i64
+        };
+        let now_str = now.to_rfc3339();
+
+        conn.execute(
+            r#"UPDATE task_run_automation SET
+                automation_status = 'success',
+                success = true,
+                ended_at = $1,
+                duration_ms = $2,
+                actions_summary = $3,
+                states_visited = $4,
+                transitions_executed = $5,
+                template_matches = $6,
+                anomalies = $7
+            WHERE id = $8"#,
+            &[
+                &now_str,
+                &duration_ms,
+                &actions_summary,
+                &states_visited,
+                &transitions_executed,
+                &template_matches,
+                &anomalies,
+                &id,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG complete_task_run_automation: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Fail a task run automation record.
+    pub async fn fail_task_run_automation(
+        &self,
+        id: &str,
+        error_type: Option<&str>,
+        error_message: &str,
+        actions_summary: Option<&str>,
+        states_visited: Option<&str>,
+        transitions_executed: Option<&str>,
+        template_matches: Option<&str>,
+        anomalies: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        // Get start time to calculate duration
+        let row = conn
+            .query_one(
+                "SELECT started_at FROM task_run_automation WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG get automation start time: {}", e))?;
+
+        let started_at: String = row.get(0);
+        let now = chrono::Utc::now();
+        let duration_ms = if let Ok(start) = chrono::DateTime::parse_from_rfc3339(&started_at) {
+            now.signed_duration_since(start.with_timezone(&chrono::Utc)).num_milliseconds()
+        } else {
+            0i64
+        };
+        let now_str = now.to_rfc3339();
+        let err_msg: Option<&str> = Some(error_message);
+
+        conn.execute(
+            r#"UPDATE task_run_automation SET
+                automation_status = 'failed',
+                success = false,
+                ended_at = $1,
+                duration_ms = $2,
+                error_type = $3,
+                error_message = $4,
+                actions_summary = $5,
+                states_visited = $6,
+                transitions_executed = $7,
+                template_matches = $8,
+                anomalies = $9
+            WHERE id = $10"#,
+            &[
+                &now_str,
+                &duration_ms,
+                &error_type,
+                &err_msg,
+                &actions_summary,
+                &states_visited,
+                &transitions_executed,
+                &template_matches,
+                &anomalies,
+                &id,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG fail_task_run_automation: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get automation records for a task run.
+    pub async fn get_task_run_automations(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<crate::database::types::TaskRunAutomation>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"SELECT id, task_run_id, workflow_name, started_at, ended_at, duration_ms,
+                       automation_status, success, error_type, error_message,
+                       actions_summary, states_visited, transitions_executed,
+                       template_matches, anomalies, iteration_number
+                FROM task_run_automation
+                WHERE task_run_id = $1
+                ORDER BY iteration_number ASC"#,
+                &[&task_run_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_task_run_automations: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| crate::database::types::TaskRunAutomation {
+                id: r.get(0),
+                task_run_id: r.get(1),
+                workflow_name: r.get(2),
+                started_at: r.get(3),
+                ended_at: r.get(4),
+                duration_ms: r.get(5),
+                automation_status: r.get(6),
+                success: r.get(7),
+                error_type: r.get(8),
+                error_message: r.get(9),
+                actions_summary: r.get(10),
+                states_visited: r.get(11),
+                transitions_executed: r.get(12),
+                template_matches: r.get(13),
+                anomalies: r.get(14),
+                iteration_number: r.get::<_, Option<i64>>(15).unwrap_or(1) as u32,
+            })
+            .collect())
+    }
+
+    /// Get a single automation record by its own ID.
+    pub async fn get_task_run_automation_by_id(
+        &self,
+        automation_id: &str,
+    ) -> Result<Option<crate::database::types::TaskRunAutomation>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let row = conn
+            .query_opt(
+                r#"SELECT id, task_run_id, workflow_name, started_at, ended_at, duration_ms,
+                       automation_status, success, error_type, error_message,
+                       actions_summary, states_visited, transitions_executed,
+                       template_matches, anomalies, iteration_number
+                FROM task_run_automation
+                WHERE id = $1"#,
+                &[&automation_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_task_run_automation_by_id: {}", e))?;
+
+        Ok(row.map(|r| crate::database::types::TaskRunAutomation {
+            id: r.get(0),
+            task_run_id: r.get(1),
+            workflow_name: r.get(2),
+            started_at: r.get(3),
+            ended_at: r.get(4),
+            duration_ms: r.get(5),
+            automation_status: r.get(6),
+            success: r.get(7),
+            error_type: r.get(8),
+            error_message: r.get(9),
+            actions_summary: r.get(10),
+            states_visited: r.get(11),
+            transitions_executed: r.get(12),
+            template_matches: r.get(13),
+            anomalies: r.get(14),
+            iteration_number: r.get::<_, Option<i64>>(15).unwrap_or(1) as u32,
+        }))
+    }
+
+    // ========================================================================
+    // Task Run MCP Calls (raw SQL)
+    // ========================================================================
+
+    /// Create a task run MCP call record.
+    pub async fn create_task_run_mcp_call(
+        &self,
+        input: &crate::mcp_client::CreateMcpCallInput,
+    ) -> Result<String, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"INSERT INTO task_run_mcp_calls (
+                id, task_run_id, step_id, step_name,
+                server_id, server_name, tool_name,
+                arguments, resolved_arguments,
+                response, response_type, duration_ms,
+                extractions, assertions,
+                success, error_message, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"#,
+            &[
+                &id,
+                &input.task_run_id.as_str(),
+                &input.step_id.as_str(),
+                &input.step_name.as_deref(),
+                &input.server_id.as_str(),
+                &input.server_name.as_deref(),
+                &input.tool_name.as_str(),
+                &input.arguments.as_deref(),
+                &input.resolved_arguments.as_deref(),
+                &input.response.as_deref(),
+                &input.response_type.as_str(),
+                &input.duration_ms,
+                &input.extractions.as_deref(),
+                &input.assertions.as_deref(),
+                &input.success,
+                &input.error_message.as_deref(),
+                &now,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG create_task_run_mcp_call: {}", e))?;
+
+        Ok(id)
+    }
+
+    /// Get all MCP calls for a task run, optionally filtered by success.
+    pub async fn get_task_run_mcp_calls(
+        &self,
+        task_run_id: &str,
+        success_filter: Option<bool>,
+    ) -> Result<crate::mcp_client::McpCallsResult, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = if let Some(success) = success_filter {
+            conn.query(
+                r#"SELECT id, task_run_id, step_id, step_name,
+                       server_id, server_name, tool_name,
+                       arguments, resolved_arguments,
+                       response, response_type, duration_ms,
+                       extractions, assertions,
+                       success, error_message, created_at
+                FROM task_run_mcp_calls
+                WHERE task_run_id = $1 AND success = $2
+                ORDER BY created_at ASC"#,
+                &[&task_run_id, &success],
+            )
+            .await
+            .map_err(|e| format!("PG get_task_run_mcp_calls: {}", e))?
+        } else {
+            conn.query(
+                r#"SELECT id, task_run_id, step_id, step_name,
+                       server_id, server_name, tool_name,
+                       arguments, resolved_arguments,
+                       response, response_type, duration_ms,
+                       extractions, assertions,
+                       success, error_message, created_at
+                FROM task_run_mcp_calls
+                WHERE task_run_id = $1
+                ORDER BY created_at ASC"#,
+                &[&task_run_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_task_run_mcp_calls: {}", e))?
+        };
+
+        let calls: Vec<crate::mcp_client::McpCallRecord> = rows
+            .iter()
+            .map(|r| crate::mcp_client::McpCallRecord {
+                id: r.get(0),
+                task_run_id: r.get(1),
+                step_id: r.get(2),
+                step_name: r.get(3),
+                server_id: r.get(4),
+                server_name: r.get(5),
+                tool_name: r.get(6),
+                arguments: r.get(7),
+                resolved_arguments: r.get(8),
+                response: r.get(9),
+                response_type: r.get(10),
+                duration_ms: r.get(11),
+                extractions: r.get(12),
+                assertions: r.get(13),
+                success: r.get(14),
+                error_message: r.get(15),
+                created_at: r.get(16),
+            })
+            .collect();
+
+        let success_count = calls.iter().filter(|c| c.success).count();
+        let failed_count = calls.iter().filter(|c| !c.success).count();
+
+        Ok(crate::mcp_client::McpCallsResult {
+            task_run_id: task_run_id.to_string(),
+            calls: calls.clone(),
+            count: calls.len(),
+            success_count,
+            failed_count,
+        })
+    }
 }

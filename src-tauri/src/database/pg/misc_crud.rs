@@ -424,4 +424,92 @@ impl PgDb {
             updated_at: r.updated_at.to_rfc3339(),
         }))
     }
+
+    // ========================================================================
+    // Shell Command Results (raw SQL)
+    // ========================================================================
+
+    /// Save a shell command execution result.
+    pub async fn save_shell_command_result(
+        &self,
+        shell_command_id: &str,
+        status: &str,
+        exit_code: Option<i32>,
+        stdout: Option<&str>,
+        stderr: Option<&str>,
+        duration_ms: Option<i64>,
+        started_at: Option<&str>,
+        completed_at: Option<&str>,
+        task_run_id: Option<&str>,
+    ) -> Result<String, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"INSERT INTO shell_command_results (
+                id, shell_command_id, task_run_id, status,
+                exit_code, stdout, stderr, duration_ms,
+                started_at, completed_at, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
+            &[
+                &id,
+                &shell_command_id,
+                &task_run_id,
+                &status,
+                &exit_code,
+                &stdout,
+                &stderr,
+                &duration_ms,
+                &started_at,
+                &completed_at,
+                &now,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG save_shell_command_result: {}", e))?;
+
+        Ok(id)
+    }
+
+    /// Get shell command results, ordered by creation date descending.
+    pub async fn get_shell_command_results(
+        &self,
+        shell_command_id: &str,
+        limit: u32,
+    ) -> Result<Vec<crate::database::types::ShellCommandResult>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let limit_i64 = limit as i64;
+
+        let rows = conn
+            .query(
+                r#"SELECT id, shell_command_id, task_run_id, status,
+                       exit_code, stdout, stderr, duration_ms,
+                       started_at, completed_at, created_at
+                FROM shell_command_results
+                WHERE shell_command_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2"#,
+                &[&shell_command_id, &limit_i64],
+            )
+            .await
+            .map_err(|e| format!("PG get_shell_command_results: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| crate::database::types::ShellCommandResult {
+                id: r.get(0),
+                shell_command_id: r.get(1),
+                task_run_id: r.get(2),
+                status: r.get(3),
+                exit_code: r.get(4),
+                stdout: r.get(5),
+                stderr: r.get(6),
+                duration_ms: r.get(7),
+                started_at: r.get(8),
+                completed_at: r.get(9),
+                created_at: r.get(10),
+            })
+            .collect())
+    }
 }

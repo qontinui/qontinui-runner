@@ -311,8 +311,9 @@ pub async fn get_task_run_mcp_calls(
     success_filter: Option<bool>,
 ) -> Result<McpResponse<McpCallsResult>, String> {
     match state
-        .checkpoint_db
+        .pg_db
         .get_task_run_mcp_calls(&task_run_id, success_filter)
+        .await
     {
         Ok(result) => Ok(McpResponse::ok(result)),
         Err(e) => {

@@ -2310,6 +2310,40 @@ impl LoopController {
             });
         }
 
+        // Memory consolidation trigger (after every N completed task runs)
+        // Runs in background with cooldown enforcement to prevent excessive consolidation.
+        {
+            let consolidation_pg = self.app_state.pg_db.clone();
+            tokio::spawn(async move {
+                let config = crate::memory::consolidation::ConsolidationConfig::default();
+                if !crate::memory::consolidation::can_run_consolidation(&consolidation_pg, config.cooldown_hours).await {
+                    return;
+                }
+                // Check if we've accumulated enough runs since last consolidation
+                // (lightweight check — just count recent completed task runs)
+                let count = consolidation_pg
+                    .get_observations_for_consolidation(1)
+                    .await
+                    .map(|obs| obs.len())
+                    .unwrap_or(0);
+                if count == 0 {
+                    return;
+                }
+                tracing::info!("Triggering background memory consolidation");
+                match crate::memory::consolidation::run_consolidation(&consolidation_pg, &config).await {
+                    Ok(stats) => {
+                        tracing::info!(
+                            "Memory consolidation complete: {} models created, {} archived",
+                            stats.models_created, stats.observations_archived
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Memory consolidation failed: {}", e);
+                    }
+                }
+            });
+        }
+
         // Auto-run generated workflow (for "Generate & Run" flow)
         // Always attempt if auto_run_generated is set — don't gate on overall_passed.
         // The save_workflow_artifact step already gates on stage completion, so if

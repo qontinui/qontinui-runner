@@ -335,16 +335,18 @@ pub async fn get_task_run_mcp_calls(
     // Verify task exists
     let task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get MCP calls
     let result = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run_mcp_calls(&id, query.success)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Apply limit if specified
