@@ -35,6 +35,7 @@ export const tutorials: Tutorial[] = [
   graphqlInfrastructureTutorial, // Architecture - full-stack GraphQL system
   knowledgeAcquisitionTutorial, // Featured - Knowledge acquisition system
   actionPlanTutorial, // Featured - Structured action plan API
+  observationMemoryTutorial, // Featured - Cross-session AI knowledge (Engram-inspired)
   blameAttributionTutorial, // Featured - Blame attribution & convergence
   multimodalVisionTutorial, // Featured - Multimodal vision pipeline
   traceAnalysisTutorial, // Featured - Trace analysis & critical path
@@ -113,6 +114,7 @@ export { opikIntegrationTutorial } from "./opik-integration";
 export { knowledgeAcquisitionTutorial } from "./knowledge-acquisition";
 export { graphqlInfrastructureTutorial } from "./graphql-infrastructure";
 export { actionPlanTutorial } from "./action-plan";
+export { observationMemoryTutorial } from "./observation-memory";
 export { blameAttributionTutorial } from "./blame-attribution";
 export { multimodalVisionTutorial } from "./multimodal-vision";
 export { traceAnalysisTutorial } from "./trace-analysis";

@@ -194,12 +194,12 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
   const totalCount = stats.reduce((sum, s) => sum + s.count, 0);
 
   return (
-    <div className="flex flex-col h-full" data-ui-element="observation-browser">
+    <div className="flex flex-col h-full" data-ui-element="observation-browser" data-tutorial-id="observation-browser">
       {/* Header */}
       <div className="flex items-center gap-3 p-4 border-b border-border">
         <Brain className="w-5 h-5 text-primary" />
         <div className="flex-1">
-          <h2 className="font-semibold text-sm" data-ui-element="observation-heading">Observation Memory</h2>
+          <h2 className="font-semibold text-sm" data-ui-element="observation-heading" data-tutorial-id="observation-heading">Observation Memory</h2>
           <p className="text-xs text-muted-foreground" data-ui-element="observation-subtitle">
             Cross-session knowledge from past runs
           </p>
@@ -208,6 +208,7 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
           onClick={() => setShowCreateForm(!showCreateForm)}
           className="px-2 py-1 text-xs bg-primary text-primary-foreground rounded-md"
           data-ui-element="new-observation-btn"
+          data-tutorial-id="observation-create-btn"
         >
           + New
         </button>
@@ -279,7 +280,7 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
 
       {/* Stats bar */}
       {stats.length > 0 && (
-        <div className="flex items-center gap-2 px-4 py-2 border-b border-border overflow-x-auto">
+        <div className="flex items-center gap-2 px-4 py-2 border-b border-border overflow-x-auto" data-tutorial-id="observation-stats">
           <span className="text-xs text-muted-foreground shrink-0">
             {totalCount} total
           </span>
@@ -313,6 +314,7 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
             placeholder="Search observations..."
             className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
             data-ui-element="observation-search-input"
+            data-tutorial-id="observation-search"
           />
         </div>
         <button
