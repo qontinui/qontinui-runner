@@ -9,6 +9,7 @@ import { gettingStartedTutorial } from "./getting-started";
 import { workflowExecutionTutorial } from "./workflow-execution";
 import { aiAnalysisTutorial } from "./ai-analysis";
 import { promptWorkflowTutorial } from "./prompt-workflow";
+import { knowledgeGraphTutorial } from "./knowledge-graph";
 
 /**
  * All available tutorials
@@ -19,6 +20,7 @@ export const tutorials: Tutorial[] = [
   promptWorkflowTutorial, // Featured - AI prompt workflows
   workflowExecutionTutorial,
   aiAnalysisTutorial,
+  knowledgeGraphTutorial,
 ];
 
 /**
@@ -88,3 +90,4 @@ export { gettingStartedTutorial } from "./getting-started";
 export { promptWorkflowTutorial } from "./prompt-workflow";
 export { workflowExecutionTutorial } from "./workflow-execution";
 export { aiAnalysisTutorial } from "./ai-analysis";
+export { knowledgeGraphTutorial } from "./knowledge-graph";
