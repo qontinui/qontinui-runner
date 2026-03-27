@@ -13,14 +13,14 @@ export interface ApiMockConfig {
 }
 
 let originalFetch: typeof fetch | null = null;
-let activeMocks: ApiMockConfig | null = null;
+let _activeMocks: ApiMockConfig | null = null;
 
 /**
  * Install mock fetch. Call before rendering components.
  */
 export function setupApiMocks(config: ApiMockConfig): void {
   originalFetch = globalThis.fetch;
-  activeMocks = config;
+  _activeMocks = config;
 
   globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
@@ -69,7 +69,7 @@ export function teardownApiMocks(): void {
     globalThis.fetch = originalFetch;
     originalFetch = null;
   }
-  activeMocks = null;
+  _activeMocks = null;
 }
 
 /**

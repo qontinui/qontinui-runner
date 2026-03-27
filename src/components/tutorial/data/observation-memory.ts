@@ -366,7 +366,7 @@ The result: **your AI gets smarter over time**, learning from every workflow run
       estimatedDuration: 1,
       resources: [
         {
-          label: "Engram (inspiration)",
+          title: "Engram (inspiration)",
           url: "https://github.com/Gentleman-Programming/engram",
         },
       ],

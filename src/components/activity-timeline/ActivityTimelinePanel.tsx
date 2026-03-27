@@ -173,7 +173,7 @@ export function ActivityTimelinePanel() {
 
   const { ref: resultsRef } = useUIElement({
     id: "timeline-results",
-    type: "container",
+    type: "generic",
     label: `Search results (${results.length} entries)`,
   });
 

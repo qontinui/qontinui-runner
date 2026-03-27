@@ -59,7 +59,7 @@ export function getGraphQLClient(): ApolloClient {
         // Detect circuit breaker / rate limit errors for recovery hints
         const msg = err.message.toLowerCase();
         if (msg.includes("circuit breaker") || msg.includes("concurrency")) {
-          console.info(
+          console.warn(
             "[GraphQL] Circuit breaker or concurrency limit hit — retry after delay",
           );
         }
@@ -100,10 +100,10 @@ export function getGraphQLClient(): ApolloClient {
     },
     on: {
       connected: () => {
-        console.debug("[GraphQL WS] Connected");
+        console.warn("[GraphQL WS] Connected");
       },
       closed: () => {
-        console.debug("[GraphQL WS] Closed");
+        console.warn("[GraphQL WS] Closed");
       },
       error: (err) => {
         console.warn("[GraphQL WS] Error:", err);

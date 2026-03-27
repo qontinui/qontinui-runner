@@ -13,6 +13,7 @@ import {
   type BackgroundObserverDeps,
   type TimelineCapturePayload,
 } from "@qontinui/ui-bridge/ai";
+import type { ControlSnapshot } from "@qontinui/ui-bridge/control";
 import { SemanticSnapshotManager } from "@qontinui/ui-bridge/ai";
 
 let observer: BackgroundObserver | null = null;
@@ -36,7 +37,7 @@ async function persistCapture(payload: TimelineCapturePayload): Promise<void> {
     });
   } catch (err) {
     // Non-fatal: PG may not be available
-    console.debug("[BackgroundObserverService] Failed to persist capture:", err);
+    console.warn("[BackgroundObserverService] Failed to persist capture:", err);
   }
 }
 
@@ -49,7 +50,7 @@ export function startBackgroundObserver(): void {
 
   const registry = getGlobalRegistry();
   if (!registry) {
-    console.debug("[BackgroundObserverService] Registry not available yet");
+    console.warn("[BackgroundObserverService] Registry not available yet");
     return;
   }
 
@@ -57,7 +58,7 @@ export function startBackgroundObserver(): void {
 
   const deps: BackgroundObserverDeps = {
     snapshotManager,
-    createControlSnapshot: () => registry.captureSnapshot(),
+    createControlSnapshot: () => (registry as { captureSnapshot: () => ControlSnapshot }).captureSnapshot(),
     onCapture: persistCapture,
   };
 
@@ -68,7 +69,7 @@ export function startBackgroundObserver(): void {
   });
 
   observer.start();
-  console.info("[BackgroundObserverService] Started");
+  console.warn("[BackgroundObserverService] Started");
 }
 
 /**
@@ -78,7 +79,7 @@ export function stopBackgroundObserver(): void {
   if (observer) {
     observer.stop();
     observer = null;
-    console.info("[BackgroundObserverService] Stopped");
+    console.warn("[BackgroundObserverService] Stopped");
   }
 }
 

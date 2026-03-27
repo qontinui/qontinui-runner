@@ -31,7 +31,7 @@ export function setupTauriMocks(): void {
     invoke: async (cmd: string, args?: unknown) => {
       if (cmd in invokeMocks) {
         const mock = invokeMocks[cmd];
-        return typeof mock === "function" ? (mock as Function)(args) : mock;
+        return typeof mock === "function" ? (mock as (a: unknown) => unknown)(args) : mock;
       }
       // Default: return null for unknown commands
       console.warn(`[tauri-mock] Unhandled invoke: ${cmd}`);
@@ -41,12 +41,12 @@ export function setupTauriMocks(): void {
 
   // Mock @tauri-apps/api/event
   const event = {
-    listen: async (_event: string, _handler: Function) => {
+    listen: async (_event: string, _handler: (...args: unknown[]) => void) => {
       // Return unlisten function
       return () => {};
     },
     emit: async (_event: string, _payload?: unknown) => {},
-    once: async (_event: string, _handler: Function) => {
+    once: async (_event: string, _handler: (...args: unknown[]) => void) => {
       return () => {};
     },
   };
@@ -65,5 +65,5 @@ export function setupTauriMocks(): void {
   };
 
   // Inject into global for module resolution
-  (globalThis as any).__TAURI_MOCKS__ = { core, event, window };
+  (globalThis as unknown as Record<string, unknown>).__TAURI_MOCKS__ = { core, event, window };
 }

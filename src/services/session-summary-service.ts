@@ -15,7 +15,6 @@ import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import {
   sessionManager,
   type SessionContext,
-  type SessionStatus,
 } from "./SessionManager";
 
 const logger = createLogger("SessionSummaryService");

@@ -80,7 +80,7 @@ async function executeAction(action: DemoAction): Promise<void> {
       });
       break;
 
-    case "waitForIdle":
+    case "waitForIdle": {
       // Poll idle status until ready or timeout
       const deadline = Date.now() + action.timeout;
       while (Date.now() < deadline) {
@@ -94,6 +94,7 @@ async function executeAction(action: DemoAction): Promise<void> {
         await sleep(500);
       }
       break;
+    }
   }
 }
 
@@ -141,6 +142,7 @@ export async function executeScript(
   const recordingStartTime = Date.now();
   const stepTimestamps: StepTimestamp[] = [];
 
+  let executionError: unknown;
   try {
     for (let i = 0; i < script.steps.length; i++) {
       if (abortRequested) break;
@@ -177,18 +179,22 @@ export async function executeScript(
 
       callbacks?.onStepComplete?.(i, step.id);
     }
-  } finally {
-    // Always stop recording, even on error
-    const stopResult = await invoke<{ success: boolean; path: string }>(
-      "stop_video_recording"
-    );
-
-    const totalDurationMs = Date.now() - recordingStartTime;
-
-    return {
-      videoPath: stopResult.path,
-      steps: stepTimestamps,
-      totalDurationMs,
-    };
+  } catch (err) {
+    executionError = err;
   }
+
+  // Always stop recording, even on error
+  const stopResult = await invoke<{ success: boolean; path: string }>(
+    "stop_video_recording"
+  ).catch(() => ({ success: false, path: "" }));
+
+  const totalDurationMs = Date.now() - recordingStartTime;
+
+  if (executionError) throw executionError;
+
+  return {
+    videoPath: stopResult.path,
+    steps: stepTimestamps,
+    totalDurationMs,
+  };
 }

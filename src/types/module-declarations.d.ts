@@ -382,6 +382,28 @@ declare module "react-window" {
 // html2canvas (missing type declarations)
 // =============================================================================
 
+// =============================================================================
+// @testing-library/react — used only via dynamic import in vdom-renderer.ts
+// (test-only dep, not installed in production)
+// =============================================================================
+
+declare module "@testing-library/react" {
+  import type { ReactElement } from "react";
+
+  interface RenderResult {
+    container: HTMLElement;
+    unmount: () => void;
+    [key: string]: unknown;
+  }
+
+  export function render(element: ReactElement): RenderResult;
+  export const screen: Record<string, unknown>;
+}
+
+// =============================================================================
+// html2canvas (missing type declarations)
+// =============================================================================
+
 declare module "html2canvas" {
   interface Html2CanvasOptions {
     allowTaint?: boolean;

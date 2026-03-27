@@ -372,7 +372,7 @@ You can also verify API contracts using the spec runner:
         "You can test endpoints directly with curl from the terminal",
       ],
       resources: [
-        { label: "Inngest (inspiration)", url: "https://www.inngest.com/docs" },
+        { title: "Inngest (inspiration)", url: "https://www.inngest.com/docs" },
       ],
     },
 

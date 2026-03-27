@@ -273,7 +273,7 @@ The timeline becomes more valuable over time as more captures accumulate. Think 
       estimatedDuration: 1,
       resources: [
         {
-          label: "Screenpipe (inspiration)",
+          title: "Screenpipe (inspiration)",
           url: "https://github.com/screenpipe/screenpipe",
         },
       ],

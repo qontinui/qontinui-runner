@@ -41,7 +41,11 @@ export function ContextManagement() {
   const { state, updateWorkflow } = useWorkflowBuilder();
   const { workflow } = state;
   const { contexts, loading: contextsLoading, evaluateAutoInclude } = useContexts();
-  const memoryContext = useObservationMemory(workflow.project_id ?? null);
+  // project_id is not part of the canonical UnifiedWorkflow schema but may
+  // be attached at runtime by the builder.  Access it safely via index signature.
+  const memoryContext = useObservationMemory(
+    (workflow as unknown as Record<string, unknown>)["project_id"] as string | null ?? null,
+  );
 
   // Local state
   const [isExpanded, setIsExpanded] = useState(true);

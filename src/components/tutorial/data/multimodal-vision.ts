@@ -360,7 +360,7 @@ Set \`brain_actor_enabled: true\` in your workflow's agentic verification config
 - *Running Your First Workflow* — How the agentic loop works`,
       resources: [
         {
-          label: "TuriX-CUA Integration Plan",
+          title: "TuriX-CUA Integration Plan",
           url: "https://github.com/TurixAI/TuriX-CUA",
         },
       ],

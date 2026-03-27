@@ -225,7 +225,7 @@ export function WatcherManagementPanel() {
 
   const { ref: watcherListRef } = useUIElement({
     id: "watchers-list",
-    type: "container",
+    type: "generic",
     label: `Watcher list (${watchers.length} watchers)`,
   });
 
@@ -429,7 +429,7 @@ function WatcherCard({
 
   const { ref: cardRef } = useUIElement({
     id: `watcher-card-${w.id}`,
-    type: "container",
+    type: "generic",
     label: `Watcher: ${w.name} (${w.enabled ? "enabled" : "disabled"}) — query: "${w.timelineQuery}", lookback: ${w.lookbackWindow}, last run: ${formatTime(w.lastRunAt)}`,
   });
 

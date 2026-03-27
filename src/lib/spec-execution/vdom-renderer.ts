@@ -42,7 +42,7 @@ export async function renderAndDiscover(
   options?: { waitMs?: number },
 ): Promise<VdomElement[]> {
   // Dynamic import to avoid pulling in test deps at runtime
-  const { render, screen } = await import("@testing-library/react");
+  const { render } = await import("@testing-library/react");
 
   const { container, unmount } = render(element);
 
@@ -148,7 +148,7 @@ function isInteractiveElement(tagName: string, el: Element): boolean {
   return false;
 }
 
-function mapType(tagName: string, role: string, el: Element): string {
+function mapType(tagName: string, role: string, _el: Element): string {
   if (role === "button" || tagName === "button") return "button";
   if (role === "link" || tagName === "a") return "link";
   if (role === "textbox" || role === "searchbox" || tagName === "input" || tagName === "textarea") return "input";
